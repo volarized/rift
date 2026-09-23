@@ -22,6 +22,7 @@ use rift_core::{
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
+use rift_protocol::configuration::SyntaxConfiguration;
 use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
@@ -188,8 +189,25 @@ impl WorkspaceIndexLimits {
         }
     }
 
+    /// Parses every source under a `[providers.syntax]` table's bounds, as
+    /// [`Self::with_syntax`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the table states a zero bound.
+    pub fn with_syntax_configuration(
+        self,
+        configuration: &SyntaxConfiguration,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let syntax = SyntaxLimits::from_configuration(configuration).map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::ZeroLimit, None, error)
+        })?;
+        Ok(self.with_syntax(syntax))
+    }
+
     /// Syntax bounds every source parses under.
-    pub(crate) const fn syntax(self) -> SyntaxLimits {
+    #[must_use]
+    pub const fn syntax(self) -> SyntaxLimits {
         self.syntax
     }
 }
@@ -1472,6 +1490,12 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The bounds this index was built under.
+    #[must_use]
+    pub const fn limits(&self) -> WorkspaceIndexLimits {
+        self.limits
     }
 
     /// Effective language path policy used by this publication.

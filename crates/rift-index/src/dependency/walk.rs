@@ -277,7 +277,8 @@ fn package_archive_files(
         ExactPackageLimits::new(
             u32::try_from(limits.package_files_max).unwrap_or(u32::MAX),
             limits.package_bytes_max,
-        ),
+        )
+        .with_syntax(limits.syntax),
     ))
 }
 
@@ -611,7 +612,8 @@ fn read_candidates(
         ExactPackageLimits::new(
             u32::try_from(limits.package_files_max).unwrap_or(u32::MAX),
             limits.package_bytes_max,
-        ),
+        )
+        .with_syntax(limits.syntax),
     ))
 }
 

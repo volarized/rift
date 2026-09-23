@@ -400,8 +400,8 @@ impl ConfigurationState {
 
     /// The bounds the index builds under: `base` with its file count, aggregate byte, and
     /// declaration bounds replaced by the `[source]` table's `files`, `workspace_size`,
-    /// and `declarations`. The per-file, depth, and result bounds stay as `base` carries
-    /// them.
+    /// and `declarations`, and its syntax and per-file bounds by `[providers.syntax]`. The
+    /// depth and result bounds stay as `base` carries them.
     pub(crate) fn index_limits(
         &self,
         base: WorkspaceIndexLimits,
@@ -411,7 +411,13 @@ impl ConfigurationState {
         let workspace_bytes_max =
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
+        let syntax = self
+            .accepted
+            .as_ref()
+            .map(|configuration| configuration.providers.syntax.clone())
+            .unwrap_or_default();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
+            .and_then(|limits| limits.with_syntax_configuration(&syntax))
             .map_err(|error| ReadError::from(ReadFault::Index(error)))
     }
 
@@ -3615,6 +3621,10 @@ pub(crate) mod tests {
         let path = rift_core::ProjectPath::new("lib.rs")?;
         let absolute = directory.path().join(path.as_str());
         let limits = WorkspaceIndexLimits::new(4, 60, 60, 4, 100)?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.syntax]\nmax_file = \"60b\"\n",
+        )?;
         fs::write(&absolute, "pub fn beacon() {}\n")?;
         let before = candidate_with_limits(directory.path(), 0, limits)?;
         let (validation, _invalidations) = IndexValidation::new(limits.files_max());

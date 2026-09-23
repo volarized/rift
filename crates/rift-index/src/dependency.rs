@@ -31,6 +31,7 @@ use rift_core::SourceUnitId;
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::read::PackageIdentity;
 use rift_ranking::IdentifierMatchClass;
+use rift_syntax::SyntaxLimits;
 
 use crate::workspace::SymbolMatch;
 
@@ -56,7 +57,7 @@ const WALK_ENTRIES_MAX_FIELD: &str = "walk_entries_max";
 /// files; `directory_depth_max` and `walk_entries_max` bound the walk that
 /// selects them; `total_bytes_max` bounds every indexed package together.
 /// The `[dependencies]` table sets the first three; the walk bounds are this
-/// crate's own.
+/// crate's own; `syntax` comes from `[providers.syntax]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DependencyIndexLimits {
     /// Most selected source bytes one package may hold.
@@ -69,6 +70,8 @@ pub struct DependencyIndexLimits {
     pub directory_depth_max: usize,
     /// Most directory entries one package walk examines, selected or not.
     pub walk_entries_max: usize,
+    /// Syntax bounds every selected source parses under.
+    pub syntax: SyntaxLimits,
 }
 
 impl From<&DependenciesConfiguration> for DependencyIndexLimits {
@@ -82,6 +85,7 @@ impl From<&DependenciesConfiguration> for DependencyIndexLimits {
             package_files_max: usize::try_from(configuration.package_files).unwrap_or(usize::MAX),
             directory_depth_max: DIRECTORY_DEPTH_MAX_DEFAULT,
             walk_entries_max: WALK_ENTRIES_MAX_DEFAULT,
+            syntax: SyntaxLimits::DEFAULT,
         }
     }
 }
