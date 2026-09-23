@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use rift_protocol::read::Language;
 
 use crate::language::{self, LanguageDefinition};
-use crate::provider::SyntaxProvider;
+use crate::provider::{SyntaxLimits, SyntaxProvider};
 
 /// One shipped definition beside the provider it constructed.
 struct RegisteredLanguage {
@@ -105,11 +105,28 @@ pub fn shipped_languages()
 /// no shipped definition claims it.
 #[must_use]
 pub fn provider_for_extension(extension: &str) -> Option<&'static dyn SyntaxProvider> {
+    entry_for_extension(extension).map(|entry| entry.provider.as_ref())
+}
+
+/// A provider for the language claiming `extension`, built under `limits` in
+/// place of its declared default bounds; `None` when no shipped definition
+/// claims the extension. The caller owns the returned provider, so a caller
+/// that parses many sources under one set of limits builds it once per
+/// language.
+#[must_use]
+pub fn provider_for_extension_with_limits(
+    extension: &str,
+    limits: SyntaxLimits,
+) -> Option<Box<dyn SyntaxProvider>> {
+    entry_for_extension(extension).map(|entry| entry.definition.syntax_provider_with_limits(limits))
+}
+
+/// The registered language claiming `extension`.
+fn entry_for_extension(extension: &str) -> Option<&'static RegisteredLanguage> {
     registry()
         .entries
         .iter()
         .find(|entry| entry.definition.extensions().contains(&extension))
-        .map(|entry| entry.provider.as_ref())
 }
 
 /// The provider filing facts under `language`; `None` when no shipped
@@ -289,6 +306,10 @@ mod tests {
                 language: self.provider_language.language(),
             })
         }
+
+        fn syntax_provider_with_limits(&self, _limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+            self.syntax_provider()
+        }
     }
 
     /// A definition claiming the rust extension beside the real one.
@@ -322,5 +343,41 @@ mod tests {
     #[should_panic(expected = "a definition's provider must file facts under")]
     fn test_assemble_refuses_a_provider_filing_under_another_identity() {
         SyntaxRegistry::assemble(&[&MISMATCHED_IDENTITY]);
+    }
+
+    #[test]
+    fn test_provider_for_extension_with_limits_applies_caller_bounds() {
+        let limits = SyntaxLimits::new(4_096, 1, 64).expect("positive bounds");
+        for extension in source_file_extensions() {
+            let limited = provider_for_extension_with_limits(extension, limits)
+                .expect("a shipped extension has a provider");
+            let declared = provider_for_extension(extension).expect("shipped provider");
+            assert_eq!(
+                limited.language(),
+                declared.language(),
+                "a limited provider must file facts under the shipped language: extension={extension}"
+            );
+            assert_eq!(limited.source_bytes_max(), 4_096);
+        }
+        assert!(provider_for_extension_with_limits("unknown", limits).is_none());
+
+        let path = ProjectPath::new("pkg/module.py").expect("valid path");
+        let source = SyntaxSource {
+            path: &path,
+            text: "value = 1\n",
+        };
+        assert!(
+            provider_for_extension("py")
+                .expect("Python provider")
+                .analyze(source)
+                .is_ok()
+        );
+        assert!(
+            provider_for_extension_with_limits("py", limits)
+                .expect("Python provider")
+                .analyze(source)
+                .is_err(),
+            "a one-node bound must refuse a source the default bounds accept"
+        );
     }
 }

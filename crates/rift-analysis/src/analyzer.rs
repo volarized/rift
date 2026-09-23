@@ -48,7 +48,7 @@ use rift_protocol::read::{
     SymbolId, SymbolOrigin, TextRange,
 };
 use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
-use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxSymbol};
+use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxSymbol};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -263,7 +263,7 @@ impl PackageAnalyzer {
         let package = input.package();
         let mut analyzed = Vec::with_capacity(input.files().len());
         for file in input.files() {
-            let parsed = parsed_file(*file, package, input.language())?;
+            let parsed = parsed_file(*file, package, input.language(), input.limits().syntax())?;
             let placement = placement_of(package, input.origin(), file.path())?;
             let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
             analyzed.push(AnalyzedFile {
@@ -1331,11 +1331,13 @@ fn wire_path(path: &CoreProjectPath) -> ProjectPath {
     ProjectPath(path.as_str().to_owned())
 }
 
-/// One package file parsed by the provider its extension names.
+/// One package file parsed by the provider its extension names, under `syntax_limits` when
+/// the caller replaced the provider's declared bounds.
 fn parsed_file(
     file: crate::input::PackageSource<'_>,
     package: &PackageIdentity,
     package_language: &Language,
+    syntax_limits: Option<SyntaxLimits>,
 ) -> Result<IndexedFile, PackageAnalysisError> {
     let context = Path::new(file.path().as_str());
     let extension = context
@@ -1346,12 +1348,23 @@ fn parsed_file(
     let syntax = if matches!(extension, "rst" | "txt" | "ipynb") {
         SyntaxDocument::empty(language, file.path().clone())
     } else {
-        let provider =
-            rift_syntax::registry::provider_for_extension(extension).ok_or_else(|| {
-                PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
-                    .at(file.path())
-                    .into_error()
-            })?;
+        let unsupported = || {
+            PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
+                .at(file.path())
+                .into_error()
+        };
+        let limited;
+        let provider: &dyn rift_syntax::SyntaxProvider = match syntax_limits {
+            Some(limits) => {
+                limited =
+                    rift_syntax::registry::provider_for_extension_with_limits(extension, limits)
+                        .ok_or_else(unsupported)?;
+                limited.as_ref()
+            }
+            None => {
+                rift_syntax::registry::provider_for_extension(extension).ok_or_else(unsupported)?
+            }
+        };
         provider
             .analyze(rift_syntax::SyntaxSource {
                 path: file.path(),
@@ -1585,6 +1598,7 @@ mod tests {
             PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
             &package,
             &language(ShippedLanguage::Rust),
+            None,
         )
         .expect_err("unsupported source extension");
         assert_eq!(
@@ -1595,6 +1609,27 @@ mod tests {
             unsupported.fault().violation(),
             super::PackageAnalysisViolation::Syntax
         );
+    }
+
+    #[test]
+    fn caller_syntax_limits_replace_each_provider_declared_bounds() {
+        let generated = format!("values = [{}]\n", "1, ".repeat(300_000));
+        let files = vec![("pkg/generated.py", generated.as_str())];
+        let Err(declared) = package_result(ShippedLanguage::Python, files.clone(), None) else {
+            panic!("a source past the declared node bound must be refused");
+        };
+        assert_eq!(
+            declared.fault().violation(),
+            super::PackageAnalysisViolation::Syntax
+        );
+
+        let raised = rift_syntax::SyntaxLimits::new(4 << 20, 1_000_000, 512).expect("bounds");
+        assert!(package_result(ShippedLanguage::Python, files, Some(raised)).is_ok());
+
+        let tight = rift_syntax::SyntaxLimits::new(4 << 20, 1, 512).expect("bounds");
+        let small = vec![("pkg/small.py", "value = 1\n")];
+        assert!(package_result(ShippedLanguage::Python, small.clone(), None).is_ok());
+        assert!(package_result(ShippedLanguage::Python, small, Some(tight)).is_err());
     }
 
     #[test]
@@ -1619,6 +1654,15 @@ mod tests {
     }
 
     fn package_analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> PackageAnalysis {
+        package_result(shipped, files, None).expect("the package analyzes")
+    }
+
+    /// One package of `files` in `shipped`, analyzed under `syntax` bounds when set.
+    fn package_result(
+        shipped: ShippedLanguage,
+        files: Vec<(&str, &str)>,
+        syntax: Option<rift_syntax::SyntaxLimits>,
+    ) -> Result<PackageAnalysis, super::PackageAnalysisError> {
         let package = identity();
         let language = language(shipped);
         let origin = ContributionOrigin::new(
@@ -1646,10 +1690,12 @@ mod tests {
             &language,
             &origin,
             &sources,
-            ExactPackageLimits::new(files_max, bytes_max),
+            syntax.map_or(ExactPackageLimits::new(files_max, bytes_max), |limits| {
+                ExactPackageLimits::new(files_max, bytes_max).with_syntax(limits)
+            }),
         )
         .expect("bounded package input");
-        PackageAnalyzer::analyze(input, 1).expect("the package analyzes")
+        PackageAnalyzer::analyze(input, 1)
     }
 
     /// One package of `files` in `shipped`, analyzed.

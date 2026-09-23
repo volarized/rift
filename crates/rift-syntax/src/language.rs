@@ -11,11 +11,11 @@ use strum::VariantArray;
 use crate::javascript::JavaScriptSyntaxProvider;
 use crate::json::JsonSyntaxProvider;
 use crate::markdown::MarkdownSyntaxProvider;
-use crate::provider::SyntaxProvider;
+use crate::provider::{SyntaxLimits, SyntaxProvider};
 use crate::python::PythonSyntaxProvider;
 use crate::rust::RustSyntaxProvider;
 use crate::toml::TomlSyntaxProvider;
-use crate::typescript::TypeScriptDialect;
+use crate::typescript::{TypeScriptDialect, TypeScriptSyntaxProvider};
 use crate::yaml::YamlSyntaxProvider;
 
 /// One language and dialect this build ships, closed at compile time.
@@ -101,6 +101,10 @@ pub trait LanguageDefinition: std::fmt::Debug + Send + Sync {
     /// The syntax provider parsing this language's sources, under its
     /// declared default bounds.
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider>;
+
+    /// The syntax provider parsing this language's sources under `limits`
+    /// in place of its declared default bounds.
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider>;
 }
 
 /// Every definition this build ships, in registration order: the one list a
@@ -136,6 +140,10 @@ impl LanguageDefinition for RustDefinition {
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(RustSyntaxProvider::default())
     }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(RustSyntaxProvider::new(limits))
+    }
 }
 
 /// JavaScript: `js` and `jsx` files; the pinned grammar parses JSX, so `jsx`
@@ -155,6 +163,10 @@ impl LanguageDefinition for JavaScriptDefinition {
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(JavaScriptSyntaxProvider::default())
     }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(JavaScriptSyntaxProvider::new(limits))
+    }
 }
 
 /// Plain TypeScript: `ts` files.
@@ -172,6 +184,13 @@ impl LanguageDefinition for TypeScriptDefinition {
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(TypeScriptDialect::TypeScript.provider())
+    }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(TypeScriptSyntaxProvider::new(
+            TypeScriptDialect::TypeScript,
+            limits,
+        ))
     }
 }
 
@@ -191,6 +210,13 @@ impl LanguageDefinition for TypeScriptTsxDefinition {
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(TypeScriptDialect::Tsx.provider())
     }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(TypeScriptSyntaxProvider::new(
+            TypeScriptDialect::Tsx,
+            limits,
+        ))
+    }
 }
 
 /// Markdown: `md` files.
@@ -208,6 +234,10 @@ impl LanguageDefinition for MarkdownDefinition {
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(MarkdownSyntaxProvider::default())
+    }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(MarkdownSyntaxProvider::new(limits))
     }
 }
 
@@ -227,6 +257,10 @@ impl LanguageDefinition for JsonDefinition {
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(JsonSyntaxProvider::default())
     }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(JsonSyntaxProvider::new(limits))
+    }
 }
 
 /// YAML: both spellings of the extension under one provider.
@@ -244,6 +278,10 @@ impl LanguageDefinition for YamlDefinition {
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(YamlSyntaxProvider::default())
+    }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(YamlSyntaxProvider::new(limits))
     }
 }
 
@@ -263,6 +301,10 @@ impl LanguageDefinition for TomlDefinition {
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(TomlSyntaxProvider::default())
     }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(TomlSyntaxProvider::new(limits))
+    }
 }
 
 /// Python: `py` sources and `pyi` stubs under one grammar.
@@ -280,6 +322,10 @@ impl LanguageDefinition for PythonDefinition {
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
         Box::new(PythonSyntaxProvider::default())
+    }
+
+    fn syntax_provider_with_limits(&self, limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
+        Box::new(PythonSyntaxProvider::new(limits))
     }
 }
 
