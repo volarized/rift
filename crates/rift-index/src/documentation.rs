@@ -8,15 +8,15 @@ use rift_analysis::documentation::notebook::{
 };
 use rift_analysis::documentation::{
     DocumentationCollection, DocumentationDeclaration, DocumentationError, DocumentationInput,
-    DocumentationSourceSet, collect_documentation, content_chunk_identity, content_digest,
+    DocumentationSourceSet, collect_documentation_incremental, content_chunk_identity,
+    content_digest,
 };
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_protocol::documentation::{
     DOCUMENTATION_SOURCE_BYTES_MAX, DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX,
-    DOCUMENTATION_WARNINGS_MAX, DocumentationChunk, DocumentationContentIdentity,
+    DocumentationChunk, DocumentationContentIdentity, DocumentationDigest,
     DocumentationSelectionReason, DocumentationSource, DocumentationSourceFormat,
-    DocumentationSourceIdentity, DocumentationStage, DocumentationWarning,
-    DocumentationWarningKind,
+    DocumentationSourceIdentity, DocumentationWarningKind,
 };
 use rift_protocol::read::{
     Language, ProjectPath, SourceKind, SourceLocationKind, SymbolId, SymbolOrigin, TextRange,
@@ -32,7 +32,28 @@ use crate::workspace::{IndexedFile, LeftOut, TextSourceFile, document, file_name
 use crate::{WorkspaceIndexError, WorkspaceIndexViolation};
 
 /// Held notebook cell content, keyed by its canonical owner.
-pub(crate) type NotebookFiles = BTreeMap<CoreProjectPath, NotebookContent>;
+pub(crate) type NotebookFiles = BTreeMap<CoreProjectPath, HeldNotebook>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct HeldNotebook {
+    digest: DocumentationDigest,
+    outcome: Arc<NotebookOutcome>,
+}
+
+#[derive(Clone, Debug)]
+enum NotebookOutcome {
+    Decoded(NotebookContent),
+    Omitted(DocumentationWarningKind),
+}
+
+impl HeldNotebook {
+    fn content(&self) -> Option<&NotebookContent> {
+        match self.outcome.as_ref() {
+            NotebookOutcome::Decoded(content) => Some(content),
+            NotebookOutcome::Omitted(_) => None,
+        }
+    }
+}
 
 /// Collects declarations the semantic publication accepted.
 pub(crate) fn declarations(
@@ -62,9 +83,14 @@ pub(crate) fn build(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
     declarations: &[DeclarationFacts],
     chunk_bytes_max: usize,
+    previous: Option<(&DocumentationCollection, &NotebookFiles)>,
 ) -> Result<(DocumentationCollection, NotebookFiles), WorkspaceIndexError> {
     let mut omissions = Vec::new();
-    let notebooks = decode_notebooks(text_files, &mut omissions);
+    let notebooks = decode_notebooks(
+        text_files,
+        previous.map(|(_, notebooks)| notebooks),
+        &mut omissions,
+    );
     let mut input_bytes = 0_u64;
 
     let mut inputs = Vec::new();
@@ -73,7 +99,7 @@ pub(crate) fn build(
             continue;
         };
         if source_format == DocumentationSourceFormat::Notebook {
-            let Some(notebook) = notebooks.get(path) else {
+            let Some(notebook) = notebooks.get(path).and_then(HeldNotebook::content) else {
                 continue;
             };
             for cell in notebook.cells() {
@@ -152,7 +178,12 @@ pub(crate) fn build(
         &mut inputs,
     );
 
-    let collection = finish_collection(inputs, declarations, omissions)?;
+    let collection = finish_collection(
+        inputs,
+        declarations,
+        omissions,
+        previous.map(|(documentation, _)| documentation),
+    )?;
     Ok((collection, notebooks))
 }
 
@@ -160,6 +191,7 @@ fn finish_collection(
     inputs: Vec<DocumentationInput<'_>>,
     declarations: &[DeclarationFacts],
     omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
+    previous: Option<&DocumentationCollection>,
 ) -> Result<DocumentationCollection, WorkspaceIndexError> {
     let sources = DocumentationSourceSet::new(inputs).map_err(documentation_error)?;
     let declarations = declarations
@@ -167,26 +199,15 @@ fn finish_collection(
         .map(DeclarationFacts::validated)
         .collect::<Result<Vec<_>, _>>()
         .map_err(documentation_error)?;
-    let collection = collect_documentation(&sources, &declarations).map_err(documentation_error)?;
-    let mut index = collection.into_index();
-    let omitted_count = u32::try_from(omissions.len()).unwrap_or(u32::MAX);
-    index.coverage.selected = index.coverage.selected.saturating_add(omitted_count);
-    index.coverage.omitted = index.coverage.omitted.saturating_add(omitted_count);
-    let warning_slots = (DOCUMENTATION_WARNINGS_MAX as usize).saturating_sub(index.warnings.len());
-    for (source, kind) in omissions.into_iter().take(warning_slots) {
-        index.warnings.push(DocumentationWarning {
-            source,
-            stage: DocumentationStage::Source,
-            kind,
-            count: 1,
-        });
-    }
-    let collection = DocumentationCollection::new(index).map_err(documentation_error)?;
-    Ok(collection)
+    collect_documentation_incremental(previous, &sources, &declarations)
+        .map_err(documentation_error)?
+        .with_source_omissions(omissions)
+        .map_err(documentation_error)
 }
 
 fn decode_notebooks(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
+    previous: Option<&NotebookFiles>,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
 ) -> NotebookFiles {
     let mut notebooks = NotebookFiles::new();
@@ -195,14 +216,41 @@ fn decode_notebooks(
         .filter(|(path, _)| format(path) == Some(DocumentationSourceFormat::Notebook))
     {
         let identity = project_owner(path, None);
+        let digest = content_digest(file.content().as_bytes());
+        if let Some(previous) = previous
+            .and_then(|notebooks| notebooks.get(path))
+            .filter(|notebook| notebook.digest == digest)
+        {
+            notebooks.insert(path.clone(), previous.clone());
+            if let NotebookOutcome::Omitted(kind) = previous.outcome.as_ref()
+                && can_count_source(omissions, 1)
+            {
+                omissions.push((identity, *kind));
+            }
+            continue;
+        }
         match decode_notebook(file.content(), &identity) {
             Ok(notebook) => {
-                notebooks.insert(path.clone(), notebook);
+                notebooks.insert(
+                    path.clone(),
+                    HeldNotebook {
+                        digest,
+                        outcome: Arc::new(NotebookOutcome::Decoded(notebook)),
+                    },
+                );
             }
             Err(error) => {
+                let kind = warning_kind(&error);
                 if can_count_source(omissions, 1) {
-                    omissions.push((identity, warning_kind(&error)));
+                    omissions.push((identity, kind));
                 }
+                notebooks.insert(
+                    path.clone(),
+                    HeldNotebook {
+                        digest,
+                        outcome: Arc::new(NotebookOutcome::Omitted(kind)),
+                    },
+                );
             }
         }
     }
@@ -300,7 +348,10 @@ fn cell_documents_where(
             continue;
         }
         let name = file_name(path);
-        for cell in notebook.cells() {
+        let Some(content) = notebook.content() else {
+            continue;
+        };
+        for cell in content.cells() {
             let owner = project_owner(path, Some(cell.cell().clone()));
             let chunks = text_chunks(cell.text(), chunk_bytes_max);
             for (index, chunk) in chunks.iter().enumerate() {
@@ -342,6 +393,7 @@ pub(crate) fn content<'a>(
     let path = CoreProjectPath::new(path.0.as_str()).ok()?;
     notebooks
         .get(&path)?
+        .content()?
         .cells()
         .iter()
         .find(|cell| cell.cell() == cell_identity)
@@ -542,5 +594,56 @@ fn warning_kind(error: &DocumentationError) -> DocumentationWarningKind {
             DocumentationWarningKind::SourceUnavailable
         }
         _ => DocumentationWarningKind::MalformedSource,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotebookFiles, decode_notebooks};
+    use crate::workspace::TextSourceFile;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn notebook_decode_reuses_success_and_failure_for_unchanged_bytes() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            rift_core::ProjectPath::new("valid.ipynb").expect("valid path"),
+            Arc::new(TextSourceFile::from_content(
+                rift_core::ProjectPath::new("valid.ipynb").expect("valid path"),
+                r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#.into(),
+            )),
+        );
+        files.insert(
+            rift_core::ProjectPath::new("invalid.ipynb").expect("valid path"),
+            Arc::new(TextSourceFile::from_content(
+                rift_core::ProjectPath::new("invalid.ipynb").expect("valid path"),
+                "{".into(),
+            )),
+        );
+
+        let mut first_omissions = Vec::new();
+        let first = decode_notebooks(&files, None, &mut first_omissions);
+        assert_eq!(first_omissions.len(), 1);
+        let mut next_omissions = Vec::new();
+        let next = decode_notebooks(&files, Some(&first), &mut next_omissions);
+
+        assert_eq!(next_omissions, first_omissions);
+        for path in files.keys() {
+            assert!(Arc::ptr_eq(&first[path].outcome, &next[path].outcome,));
+        }
+        assert!(matches!(
+            next[&rift_core::ProjectPath::new("invalid.ipynb").expect("valid path")]
+                .outcome
+                .as_ref(),
+            super::NotebookOutcome::Omitted(_)
+        ));
+        assert!(matches!(
+            next[&rift_core::ProjectPath::new("valid.ipynb").expect("valid path")]
+                .outcome
+                .as_ref(),
+            super::NotebookOutcome::Decoded(_)
+        ));
+        let _: NotebookFiles = next;
     }
 }

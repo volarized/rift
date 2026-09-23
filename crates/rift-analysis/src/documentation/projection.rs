@@ -681,6 +681,107 @@ mod tests {
     }
 
     #[test]
+    fn repeated_collection_and_source_are_refused_without_changing_projection() {
+        let source = source("guide.md", "Guide", DocumentationSourceFormat::Markdown);
+        let first = collection(
+            vec![source.clone()],
+            vec![block(
+                &source,
+                "guide",
+                TextRange { start: 0, end: 5 },
+                vec![("guide-chunk", TextRange { start: 0, end: 5 })],
+                &[],
+                None,
+            )],
+        );
+        let duplicate_source = collection(vec![source.clone()], Vec::new());
+        let mut projection = DocumentationProjection::new(&first).expect("projection");
+        let error = projection
+            .extend_collection(&first)
+            .expect_err("duplicate block refused");
+        assert_eq!(error.fault().field(), "projection.block");
+        let error = projection
+            .extend_collection(&duplicate_source)
+            .expect_err("duplicate source refused");
+        assert_eq!(error.fault().field(), "projection.source");
+        assert_eq!(projection.sources, 1);
+        assert_eq!(projection.block_count, 1);
+        let projected = projection
+            .project(
+                &[input("guide-chunk", FieldSet::EMPTY)],
+                DocumentationProjectionTarget::Documentation,
+                |_, _| Some(TextRange { start: 1, end: 3 }),
+            )
+            .expect("prior projection remains valid");
+        assert_eq!(projected[0].order().len(), 1);
+    }
+
+    #[test]
+    fn projection_accepts_source_bound_and_refuses_one_more_source() {
+        let limit = rift_protocol::documentation::DOCUMENTATION_SOURCES_MAX;
+        let sources = (0..limit)
+            .map(|index| {
+                source(
+                    &format!("docs/{index:06}.md"),
+                    "",
+                    DocumentationSourceFormat::Markdown,
+                )
+            })
+            .collect();
+        let full = collection(sources, Vec::new());
+        let next = collection(
+            vec![source("extra.md", "", DocumentationSourceFormat::Markdown)],
+            Vec::new(),
+        );
+        let mut projection = DocumentationProjection::new(&full).expect("exact source bound");
+        let error = projection
+            .extend_collection(&next)
+            .expect_err("aggregate source bound");
+        assert_eq!(error.fault().field(), "projection.collections");
+        assert_eq!(projection.sources, limit as usize);
+        assert!(
+            projection
+                .source(&next.index().sources[0].identity)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overlapping_blocks_choose_shortest_range_then_earliest_start() {
+        let source = source(
+            "guide.md",
+            "0123456789abcdefghij",
+            DocumentationSourceFormat::Markdown,
+        );
+        let blocks = [("outer", 0, 20), ("earlier", 2, 10), ("later", 3, 11)]
+            .into_iter()
+            .map(|(name, start, end)| {
+                block(
+                    &source,
+                    name,
+                    TextRange { start, end },
+                    vec![("guide-chunk", TextRange { start: 0, end: 20 })],
+                    &[],
+                    None,
+                )
+            })
+            .collect();
+        let collection = collection(vec![source], blocks);
+        let projection = DocumentationProjection::new(&collection).expect("projection");
+        let projected = projection
+            .project(
+                &[input("guide-chunk", FieldSet::EMPTY)],
+                DocumentationProjectionTarget::Documentation,
+                |_, _| Some(TextRange { start: 4, end: 6 }),
+            )
+            .expect("overlapping projection");
+        let selected = projection
+            .block(projected[0].order()[0].identity())
+            .expect("selected block");
+        assert_eq!(selected.identity, content_digest(b"earlier"));
+    }
+
+    #[test]
     fn projection_uses_most_specific_block_and_unions_duplicate_fields() {
         let text = "first block second block";
         let source = source("docs/guide.md", text, DocumentationSourceFormat::Markdown);

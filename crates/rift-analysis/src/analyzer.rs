@@ -1318,6 +1318,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn package_failure_preserves_syntax_identity_and_package_context() {
+        use rift_core::{ErrorCode, ErrorContext, ErrorName};
+        use std::error::Error as _;
+
+        let package = identity();
+        let provider =
+            super::PackageAnalysisFault::new(super::PackageAnalysisViolation::Provider, &package)
+                .into_error();
+        assert_eq!(provider.name(), ErrorName::Wire(ErrorCode::InternalError));
+        assert_eq!(
+            provider.context(),
+            [
+                ErrorContext::new("violation", "provider"),
+                ErrorContext::new("package", "cargo/beacon@1.0.0"),
+            ]
+        );
+        assert!(provider.source().is_none());
+
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let syntax = rift_core::Error::new(rift_syntax::SyntaxFault::ParseCancelled {
+            path: Some(path.clone()),
+        });
+        let syntax_name = syntax.name();
+        let wrapped =
+            super::PackageAnalysisFault::new(super::PackageAnalysisViolation::Syntax, &package)
+                .at(&path)
+                .caused_by(syntax)
+                .into_error();
+        assert_eq!(wrapped.name(), syntax_name);
+        assert_eq!(
+            wrapped.context()[2],
+            ErrorContext::new("path", "src/lib.rs")
+        );
+        assert!(wrapped.source().is_some());
+
+        let unsupported = super::parsed_file(
+            PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
+            &package,
+            &language(ShippedLanguage::Rust),
+        )
+        .expect_err("unsupported source extension");
+        assert_eq!(
+            unsupported.name(),
+            ErrorName::Wire(ErrorCode::InternalError)
+        );
+        assert_eq!(
+            unsupported.fault().violation(),
+            super::PackageAnalysisViolation::Syntax
+        );
+    }
+
+    #[test]
+    fn plain_text_package_source_keeps_text_language_and_documentation() {
+        let publication = analyzed(
+            ShippedLanguage::Rust,
+            vec![("guide.txt", "Package documentation.\n")],
+        );
+        let document = publication
+            .documents
+            .iter()
+            .find(|document| document.kind == PackageDocumentKind::File)
+            .expect("text file document");
+        assert_eq!(document.language.name, "text");
+        let documentation = &publication.documentation;
+        assert_eq!(documentation.sources[0].media_type, "text/plain");
+        assert_eq!(documentation.blocks.len(), 1);
+    }
+
     fn language(shipped: ShippedLanguage) -> Language {
         shipped.language()
     }
@@ -1700,6 +1769,27 @@ mod tests {
         assert_eq!(files[0].file().path().as_str(), "src/lib.rs");
         assert!(files[0].is_public("spawn"));
         assert_eq!(analysis.publication().symbols.len(), 1);
+    }
+
+    #[test]
+    fn test_notebook_code_cell_uses_package_language_when_cell_language_is_absent() {
+        let source =
+            r#"{"cells":[{"cell_type":"code","source":"def spawn(): pass\n"}],"metadata":{}}"#;
+        let publication = analyzed(
+            ShippedLanguage::Python,
+            vec![("notebooks/guide.ipynb", source)],
+        );
+        let document = publication
+            .documents
+            .iter()
+            .find(|document| document.kind == PackageDocumentKind::File)
+            .expect("notebook code cell document");
+
+        assert_eq!(document.language.name, "python");
+        assert_eq!(
+            document.file_content.as_deref(),
+            Some("def spawn(): pass\n")
+        );
     }
 
     /// A declaration past the retained-source bound keeps the bytes that fit, reports the

@@ -1,7 +1,8 @@
 use super::*;
 use rift_protocol::documentation::*;
 use rift_protocol::read::{
-    Digest, ProjectPath, SourceKind, SourceLocationKind, SymbolOrigin, TextRange,
+    Digest, Language, ProjectPath, SourceKind, SourceLocationKind, SymbolId, SymbolOrigin,
+    TextRange,
 };
 use rift_syntax::{
     MarkdownSyntaxProvider, PythonSyntaxProvider, RustSyntaxProvider, SyntaxProvider, SyntaxSource,
@@ -74,6 +75,262 @@ fn collect(path: &str, text: &str) -> DocumentationCollection {
         &[],
     )
     .expect("collection")
+}
+
+#[test]
+fn incremental_collection_reuses_unchanged_source_facts_and_matches_full_build() {
+    let previous_sources = DocumentationSourceSet::new(vec![
+        input("a.md", "# Alpha\n\nfirst body\n"),
+        input("b.md", "# Beta\n\nold body\n"),
+    ])
+    .expect("previous source set");
+    let previous = collect_documentation(&previous_sources, &[]).expect("previous collection");
+
+    let next_sources = DocumentationSourceSet::new(vec![
+        input("a.md", "# Alpha\n\nfirst body\n"),
+        input("b.md", "# Beta\n\nnew body\n"),
+        input("c.md", "# Gamma\n\nnew source\n"),
+    ])
+    .expect("next source set");
+    let incremental = collect_documentation_incremental(Some(&previous), &next_sources, &[])
+        .expect("incremental collection");
+    let full = collect_documentation(&next_sources, &[]).expect("full collection");
+
+    assert_eq!(incremental.index(), full.index());
+    let prior_cache = previous.extraction_cache().expect("process cache");
+    let next_cache = incremental.extraction_cache().expect("next process cache");
+    let alpha = &previous.index().sources[0].identity;
+    let beta = &previous.index().sources[1].identity;
+    assert!(std::sync::Arc::ptr_eq(
+        &prior_cache.sources[alpha].facts,
+        &next_cache.sources[alpha].facts,
+    ));
+    assert!(!std::sync::Arc::ptr_eq(
+        &prior_cache.sources[beta].facts,
+        &next_cache.sources[beta].facts,
+    ));
+}
+
+#[test]
+fn incremental_collection_relinks_cached_candidates_after_declaration_changes() {
+    let content = "Use `Compass`.\n";
+    let owner = source("lib.rs", "pub struct Compass;").identity;
+    let rust = Language::from_identity_segment("rust").expect("Rust language");
+    let python = Language::from_identity_segment("python").expect("Python language");
+    let rust_symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
+    let python_symbol = SymbolId(rift_core::symbol_identity("python", "lib.rs", "Compass"));
+    let rust_declaration = DocumentationDeclaration::new(
+        &rust_symbol,
+        &rust,
+        "Compass",
+        "Compass",
+        &owner,
+        TextRange { start: 0, end: 19 },
+    )
+    .expect("Rust declaration");
+    let python_declaration = DocumentationDeclaration::new(
+        &python_symbol,
+        &python,
+        "Compass",
+        "Compass",
+        &owner,
+        TextRange { start: 0, end: 19 },
+    )
+    .expect("Python declaration");
+    let previous_sources =
+        DocumentationSourceSet::new(vec![input("guide.md", content)]).expect("source set");
+    let previous =
+        collect_documentation(&previous_sources, std::slice::from_ref(&rust_declaration))
+            .expect("previous collection");
+    let next = collect_documentation_incremental(
+        Some(&previous),
+        &previous_sources,
+        &[rust_declaration, python_declaration],
+    )
+    .expect("updated declaration resolution");
+    let full = collect_documentation(
+        &previous_sources,
+        &[
+            DocumentationDeclaration::new(
+                &rust_symbol,
+                &rust,
+                "Compass",
+                "Compass",
+                &owner,
+                TextRange { start: 0, end: 19 },
+            )
+            .expect("Rust declaration"),
+            DocumentationDeclaration::new(
+                &python_symbol,
+                &python,
+                "Compass",
+                "Compass",
+                &owner,
+                TextRange { start: 0, end: 19 },
+            )
+            .expect("Python declaration"),
+        ],
+    )
+    .expect("full collection");
+
+    assert_eq!(next.index(), full.index());
+    assert!(next.index().references.is_empty());
+    assert_eq!(next.index().unresolved_references.len(), 1);
+    assert_eq!(
+        next.index().unresolved_references[0].reason,
+        DocumentationUnresolvedReason::Ambiguous
+    );
+}
+
+#[test]
+fn incremental_collection_invalidates_source_revision_and_selection_changes() {
+    let text = "# Guide\n\nOne paragraph.\n";
+    let original = package_input(
+        text,
+        DocumentationSelectionReason::PackageArchive,
+        content_digest(b"archive revision"),
+    );
+    let previous_sources = DocumentationSourceSet::new(vec![original]).expect("source set");
+    let previous = collect_documentation(&previous_sources, &[]).expect("previous collection");
+
+    let changed = package_input(
+        text,
+        DocumentationSelectionReason::CloudResolver,
+        content_digest(b"new source revision"),
+    );
+    let next_sources = DocumentationSourceSet::new(vec![changed]).expect("changed source set");
+    let incremental = collect_documentation_incremental(Some(&previous), &next_sources, &[])
+        .expect("incremental collection");
+    let full = collect_documentation(&next_sources, &[]).expect("full collection");
+
+    assert_eq!(incremental.index(), full.index());
+    let previous_cache = previous.extraction_cache().expect("previous cache");
+    let next_cache = incremental.extraction_cache().expect("next cache");
+    let identity = &previous.index().sources[0].identity;
+    assert!(!std::sync::Arc::ptr_eq(
+        &previous_cache.sources[identity].facts,
+        &next_cache.sources[identity].facts,
+    ));
+}
+
+#[test]
+fn incremental_collection_adds_removes_and_renames_sources_exactly() {
+    let previous_sources = DocumentationSourceSet::new(vec![
+        input("a.md", "# Alpha\n\nKeep this source.\n"),
+        input("removed.md", "# Removed\n\nDrop this source.\n"),
+    ])
+    .expect("previous source set");
+    let previous = collect_documentation(&previous_sources, &[]).expect("previous collection");
+    let next_sources = DocumentationSourceSet::new(vec![
+        input("a.md", "# Alpha\n\nKeep this source.\n"),
+        input("renamed.md", "# Renamed\n\nSame bytes, new owner.\n"),
+    ])
+    .expect("next source set");
+
+    let incremental = collect_documentation_incremental(Some(&previous), &next_sources, &[])
+        .expect("incremental collection");
+    let full = collect_documentation(&next_sources, &[]).expect("full collection");
+
+    assert_eq!(incremental.index(), full.index());
+    assert_eq!(incremental.index().sources.len(), 2);
+    assert!(incremental.index().sources.iter().all(|source| !matches!(
+        &source.identity.source,
+        DocumentationSourceIdentity::Project { path } if path.0 == "removed.md"
+    )));
+}
+
+#[test]
+fn incremental_attached_comments_invalidate_when_syntax_facts_appear_or_disappear() {
+    let text = "/// Compass documentation.\npub struct Compass;\n";
+    let path = rift_core::ProjectPath::new("lib.rs").expect("source path");
+    let syntax = RustSyntaxProvider::default()
+        .analyze(SyntaxSource { path: &path, text })
+        .expect("Rust syntax");
+    let syntax_symbol = syntax
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "Compass")
+        .expect("Compass symbol");
+    let language = syntax.language().clone();
+    let symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
+    let owner = source("lib.rs", text).identity;
+    let declaration = DocumentationDeclaration::new(
+        &symbol,
+        &language,
+        &syntax_symbol.name,
+        &syntax_symbol.qualified_name,
+        &owner,
+        TextRange {
+            start: syntax_symbol.range.start,
+            end: syntax_symbol.range.end,
+        },
+    )
+    .expect("attached declaration");
+    let absent_sources =
+        DocumentationSourceSet::new(vec![input("lib.rs", text)]).expect("source without syntax");
+    let absent = collect_documentation(&absent_sources, std::slice::from_ref(&declaration))
+        .expect("collection without syntax");
+    let present_input = input("lib.rs", text)
+        .with_syntax(&syntax)
+        .expect("matching syntax");
+    let present_sources =
+        DocumentationSourceSet::new(vec![present_input]).expect("source with syntax");
+
+    let appeared = collect_documentation_incremental(
+        Some(&absent),
+        &present_sources,
+        std::slice::from_ref(&declaration),
+    )
+    .expect("syntax appearance");
+    let full_present = collect_documentation(&present_sources, std::slice::from_ref(&declaration))
+        .expect("full source with syntax");
+    assert_eq!(appeared.index(), full_present.index());
+    assert!(!appeared.index().blocks.is_empty());
+
+    let disappeared =
+        collect_documentation_incremental(Some(&appeared), &absent_sources, &[declaration])
+            .expect("syntax removal");
+    assert_eq!(disappeared.index(), absent.index());
+    assert!(disappeared.index().blocks.is_empty());
+}
+
+fn package_input(
+    text: &str,
+    selection: DocumentationSelectionReason,
+    revision: DocumentationDigest,
+) -> DocumentationInput<'_> {
+    let mut record = source("README.md", text);
+    record.identity.source = DocumentationSourceIdentity::Package {
+        unit: rift_protocol::read::SourceUnitId(
+            "rift://source/cargo/beacon@1.0.0/README.md".to_owned(),
+        ),
+    };
+    record.origin = SymbolOrigin {
+        location: Some(SourceLocationKind::Dependency),
+        package: Some(rift_protocol::read::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "beacon".to_owned(),
+            version: "1.0.0".to_owned(),
+        }),
+        source_kind: SourceKind::Authored,
+    };
+    record.selection = selection;
+    record.revision = revision;
+    let chunks = crate::text_chunks(text, 16)
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| DocumentationChunk {
+            identity: format!("README.md#{index}"),
+            range: TextRange {
+                start: chunk.byte_offset(),
+                end: chunk.byte_offset() + chunk.content().len() as u64,
+            },
+        })
+        .collect();
+    DocumentationInput::new(record, text)
+        .expect("package source facts")
+        .with_chunks(chunks)
+        .expect("package source chunks")
 }
 
 fn compass_collection(text: &str) -> (DocumentationCollection, rift_protocol::read::SymbolId) {

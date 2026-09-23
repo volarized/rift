@@ -589,6 +589,15 @@ mod tests {
     }
 
     #[test]
+    fn cells_without_string_type_are_skipped() {
+        let source = r#"{"cells":[{"source":"missing type"},{"cell_type":7,"source":"wrong type"}],"metadata":{}}"#;
+        let content = decode_notebook(source, &notebook_identity()).expect("notebook");
+
+        assert!(content.cells().is_empty());
+        assert_eq!(content.coverage().selected, 0);
+    }
+
+    #[test]
     fn unique_valid_authored_id_and_string_source_are_preserved() {
         let source = r#"{"cells":[{"cell_type":"markdown","id":"valid_ID-2","source":"exact\ntext"}],"metadata":{}}"#;
         let content = decode_notebook(source, &notebook_identity()).expect("notebook");

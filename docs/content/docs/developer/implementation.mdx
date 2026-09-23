@@ -162,6 +162,14 @@ the lexical rows. Blocks retain byte ranges and digests; excerpts come from the 
 after pagination. The same transaction writes documentation metadata, lexical units, and their
 tree revision.
 
+The collector keeps parser facts for each selected source in memory. Incremental rebuilds reuse
+facts when source metadata, chunk mappings, extractor revision, and accepted attached symbols match.
+Link and declaration changes invalidate affected blocks; unchanged notebook bytes reuse decoded
+cells. A restart rebuilds parser facts from source.
+
+SQLite keeps one validated documentation snapshot and changes only reverse-reference rows whose
+stored values differ. Those changes share the lexical writer's transaction.
+
 One transaction writes the units and the stamp together, so the store is never a partial mix of
 two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
 named the files it read deletes those paths' rows and inserts their new ones, which costs one

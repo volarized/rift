@@ -1278,6 +1278,7 @@ impl WorkspaceIndex {
             &text_files,
             &declarations,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            None,
         )?;
         Ok(Self {
             root,
@@ -1338,6 +1339,7 @@ impl WorkspaceIndex {
             &text_files,
             &declarations,
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
+            Some((&self.documentation, &self.notebooks)),
         )?;
         Ok(Self {
             root: self.root.clone(),
@@ -1421,6 +1423,7 @@ impl WorkspaceIndex {
             &text_files,
             &declarations,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            None,
         )?;
         Ok(Self {
             root,

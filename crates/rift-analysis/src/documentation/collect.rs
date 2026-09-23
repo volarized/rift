@@ -2,16 +2,18 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use rift_core::line::{line_of, line_starts, lines_inclusive};
 use rift_protocol::documentation::{
     DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_WARNINGS_MAX,
     DocumentationBlock, DocumentationBlockKind, DocumentationCoverage, DocumentationDigest,
     DocumentationHeading, DocumentationIndex, DocumentationLink, DocumentationLinkResolution,
-    DocumentationReferenceCandidate, DocumentationSourceFormat, DocumentationStage,
-    DocumentationUnresolvedReason, DocumentationWarning, DocumentationWarningKind,
-    NotebookCellKind,
+    DocumentationReference, DocumentationReferenceCandidate, DocumentationSourceFormat,
+    DocumentationStage, DocumentationUnresolvedReason, DocumentationWarning,
+    DocumentationWarningKind, NotebookCellKind,
 };
+use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::TextRange;
 use rift_syntax::{
     ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxDocument, SyntaxProvider,
@@ -23,7 +25,6 @@ use super::identity::{canonical_digest, content_digest};
 use super::input::{slice, source_path};
 use super::{
     DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
-    resolve_references,
 };
 
 /// Collects metadata without acquiring bytes or retaining another text copy.
@@ -39,52 +40,102 @@ pub fn collect_documentation(
     sources: &DocumentationSourceSet<'_>,
     declarations: &[DocumentationDeclaration<'_>],
 ) -> Result<DocumentationCollection, DocumentationError> {
-    let mut output = Collected::default();
-    for input in sources.sources() {
-        let checkpoint = output.checkpoint();
-        if let Err(error) = extract_source(input, declarations, &mut output) {
-            let Some(kind) = recoverable_source_error(input, &error) else {
-                return Err(error);
-            };
-            output.rollback(checkpoint);
-            output.omitted = output.omitted.saturating_add(1);
-            warn(input, &mut output, kind, 1);
-        }
+    collect_documentation_incremental(None, sources, declarations)
+}
+
+/// Collects metadata while reusing parser facts from one prior process-local build.
+///
+/// Resolution updates blocks whose input or recorded dependency changed.
+/// Cached parser facts remain bounded by the source and collection limits.
+///
+/// # Errors
+///
+/// Refuses malformed source facts, invalid parser ranges, or output exceeding a bound.
+pub fn collect_documentation_incremental(
+    previous: Option<&DocumentationCollection>,
+    sources: &DocumentationSourceSet<'_>,
+    declarations: &[DocumentationDeclaration<'_>],
+) -> Result<DocumentationCollection, DocumentationError> {
+    if declarations.len() > PACKAGE_SYMBOLS_MAX as usize {
+        return Err(refused(DocumentationViolation::LimitExceeded, "references"));
     }
+    let attached = attached_declaration_facts(declarations);
+    let (mut output, cache) = collect_source_facts(previous, sources, declarations, &attached)?;
     let records = sources
         .sources()
         .iter()
         .map(|input| input.source().clone())
         .collect::<Vec<_>>();
-    super::resolve_links(
-        &records,
-        &output.blocks,
-        &mut output.links,
-        &output.fragments,
-    )?;
-    output.links.append(&mut output.unresolved_links);
-    let (mut references, unresolved_references) =
-        resolve_references(declarations, &output.candidates)?.into_parts();
-    references.extend(super::links::resolve_declaration_links(
-        &records,
-        &output.blocks,
-        &mut output.links,
+    let resolution_cache = resolve_collected(previous, declarations, &records, &mut output)?;
+    build_collection(sources, output, cache, resolution_cache)
+}
+
+fn collect_source_facts(
+    previous: Option<&DocumentationCollection>,
+    sources: &DocumentationSourceSet<'_>,
+    declarations: &[DocumentationDeclaration<'_>],
+    attached: &BTreeMap<
+        rift_protocol::documentation::DocumentationContentIdentity,
+        Vec<(
+            rift_protocol::read::SymbolId,
+            rift_protocol::read::TextRange,
+        )>,
+    >,
+) -> Result<(Collected, ExtractionCache), DocumentationError> {
+    let mut output = Collected::default();
+    let mut cache = ExtractionCache::default();
+    for input in sources.sources() {
+        let key = extraction_key(
+            input,
+            attached.get(&input.source().identity).map(Vec::as_slice),
+        )?;
+        let facts = previous
+            .and_then(DocumentationCollection::extraction_cache)
+            .and_then(|previous| previous.sources.get(&input.source().identity))
+            .filter(|cached| cached.key == key)
+            .map_or_else(
+                || extract_source_facts(input, declarations),
+                |cached| Ok(Arc::clone(&cached.facts)),
+            )?;
+        if merge_source(input, &mut output, &facts)
+            && cache
+                .warning_count
+                .checked_add(facts.warnings.len())
+                .is_some_and(|count| count <= DOCUMENTATION_WARNINGS_MAX as usize)
+        {
+            cache.warning_count += facts.warnings.len();
+            cache
+                .sources
+                .insert(input.source().identity.clone(), CachedSource { key, facts });
+        }
+    }
+    Ok((output, cache))
+}
+
+fn resolve_collected(
+    previous: Option<&DocumentationCollection>,
+    declarations: &[DocumentationDeclaration<'_>],
+    records: &[rift_protocol::documentation::DocumentationSource],
+    output: &mut Collected,
+) -> Result<Option<super::resolution::ResolutionCache>, DocumentationError> {
+    let input = super::resolution::ResolutionInput {
+        sources: records,
+        blocks: &output.blocks,
+        resolvable_links: &output.links,
+        fixed_unresolved_links: &output.unresolved_links,
+        fragments: &output.fragments,
+        candidates: &output.candidates,
         declarations,
-    )?);
-    references.sort_by(|left, right| {
-        (
-            &left.evidence,
-            &left.block,
-            left.range.start,
-            &left.identity,
-        )
-            .cmp(&(
-                &right.evidence,
-                &right.block,
-                right.range.start,
-                &right.identity,
-            ))
-    });
+    };
+    let resolved = super::resolution::ResolutionCache::resolve(
+        previous.and_then(DocumentationCollection::resolution_cache),
+        &input,
+    )?;
+    let mut links = resolved.resolvable_links;
+    links.extend(resolved.fixed_unresolved_links);
+    let references = resolved.references;
+    let unresolved_references = resolved.unresolved_references;
+    let resolution_cache = resolved.next_cache;
     output.blocks.sort_by(|a, b| {
         (&a.source, a.range.start, a.kind, &a.identity).cmp(&(
             &b.source,
@@ -93,16 +144,36 @@ pub fn collect_documentation(
             &b.identity,
         ))
     });
+    output.links = links;
+    output.references = references;
+    output.unresolved_references = unresolved_references;
+    output.unresolved_links.clear();
+    output.fragments.clear();
+    output.candidates.clear();
+    Ok(resolution_cache)
+}
+
+fn build_collection(
+    sources: &DocumentationSourceSet<'_>,
+    output: Collected,
+    cache: ExtractionCache,
+    resolution_cache: Option<super::resolution::ResolutionCache>,
+) -> Result<DocumentationCollection, DocumentationError> {
     let selected = u32::try_from(sources.sources().len())
         .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+    let records = sources
+        .sources()
+        .iter()
+        .map(|input| input.source().clone())
+        .collect::<Vec<_>>();
     DocumentationCollection::new(DocumentationIndex {
         documentation_revision: super::documentation_revision(),
         selection_digest: sources.selection_digest().clone(),
         sources: records,
         blocks: output.blocks,
         links: output.links,
-        references,
-        unresolved_references,
+        references: output.references,
+        unresolved_references: output.unresolved_references,
         coverage: DocumentationCoverage {
             selected,
             parsed: selected - output.omitted,
@@ -111,52 +182,180 @@ pub fn collect_documentation(
         },
         warnings: output.warnings,
     })
+    .map(|collection| {
+        collection
+            .with_extraction_cache(cache)
+            .with_resolution_cache(resolution_cache)
+    })
 }
 
-#[derive(Default)]
-struct Collected {
+#[derive(Clone, Debug, Default)]
+pub(super) struct Collected {
     blocks: Vec<DocumentationBlock>,
     links: Vec<DocumentationLink>,
     unresolved_links: Vec<DocumentationLink>,
+    references: Vec<DocumentationReference>,
+    unresolved_references: Vec<DocumentationReferenceCandidate>,
     fragments: Vec<super::DocumentationFragment>,
     candidates: Vec<DocumentationReferenceCandidate>,
     warnings: Vec<DocumentationWarning>,
     omitted: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Checkpoint {
-    blocks: usize,
-    links: usize,
-    unresolved_links: usize,
-    fragments: usize,
-    candidates: usize,
-    warnings: usize,
-    omitted: u32,
+#[derive(Debug, Default)]
+pub(super) struct ExtractionCache {
+    pub(super) sources:
+        BTreeMap<rift_protocol::documentation::DocumentationContentIdentity, CachedSource>,
+    warning_count: usize,
 }
 
-impl Collected {
-    fn checkpoint(&self) -> Checkpoint {
-        Checkpoint {
-            blocks: self.blocks.len(),
-            links: self.links.len(),
-            unresolved_links: self.unresolved_links.len(),
-            fragments: self.fragments.len(),
-            candidates: self.candidates.len(),
-            warnings: self.warnings.len(),
-            omitted: self.omitted,
-        }
-    }
+#[derive(Debug)]
+pub(super) struct CachedSource {
+    pub(super) key: DocumentationDigest,
+    pub(super) facts: Arc<Collected>,
+}
 
-    fn rollback(&mut self, checkpoint: Checkpoint) {
-        self.blocks.truncate(checkpoint.blocks);
-        self.links.truncate(checkpoint.links);
-        self.unresolved_links.truncate(checkpoint.unresolved_links);
-        self.fragments.truncate(checkpoint.fragments);
-        self.candidates.truncate(checkpoint.candidates);
-        self.warnings.truncate(checkpoint.warnings);
-        self.omitted = checkpoint.omitted;
+type AttachedSyntaxFacts = Option<(
+    String,
+    Vec<(rift_protocol::read::SymbolId, Vec<(u64, u64)>)>,
+)>;
+
+fn extraction_key(
+    input: &DocumentationInput<'_>,
+    attached: Option<
+        &[(
+            rift_protocol::read::SymbolId,
+            rift_protocol::read::TextRange,
+        )],
+    >,
+) -> Result<DocumentationDigest, DocumentationError> {
+    let attached = attached.unwrap_or_default();
+    let syntax_facts = attached_syntax_facts(input, attached)?;
+    canonical_digest(&(
+        input.source(),
+        input.chunks(),
+        super::documentation_revision(),
+        attached,
+        syntax_facts,
+    ))
+}
+
+fn attached_syntax_facts(
+    input: &DocumentationInput<'_>,
+    attached: &[(
+        rift_protocol::read::SymbolId,
+        rift_protocol::read::TextRange,
+    )],
+) -> Result<AttachedSyntaxFacts, DocumentationError> {
+    let Some(syntax) = input.syntax() else {
+        return Ok(None);
+    };
+    let accepted: std::collections::BTreeSet<_> =
+        attached.iter().map(|(symbol, _)| symbol.clone()).collect();
+    let path = rift_core::ProjectPath::new(super::references::declaration_path(
+        &input.source().identity,
+    )?)
+    .map_err(|_| refused(DocumentationViolation::Identity, "source"))?;
+    let facts = syntax
+        .symbols()
+        .iter()
+        .filter_map(|symbol| {
+            let identity = rift_core::symbol_identity(
+                &syntax.language().identity_segment(),
+                path.as_str(),
+                &symbol.qualified_name,
+            );
+            let identity = rift_protocol::read::SymbolId(identity);
+            if !accepted.contains(&identity) {
+                return None;
+            }
+            Some((
+                identity,
+                symbol
+                    .documentation_ranges
+                    .iter()
+                    .map(|range| (range.start, range.end))
+                    .collect(),
+            ))
+        })
+        .collect();
+    Ok(Some((syntax.language().identity_segment(), facts)))
+}
+
+fn attached_declaration_facts(
+    declarations: &[DocumentationDeclaration<'_>],
+) -> BTreeMap<
+    rift_protocol::documentation::DocumentationContentIdentity,
+    Vec<(
+        rift_protocol::read::SymbolId,
+        rift_protocol::read::TextRange,
+    )>,
+> {
+    let mut attached = BTreeMap::new();
+    for declaration in declarations {
+        attached
+            .entry(declaration.source().clone())
+            .or_insert_with(Vec::new)
+            .push((declaration.symbol().clone(), declaration.range().clone()));
     }
+    for facts in attached.values_mut() {
+        facts.sort_by(|left, right| {
+            (&left.0, left.1.start, left.1.end).cmp(&(&right.0, right.1.start, right.1.end))
+        });
+    }
+    attached
+}
+
+fn extract_source_facts(
+    input: &DocumentationInput<'_>,
+    declarations: &[DocumentationDeclaration<'_>],
+) -> Result<Arc<Collected>, DocumentationError> {
+    let mut facts = Collected::default();
+    if let Err(error) = extract_source(input, declarations, &mut facts) {
+        let Some(kind) = recoverable_source_error(input, &error) else {
+            return Err(error);
+        };
+        facts = Collected::default();
+        facts.omitted = 1;
+        warn(input, &mut facts, kind, 1);
+    }
+    Ok(Arc::new(facts))
+}
+
+fn merge_source(input: &DocumentationInput<'_>, output: &mut Collected, facts: &Collected) -> bool {
+    let fits = output.blocks.len().saturating_add(facts.blocks.len())
+        <= DOCUMENTATION_BLOCKS_MAX as usize
+        && output
+            .links
+            .len()
+            .saturating_add(output.unresolved_links.len())
+            .saturating_add(facts.links.len())
+            .saturating_add(facts.unresolved_links.len())
+            <= DOCUMENTATION_REFERENCES_MAX as usize
+        && output.fragments.len().saturating_add(facts.fragments.len())
+            <= DOCUMENTATION_REFERENCES_MAX as usize
+        && output
+            .candidates
+            .len()
+            .saturating_add(facts.candidates.len())
+            <= DOCUMENTATION_REFERENCES_MAX as usize;
+    if !fits {
+        output.omitted = output.omitted.saturating_add(1);
+        warn(input, output, DocumentationWarningKind::LimitExceeded, 1);
+        return false;
+    }
+    output.blocks.extend(facts.blocks.iter().cloned());
+    output.links.extend(facts.links.iter().cloned());
+    output
+        .unresolved_links
+        .extend(facts.unresolved_links.iter().cloned());
+    output.fragments.extend(facts.fragments.iter().cloned());
+    output.candidates.extend(facts.candidates.iter().cloned());
+    for warning in &facts.warnings {
+        warn(input, output, warning.kind, warning.count);
+    }
+    output.omitted = output.omitted.saturating_add(facts.omitted);
+    true
 }
 
 fn recoverable_source_error(

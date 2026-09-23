@@ -1,5 +1,6 @@
 //! Documentation metadata and reverse references committed with the lexical corpus.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use rift_analysis::documentation::DocumentationCollection;
@@ -103,11 +104,31 @@ pub(crate) async fn replace(
     executor: &mut dyn Executor,
     encoded: Option<&EncodedDocumentation>,
 ) -> Result<(), LexicalIndexError> {
-    DocumentationReferenceRecord::all()
-        .delete()
-        .exec(executor)
-        .await
-        .map_err(storage_error)?;
+    match encoded {
+        Some(encoded) => {
+            let previous = DocumentationReferenceRecord::all()
+                .limit(rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX as usize + 1)
+                .exec(executor)
+                .await
+                .map_err(storage_error)?;
+            if previous.len() > rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX as usize
+            {
+                return Err(batch_limit_error(
+                    "documentation.references",
+                    previous.len() as u64,
+                    u64::from(rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX),
+                ));
+            }
+            update_references(executor, &encoded.references, &previous).await?;
+        }
+        None => {
+            DocumentationReferenceRecord::all()
+                .delete()
+                .exec(executor)
+                .await
+                .map_err(storage_error)?;
+        }
+    }
     DocumentationManifestRecord::all()
         .delete()
         .exec(executor)
@@ -123,7 +144,36 @@ pub(crate) async fn replace(
     .exec(executor)
     .await
     .map_err(storage_error)?;
-    for (identity, target, block, position) in &encoded.references {
+    Ok(())
+}
+
+async fn update_references(
+    executor: &mut dyn Executor,
+    current: &[(String, String, String, i64)],
+    previous: &[DocumentationReferenceRecord],
+) -> Result<(), LexicalIndexError> {
+    let current = current_reference_rows(current);
+    let previous = previous_reference_rows(previous);
+    for (identity, row) in &previous {
+        if current.get(identity) == Some(row) {
+            continue;
+        }
+        DocumentationReferenceRecord::filter_by_identity(identity)
+            .delete()
+            .exec(executor)
+            .await
+            .map_err(storage_error)?;
+    }
+    for (identity, (target, block, position)) in &current {
+        let unchanged =
+            previous
+                .get(identity)
+                .is_some_and(|(prior_target, prior_block, prior_position)| {
+                    prior_target == target && prior_block == block && prior_position == position
+                });
+        if unchanged {
+            continue;
+        }
         toasty::create!(DocumentationReferenceRecord {
             identity: identity.clone(),
             target: target.clone(),
@@ -135,6 +185,37 @@ pub(crate) async fn replace(
         .map_err(storage_error)?;
     }
     Ok(())
+}
+
+type ReferenceRow = (String, String, i64);
+
+fn current_reference_rows(
+    references: &[(String, String, String, i64)],
+) -> BTreeMap<String, ReferenceRow> {
+    references
+        .iter()
+        .map(|(identity, target, block, position)| {
+            (identity.clone(), (target.clone(), block.clone(), *position))
+        })
+        .collect()
+}
+
+fn previous_reference_rows(
+    previous: &[DocumentationReferenceRecord],
+) -> BTreeMap<String, ReferenceRow> {
+    previous
+        .iter()
+        .map(|reference| {
+            (
+                reference.identity.clone(),
+                (
+                    reference.target.clone(),
+                    reference.block.clone(),
+                    reference.position,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Decodes and revalidates metadata within the caller's revision-scoped transaction.
@@ -169,7 +250,9 @@ fn invalid_metadata(error: impl std::error::Error + Send + Sync + 'static) -> Le
 
 #[cfg(test)]
 mod tests {
-    use super::MetadataWriter;
+    use super::{
+        DocumentationCollection, DocumentationReferenceRecord, EncodedDocumentation, MetadataWriter,
+    };
     use std::io::Write;
 
     #[test]
@@ -328,10 +411,11 @@ mod tests {
         let path = rift_core::ProjectPath::new("README.md")?;
         let old_text = "oldquartzterm guide\n";
         let old_document = index_document(&path, old_text, "old-digest")?;
-        let old_metadata = collection(old_text);
+        let old_metadata = reference_collection("api.md", "Use `Compass`, then `Compass`.\n")?;
         store
             .replace_all_with_documentation(&[old_document], "tree-old", &old_metadata)
             .await?;
+        let old_reference_rows = read_reference_rows(&database).await?;
 
         let mut access = database.writing().await?;
         let mut transaction = access.transaction().await?;
@@ -346,11 +430,13 @@ mod tests {
 
         let new_text = "newquartzterm guide\n";
         let new_document = index_document(&path, new_text, "new-digest")?;
+        let new_metadata = reference_collection("api.md", "Use `Apex`, then `Compass`.\n")?;
         let error = store
-            .replace_all_with_documentation(&[new_document], "tree-new", &collection(new_text))
+            .replace_all_with_documentation(&[new_document], "tree-new", &new_metadata)
             .await
             .expect_err("metadata trigger refuses after lexical writes");
         assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        assert_eq!(read_reference_rows(&database).await?, old_reference_rows);
 
         let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree-old").await? else {
             panic!("the prior metadata revision remains readable");
@@ -392,6 +478,267 @@ mod tests {
         };
         assert!(new_rank.order().is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_reference_rows_are_not_written_during_metadata_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
+
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        let first = reference_collection("a.md", "Use `Compass`.\n")?;
+        let unchanged = first.index().references[0].identity.0.clone();
+        store
+            .replace_all_with_documentation(&[], "tree1", &first)
+            .await?;
+
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        let delete_trigger = format!(
+            "CREATE TRIGGER reject_unchanged_documentation_reference_delete BEFORE DELETE ON documentation_references WHEN OLD.identity = '{unchanged}' BEGIN SELECT RAISE(ABORT, 'unchanged reference touched'); END"
+        );
+        toasty::sql::statement(&delete_trigger)
+            .exec(&mut transaction)
+            .await?;
+        let update_trigger = format!(
+            "CREATE TRIGGER reject_unchanged_documentation_reference_update BEFORE UPDATE ON documentation_references WHEN OLD.identity = '{unchanged}' BEGIN SELECT RAISE(ABORT, 'unchanged reference touched'); END"
+        );
+        toasty::sql::statement(&update_trigger)
+            .exec(&mut transaction)
+            .await?;
+        transaction.commit().await?;
+        drop(access);
+
+        let updated = reference_collection("a.md", "Use `Compass`.\n\nAdditional paragraph.\n")?;
+        store
+            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &updated)
+            .await?;
+        let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
+            panic!("updated metadata publication must be available");
+        };
+        assert!(
+            loaded
+                .index()
+                .references
+                .iter()
+                .any(|reference| reference.identity.0 == unchanged)
+        );
+        assert_eq!(loaded.index().references.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_delta_adds_removes_and_shifts_exact_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{LexicalIndexLimits, LexicalSearchIndex};
+
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        let prior = reference_collection("api.md", "Use `Compass`, then `Compass`.\n")?;
+        let current = reference_collection("api.md", "Use `Apex`, then `Compass`.\n")?;
+        let prior_encoded = EncodedDocumentation::new(&prior)?;
+        let current_encoded = EncodedDocumentation::new(&current)?;
+        let mut prior_rows = prior_encoded.references.clone();
+        prior_rows.sort_by(|left, right| left.0.cmp(&right.0));
+        store
+            .replace_all_with_documentation(&[], "tree1", &prior)
+            .await?;
+        assert_eq!(read_reference_rows(&database).await?, prior_rows);
+
+        let mut current_rows = current_encoded.references.clone();
+        current_rows.sort_by(|left, right| left.0.cmp(&right.0));
+        store
+            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &current)
+            .await?;
+        assert_eq!(read_reference_rows(&database).await?, current_rows);
+
+        let prior_ids: std::collections::BTreeSet<_> = prior_encoded
+            .references
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect();
+        let current_ids: std::collections::BTreeSet<_> = current_encoded
+            .references
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect();
+        assert_eq!(prior_ids.difference(&current_ids).count(), 1);
+        assert_eq!(current_ids.difference(&prior_ids).count(), 1);
+        let prior_compass = prior_encoded
+            .references
+            .iter()
+            .find(|row| row.3 == 0)
+            .expect("first prior reference");
+        let current_compass = current_encoded
+            .references
+            .iter()
+            .find(|row| row.0 == prior_compass.0)
+            .expect("same reference after earlier insertion");
+        assert_eq!(prior_compass.1, current_compass.1);
+        assert_eq!(prior_compass.2, current_compass.2);
+        assert_eq!(prior_compass.3, 0);
+        assert_eq!(current_compass.3, 1);
+        Ok(())
+    }
+
+    async fn read_reference_rows(
+        database: &crate::WorkspaceDatabase,
+    ) -> Result<Vec<(String, String, String, i64)>, Box<dyn std::error::Error>> {
+        let mut connection = database.connection().await?;
+        let mut rows: Vec<_> = DocumentationReferenceRecord::all()
+            .limit(rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX as usize + 1)
+            .exec(&mut connection)
+            .await?
+            .into_iter()
+            .map(|row| (row.identity, row.target, row.block, row.position))
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    #[tokio::test]
+    async fn replacement_recovers_from_corrupt_prior_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
+
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        let prior = collection("old metadata");
+        store
+            .replace_all_with_documentation(&[], "tree1", &prior)
+            .await?;
+
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        toasty::sql::statement(
+            "UPDATE documentation_manifest SET payload = 'corrupt' WHERE id = 1",
+        )
+        .exec(&mut transaction)
+        .await?;
+        transaction.commit().await?;
+        drop(access);
+
+        let error = store
+            .documentation("tree1")
+            .await
+            .expect_err("read must refuse corrupt prior metadata");
+        assert_eq!(
+            error.fault().violation(),
+            crate::LexicalIndexViolation::StoredKindInvalid
+        );
+
+        let current = collection("current metadata");
+        store
+            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &current)
+            .await?;
+        let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
+            panic!("replacement must publish validated current metadata");
+        };
+        assert_eq!(loaded.index(), current.index());
+        Ok(())
+    }
+
+    fn reference_collection(
+        path: &str,
+        content: &str,
+    ) -> Result<DocumentationCollection, Box<dyn std::error::Error>> {
+        use rift_analysis::documentation::{
+            DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
+            collect_documentation, content_digest,
+        };
+        use rift_protocol::documentation::{
+            DocumentationChunk, DocumentationContentIdentity, DocumentationSelectionReason,
+            DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
+        };
+        use rift_protocol::read::{
+            Language, ProjectPath, SourceKind, SourceLocationKind, SymbolId, SymbolOrigin,
+            TextRange,
+        };
+
+        let identity = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Project {
+                path: ProjectPath("lib.rs".into()),
+            },
+            cell: None,
+        };
+        let language = Language::from_identity_segment("rust")?;
+        let symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
+        let declaration = DocumentationDeclaration::new(
+            &symbol,
+            &language,
+            "Compass",
+            "Compass",
+            &identity,
+            TextRange { start: 0, end: 19 },
+        )?;
+        let additional_symbol = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Apex"));
+        let additional_declaration = DocumentationDeclaration::new(
+            &additional_symbol,
+            &language,
+            "Apex",
+            "Apex",
+            &identity,
+            TextRange { start: 0, end: 19 },
+        )?;
+        let source = DocumentationSource {
+            identity: DocumentationContentIdentity {
+                source: DocumentationSourceIdentity::Project {
+                    path: ProjectPath(path.into()),
+                },
+                cell: None,
+            },
+            revision: content_digest(content.as_bytes()),
+            content_digest: content_digest(content.as_bytes()),
+            origin: SymbolOrigin {
+                location: Some(SourceLocationKind::Project),
+                package: None,
+                source_kind: SourceKind::Authored,
+            },
+            format: DocumentationSourceFormat::Markdown,
+            media_type: "text/markdown".into(),
+            selection: DocumentationSelectionReason::Workspace,
+            byte_length: content.len() as u64,
+            language: None,
+            physical_ranges: Vec::new(),
+            license: None,
+        };
+        let input =
+            DocumentationInput::new(source, content)?.with_chunks(vec![DocumentationChunk {
+                identity: path.into(),
+                range: TextRange {
+                    start: 0,
+                    end: content.len() as u64,
+                },
+            }])?;
+        Ok(collect_documentation(
+            &DocumentationSourceSet::new(vec![input])?,
+            &[declaration, additional_declaration],
+        )?)
     }
 
     fn index_document(

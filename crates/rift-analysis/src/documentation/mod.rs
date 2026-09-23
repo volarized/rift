@@ -5,6 +5,8 @@ mod collect;
 #[cfg(all(test, feature = "collector"))]
 mod collect_tests;
 mod context;
+#[cfg(all(test, feature = "collector"))]
+mod coverage_tests;
 mod failure;
 mod identity;
 mod input;
@@ -14,6 +16,8 @@ pub mod notebook;
 pub mod projection;
 mod publication;
 mod references;
+#[cfg(feature = "collector")]
+mod resolution;
 #[cfg(feature = "collector")]
 mod rst;
 
@@ -32,6 +36,6 @@ pub use references::{
 
 pub use crate::analyzer_revision as documentation_revision;
 #[cfg(feature = "collector")]
-pub use collect::collect_documentation;
+pub use collect::{collect_documentation, collect_documentation_incremental};
 pub use context::{documentation_context, documentation_context_with_budget};
 pub use identity::{content_chunk_identity, content_digest, content_owner_identity};

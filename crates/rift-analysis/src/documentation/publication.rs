@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(feature = "collector")]
+use rift_protocol::documentation::DocumentationStage;
 use rift_protocol::documentation::{
     DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_HEADING_DEPTH_MAX, DOCUMENTATION_REFERENCES_MAX,
     DOCUMENTATION_SOURCES_MAX, DOCUMENTATION_TEXT_BYTES_MAX, DOCUMENTATION_TOTAL_BYTES_MAX,
@@ -111,6 +113,10 @@ pub struct DocumentationCollection {
     references: BTreeMap<SymbolId, Vec<usize>>,
     blocks: BTreeMap<DocumentationDigest, usize>,
     sources: BTreeMap<DocumentationContentIdentity, usize>,
+    #[cfg(feature = "collector")]
+    extraction_cache: Option<super::collect::ExtractionCache>,
+    #[cfg(feature = "collector")]
+    resolution_cache: Option<super::resolution::ResolutionCache>,
 }
 
 impl DocumentationCollection {
@@ -221,7 +227,89 @@ impl DocumentationCollection {
             references,
             blocks,
             sources,
+            #[cfg(feature = "collector")]
+            extraction_cache: None,
+            #[cfg(feature = "collector")]
+            resolution_cache: None,
         })
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) fn with_extraction_cache(mut self, cache: super::collect::ExtractionCache) -> Self {
+        self.extraction_cache = Some(cache);
+        self
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) fn extraction_cache(&self) -> Option<&super::collect::ExtractionCache> {
+        self.extraction_cache.as_ref()
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) fn resolution_cache(&self) -> Option<&super::resolution::ResolutionCache> {
+        self.resolution_cache.as_ref()
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) fn with_resolution_cache(
+        mut self,
+        cache: Option<super::resolution::ResolutionCache>,
+    ) -> Self {
+        self.resolution_cache = cache;
+        self
+    }
+
+    #[cfg(feature = "collector")]
+    /// Appends source warnings and omissions, then validates complete publication.
+    ///
+    /// # Errors
+    ///
+    /// Refuses omission counts outside the documentation source bound or invalid metadata.
+    pub fn with_source_omissions(
+        self,
+        omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
+    ) -> Result<Self, DocumentationError> {
+        if omissions.len() > DOCUMENTATION_SOURCES_MAX as usize {
+            return Err(refused(DocumentationViolation::LimitExceeded, "sources"));
+        }
+        let omitted_count = u32::try_from(omissions.len())
+            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+        let DocumentationCollection {
+            mut index,
+            #[cfg(feature = "collector")]
+            extraction_cache,
+            #[cfg(feature = "collector")]
+            resolution_cache,
+            ..
+        } = self;
+        index.coverage.selected = index
+            .coverage
+            .selected
+            .checked_add(omitted_count)
+            .filter(|count| *count <= DOCUMENTATION_SOURCES_MAX)
+            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+        index.coverage.omitted = index
+            .coverage
+            .omitted
+            .checked_add(omitted_count)
+            .ok_or_else(|| refused(DocumentationViolation::LimitExceeded, "sources"))?;
+        let warning_slots =
+            (DOCUMENTATION_WARNINGS_MAX as usize).saturating_sub(index.warnings.len());
+        for (source, kind) in omissions.into_iter().take(warning_slots) {
+            index.warnings.push(DocumentationWarning {
+                source,
+                stage: DocumentationStage::Source,
+                kind,
+                count: 1,
+            });
+        }
+        let mut collection = Self::new(index)?;
+        #[cfg(feature = "collector")]
+        {
+            collection.extraction_cache = extraction_cache;
+            collection.resolution_cache = resolution_cache;
+        }
+        Ok(collection)
     }
 
     /// Returns the complete metadata publication.

@@ -820,6 +820,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_python_archive_prefers_stubs_and_keeps_documentation() {
+        let members = [
+            ("six.py", b"def public(): ...\n".as_slice()),
+            ("six.pyi", b"def public() -> None: ...\n".as_slice()),
+            ("README.md", b"# six\n".as_slice()),
+        ];
+        let archive_bytes = cargo_archive(&members);
+        let archive_digest: [u8; 32] = Sha256::digest(&archive_bytes).into();
+        let archive_directory = tempfile::tempdir().expect("archive directory");
+        let archive_path = archive_directory.path().join("beacon-1.0.0.crate");
+        std::fs::write(&archive_path, archive_bytes).expect("archive bytes");
+        let package = identity("cargo", "beacon", "1.0.0");
+        let entry =
+            CatalogEntry::dependency(package, language(ShippedLanguage::Python), None, true)
+                .with_source_archive(archive_path, archive_digest);
+
+        let files = package_files(&entry, &DependencyIndexLimits::default())
+            .expect("cached archive selects Python stub and docs");
+
+        assert_eq!(sorted_paths(&files), ["README.md", "six.pyi"]);
+    }
+
+    #[test]
     fn test_package_files_python_takes_modules_when_no_stub_exists() {
         let root = tempfile::tempdir().expect("package root");
         write(root.path(), "pkg/__init__.py", b"");

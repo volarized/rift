@@ -204,7 +204,7 @@ pub fn resolve_references(
     })
 }
 
-fn validate_candidate(
+pub(super) fn validate_candidate(
     candidate: &DocumentationReferenceCandidate,
 ) -> Result<(), DocumentationError> {
     let spelling_accepted = !candidate.authored.is_empty()
@@ -225,13 +225,13 @@ enum NameMatch<'declaration> {
 type LanguageKey<'declaration> = (&'declaration str, Option<&'declaration str>);
 type NameKey<'declaration> = (&'declaration str, Option<LanguageKey<'declaration>>);
 
-struct DeclarationNames<'declaration> {
+pub(super) struct DeclarationNames<'declaration> {
     qualified: BTreeMap<NameKey<'declaration>, NameMatch<'declaration>>,
     bare: BTreeMap<NameKey<'declaration>, NameMatch<'declaration>>,
 }
 
 impl<'declaration> DeclarationNames<'declaration> {
-    fn new(declarations: &'declaration [DocumentationDeclaration<'_>]) -> Self {
+    pub(super) fn new(declarations: &'declaration [DocumentationDeclaration<'_>]) -> Self {
         let mut index = Self {
             qualified: BTreeMap::new(),
             bare: BTreeMap::new(),
@@ -262,17 +262,25 @@ impl<'declaration> DeclarationNames<'declaration> {
         }
     }
 
-    fn resolve(
+    pub(super) fn resolve(
         &self,
         candidate: &DocumentationReferenceCandidate,
     ) -> Result<
         (&'declaration SymbolId, DocumentationReferenceEvidence),
         DocumentationUnresolvedReason,
     > {
-        let key = (
-            candidate.authored.as_str(),
-            candidate.language.as_ref().map(language_key),
-        );
+        self.resolve_name(&candidate.authored, candidate.language.as_ref())
+    }
+
+    pub(super) fn resolve_name(
+        &self,
+        authored: &str,
+        language: Option<&Language>,
+    ) -> Result<
+        (&'declaration SymbolId, DocumentationReferenceEvidence),
+        DocumentationUnresolvedReason,
+    > {
+        let key = (authored, language.map(language_key));
         if let Some(found) = self.qualified.get(&key) {
             return exact_match(*found, DocumentationReferenceEvidence::QualifiedName);
         }

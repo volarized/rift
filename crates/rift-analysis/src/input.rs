@@ -418,4 +418,33 @@ mod tests {
         );
         assert_eq!(error.fault().path(), Some("src/lib.rs"));
     }
+
+    #[test]
+    fn non_authored_package_origin_is_rejected() {
+        let package = identity();
+        let language = language();
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Dependency {
+                package: package.clone(),
+            }),
+            SourceKind::Generated,
+        )
+        .expect("generated dependency origin");
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let sources = [PackageSource::new(&path, "fn open() {}")];
+
+        let error = ExactPackageInput::new(
+            &package,
+            &language,
+            &origin,
+            &sources,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect_err("package input requires authored dependency origin");
+
+        assert_eq!(
+            error.fault().violation(),
+            PackageInputViolation::InvalidOrigin
+        );
+    }
 }

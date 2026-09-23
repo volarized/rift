@@ -37,6 +37,29 @@ fn read(bytes: &[u8], limits: ArchiveLimits) -> Result<ArchiveFiles, ArchiveErro
 }
 
 #[test]
+fn archive_error_messages_are_generic() {
+    let errors = [
+        ArchiveError::InvalidLimits,
+        ArchiveError::CompressedLimit,
+        ArchiveError::DigestMismatch,
+        ArchiveError::InvalidArchive,
+        ArchiveError::ExpandedLimit,
+        ArchiveError::MemberLimit,
+        ArchiveError::WorkLimit,
+        ArchiveError::UnsafePath,
+        ArchiveError::DuplicatePath,
+        ArchiveError::UnsupportedEntry,
+        ArchiveError::RootMismatch,
+    ];
+
+    for error in errors {
+        let message = error.to_string();
+        assert!(!message.is_empty());
+        assert!(!message.contains("release/"), "{message}");
+    }
+}
+
+#[test]
 fn verified_tar_and_zip_produce_identical_files() -> TestResult {
     let tar = tar_bytes(&[
         ("release/", b"", tar::EntryType::Directory),
@@ -152,6 +175,42 @@ fn links_and_special_files_are_refused() -> TestResult {
             ArchiveError::UnsupportedEntry
         );
     }
+    Ok(())
+}
+
+#[test]
+fn sparse_pax_metadata_and_invalid_release_roots_are_refused() -> TestResult {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder.append_pax_extensions([("GNU.sparse.map", b"0,4".as_slice())])?;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder.append_data(&mut header, "release/a", b"text".as_slice())?;
+    let tar = builder.into_inner()?;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar)?;
+    let sparse = gzip.finish()?;
+
+    assert_eq!(
+        read(&sparse, ArchiveLimits::default()).expect_err("sparse PAX metadata is refused"),
+        ArchiveError::UnsupportedEntry
+    );
+
+    let regular = tar_bytes(&[("release/a", b"text", tar::EntryType::Regular)])?;
+    let digest = ArchiveDigest::Sha256(Sha256::digest(&regular).into());
+    assert_eq!(
+        read_archive(
+            &regular,
+            ArchiveFormat::TarGzip,
+            &digest,
+            Some("../release"),
+            ArchiveLimits::default(),
+        )
+        .expect_err("release root must be one safe path component"),
+        ArchiveError::UnsafePath
+    );
     Ok(())
 }
 

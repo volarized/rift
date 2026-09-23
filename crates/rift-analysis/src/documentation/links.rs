@@ -71,7 +71,87 @@ pub fn resolve_links(
     Ok(())
 }
 
-type Fragments<'a> = BTreeMap<(&'a DocumentationContentIdentity, &'a str), Option<&'a TextRange>>;
+pub(super) type Fragments<'a> =
+    BTreeMap<(&'a DocumentationContentIdentity, &'a str), Option<&'a TextRange>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "collector")]
+pub(super) enum DeclarationLinkMatch {
+    Symbol(rift_protocol::read::SymbolId),
+    Ambiguous,
+    Missing,
+}
+
+#[cfg(feature = "collector")]
+pub(super) struct DeclarationLinkNames<'declaration> {
+    symbols: BTreeMap<&'declaration str, &'declaration rift_protocol::read::SymbolId>,
+    qualified: BTreeMap<
+        (&'declaration DocumentationContentIdentity, String),
+        Option<&'declaration rift_protocol::read::SymbolId>,
+    >,
+}
+
+#[cfg(feature = "collector")]
+impl<'declaration> DeclarationLinkNames<'declaration> {
+    pub(super) fn new(
+        declarations: &'declaration [super::DocumentationDeclaration<'_>],
+    ) -> Result<Self, DocumentationError> {
+        let symbols = declarations
+            .iter()
+            .map(|declaration| (declaration.symbol().0.as_str(), declaration.symbol()))
+            .collect();
+        let mut qualified = BTreeMap::new();
+        for declaration in declarations {
+            let parsed = rift_core::parse_symbol_identity(&declaration.symbol().0)
+                .map_err(|_| refused(DocumentationViolation::Identity, "declaration.symbol"))?;
+            qualified
+                .entry((declaration.source(), parsed.qualified_name().to_owned()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(declaration.symbol()));
+        }
+        Ok(Self { symbols, qualified })
+    }
+
+    pub(super) fn direct(
+        &self,
+        authored: &str,
+    ) -> Option<&'declaration rift_protocol::read::SymbolId> {
+        self.symbols.get(authored).copied()
+    }
+
+    pub(super) fn qualified(
+        &self,
+        source: &DocumentationContentIdentity,
+        name: &str,
+    ) -> DeclarationLinkMatch {
+        match self.qualified.get(&(source, name.to_owned())) {
+            Some(Some(symbol)) => DeclarationLinkMatch::Symbol((*symbol).clone()),
+            Some(None) => DeclarationLinkMatch::Ambiguous,
+            None => DeclarationLinkMatch::Missing,
+        }
+    }
+
+    pub(super) fn lookup(
+        &self,
+        source: &DocumentationSource,
+        authored: &str,
+    ) -> Result<DeclarationLinkMatch, DocumentationError> {
+        if let Some(symbol) = self.direct(authored) {
+            return Ok(DeclarationLinkMatch::Symbol(symbol.clone()));
+        }
+        let Destination::Local {
+            identity,
+            fragment: Some(fragment),
+        } = local_destination(source, authored)?
+        else {
+            return Ok(DeclarationLinkMatch::Missing);
+        };
+        let Ok(fragment) = percent_decode_str(&fragment).decode_utf8() else {
+            return Ok(DeclarationLinkMatch::Missing);
+        };
+        Ok(self.qualified(&identity, &fragment))
+    }
+}
 
 /// Resolves explicit symbol addresses and exact declaration fragments against supplied facts.
 /// No spelling is inferred from prose or a generated heading fragment.
@@ -97,66 +177,43 @@ pub(super) fn resolve_declaration_links(
         .iter()
         .map(|block| (&block.identity, block))
         .collect();
-    let symbols: BTreeMap<_, _> = declarations
-        .iter()
-        .map(|declaration| (declaration.symbol().0.as_str(), declaration.symbol()))
-        .collect();
-    let mut names = BTreeMap::new();
-    for declaration in declarations {
-        let parsed = rift_core::parse_symbol_identity(&declaration.symbol().0)
-            .map_err(|_| refused(DocumentationViolation::Identity, "declaration.symbol"))?;
-        names
-            .entry((declaration.source(), parsed.qualified_name().to_owned()))
-            .and_modify(|entry| *entry = None)
-            .or_insert(Some(declaration.symbol()));
-    }
+    let names = DeclarationLinkNames::new(declarations)?;
     let mut references = Vec::new();
     let mut occurrences = BTreeMap::new();
     for link in links {
-        let symbol = if let Some(symbol) = symbols.get(link.authored.as_str()) {
-            Some(*symbol)
-        } else {
-            let block = blocks
-                .get(&link.block)
-                .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
-            let source = sources
-                .get(&block.source)
-                .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
-            match local_destination(source, &link.authored)? {
-                Destination::Local {
-                    identity,
-                    fragment: Some(fragment),
-                } => {
-                    let Ok(fragment) = percent_decode_str(&fragment).decode_utf8() else {
-                        continue;
-                    };
-                    match names.get(&(&identity, fragment.into_owned())) {
-                        Some(Some(symbol)) => Some(*symbol),
-                        Some(None) => {
-                            link.resolution = unresolved(DocumentationUnresolvedReason::Ambiguous);
-                            None
-                        }
-                        None => None,
-                    }
-                }
-                _ => None,
+        let block = blocks
+            .get(&link.block)
+            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "link.block"))?;
+        let source = sources
+            .get(&block.source)
+            .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.source"))?;
+        let symbol = match names.lookup(source, &link.authored)? {
+            DeclarationLinkMatch::Symbol(symbol) => symbol,
+            DeclarationLinkMatch::Ambiguous => {
+                link.resolution = unresolved(DocumentationUnresolvedReason::Ambiguous);
+                continue;
             }
+            DeclarationLinkMatch::Missing => continue,
         };
-        let Some(symbol) = symbol else { continue };
         link.resolution = DocumentationLinkResolution::Resolved {
             target: DocumentationTarget::Symbol {
                 symbol: symbol.clone(),
             },
         };
         let evidence = DocumentationReferenceEvidence::AuthoredLink;
-        let key = (&link.block, symbol, evidence, &link.authored);
-        let ordinal = occurrences.entry(key).or_insert(0_u32);
+        let key = (
+            link.block.clone(),
+            symbol.clone(),
+            evidence,
+            link.authored.clone(),
+        );
+        let ordinal = occurrences.entry(key.clone()).or_insert(0_u32);
         let identity = super::identity::canonical_digest(&(key, *ordinal))?;
         *ordinal += 1;
         references.push(DocumentationReference {
             identity,
             block: link.block.clone(),
-            target: symbol.clone(),
+            target: symbol,
             range: link.range.clone(),
             authored: link.authored.clone(),
             evidence,
@@ -165,7 +222,7 @@ pub(super) fn resolve_declaration_links(
     Ok(references)
 }
 
-fn fragment_index(
+pub(super) fn fragment_index(
     fragments: &[DocumentationFragment],
 ) -> Result<Fragments<'_>, DocumentationError> {
     let mut index = BTreeMap::new();
@@ -217,7 +274,7 @@ fn resolve_destination(
     })
 }
 
-enum Destination {
+pub(super) enum Destination {
     Local {
         identity: DocumentationContentIdentity,
         fragment: Option<String>,
@@ -225,7 +282,7 @@ enum Destination {
     Unresolved(DocumentationUnresolvedReason),
 }
 
-fn local_destination(
+pub(super) fn local_destination(
     source: &DocumentationSource,
     authored: &str,
 ) -> Result<Destination, DocumentationError> {
