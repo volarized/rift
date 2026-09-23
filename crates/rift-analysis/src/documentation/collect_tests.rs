@@ -299,11 +299,18 @@ fn package_input(
     selection: DocumentationSelectionReason,
     revision: DocumentationDigest,
 ) -> DocumentationInput<'_> {
-    let mut record = source("README.md", text);
+    package_input_at("README.md", text, selection, revision)
+}
+
+fn package_input_at<'a>(
+    path: &str,
+    text: &'a str,
+    selection: DocumentationSelectionReason,
+    revision: DocumentationDigest,
+) -> DocumentationInput<'a> {
+    let mut record = source(path, text);
     record.identity.source = DocumentationSourceIdentity::Package {
-        unit: rift_protocol::read::SourceUnitId(
-            "rift://source/cargo/beacon@1.0.0/README.md".to_owned(),
-        ),
+        unit: rift_protocol::read::SourceUnitId(format!("rift://source/cargo/beacon@1.0.0/{path}")),
     };
     record.origin = SymbolOrigin {
         location: Some(SourceLocationKind::Dependency),
@@ -320,7 +327,7 @@ fn package_input(
         .into_iter()
         .enumerate()
         .map(|(index, chunk)| DocumentationChunk {
-            identity: format!("README.md#{index}"),
+            identity: format!("{path}#{index}"),
             range: TextRange {
                 start: chunk.byte_offset(),
                 end: chunk.byte_offset() + chunk.content().len() as u64,
@@ -379,6 +386,83 @@ fn authored_declaration_links_resolve_without_selecting_or_fetching_code() {
 }
 
 #[test]
+fn package_sibling_link_resolves_with_exact_source_unit() {
+    let revision = content_digest(b"package revision");
+    let sources = DocumentationSourceSet::new(vec![
+        package_input_at(
+            "README.md",
+            "[source](src/lib.md)\n",
+            DocumentationSelectionReason::PackageArchive,
+            revision.clone(),
+        ),
+        package_input_at(
+            "src/lib.md",
+            "# Library\n",
+            DocumentationSelectionReason::PackageArchive,
+            revision,
+        ),
+    ])
+    .expect("package source set");
+    let collection = collect_documentation(&sources, &[]).expect("package collection");
+    let link = collection
+        .index()
+        .links
+        .iter()
+        .find(|link| link.authored == "src/lib.md")
+        .expect("sibling link");
+
+    assert!(matches!(
+        &link.resolution,
+        DocumentationLinkResolution::Resolved {
+            target: DocumentationTarget::Source { source, .. }
+        } if matches!(
+            &source.source,
+            DocumentationSourceIdentity::Package { unit }
+                if unit.0 == "rift://source/cargo/beacon@1.0.0/src/lib.md"
+        )
+    ));
+}
+
+#[test]
+fn aggregate_block_limit_omits_source_and_keeps_later_source() {
+    let block_count = DOCUMENTATION_BLOCKS_MAX as usize / 2 + 1;
+    let large = "entry.\n\n".repeat(block_count);
+    let sources = DocumentationSourceSet::new(vec![
+        input("a.txt", &large),
+        input("b.txt", &large),
+        input("z.txt", "kept.\n"),
+    ])
+    .expect("bounded source set");
+
+    let collection = collect_documentation(&sources, &[]).expect("bounded collection");
+    let index = collection.index();
+    assert_eq!(index.coverage.selected, 3);
+    assert_eq!(index.coverage.parsed, 2);
+    assert_eq!(index.coverage.omitted, 1);
+    assert!(index.blocks.iter().any(|block| {
+        matches!(
+            &block.source.source,
+            DocumentationSourceIdentity::Project { path } if path.0 == "z.txt"
+        )
+    }));
+    assert!(!index.blocks.iter().any(|block| {
+        matches!(
+            &block.source.source,
+            DocumentationSourceIdentity::Project { path } if path.0 == "b.txt"
+        )
+    }));
+    assert!(index.warnings.iter().any(|warning| {
+        warning.kind == DocumentationWarningKind::LimitExceeded
+            && warning.stage == DocumentationStage::Extract
+            && warning.count == 1
+            && matches!(
+                &warning.source.source,
+                DocumentationSourceIdentity::Project { path } if path.0 == "b.txt"
+            )
+    }));
+}
+
+#[test]
 fn context_shares_excerpt_budget_and_reports_utf8_cut_and_missing_source() {
     let text = "αβγδ `Compass`.\n";
     let (collection, symbol) = compass_collection(text);
@@ -434,6 +518,21 @@ fn context_reports_captured_source_truncated_before_block_range() {
         context.warnings[0].kind,
         DocumentationWarningKind::SourceTruncated
     );
+}
+
+#[test]
+fn context_rejects_excerpt_longer_than_block_range() {
+    let text = "`Compass` is documented here.\n";
+    let (collection, symbol) = compass_collection(text);
+    let mut context = documentation_context(&collection, &symbol, |_| Some(text));
+    let block = &collection.index().blocks[0];
+    let range_bytes =
+        usize::try_from(block.range.end - block.range.start).expect("block range fits memory");
+    context.references[0].excerpt = Some("x".repeat(range_bytes + 1));
+
+    let error = validate_documentation_context(&context, &symbol).expect_err("oversized excerpt");
+    assert_eq!(error.fault().violation(), DocumentationViolation::Range);
+    assert_eq!(error.fault().field(), "excerpt");
 }
 
 #[test]

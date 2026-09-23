@@ -1145,6 +1145,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_width_link_range_at_block_boundary_is_valid() {
+        let source_record = source("README.md", "hello world");
+        let mut candidate = index(vec![source_record]);
+        let mut boundary_link = link(&candidate.blocks[0], "next.md");
+        boundary_link.range = TextRange { start: 0, end: 0 };
+        candidate.links.push(boundary_link);
+
+        assert!(DocumentationCollection::new(candidate).is_ok());
+    }
+
+    #[test]
     fn changes_report_source_and_link_replacements() {
         let old_source = source("README.md", "hello world");
         let mut old = index(vec![old_source.clone()]);
