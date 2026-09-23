@@ -1,6 +1,6 @@
 //! Live integration: one checkpoint reached two ways answers one encoding.
 //!
-//! `RIFT_SEARCH_LIVE=1 cargo nextest run -p rift-search --test live_model_sources`
+//! `RIFT_LIVE_SEARCH=1 cargo nextest run -p rift-search --test live_model_sources`
 //! runs the suite; without the variable every test skips visibly. It acquires
 //! the default model from the hub, copies the three acquired files into a
 //! workspace directory, and loads both. The two are the same bytes reached two
@@ -23,7 +23,7 @@ use rift_search::{
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// The environment variable that turns the live model tests on.
-const SEARCH_LIVE_VARIABLE: &str = "RIFT_SEARCH_LIVE";
+const SEARCH_LIVE_VARIABLE: &str = "RIFT_LIVE_SEARCH";
 
 /// The repository this suite acquires; the workspace's own default.
 const REPOSITORY: &str = "minishlab/potion-retrieval-32M";

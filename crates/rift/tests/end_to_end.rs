@@ -26,7 +26,7 @@ use serde_json::json;
 // so `docs/content/docs/index.mdx` never surfaced beside `README.md`.
 //
 // The design's companion proof - a ranked-only hit does not claim `content`
-// - needs the live vector ranking (`RIFT_SEARCH_LIVE`, a model download from
+// - needs the live vector ranking (`RIFT_LIVE_SEARCH`, a model download from
 // the hub), which is outside the gates this suite runs under and outside
 // the hermetic policy every other fixture here follows; `rift-server`'s own
 // `search.rs` unit tests (`search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files`

@@ -133,7 +133,7 @@ live-archive-target:
     mkdir -p target/live-archive
 
 live-test archive="": live-archive-target
-    RIFT_ENGINE_LIVE=1 RIFT_SEARCH_LIVE=1 cargo nextest run --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-to target/live-archive --extract-overwrite --workspace-remap ." } }}
+    RIFT_ENGINE_LIVE=1 RIFT_LIVE_SEARCH=1 cargo nextest run --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-to target/live-archive --extract-overwrite --workspace-remap ." } }}
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
