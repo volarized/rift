@@ -847,6 +847,60 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_archive_refuses_a_directory_at_archive_path() {
+        let directory = tempfile::tempdir().expect("archive directory");
+        let path = directory.path().to_path_buf();
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            true,
+        )
+        .with_source_archive(path.clone(), [0; 32]);
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("directory cannot be read as a cached archive");
+
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::PackageBytesExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(evidence.field.as_str(), "archive.compressed_bytes");
+        assert_eq!(error.fault().path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn test_cached_archive_refuses_oversized_file_before_reading() {
+        let directory = tempfile::tempdir().expect("archive directory");
+        let path = directory.path().join("beacon.crate");
+        let maximum = u64::try_from(super::ArchiveLimits::default().compressed_bytes_max())
+            .expect("archive byte bound");
+        std::fs::File::create(&path)
+            .expect("archive file")
+            .set_len(maximum + 1)
+            .expect("oversized archive length");
+        let entry = CatalogEntry::dependency(
+            identity("cargo", "beacon", "1.0.0"),
+            language(ShippedLanguage::Rust),
+            None,
+            true,
+        )
+        .with_source_archive(path.clone(), [0; 32]);
+
+        let error = package_files(&entry, &DependencyIndexLimits::default())
+            .expect_err("archive length exceeds compressed byte bound");
+        assert_eq!(
+            violation_of(&error),
+            PackageIndexViolation::PackageBytesExceeded
+        );
+        let evidence = error.fault().limit_evidence().expect("limit evidence");
+        assert_eq!(evidence.field, "archive.compressed_bytes");
+        assert_eq!((evidence.limit, evidence.required), (maximum, maximum + 1));
+        assert_eq!(error.fault().path(), Some(path.as_path()));
+    }
+
+    #[test]
     fn test_cached_archive_refuses_a_digest_mismatch_as_unreadable() {
         let directory = tempfile::tempdir().expect("archive directory");
         let path = directory.path().join("beacon-1.0.0.crate");
