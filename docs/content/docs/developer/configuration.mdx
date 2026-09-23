@@ -462,8 +462,9 @@ pooled connections shared by search and stored logs; writes wait for one process
 <VersionBadge version="v0.0.25" />
 
 A visible file joins the lexical index through its effective language entry, or through
-`[search.text].include` when no language claims it. Narrow that list where the workspace holds
-large unclaimed files search should not carry:
+`[search.text].include` when no language claims it. Documentation collection also selects visible
+`.md`, `.markdown`, `.mdx`, `.rst`, and `.ipynb` sources. Its `.txt` selection follows `include`.
+Narrow that list where the workspace holds large unclaimed files search should not carry:
 
 ```toml
 [search.text]
@@ -477,7 +478,7 @@ busy_timeout = "5s"
 
 - `include` selects text files from the visible paths no language entry claimed, at most 64
   patterns. It defaults to `["**"]`, so every such path joins the lexical text index; an explicit
-  empty list selects no text file
+  empty list leaves only language-selected files and required documentation sources
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16

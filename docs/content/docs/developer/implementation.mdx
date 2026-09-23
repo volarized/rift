@@ -152,6 +152,16 @@ through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surfa
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
 
+Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
+bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its
+collector feature enables syntax parsers; readers can validate stored metadata and project ranked
+identities without linking parsers or storage code.
+
+The workspace database stores the documentation manifest and reverse symbol references beside
+the lexical rows. Blocks retain byte ranges and digests; excerpts come from the captured source
+after pagination. The same transaction writes documentation metadata, lexical units, and their
+tree revision.
+
 One transaction writes the units and the stamp together, so the store is never a partial mix of
 two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
 named the files it read deletes those paths' rows and inserts their new ones, which costs one

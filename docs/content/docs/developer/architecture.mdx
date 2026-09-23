@@ -407,7 +407,8 @@ Each rebuild derives lexical units for [`search`](/docs/mcp#tool-search).
 
 The rebuild derives one unit per indexed symbol, and chunks from every bounded UTF-8 file without
 a NUL byte whose effective language entry or
-[`[search.text].include`](/docs/developer/configuration#search) selects it. Syntax providers enrich files
+[`[search.text].include`](/docs/developer/configuration#search) selects it. Visible Markdown, MDX,
+reStructuredText, and notebook documentation also enter collection. Syntax providers enrich files
 their effective language entry selects. The units persist in the workspace database at
 `.rift/db`, stamped with the tree revision that published them.
 
@@ -485,6 +486,33 @@ The index records a corpus revision covering the field shape, the derivation the
 terms were split with, the tokenizer, and the weights. A store stamped with another revision
 holds rows this build cannot read, so it answers as if nothing had been published and the next
 publication replaces it.
+
+#### Documentation
+
+`search` with `target: "documentation"` returns blocks from selected documentation sources.
+Workspace selection includes `.md`, `.markdown`, `.mdx`, `.rst`, and `.ipynb`, plus `.txt`
+selected by `[search.text].include`. Source visibility applies before collection.
+
+Each regular source keeps its existing text chunks. Notebook markdown and code cells receive
+separate content owners; outputs and raw notebook JSON stay outside ranking. Collection records
+block ranges, headings, links, source digests, and exact-symbol references beside those owners.
+It neither executes code nor follows links to acquire more sources.
+
+Before fusion, the read maps existing ranked documents to block identities and keeps the best
+position once per ranking input. A heading and its text chunk therefore return one documentation
+hit. Under `target: "all"`, an attached comment keeps its symbol result when that symbol answered;
+a file match outside the comment remains a file result.
+
+For example, a guide containing the inline code `Compass` can contribute context to
+`get_symbol` with `name: "Compass"` and `include: ["documentation"]`. The reference resolves only
+when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
+The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
+page, with typed warnings for missing bytes or reached bounds.
+
+Local package collection reads already-present installed sources or verified cached archives.
+It does not download missing package sources. Global documentation requests use the existing
+package REST client only after the service advertises the corresponding capability. Workspace
+paths and source bytes remain local.
 
 #### Query phases
 
