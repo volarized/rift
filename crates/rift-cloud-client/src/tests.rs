@@ -1,5 +1,7 @@
 use super::*;
 
+mod documentation;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
