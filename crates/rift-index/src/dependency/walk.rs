@@ -713,6 +713,13 @@ mod tests {
         let members = [
             ("src/lib.rs", b"pub fn spawn() {}\n".as_slice()),
             ("README.md", b"# Beacon\n".as_slice()),
+            ("guide.markdown", b"# Markdown guide\n\nCompass note.\n".as_slice()),
+            ("guide.mdx", b"# MDX guide\n\nCompass note.\n".as_slice()),
+            ("guide.rst", b"RST guide\n=========\n\nCompass note.\n".as_slice()),
+            (
+                "guide.ipynb",
+                br##"{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"markdown","metadata":{},"source":"# Notebook\n\nCompass note."}]}"##.as_slice(),
+            ),
             ("tests/ignored.rs", b"fn ignored() {}\n".as_slice()),
         ];
         let archive_bytes = cargo_archive(&members);
@@ -751,6 +758,22 @@ mod tests {
                 .map(|file| (file.path().as_str(), file.content()))
                 .collect::<Vec<_>>()
         );
+        let archived_index = super::super::PackageIndex::build(&archived_entry, &archived, 1)
+            .expect("cached package index");
+        let installed_index = super::super::PackageIndex::build(&installed_entry, &installed, 1)
+            .expect("installed package index");
+        assert_eq!(
+            archived_index.documentation().index().blocks,
+            installed_index.documentation().index().blocks
+        );
+        for block in &archived_index.documentation().index().blocks {
+            assert_eq!(
+                archived_index.documentation_content(&block.source),
+                installed_index.documentation_content(&block.source),
+                "content for {}",
+                block.identity.0
+            );
+        }
     }
 
     #[test]

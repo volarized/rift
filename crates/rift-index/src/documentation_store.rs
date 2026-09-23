@@ -306,4 +306,109 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn metadata_write_failure_rolls_back_lexical_rows_and_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            LexicalIndexLimits, LexicalIndexViolation, LexicalSearchIndex, RevisionScoped,
+        };
+        use rift_ranking::{DocumentIdentity, ParsedQuery, QueryPhase};
+
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        let path = rift_core::ProjectPath::new("README.md")?;
+        let old_text = "oldquartzterm guide\n";
+        let old_document = index_document(&path, old_text, "old-digest")?;
+        let old_metadata = collection(old_text);
+        store
+            .replace_all_with_documentation(&[old_document], "tree-old", &old_metadata)
+            .await?;
+
+        let mut access = database.writing().await?;
+        let mut transaction = access.transaction().await?;
+        toasty::sql::statement(
+            "CREATE TRIGGER reject_documentation_manifest BEFORE INSERT ON documentation_manifest \
+             BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END",
+        )
+        .exec(&mut transaction)
+        .await?;
+        transaction.commit().await?;
+        drop(access);
+
+        let new_text = "newquartzterm guide\n";
+        let new_document = index_document(&path, new_text, "new-digest")?;
+        let error = store
+            .replace_all_with_documentation(&[new_document], "tree-new", &collection(new_text))
+            .await
+            .expect_err("metadata trigger refuses after lexical writes");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+
+        let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree-old").await? else {
+            panic!("the prior metadata revision remains readable");
+        };
+        assert_eq!(loaded.index(), old_metadata.index());
+        assert!(matches!(
+            store.documentation("tree-new").await?,
+            RevisionScoped::OtherRevision(revision) if revision == "tree-old"
+        ));
+        assert_eq!(
+            store
+                .content(&DocumentIdentity::new("README.md")?)
+                .await?
+                .as_deref(),
+            Some(old_text)
+        );
+        let RevisionScoped::Matched(old_rank) = store
+            .rank(
+                "tree-old",
+                &ParsedQuery::parse("oldquartzterm")?,
+                QueryPhase::Precise,
+                10,
+            )
+            .await?
+        else {
+            panic!("the prior lexical revision remains searchable");
+        };
+        assert_eq!(old_rank.order().len(), 1);
+        let RevisionScoped::Matched(new_rank) = store
+            .rank(
+                "tree-old",
+                &ParsedQuery::parse("newquartzterm")?,
+                QueryPhase::Precise,
+                10,
+            )
+            .await?
+        else {
+            panic!("the prior lexical revision remains searchable");
+        };
+        assert!(new_rank.order().is_empty());
+        Ok(())
+    }
+
+    fn index_document(
+        path: &rift_core::ProjectPath,
+        text: &str,
+        digest: &str,
+    ) -> Result<rift_ranking::IndexDocument, Box<dyn std::error::Error>> {
+        use rift_ranking::{
+            DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
+            SearchableField,
+        };
+        Ok(IndexDocument::new(
+            DocumentIdentity::new(path.as_str())?,
+            DocumentLocation::Project(path.clone()),
+            DocumentKind::TextFile,
+            digest,
+            DocumentFields::empty().with(SearchableField::FileContent, text),
+        )?)
+    }
 }

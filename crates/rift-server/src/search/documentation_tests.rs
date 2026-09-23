@@ -91,6 +91,26 @@ async fn answer(
     ))
 }
 
+async fn scoped_documentation_search(
+    service: &ReadService,
+    store: &SearchIndex,
+    scope: &str,
+    dependency_context: Option<&rift_dependency::DependencyContext>,
+) -> TestResult<SearchResult> {
+    let query = "shared compass reference";
+    let params: SearchParams = serde_json::from_value(json!({
+        "query": query,
+        "scope": scope,
+        "target": "documentation",
+        "limit": 100
+    }))?;
+    let answer = answer(store, service, query).await?;
+    Ok(match dependency_context {
+        Some(context) => service.search_with_dependency_context(&params, &answer, context)?,
+        None => service.search(&params, &answer)?,
+    })
+}
+
 async fn search_for(
     store: &SearchIndex,
     service: &ReadService,
@@ -569,14 +589,19 @@ async fn attached_comment_overlap_keeps_one_existing_rank_and_symbol_owner() -> 
     Ok(())
 }
 
-fn package_index(root: &Path, version: &str, content: &str) -> TestResult<PackageIndex> {
+fn package_index(
+    root: &Path,
+    name: &str,
+    version: &str,
+    content: &str,
+) -> TestResult<PackageIndex> {
     fs::create_dir_all(root.join("src"))?;
     fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
     fs::write(root.join("README.md"), content)?;
     let entry = CatalogEntry::dependency(
         PackageIdentity {
             manager: "cargo".to_owned(),
-            name: "beacon-kit".to_owned(),
+            name: name.to_owned(),
             version: version.to_owned(),
         },
         ShippedLanguage::Rust.language(),
@@ -594,16 +619,25 @@ async fn same_name_package_versions_keep_distinct_documentation_sources() -> Tes
     let store = stored(directory.path(), &service).await?;
     let first = tempfile::tempdir()?;
     let second = tempfile::tempdir()?;
+    let third = tempfile::tempdir()?;
     let mut dependencies = DependencyIndex::empty(DependencyIndexLimits::default());
     dependencies.insert(package_index(
         first.path(),
+        "beacon-kit",
         "1.0.0",
         "# Beacon Kit\n\nShared navigation reference. Release one.\n",
     )?)?;
     dependencies.insert(package_index(
         second.path(),
+        "beacon-kit",
         "2.0.0",
         "# Beacon Kit\n\nShared navigation reference. Release two.\n",
+    )?)?;
+    dependencies.insert(package_index(
+        third.path(),
+        "navigation-kit",
+        "1.0.0",
+        "# Navigation Kit\n\nShared navigation reference. Alternate package.\n",
     )?)?;
     let service = service.with_packages(Arc::new(PackageBranch::from_index(dependencies)));
     let params: SearchParams = serde_json::from_value(json!({
@@ -617,7 +651,7 @@ async fn same_name_package_versions_keep_distinct_documentation_sources() -> Tes
         &params,
         &answer(&store, &service, "shared navigation reference").await?,
     )?;
-    assert_eq!(result.results.len(), 2, "{result:#?}");
+    assert_eq!(result.results.len(), 3, "{result:#?}");
     let versions = result
         .results
         .iter()
@@ -635,7 +669,7 @@ async fn same_name_package_versions_keep_distinct_documentation_sources() -> Tes
             Ok(unit.0.clone())
         })
         .collect::<TestResult<Vec<_>>>()?;
-    assert_eq!(versions.len(), 2);
+    assert_eq!(versions.len(), 3);
     assert!(
         versions
             .iter()
@@ -646,6 +680,175 @@ async fn same_name_package_versions_keep_distinct_documentation_sources() -> Tes
             .iter()
             .any(|unit| unit.contains("beacon-kit@2.0.0"))
     );
+    assert!(
+        versions
+            .iter()
+            .any(|unit| unit.contains("navigation-kit@1.0.0"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn documentation_scope_selects_workspace_and_cached_package_sources() -> TestResult {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::packages::tests::{RESOLVE_SPAN, RecordedSpans, context_naming_one_package};
+
+    let directory = tempfile::tempdir()?;
+    fs::create_dir(directory.path().join("src"))?;
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "pub struct WorkspaceBeacon;\n",
+    )?;
+    fs::write(
+        directory.path().join("guide.md"),
+        "# Workspace guide\n\nShared compass reference.\n",
+    )?;
+    let workspace = service(directory.path())?;
+    let store = stored(directory.path(), &workspace).await?;
+    let package_root = tempfile::tempdir()?;
+    let mut packages = DependencyIndex::empty(DependencyIndexLimits::default());
+    packages.insert(package_index(
+        package_root.path(),
+        "absent-probe",
+        "1.0.0",
+        "# Package guide\n\nShared compass reference.\n",
+    )?)?;
+    let local =
+        service(directory.path())?.with_packages(Arc::new(PackageBranch::from_index(packages)));
+    let local_context = context_naming_one_package();
+
+    let recorded = RecordedSpans::default();
+    let local_result = {
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(recorded.clone()));
+        scoped_documentation_search(&local, &store, "local", Some(&local_context)).await?
+    };
+    assert_eq!(recorded.named(RESOLVE_SPAN), 0, "{recorded:?}");
+    assert_eq!(local_result.results.len(), 2, "{local_result:#?}");
+    assert_eq!(
+        local_result
+            .results
+            .iter()
+            .filter(|hit| hit.unit.is_some())
+            .count(),
+        1
+    );
+
+    let mut packages = DependencyIndex::empty(DependencyIndexLimits::default());
+    let second_package_root = tempfile::tempdir()?;
+    packages.insert(package_index(
+        second_package_root.path(),
+        "absent-probe",
+        "1.0.0",
+        "# Package guide\n\nShared compass reference.\n",
+    )?)?;
+    let global =
+        service(directory.path())?.with_packages(Arc::new(PackageBranch::from_index(packages)));
+    let global_result = scoped_documentation_search(&global, &store, "global", None).await?;
+    assert_eq!(global_result.results.len(), 1, "{global_result:#?}");
+    assert!(global_result.results[0].unit.is_some());
+
+    let mut packages = DependencyIndex::empty(DependencyIndexLimits::default());
+    let third_package_root = tempfile::tempdir()?;
+    packages.insert(package_index(
+        third_package_root.path(),
+        "absent-probe",
+        "1.0.0",
+        "# Package guide\n\nShared compass reference.\n",
+    )?)?;
+    let all =
+        service(directory.path())?.with_packages(Arc::new(PackageBranch::from_index(packages)));
+    let all_result = scoped_documentation_search(&all, &store, "all", None).await?;
+    assert_eq!(all_result.results.len(), 2, "{all_result:#?}");
+    assert_eq!(
+        all_result
+            .results
+            .iter()
+            .filter(|hit| hit.unit.is_some())
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_symbol_documentation_keeps_scope_hits_and_exact_source_context() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::create_dir(directory.path().join("src"))?;
+    fs::write(directory.path().join("src/lib.rs"), "pub struct Beacon;\n")?;
+    fs::write(
+        directory.path().join("guide.md"),
+        "Use `Beacon` for local navigation.\n",
+    )?;
+    let package_root = tempfile::tempdir()?;
+    let mut packages = DependencyIndex::empty(DependencyIndexLimits::default());
+    packages.insert(package_index(
+        package_root.path(),
+        "absent-probe",
+        "1.0.0",
+        "Use `Beacon` for package navigation.\n",
+    )?)?;
+    let package_branch = Arc::new(PackageBranch::from_index(packages));
+    let service = service(directory.path())?.with_packages(package_branch);
+
+    let local_without: GetSymbolParams = serde_json::from_value(json!({
+        "name": "Beacon",
+        "scope": "local"
+    }))?;
+    let local_with: GetSymbolParams = serde_json::from_value(json!({
+        "name": "Beacon",
+        "scope": "local",
+        "include": ["documentation"]
+    }))?;
+    let without = service.get_symbol(&local_without)?;
+    let local = service.get_symbol(&local_with)?;
+    assert_eq!(local.hits.len(), without.hits.len());
+    assert_eq!(local.hits.len(), 1);
+    assert!(local.hits[0].unit.is_none());
+    assert_eq!(
+        local.hits[0]
+            .documentation
+            .as_ref()
+            .map(|context| context.references.len()),
+        Some(1)
+    );
+    assert!(
+        serde_json::to_value(without)?["hits"][0]
+            .get("documentation")
+            .is_none()
+    );
+
+    let global_params: GetSymbolParams = serde_json::from_value(json!({
+        "name": "Beacon",
+        "scope": "global",
+        "include": ["documentation"]
+    }))?;
+    let global = service.get_symbol(&global_params)?;
+    assert_eq!(global.hits.len(), 1);
+    assert!(global.hits[0].unit.is_some());
+    assert_eq!(
+        global.hits[0]
+            .documentation
+            .as_ref()
+            .map(|context| context.references.len()),
+        Some(1)
+    );
+
+    let all_params: GetSymbolParams = serde_json::from_value(json!({
+        "name": "Beacon",
+        "scope": "all",
+        "include": ["documentation"]
+    }))?;
+    let all = service.get_symbol(&all_params)?;
+    assert_eq!(all.hits.len(), 2);
+    assert!(all.hits[0].unit.is_none());
+    assert!(all.hits[1].unit.is_some());
+    assert!(all.hits.iter().all(|hit| {
+        hit.documentation
+            .as_ref()
+            .is_some_and(|context| context.references.len() == 1)
+    }));
     Ok(())
 }
 

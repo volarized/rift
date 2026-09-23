@@ -10,6 +10,7 @@ use documentation::SearchDocumentation;
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::sync::RwLockReadGuard;
 
 use rift_core::constants::{
     FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
@@ -248,14 +249,11 @@ impl ReadService {
         // bound, so `pagination.total_pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
-        let fallback = self.fill_packages(params.scope, dependency_context)?;
-        let dependencies = self.dependency_index(params.scope)?;
+        let package_indexes =
+            self.search_package_indexes(params, query.is_some(), dependency_context)?;
 
         let mut results = Vec::new();
-        let mut warnings = self.warnings();
-        warnings.extend(selected.warnings());
-        warnings.extend(self.documentation_warnings(params.target));
-        warnings.extend(references.analysis_unavailable().cloned());
+        let mut warnings = self.initial_search_warnings(&selected, params.target, references);
         let mut ranked_truncated_at = None;
         if let Some(query) = query {
             let parsed = parsed_query(query)?;
@@ -272,7 +270,13 @@ impl ReadService {
                 params.scope,
                 &selected,
                 (&parsed, store),
-                dependencies.as_deref(),
+                SearchDependencies {
+                    ranking: package_indexes.ranking.as_deref(),
+                    documentation: package_indexes
+                        .documentation
+                        .as_deref()
+                        .or(package_indexes.ranking.as_deref()),
+                },
                 &mut results,
             )?;
         }
@@ -309,7 +313,10 @@ impl ReadService {
                 self.index(),
                 Resolution {
                     force_include: selected.force_include.as_ref(),
-                    packages: dependencies.as_deref(),
+                    packages: package_indexes
+                        .documentation
+                        .as_deref()
+                        .or(package_indexes.ranking.as_deref()),
                 },
             ));
         }
@@ -321,14 +328,61 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: Self::search_warnings(
+            warnings: search_package_warnings(
                 warnings,
                 params.scope,
-                (dependencies.as_deref(), dependency_context, fallback),
+                dependency_context,
+                package_indexes,
                 traversal_report,
                 results_max_reached,
             ),
         })
+    }
+
+    /// Selects package indexes for ranking and documentation reads.
+    fn search_package_indexes<'service>(
+        &'service self,
+        params: &SearchParams,
+        has_query: bool,
+        dependency_context: &DependencyContext,
+    ) -> Result<SearchPackageIndexes<'service>, ReadError> {
+        let local_documentation = has_query
+            && params.scope == SearchScope::Local
+            && matches!(
+                params.target,
+                SearchParamsTarget::Documentation | SearchParamsTarget::All
+            )
+            && self.revision().is_none();
+        let fallback = if local_documentation {
+            self.fill_local_documentation_packages(dependency_context)?
+        } else {
+            self.fill_packages(params.scope, dependency_context)?
+        };
+        let ranking = self.dependency_index(params.scope)?;
+        let documentation = if local_documentation {
+            self.documentation_dependency_index()?
+        } else {
+            None
+        };
+        Ok(SearchPackageIndexes {
+            fallback,
+            ranking,
+            documentation,
+            local_documentation,
+        })
+    }
+
+    fn initial_search_warnings(
+        &self,
+        selected: &SelectedPaths,
+        target: SearchParamsTarget,
+        references: &EngineReferences,
+    ) -> Vec<ReadWarning> {
+        let mut warnings = self.warnings();
+        warnings.extend(selected.warnings());
+        warnings.extend(self.documentation_warnings(target));
+        warnings.extend(references.analysis_unavailable().cloned());
+        warnings
     }
 
     fn documentation_warnings(&self, target: SearchParamsTarget) -> Vec<ReadWarning> {
@@ -439,7 +493,7 @@ impl ReadService {
         scope: SearchScope,
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
-        dependencies: Option<&DependencyIndex>,
+        packages: SearchDependencies<'_>,
         results: &mut Vec<SearchHit>,
     ) -> Result<Option<usize>, ReadError> {
         let index = self.index();
@@ -451,17 +505,21 @@ impl ReadService {
             force_include: (scope != SearchScope::Global)
                 .then_some(selected.force_include.as_ref())
                 .flatten(),
-            packages: dependencies,
+            packages: packages.ranking,
         };
         let resolution = Resolution {
             force_include: sources.force_include,
-            packages: dependencies,
+            packages: packages.ranking,
+        };
+        let documentation_resolution = Resolution {
+            force_include: sources.force_include,
+            packages: packages.documentation,
         };
         let documentation = matches!(
             criteria.target,
             SearchParamsTarget::Documentation | SearchParamsTarget::All
         )
-        .then(|| SearchDocumentation::new(index, scope, resolution))
+        .then(|| SearchDocumentation::new(index, scope, documentation_resolution))
         .transpose()?;
         let screen = CandidateScreen {
             index,
@@ -481,7 +539,7 @@ impl ReadService {
         )?];
         inputs.extend(store.precise().iter().cloned());
         inputs.extend(package_inputs(
-            dependencies,
+            packages.documentation,
             query,
             QueryPhase::Precise,
             fetch_limit,
@@ -495,7 +553,7 @@ impl ReadService {
         if ranked.len() < fetch_limit {
             let mut widened: Vec<RankingInput> = store.broad().to_vec();
             widened.extend(package_inputs(
-                dependencies,
+                packages.documentation,
                 query,
                 QueryPhase::Broad,
                 fetch_limit,
@@ -899,6 +957,55 @@ fn package_inputs(
             )
         })
         .collect()
+}
+
+/// Package indexes held for one search. Local documentation reads can see a static package
+/// index while identifier ranking remains project-only.
+struct SearchPackageIndexes<'service> {
+    fallback: PackageFallback,
+    ranking: Option<RwLockReadGuard<'service, DependencyIndex>>,
+    documentation: Option<RwLockReadGuard<'service, DependencyIndex>>,
+    local_documentation: bool,
+}
+
+/// The package lanes one candidate projection can read.
+#[derive(Clone, Copy)]
+struct SearchDependencies<'a> {
+    ranking: Option<&'a DependencyIndex>,
+    documentation: Option<&'a DependencyIndex>,
+}
+
+fn search_package_warnings(
+    warnings: Vec<ReadWarning>,
+    scope: SearchScope,
+    context: &DependencyContext,
+    packages: SearchPackageIndexes<'_>,
+    traversal: TraversalReport,
+    results_max_reached: Option<usize>,
+) -> Vec<ReadWarning> {
+    let mut warnings = ReadService::search_warnings(
+        warnings,
+        scope,
+        (
+            packages.ranking.as_deref(),
+            context,
+            packages.fallback.clone(),
+        ),
+        traversal,
+        results_max_reached,
+    );
+    if packages.local_documentation {
+        warnings.extend(
+            package_warnings(
+                packages.documentation.as_deref(),
+                context,
+                packages.fallback,
+            )
+            .into_iter()
+            .skip(1),
+        );
+    }
+    warnings
 }
 
 /// Which indexes the identifier ranking reads.

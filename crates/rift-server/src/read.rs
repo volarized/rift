@@ -18,7 +18,7 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
-use rift_protocol::dependencies::DependenciesConfiguration;
+use rift_protocol::dependencies::{DependenciesConfiguration, DependencyResolution};
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude,
@@ -1149,6 +1149,48 @@ impl ReadService {
         })
     }
 
+    /// Fills on-disk dependency sources for local documentation search without running a
+    /// toolchain. Revision snapshots carry no current dependency sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a holder panics with a branch lock held, or when the
+    /// workspace's visible paths cannot be read.
+    pub(crate) fn fill_local_documentation_packages(
+        &self,
+        dependency_context: &DependencyContext,
+    ) -> Result<PackageFallback, ReadError> {
+        let (Some(branch), Some(source_policy)) = (&self.packages, self.source_policy.as_deref())
+        else {
+            return Ok(PackageFallback::default());
+        };
+        if self.revision.is_some() {
+            return Ok(PackageFallback::default());
+        }
+        let held = branch.read()?;
+        if branch_matches_exact_context(&held, dependency_context) {
+            return Ok(PackageFallback::default());
+        }
+        drop(held);
+        let visible: Vec<ProjectPath> = source_policy
+            .visible_paths()
+            .map_err(ReadFault::index)?
+            .iter()
+            .map(project_path)
+            .collect();
+        let configuration = DependenciesConfiguration {
+            resolution: DependencyResolution::Static,
+            ..self.dependency_configuration.clone()
+        };
+        branch.fill(&PackageFill {
+            root: self.index.root(),
+            visible: &visible,
+            resolution: ResolutionPolicy::from(&configuration),
+            limits: DependencyIndexLimits::from(&configuration),
+            context: dependency_context,
+        })
+    }
+
     /// The package branch an answer whose `scope` reaches packages reads, held on the read
     /// side for the life of the answer. None for the local scope, and for a service with
     /// no branch attached, which answers as an empty branch.
@@ -1163,6 +1205,21 @@ impl ReadService {
         match &self.packages {
             Some(branch) if scope != SearchScope::Local => branch.read().map(Some),
             _ => Ok(None),
+        }
+    }
+
+    /// The package branch selected for documentation search, including local on-disk
+    /// packages filled under static resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when a holder panicked with the lock held.
+    pub(crate) fn documentation_dependency_index(
+        &self,
+    ) -> Result<Option<RwLockReadGuard<'_, DependencyIndex>>, ReadError> {
+        match &self.packages {
+            Some(branch) => branch.read().map(Some),
+            None => Ok(None),
         }
     }
 
@@ -1206,6 +1263,33 @@ impl ReadService {
     fn symbol_timelines(&self) -> Result<SymbolTimelines, ReadError> {
         SymbolTimelines::open(self.index.root(), self.revision.as_ref(), &self.history)
     }
+}
+
+/// Whether one held package branch exactly matches a context made of locked versions.
+fn branch_matches_exact_context(index: &DependencyIndex, context: &DependencyContext) -> bool {
+    let mut selected = std::collections::BTreeSet::new();
+    for entry in context.entries() {
+        let (Some(version), None) = (&entry.version, &entry.requirement) else {
+            return false;
+        };
+        selected.insert((
+            entry.manager.as_str(),
+            entry.name.as_str(),
+            version.as_str(),
+        ));
+    }
+    let held = index
+        .packages()
+        .map(|package| {
+            let identity = package.identity();
+            (
+                identity.manager.as_str(),
+                identity.name.as_str(),
+                identity.version.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    held.len() == selected.len() && held.iter().all(|identity| selected.contains(identity))
 }
 
 /// Accepts a caller-supplied result limit: positive and at most `PAGE_LIMIT_MAX`. The
