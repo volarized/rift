@@ -5,7 +5,8 @@ use rift_protocol::read::{
     TextRange,
 };
 use rift_syntax::{
-    MarkdownSyntaxProvider, PythonSyntaxProvider, RustSyntaxProvider, SyntaxProvider, SyntaxSource,
+    MarkdownSyntaxProvider, PythonSyntaxProvider, RustSyntaxProvider, SyntaxLimits, SyntaxProvider,
+    SyntaxSource,
 };
 
 fn source(path: &str, text: &str) -> DocumentationSource {
@@ -244,7 +245,7 @@ fn incremental_attached_comments_invalidate_when_syntax_facts_appear_or_disappea
     let text = "/// Compass documentation.\npub struct Compass;\n";
     let path = rift_core::ProjectPath::new("lib.rs").expect("source path");
     let syntax = RustSyntaxProvider::default()
-        .analyze(SyntaxSource { path: &path, text })
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
         .expect("Rust syntax");
     let syntax_symbol = syntax
         .symbols()
@@ -629,7 +630,7 @@ fn supplied_markdown_syntax_produces_same_metadata_as_owned_parse() {
     let text = "# Notes\n\nOne paragraph.\n\n## Notes\nTwo.\n";
     let path = rift_core::ProjectPath::new("README.md").expect("path");
     let syntax = MarkdownSyntaxProvider::default()
-        .analyze(SyntaxSource { path: &path, text })
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
         .expect("syntax");
     let sources = DocumentationSourceSet::new(vec![
         input("README.md", text)
@@ -797,10 +798,13 @@ fn supplied_syntax_with_same_path_and_different_bytes_is_refused() {
     let other_text = "# Other\n";
     let path = rift_core::ProjectPath::new("README.md").expect("path");
     let syntax = MarkdownSyntaxProvider::default()
-        .analyze(SyntaxSource {
-            path: &path,
-            text: other_text,
-        })
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: other_text,
+            },
+            SyntaxLimits::default(),
+        )
         .expect("syntax");
     let error = input("README.md", text)
         .with_syntax(&syntax)
@@ -813,7 +817,7 @@ fn attached_comment_blocks_keep_original_bytes_and_exact_symbol() {
     let text = "/// Answers one request.\npub fn serve() {}\n";
     let path = rift_core::ProjectPath::new("src/lib.rs").expect("path");
     let syntax = RustSyntaxProvider::default()
-        .analyze(SyntaxSource { path: &path, text })
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
         .expect("Rust syntax");
     let symbol = &syntax.symbols()[0];
     let symbol_id = rift_protocol::read::SymbolId(rift_core::symbol_identity(
@@ -862,7 +866,7 @@ fn python_docstring_blocks_keep_exact_content_range_and_symbol() {
     let text = "def serve():\n    \"\"\"Answers one request.\"\"\"\n    return True\n";
     let path = rift_core::ProjectPath::new("src/app.py").expect("path");
     let syntax = PythonSyntaxProvider::default()
-        .analyze(SyntaxSource { path: &path, text })
+        .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
         .expect("Python syntax");
     let symbol = syntax
         .symbols()

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use rift_protocol::read::Language;
 
 use crate::language::{self, LanguageDefinition};
-use crate::provider::{SyntaxLimits, SyntaxProvider};
+use crate::provider::SyntaxProvider;
 
 /// One shipped definition beside the provider it constructed.
 struct RegisteredLanguage {
@@ -23,7 +23,6 @@ struct RegisteredLanguage {
 struct SyntaxRegistry {
     entries: Vec<RegisteredLanguage>,
     extensions: Vec<&'static str>,
-    file_bytes_max_default: usize,
 }
 
 impl SyntaxRegistry {
@@ -63,17 +62,9 @@ impl SyntaxRegistry {
                 provider,
             });
         }
-        let file_bytes_max_default = entries
-            .iter()
-            .map(|entry| entry.provider.source_bytes_max())
-            .max()
-            .unwrap_or_else(|| {
-                unreachable!("a non-empty definition set must have a maximum source byte bound")
-            });
         Self {
             entries,
             extensions,
-            file_bytes_max_default,
         }
     }
 }
@@ -108,19 +99,6 @@ pub fn provider_for_extension(extension: &str) -> Option<&'static dyn SyntaxProv
     entry_for_extension(extension).map(|entry| entry.provider.as_ref())
 }
 
-/// A provider for the language claiming `extension`, built under `limits` in
-/// place of its declared default bounds; `None` when no shipped definition
-/// claims the extension. The caller owns the returned provider, so a caller
-/// that parses many sources under one set of limits builds it once per
-/// language.
-#[must_use]
-pub fn provider_for_extension_with_limits(
-    extension: &str,
-    limits: SyntaxLimits,
-) -> Option<Box<dyn SyntaxProvider>> {
-    entry_for_extension(extension).map(|entry| entry.definition.syntax_provider_with_limits(limits))
-}
-
 /// The registered language claiming `extension`.
 fn entry_for_extension(extension: &str) -> Option<&'static RegisteredLanguage> {
     registry()
@@ -144,12 +122,12 @@ pub fn source_file_extensions() -> &'static [&'static str] {
     &registry().extensions
 }
 
-/// The largest per-source byte bound any shipped provider accepts by
-/// default. The workspace's default per-file bound derives from it, so no
-/// provider's default is unreachable under the scan.
+/// The per-source byte bound every provider parses under by default. The
+/// workspace's default per-file bound derives from it, so the scan admits
+/// every file a provider accepts.
 #[must_use]
-pub fn file_bytes_max_default() -> usize {
-    registry().file_bytes_max_default
+pub const fn file_bytes_max_default() -> usize {
+    crate::provider::SOURCE_BYTES_MAX_DEFAULT
 }
 
 #[cfg(test)]
@@ -161,8 +139,7 @@ mod tests {
     use crate::document::SyntaxDocument;
     use crate::failure::SyntaxError;
     use crate::language::ShippedLanguage;
-    use crate::provider::SyntaxSource;
-    use crate::rust::RustSyntaxProvider;
+    use crate::provider::{SyntaxLimits, SyntaxSource};
 
     fn rust() -> Language {
         Language {
@@ -229,22 +206,17 @@ mod tests {
     }
 
     #[test]
-    fn test_file_bytes_max_default_is_the_largest_declared_provider_bound() {
-        assert_eq!(
-            file_bytes_max_default(),
-            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
-    }
-
-    #[test]
     fn test_registry_analyzes_through_the_trait_object() {
         let path = ProjectPath::new("src/lib.rs").expect("valid fixture path");
         let provider = provider_for_extension("rs").expect("the rust provider claims rs");
         let document = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub fn beacon() {}",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub fn beacon() {}",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("fixture must parse");
         assert_eq!(document.language(), &rust());
         assert_eq!(document.symbols()[0].name, "beacon");
@@ -262,11 +234,11 @@ mod tests {
             &self.language
         }
 
-        fn source_bytes_max(&self) -> usize {
-            1
-        }
-
-        fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        fn analyze(
+            &self,
+            source: SyntaxSource<'_>,
+            _limits: SyntaxLimits,
+        ) -> Result<SyntaxDocument, SyntaxError> {
             Ok(SyntaxDocument::new(
                 self.language.clone(),
                 source.path.clone(),
@@ -306,10 +278,6 @@ mod tests {
                 language: self.provider_language.language(),
             })
         }
-
-        fn syntax_provider_with_limits(&self, _limits: SyntaxLimits) -> Box<dyn SyntaxProvider> {
-            self.syntax_provider()
-        }
     }
 
     /// A definition claiming the rust extension beside the real one.
@@ -343,41 +311,5 @@ mod tests {
     #[should_panic(expected = "a definition's provider must file facts under")]
     fn test_assemble_refuses_a_provider_filing_under_another_identity() {
         SyntaxRegistry::assemble(&[&MISMATCHED_IDENTITY]);
-    }
-
-    #[test]
-    fn test_provider_for_extension_with_limits_applies_caller_bounds() {
-        let limits = SyntaxLimits::new(4_096, 1, 64).expect("positive bounds");
-        for extension in source_file_extensions() {
-            let limited = provider_for_extension_with_limits(extension, limits)
-                .expect("a shipped extension has a provider");
-            let declared = provider_for_extension(extension).expect("shipped provider");
-            assert_eq!(
-                limited.language(),
-                declared.language(),
-                "a limited provider must file facts under the shipped language: extension={extension}"
-            );
-            assert_eq!(limited.source_bytes_max(), 4_096);
-        }
-        assert!(provider_for_extension_with_limits("unknown", limits).is_none());
-
-        let path = ProjectPath::new("pkg/module.py").expect("valid path");
-        let source = SyntaxSource {
-            path: &path,
-            text: "value = 1\n",
-        };
-        assert!(
-            provider_for_extension("py")
-                .expect("Python provider")
-                .analyze(source)
-                .is_ok()
-        );
-        assert!(
-            provider_for_extension_with_limits("py", limits)
-                .expect("Python provider")
-                .analyze(source)
-                .is_err(),
-            "a one-node bound must refuse a source the default bounds accept"
-        );
     }
 }

@@ -40,17 +40,14 @@
 use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
-use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::Node;
 
 use crate::document::{ByteRange, SyntaxDocument};
 mod facts;
 use crate::extract::{self, Declaration, GrammarRules};
-use crate::failure::{SyntaxError, SyntaxFault};
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::failure::SyntaxError;
+use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use facts::{
     MARKDOWN_INLINE_RANGES_MAX, MARKDOWN_PROGRESS_CALLBACKS_MAX, MarkdownBlockFact,
     MarkdownBlockKind, MarkdownBlockStructure, MarkdownFacts, MarkdownHeadingFact,
@@ -272,37 +269,16 @@ impl GrammarRules for MarkdownRules {
 #[derive(Debug, Clone)]
 pub struct MarkdownSyntaxProvider {
     language: Language,
-    limits: SyntaxLimits,
 }
 
-impl MarkdownSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one markdown source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider with explicit bounds.
-    #[must_use]
-    pub fn new(limits: SyntaxLimits) -> Self {
+impl Default for MarkdownSyntaxProvider {
+    fn default() -> Self {
         Self {
             language: Language {
                 name: "markdown".to_owned(),
                 dialect: None,
             },
-            limits,
         }
-    }
-}
-
-/// The markdown provider's declared default bounds, proven positive at
-/// compile time.
-const MARKDOWN_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    MarkdownSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
-
-impl Default for MarkdownSyntaxProvider {
-    fn default() -> Self {
-        Self::new(MARKDOWN_SYNTAX_LIMITS_DEFAULT)
     }
 }
 
@@ -311,30 +287,21 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
-        if source.text.len() > self.limits.source_bytes_max() {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: Some(source.path.clone()),
-                source_bytes: source.text.len(),
-                source_bytes_max: self.limits.source_bytes_max(),
-            }));
-        }
-        let trees = facts::parse_markdown_trees(
-            source,
-            self.limits,
-            facts::MarkdownParseBounds::default(),
-        )?;
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
+        limits.admit_source(source)?;
+        let trees =
+            facts::parse_markdown_trees(source, limits, facts::MarkdownParseBounds::default())?;
         let rules = MarkdownRules {
             kinds: markdown_kinds(),
         };
         let (nodes, symbols) = extract::extract(
             trees.block.root_node(),
             source,
-            self.limits,
+            limits,
             &self.language,
             &rules,
         )?;
@@ -346,7 +313,7 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
             trees.block.root_node().has_error(),
         )
         .with_source_witness(source.text);
-        let markdown_facts = facts::extract_markdown_facts(source, &trees, &syntax, self.limits)?;
+        let markdown_facts = facts::extract_markdown_facts(source, &trees, &syntax, limits)?;
         Ok(syntax.with_markdown_facts(markdown_facts))
     }
 
@@ -402,10 +369,13 @@ mod tests {
 
     fn analyze(text: &str) -> SyntaxDocument {
         MarkdownSyntaxProvider::default()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("markdown fixture must parse")
     }
 
@@ -434,14 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_and_byte_bound() {
+    fn test_provider_declares_language() {
         let provider = MarkdownSyntaxProvider::default();
         assert_eq!(provider.language().name, "markdown");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(
-            provider.source_bytes_max(),
-            MarkdownSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
     }
 
     #[test]
@@ -851,10 +817,13 @@ mod tests {
     #[test]
     fn test_provider_enforces_source_node_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
-            MarkdownSyntaxProvider::new(limits).analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            MarkdownSyntaxProvider::default().analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                limits,
+            )
         };
         let source_error = bounded(
             SyntaxLimits::new(3, 10, 10).expect("positive limits"),

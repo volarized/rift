@@ -36,7 +36,8 @@ use rift_ranking::{
     ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms, match_class,
 };
 use rift_syntax::{
-    SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, SyntaxViolation, registry,
+    SyntaxError, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol,
+    SyntaxViolation, registry,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -67,6 +68,7 @@ pub struct WorkspaceIndexLimits {
     declarations_max: usize,
     directory_depth_max: usize,
     results_max: usize,
+    syntax: SyntaxLimits,
 }
 
 impl WorkspaceIndexLimits {
@@ -93,6 +95,7 @@ impl WorkspaceIndexLimits {
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max,
             results_max,
+            syntax: SyntaxLimits::default(),
         }
         .validated()
     }
@@ -173,6 +176,22 @@ impl WorkspaceIndexLimits {
     pub(crate) const fn workspace_bytes_max(self) -> usize {
         self.workspace_bytes_max
     }
+
+    /// Parses every source under `syntax`; the per-file byte bound follows its source bound,
+    /// so the walk admits every file a provider accepts.
+    #[must_use]
+    pub const fn with_syntax(self, syntax: SyntaxLimits) -> Self {
+        Self {
+            file_bytes_max: syntax.source_bytes_max(),
+            syntax,
+            ..self
+        }
+    }
+
+    /// Syntax bounds every source parses under.
+    pub(crate) const fn syntax(self) -> SyntaxLimits {
+        self.syntax
+    }
 }
 
 impl Default for WorkspaceIndexLimits {
@@ -184,6 +203,7 @@ impl Default for WorkspaceIndexLimits {
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
+            syntax: SyntaxLimits::default(),
         }
     }
 }
@@ -1088,8 +1108,9 @@ impl IndexContents {
         text_file: TextSourceFile,
         context_path: &Path,
         provider: &dyn SyntaxProvider,
+        syntax: SyntaxLimits,
     ) -> Result<(), WorkspaceIndexError> {
-        match syntax_read(&text_file, context_path, provider)? {
+        match syntax_read(&text_file, context_path, provider, syntax)? {
             IndexRead::Included(file) => {
                 self.files.insert(file.path().clone(), Arc::new(file));
                 self.hold_text_file(text_file);
@@ -1253,7 +1274,7 @@ impl WorkspaceIndex {
         for (path, provider) in classified.source {
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
                 IndexRead::Included(text_file) => {
-                    contents.hold_source_file(text_file, &path, provider)?;
+                    contents.hold_source_file(text_file, &path, provider, limits.syntax())?;
                 }
                 IndexRead::Skipped(warning) => contents.leave_out(warning),
             }
@@ -1375,7 +1396,12 @@ impl WorkspaceIndex {
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
             IndexRead::Included(text_file) => match class {
                 ClassifiedPath::Source(provider) => {
-                    contents.hold_source_file(text_file, &absolute, provider)?;
+                    contents.hold_source_file(
+                        text_file,
+                        &absolute,
+                        provider,
+                        self.limits.syntax(),
+                    )?;
                 }
                 ClassifiedPath::Text => contents.hold_text_file(text_file),
             },
@@ -1993,7 +2019,12 @@ impl WorkspaceIndex {
             if let Some(ClassifiedPath::Source(provider)) =
                 self.language.classifies(&context_path)?
             {
-                files.push(indexed_file_from_catalog(file, &context_path, provider)?);
+                files.push(indexed_file_from_catalog(
+                    file,
+                    &context_path,
+                    provider,
+                    self.limits.syntax(),
+                )?);
             }
         }
         Self::from_parts(
@@ -2825,8 +2856,9 @@ fn syntax_read(
     file: &TextSourceFile,
     context_path: &Path,
     provider: &dyn SyntaxProvider,
+    limits: SyntaxLimits,
 ) -> Result<IndexRead<IndexedFile>, WorkspaceIndexError> {
-    match indexed_file_from_catalog(file, context_path, provider) {
+    match indexed_file_from_catalog(file, context_path, provider, limits) {
         Ok(indexed) => Ok(IndexRead::Included(indexed)),
         Err(error) => match error.fault().left_out_file(file.path().clone()) {
             Some(warning) => Ok(IndexRead::left_out(warning)),
@@ -2839,12 +2871,16 @@ pub(crate) fn indexed_file_from_catalog(
     file: &TextSourceFile,
     context_path: &Path,
     provider: &dyn SyntaxProvider,
+    limits: SyntaxLimits,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
     let syntax = provider
-        .analyze(SyntaxSource {
-            path: file.path(),
-            text: file.content(),
-        })
+        .analyze(
+            SyntaxSource {
+                path: file.path(),
+                text: file.content(),
+            },
+            limits,
+        )
         .map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
         })?;
@@ -2886,10 +2922,13 @@ pub(crate) fn included_file(
     }
     let source = source_utf8(bytes, context_path)?;
     let syntax = provider
-        .analyze(SyntaxSource {
-            path: &project_path,
-            text: &source,
-        })
+        .analyze(
+            SyntaxSource {
+                path: &project_path,
+                text: &source,
+            },
+            limits.syntax(),
+        )
         .map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
         })?;
@@ -4958,16 +4997,18 @@ mod tests {
     #[test]
     fn test_read_file_classifies_syntax_and_non_nfc_path_failures() {
         let directory = fixture();
-        let limits = WorkspaceIndexLimits::default();
+        let strict_limits = WorkspaceIndexLimits {
+            syntax: SyntaxLimits::new(1, 1, 1).expect("positive bounds"),
+            ..WorkspaceIndexLimits::default()
+        };
         let mut bytes = 0;
-        let strict_parser =
-            RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let parser = RustSyntaxProvider::default();
         let source_path = directory.path().join("src/lib.rs");
         let syntax_error = read_file(
             directory.path(),
             &source_path,
-            &strict_parser,
-            limits,
+            &parser,
+            strict_limits,
             &mut bytes,
         )
         .expect_err("syntax byte bound");
@@ -4983,9 +5024,9 @@ mod tests {
             "a syntax failure must keep the underlying syntax classification"
         );
 
-        let parser = RustSyntaxProvider::default();
         let decomposed = directory.path().join("src/cafe\u{301}.rs");
         fs::write(&decomposed, "fn accent() {}").expect("decomposed source");
+        let limits = WorkspaceIndexLimits::default();
         let path_error = read_file(directory.path(), &decomposed, &parser, limits, &mut bytes)
             .expect_err("non-NFC project path");
         assert_eq!(
@@ -5969,10 +6010,11 @@ mod tests {
             "a syntax fault with no provider refusal behind it fails the build"
         );
 
-        let strict = RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let strict = SyntaxLimits::new(1, 1, 1).expect("positive bounds");
         let text = TextSourceFile::from_content(path.clone(), "pub fn deep() {}\n".to_owned());
-        let refused = indexed_file_from_catalog(&text, context, &strict)
-            .expect_err("the provider's byte bound refuses the file");
+        let refused =
+            indexed_file_from_catalog(&text, context, &RustSyntaxProvider::default(), strict)
+                .expect_err("the syntax byte bound refuses the file");
         assert_eq!(
             refused.fault().left_out_file(path.clone()),
             Some(WorkspaceIndexWarning::SyntaxTooLarge {
@@ -5994,11 +6036,11 @@ mod tests {
             &self.language
         }
 
-        fn source_bytes_max(&self) -> usize {
-            4_096
-        }
-
-        fn analyze(&self, _source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        fn analyze(
+            &self,
+            _source: SyntaxSource<'_>,
+            _limits: SyntaxLimits,
+        ) -> Result<SyntaxDocument, SyntaxError> {
             Err(rift_core::Error::new(
                 rift_syntax::SyntaxFault::UnknownNodeKind {
                     kind: "beacon".to_owned(),
@@ -6020,7 +6062,12 @@ mod tests {
                 .expect("rust is a language"),
         };
 
-        let Err(error) = syntax_read(&text, Path::new("/workspace/lib.rs"), &provider) else {
+        let Err(error) = syntax_read(
+            &text,
+            Path::new("/workspace/lib.rs"),
+            &provider,
+            SyntaxLimits::default(),
+        ) else {
             panic!("a provider fault outside its bounds fails the build");
         };
 
@@ -6833,7 +6880,12 @@ mod tests {
         for name in ["a.rs", "b.rs", "c.rs"] {
             let file = declaring_file(name, 3);
             contents
-                .hold_source_file(file, &root.path().join(name), provider)
+                .hold_source_file(
+                    file,
+                    &root.path().join(name),
+                    provider,
+                    SyntaxLimits::default(),
+                )
                 .expect("the catalog holds the file");
         }
         let built = built_contents(root.path(), contents.sorted(), 4, None)
@@ -6879,7 +6931,12 @@ mod tests {
         for name in ["a.rs", "b.rs"] {
             let file = declaring_file(name, 3);
             contents
-                .hold_source_file(file, &root.path().join(name), provider)
+                .hold_source_file(
+                    file,
+                    &root.path().join(name),
+                    provider,
+                    SyntaxLimits::default(),
+                )
                 .expect("the catalog holds the file");
         }
         let built = built_contents(root.path(), contents.sorted(), 6, None)

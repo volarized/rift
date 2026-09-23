@@ -1273,7 +1273,7 @@ mod tests {
         let text = "About\n=====\n\nOne.\n\nPolicy\n======\n\nTwo.\n\nDetails\n-------\n\nThree.\n";
         let path = ProjectPath::new("AUTHORS.md").expect("valid fixture path");
         let document = crate::markdown::MarkdownSyntaxProvider::default()
-            .analyze(SyntaxSource { path: &path, text })
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
             .expect("setext Markdown parses");
         let facts = document.markdown_facts().expect("Markdown facts");
         let levels = (0..facts.headings().len())
@@ -1294,7 +1294,7 @@ mod tests {
         let text = "# [";
         let path = ProjectPath::new("docs/malformed.md").expect("valid fixture path");
         let document = crate::markdown::MarkdownSyntaxProvider::default()
-            .analyze(SyntaxSource { path: &path, text })
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
             .expect("malformed Markdown still yields facts");
         let facts = document.markdown_facts().expect("Markdown facts");
 

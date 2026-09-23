@@ -16,8 +16,8 @@ use rift_protocol::documentation::{
 use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::TextRange;
 use rift_syntax::{
-    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxDocument, SyntaxProvider,
-    SyntaxSource,
+    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits,
+    SyntaxProvider, SyntaxSource,
 };
 
 use super::failure::{DocumentationError, DocumentationViolation, refused};
@@ -628,10 +628,13 @@ fn markdown_document<'a>(
     }
     let path = source_file_path(input.source())?;
     MarkdownSyntaxProvider::default()
-        .analyze(SyntaxSource {
-            path: &path,
-            text: input.text(),
-        })
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: input.text(),
+            },
+            SyntaxLimits::default(),
+        )
         .map(Cow::Owned)
         .map_err(|error| {
             rift_core::Error::new(

@@ -290,7 +290,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use rift_core::ProjectPath;
-    use rift_syntax::{SyntaxSource, registry};
+    use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
 
     use super::{WorkspaceSemanticError, WorkspaceSemantics, publication_limits};
 
@@ -298,10 +298,13 @@ mod tests {
         let path = ProjectPath::new("src/lib.rs").expect("path");
         registry::provider_for_extension("rs")
             .expect("rust provider")
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub fn beacon() {}\n",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub fn beacon() {}\n",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("document")
     }
 
@@ -314,10 +317,13 @@ mod tests {
         }
         registry::provider_for_extension("rs")
             .expect("rust provider")
-            .analyze(SyntaxSource {
-                path: &path,
-                text: &text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: &text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("document")
     }
 

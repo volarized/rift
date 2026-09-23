@@ -22,8 +22,7 @@ pub struct ExactPackageLimits {
 }
 
 impl ExactPackageLimits {
-    /// Constructs package input bounds; every source parses under its provider's declared
-    /// syntax bounds.
+    /// Constructs package input bounds; every source parses under the default syntax bounds.
     #[must_use]
     pub const fn new(files_max: u32, bytes_max: u64) -> Self {
         Self {
@@ -34,7 +33,7 @@ impl ExactPackageLimits {
         }
     }
 
-    /// Parses every source under `syntax` in place of each provider's declared bounds.
+    /// Parses every source under `syntax` in place of the default bounds.
     ///
     /// A caller that must analyze packages carrying one outsized generated file raises the
     /// bounds here; the package source and byte bounds still apply.
@@ -47,11 +46,11 @@ impl ExactPackageLimits {
         }
     }
 
-    /// Syntax bounds replacing each provider's declared bounds, when the caller set them.
+    /// Syntax bounds every source parses under: the caller's, or the default bounds.
     #[cfg(feature = "collector")]
     #[must_use]
-    pub const fn syntax(self) -> Option<SyntaxLimits> {
-        self.syntax
+    pub fn syntax(self) -> SyntaxLimits {
+        self.syntax.unwrap_or_default()
     }
 
     /// Maximum source count.

@@ -17,7 +17,7 @@ use rift_history::{
 use rift_index::SymbolMatch;
 use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration};
 use rift_protocol::read::{RevisionId, SymbolHistory, SymbolVersion, SymbolVersionKind};
-use rift_syntax::{SyntaxDocument, SyntaxProvider, SyntaxSource, SyntaxSymbol};
+use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
 
 use crate::read::{ReadError, ReadFault, project_path, symbol_id};
 
@@ -43,6 +43,7 @@ pub(crate) struct SymbolTimelines {
     repository: Repository,
     start: ResolvedRevision,
     revisions_max: usize,
+    syntax: SyntaxLimits,
     walks: HashMap<String, PathHistory>,
     parses: HashMap<ParseKey, Option<ParsedRevision>>,
 }
@@ -93,6 +94,7 @@ impl SymbolTimelines {
             repository,
             start,
             revisions_max,
+            syntax: SyntaxLimits::default(),
             walks: HashMap::new(),
             parses: HashMap::new(),
         })
@@ -116,6 +118,7 @@ impl SymbolTimelines {
             repository,
             start,
             revisions_max,
+            syntax,
             walks,
             parses,
             ..
@@ -134,6 +137,7 @@ impl SymbolTimelines {
                 repository,
                 parses,
                 provider,
+                *syntax,
                 path,
                 revision,
                 &matched.symbol.qualified_name,
@@ -177,6 +181,7 @@ fn revision_state(
     repository: &Repository,
     parses: &mut HashMap<ParseKey, Option<ParsedRevision>>,
     provider: &dyn SyntaxProvider,
+    syntax: SyntaxLimits,
     path: &ProjectPath,
     revision: &PathRevision,
     qualified_name: &str,
@@ -187,7 +192,9 @@ fn revision_state(
     let key = (path.as_str().to_owned(), blob.blob_id());
     let cached = match parses.entry(key) {
         Entry::Occupied(occupied) => occupied.into_mut(),
-        Entry::Vacant(vacant) => vacant.insert(parse_blob(repository, provider, path, blob)?),
+        Entry::Vacant(vacant) => {
+            vacant.insert(parse_blob(repository, provider, syntax, path, blob)?)
+        }
     };
     Ok(match cached {
         Some(analysis) => analysis
@@ -202,9 +209,9 @@ fn revision_state(
     })
 }
 
-/// Parses one committed blob through the provider. `None` marks a blob the
-/// tier cannot analyze - over the provider's byte bound, not UTF-8, or
-/// refused by the parser - so its revision contributes no version.
+/// Parses one committed blob through the provider under `syntax`. `None`
+/// marks a blob the tier cannot analyze - over the source byte bound, not
+/// UTF-8, or refused by the parser - so its revision contributes no version.
 ///
 /// # Errors
 ///
@@ -213,10 +220,11 @@ fn revision_state(
 fn parse_blob(
     repository: &Repository,
     provider: &dyn SyntaxProvider,
+    syntax: SyntaxLimits,
     path: &ProjectPath,
     blob: &TreeFile,
 ) -> Result<Option<ParsedRevision>, ReadError> {
-    let bytes = match repository.blob_bytes(blob, provider.source_bytes_max()) {
+    let bytes = match repository.blob_bytes(blob, syntax.source_bytes_max()) {
         Ok(bytes) => bytes,
         Err(error) => {
             return match error.fault() {
@@ -228,7 +236,9 @@ fn parse_blob(
     let Ok(text) = String::from_utf8(bytes) else {
         return Ok(None);
     };
-    let document = provider.analyze(SyntaxSource { path, text: &text }).ok();
+    let document = provider
+        .analyze(SyntaxSource { path, text: &text }, syntax)
+        .ok();
     Ok(document.map(|document| ParsedRevision { text, document }))
 }
 
@@ -550,13 +560,13 @@ mod tests {
             self.inner.language()
         }
 
-        fn source_bytes_max(&self) -> usize {
-            self.inner.source_bytes_max()
-        }
-
-        fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        fn analyze(
+            &self,
+            source: SyntaxSource<'_>,
+            limits: SyntaxLimits,
+        ) -> Result<SyntaxDocument, SyntaxError> {
             self.analyzed.fetch_add(1, Ordering::SeqCst);
-            self.inner.analyze(source)
+            self.inner.analyze(source, limits)
         }
 
         fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {

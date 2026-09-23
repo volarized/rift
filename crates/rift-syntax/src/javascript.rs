@@ -11,46 +11,22 @@ use rift_protocol::read::{Language, NodeFacet};
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
 use crate::failure::SyntaxError;
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Bounded Tree-sitter JavaScript fact provider.
 #[derive(Debug, Clone)]
 pub struct JavaScriptSyntaxProvider {
     language: Language,
-    limits: SyntaxLimits,
 }
 
-impl JavaScriptSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one JavaScript
-    /// source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider with explicit bounds.
-    #[must_use]
-    pub fn new(limits: SyntaxLimits) -> Self {
+impl Default for JavaScriptSyntaxProvider {
+    fn default() -> Self {
         Self {
             language: Language {
                 name: "javascript".to_owned(),
                 dialect: None,
             },
-            limits,
         }
-    }
-}
-
-/// The JavaScript provider's declared default bounds, proven positive at
-/// compile time.
-const JAVASCRIPT_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    JavaScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
-
-impl Default for JavaScriptSyntaxProvider {
-    fn default() -> Self {
-        Self::new(JAVASCRIPT_SYNTAX_LIMITS_DEFAULT)
     }
 }
 
@@ -59,16 +35,16 @@ impl SyntaxProvider for JavaScriptSyntaxProvider {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
         ecmascript::analyze(
             &self.language,
             &javascript_grammar(),
             javascript_kinds(),
-            self.limits,
+            limits,
             source,
         )
     }
@@ -103,22 +79,21 @@ mod tests {
 
     fn analyze(text: &str) -> SyntaxDocument {
         JavaScriptSyntaxProvider::default()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("JavaScript fixture must parse")
     }
 
     #[test]
-    fn test_provider_declares_language_and_byte_bound() {
+    fn test_provider_declares_language() {
         let provider = JavaScriptSyntaxProvider::default();
         assert_eq!(provider.language().name, "javascript");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(
-            provider.source_bytes_max(),
-            JavaScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
     }
 
     #[test]
@@ -325,37 +300,43 @@ mod tests {
 
     #[test]
     fn test_provider_enforces_source_node_and_depth_limits() {
-        let source_error =
-            JavaScriptSyntaxProvider::new(SyntaxLimits::new(3, 10, 10).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let source_error = JavaScriptSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "let x = 1;",
-                })
-                .expect_err("source bound");
+                },
+                SyntaxLimits::new(3, 10, 10).expect("positive limits"),
+            )
+            .expect_err("source bound");
         assert_eq!(
             source_error.fault().violation(),
             SyntaxViolation::SourceTooLarge
         );
 
-        let node_error =
-            JavaScriptSyntaxProvider::new(SyntaxLimits::new(100, 1, 10).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let node_error = JavaScriptSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "let x = 1;",
-                })
-                .expect_err("node bound");
+                },
+                SyntaxLimits::new(100, 1, 10).expect("positive limits"),
+            )
+            .expect_err("node bound");
         assert_eq!(
             node_error.fault().violation(),
             SyntaxViolation::TooManyNodes
         );
 
-        let depth_error =
-            JavaScriptSyntaxProvider::new(SyntaxLimits::new(100, 50, 1).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let depth_error = JavaScriptSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "function f() { if (x) { y(); } }",
-                })
-                .expect_err("depth bound");
+                },
+                SyntaxLimits::new(100, 50, 1).expect("positive limits"),
+            )
+            .expect_err("depth bound");
         assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
     }
 

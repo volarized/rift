@@ -28,9 +28,7 @@ use tree_sitter::{Node, Parser};
 use crate::document::SyntaxDocument;
 use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Grammar spelling of a function definition, `async def` included.
 const FUNCTION_KIND: &str = "function_definition";
@@ -325,37 +323,16 @@ impl GrammarRules for PythonRules {
 #[derive(Debug, Clone)]
 pub struct PythonSyntaxProvider {
     language: Language,
-    limits: SyntaxLimits,
 }
 
-impl PythonSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one Python source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider with explicit bounds.
-    #[must_use]
-    pub fn new(limits: SyntaxLimits) -> Self {
+impl Default for PythonSyntaxProvider {
+    fn default() -> Self {
         Self {
             language: Language {
                 name: "python".to_owned(),
                 dialect: None,
             },
-            limits,
         }
-    }
-}
-
-/// The Python provider's declared default bounds, proven positive at
-/// compile time.
-const PYTHON_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    PythonSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
-
-impl Default for PythonSyntaxProvider {
-    fn default() -> Self {
-        Self::new(PYTHON_SYNTAX_LIMITS_DEFAULT)
     }
 }
 
@@ -380,18 +357,12 @@ impl SyntaxProvider for PythonSyntaxProvider {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
-        if source.text.len() > self.limits.source_bytes_max() {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: Some(source.path.clone()),
-                source_bytes: source.text.len(),
-                source_bytes_max: self.limits.source_bytes_max(),
-            }));
-        }
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
+        limits.admit_source(source)?;
         let mut parser = python_parser()?;
         let tree = parser.parse(source.text, None).ok_or_else(|| {
             Error::new(SyntaxFault::ParseCancelled {
@@ -401,13 +372,8 @@ impl SyntaxProvider for PythonSyntaxProvider {
         let rules = PythonRules {
             kinds: python_kinds(),
         };
-        let (nodes, symbols) = extract::extract(
-            tree.root_node(),
-            source,
-            self.limits,
-            &self.language,
-            &rules,
-        )?;
+        let (nodes, symbols) =
+            extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -452,7 +418,7 @@ mod tests {
     fn analyze(text: &str) -> SyntaxDocument {
         let path = ProjectPath::new("src/service.py").expect("valid fixture path");
         PythonSyntaxProvider::default()
-            .analyze(SyntaxSource { path: &path, text })
+            .analyze(SyntaxSource { path: &path, text }, SyntaxLimits::default())
             .expect("Python fixture must parse")
     }
 
@@ -603,15 +569,15 @@ mod tests {
     fn test_a_source_past_the_byte_bound_refuses() {
         let path = ProjectPath::new("src/service.py").expect("valid fixture path");
         let text = "x = 1\n".repeat(1024);
-        let provider = PythonSyntaxProvider::new(
-            SyntaxLimits::new(16, SYNTAX_NODES_MAX_DEFAULT, SYNTAX_DEPTH_MAX_DEFAULT)
-                .expect("positive fixture bounds"),
-        );
-        let error = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: &text,
-            })
+        let limits = SyntaxLimits::new(16, 250_000, 512).expect("positive fixture bounds");
+        let error = PythonSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: &text,
+                },
+                limits,
+            )
             .expect_err("a source past the byte bound must refuse");
         assert!(error.to_string().contains("source"), "{error}");
     }
@@ -633,13 +599,9 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_and_byte_bound() {
+    fn test_provider_declares_language() {
         let provider = PythonSyntaxProvider::default();
         assert_eq!(provider.language().name, "python");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(
-            provider.source_bytes_max(),
-            PythonSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
     }
 }

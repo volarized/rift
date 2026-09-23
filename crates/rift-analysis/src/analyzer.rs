@@ -1331,13 +1331,12 @@ fn wire_path(path: &CoreProjectPath) -> ProjectPath {
     ProjectPath(path.as_str().to_owned())
 }
 
-/// One package file parsed by the provider its extension names, under `syntax_limits` when
-/// the caller replaced the provider's declared bounds.
+/// One package file parsed by the provider its extension names, under `syntax_limits`.
 fn parsed_file(
     file: crate::input::PackageSource<'_>,
     package: &PackageIdentity,
     package_language: &Language,
-    syntax_limits: Option<SyntaxLimits>,
+    syntax_limits: SyntaxLimits,
 ) -> Result<IndexedFile, PackageAnalysisError> {
     let context = Path::new(file.path().as_str());
     let extension = context
@@ -1348,28 +1347,20 @@ fn parsed_file(
     let syntax = if matches!(extension, "rst" | "txt" | "ipynb") {
         SyntaxDocument::empty(language, file.path().clone())
     } else {
-        let unsupported = || {
-            PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
-                .at(file.path())
-                .into_error()
-        };
-        let limited;
-        let provider: &dyn rift_syntax::SyntaxProvider = match syntax_limits {
-            Some(limits) => {
-                limited =
-                    rift_syntax::registry::provider_for_extension_with_limits(extension, limits)
-                        .ok_or_else(unsupported)?;
-                limited.as_ref()
-            }
-            None => {
-                rift_syntax::registry::provider_for_extension(extension).ok_or_else(unsupported)?
-            }
-        };
+        let provider =
+            rift_syntax::registry::provider_for_extension(extension).ok_or_else(|| {
+                PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
+                    .at(file.path())
+                    .into_error()
+            })?;
         provider
-            .analyze(rift_syntax::SyntaxSource {
-                path: file.path(),
-                text: file.text(),
-            })
+            .analyze(
+                rift_syntax::SyntaxSource {
+                    path: file.path(),
+                    text: file.text(),
+                },
+                syntax_limits,
+            )
             .map_err(|error| {
                 PackageAnalysisFault::new(PackageAnalysisViolation::Syntax, package)
                     .at(file.path())
@@ -1545,7 +1536,7 @@ mod tests {
         PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
     };
     use rift_protocol::read::{Language, PackageIdentity};
-    use rift_syntax::ShippedLanguage;
+    use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
     use super::{PackageAnalysis, PackageAnalyzer, bound};
     use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
@@ -1598,7 +1589,7 @@ mod tests {
             PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
             &package,
             &language(ShippedLanguage::Rust),
-            None,
+            SyntaxLimits::default(),
         )
         .expect_err("unsupported source extension");
         assert_eq!(

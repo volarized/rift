@@ -11,9 +11,7 @@ use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, Streaming
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault, incompatible_grammar, invalid_query};
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Rust declaration kind emitted by the Tree-sitter provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -294,11 +292,11 @@ impl RustQuery {
                 bound: SyntaxBound::CapturesMax,
             }));
         }
-        if source.len() > RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT {
+        if source.len() > SOURCE_BYTES_MAX_DEFAULT {
             return Err(Error::new(SyntaxFault::SourceTooLarge {
                 path: None,
                 source_bytes: source.len(),
-                source_bytes_max: RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
+                source_bytes_max: SOURCE_BYTES_MAX_DEFAULT,
             }));
         }
         let mut parser = rust_parser()?;
@@ -326,37 +324,16 @@ impl RustQuery {
 #[derive(Debug, Clone)]
 pub struct RustSyntaxProvider {
     language: Language,
-    limits: SyntaxLimits,
 }
 
-impl RustSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one Rust source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider with explicit bounds.
-    #[must_use]
-    pub fn new(limits: SyntaxLimits) -> Self {
+impl Default for RustSyntaxProvider {
+    fn default() -> Self {
         Self {
             language: Language {
                 name: "rust".to_owned(),
                 dialect: None,
             },
-            limits,
         }
-    }
-}
-
-/// The Rust provider's declared default bounds, proven positive at compile
-/// time.
-const RUST_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
-
-impl Default for RustSyntaxProvider {
-    fn default() -> Self {
-        Self::new(RUST_SYNTAX_LIMITS_DEFAULT)
     }
 }
 
@@ -365,18 +342,12 @@ impl SyntaxProvider for RustSyntaxProvider {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
-        if source.text.len() > self.limits.source_bytes_max() {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: Some(source.path.clone()),
-                source_bytes: source.text.len(),
-                source_bytes_max: self.limits.source_bytes_max(),
-            }));
-        }
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
+        limits.admit_source(source)?;
         let mut parser = rust_parser()?;
         let tree = parser.parse(source.text, None).ok_or_else(|| {
             Error::new(SyntaxFault::ParseCancelled {
@@ -386,7 +357,7 @@ impl SyntaxProvider for RustSyntaxProvider {
         let (nodes, symbols) = extract::extract(
             tree.root_node(),
             source,
-            self.limits,
+            limits,
             &self.language,
             &RustGrammarRules,
         )?;
@@ -670,10 +641,13 @@ mod tests {
 
     fn analyze(text: &str) -> SyntaxDocument {
         RustSyntaxProvider::default()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("Rust fixture must parse")
     }
 
@@ -919,14 +893,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_and_byte_bound() {
+    fn test_provider_declares_language() {
         let provider = RustSyntaxProvider::default();
         assert_eq!(provider.language().name, "rust");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(
-            provider.source_bytes_max(),
-            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
     }
 
     #[test]
@@ -974,37 +944,43 @@ mod tests {
                 .violation(),
             SyntaxViolation::ZeroLimit,
         );
-        let source_error =
-            RustSyntaxProvider::new(SyntaxLimits::new(3, 10, 10).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let source_error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
-                })
-                .expect_err("source bound");
+                },
+                SyntaxLimits::new(3, 10, 10).expect("positive limits"),
+            )
+            .expect_err("source bound");
         assert_eq!(
             source_error.fault().violation(),
             SyntaxViolation::SourceTooLarge
         );
 
-        let node_error =
-            RustSyntaxProvider::new(SyntaxLimits::new(100, 1, 10).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let node_error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
-                })
-                .expect_err("node bound");
+                },
+                SyntaxLimits::new(100, 1, 10).expect("positive limits"),
+            )
+            .expect_err("node bound");
         assert_eq!(
             node_error.fault().violation(),
             SyntaxViolation::TooManyNodes
         );
 
-        let depth_error =
-            RustSyntaxProvider::new(SyntaxLimits::new(100, 20, 1).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let depth_error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "fn x() { { 1 } }",
-                })
-                .expect_err("depth bound");
+                },
+                SyntaxLimits::new(100, 20, 1).expect("positive limits"),
+            )
+            .expect_err("depth bound");
         assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
     }
 
@@ -1079,11 +1055,14 @@ mod tests {
 
     #[test]
     fn test_source_too_large_error_reports_sizes_path_and_limit_origin() {
-        let error = RustSyntaxProvider::new(SyntaxLimits::new(3, 10, 10).expect("positive limits"))
-            .analyze(SyntaxSource {
-                path: &path(),
-                text: "fn x() {}",
-            })
+        let error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text: "fn x() {}",
+                },
+                SyntaxLimits::new(3, 10, 10).expect("positive limits"),
+            )
             .expect_err("source bound");
         assert_eq!(
             error.descriptor().name(),
@@ -1098,7 +1077,7 @@ mod tests {
         );
 
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
-        let oversized = "a".repeat(RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT + 1);
+        let oversized = "a".repeat(SOURCE_BYTES_MAX_DEFAULT + 1);
         let error = query.captures(&oversized, 1).expect_err("oversized source");
         assert_eq!(error.fault().violation(), SyntaxViolation::SourceTooLarge);
         assert_eq!(
@@ -1108,21 +1087,23 @@ mod tests {
                  path <raw text>, source_bytes {bytes}, source_bytes_max {max}; \
                  resize the request below the named limit, or raise that limit \
                  in the workspace configuration",
-                bytes = RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT + 1,
-                max = RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
+                bytes = SOURCE_BYTES_MAX_DEFAULT + 1,
+                max = SOURCE_BYTES_MAX_DEFAULT,
             )
         );
     }
 
     #[test]
     fn test_tree_bound_errors_report_path_and_configured_limit() {
-        let node_error =
-            RustSyntaxProvider::new(SyntaxLimits::new(100, 1, 10).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let node_error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "fn x() {}",
-                })
-                .expect_err("node bound");
+                },
+                SyntaxLimits::new(100, 1, 10).expect("positive limits"),
+            )
+            .expect_err("node bound");
         assert_eq!(
             node_error.to_string(),
             "the request exceeded a declared resource limit: \
@@ -1131,13 +1112,15 @@ mod tests {
              in the workspace configuration"
         );
 
-        let depth_error =
-            RustSyntaxProvider::new(SyntaxLimits::new(100, 20, 1).expect("positive limits"))
-                .analyze(SyntaxSource {
+        let depth_error = RustSyntaxProvider::default()
+            .analyze(
+                SyntaxSource {
                     path: &path(),
                     text: "fn x() { { 1 } }",
-                })
-                .expect_err("depth bound");
+                },
+                SyntaxLimits::new(100, 20, 1).expect("positive limits"),
+            )
+            .expect_err("depth bound");
         assert_eq!(
             depth_error.to_string(),
             "the request exceeded a declared resource limit: \

@@ -6,6 +6,7 @@
 
 use rift_core::ProjectPath;
 use rift_protocol::read::Language;
+use rift_syntax::SyntaxLimits;
 use rift_syntax::{SyntaxDocument, SyntaxSource, registry};
 
 /// Fixtures proving one provider's `signatures` and `documentation` facts.
@@ -79,10 +80,13 @@ fn path() -> ProjectPath {
 
 fn analyze(provider: &dyn rift_syntax::SyntaxProvider, text: &str) -> SyntaxDocument {
     provider
-        .analyze(SyntaxSource {
-            path: &path(),
-            text,
-        })
+        .analyze(
+            SyntaxSource {
+                path: &path(),
+                text,
+            },
+            SyntaxLimits::default(),
+        )
         .expect("fixture must parse")
 }
 

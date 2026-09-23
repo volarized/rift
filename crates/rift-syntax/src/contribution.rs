@@ -303,6 +303,7 @@ pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnit
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::SyntaxLimits;
     use rift_core::{ProjectPath, ProviderRevision, SourceRevision, SymbolId, TreeRevision};
 
     use super::SyntaxPublicationBuilder;
@@ -325,10 +326,13 @@ mod tests {
         let provider = RustSyntaxProvider::default();
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let document = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub struct Beacon; impl Beacon { pub fn run() {} }",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub struct Beacon; impl Beacon { pub fn run() {} }",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("syntax document");
         let mut builder = SyntaxPublicationBuilder::new(
             publication(1),
@@ -379,10 +383,13 @@ mod tests {
         let provider = RustSyntaxProvider::default();
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let document = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub struct Beacon;",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub struct Beacon;",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("syntax document");
         let mut builder = SyntaxPublicationBuilder::new(
             publication(1),
@@ -411,10 +418,13 @@ mod tests {
         let provider = RustSyntaxProvider::default();
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let document = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub fn spawn() {}\npub struct Runtime; impl Runtime { pub fn new() {} }",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub fn spawn() {}\npub struct Runtime; impl Runtime { pub fn new() {} }",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("syntax document");
         let package = PackageIdentity {
             manager: "cargo".to_owned(),
