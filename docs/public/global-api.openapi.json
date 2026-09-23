@@ -1,0 +1,2533 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Rift Global Package API",
+    "description": "REST contract for package capabilities, resolution, declaration search, and symbol reads.",
+    "version": "0.0.43"
+  },
+  "security": [
+    {},
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "summary": "Read package API capabilities.",
+        "description": "Returns supported package managers, features, publication revisions, and active bounds.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Capabilities and active bounds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "supported_package_managers": [
+                        "cargo",
+                        "npm",
+                        "pypi"
+                      ],
+                      "supported_features": [
+                        "resolutions",
+                        "search",
+                        "symbols"
+                      ],
+                      "publication_format": "rift-package-index-v1",
+                      "analyzer_revision": "2026-09-22",
+                      "corpus_revision": "2026-09-22",
+                      "required_search_fields": [
+                        "name",
+                        "qualified_name",
+                        "documentation",
+                        "signature",
+                        "declaration_source"
+                      ],
+                      "bounds": {
+                        "request_body_bytes_max": 4194304,
+                        "response_body_bytes_max": 33554432,
+                        "dependency_entries_max": 20000,
+                        "query_bytes_max": 4096,
+                        "query_terms_max": 32,
+                        "query_term_bytes_max": 256,
+                        "identifiers_max": 16,
+                        "identifier_bytes_max": 4096,
+                        "packages_max": 20000,
+                        "page_limit_min": 1,
+                        "page_limit_max": 200,
+                        "page_limit_default": 100,
+                        "cursor_bytes_max": 4096,
+                        "candidate_pool_max": 1000,
+                        "warnings_max": 32,
+                        "source_bytes_max": 1048576
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/Cache-Control"
+              }
+            }
+          },
+          "304": {
+            "description": "The cached capability representation has not changed.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/Cache-Control"
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
+    },
+    "/v1/resolutions": {
+      "post": {
+        "operationId": "resolvePackageContext",
+        "summary": "Resolve package context.",
+        "description": "Classifies canonical exact versions and declared requirements against indexed package versions.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "description": "Canonical package context.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageResolutionRequest"
+              },
+              "examples": {
+                "valid": {
+                  "summary": "Valid request",
+                  "value": {
+                    "entries": [
+                      {
+                        "manager": "cargo",
+                        "name": "serde",
+                        "availability": "canonical",
+                        "version": "1.0.219"
+                      },
+                      {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "availability": "canonical",
+                        "requirement": "^5.7.2"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resolution result accounting for every submitted entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageResolutionResponse"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "available_exact": [
+                        {
+                          "manager": "cargo",
+                          "name": "serde",
+                          "version": "1.0.219"
+                        }
+                      ],
+                      "resolved_requirements": [
+                        {
+                          "entry": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "availability": "canonical",
+                            "requirement": "^5.7.2"
+                          },
+                          "package": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "version": "5.7.2"
+                          }
+                        }
+                      ],
+                      "missing_exact": [],
+                      "missing_requirements": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
+    },
+    "/v1/search": {
+      "post": {
+        "operationId": "searchPackages",
+        "summary": "Search package declarations.",
+        "description": "Returns one ranked declaration page from selected exact package versions.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "requestBody": {
+          "description": "Structured package search query.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageSearchRequest"
+              },
+              "examples": {
+                "valid": {
+                  "summary": "Valid request",
+                  "value": {
+                    "query": "ReadService",
+                    "terms": [
+                      {
+                        "text": "ReadService",
+                        "phrase": false,
+                        "prefix": false
+                      }
+                    ],
+                    "identifiers": [
+                      "readservice"
+                    ],
+                    "packages": [
+                      {
+                        "manager": "cargo",
+                        "name": "serde",
+                        "version": "1.0.219"
+                      }
+                    ],
+                    "phase": "precise"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One ranked package declaration page.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageSearchPage"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "items": [
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "name": "serde",
+                            "version": "1.0.219"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/rust/rift-server/ReadService",
+                            "language": "rust",
+                            "name": "ReadService",
+                            "kind": "struct",
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "name": "serde",
+                                "version": "1.0.219"
+                              },
+                              "source_kind": "authored"
+                            }
+                          },
+                          "unit": "rift://source/cargo/serde-1.0.219/src/de.rs",
+                          "range": {
+                            "start": 0,
+                            "end": 10
+                          },
+                          "line": 1,
+                          "contributing_fields": [
+                            "name"
+                          ],
+                          "match_class": "name_exact"
+                        }
+                      ],
+                      "warnings": [],
+                      "publication_format": "rift-package-index-v1",
+                      "analyzer_revision": "2026-09-22",
+                      "corpus_revision": "2026-09-22",
+                      "next_cursor": "eyJwYWdlIjoyfQ"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
+    },
+    "/v1/symbols": {
+      "post": {
+        "operationId": "listPackageSymbols",
+        "summary": "List package symbols.",
+        "description": "Returns one declaration page from selected exact package versions.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "requestBody": {
+          "description": "Package declaration lookup query.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageSymbolRequest"
+              },
+              "examples": {
+                "valid": {
+                  "summary": "Valid request",
+                  "value": {
+                    "name": "ReadService",
+                    "language": "rust",
+                    "include": [
+                      "source"
+                    ],
+                    "packages": [
+                      {
+                        "manager": "cargo",
+                        "name": "serde",
+                        "version": "1.0.219"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One package declaration page.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageSymbolPage"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "items": [
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "name": "serde",
+                            "version": "1.0.219"
+                          },
+                          "symbol": {
+                            "id": "rift://symbol/rust/rift-server/ReadService",
+                            "language": "rust",
+                            "name": "ReadService",
+                            "kind": "struct",
+                            "origin": {
+                              "location": "dependency",
+                              "package": {
+                                "manager": "cargo",
+                                "name": "serde",
+                                "version": "1.0.219"
+                              },
+                              "source_kind": "authored"
+                            }
+                          },
+                          "unit": "rift://source/cargo/serde-1.0.219/src/de.rs",
+                          "range": {
+                            "start": 0,
+                            "end": 10
+                          },
+                          "line": 1,
+                          "match_class": "name_exact"
+                        }
+                      ],
+                      "warnings": [],
+                      "publication_format": "rift-package-index-v1",
+                      "analyzer_revision": "2026-09-22",
+                      "corpus_revision": "2026-09-22",
+                      "next_cursor": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque token"
+      }
+    },
+    "parameters": {
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Maximum entries in one page.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 100
+        }
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque cursor for the next page.",
+        "schema": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      }
+    },
+    "schemas": {
+      "PackageIdentity": {
+        "additionalProperties": false,
+        "description": "One package as its package manager identifies it.",
+        "properties": {
+          "manager": {
+            "description": "Package manager or ecosystem name.",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "name": {
+            "description": "Package name in that ecosystem.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "version": {
+            "description": "Resolved package version.",
+            "maxLength": 4096,
+            "type": "string"
+          }
+        },
+        "required": [
+          "manager",
+          "name",
+          "version"
+        ],
+        "type": "object"
+      },
+      "SourceUnitId": {
+        "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+        "maxLength": 8192,
+        "minLength": 17,
+        "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+        "type": "string"
+      },
+      "SymbolId": {
+        "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+        "examples": [
+          "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+        ],
+        "maxLength": 8192,
+        "minLength": 17,
+        "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+        "type": "string"
+      },
+      "Symbol": {
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
+        "properties": {
+          "container": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SymbolId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
+          },
+          "document_local": {
+            "default": false,
+            "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
+            "type": "boolean"
+          },
+          "documentation": {
+            "default": [],
+            "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/Documentation"
+            },
+            "type": "array"
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "default": {},
+            "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
+          },
+          "facets": {
+            "default": [],
+            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
+            "items": {
+              "$ref": "#/components/schemas/SymbolFacet"
+            },
+            "type": "array"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SymbolId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExactKind",
+            "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
+          },
+          "language": {
+            "$ref": "#/components/schemas/Language",
+            "description": "The language this symbol belongs to."
+          },
+          "modifiers": {
+            "default": [],
+            "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SymbolOrigin",
+            "default": {
+              "location": "project",
+              "source_kind": "authored"
+            },
+            "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
+          },
+          "signatures": {
+            "default": [],
+            "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
+            "items": {
+              "$ref": "#/components/schemas/Signature"
+            },
+            "type": "array"
+          },
+          "types": {
+            "default": [],
+            "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/TypeBinding"
+            },
+            "type": "array"
+          },
+          "visibility": {
+            "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "language",
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "SymbolOrigin": {
+        "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
+        "properties": {
+          "location": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceLocationKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
+          },
+          "package": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PackageIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
+          },
+          "source_kind": {
+            "$ref": "#/components/schemas/SourceKind",
+            "description": "Whether the declaration is authored, generated, or synthetic."
+          }
+        },
+        "required": [
+          "source_kind"
+        ],
+        "type": "object"
+      },
+      "SourceKind": {
+        "description": "How source or a declaration came to exist.",
+        "type": "string",
+        "enum": [
+          "authored",
+          "generated",
+          "synthetic"
+        ],
+        "x-enum-descriptions": [
+          "A person wrote it.",
+          "A tool produced it from other source.",
+          "The provider minted it without any source text."
+        ]
+      },
+      "SourceLocationKind": {
+        "description": "Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package\nownership is the separate `package` field: a `project` declaration can carry one too,\nand `dependency` always does.",
+        "type": "string",
+        "enum": [
+          "project",
+          "dependency",
+          "stdlib",
+          "external"
+        ],
+        "x-enum-descriptions": [
+          "Owned by the current workspace.",
+          "Owned by one resolved dependency.",
+          "Installed with the language toolchain.",
+          "Outside the project, dependency graph, and standard library."
+        ]
+      },
+      "Language": {
+        "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+        "examples": [
+          "rust"
+        ],
+        "maxLength": 129,
+        "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
+        "type": "string"
+      },
+      "Documentation": {
+        "description": "One block of documentation attached to a declaration, in the markup it was written in.",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/DocumentationFormat",
+            "description": "Markup the comment text uses."
+          },
+          "text": {
+            "description": "The body of the comment, with the comment syntax stripped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "text"
+        ],
+        "type": "object"
+      },
+      "DocumentationFormat": {
+        "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",
+        "type": "string",
+        "enum": [
+          "plain",
+          "markdown"
+        ],
+        "x-enum-descriptions": [
+          "Plain text with no markup to render.",
+          "Markdown as authored in the source."
+        ]
+      },
+      "Extensions": {
+        "additionalProperties": false,
+        "description": "Facts a provider carries that the model has no field for, under a reverse-domain key.\nKeys and values use RFC 8785 canonical JSON. Consumers skip entries they do not\nimplement.",
+        "patternProperties": {
+          "^[a-z0-9]+(?:[.-][a-z0-9]+)+\\.[A-Za-z][A-Za-z0-9_-]*$": {
+            "$ref": "#/components/schemas/ExtensionValue"
+          }
+        },
+        "type": "object"
+      },
+      "ExtensionValue": {
+        "additionalProperties": false,
+        "description": "Versioned extension value. data is validated against the schema advertised for its key\nand version.",
+        "properties": {
+          "data": {
+            "description": "The value itself, shaped by whatever that key and version advertise. Rift carries it\nand never interprets it."
+          },
+          "version": {
+            "description": "Which version of the key's advertised schema shaped `data`. A consumer skips a value\nwhose version it does not implement.",
+            "format": "uint64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "data"
+        ],
+        "type": "object"
+      },
+      "SymbolFacet": {
+        "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
+        "type": "string",
+        "enum": [
+          "namespace",
+          "module",
+          "type",
+          "value",
+          "callable",
+          "member",
+          "member_container",
+          "parameter",
+          "type_parameter",
+          "constructible",
+          "extensible",
+          "implementable",
+          "macro",
+          "test",
+          "annotation",
+          "extension",
+          "variant",
+          "enumeration",
+          "alias",
+          "property",
+          "abstract",
+          "constructor",
+          "static",
+          "mutable",
+          "public",
+          "deprecated",
+          "entrypoint",
+          "operator",
+          "async",
+          "generator"
+        ],
+        "x-enum-descriptions": [
+          "A named scope that groups declarations.",
+          "A compilation or import unit.",
+          "Names a type.",
+          "Holds a runtime value.",
+          "Can be invoked.",
+          "Belongs to a containing type.",
+          "Owns members of its own.",
+          "A declared input of a callable.",
+          "A generic parameter a declaration abstracts over.",
+          "Instances of it can be created.",
+          "Other types can inherit from it.",
+          "Other types can fulfil it.",
+          "Expands at compile time.",
+          "Exercises other code as a test.",
+          "Decorates other declarations.",
+          "Adds members to a type declared elsewhere.",
+          "One case of an enumeration.",
+          "A closed set of variants.",
+          "Another name for an existing symbol.",
+          "A member accessed like a field but backed by code.",
+          "Declared without a complete implementation.",
+          "Creates instances of its container.",
+          "Belongs to the type rather than an instance.",
+          "Its value can change after initialization.",
+          "Visible outside its declaring scope.",
+          "Marked as discouraged for new use.",
+          "Where execution starts.",
+          "Invoked through operator syntax.",
+          "Runs asynchronously.",
+          "Yields a sequence of values over time."
+        ]
+      },
+      "ExactKind": {
+        "description": "A provider-local kind preserving the construct name used by that language implementation.",
+        "pattern": "^[A-Za-z][A-Za-z0-9._-]*$",
+        "type": "string"
+      },
+      "Signature": {
+        "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
+        "properties": {
+          "display": {
+            "description": "The signature as a reader sees it, in the language's own syntax.",
+            "type": "string"
+          },
+          "effects": {
+            "default": [],
+            "description": "Effect keywords the declaration carries, in the language's own words: `async`,\n`unsafe`, `pure`. The spelling is preserved and never mapped onto a portable\nmeaning; absent when empty.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "default": {},
+            "description": "Signature facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
+          },
+          "language": {
+            "$ref": "#/components/schemas/Language",
+            "description": "The language whose syntax `display` is written in."
+          },
+          "links": {
+            "default": [],
+            "description": "Symbols named inside `display`, each with the byte range of `display` that names it,\nso a renderer can turn the rendered text into links. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/SignatureLink"
+            },
+            "type": "array"
+          },
+          "parameters": {
+            "default": [],
+            "description": "Declared parameters, in source order. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/Parameter"
+            },
+            "type": "array"
+          },
+          "receiver": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Parameter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
+          },
+          "returns": {
+            "default": [],
+            "description": "What the call yields, absent when empty. An array because a language may return\nseveral values, and because a declared and an inferred return are separate\nbindings.",
+            "items": {
+              "$ref": "#/components/schemas/TypeBinding"
+            },
+            "type": "array"
+          },
+          "throws": {
+            "default": [],
+            "description": "Types this form declares it can raise. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/TypeExpression"
+            },
+            "type": "array"
+          },
+          "type_parameters": {
+            "default": [],
+            "description": "The generic parameters this form declares, each as the symbol that declares it.\nAbsent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/SymbolId"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "display",
+          "language"
+        ],
+        "type": "object"
+      },
+      "Parameter": {
+        "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
+        "properties": {
+          "default": {
+            "description": "The default value as written in the source. Absent where there is none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "default": {},
+            "description": "Parameter facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
+          },
+          "name": {
+            "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where this parameter is written in the source."
+          },
+          "optional": {
+            "description": "Whether a call may leave it out.",
+            "type": "boolean"
+          },
+          "types": {
+            "default": [],
+            "description": "What it accepts, absent when empty. An array because a declared type and an\ninferred one are separate bindings.",
+            "items": {
+              "$ref": "#/components/schemas/TypeBinding"
+            },
+            "type": "array"
+          },
+          "variadic": {
+            "description": "Whether it absorbs the arguments that follow - `*args`, `...rest`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "optional",
+          "variadic"
+        ],
+        "type": "object"
+      },
+      "NodeId": {
+        "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
+        "examples": [
+          "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+        ],
+        "maxLength": 8192,
+        "minLength": 27,
+        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+        "type": "string"
+      },
+      "TypeBinding": {
+        "description": "One type a symbol carries, together with the role it plays for that symbol.",
+        "properties": {
+          "origin": {
+            "$ref": "#/components/schemas/TypeBindingOrigin",
+            "description": "Where the type fact came from."
+          },
+          "role": {
+            "$ref": "#/components/schemas/TypeBindingRole",
+            "description": "The role this type plays for the symbol."
+          },
+          "type": {
+            "$ref": "#/components/schemas/TypeExpression",
+            "description": "The type itself."
+          }
+        },
+        "required": [
+          "role",
+          "origin",
+          "type"
+        ],
+        "type": "object"
+      },
+      "TypeBindingRole": {
+        "description": "What this type is to the symbol that carries it.",
+        "type": "string",
+        "enum": [
+          "receiver",
+          "parameter",
+          "return",
+          "field",
+          "bound",
+          "element",
+          "key",
+          "error",
+          "underlying",
+          "yielded",
+          "awaited",
+          "discriminant"
+        ],
+        "x-enum-descriptions": [
+          "The type of the implicit first parameter.",
+          "The type a parameter accepts.",
+          "The type a call yields.",
+          "The type a field holds.",
+          "A constraint on a type parameter.",
+          "The type of a collection's entries.",
+          "The type a map is indexed by.",
+          "The type of the failure a fallible result carries.",
+          "The type an alias or wrapper stands for.",
+          "The type a generator produces per step.",
+          "The type awaiting the value resolves to.",
+          "The type that tags which variant a value holds."
+        ]
+      },
+      "TypeBindingOrigin": {
+        "description": "Where the type fact came from. A declared type and an inferred one can both be present\nand disagree, which is the interesting case.",
+        "type": "string",
+        "enum": [
+          "declared",
+          "inferred",
+          "expected"
+        ],
+        "x-enum-descriptions": [
+          "Written in the source by the author.",
+          "Worked out by the provider from usage.",
+          "Required by the surrounding context."
+        ]
+      },
+      "TypeExpression": {
+        "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
+        "properties": {
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "default": {},
+            "description": "Type facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
+          },
+          "language": {
+            "$ref": "#/components/schemas/Language",
+            "description": "The language the spelling is in, and so which provider produced it."
+          },
+          "resolved": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SymbolId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
+          },
+          "source": {
+            "description": "The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "language",
+          "source"
+        ],
+        "type": "object"
+      },
+      "SignatureLink": {
+        "description": "One symbol named inside a rendered signature, with the byte range of that rendering which\nnames it.",
+        "properties": {
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Offsets into the rendered string in `Signature.display`."
+          },
+          "symbol": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol that stretch of text names."
+          }
+        },
+        "required": [
+          "range",
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "TextRange": {
+        "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+        "properties": {
+          "end": {
+            "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "description": "First byte of the range, counted from the start of the file.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "PackageContextEntry": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "version"
+                ]
+              },
+              {
+                "required": [
+                  "requirement"
+                ]
+              }
+            ]
+          }
+        ],
+        "description": "One package the workspace depends on, as its manifests and lockfiles state it.\n\nEntries order by manager, then name, then the selector they state: a declared\nrequirement before an exact version.",
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/PackageAvailability",
+            "description": "Whether a global package index can answer for this entry."
+          },
+          "manager": {
+            "description": "Package manager or ecosystem name.",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "name": {
+            "description": "Package name in that ecosystem.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "requirement": {
+            "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
+            "maxLength": 4096,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
+            "maxLength": 4096,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "manager",
+          "name",
+          "availability"
+        ],
+        "type": "object"
+      },
+      "PackageAvailability": {
+        "description": "Whether a global package index can answer for one package.",
+        "type": "string",
+        "enum": [
+          "canonical",
+          "local_only"
+        ],
+        "x-enum-descriptions": [
+          "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
+          "The entry names a path, git, or custom-registry package only this machine can\nanswer for."
+        ]
+      },
+      "PublicationFormat": {
+        "description": "Publication format used by the package index.",
+        "type": "string",
+        "enum": [
+          "rift-package-index-v1",
+          "unknown"
+        ]
+      },
+      "QueryTerm": {
+        "additionalProperties": false,
+        "description": "One bounded member from the parsed query.",
+        "properties": {
+          "text": {
+            "description": "One parsed query term or phrase.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "phrase": {
+            "description": "Whether the caller quoted this term.",
+            "type": "boolean"
+          },
+          "prefix": {
+            "description": "Whether the remote index widens this term as a prefix.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "text",
+          "phrase",
+          "prefix"
+        ],
+        "type": "object"
+      },
+      "Warning": {
+        "additionalProperties": true,
+        "description": "One condition the caller must account for.",
+        "properties": {
+          "code": {
+            "description": "Stable warning code.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "enum": [
+              "query_narrowed",
+              "source_truncated",
+              "publication_changed",
+              "capability_unavailable",
+              "result_truncated",
+              "unknown"
+            ]
+          },
+          "detail": {
+            "description": "Bounded explanation for the warning.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "CapabilityBounds": {
+        "additionalProperties": true,
+        "description": "Active server ceilings for requests and responses.",
+        "properties": {
+          "request_body_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4194304
+          },
+          "response_body_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 33554432
+          },
+          "dependency_entries_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20000
+          },
+          "query_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "query_terms_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32
+          },
+          "query_term_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          },
+          "identifiers_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16
+          },
+          "identifier_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "packages_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20000
+          },
+          "page_limit_min": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "page_limit_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "page_limit_default": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "cursor_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "candidate_pool_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "warnings_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32
+          },
+          "source_bytes_max": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1048576
+          }
+        },
+        "required": [
+          "request_body_bytes_max",
+          "response_body_bytes_max",
+          "dependency_entries_max",
+          "query_bytes_max",
+          "query_terms_max",
+          "query_term_bytes_max",
+          "identifiers_max",
+          "identifier_bytes_max",
+          "packages_max",
+          "page_limit_min",
+          "page_limit_max",
+          "page_limit_default",
+          "cursor_bytes_max",
+          "candidate_pool_max",
+          "warnings_max",
+          "source_bytes_max"
+        ],
+        "type": "object"
+      },
+      "Capabilities": {
+        "additionalProperties": true,
+        "description": "Capabilities and active bounds for the package API.",
+        "properties": {
+          "supported_package_managers": {
+            "description": "Supported package managers.",
+            "items": {
+              "description": "Package manager name.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3
+          },
+          "supported_features": {
+            "description": "Supported API features.",
+            "items": {
+              "description": "Feature name.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32
+          },
+          "publication_format": {
+            "$ref": "#/components/schemas/PublicationFormat"
+          },
+          "analyzer_revision": {
+            "description": "Analyzer revision used to produce declarations.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "corpus_revision": {
+            "description": "Corpus revision used to answer reads.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "required_search_fields": {
+            "description": "Fields required for package search.",
+            "items": {
+              "description": "Search field name.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/CapabilityBounds"
+          }
+        },
+        "required": [
+          "supported_package_managers",
+          "supported_features",
+          "publication_format",
+          "analyzer_revision",
+          "corpus_revision",
+          "required_search_fields",
+          "bounds"
+        ],
+        "type": "object"
+      },
+      "PackageResolutionRequest": {
+        "additionalProperties": false,
+        "description": "Canonical dependency context submitted for package resolution.",
+        "properties": {
+          "entries": {
+            "description": "Canonical dependency context entries.",
+            "items": {
+              "$ref": "#/components/schemas/PackageContextEntry"
+            },
+            "type": "array",
+            "maxItems": 20000
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "type": "object"
+      },
+      "ResolvedRequirement": {
+        "additionalProperties": true,
+        "description": "One submitted requirement paired with its resolved package.",
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/PackageContextEntry"
+          },
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          }
+        },
+        "required": [
+          "entry",
+          "package"
+        ],
+        "type": "object"
+      },
+      "PackageResolutionResponse": {
+        "additionalProperties": true,
+        "description": "Resolution result accounting for each submitted entry.",
+        "properties": {
+          "available_exact": {
+            "description": "Exact packages available in the global index.",
+            "items": {
+              "$ref": "#/components/schemas/PackageIdentity"
+            },
+            "type": "array",
+            "maxItems": 20000
+          },
+          "resolved_requirements": {
+            "description": "Requirements resolved to exact packages.",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedRequirement"
+            },
+            "type": "array",
+            "maxItems": 20000
+          },
+          "missing_exact": {
+            "description": "Exact packages absent from the global index.",
+            "items": {
+              "$ref": "#/components/schemas/PackageIdentity"
+            },
+            "type": "array",
+            "maxItems": 20000
+          },
+          "missing_requirements": {
+            "description": "Requirements absent from the global index.",
+            "items": {
+              "$ref": "#/components/schemas/PackageContextEntry"
+            },
+            "type": "array",
+            "maxItems": 20000
+          }
+        },
+        "required": [
+          "available_exact",
+          "resolved_requirements",
+          "missing_exact",
+          "missing_requirements"
+        ],
+        "type": "object"
+      },
+      "SearchScope": {
+        "description": "Package search reads public declarations from selected exact package versions.",
+        "type": "string",
+        "enum": [
+          "source"
+        ]
+      },
+      "PackageSearchRequest": {
+        "additionalProperties": false,
+        "description": "Structured package declaration search query.",
+        "properties": {
+          "query": {
+            "description": "Original query text.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "terms": {
+            "description": "Ordered parsed query members.",
+            "items": {
+              "$ref": "#/components/schemas/QueryTerm"
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32
+          },
+          "identifiers": {
+            "description": "Ordered extracted identifiers.",
+            "items": {
+              "description": "Extracted identifier.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "type": "array",
+            "maxItems": 16
+          },
+          "include": {
+            "description": "Optional fields to include.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "source"
+              ]
+            },
+            "type": "array",
+            "maxItems": 1
+          },
+          "packages": {
+            "description": "Selected exact package versions.",
+            "items": {
+              "$ref": "#/components/schemas/PackageIdentity"
+            },
+            "type": "array",
+            "maxItems": 20000
+          },
+          "phase": {
+            "description": "Ranking phase to execute.",
+            "type": "string",
+            "enum": [
+              "precise",
+              "broad"
+            ]
+          }
+        },
+        "required": [
+          "query",
+          "terms",
+          "identifiers",
+          "packages",
+          "phase"
+        ],
+        "type": "object"
+      },
+      "IdentifierMatchClass": {
+        "description": "Match class established for one declaration identifier.",
+        "type": "string",
+        "enum": [
+          "qualified_exact",
+          "name_exact",
+          "name_prefix",
+          "substring",
+          "unknown"
+        ]
+      },
+      "PackageSearchHit": {
+        "additionalProperties": true,
+        "description": "One public package declaration returned by search.",
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          },
+          "symbol": {
+            "$ref": "#/components/schemas/Symbol"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange"
+          },
+          "line": {
+            "description": "One-based source line containing the declaration.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "contributing_fields": {
+            "description": "Fields that contributed to ranking.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "name",
+                "qualified_name",
+                "documentation",
+                "signature",
+                "declaration_source",
+                "unknown"
+              ]
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "match_class": {
+            "$ref": "#/components/schemas/IdentifierMatchClass"
+          },
+          "source": {
+            "description": "Optional declaration source excerpt.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 1048576
+          }
+        },
+        "required": [
+          "package",
+          "symbol",
+          "unit",
+          "range",
+          "line",
+          "contributing_fields",
+          "match_class"
+        ],
+        "type": "object"
+      },
+      "PackageSearchPage": {
+        "additionalProperties": true,
+        "description": "One ranked page of package declarations.",
+        "properties": {
+          "items": {
+            "description": "Ranked package declarations.",
+            "items": {
+              "$ref": "#/components/schemas/PackageSearchHit"
+            },
+            "type": "array",
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "description": "Opaque cursor for the next page.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "warnings": {
+            "description": "Warnings attached to this page.",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            },
+            "type": "array",
+            "maxItems": 32
+          },
+          "publication_format": {
+            "$ref": "#/components/schemas/PublicationFormat"
+          },
+          "analyzer_revision": {
+            "description": "Analyzer revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "corpus_revision": {
+            "description": "Corpus revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "items",
+          "warnings",
+          "publication_format",
+          "analyzer_revision",
+          "corpus_revision"
+        ],
+        "type": "object"
+      },
+      "PackageSymbolRequest": {
+        "additionalProperties": false,
+        "description": "Package declaration lookup query.",
+        "properties": {
+          "name": {
+            "description": "Declaration name to look up.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "language": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Language"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional language filter."
+          },
+          "include": {
+            "description": "Optional fields to include.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "source"
+              ]
+            },
+            "type": "array",
+            "maxItems": 1
+          },
+          "packages": {
+            "description": "Selected exact package versions.",
+            "items": {
+              "$ref": "#/components/schemas/PackageIdentity"
+            },
+            "type": "array",
+            "maxItems": 20000
+          }
+        },
+        "required": [
+          "name",
+          "packages"
+        ],
+        "type": "object"
+      },
+      "PackageSymbol": {
+        "additionalProperties": true,
+        "description": "One package declaration returned by symbol lookup.",
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          },
+          "symbol": {
+            "$ref": "#/components/schemas/Symbol"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange"
+          },
+          "line": {
+            "description": "One-based source line containing the declaration.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "match_class": {
+            "$ref": "#/components/schemas/IdentifierMatchClass"
+          },
+          "source": {
+            "description": "Optional declaration source excerpt.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 1048576
+          }
+        },
+        "required": [
+          "package",
+          "symbol",
+          "unit",
+          "range",
+          "line",
+          "match_class"
+        ],
+        "type": "object"
+      },
+      "PackageSymbolPage": {
+        "additionalProperties": true,
+        "description": "One page of package declarations.",
+        "properties": {
+          "items": {
+            "description": "Package declarations.",
+            "items": {
+              "$ref": "#/components/schemas/PackageSymbol"
+            },
+            "type": "array",
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "description": "Opaque cursor for the next page.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "warnings": {
+            "description": "Warnings attached to this page.",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            },
+            "type": "array",
+            "maxItems": 32
+          },
+          "publication_format": {
+            "$ref": "#/components/schemas/PublicationFormat"
+          },
+          "analyzer_revision": {
+            "description": "Analyzer revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "corpus_revision": {
+            "description": "Corpus revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "items",
+          "warnings",
+          "publication_format",
+          "analyzer_revision",
+          "corpus_revision"
+        ],
+        "type": "object"
+      },
+      "ProblemDetails": {
+        "additionalProperties": true,
+        "description": "RFC 9457 problem details for an application error.",
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "instance": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uri",
+            "maxLength": 2048
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "RetryAfter": {
+        "description": "Bounded retry delay in seconds.",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 86400
+      },
+      "RateLimitLimit": {
+        "description": "Bounded request limit for the current period.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000000000
+      },
+      "RateLimitRemaining": {
+        "description": "Bounded requests remaining in the current period.",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1000000000
+      },
+      "RateLimitReset": {
+        "description": "Unix seconds until the current rate limit resets.",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 2147483647
+      },
+      "WWWAuthenticate": {
+        "description": "Bearer authentication challenge.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "headers": {
+      "ETag": {
+        "description": "Entity tag for capability cache validation.",
+        "schema": {
+          "description": "Entity tag.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "Cache-Control": {
+        "description": "Private cache policy.",
+        "schema": {
+          "description": "Cache policy.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "WWW-Authenticate": {
+        "description": "Bearer authentication challenge.",
+        "schema": {
+          "$ref": "#/components/schemas/WWWAuthenticate"
+        }
+      },
+      "Retry-After": {
+        "description": "Bounded retry delay in seconds.",
+        "schema": {
+          "$ref": "#/components/schemas/RetryAfter"
+        }
+      },
+      "RateLimit-Limit": {
+        "description": "Bounded request limit for the current period.",
+        "schema": {
+          "$ref": "#/components/schemas/RateLimitLimit"
+        }
+      },
+      "RateLimit-Remaining": {
+        "description": "Bounded requests remaining in the current period.",
+        "schema": {
+          "$ref": "#/components/schemas/RateLimitRemaining"
+        }
+      },
+      "RateLimit-Reset": {
+        "description": "Unix seconds until the current rate limit resets.",
+        "schema": {
+          "$ref": "#/components/schemas/RateLimitReset"
+        }
+      }
+    }
+  }
+}

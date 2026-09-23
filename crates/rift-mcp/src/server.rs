@@ -47,6 +47,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
+use crate::global::{
+    GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
+    package_symbols,
+};
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -618,6 +622,45 @@ impl ReadAnswer for NodesResult {
     }
 }
 
+/// Replaces the local package branch's legacy global warning with routed client state.
+fn apply_global_warnings(warnings: &mut Vec<ReadWarning>, route: &GlobalRoute) {
+    let fallback_indexed = warnings
+        .iter()
+        .find_map(|warning| match warning {
+            ReadWarning::GlobalIndexUnavailable { indexed, .. } => Some(*indexed),
+            _ => None,
+        })
+        .unwrap_or(0);
+    *warnings = warnings
+        .drain(..)
+        .filter_map(|warning| match warning {
+            ReadWarning::GlobalIndexUnavailable { .. } => None,
+            ReadWarning::PackageSkipped { package, reason } => {
+                Some(ReadWarning::PackageUnavailable { package, reason })
+            }
+            warning => Some(warning),
+        })
+        .collect();
+    route.record_fallback(fallback_indexed);
+    if let Some(warning) = route.fallback_warning(fallback_indexed) {
+        warnings.push(warning);
+    }
+    let package_warnings = warnings
+        .iter()
+        .filter(|warning| {
+            matches!(
+                warning,
+                ReadWarning::PackageUnavailable { .. } | ReadWarning::PackageContextDegraded { .. }
+            )
+        })
+        .count();
+    warnings.extend(
+        route
+            .missing_warnings()
+            .take(rift_protocol::read::DEPENDENCY_WARNINGS_MAX.saturating_sub(package_warnings)),
+    );
+}
+
 /// Most bytes one read warning's `detail` carries: the bound the served schema advertises
 /// for it, applied to a failure's rendering before it reaches the wire.
 const WARNING_DETAIL_BYTES_MAX: usize = 4096;
@@ -922,12 +965,14 @@ fn bounded_detail(mut detail: String, bytes_max: usize) -> String {
     detail
 }
 
-/// What the search store answered for both query phases of one request.
-#[derive(Debug, Default)]
+/// What the search store answered for both query phases of one request, and how far
+/// the vector ranking had got for the tree it was read for.
+#[derive(Debug)]
 struct PhasedRanking {
     precise: Vec<RankingInput>,
     broad: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
+    readiness: VectorReadiness,
 }
 
 /// The ranking one search request merges, and what the search index's own state adds to
@@ -977,7 +1022,6 @@ impl SearchRanking {
 /// bound never reach a page.
 fn ranking_of(
     searched: RevisionScoped<PhasedRanking>,
-    readiness: VectorReadiness,
     files: u64,
     tree_revision: &str,
     commit_state: LexicalCommitState,
@@ -985,7 +1029,7 @@ fn ranking_of(
 ) -> Option<SearchRanking> {
     match (searched, commit_state) {
         (RevisionScoped::Matched(phased), _) => {
-            let mut warnings = readiness_warnings(readiness, files);
+            let mut warnings = readiness_warnings(phased.readiness, files);
             warnings.extend(phased.lexical_truncated_at.map(lexical_truncated));
             Some(SearchRanking {
                 answer: StoreAnswer::new(phased.precise, phased.broad, weights),
@@ -1246,6 +1290,8 @@ pub struct RiftMcp {
     /// The shares the identifier, full-text, and vector rankings fuse under, as
     /// `[search.ranking]` set them.
     ranking_weights: RankingWeights,
+    /// Lazy global package client, replaced when accepted settings or credentials change.
+    global: Arc<GlobalState>,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
@@ -1442,6 +1488,7 @@ impl RiftMcp {
             blocking,
             search_index,
             ranking_weights,
+            global: Arc::new(GlobalState::default()),
             lexical,
             #[cfg(test)]
             dependencies: packages,
@@ -1566,9 +1613,88 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        if params.rev.is_none() && params.scope != SearchScope::Local {
+            return self.current_tree_get_symbol(params).await;
+        }
         let rev = params.rev.clone();
         self.read_at(rev, move |reads| reads.get_symbol(&params))
             .await
+    }
+
+    /// Routes one current-tree package lookup through global data and selected local fallback.
+    async fn current_tree_get_symbol(
+        &self,
+        params: GetSymbolParams,
+    ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let configuration = resolved.published.configuration.global_configuration();
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(&configuration, &context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(&context),
+        };
+        let mut remote_warnings = Vec::new();
+        let remote = match (&route.client, route.remote_packages.is_empty()) {
+            (Some(client), false) => {
+                match tokio::time::timeout_at(
+                    deadline.at(),
+                    Box::pin(package_symbols(client, &params, &route.remote_packages)),
+                )
+                .await
+                {
+                    Ok(Ok(remote)) => {
+                        remote_warnings = remote.warnings;
+                        remote.items
+                    }
+                    Ok(Err(error)) => {
+                        route.discard_remote(&context, &error);
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        route.discard_remote(&context, &rift_cloud_client::ClientError::Deadline);
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        let mut collected = params.clone();
+        collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
+        collected.page_index = 0;
+        let fallback_context = Arc::clone(&route.fallback_context);
+        let answer = self
+            .current_tree_read(&resolved, move |reads| {
+                reads.get_symbol_with_dependency_context(&collected, &fallback_context)
+            })
+            .await?;
+        let mut answer = match merge_symbols(&params, answer.0, remote) {
+            Ok(mut answer) => {
+                answer.warnings.append(&mut remote_warnings);
+                answer
+            }
+            Err(error) => {
+                route.discard_remote(&context, &error);
+                let mut collected = params.clone();
+                collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
+                collected.page_index = 0;
+                let fallback_context = Arc::clone(&route.fallback_context);
+                self.current_tree_read(&resolved, move |reads| {
+                    reads.get_symbol_with_dependency_context(&collected, &fallback_context)
+                })
+                .await?
+                .0
+            }
+        };
+        apply_global_warnings(&mut answer.warnings, &route);
+        Ok(Json(answer))
     }
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
@@ -1708,14 +1834,163 @@ impl RiftMcp {
                 self.ranking_weights,
             )
         });
-        let executed = params;
-        let mut answer = self
-            .current_tree_read(&resolved, move |reads| {
-                reads.search_with_references(&executed, &answer, &references)
-            })
+        self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
+            .await
+    }
+
+    /// Routes one current-tree search through global data and selected local fallback.
+    async fn route_current_tree_search(
+        &self,
+        resolved: ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        warnings: Vec<ReadWarning>,
+        references: EngineReferences,
+        deadline: RequestDeadline,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        if params.scope == SearchScope::Local {
+            let mut answer = self
+                .current_tree_search_selected(
+                    &resolved,
+                    params,
+                    answer,
+                    Arc::new(references),
+                    Arc::clone(resolved.published.reads.dependency_context()),
+                )
+                .await?;
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
+        }
+
+        let references = Arc::new(references);
+        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let parsed = params
+            .query
+            .as_deref()
+            .and_then(|query| ParsedQuery::parse(query).ok());
+        let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
+            .then_some(parsed)
+            .flatten();
+        let Some(parsed) = remote_query else {
+            let selected = Arc::new(context.filter_entries(|_| false));
+            let mut answer = self
+                .current_tree_search_selected(&resolved, params, answer, references, selected)
+                .await?;
+            answer
+                .0
+                .warnings
+                .retain(|warning| !matches!(warning, ReadWarning::GlobalIndexUnavailable { .. }));
+            answer.0.warnings.extend(warnings);
+            return Ok(answer);
+        };
+
+        let configuration = resolved.published.configuration.global_configuration();
+        let (mut route, mut remote) = self
+            .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
+            .await;
+        let remote_warnings = std::mem::take(&mut remote.warnings);
+        let mut collected = params.clone();
+        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page_index = 0;
+        let mut local = self
+            .current_tree_search_selected(
+                &resolved,
+                collected.clone(),
+                answer.clone(),
+                Arc::clone(&references),
+                Arc::clone(&route.fallback_context),
+            )
             .await?;
-        answer.0.warnings.extend(warnings);
-        Ok(answer)
+        local.0.warnings.extend(warnings.clone());
+        let mut answer = match merge_search(&params, local.0, remote) {
+            Ok(mut answer) => {
+                answer.warnings.extend(remote_warnings);
+                answer
+            }
+            Err(error) => {
+                route.discard_remote(&context, &error);
+                let mut fallback = self
+                    .current_tree_search_selected(
+                        &resolved,
+                        collected,
+                        answer,
+                        references,
+                        Arc::clone(&route.fallback_context),
+                    )
+                    .await?;
+                fallback.0.warnings.extend(warnings);
+                fallback.0
+            }
+        };
+        apply_global_warnings(&mut answer.warnings, &route);
+        Ok(Json(answer))
+    }
+
+    /// Resolves and reads the remote branch inside one MCP request deadline.
+    async fn global_search_candidates(
+        &self,
+        deadline: RequestDeadline,
+        configuration: &rift_protocol::configuration::GlobalConfiguration,
+        context: &Arc<rift_dependency::DependencyContext>,
+        params: &SearchParams,
+        parsed: &ParsedQuery,
+    ) -> (GlobalRoute, GlobalSearchCandidates) {
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(configuration, context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(context),
+        };
+        let remote = match (&route.client, route.remote_packages.is_empty()) {
+            (Some(client), false) => {
+                match tokio::time::timeout_at(
+                    deadline.at(),
+                    Box::pin(package_search(
+                        client,
+                        params,
+                        parsed,
+                        &route.remote_packages,
+                    )),
+                )
+                .await
+                {
+                    Ok(Ok(remote)) => remote,
+                    Ok(Err(error)) => {
+                        route.discard_remote(context, &error);
+                        GlobalSearchCandidates::default()
+                    }
+                    Err(_) => {
+                        route.discard_remote(context, &rift_cloud_client::ClientError::Deadline);
+                        GlobalSearchCandidates::default()
+                    }
+                }
+            }
+            _ => GlobalSearchCandidates::default(),
+        };
+        (route, remote)
+    }
+
+    /// Executes one search with package work limited to `dependency_context`.
+    async fn current_tree_search_selected(
+        &self,
+        resolved: &ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        references: Arc<EngineReferences>,
+        dependency_context: Arc<rift_dependency::DependencyContext>,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        self.current_tree_read(resolved, move |reads| {
+            reads.search_with_references_and_dependency_context(
+                &params,
+                &answer,
+                &references,
+                &dependency_context,
+            )
+        })
+        .await
     }
 
     /// Repeats engine reads against a fresh publication when their captured tree moves.
@@ -1841,7 +2116,6 @@ impl RiftMcp {
             .await?;
         Ok(ranking_of(
             searched,
-            index.readiness(),
             published.reads.file_count(),
             tree_revision,
             commit_state,
@@ -1890,6 +2164,7 @@ impl RiftMcp {
         };
         Ok(RevisionScoped::Matched(PhasedRanking {
             lexical_truncated_at: precise.lexical_truncated_at(),
+            readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
         }))
@@ -3861,7 +4136,7 @@ mod tests {
             data.message.as_ref(),
             "the request does not match the documented form: tool search, field paths, \
              accepted exclude, force_include, include, \
-             example {\"exclude\":[\"src/generated/**\"],\"include\":[\"src/**\"]}; \
+             example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}; \
              correct the reported field and resend the request"
         );
         let wire = data.data.ok_or("wire error data must be present")?;
@@ -5908,7 +6183,7 @@ mod tests {
             .clone()
             .ok_or("a refused model must not stop the search index from opening")?;
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Disabled,
             "a refused model disables the tier rather than leaving it preparing"
         );
@@ -5946,7 +6221,7 @@ mod tests {
             .clone()
             .ok_or("an invalid configuration must not stop the search index from opening")?;
         assert_eq!(
-            index.readiness(),
+            index.pass_readiness(),
             VectorReadiness::Disabled,
             "a server that answers nothing must not spend a download first"
         );
@@ -6002,6 +6277,16 @@ mod tests {
         ranking.answer.precise().is_empty() && ranking.answer.broad().is_empty()
     }
 
+    /// One phased ranking that answered nothing, under `readiness`.
+    fn phased(readiness: VectorReadiness) -> super::PhasedRanking {
+        super::PhasedRanking {
+            precise: Vec::new(),
+            broad: Vec::new(),
+            lexical_truncated_at: None,
+            readiness,
+        }
+    }
+
     /// The one `lexical_ranking_unavailable` detail a ranking carries, or nothing when it
     /// carries none.
     fn unavailable_detail(ranking: &super::SearchRanking) -> Option<&str> {
@@ -6016,7 +6301,6 @@ mod tests {
         assert!(
             super::ranking_of(
                 RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Settled,
@@ -6032,7 +6316,6 @@ mod tests {
     fn a_settled_store_holding_no_tree_warns_that_it_will_not_answer() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::NoRevision,
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,
@@ -6055,7 +6338,6 @@ mod tests {
         ] {
             let ranking = super::ranking_of(
                 searched,
-                VectorReadiness::Ready,
                 10,
                 "bbbbbbbb",
                 LexicalCommitState::Committing,
@@ -6077,7 +6359,6 @@ mod tests {
     fn a_store_owed_a_whole_replace_warns_that_it_missed_a_commit() -> TestResult {
         let ranking = super::ranking_of(
             RevisionScoped::OtherRevision("aaaaaaaa".to_owned()),
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Owed {
@@ -6099,11 +6380,10 @@ mod tests {
     #[test]
     fn a_matched_store_ranks_its_units_and_carries_the_readiness_warning() -> TestResult {
         let ranking = super::ranking_of(
-            RevisionScoped::Matched(super::PhasedRanking::default()),
-            VectorReadiness::Preparing {
+            RevisionScoped::Matched(phased(VectorReadiness::Preparing {
                 prepared: 1,
                 total: 4,
-            },
+            })),
             10,
             "bbbbbbbb",
             LexicalCommitState::Committing,
@@ -6131,9 +6411,8 @@ mod tests {
         let ranking = super::ranking_of(
             RevisionScoped::Matched(super::PhasedRanking {
                 lexical_truncated_at: Some(1_000),
-                ..super::PhasedRanking::default()
+                ..phased(VectorReadiness::Ready)
             }),
-            VectorReadiness::Ready,
             10,
             "bbbbbbbb",
             LexicalCommitState::Settled,

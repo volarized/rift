@@ -1,11 +1,11 @@
 {
-  "author": {
-    "email": "contact@volar.sh",
-    "name": "volar.sh",
-    "url": "https://volar.sh"
-  },
-  "description": "Rift is an agentic development toolkit for reading and discovering codebases.",
-  "displayName": "Rift",
   "name": "rift",
-  "version": "0.0.41"
+  "displayName": "Rift",
+  "version": "0.0.43",
+  "description": "Rift is an agentic development toolkit for reading and discovering codebases.",
+  "author": {
+    "name": "volar.sh",
+    "email": "contact@volar.sh",
+    "url": "https://volar.sh"
+  }
 }

@@ -2,6 +2,7 @@
 
 mod election;
 mod failure;
+mod global;
 mod http;
 mod identity;
 pub mod logs;

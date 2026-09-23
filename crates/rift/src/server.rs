@@ -1189,8 +1189,10 @@ fn rendered_fields(fields: &str) -> String {
     let Ok(named) = serde_json::from_str::<Map<String, Value>>(fields) else {
         return format!(" {fields}");
     };
+    let mut fields = named.iter().collect::<Vec<_>>();
+    fields.sort_by_key(|(key, _)| *key);
     let mut rendered = String::new();
-    for (key, value) in &named {
+    for (key, value) in fields {
         rendered.push(' ');
         rendered.push_str(key);
         rendered.push('=');

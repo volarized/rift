@@ -24,6 +24,17 @@ test-group = 'live'
 filter = 'binary(=server_cli) or binary(=mcp_proxy) or binary(=end_to_end) or binary(=logs_resource)'
 test-group = 'election'
 
+# The two suites that read the model hub wait out a download, and each names the
+# budget it will wait. Those budgets run to six minutes, so the default
+# one-minute deadline ends the test first: nextest reports a timeout and the
+# suite never prints the readiness it reached, which is the whole diagnostic a
+# slow or unreachable hub is meant to leave behind. The deadline here is above
+# every wait either suite declares, and `dev/tests/test_delivery.py` keeps it
+# there.
+[[profile.default.overrides]]
+filter = 'binary(=live_vector_search) or binary(=live_model_sources)'
+slow-timeout = { period = "420s", terminate-after = 1, grace-period = "30s" }
+
 [profile.ci]
 default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/^live_/)"
 global-timeout = "480s"

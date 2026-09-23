@@ -15,13 +15,13 @@ the cataloged packages alone, `all` from both, project hits first. Use
 
 Parameters:
 
-- `include` - Optional hit fields to attach: `source`, `history`.
-- `language` - Narrows the answer to one language.
-- `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
+- `language` - Narrows the answer to one language.
+- `scope` - Which declarations the lookup searches: the project tree, the dependency packages, or both.
+- `include` - Optional hit fields to attach: `source`, `history`.
+- `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
-- `scope` - Which declarations the lookup searches: the project tree, the dependency packages, or both.
 
 ## nodes
 
@@ -57,15 +57,15 @@ results computed from another.
 
 Parameters:
 
-- `change` - Two committed revisions to compare, standing alone.
+- `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
+- `order` - Which total order the page comes back in.
+- `query` - Text to match against declaration names, qualified names, signatures, attached documentation, declaration source, and file contents.
+- `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
+- `paths` - Files eligible for the search, selected by project-relative globs.
 - `include` - Extra payload to attach to every hit.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
-- `order` - Which total order the page comes back in.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
-- `paths` - Files eligible for the search, selected by project-relative globs.
-- `query` - Text to match against declaration names, qualified names, signatures, attached documentation, declaration source, and file contents.
 - `rev` - The version-control revision to search - a branch, tag, or commit id as the workspace's version control spells it.
-- `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
-- `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
 - `traversal` - A bounded relationship walk from `seed`, standing alone or beside `query`.
+- `change` - Two committed revisions to compare, standing alone.
 

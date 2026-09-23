@@ -9,7 +9,6 @@
       "type": "string"
     },
     "Documentation": {
-      "additionalProperties": false,
       "description": "One block of documentation attached to a declaration, in the markup it was written in.",
       "properties": {
         "format": {
@@ -455,7 +454,6 @@
       "type": "object"
     },
     "Parameter": {
-      "additionalProperties": false,
       "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
       "properties": {
         "default": {
@@ -521,7 +519,6 @@
       "type": "string"
     },
     "Signature": {
-      "additionalProperties": false,
       "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
       "properties": {
         "display": {
@@ -604,7 +601,6 @@
       "type": "object"
     },
     "SignatureLink": {
-      "additionalProperties": false,
       "description": "One symbol named inside a rendered signature, with the byte range of that rendering which\nnames it.",
       "properties": {
         "range": {
@@ -685,7 +681,6 @@
       "type": "string"
     },
     "SymbolOrigin": {
-      "additionalProperties": false,
       "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
       "properties": {
         "location": {
@@ -721,7 +716,6 @@
       "type": "object"
     },
     "TextRange": {
-      "additionalProperties": false,
       "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
       "properties": {
         "end": {
@@ -746,7 +740,6 @@
       "type": "object"
     },
     "TypeBinding": {
-      "additionalProperties": false,
       "description": "One type a symbol carries, together with the role it plays for that symbol.",
       "properties": {
         "origin": {
@@ -855,7 +848,6 @@
       ]
     },
     "TypeExpression": {
-      "additionalProperties": false,
       "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
       "properties": {
         "extensions": {

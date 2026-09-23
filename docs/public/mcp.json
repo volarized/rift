@@ -160,7 +160,6 @@
             "type": "string"
           },
           "Documentation": {
-            "additionalProperties": false,
             "description": "One block of documentation attached to a declaration, in the markup it was written in.",
             "properties": {
               "format": {
@@ -336,6 +335,101 @@
             ],
             "type": "object"
           },
+          "GlobalFailureClass": {
+            "description": "Bounded classes a global API failure can carry in a read warning.",
+            "oneOf": [
+              {
+                "const": "connection",
+                "description": "The endpoint could not accept a connection.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "The operation exceeded its time bound.",
+                "type": "string"
+              },
+              {
+                "const": "retry_exhausted",
+                "description": "Bounded retry attempts ended without a valid response.",
+                "type": "string"
+              },
+              {
+                "const": "authentication",
+                "description": "The endpoint rejected credentials or access.",
+                "type": "string"
+              },
+              {
+                "const": "credential_configuration",
+                "description": "Credential configuration prevented a request.",
+                "type": "string"
+              },
+              {
+                "const": "non_success_response",
+                "description": "The endpoint returned a non-success status.",
+                "type": "string"
+              },
+              {
+                "const": "invalid_response",
+                "description": "The response did not satisfy its wire fields.",
+                "type": "string"
+              },
+              {
+                "const": "response_truncated",
+                "description": "The response exceeded its byte or item bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_format",
+                "description": "The publication format was not supported.",
+                "type": "string"
+              },
+              {
+                "const": "corpus_revision",
+                "description": "The response named an unsupported corpus revision.",
+                "type": "string"
+              },
+              {
+                "const": "required_field_set",
+                "description": "The response omitted a required field set.",
+                "type": "string"
+              }
+            ]
+          },
+          "GlobalPageWarningCode": {
+            "description": "Stable conditions a global package page can report while returning valid items.",
+            "oneOf": [
+              {
+                "const": "query_narrowed",
+                "description": "The service narrowed a query before ranking.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "The service omitted source content at its source bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_changed",
+                "description": "The publication changed while pages were assembled.",
+                "type": "string"
+              },
+              {
+                "const": "capability_unavailable",
+                "description": "A requested capability was unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "result_truncated",
+                "description": "The service stopped before its result bound.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "The service returned a code this client does not know.",
+                "type": "string"
+              }
+            ]
+          },
           "Language": {
             "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "examples": [
@@ -354,6 +448,79 @@
             "minLength": 27,
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
             "type": "string"
+          },
+          "PackageAvailability": {
+            "description": "Whether a global package index can answer for one package.",
+            "oneOf": [
+              {
+                "const": "canonical",
+                "description": "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
+                "type": "string"
+              },
+              {
+                "const": "local_only",
+                "description": "The entry names a path, git, or custom-registry package only this machine can\nanswer for.",
+                "type": "string"
+              }
+            ]
+          },
+          "PackageContextEntry": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "oneOf": [
+                  {
+                    "required": [
+                      "version"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "requirement"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "description": "One package the workspace depends on, as its manifests and lockfiles state it.\n\nEntries order by manager, then name, then the selector they state: a declared\nrequirement before an exact version.",
+            "properties": {
+              "availability": {
+                "$ref": "#/$defs/PackageAvailability",
+                "description": "Whether a global package index can answer for this entry."
+              },
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "requirement": {
+                "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "manager",
+              "name",
+              "availability"
+            ],
+            "type": "object"
           },
           "PackageIdentity": {
             "additionalProperties": false,
@@ -408,7 +575,6 @@
             "type": "object"
           },
           "Parameter": {
-            "additionalProperties": false,
             "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
             "properties": {
               "default": {
@@ -508,7 +674,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -520,7 +686,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -530,7 +696,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -854,6 +1020,231 @@
               },
               {
                 "additionalProperties": false,
+                "description": "Global access was disabled, so every selected package used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_access_disabled",
+                    "type": "string"
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API could not answer, so the affected packages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_api_unavailable",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the global API failure."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API advertised a publication the client cannot read, so the affected\npackages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_publication_incompatible",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the incompatible publication."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API returned an invalid or truncated response, so the affected packages\nused the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_response_invalid",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the invalid response."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "properties": {
+                  "code": {
+                    "const": "global_page_warning",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Optional bounded explanation returned by the global package service.",
+                    "maxLength": 1024,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "warning_code": {
+                    "$ref": "#/$defs/GlobalPageWarningCode",
+                    "description": "Stable condition code returned by the global package service."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning_code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution named no remote package, so the package used local indexing.\nAt most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_absent",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The exact package absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution could not resolve a declared requirement, so the entry used\nlocal indexing. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_requirement_absent",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The declared requirement absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A package remained unavailable after local fallback. At most `DEPENDENCY_WARNINGS_MAX`\npackage and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_unavailable",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the local fallback could not serve."
+                  },
+                  "reason": {
+                    "description": "Why local fallback could not serve the package.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
                 "properties": {
                   "code": {
@@ -1064,7 +1455,6 @@
             "type": "string"
           },
           "Signature": {
-            "additionalProperties": false,
             "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
             "properties": {
               "display": {
@@ -1147,7 +1537,6 @@
             "type": "object"
           },
           "SignatureLink": {
-            "additionalProperties": false,
             "description": "One symbol named inside a rendered signature, with the byte range of that rendering which\nnames it.",
             "properties": {
               "range": {
@@ -1218,7 +1607,6 @@
             "type": "string"
           },
           "Symbol": {
-            "additionalProperties": false,
             "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
@@ -1522,7 +1910,6 @@
             "type": "string"
           },
           "SymbolOrigin": {
-            "additionalProperties": false,
             "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
@@ -1631,7 +2018,6 @@
             ]
           },
           "TextRange": {
-            "additionalProperties": false,
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
               "end": {
@@ -1656,7 +2042,6 @@
             "type": "object"
           },
           "TypeBinding": {
-            "additionalProperties": false,
             "description": "One type a symbol carries, together with the role it plays for that symbol.",
             "properties": {
               "origin": {
@@ -1765,7 +2150,6 @@
             ]
           },
           "TypeExpression": {
-            "additionalProperties": false,
             "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
             "properties": {
               "extensions": {
@@ -2062,6 +2446,101 @@
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
           },
+          "GlobalFailureClass": {
+            "description": "Bounded classes a global API failure can carry in a read warning.",
+            "oneOf": [
+              {
+                "const": "connection",
+                "description": "The endpoint could not accept a connection.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "The operation exceeded its time bound.",
+                "type": "string"
+              },
+              {
+                "const": "retry_exhausted",
+                "description": "Bounded retry attempts ended without a valid response.",
+                "type": "string"
+              },
+              {
+                "const": "authentication",
+                "description": "The endpoint rejected credentials or access.",
+                "type": "string"
+              },
+              {
+                "const": "credential_configuration",
+                "description": "Credential configuration prevented a request.",
+                "type": "string"
+              },
+              {
+                "const": "non_success_response",
+                "description": "The endpoint returned a non-success status.",
+                "type": "string"
+              },
+              {
+                "const": "invalid_response",
+                "description": "The response did not satisfy its wire fields.",
+                "type": "string"
+              },
+              {
+                "const": "response_truncated",
+                "description": "The response exceeded its byte or item bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_format",
+                "description": "The publication format was not supported.",
+                "type": "string"
+              },
+              {
+                "const": "corpus_revision",
+                "description": "The response named an unsupported corpus revision.",
+                "type": "string"
+              },
+              {
+                "const": "required_field_set",
+                "description": "The response omitted a required field set.",
+                "type": "string"
+              }
+            ]
+          },
+          "GlobalPageWarningCode": {
+            "description": "Stable conditions a global package page can report while returning valid items.",
+            "oneOf": [
+              {
+                "const": "query_narrowed",
+                "description": "The service narrowed a query before ranking.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "The service omitted source content at its source bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_changed",
+                "description": "The publication changed while pages were assembled.",
+                "type": "string"
+              },
+              {
+                "const": "capability_unavailable",
+                "description": "A requested capability was unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "result_truncated",
+                "description": "The service stopped before its result bound.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "The service returned a code this client does not know.",
+                "type": "string"
+              }
+            ]
+          },
           "Language": {
             "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
             "examples": [
@@ -2272,6 +2751,79 @@
             ],
             "type": "object"
           },
+          "PackageAvailability": {
+            "description": "Whether a global package index can answer for one package.",
+            "oneOf": [
+              {
+                "const": "canonical",
+                "description": "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
+                "type": "string"
+              },
+              {
+                "const": "local_only",
+                "description": "The entry names a path, git, or custom-registry package only this machine can\nanswer for.",
+                "type": "string"
+              }
+            ]
+          },
+          "PackageContextEntry": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "oneOf": [
+                  {
+                    "required": [
+                      "version"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "requirement"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "description": "One package the workspace depends on, as its manifests and lockfiles state it.\n\nEntries order by manager, then name, then the selector they state: a declared\nrequirement before an exact version.",
+            "properties": {
+              "availability": {
+                "$ref": "#/$defs/PackageAvailability",
+                "description": "Whether a global package index can answer for this entry."
+              },
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "requirement": {
+                "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "manager",
+              "name",
+              "availability"
+            ],
+            "type": "object"
+          },
           "PackageIdentity": {
             "additionalProperties": false,
             "description": "One package as its package manager identifies it.",
@@ -2334,7 +2886,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -2346,7 +2898,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2356,7 +2908,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -2680,6 +3232,231 @@
               },
               {
                 "additionalProperties": false,
+                "description": "Global access was disabled, so every selected package used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_access_disabled",
+                    "type": "string"
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API could not answer, so the affected packages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_api_unavailable",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the global API failure."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API advertised a publication the client cannot read, so the affected\npackages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_publication_incompatible",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the incompatible publication."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API returned an invalid or truncated response, so the affected packages\nused the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_response_invalid",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the invalid response."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "properties": {
+                  "code": {
+                    "const": "global_page_warning",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Optional bounded explanation returned by the global package service.",
+                    "maxLength": 1024,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "warning_code": {
+                    "$ref": "#/$defs/GlobalPageWarningCode",
+                    "description": "Stable condition code returned by the global package service."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning_code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution named no remote package, so the package used local indexing.\nAt most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_absent",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The exact package absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution could not resolve a declared requirement, so the entry used\nlocal indexing. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_requirement_absent",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The declared requirement absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A package remained unavailable after local fallback. At most `DEPENDENCY_WARNINGS_MAX`\npackage and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_unavailable",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the local fallback could not serve."
+                  },
+                  "reason": {
+                    "description": "Why local fallback could not serve the package.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
                 "properties": {
                   "code": {
@@ -2932,7 +3709,6 @@
             "type": "string"
           },
           "TextRange": {
-            "additionalProperties": false,
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
               "end": {
@@ -3680,7 +4456,6 @@
             "type": "string"
           },
           "Documentation": {
-            "additionalProperties": false,
             "description": "One block of documentation attached to a declaration, in the markup it was written in.",
             "properties": {
               "format": {
@@ -3762,6 +4537,101 @@
             "minLength": 13,
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
+          },
+          "GlobalFailureClass": {
+            "description": "Bounded classes a global API failure can carry in a read warning.",
+            "oneOf": [
+              {
+                "const": "connection",
+                "description": "The endpoint could not accept a connection.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "The operation exceeded its time bound.",
+                "type": "string"
+              },
+              {
+                "const": "retry_exhausted",
+                "description": "Bounded retry attempts ended without a valid response.",
+                "type": "string"
+              },
+              {
+                "const": "authentication",
+                "description": "The endpoint rejected credentials or access.",
+                "type": "string"
+              },
+              {
+                "const": "credential_configuration",
+                "description": "Credential configuration prevented a request.",
+                "type": "string"
+              },
+              {
+                "const": "non_success_response",
+                "description": "The endpoint returned a non-success status.",
+                "type": "string"
+              },
+              {
+                "const": "invalid_response",
+                "description": "The response did not satisfy its wire fields.",
+                "type": "string"
+              },
+              {
+                "const": "response_truncated",
+                "description": "The response exceeded its byte or item bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_format",
+                "description": "The publication format was not supported.",
+                "type": "string"
+              },
+              {
+                "const": "corpus_revision",
+                "description": "The response named an unsupported corpus revision.",
+                "type": "string"
+              },
+              {
+                "const": "required_field_set",
+                "description": "The response omitted a required field set.",
+                "type": "string"
+              }
+            ]
+          },
+          "GlobalPageWarningCode": {
+            "description": "Stable conditions a global package page can report while returning valid items.",
+            "oneOf": [
+              {
+                "const": "query_narrowed",
+                "description": "The service narrowed a query before ranking.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "The service omitted source content at its source bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_changed",
+                "description": "The publication changed while pages were assembled.",
+                "type": "string"
+              },
+              {
+                "const": "capability_unavailable",
+                "description": "A requested capability was unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "result_truncated",
+                "description": "The service stopped before its result bound.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "The service returned a code this client does not know.",
+                "type": "string"
+              }
+            ]
           },
           "GraphHop": {
             "additionalProperties": false,
@@ -3861,6 +4731,79 @@
             "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
             "type": "string"
           },
+          "PackageAvailability": {
+            "description": "Whether a global package index can answer for one package.",
+            "oneOf": [
+              {
+                "const": "canonical",
+                "description": "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
+                "type": "string"
+              },
+              {
+                "const": "local_only",
+                "description": "The entry names a path, git, or custom-registry package only this machine can\nanswer for.",
+                "type": "string"
+              }
+            ]
+          },
+          "PackageContextEntry": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "oneOf": [
+                  {
+                    "required": [
+                      "version"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "requirement"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "description": "One package the workspace depends on, as its manifests and lockfiles state it.\n\nEntries order by manager, then name, then the selector they state: a declared\nrequirement before an exact version.",
+            "properties": {
+              "availability": {
+                "$ref": "#/$defs/PackageAvailability",
+                "description": "Whether a global package index can answer for this entry."
+              },
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "requirement": {
+                "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
+                "maxLength": 4096,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "manager",
+              "name",
+              "availability"
+            ],
+            "type": "object"
+          },
           "PackageIdentity": {
             "additionalProperties": false,
             "description": "One package as its package manager identifies it.",
@@ -3914,7 +4857,6 @@
             "type": "object"
           },
           "Parameter": {
-            "additionalProperties": false,
             "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list.",
             "properties": {
               "default": {
@@ -4014,7 +4956,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The vector ranking is still being built, so the answer was ranked lexically alone.\n`prepared` and `total` state how many declarations already carry a vector, and\n`ready_in` is derived from workspace size and embedding progress.",
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
                 "properties": {
                   "code": {
                     "const": "vector_index_preparing",
@@ -4026,7 +4968,7 @@
                     "type": "string"
                   },
                   "prepared": {
-                    "description": "Declarations that already carry a vector.",
+                    "description": "Declarations of the captured tree that already carry a vector.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -4036,7 +4978,7 @@
                     "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
                   },
                   "total": {
-                    "description": "Declarations the published set holds.",
+                    "description": "Declarations the set being embedded holds.",
                     "format": "uint64",
                     "minimum": 0,
                     "type": "integer"
@@ -4355,6 +5297,231 @@
                   "code",
                   "indexed",
                   "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Global access was disabled, so every selected package used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_access_disabled",
+                    "type": "string"
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API could not answer, so the affected packages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_api_unavailable",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the global API failure."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API advertised a publication the client cannot read, so the affected\npackages used the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_publication_incompatible",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the incompatible publication."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API returned an invalid or truncated response, so the affected packages\nused the local index.",
+                "properties": {
+                  "code": {
+                    "const": "global_response_invalid",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the invalid response."
+                  },
+                  "fallback_indexed": {
+                    "description": "Packages the local fallback indexed for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "fallback_unresolved": {
+                    "description": "Packages the local fallback could not resolve for this answer.",
+                    "format": "uint64",
+                    "maximum": 20000,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class",
+                  "fallback_indexed",
+                  "fallback_unresolved"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "properties": {
+                  "code": {
+                    "const": "global_page_warning",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Optional bounded explanation returned by the global package service.",
+                    "maxLength": 1024,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "warning_code": {
+                    "$ref": "#/$defs/GlobalPageWarningCode",
+                    "description": "Stable condition code returned by the global package service."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning_code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution named no remote package, so the package used local indexing.\nAt most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_absent",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The exact package absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A valid global resolution could not resolve a declared requirement, so the entry used\nlocal indexing. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_requirement_absent",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The declared requirement absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A package remained unavailable after local fallback. At most `DEPENDENCY_WARNINGS_MAX`\npackage and dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_unavailable",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The package the local fallback could not serve."
+                  },
+                  "reason": {
+                    "description": "Why local fallback could not serve the package.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "package",
+                  "reason"
                 ],
                 "type": "object"
               },
@@ -4878,7 +6045,6 @@
             ]
           },
           "Signature": {
-            "additionalProperties": false,
             "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
             "properties": {
               "display": {
@@ -4961,7 +6127,6 @@
             "type": "object"
           },
           "SignatureLink": {
-            "additionalProperties": false,
             "description": "One symbol named inside a rendered signature, with the byte range of that rendering which\nnames it.",
             "properties": {
               "range": {
@@ -5032,7 +6197,6 @@
             "type": "string"
           },
           "Symbol": {
-            "additionalProperties": false,
             "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
@@ -5345,7 +6509,6 @@
             "type": "string"
           },
           "SymbolOrigin": {
-            "additionalProperties": false,
             "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
@@ -5416,7 +6579,6 @@
             ]
           },
           "TextRange": {
-            "additionalProperties": false,
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
             "properties": {
               "end": {
@@ -5441,7 +6603,6 @@
             "type": "object"
           },
           "TypeBinding": {
-            "additionalProperties": false,
             "description": "One type a symbol carries, together with the role it plays for that symbol.",
             "properties": {
               "origin": {
@@ -5550,7 +6711,6 @@
             ]
           },
           "TypeExpression": {
-            "additionalProperties": false,
             "description": "How a type is written in the source, plus the symbol that declares it when one does. A\ntype with a declaration resolves to that symbol; a structural type - `string | null`,\n`{ a: string }` - has the spelling and nothing to resolve to.",
             "properties": {
               "extensions": {

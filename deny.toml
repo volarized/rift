@@ -67,6 +67,12 @@ skip = [
   { name = "cpufeatures", version = "0.2.17" },
   { name = "base64", version = "0.22.1" },
 
+  # oas3-gen-support 0.28.0 uses bon and validator with darling 0.23 while its
+  # serde_with dependency uses darling 0.24. Generated client source requires both.
+  { name = "darling", version = "0.23.0" },
+  { name = "darling_core", version = "0.23.0" },
+  { name = "darling_macro", version = "0.23.0" },
+
   # waitpid-any 0.3.0 pins windows-sys 0.59, which pins windows-targets 0.52.
   # Its process handle API keeps the stopped process distinct from a replacement;
   # these import libraries cannot be aligned with notify's windows-targets 0.53.

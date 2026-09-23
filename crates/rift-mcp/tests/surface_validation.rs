@@ -401,7 +401,18 @@ fn assert_dependency_warnings_only(structured: &Value) {
         assert!(
             matches!(
                 warning["code"].as_str(),
-                Some("global_index_unavailable" | "package_skipped" | "package_context_degraded")
+                Some(
+                    "global_access_disabled"
+                        | "global_api_unavailable"
+                        | "global_publication_incompatible"
+                        | "global_response_invalid"
+                        | "global_page_warning"
+                        | "package_absent"
+                        | "package_requirement_absent"
+                        | "package_unavailable"
+                        | "package_skipped"
+                        | "package_context_degraded"
+                )
             ),
             "a package-scoped answer warns of the package branch alone: {warning:#}"
         );
@@ -552,7 +563,10 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
-    let configuration = format!("{}{ENGINE}", hermetic_search::VECTOR_DISABLED);
+    let configuration = format!(
+        "{}\n[global]\nenabled = false\n{ENGINE}",
+        hermetic_search::VECTOR_DISABLED
+    );
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");

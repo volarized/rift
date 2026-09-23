@@ -79,7 +79,8 @@ just generate-check
 ## Rust development
 
 Rust uses the toolchain pinned by `rust-toolchain.toml`. Install `uv`, `just`, `cargo-audit`,
-`cargo-deny`, `cargo-llvm-cov`, and `cargo-nextest`, then run checks from the repository root.
+`cargo-deny`, `cargo-llvm-cov`, `cargo-nextest`, and `oas3-gen 0.28.0`, then run checks from the
+repository root.
 Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 
 | Command | Check |
