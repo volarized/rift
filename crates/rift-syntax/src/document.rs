@@ -2,15 +2,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rift_core::{ProjectPath, is_portable_name};
+use rift_core::{FileDigest, ProjectPath, is_portable_name};
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
+
+use crate::markdown::MarkdownFacts;
 
 /// The character a qualified name carries its disambiguating number after,
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
 /// Half-open UTF-8 byte range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteRange {
     /// First included byte.
     pub start: u64,
@@ -80,6 +82,8 @@ pub struct SyntaxSymbol {
     /// Doc comments the grammar attaches to this declaration, stripped of
     /// comment syntax. Empty when nothing attaches.
     pub documentation: Vec<Documentation>,
+    /// Exact source ranges for attached documentation.
+    pub documentation_ranges: Vec<ByteRange>,
 }
 
 /// Immutable syntax facts for one source file.
@@ -93,6 +97,8 @@ pub struct SyntaxDocument {
     symbols: Vec<SyntaxSymbol>,
     has_errors: bool,
     left_out_declarations: usize,
+    markdown_facts: Option<MarkdownFacts>,
+    source_digest: Option<FileDigest>,
 }
 
 /// Suffixes every repeated qualified name apart, in source order.
@@ -187,6 +193,15 @@ fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> usize {
 }
 
 impl SyntaxDocument {
+    /// Creates a file holder with no declaration syntax facts.
+    ///
+    /// Use this for selected text whose format has no shipped syntax provider. Format
+    /// extraction remains the documentation adapter's responsibility.
+    #[must_use]
+    pub fn empty(language: Language, path: ProjectPath) -> Self {
+        Self::new(language, path, Vec::new(), Vec::new(), false)
+    }
+
     /// Assembles one document from a provider's extracted facts, suffixing
     /// every repeated qualified name apart so each declaration addresses
     /// one identity, then leaving out every declaration whose name the
@@ -207,7 +222,16 @@ impl SyntaxDocument {
             symbols,
             has_errors,
             left_out_declarations,
+            markdown_facts: None,
+            source_digest: None,
         }
+    }
+
+    /// Attaches facts extracted from the same Markdown tree.
+    pub(crate) fn with_markdown_facts(mut self, facts: MarkdownFacts) -> Self {
+        self.has_errors |= !facts.error_ranges().is_empty();
+        self.markdown_facts = Some(facts);
+        self
     }
 
     /// Returns the language identity these facts are filed under.
@@ -220,6 +244,17 @@ impl SyntaxDocument {
     #[must_use]
     pub const fn path(&self) -> &ProjectPath {
         &self.path
+    }
+
+    /// Returns digest for exact bytes parsed by this provider.
+    #[must_use]
+    pub const fn source_digest(&self) -> Option<&FileDigest> {
+        self.source_digest.as_ref()
+    }
+
+    pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
+        self.source_digest = Some(FileDigest::of(source.as_bytes()));
+        self
     }
 
     /// Returns every named syntax node in pre-order.
@@ -247,6 +282,12 @@ impl SyntaxDocument {
     #[must_use]
     pub const fn has_errors(&self) -> bool {
         self.has_errors
+    }
+
+    /// Returns Markdown block and inline facts when the Markdown provider produced them.
+    #[must_use]
+    pub const fn markdown_facts(&self) -> Option<&MarkdownFacts> {
+        self.markdown_facts.as_ref()
     }
 
     /// Returns nodes covering byte position, outermost first.
@@ -301,6 +342,7 @@ mod tests {
             body_range: None,
             signatures: Vec::new(),
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }
     }
 
@@ -315,6 +357,20 @@ mod tests {
             })
             .collect();
         SyntaxDocument::new(language(), path(), Vec::new(), symbols, false)
+    }
+
+    #[test]
+    fn empty_file_holder_keeps_language_and_path_without_declarations() {
+        let language = language();
+        let path = path();
+
+        let document = SyntaxDocument::empty(language.clone(), path.clone());
+
+        assert_eq!(document.language(), &language);
+        assert_eq!(document.path(), &path);
+        assert!(document.nodes().is_empty());
+        assert!(document.symbols().is_empty());
+        assert!(!document.has_errors());
     }
 
     fn qualified_names(document: &SyntaxDocument) -> Vec<&str> {

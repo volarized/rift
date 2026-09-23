@@ -203,7 +203,7 @@ impl LanguageDefinition for MarkdownDefinition {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["md"]
+        &["md", "markdown", "mdx"]
     }
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {

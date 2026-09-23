@@ -153,23 +153,28 @@ impl PythonRules {
     /// The definition's docstring: its body suite's leading string
     /// expression, quotes stripped. `None` when the body opens with
     /// anything else.
-    fn docstring(&self, node: Node<'_>, text: &str) -> Vec<Documentation> {
+    fn docstring(
+        &self,
+        node: Node<'_>,
+        text: &str,
+    ) -> Result<(Vec<Documentation>, Vec<crate::ByteRange>), SyntaxError> {
         let Some(body) = node.child_by_field_id(self.kinds.body.get()) else {
-            return Vec::new();
+            return Ok((Vec::new(), Vec::new()));
         };
         let Some(first) = body.named_child(0) else {
-            return Vec::new();
+            return Ok((Vec::new(), Vec::new()));
         };
         if first.kind_id() != self.kinds.expression_statement {
-            return Vec::new();
+            return Ok((Vec::new(), Vec::new()));
         }
         let Some(string) = first
             .named_child(0)
             .filter(|expression| expression.kind_id() == self.kinds.string)
         else {
-            return Vec::new();
+            return Ok((Vec::new(), Vec::new()));
         };
         let mut content = String::new();
+        let mut ranges = Vec::new();
         for child_index in string.named_child_indices() {
             let Some(child) = string.named_child(child_index) else {
                 continue;
@@ -178,15 +183,19 @@ impl PythonRules {
                 && let Some(piece) = text.get(child.byte_range())
             {
                 content.push_str(piece);
+                ranges.push(extract::byte_range(child)?);
             }
         }
         if content.is_empty() {
-            return Vec::new();
+            return Ok((Vec::new(), Vec::new()));
         }
-        vec![Documentation {
-            format: DocumentationFormat::Plain,
-            text: content,
-        }]
+        Ok((
+            vec![Documentation {
+                format: DocumentationFormat::Plain,
+                text: content,
+            }],
+            ranges,
+        ))
     }
 
     /// One definition's declaration facts, shared by `def` and `class`.
@@ -204,13 +213,15 @@ impl PythonRules {
             Some(body) => Some(extract::byte_range(body)?),
             None => None,
         };
+        let (documentation, documentation_ranges) = self.docstring(node, text)?;
         Ok(Some(Declaration {
             name,
             kind,
             facets,
             visibility: None,
             body_range,
-            documentation: self.docstring(node, text),
+            documentation,
+            documentation_ranges,
         }))
     }
 
@@ -232,6 +243,7 @@ impl PythonRules {
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         })
     }
 
@@ -402,7 +414,8 @@ impl SyntaxProvider for PythonSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_source_witness(source.text))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -428,6 +441,13 @@ mod tests {
     use rift_core::ProjectPath;
 
     use super::*;
+    use crate::ByteRange;
+
+    fn text_at(text: &str, range: ByteRange) -> &str {
+        let start = usize::try_from(range.start).expect("range starts within source");
+        let end = usize::try_from(range.end).expect("range ends within source");
+        &text[start..end]
+    }
 
     fn analyze(text: &str) -> SyntaxDocument {
         let path = ProjectPath::new("src/service.py").expect("valid fixture path");
@@ -510,10 +530,9 @@ mod tests {
 
     #[test]
     fn test_docstrings_ride_as_plain_documentation_with_quotes_stripped() {
-        let document = analyze(
-            "def serve():\n    \"\"\"Answers one request.\"\"\"\n    pass\n\
-             \n\nclass Widget:\n    'One drawn control.'\n",
-        );
+        let text = "def serve():\n    \"\"\"Answers one request.\"\"\"\n    pass\n\
+             \n\nclass Widget:\n    'One drawn control.'\n";
+        let document = analyze(text);
         let function = symbol(&document, "serve");
         assert_eq!(
             function.documentation,
@@ -524,6 +543,10 @@ mod tests {
         );
         let class = symbol(&document, "Widget");
         assert_eq!(class.documentation[0].text, "One drawn control.");
+        assert_eq!(
+            text_at(text, function.documentation_ranges[0]),
+            "Answers one request."
+        );
     }
 
     #[test]

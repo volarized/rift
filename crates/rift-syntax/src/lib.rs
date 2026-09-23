@@ -26,7 +26,11 @@ pub use failure::{SyntaxBound, SyntaxError, SyntaxFault, SyntaxViolation};
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;
 pub use language::{LanguageDefinition, ShippedLanguage, definitions};
-pub use markdown::MarkdownSyntaxProvider;
+pub use markdown::{
+    MARKDOWN_INLINE_RANGES_MAX, MARKDOWN_PROGRESS_CALLBACKS_MAX, MarkdownBlockFact,
+    MarkdownBlockKind, MarkdownBlockStructure, MarkdownFacts, MarkdownHeadingFact,
+    MarkdownLinkFact, MarkdownLinkKind, MarkdownReferenceCandidate, MarkdownSyntaxProvider,
+};
 pub use provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use python::PythonSyntaxProvider;
 pub use rust::{RustQuery, RustQueryCapture, RustSyntaxProvider};

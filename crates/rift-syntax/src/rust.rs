@@ -396,7 +396,8 @@ impl SyntaxProvider for RustSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_source_witness(source.text))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -442,13 +443,15 @@ impl GrammarRules for RustGrammarRules {
         if is_entrypoint(node, kind, &name) {
             facets.push(SymbolFacet::Entrypoint);
         }
+        let (documentation, documentation_ranges) = attachment::attached_documentation(node, text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
             facets,
             visibility: Some(visibility.authored()),
             body_range: body_range(node, kind)?,
-            documentation: attachment::attached_documentation(node, text),
+            documentation,
+            documentation_ranges,
         }))
     }
 
@@ -655,6 +658,12 @@ mod tests {
     use super::*;
     use crate::failure::{SyntaxViolation, position_overflow};
 
+    fn text_at(text: &str, range: ByteRange) -> &str {
+        let start = usize::try_from(range.start).expect("range starts within source");
+        let end = usize::try_from(range.end).expect("range ends within source");
+        &text[start..end]
+    }
+
     fn path() -> ProjectPath {
         ProjectPath::new("src/lib.rs").expect("valid fixture path")
     }
@@ -788,6 +797,21 @@ mod tests {
             .map(|symbol| symbol.signatures[0].display.as_str())
             .collect();
         assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
+    }
+
+    #[test]
+    fn attached_documentation_ranges_name_original_comment_bytes() {
+        let text = "/// First line.\n/// Second line.\n#[inline]\npub fn serve() {}\n";
+        let document = analyze(text);
+        let ranges = &document.symbols()[0].documentation_ranges;
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| text_at(text, *range))
+                .collect::<Vec<_>>(),
+            ["/// First line.\n", "/// Second line.\n"]
+        );
+        assert!(ranges[1].end < document.symbols()[0].item_range.start);
     }
 
     #[test]
