@@ -746,7 +746,7 @@ jobs:
         run: |
           just artifact-test --binary target/integration-cli/rift --junit target/integration/artifact.xml
           just agent-test --binary target/integration-cli/rift --junit target/integration/agent.xml
-          just conformance target/integration-cli/rift
+          just conformance --binary target/integration-cli/rift
       - name: Validate cold first use
         run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
       - uses: actions/upload-artifact@v6.0.0
