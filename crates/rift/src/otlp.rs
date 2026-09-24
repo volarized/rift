@@ -31,7 +31,8 @@ const RIFT_OTLP_FILTER_VAR: &str = "RIFT_OTLP_FILTER";
 /// Keeps Rift's own crates - the ones `traced!` and `traced_async!` instrument - at
 /// info; a dependency's own spans stay out unless the operator names it.
 #[cfg(feature = "otlp")]
-const DEFAULT_OTLP_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=info";
+const DEFAULT_OTLP_FILTER: &str =
+    "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_analysis=info";
 
 /// The installed exporter's tracer provider, held so the caller can flush and shut it
 /// down before the process exits.
