@@ -344,10 +344,7 @@ fn read_zip(
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
-            .map_err(|_| ArchiveError::InvalidArchive)?;
-        if entry.encrypted() {
-            return Err(ArchiveError::UnsupportedEntry);
-        }
+            .map_err(|error| zip_entry_error(&error))?;
         if entry.is_symlink() {
             let path = entry.name().to_owned();
             output.push_skipped_link(&path)?;
@@ -364,6 +361,17 @@ fn read_zip(
         output.push(&path, directory, size, &mut entry)?;
     }
     Ok(output.into_files_and_skipped_links())
+}
+
+/// zip 8.6 refuses to open an encrypted member without a password before the entry exists, so
+/// the refusal itself is where an encrypted member is recognized.
+fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
+    match error {
+        zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED) => {
+            ArchiveError::UnsupportedEntry
+        }
+        _ => ArchiveError::InvalidArchive,
+    }
 }
 
 // zip 8.6 allocates its central-directory Vec before exposing `len()`. Its fixed-size
