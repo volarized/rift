@@ -1,8 +1,9 @@
-//! Markdown syntax facts from the pinned tree-sitter-md block grammar.
+//! Markdown syntax facts from the pinned tree-sitter-md block and inline grammars.
 //!
-//! Only the block grammar is read; inline content stays raw bytes -
-//! `**bold**` in a heading is part of the name - so the inline grammar
-//! never loads. Each named heading declares one `heading` symbol.
+//! The block grammar supplies headings and block structure. The inline
+//! grammar supplies authored link ranges and inline code candidates. Heading
+//! names keep source spelling, so `**bold**` stays part of the name. Each
+//! named heading declares one `heading` symbol.
 //!
 //! Decisions this module fixes:
 //! - Nesting follows the grammar's section tree. The pinned block grammar
@@ -41,13 +42,19 @@ use std::sync::OnceLock;
 
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::document::{ByteRange, SyntaxDocument};
+mod facts;
 use crate::extract::{self, Declaration, GrammarRules};
-use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
+use crate::failure::{SyntaxError, SyntaxFault};
 use crate::provider::{
     SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
+};
+pub use facts::{
+    MARKDOWN_INLINE_RANGES_MAX, MARKDOWN_PROGRESS_CALLBACKS_MAX, MarkdownBlockFact,
+    MarkdownBlockKind, MarkdownBlockStructure, MarkdownFacts, MarkdownHeadingFact,
+    MarkdownLinkFact, MarkdownLinkKind, MarkdownReferenceCandidate,
 };
 
 /// Grammar spelling of a `section`, one nesting level per heading.
@@ -209,6 +216,7 @@ impl MarkdownRules {
             visibility: None,
             body_range: section_body_range(section, heading)?,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -226,6 +234,7 @@ impl MarkdownRules {
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         })
     }
 }
@@ -314,33 +323,31 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
                 source_bytes_max: self.limits.source_bytes_max(),
             }));
         }
-        let grammar = markdown_grammar();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .map_err(|_| incompatible_grammar(&grammar))?;
-        let tree = parser.parse(source.text, None).ok_or_else(|| {
-            Error::new(SyntaxFault::ParseCancelled {
-                path: Some(source.path.clone()),
-            })
-        })?;
+        let trees = facts::parse_markdown_trees(
+            source,
+            self.limits,
+            facts::MarkdownParseBounds::default(),
+        )?;
         let rules = MarkdownRules {
             kinds: markdown_kinds(),
         };
         let (nodes, symbols) = extract::extract(
-            tree.root_node(),
+            trees.block.root_node(),
             source,
             self.limits,
             &self.language,
             &rules,
         )?;
-        Ok(SyntaxDocument::new(
+        let syntax = SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
             nodes,
             symbols,
-            tree.root_node().has_error(),
-        ))
+            trees.block.root_node().has_error(),
+        )
+        .with_source_witness(source.text);
+        let markdown_facts = facts::extract_markdown_facts(source, &trees, &syntax, self.limits)?;
+        Ok(syntax.with_markdown_facts(markdown_facts))
     }
 
     /// Portable structural facets for one block grammar node kind. Most
@@ -382,6 +389,12 @@ mod tests {
 
     use super::*;
     use crate::failure::SyntaxViolation;
+
+    fn text_at(text: &str, range: ByteRange) -> &str {
+        let start = usize::try_from(range.start).expect("range starts within source");
+        let end = usize::try_from(range.end).expect("range ends within source");
+        &text[start..end]
+    }
 
     fn path() -> ProjectPath {
         ProjectPath::new("docs/guide.md").expect("valid fixture path")
@@ -429,6 +442,126 @@ mod tests {
             provider.source_bytes_max(),
             MarkdownSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
         );
+    }
+
+    #[test]
+    fn test_documentation_facts_keep_source_ranges_links_and_code_language() {
+        let text = "# Guide\r\n\r\nSee [install](../install#steps) and `Widget`.\r\n\r\n```rust\r\nfn main() {}\r\n```";
+        let document = analyze(text);
+        let facts = document.markdown_facts().expect("Markdown facts");
+        assert_eq!(
+            facts
+                .blocks()
+                .iter()
+                .map(|block| (block.structure, block.kind, block.line))
+                .collect::<Vec<_>>(),
+            [
+                (MarkdownBlockStructure::Heading, MarkdownBlockKind::Prose, 1),
+                (
+                    MarkdownBlockStructure::Paragraph,
+                    MarkdownBlockKind::Prose,
+                    3
+                ),
+                (MarkdownBlockStructure::Code, MarkdownBlockKind::Code, 5),
+            ]
+        );
+        let code = facts
+            .blocks()
+            .iter()
+            .find(|block| block.kind == MarkdownBlockKind::Code)
+            .expect("fenced code block");
+        assert_eq!(code.code_language.as_deref(), Some("rust"));
+        let heading = &facts.headings()[0];
+        assert_eq!(
+            document.symbols()[heading.symbol_index].qualified_name,
+            "Guide"
+        );
+        assert_eq!(facts.heading_path(Some(0)).len(), 1);
+        assert_eq!(facts.links().len(), 1);
+        let link = &facts.links()[0];
+        assert_eq!(link.kind, MarkdownLinkKind::Authored);
+        assert_eq!(
+            link.destination_range.map(|range| text_at(text, range)),
+            Some("../install#steps")
+        );
+        assert_eq!(
+            link.fragment_range.map(|range| text_at(text, range)),
+            Some("steps")
+        );
+        assert_eq!(facts.reference_candidates().len(), 1);
+        let candidate = facts.reference_candidates()[0].range;
+        assert_eq!(text_at(text, candidate), "Widget");
+    }
+
+    #[test]
+    fn test_mdx_filter_is_opt_in_and_keeps_inline_code_marker() {
+        let text = "# Guide\n\nPlain < value and `<Component />`.\n";
+        let document = analyze(text);
+        let facts = document.markdown_facts().expect("Markdown facts");
+        assert_eq!(facts.blocks().len(), 2);
+        let mdx = facts.for_mdx(text);
+        assert_eq!(facts.omitted_ranges().len(), 0);
+        assert_eq!(mdx.omitted_ranges().len(), 1);
+        assert_eq!(mdx.blocks().len(), 1);
+        assert_eq!(mdx.blocks()[0].structure, MarkdownBlockStructure::Heading);
+    }
+
+    #[test]
+    fn test_mdx_filter_removes_headings_with_mdx_markers_and_reparents_blocks() {
+        let text = "# <Component />\n\nIntro.\n";
+        let document = analyze(text);
+        let facts = document.markdown_facts().expect("Markdown facts");
+        let mdx = facts.for_mdx(text);
+        assert!(mdx.headings().is_empty());
+        assert_eq!(mdx.blocks().len(), 1);
+        assert_eq!(mdx.blocks()[0].structure, MarkdownBlockStructure::Paragraph);
+        assert_eq!(mdx.blocks()[0].heading, None);
+    }
+
+    #[test]
+    fn test_facts_preserve_crlf_and_missing_final_newline_offsets() {
+        let text = "# Guide\r\n\r\nSee [install](/install#steps)";
+        let document = analyze(text);
+        let facts = document.markdown_facts().expect("Markdown facts");
+        assert_eq!(facts.blocks()[0].line, 1);
+        assert_eq!(facts.blocks()[1].line, 3);
+        assert_eq!(facts.blocks()[1].range.end, text.len() as u64);
+        assert_eq!(facts.error_ranges(), []);
+    }
+
+    #[test]
+    fn test_commonmark_and_gfm_blocks_keep_authored_reference_ranges() {
+        let text = "> quoted text\n\n- list item\n\n| Name | Value |\n| --- | --- |\n| A | B |\n\n[id]: /target#part\n\nSee [id].\n";
+        let document = analyze(text);
+        let facts = document.markdown_facts().expect("Markdown facts");
+        assert!(
+            facts
+                .blocks()
+                .iter()
+                .any(|block| { block.structure == MarkdownBlockStructure::BlockQuote })
+        );
+        assert!(
+            facts
+                .blocks()
+                .iter()
+                .any(|block| { block.structure == MarkdownBlockStructure::List })
+        );
+        assert!(
+            facts
+                .blocks()
+                .iter()
+                .any(|block| { block.structure == MarkdownBlockStructure::Table })
+        );
+        let definition = facts
+            .links()
+            .iter()
+            .find(|link| link.kind == MarkdownLinkKind::ReferenceDefinition)
+            .expect("reference definition");
+        let destination = definition.destination_range.expect("authored destination");
+        assert_eq!(text_at(text, destination), "/target#part");
+        assert!(facts.links().iter().any(|link| {
+            link.kind == MarkdownLinkKind::ReferenceUse && text_at(text, link.range) == "[id]"
+        }));
     }
 
     /// ATX headings h1 through h6 nest one section per level: each symbol's

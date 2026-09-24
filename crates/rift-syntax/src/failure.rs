@@ -26,6 +26,12 @@ pub enum SyntaxViolation {
     InvalidQuery,
     /// Query produced more captures than accepted.
     TooManyCaptures,
+    /// Markdown produced more inline ranges than accepted.
+    TooManyMarkdownInlineRanges,
+    /// Markdown parser exceeded progress callback bound.
+    MarkdownProgressExceeded,
+    /// Markdown inline ranges were rejected by Tree-sitter.
+    InvalidMarkdownRanges,
     /// Node kind is outside interpreted grammar vocabulary.
     UnknownNodeKind,
 }
@@ -118,6 +124,27 @@ pub enum SyntaxFault {
         /// Configured capture bound.
         captures_max: usize,
     },
+    /// Markdown block tree produced more inline ranges than accepted.
+    TooManyMarkdownInlineRanges {
+        /// Failing source path.
+        path: ProjectPath,
+        /// Configured inline range bound.
+        inline_ranges_max: usize,
+        /// Observed inline ranges.
+        observed: usize,
+    },
+    /// Markdown parsing exceeded its shared progress callback bound.
+    MarkdownProgressExceeded {
+        /// Failing source path.
+        path: ProjectPath,
+        /// Configured callback bound.
+        progress_callbacks_max: usize,
+    },
+    /// Markdown parser rejected ranges produced by its block tree.
+    InvalidMarkdownRanges {
+        /// Failing source path.
+        path: ProjectPath,
+    },
     /// Node kind is outside interpreted grammar vocabulary.
     UnknownNodeKind {
         /// Unrecognized grammar kind string.
@@ -139,6 +166,11 @@ impl SyntaxFault {
             Self::PositionOverflow { .. } => SyntaxViolation::PositionOverflow,
             Self::InvalidQuery { .. } => SyntaxViolation::InvalidQuery,
             Self::TooManyCaptures { .. } => SyntaxViolation::TooManyCaptures,
+            Self::TooManyMarkdownInlineRanges { .. } => {
+                SyntaxViolation::TooManyMarkdownInlineRanges
+            }
+            Self::MarkdownProgressExceeded { .. } => SyntaxViolation::MarkdownProgressExceeded,
+            Self::InvalidMarkdownRanges { .. } => SyntaxViolation::InvalidMarkdownRanges,
             Self::UnknownNodeKind { .. } => SyntaxViolation::UnknownNodeKind,
         }
     }
@@ -151,12 +183,15 @@ impl Fault for SyntaxFault {
             Self::SourceTooLarge { .. }
             | Self::TooManyNodes { .. }
             | Self::TooDeep { .. }
-            | Self::TooManyCaptures { .. } => ErrorName::Wire(ErrorCode::LimitExceeded),
+            | Self::TooManyCaptures { .. }
+            | Self::TooManyMarkdownInlineRanges { .. }
+            | Self::MarkdownProgressExceeded { .. } => ErrorName::Wire(ErrorCode::LimitExceeded),
             Self::ParseCancelled { .. } => ErrorName::Wire(ErrorCode::Cancelled),
             Self::IncompatibleGrammar { .. }
             | Self::PositionOverflow { .. }
             | Self::InvalidQuery { .. }
-            | Self::UnknownNodeKind { .. } => ErrorName::Wire(ErrorCode::InternalError),
+            | Self::UnknownNodeKind { .. }
+            | Self::InvalidMarkdownRanges { .. } => ErrorName::Wire(ErrorCode::InternalError),
         }
     }
 
@@ -224,6 +259,25 @@ impl Fault for SyntaxFault {
             ],
             Self::TooManyCaptures { captures_max } => {
                 vec![ErrorContext::new("captures_max", captures_max.to_string())]
+            }
+            Self::TooManyMarkdownInlineRanges {
+                path,
+                inline_ranges_max,
+                observed,
+            } => vec![
+                ErrorContext::new("path", path.to_string()),
+                ErrorContext::new("inline_ranges_max", inline_ranges_max.to_string()),
+                ErrorContext::new("observed", observed.to_string()),
+            ],
+            Self::MarkdownProgressExceeded {
+                path,
+                progress_callbacks_max,
+            } => vec![
+                ErrorContext::new("path", path.to_string()),
+                ErrorContext::new("progress_callbacks_max", progress_callbacks_max.to_string()),
+            ],
+            Self::InvalidMarkdownRanges { path } => {
+                vec![ErrorContext::new("path", path.to_string())]
             }
             Self::UnknownNodeKind { kind } => {
                 vec![ErrorContext::new("node_kind", kind.clone())]

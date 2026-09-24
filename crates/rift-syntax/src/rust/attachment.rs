@@ -9,6 +9,9 @@
 
 use std::sync::OnceLock;
 
+use crate::ByteRange;
+use crate::extract;
+use crate::failure::SyntaxError;
 use rift_protocol::read::{Documentation, DocumentationFormat};
 use tree_sitter::Node;
 
@@ -182,9 +185,13 @@ fn is_doc_comment(node: Node<'_>) -> bool {
 /// [`declaration_start`] extends the span over, filtered to outer doc
 /// comments alone, since an attribute contributes no text - stripped of
 /// comment syntax and joined in source order. Empty when nothing attaches.
-pub(super) fn attached_documentation(node: Node<'_>, text: &str) -> Vec<Documentation> {
+pub(super) fn attached_documentation(
+    node: Node<'_>,
+    text: &str,
+) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
     let mut front = node;
     let mut comments: Vec<&str> = Vec::new();
+    let mut ranges = Vec::new();
     while let Some(previous) = front.prev_sibling() {
         if !is_attached(previous) {
             break;
@@ -204,22 +211,27 @@ pub(super) fn attached_documentation(node: Node<'_>, text: &str) -> Vec<Document
         }
         if is_doc_comment(previous) {
             comments.push(previous_text);
+            ranges.push(extract::byte_range(previous)?);
         }
         front = previous;
     }
     if comments.is_empty() {
-        return Vec::new();
+        return Ok((Vec::new(), Vec::new()));
     }
     comments.reverse();
+    ranges.reverse();
     let text = comments
         .iter()
         .map(|comment| strip_doc_comment_marker(comment))
         .collect::<Vec<_>>()
         .join("\n");
-    vec![Documentation {
-        format: DocumentationFormat::Markdown,
-        text,
-    }]
+    Ok((
+        vec![Documentation {
+            format: DocumentationFormat::Markdown,
+            text,
+        }],
+        ranges,
+    ))
 }
 
 /// Strips one doc comment's syntax, keeping its written text: `///` (with

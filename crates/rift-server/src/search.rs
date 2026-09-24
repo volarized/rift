@@ -2720,7 +2720,7 @@ impl Tower {
     }
 
     /// A sentence present in both a provider-claimed file (markdown, syntax index) and a
-    /// `.mdx` file (`[search.text]`, no provider claims it) returns both hits: each file
+    /// `.txt` file (`[search.text]`, no provider claims it) returns both hits: each file
     /// contributes its own text document to the store, and the two resolve to the two
     /// file shapes the answer distinguishes by language.
     #[tokio::test]
@@ -2733,7 +2733,7 @@ impl Tower {
             format!("# Rift\n\nRift is an {sentence}.\n"),
         )?;
         fs::write(
-            directory.path().join("guide.mdx"),
+            directory.path().join("guide.txt"),
             format!("Rift is an {sentence} for editors.\n"),
         )?;
         let service = ReadService::build(
@@ -2760,14 +2760,14 @@ impl Tower {
             json!(["markdown"]),
             "a provider-claimed file carries the language that claimed it: {readme:#?}"
         );
-        let mdx = results
+        let text = results
             .iter()
-            .find(|hit| hit["path"] == json!("guide.mdx"))
+            .find(|hit| hit["path"] == json!("guide.txt"))
             .ok_or("the text-lane file must return a hit through the store")?;
         assert_eq!(
-            mdx["hit"]["languages"],
+            text["hit"]["languages"],
             serde_json::Value::Null,
-            "a text-lane file no provider claims carries no language: {mdx:#?}"
+            "a text-lane file no provider claims carries no language: {text:#?}"
         );
         Ok(())
     }

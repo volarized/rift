@@ -72,6 +72,97 @@ pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str)
     )
 }
 
+/// Parsed parts of a canonical wire symbol identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSymbolIdentity {
+    language_segment: String,
+    path: ProjectPath,
+    qualified_name: String,
+}
+
+impl ParsedSymbolIdentity {
+    /// Returns language segment from wire identity.
+    #[must_use]
+    pub fn language_segment(&self) -> &str {
+        &self.language_segment
+    }
+
+    /// Returns decoded project path from wire identity.
+    #[must_use]
+    pub const fn path(&self) -> &ProjectPath {
+        &self.path
+    }
+
+    /// Returns decoded qualified name from wire identity.
+    #[must_use]
+    pub fn qualified_name(&self) -> &str {
+        &self.qualified_name
+    }
+
+    /// Returns canonical wire identity.
+    #[must_use]
+    pub fn wire_identity(&self) -> String {
+        symbol_identity(
+            &self.language_segment,
+            self.path.as_str(),
+            &self.qualified_name,
+        )
+    }
+}
+
+/// Failure to parse a canonical wire symbol identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolIdentityError;
+
+impl std::fmt::Display for SymbolIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("symbol identity is not canonical")
+    }
+}
+
+impl std::error::Error for SymbolIdentityError {}
+
+/// Parses one canonical `rift://symbol/` identity.
+///
+/// # Errors
+///
+/// Returns [`SymbolIdentityError`] for invalid structure, language, path, encoding, or spelling.
+pub fn parse_symbol_identity(value: &str) -> Result<ParsedSymbolIdentity, SymbolIdentityError> {
+    const SYMBOL_ID_BYTES_MAX: usize = 8_192;
+
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityError);
+    }
+    let remainder = value
+        .strip_prefix(SYMBOL_URI_PREFIX)
+        .ok_or(SymbolIdentityError)?;
+    let (language_segment, remainder) = remainder.split_once('/').ok_or(SymbolIdentityError)?;
+    rift_protocol::read::Language::from_identity_segment(language_segment)
+        .map_err(|_| SymbolIdentityError)?;
+    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or(SymbolIdentityError)?;
+    let path = percent_encoding::percent_decode_str(encoded_path)
+        .decode_utf8()
+        .map_err(|_| SymbolIdentityError)?
+        .into_owned();
+    let qualified_name = percent_encoding::percent_decode_str(encoded_name)
+        .decode_utf8()
+        .map_err(|_| SymbolIdentityError)?
+        .into_owned();
+    if path.is_empty() || qualified_name.is_empty() {
+        return Err(SymbolIdentityError);
+    }
+    let path = ProjectPath::new(path).map_err(|_| SymbolIdentityError)?;
+    let parsed = ParsedSymbolIdentity {
+        language_segment: language_segment.to_owned(),
+        path,
+        qualified_name,
+    };
+    if parsed.wire_identity() != value {
+        return Err(SymbolIdentityError);
+    }
+    Ok(parsed)
+}
+
 /// An identity value that is empty or carries a control character.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdFault;
@@ -502,7 +593,7 @@ mod tests {
         CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision, ProviderId,
         ProviderRevision, ProviderSymbolId, SourceResolverId, SourceResolverIdViolation,
         SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision,
-        WorkspaceId, encode_path, symbol_identity,
+        WorkspaceId, encode_path, parse_symbol_identity, symbol_identity,
     };
     use crate::constants::{
         SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
@@ -543,6 +634,34 @@ mod tests {
             identity,
             "rift://symbol/rust/src/caf%C3%A9%20mod.rs/Rift::separated%20name"
         );
+    }
+
+    #[test]
+    fn parse_symbol_identity_accepts_only_canonical_wire_spelling() {
+        let identity = symbol_identity("rust", "src/café mod.rs", "Rift::separated name");
+        let parsed = parse_symbol_identity(&identity).expect("canonical symbol identity");
+        assert_eq!(parsed.language_segment(), "rust");
+        assert_eq!(parsed.path().as_str(), "src/café mod.rs");
+        assert_eq!(parsed.qualified_name(), "Rift::separated name");
+        assert_eq!(parsed.wire_identity(), identity);
+        let oversized = format!("rift://symbol/rust/src/lib.rs/{}", "x".repeat(8192));
+        let error = parse_symbol_identity(&oversized).expect_err("identity exceeds byte bound");
+        assert_eq!(error.to_string(), "symbol identity is not canonical");
+
+        for invalid in [
+            "invalid",
+            "rift://symbol/Rust/src/lib.rs/Thing",
+            "rift://symbol/rust//Thing",
+            "rift://symbol/rust/src/lib.rs/",
+            "rift://symbol/rust/src%2flib.rs/Thing",
+            "rift://symbol/rust/src%FF.rs/Thing",
+            "rift://symbol/rust/src/../lib.rs/Thing",
+        ] {
+            assert!(
+                parse_symbol_identity(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

@@ -54,6 +54,31 @@ pub fn lines_inclusive(source: &str) -> std::str::SplitInclusive<'_, char> {
     source.split_inclusive(char::from(LINE_FEED))
 }
 
+/// Returns each line's starting byte offset in ascending order.
+///
+/// The source is scanned once, and every returned offset addresses an exact UTF-8 boundary.
+#[must_use]
+pub fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut consumed = 0_usize;
+    for line in lines_inclusive(source) {
+        starts.push(consumed);
+        consumed += line.len();
+    }
+    starts
+}
+
+/// Returns the 1-based line containing `byte_offset`, from precomputed line starts.
+///
+/// `starts` must come from [`line_starts`] for the same source. An offset past the last start
+/// names the last line; empty starts name line one.
+#[must_use]
+pub fn line_of(starts: &[usize], byte_offset: u64) -> u64 {
+    let offset = usize::try_from(byte_offset).unwrap_or(usize::MAX);
+    let line = starts.partition_point(|start| *start <= offset);
+    u64::try_from(line.max(1)).unwrap_or(u64::MAX)
+}
+
 /// Strips `line`'s ending: `\r\n` first, then `\n`, leaving `line` unchanged when neither
 /// matches.
 #[must_use]

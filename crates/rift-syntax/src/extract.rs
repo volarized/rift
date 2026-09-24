@@ -94,6 +94,8 @@ pub(crate) struct Declaration {
     /// nothing attaches. Carried through to [`SyntaxSymbol::documentation`]
     /// unchanged - the walk itself never inspects a comment's syntax.
     pub(crate) documentation: Vec<Documentation>,
+    /// Exact source ranges for attached documentation.
+    pub(crate) documentation_ranges: Vec<ByteRange>,
 }
 
 /// Converts one node's span to the wire byte width.
@@ -220,6 +222,7 @@ fn qualified_symbol(
         body_range: declaration.body_range,
         signatures,
         documentation: declaration.documentation,
+        documentation_ranges: declaration.documentation_ranges,
     })
 }
 

@@ -151,6 +151,7 @@ impl GrammarRules for JsonRules {
             visibility: None,
             body_range,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -252,7 +253,8 @@ impl SyntaxProvider for JsonSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_source_witness(source.text))
     }
 
     /// Portable structural facets for one JSON grammar node kind. The

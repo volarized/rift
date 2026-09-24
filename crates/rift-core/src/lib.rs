@@ -2,6 +2,7 @@
 
 mod capture;
 mod configuration;
+mod digest;
 mod error;
 mod identity;
 mod limits;
@@ -17,16 +18,18 @@ pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
 };
+pub use digest::FileDigest;
 pub use error::{
     CAUSE_DEPTH_MAX, CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault,
     LimitEvidence, RetryDirective, RiftError, causes, fault_label, render_failure,
 };
 pub use identity::{
     CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
-    ProviderId, ProviderRevision, ProviderSymbolId, RevisionError, RevisionFault, SourceResolverId,
-    SourceResolverIdError, SourceResolverIdFault, SourceResolverIdViolation, SourceRevision,
-    SourceUnitId, SourceUnitIdError, SourceUnitIdFault, SymbolId, TreeRevision, WorkspaceId,
-    encode_path, symbol_identity,
+    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, RevisionError,
+    RevisionFault, SourceResolverId, SourceResolverIdError, SourceResolverIdFault,
+    SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault,
+    SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId, encode_path, parse_symbol_identity,
+    symbol_identity,
 };
 pub use limits::{BudgetExhausted, LoopBudget};
 pub use measurement::{

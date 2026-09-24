@@ -32,7 +32,7 @@ use serde_json::json;
 // `search.rs` unit tests (`search_matched_by_carries_both_members_once_the_lexical_lane_covers_text_files`
 // and the sans-I/O tests beside it) prove that half of the fix directly.
 
-/// `search` returns a `.mdx` file and a `justfile` for text they hold, each
+/// File-target `search` returns a `.mdx` file and a `justfile` for text they hold, each
 /// as a flat file hit whose `matched_by` claims the `content` lane.
 #[tokio::test]
 async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestResult {
@@ -57,7 +57,7 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     let mdx = proxied_call(
         &client,
         "search",
-        &json!({ "query": "agentic development toolkit", "limit": 50 }),
+        &json!({ "query": "agentic development toolkit", "target": "file", "limit": 50 }),
     )
     .await?;
     let mdx_hits: Vec<&serde_json::Value> = mdx["results"]

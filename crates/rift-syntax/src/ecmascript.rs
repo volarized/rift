@@ -380,6 +380,7 @@ impl GrammarRules for EcmaScriptRules {
             visibility: self.accessibility(node, text),
             body_range: self.body_range(node, kind)?,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -462,7 +463,8 @@ pub(crate) fn analyze(
         nodes,
         symbols,
         tree.root_node().has_error(),
-    ))
+    )
+    .with_source_witness(source.text))
 }
 
 /// Portable structural facets for one ECMAScript grammar node kind, shared

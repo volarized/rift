@@ -240,6 +240,7 @@ impl YamlRules {
             visibility: None,
             body_range,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -265,6 +266,7 @@ impl YamlRules {
             visibility: None,
             body_range: self.document_body_range(document)?,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -397,7 +399,8 @@ impl SyntaxProvider for YamlSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_source_witness(source.text))
     }
 
     /// Portable structural facets for one YAML grammar node kind. The

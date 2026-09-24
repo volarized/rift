@@ -267,6 +267,7 @@ impl TomlRules {
             visibility: None,
             body_range,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         }))
     }
 
@@ -284,6 +285,7 @@ impl TomlRules {
             visibility: None,
             body_range: None,
             documentation: Vec::new(),
+            documentation_ranges: Vec::new(),
         })
     }
 }
@@ -405,7 +407,8 @@ impl SyntaxProvider for TomlSyntaxProvider {
             nodes,
             symbols,
             tree.root_node().has_error(),
-        ))
+        )
+        .with_source_witness(source.text))
     }
 
     /// Portable structural facets for one TOML grammar node kind. The

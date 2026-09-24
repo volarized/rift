@@ -177,7 +177,8 @@ mod tests {
         assert_eq!(
             source_file_extensions(),
             [
-                "rs", "js", "jsx", "ts", "tsx", "md", "json", "yaml", "yml", "toml", "py", "pyi"
+                "rs", "js", "jsx", "ts", "tsx", "md", "markdown", "mdx", "json", "yaml", "yml",
+                "toml", "py", "pyi"
             ]
         );
     }
@@ -255,7 +256,8 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 false,
-            ))
+            )
+            .with_source_witness(source.text))
         }
 
         fn node_facets(&self, _kind: &str) -> Vec<NodeFacet> {
