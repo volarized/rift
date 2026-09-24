@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "axum",
  "clap",
@@ -4386,7 +4386,7 @@ dependencies = [
 
 [[package]]
 name = "rift-analysis"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "flate2",
  "percent-encoding",
@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "rift-cloud-client"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "anyhow",
  "axum",
@@ -4437,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "rift-core"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "percent-encoding",
  "rift-protocol",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "rift-dependency"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4469,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "rift-history"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "gix",
  "rift-core",
@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "rift-index"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "flate2",
  "ignore",
@@ -4509,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "rift-lsp"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "globset",
  "lsp-types",
@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "rift-mcp"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "axum",
  "data-encoding",
@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "rift-protocol"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "rift-provider"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "rift-core",
  "rift-protocol",
@@ -4580,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "rift-ranking"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "data-encoding",
  "rift-core",
@@ -4591,7 +4591,7 @@ dependencies = [
 
 [[package]]
 name = "rift-schema-export"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "jsonschema",
  "rift-cloud-client",
@@ -4605,7 +4605,7 @@ dependencies = [
 
 [[package]]
 name = "rift-search"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "axum",
  "candle-core",
@@ -4629,7 +4629,7 @@ dependencies = [
 
 [[package]]
 name = "rift-server"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "lsp-types",
  "percent-encoding",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "rift-syntax"
-version = "0.0.44"
+version = "0.0.45"
 dependencies = [
  "rift-core",
  "rift-protocol",
