@@ -85,62 +85,69 @@ pub(crate) fn build(
     chunk_bytes_max: usize,
     previous: Option<(&DocumentationCollection, &NotebookFiles)>,
 ) -> Result<(DocumentationCollection, NotebookFiles), WorkspaceIndexError> {
-    check_regular_source_count(text_files)?;
-    let mut omissions = Vec::new();
-    let notebooks = decode_notebooks(
-        text_files,
-        previous.map(|(_, notebooks)| notebooks),
-        &mut omissions,
-    )?;
-    let mut collected = CollectedInputs {
-        input_bytes: 0,
-        inputs: Vec::new(),
-        omissions,
-    };
-    for (path, file) in text_files {
-        let Some(source_format) = format(path) else {
-            continue;
-        };
-        if source_format == DocumentationSourceFormat::Notebook {
-            let Some(notebook) = notebooks.get(path).and_then(HeldNotebook::content) else {
-                continue;
-            };
-            append_notebook_inputs(
-                path,
-                file,
-                notebook,
-                source_format,
-                chunk_bytes_max,
-                &mut collected,
+    rift_core::traced!(
+        component = "documentation",
+        operation = "documentation.collect",
+        sources = text_files.len(),
+        {
+            check_regular_source_count(text_files)?;
+            let mut omissions = Vec::new();
+            let notebooks = decode_notebooks(
+                text_files,
+                previous.map(|(_, notebooks)| notebooks),
+                &mut omissions,
             )?;
-            continue;
+            let mut collected = CollectedInputs {
+                input_bytes: 0,
+                inputs: Vec::new(),
+                omissions,
+            };
+            for (path, file) in text_files {
+                let Some(source_format) = format(path) else {
+                    continue;
+                };
+                if source_format == DocumentationSourceFormat::Notebook {
+                    let Some(notebook) = notebooks.get(path).and_then(HeldNotebook::content) else {
+                        continue;
+                    };
+                    append_notebook_inputs(
+                        path,
+                        file,
+                        notebook,
+                        source_format,
+                        chunk_bytes_max,
+                        &mut collected,
+                    )?;
+                    continue;
+                }
+                append_regular_input(
+                    path,
+                    file,
+                    files.get(path).map(Arc::as_ref),
+                    source_format,
+                    chunk_bytes_max,
+                    &mut collected,
+                )?;
+            }
+
+            append_attached_inputs(
+                files,
+                declarations,
+                chunk_bytes_max,
+                &mut collected.input_bytes,
+                &mut collected.omissions,
+                &mut collected.inputs,
+            )?;
+
+            let collection = finish_collection(
+                collected.inputs,
+                declarations,
+                collected.omissions,
+                previous.map(|(documentation, _)| documentation),
+            )?;
+            Ok((collection, notebooks))
         }
-        append_regular_input(
-            path,
-            file,
-            files.get(path).map(Arc::as_ref),
-            source_format,
-            chunk_bytes_max,
-            &mut collected,
-        )?;
-    }
-
-    append_attached_inputs(
-        files,
-        declarations,
-        chunk_bytes_max,
-        &mut collected.input_bytes,
-        &mut collected.omissions,
-        &mut collected.inputs,
-    )?;
-
-    let collection = finish_collection(
-        collected.inputs,
-        declarations,
-        collected.omissions,
-        previous.map(|(documentation, _)| documentation),
-    )?;
-    Ok((collection, notebooks))
+    )
 }
 
 #[derive(Default)]

@@ -22,10 +22,12 @@ pub const DOCUMENTATION_SOURCES_MAX: u32 = 100_000;
 pub const DOCUMENTATION_SOURCE_BYTES_MAX: u32 = 4 << 20;
 /// Source bytes one collection accepts together.
 pub const DOCUMENTATION_TOTAL_BYTES_MAX: u64 = 512 << 20;
-/// Blocks one collection retains.
-pub const DOCUMENTATION_BLOCKS_MAX: u32 = 100_000;
-/// Links or reference candidates one collection retains.
-pub const DOCUMENTATION_REFERENCES_MAX: u32 = 100_000;
+/// Blocks one collection retains. The fastapi corpus tree's translated documentation
+/// alone holds 124,000.
+pub const DOCUMENTATION_BLOCKS_MAX: u32 = 250_000;
+/// Links or reference candidates one collection retains. The fastapi corpus tree holds
+/// 21,000 links and 52,000 unresolved reference spellings.
+pub const DOCUMENTATION_REFERENCES_MAX: u32 = 250_000;
 /// Heading levels one block retains.
 pub const DOCUMENTATION_HEADING_DEPTH_MAX: u32 = 512;
 /// Bytes one authored heading, destination, or reference spelling retains.

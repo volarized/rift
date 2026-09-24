@@ -12,16 +12,29 @@
 //! `SQLite` FTS5 is reached through raw SQL because Toasty 0.10 has no typed
 //! virtual-table or `MATCH` API, the same boundary the Toasty compatibility
 //! test documents. Raw SQL stays isolated to the FTS virtual table and its
-//! rows; the authoritative `lexical_documents` and `lexical_index_state` tables are
-//! ordinary Toasty models.
+//! rows; the authoritative `lexical_documents`, `lexical_files`, and
+//! `lexical_index_state` tables are ordinary Toasty models.
+//!
+//! The FTS table is an external-content index over `lexical_documents`: it
+//! holds the token index alone and reads column values from the typed row its
+//! rowid names. FTS5 leaves the two in step to the writer: "It is still the
+//! responsibility of the user to ensure that the contents of an external
+//! content FTS5 table are kept up to date with the content table"
+//! (<https://www.sqlite.org/fts5.html>). Every write here therefore removes a
+//! row's index entries with the `'delete'` command while the typed row still
+//! holds the values they were indexed from, and indexes a typed row only after
+//! it is written.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
 };
-use rift_protocol::configuration::LEXICAL_UNITS_MAX_DEFAULT;
+use rift_protocol::configuration::{
+    LEXICAL_TRANSACTION_BYTES_DEFAULT, LEXICAL_TRANSACTION_UNITS_DEFAULT, LEXICAL_UNITS_MAX_DEFAULT,
+};
 use rift_ranking::{
     CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
     IndexCapabilities, IndexDocument, IndexReader, ParsedQuery, PublicationFormat, QueryPhase,
@@ -36,6 +49,7 @@ use toasty::db::Connection;
 use toasty::migration::{MigrationFile, MigrationSet};
 use toasty::stmt::{Type, Value};
 
+use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::WorkspaceDatabase;
 
 /// Default maximum content bytes accepted for one lexical document (1 MiB).
@@ -47,11 +61,8 @@ const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 /// Default busy-wait budget, in milliseconds, `SQLite` grants a connection
 /// before returning `SQLITE_BUSY`.
 const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
-/// `bm25` column weight applied to the FTS `identity` column. `identity` is
-/// `UNINDEXED` and never matches a term, but `bm25` still numbers every
-/// declared column positionally, `identity` included, so this placeholder
-/// keeps the searchable columns' weights aligned to their own positions.
-const LEXICAL_IDENTITY_RANK_WEIGHT: f64 = 0.0;
+/// The byte width of one recorded file digest, a SHA-256.
+const RECORDED_DIGEST_BYTES: usize = 32;
 
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
@@ -150,6 +161,61 @@ ALTER TABLE lexical_index_state ADD COLUMN corpus_revision TEXT NOT NULL DEFAULT
 CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL, position BIGINT NOT NULL)
 -- #[toasty::breakpoint]
 CREATE INDEX documentation_references_target ON documentation_references(target)",
+    ),
+    MigrationFile::new(
+        7,
+        "lexical_rows",
+        "DROP TABLE lexical_documents_fts
+-- #[toasty::breakpoint]
+DROP TABLE lexical_documents
+-- #[toasty::breakpoint]
+DROP TABLE lexical_index_state
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_documents(
+        id INTEGER PRIMARY KEY,
+        identity TEXT NOT NULL UNIQUE,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        byte_length BIGINT NOT NULL,
+        name TEXT,
+        qualified_name TEXT,
+        identifier_terms TEXT,
+        signature TEXT,
+        documentation TEXT,
+        declaration_source TEXT,
+        file_content TEXT
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX lexical_documents_path ON lexical_documents(path)
+-- #[toasty::breakpoint]
+CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(name, qualified_name, identifier_terms, \
+signature, documentation, declaration_source, file_content, content='lexical_documents', \
+content_rowid='id', tokenize='unicode61 remove_diacritics 0')
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_files(path TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_index_state(
+        id BIGINT PRIMARY KEY NOT NULL,
+        tree_revision TEXT,
+        corpus_revision TEXT NOT NULL,
+        derivation_revision TEXT NOT NULL
+    )",
+    ),
+    MigrationFile::new(
+        8,
+        "documentation_sources",
+        "DROP TABLE documentation_references
+-- #[toasty::breakpoint]
+DELETE FROM documentation_manifest
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_sources(identity TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, payload TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_target ON documentation_references(target)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_source ON documentation_references(source)",
     ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
@@ -308,12 +374,15 @@ pub struct LexicalIndexLimits {
     matches_max: u32,
     pool_slots: u32,
     busy_timeout_ms: u32,
+    documentation_bytes_max: usize,
+    transaction_units_max: usize,
+    transaction_bytes_max: usize,
 }
 
 impl LexicalIndexLimits {
     /// Constructs explicit lexical index bounds.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         units_max: u32,
         unit_bytes_max: u32,
         matches_max: u32,
@@ -326,7 +395,53 @@ impl LexicalIndexLimits {
             matches_max,
             pool_slots,
             busy_timeout_ms,
+            documentation_bytes_max: crate::documentation_store::METADATA_BYTES_MAX,
+            transaction_units_max: bound_u64_as_usize(LEXICAL_TRANSACTION_UNITS_DEFAULT),
+            transaction_bytes_max: bound_u64_as_usize(LEXICAL_TRANSACTION_BYTES_DEFAULT),
         }
+    }
+
+    /// Bounds the units and content bytes one transaction writes. A write past either
+    /// commits in several transactions, one file's units always in one.
+    #[must_use]
+    pub const fn with_transaction_bounds(
+        self,
+        transaction_units_max: usize,
+        transaction_bytes_max: usize,
+    ) -> Self {
+        Self {
+            transaction_units_max,
+            transaction_bytes_max,
+            ..self
+        }
+    }
+
+    /// Returns the most units one transaction writes.
+    #[must_use]
+    pub const fn transaction_units_max(self) -> usize {
+        self.transaction_units_max
+    }
+
+    /// Returns the most content bytes one transaction writes.
+    #[must_use]
+    pub const fn transaction_bytes_max(self) -> usize {
+        self.transaction_bytes_max
+    }
+
+    /// Bounds the encoded documentation metadata one commit stores. A commit whose
+    /// metadata encodes past it stores its lexical documents without the metadata.
+    #[must_use]
+    pub const fn with_documentation_bytes_max(self, documentation_bytes_max: usize) -> Self {
+        Self {
+            documentation_bytes_max,
+            ..self
+        }
+    }
+
+    /// Returns the encoded documentation metadata bytes one commit stores, at most.
+    #[must_use]
+    pub const fn documentation_bytes_max(self) -> usize {
+        self.documentation_bytes_max
     }
 
     /// Returns maximum indexed documents accepted per `replace_all`.
@@ -590,6 +705,12 @@ pub(crate) fn storage_error(source: toasty::Error) -> LexicalIndexError {
     lexical_error_caused_by(LexicalIndexViolation::Storage, None, source)
 }
 
+/// Narrows an accepted `u64` bound into `usize`, answering the platform's ceiling for a
+/// bound no in-memory collection could reach anyway.
+pub(crate) fn bound_u64_as_usize(bound: u64) -> usize {
+    usize::try_from(bound).unwrap_or(usize::MAX)
+}
+
 /// Widens a `u32` domain bound into `usize` for in-memory comparisons; `u32`
 /// always fits `usize` on every platform Rift targets.
 pub(crate) fn bound_as_usize(bound: u32) -> usize {
@@ -718,8 +839,22 @@ pub(crate) struct LexicalDocumentRecord {
 pub(crate) struct LexicalIndexStateRecord {
     #[key]
     id: i64,
-    tree_revision: String,
+    tree_revision: Option<String>,
     corpus_revision: String,
+    derivation_revision: String,
+}
+
+/// One indexed file's content digest: the bytes its stored rows were derived from.
+///
+/// The key field is named for what it holds rather than for its column: a key field named
+/// `path` collides with a name the model derive generates for its own key filter.
+#[derive(Debug, toasty::Model)]
+#[table = "lexical_files"]
+pub(crate) struct LexicalFileRecord {
+    #[key]
+    #[column("path")]
+    project_path: String,
+    digest: Vec<u8>,
 }
 
 /// Converts a content byte length already bounded by `unit_bytes_max` (a
@@ -750,26 +885,65 @@ pub(crate) fn require_pragma_row(
     )
 }
 
-/// Inserts one unit's typed row and its derived FTS row.
-/// Deletes every unit filed under one path, from the typed table and the FTS index alike.
+/// The searchable columns, comma separated, in the order [`SearchableField::ALL`] declares:
+/// the FTS table's own column list, and the typed table's columns of the same names.
+fn searchable_columns() -> String {
+    SearchableField::ALL.map(SearchableField::column).join(", ")
+}
+
+/// Deletes every unit filed under one path, from the FTS index and the typed table alike,
+/// and forgets the digest recorded for the path.
 ///
-/// The FTS rows go first, while `lexical_documents` still holds the identities that name
-/// them:
-/// the virtual table carries no path column of its own.
+/// The index entries go first, through the FTS5 `'delete'` command, while the typed rows
+/// still hold the values they were indexed from: the command "must match the values
+/// currently stored in the table" or "the results may be unpredictable"
+/// (<https://www.sqlite.org/fts5.html>). The path index finds the rows, so the work is one
+/// lookup per path and one delete per unit, never a scan of the FTS table.
 async fn delete_path_units(
     executor: &mut dyn Executor,
     path: &ProjectPath,
 ) -> Result<(), LexicalIndexError> {
-    toasty::sql::statement(
-        "DELETE FROM lexical_documents_fts WHERE identity IN \
-         (SELECT identity FROM lexical_documents WHERE path = ?1)",
-    )
+    let columns = searchable_columns();
+    toasty::sql::statement(format!(
+        "INSERT INTO lexical_documents_fts(lexical_documents_fts, rowid, {columns}) \
+         SELECT 'delete', id, {columns} FROM lexical_documents WHERE path = ?1"
+    ))
     .bind(path.as_str().to_owned())
-    .exec(executor)
+    .exec(&mut *executor)
     .await
     .map_err(storage_error)?;
     toasty::sql::statement("DELETE FROM lexical_documents WHERE path = ?1")
         .bind(path.as_str().to_owned())
+        .exec(&mut *executor)
+        .await
+        .map_err(storage_error)?;
+    LexicalFileRecord::filter_by_project_path(path.as_str())
+        .delete()
+        .exec(executor)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Deletes every unit, every index entry, and every recorded digest.
+///
+/// `'delete-all'` clears an external-content index without reading a typed row, which is
+/// what lets it run before the typed rows go: FTS5 offers it "only with external content
+/// and contentless tables" and it "deletes all entries from the full-text index".
+async fn delete_every_unit(executor: &mut dyn Executor) -> Result<(), LexicalIndexError> {
+    toasty::sql::statement(
+        "INSERT INTO lexical_documents_fts(lexical_documents_fts) VALUES('delete-all')",
+    )
+    .exec(&mut *executor)
+    .await
+    .map_err(storage_error)?;
+    LexicalDocumentRecord::all()
+        .delete()
+        .exec(&mut *executor)
+        .await
+        .map_err(storage_error)?;
+    LexicalFileRecord::all()
+        .delete()
         .exec(executor)
         .await
         .map_err(storage_error)?;
@@ -778,13 +952,16 @@ async fn delete_path_units(
 
 /// What one publication stamped the store with.
 ///
-/// The two revisions travel together because a read needs both: the tree
-/// revision says which publication the rows belong to, and the corpus
-/// revision says whether this build can read them at all.
+/// The tree revision says which publication the rows answer for, and is absent while a
+/// write too large for one transaction is under way. The corpus revision says whether this
+/// build can read the rows at all, and the derivation revision whether this build would
+/// derive the same rows from the same bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)]
 struct StoredStamp {
-    tree_revision: String,
+    tree_revision: Option<String>,
     corpus_revision: CorpusRevision,
+    derivation_revision: String,
 }
 
 /// The stamp the store carries, read through `executor` so a caller can place
@@ -800,16 +977,38 @@ async fn stored_stamp(
     Ok(record.map(|record| StoredStamp {
         tree_revision: record.tree_revision,
         corpus_revision: CorpusRevision::stored(record.corpus_revision),
+        derivation_revision: record.derivation_revision,
     }))
 }
 
-/// Stamps the store with `tree_revision` and the corpus revision this build
-/// derives, so a later read can tell both which publication the rows belong
-/// to and whether it can read them at all.
-async fn stamp(executor: &mut dyn Executor, tree_revision: &str) -> Result<(), LexicalIndexError> {
+/// What a reader answers before it ranks, when the stored stamp does not name
+/// `tree_revision`: nothing to rank, or a store that moved to another tree.
+///
+/// A store holding no stamp, a stamp naming no tree, or rows under another corpus revision
+/// answers [`RevisionScoped::NoRevision`]: none of them holds a publication this build can
+/// read. `None` means the store holds `tree_revision` and the reader goes on to rank.
+fn stamp_scope<T>(stored: Option<StoredStamp>, tree_revision: &str) -> Option<RevisionScoped<T>> {
+    let Some(stored) = stored else {
+        return Some(RevisionScoped::NoRevision);
+    };
+    if stored.corpus_revision != CorpusRevision::current() {
+        return Some(RevisionScoped::NoRevision);
+    }
+    match stored.tree_revision {
+        None => Some(RevisionScoped::NoRevision),
+        Some(stored) if stored != tree_revision => Some(RevisionScoped::OtherRevision(stored)),
+        Some(_) => None,
+    }
+}
+
+/// Stamps the store with `stamp` and the corpus revision this build derives, so a later
+/// read can tell which publication the rows belong to and whether it can read them at
+/// all, and a later write whether it can keep them.
+async fn stamp(executor: &mut dyn Executor, stamp: &LexicalStamp) -> Result<(), LexicalIndexError> {
     LexicalIndexStateRecord::upsert_by_id(LEXICAL_INDEX_STATE_ID)
-        .tree_revision(tree_revision.to_owned())
+        .tree_revision(stamp.tree_revision.clone())
         .corpus_revision(CorpusRevision::current().as_str().to_owned())
+        .derivation_revision(stamp.derivation_revision.clone())
         .exec(executor)
         .await
         .map_err(storage_error)?;
@@ -818,36 +1017,76 @@ async fn stamp(executor: &mut dyn Executor, tree_revision: &str) -> Result<(), L
 
 /// How many documents the typed table holds right now.
 async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, LexicalIndexError> {
-    let rows = toasty::sql::query("SELECT count(*) FROM lexical_documents")
+    let counted = single_i64(executor, "SELECT count(*) FROM lexical_documents", "count").await?;
+    Ok(usize::try_from(counted).unwrap_or(usize::MAX))
+}
+
+/// The highest typed-row id right now, or zero in an empty table.
+///
+/// An `INTEGER PRIMARY KEY` row inserted without an id takes one past the highest id the
+/// table holds, so every row inserted after this read has an id above it.
+async fn last_unit_id(executor: &mut dyn Executor) -> Result<i64, LexicalIndexError> {
+    single_i64(
+        executor,
+        "SELECT coalesce(max(id), 0) FROM lexical_documents",
+        "last id",
+    )
+    .await
+}
+
+/// Runs one query answering one integer.
+async fn single_i64(
+    executor: &mut dyn Executor,
+    sql: &'static str,
+    label: &'static str,
+) -> Result<i64, LexicalIndexError> {
+    let rows = toasty::sql::query(sql)
         .column_types([Type::I64])
         .exec(executor)
         .await
         .map_err(storage_error)?;
-    let [Value::Record(record)] = rows.as_slice() else {
-        return Err(
-            lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
-                "count",
-                format!("unexpected unit-count rows: rows={rows:?}"),
-            )),
-        );
-    };
-    let [Value::I64(counted)] = record.as_slice() else {
-        return Err(
-            lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
-                "count",
-                format!("unexpected unit-count row: row={record:?}"),
-            )),
-        );
-    };
-    Ok(usize::try_from(*counted).unwrap_or(usize::MAX))
+    if let [Value::Record(record)] = rows.as_slice()
+        && let [Value::I64(value)] = record.as_slice()
+    {
+        return Ok(*value);
+    }
+    Err(
+        lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
+            label,
+            format!("unexpected {label} rows: rows={rows:?}"),
+        )),
+    )
 }
 
-/// Writes one document's typed row and its FTS row.
+/// Writes each document's typed row, then indexes every row this call wrote in one
+/// statement.
 ///
-/// The two carry the same fields, in the same order, because the typed
-/// row is what a read resolves through and the FTS row is what a term
-/// matches: a column filled in one and absent from the other would rank a
-/// document the reader cannot then describe.
+/// The typed row and the index entry carry the same fields because the index reads them
+/// from the typed row: a column filled in one and absent from the other would rank a
+/// document the reader cannot then describe. Indexing the batch's rows together, selected
+/// by the ids they took above [`last_unit_id`], hands FTS5 one set-based insert rather
+/// than one statement per document.
+async fn insert_documents(
+    executor: &mut dyn Executor,
+    documents: &[IndexDocument],
+) -> Result<(), LexicalIndexError> {
+    let last = last_unit_id(&mut *executor).await?;
+    for document in documents {
+        insert_document(&mut *executor, document, project_location(document)?).await?;
+    }
+    let columns = searchable_columns();
+    toasty::sql::statement(format!(
+        "INSERT INTO lexical_documents_fts(rowid, {columns}) \
+         SELECT id, {columns} FROM lexical_documents WHERE id > ?1"
+    ))
+    .bind(last)
+    .exec(executor)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Writes one document's typed row.
 async fn insert_document(
     executor: &mut dyn Executor,
     document: &IndexDocument,
@@ -873,25 +1112,44 @@ async fn insert_document(
     .exec(executor)
     .await
     .map_err(storage_error)?;
-
-    let mut insert =
-        toasty::sql::statement(fts_insert_sql()).bind(document.identity().as_str().to_owned());
-    for searchable in SearchableField::ALL {
-        insert = insert.bind(fields.get(searchable).unwrap_or_default().to_owned());
-    }
-    insert.exec(executor).await.map_err(storage_error)?;
     Ok(())
 }
 
-/// The FTS insert, with one placeholder for `identity` and one per searchable
-/// field, in the column order [`SearchableField::ALL`] declares.
-fn fts_insert_sql() -> String {
-    let columns = SearchableField::ALL.map(SearchableField::column).join(", ");
-    let placeholders = (1..=SearchableField::ALL.len() + 1)
-        .map(|position| format!("?{position}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("INSERT INTO lexical_documents_fts(identity, {columns}) VALUES ({placeholders})")
+/// Records the digest each named file's rows were derived from.
+async fn record_files(
+    executor: &mut dyn Executor,
+    recorded: &[(ProjectPath, FileDigest)],
+) -> Result<(), LexicalIndexError> {
+    for (path, digest) in recorded {
+        toasty::create!(LexicalFileRecord {
+            project_path: path.as_str().to_owned(),
+            digest: digest.as_bytes().to_vec(),
+        })
+        .exec(&mut *executor)
+        .await
+        .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+/// Reads one recorded row back as the path and digest it was written from.
+fn decode_recorded(
+    record: LexicalFileRecord,
+) -> Result<(ProjectPath, FileDigest), LexicalIndexError> {
+    let path = ProjectPath::new(record.project_path).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
+    })?;
+    let observed = record.digest.len();
+    let bytes: [u8; RECORDED_DIGEST_BYTES] = record.digest.try_into().map_err(|_| {
+        lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
+            "recorded digest",
+            format!(
+                "path {path} records a {observed}-byte digest; a file digest holds \
+                 {RECORDED_DIGEST_BYTES} bytes"
+            ),
+        ))
+    })?;
+    Ok((path, FileDigest::from_bytes(bytes)))
 }
 
 /// Rebuilds one published document from its typed row.
@@ -990,28 +1248,25 @@ fn matched_fields(isolated: &[Value]) -> FieldSet {
         .collect()
 }
 
-/// The `bm25` weight arguments, in FTS column order: the `identity`
-/// placeholder first, then one weight per searchable field.
+/// The `bm25` weight arguments, in FTS column order: one weight per searchable field.
 ///
 /// The weights come from [`SearchableField`] rather than from constants here,
 /// so the ranking this store runs and the ranking every other reader runs are
 /// the same numbers. FTS5 takes them as literal arguments, never as bind
 /// parameters, which is why they are rendered into the statement.
 fn rank_weights() -> String {
-    std::iter::once(LEXICAL_IDENTITY_RANK_WEIGHT)
-        .chain(SearchableField::ALL.map(SearchableField::rank_weight))
+    SearchableField::ALL
+        .map(SearchableField::rank_weight)
         .map(|weight| weight.to_string())
-        .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// The `bm25` weight arguments that isolate one column: every weight zero
 /// except this field's, set to one.
 fn isolated_weights(field: SearchableField) -> String {
-    std::iter::once(0.0_f64)
-        .chain(SearchableField::ALL.map(|declared| f64::from(u8::from(declared == field))))
+    SearchableField::ALL
+        .map(|declared| f64::from(u8::from(declared == field)))
         .map(|weight| weight.to_string())
-        .collect::<Vec<_>>()
         .join(", ")
 }
 
@@ -1038,14 +1293,14 @@ fn lexical_search_sql() -> String {
         );
     }
     format!(
-        "SELECT lexical_documents_fts.identity, lexical_documents.path, \
+        "SELECT lexical_documents.identity, lexical_documents.path, \
          lexical_documents.kind, \
          bm25(lexical_documents_fts, {ranked}) AS rank{isolated} \
          FROM lexical_documents_fts \
          JOIN lexical_documents \
-         ON lexical_documents.identity = lexical_documents_fts.identity \
+         ON lexical_documents.id = lexical_documents_fts.rowid \
          WHERE lexical_documents_fts MATCH ?1 \
-         ORDER BY rank, lexical_documents_fts.identity LIMIT ?2"
+         ORDER BY rank, lexical_documents.identity LIMIT ?2"
     )
 }
 
@@ -1061,18 +1316,33 @@ fn lexical_search_column_types() -> Vec<Type> {
 /// A rebuild writes what it read under each path it named and nothing else, so `replaced`
 /// names every one of those paths and `inserted` carries the units the rebuilt index
 /// derived for them. A path the rebuild read appears in both halves; a path it found gone
-/// appears only in the first.
+/// appears only in the first. `recorded` carries the content digest of every replaced path
+/// the rebuild still holds, which is what a later process compares its own tree against
+/// before it writes anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LexicalChange {
     replaced: Vec<ProjectPath>,
     inserted: Vec<IndexDocument>,
+    recorded: Vec<(ProjectPath, FileDigest)>,
 }
 
 impl LexicalChange {
-    /// Builds one change from the paths whose units go and the units that replace them.
+    /// Builds one change from the paths whose units go and the units that replace them,
+    /// recording no digest.
     #[must_use]
     pub fn new(replaced: Vec<ProjectPath>, inserted: Vec<IndexDocument>) -> Self {
-        Self { replaced, inserted }
+        Self {
+            replaced,
+            inserted,
+            recorded: Vec::new(),
+        }
+    }
+
+    /// This change, recording the content digest each replaced path's units were derived
+    /// from.
+    #[must_use]
+    pub fn with_recorded(self, recorded: Vec<(ProjectPath, FileDigest)>) -> Self {
+        Self { recorded, ..self }
     }
 
     /// The paths whose stored units this change deletes before it inserts.
@@ -1087,18 +1357,227 @@ impl LexicalChange {
         &self.inserted
     }
 
+    /// The content digests this change records, one per replaced path the rebuild holds.
+    #[must_use]
+    pub fn recorded(&self) -> &[(ProjectPath, FileDigest)] {
+        &self.recorded
+    }
+
     /// Whether this change writes nothing, so the stored set already answers for the tree
     /// that produced it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.replaced.is_empty() && self.inserted.is_empty()
+        self.replaced.is_empty() && self.inserted.is_empty() && self.recorded.is_empty()
     }
 
-    /// The change as its two halves, for a caller that rebuilds it over a narrowed
+    /// This change as consecutive parts, each writing at most `units_max` units and
+    /// `bytes_max` content bytes, in replaced-path order.
+    ///
+    /// A path's deletion, its units, and its recorded digest always land in one part, so
+    /// applying the parts in order leaves exactly what applying the whole change leaves,
+    /// and a store that stops between two parts holds whole paths alone. A path whose own
+    /// units pass either bound takes a part of its own. A unit filed under a path the
+    /// change does not replace joins the last part. An empty change answers one empty
+    /// part, since the part that lands last is what stamps the store.
+    #[must_use]
+    pub fn into_parts_within(self, units_max: usize, bytes_max: usize) -> Vec<Self> {
+        let Self {
+            replaced,
+            inserted,
+            recorded,
+        } = self;
+        let mut units_by_path: BTreeMap<ProjectPath, Vec<IndexDocument>> = BTreeMap::new();
+        let mut unfiled = Vec::new();
+        for unit in inserted {
+            match unit.location() {
+                DocumentLocation::Project(path) if replaced.contains(path) => {
+                    units_by_path.entry(path.clone()).or_default().push(unit);
+                }
+                DocumentLocation::Project(_) | DocumentLocation::Unit(_) => unfiled.push(unit),
+            }
+        }
+        let mut digests: BTreeMap<ProjectPath, FileDigest> = recorded.into_iter().collect();
+        let mut parts = vec![Self::default()];
+        let mut room = PartRoom::new(units_max, bytes_max);
+        for path in replaced {
+            let units = units_by_path.remove(&path).unwrap_or_default();
+            if !room.admits(&units) {
+                parts.push(Self::default());
+                room = PartRoom::new(units_max, bytes_max);
+            }
+            room.take(&units);
+            let last = parts.len() - 1;
+            let part = &mut parts[last];
+            part.recorded
+                .extend(digests.remove(&path).map(|digest| (path.clone(), digest)));
+            part.replaced.push(path);
+            part.inserted.extend(units);
+        }
+        let last = parts.len() - 1;
+        parts[last].inserted.extend(unfiled);
+        parts[last].recorded.extend(digests);
+        parts
+    }
+
+    /// The change as its three halves, for a caller that rebuilds it over a narrowed
     /// unit list.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<ProjectPath>, Vec<IndexDocument>) {
-        (self.replaced, self.inserted)
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ProjectPath>,
+        Vec<IndexDocument>,
+        Vec<(ProjectPath, FileDigest)>,
+    ) {
+        (self.replaced, self.inserted, self.recorded)
+    }
+}
+
+/// What one part of a split change has left to hold, in units and content bytes.
+///
+/// A part that holds nothing yet admits any path, which is what lets a path larger than
+/// either bound take a part of its own.
+struct PartRoom {
+    units_left: usize,
+    bytes_left: usize,
+    empty: bool,
+}
+
+impl PartRoom {
+    const fn new(units_max: usize, bytes_max: usize) -> Self {
+        Self {
+            units_left: units_max,
+            bytes_left: bytes_max,
+            empty: true,
+        }
+    }
+
+    /// Whether this part can take one path's `units` whole.
+    fn admits(&self, units: &[IndexDocument]) -> bool {
+        let fits_units = units.len() <= self.units_left;
+        let fits_bytes = content_bytes(units) <= self.bytes_left;
+        self.empty || (fits_units && fits_bytes)
+    }
+
+    /// Counts one path's `units` against this part.
+    fn take(&mut self, units: &[IndexDocument]) {
+        self.units_left = self.units_left.saturating_sub(units.len());
+        self.bytes_left = self.bytes_left.saturating_sub(content_bytes(units));
+        self.empty = false;
+    }
+}
+
+/// The content bytes `units` carry together.
+fn content_bytes(units: &[IndexDocument]) -> usize {
+    units
+        .iter()
+        .map(|unit| unit.content().len())
+        .fold(0, usize::saturating_add)
+}
+
+/// What one lexical transaction stamps the store with.
+///
+/// `tree_revision` names the publication the rows answer for once the transaction
+/// commits. A write too large for one transaction commits its earlier parts with no tree
+/// revision, so a reader meets no publication rather than a mix of two, and only its last
+/// part names the tree. `derivation_revision` names what, besides a file's bytes, decided
+/// the rows: a later write keeps rows stamped with its own derivation revision and
+/// replaces every row stamped with another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexicalStamp {
+    tree_revision: Option<String>,
+    derivation_revision: String,
+}
+
+impl LexicalStamp {
+    /// A stamp naming the publication `tree_revision` the rows answer for.
+    #[must_use]
+    pub fn published(tree_revision: &str, derivation_revision: &str) -> Self {
+        Self {
+            tree_revision: Some(tree_revision.to_owned()),
+            derivation_revision: derivation_revision.to_owned(),
+        }
+    }
+
+    /// A stamp naming no publication, for the parts of a write that commit before its last.
+    #[must_use]
+    pub fn unpublished(derivation_revision: &str) -> Self {
+        Self {
+            tree_revision: None,
+            derivation_revision: derivation_revision.to_owned(),
+        }
+    }
+
+    /// The publication this stamp names, if any.
+    #[must_use]
+    pub fn tree_revision(&self) -> Option<&str> {
+        self.tree_revision.as_deref()
+    }
+
+    /// What besides a file's bytes decided the rows this stamp covers.
+    #[must_use]
+    pub fn derivation_revision(&self) -> &str {
+        &self.derivation_revision
+    }
+}
+
+/// Which documentation metadata one transaction writes.
+enum DocumentationWrite {
+    /// The stored metadata stays as it is.
+    Kept,
+    /// The stored metadata is replaced by this encoding, or cleared when there is none.
+    Replaced(Option<crate::documentation_store::EncodedDocumentation>),
+}
+
+/// Which stored units one write deletes before it inserts.
+#[derive(Clone, Copy)]
+enum StoredUnits<'a> {
+    /// Every stored unit and recorded digest goes, then these units land.
+    Every(&'a [IndexDocument]),
+    /// The units and digests under the change's replaced paths go, then its units and
+    /// digests land.
+    Named(&'a LexicalChange),
+}
+
+impl<'a> StoredUnits<'a> {
+    /// The write's form, as its span names it.
+    const fn mode(self) -> &'static str {
+        match self {
+            Self::Every(_) => "replace",
+            Self::Named(_) => "apply",
+        }
+    }
+
+    /// The units this write inserts.
+    fn inserted(self) -> &'a [IndexDocument] {
+        match self {
+            Self::Every(inserted) => inserted,
+            Self::Named(change) => change.inserted(),
+        }
+    }
+
+    /// Deletes what this write replaces and inserts what it carries, inside the caller's
+    /// transaction.
+    async fn write(
+        self,
+        executor: &mut dyn Executor,
+        limits: LexicalIndexLimits,
+    ) -> Result<(), LexicalIndexError> {
+        match self {
+            Self::Every(inserted) => {
+                delete_every_unit(&mut *executor).await?;
+                insert_documents(executor, inserted).await
+            }
+            Self::Named(change) => {
+                for path in change.replaced() {
+                    delete_path_units(&mut *executor, path).await?;
+                }
+                let stored = indexed_unit_count(&mut *executor).await?;
+                validate_indexed_count(stored.saturating_add(change.inserted().len()), limits)?;
+                insert_documents(&mut *executor, change.inserted()).await?;
+                record_files(executor, change.recorded()).await
+            }
+        }
     }
 }
 
@@ -1138,6 +1617,10 @@ impl LexicalSearchIndex {
     /// two units share one identity: the previously indexed state stays
     /// fully intact in every refusal case.
     ///
+    /// The replacement records no file digest and stamps no derivation revision, so a
+    /// later [`Self::recorded_files`] finds nothing it can keep and the next write that
+    /// compares against the store replaces this set whole.
+    ///
     /// # Errors
     ///
     /// Returns [`LexicalIndexError`] on bound violations or storage failure.
@@ -1153,65 +1636,69 @@ impl LexicalSearchIndex {
         documents: &[IndexDocument],
         tree_revision: &str,
     ) -> Result<(), LexicalIndexError> {
-        self.replace_all_metadata(documents, tree_revision, None)
-            .await
+        validate_lexical_batch(documents, self.limits)?;
+        self.write(
+            StoredUnits::Every(documents),
+            &LexicalStamp::published(tree_revision, ""),
+            DocumentationWrite::Replaced(None),
+        )
+        .await
     }
 
     /// Replaces lexical documents and validated documentation metadata in one transaction.
     ///
     /// # Errors
     ///
-    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    /// Refuses invalid document batches or storage failure. Metadata that encodes past
+    /// [`LexicalIndexLimits::documentation_bytes_max`] is left out of the commit instead.
     pub async fn replace_all_with_documentation(
         &self,
         documents: &[IndexDocument],
         tree_revision: &str,
         documentation: &rift_analysis::documentation::DocumentationCollection,
     ) -> Result<(), LexicalIndexError> {
-        self.replace_all_metadata(documents, tree_revision, Some(documentation))
-            .await
-    }
-
-    async fn replace_all_metadata(
-        &self,
-        documents: &[IndexDocument],
-        tree_revision: &str,
-        documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
-    ) -> Result<(), LexicalIndexError> {
         validate_lexical_batch(documents, self.limits)?;
-        let metadata = documentation
-            .map(crate::documentation_store::EncodedDocumentation::new)
-            .transpose()?;
-
-        let mut access = self.database.writing().await?;
-        let mut transaction = access.transaction().await?;
-
-        toasty::sql::statement("DELETE FROM lexical_documents_fts")
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
-        LexicalDocumentRecord::all()
-            .delete()
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
-
-        for document in documents {
-            insert_document(&mut transaction, document, project_location(document)?).await?;
-        }
-
-        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
-        stamp(&mut transaction, tree_revision).await?;
-
-        transaction.commit().await.map_err(storage_error)
+        let metadata = crate::documentation_store::encode_within(
+            Some(documentation),
+            self.limits.documentation_bytes_max(),
+        )?;
+        self.write(
+            StoredUnits::Every(documents),
+            &LexicalStamp::published(tree_revision, ""),
+            DocumentationWrite::Replaced(metadata),
+        )
+        .await
     }
 
-    /// Applies one change set's documents and stamps `tree_revision`, in one transaction.
+    /// Deletes every unit, every recorded digest, and the documentation metadata, and
+    /// stamps no publication under `derivation_revision`.
     ///
-    /// The transaction deletes every unit filed under a dropped path, inserts the units the
-    /// change derived, and stamps the revision. Deleting by path is what makes this
-    /// incremental: a text file split into chunks files every chunk under its own path, so
-    /// one delete reaches all of them.
+    /// A write that finds the stored rows derived under another derivation revision
+    /// clears them first, then fills the store with changes stamped under its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] on storage failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation before commit leaves every row and the stamp intact.
+    pub async fn clear(&self, derivation_revision: &str) -> Result<(), LexicalIndexError> {
+        self.write(
+            StoredUnits::Every(&[]),
+            &LexicalStamp::unpublished(derivation_revision),
+            DocumentationWrite::Replaced(None),
+        )
+        .await
+    }
+
+    /// Applies one change set's documents and digests and stamps `stamp`, in one
+    /// transaction, leaving the documentation metadata as it is.
+    ///
+    /// The transaction deletes every unit filed under a replaced path, inserts the units the
+    /// change derived, records the digests it carries, and stamps the store. Deleting by
+    /// path is what makes this incremental: a text file split into chunks files every chunk
+    /// under its own path, so one delete reaches all of them.
     ///
     /// The resulting set is counted inside the transaction, after the deletions and before
     /// the inserts, because an incremental apply cannot know its own resulting size any
@@ -1225,60 +1712,139 @@ impl LexicalSearchIndex {
     ///
     /// # Cancel safety
     ///
-    /// Cancellation before commit leaves the previously indexed units and tree-revision
-    /// stamp fully intact. Cancellation after commit has the same durable result as
-    /// completion.
+    /// Cancellation before commit leaves the previously indexed units, digests, and stamp
+    /// fully intact. Cancellation after commit has the same durable result as completion.
     pub async fn apply(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
+        stamp: &LexicalStamp,
     ) -> Result<(), LexicalIndexError> {
-        self.apply_metadata(change, tree_revision, None).await
+        validate_lexical_units(change.inserted(), self.limits)?;
+        self.write(StoredUnits::Named(change), stamp, DocumentationWrite::Kept)
+            .await
     }
 
     /// Applies lexical changes and replaces their documentation metadata atomically.
     ///
     /// # Errors
     ///
-    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    /// Refuses invalid document batches or storage failure. Metadata that encodes past
+    /// [`LexicalIndexLimits::documentation_bytes_max`] is left out of the commit instead.
     pub async fn apply_with_documentation(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
+        stamp: &LexicalStamp,
         documentation: &rift_analysis::documentation::DocumentationCollection,
     ) -> Result<(), LexicalIndexError> {
-        self.apply_metadata(change, tree_revision, Some(documentation))
-            .await
+        validate_lexical_units(change.inserted(), self.limits)?;
+        let metadata = crate::documentation_store::encode_within(
+            Some(documentation),
+            self.limits.documentation_bytes_max(),
+        )?;
+        self.write(
+            StoredUnits::Named(change),
+            stamp,
+            DocumentationWrite::Replaced(metadata),
+        )
+        .await
     }
 
-    async fn apply_metadata(
+    /// The content digest each stored file's rows were derived from, when those rows were
+    /// derived under `derivation_revision` and this build's corpus revision.
+    ///
+    /// `None` means no stored row can be kept: the store holds no stamp, or rows another
+    /// build, another configuration, or another corpus shape derived. A store whose last
+    /// write stopped between its parts answers what those parts recorded, because each
+    /// part recorded its paths' digests in the transaction that wrote their rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when the store records more files than `units_max`,
+    /// when a recorded row fails to decode, or on storage failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the transaction is read-only.
+    pub async fn recorded_files(
         &self,
-        change: &LexicalChange,
-        tree_revision: &str,
-        documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
+        derivation_revision: &str,
+    ) -> Result<Option<WorkspaceDigests>, LexicalIndexError> {
+        let mut connection = self.database.connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let Some(stored) = stored_stamp(&mut transaction).await? else {
+            return Ok(None);
+        };
+        let corpus_matches = stored.corpus_revision == CorpusRevision::current();
+        let derivation_matches = stored.derivation_revision == derivation_revision;
+        if !(corpus_matches && derivation_matches) {
+            return Ok(None);
+        }
+        let bound = bound_as_usize(self.limits.units_max());
+        let records = LexicalFileRecord::all()
+            .limit(bound.saturating_add(1))
+            .exec(&mut transaction)
+            .await
+            .map_err(storage_error)?;
+        if records.len() > bound {
+            return Err(batch_limit_error(
+                "lexical.files",
+                limit_count(records.len()),
+                u64::from(self.limits.units_max()),
+            ));
+        }
+        let recorded = records
+            .into_iter()
+            .map(decode_recorded)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(WorkspaceDigests::new(recorded)))
+    }
+
+    /// Runs one write as one transaction: the units, then the documentation metadata the
+    /// write replaces, then the stamp.
+    async fn write(
+        &self,
+        units: StoredUnits<'_>,
+        stamp_with: &LexicalStamp,
+        documentation: DocumentationWrite,
     ) -> Result<(), LexicalIndexError> {
-        validate_lexical_units(change.inserted(), self.limits)?;
-        let metadata = documentation
-            .map(crate::documentation_store::EncodedDocumentation::new)
-            .transpose()?;
+        let limits = self.limits;
+        rift_core::traced_async!(
+            component = "lexical",
+            operation = "lexical.commit",
+            mode = units.mode(),
+            {
+                let mut access = rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.write_turn",
+                    { self.database.writing().await }
+                )
+                .await?;
+                let mut transaction = access.transaction().await?;
 
-        let mut access = self.database.writing().await?;
-        let mut transaction = access.transaction().await?;
+                let executor = &mut transaction;
+                rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.documents",
+                    documents = units.inserted().len(),
+                    { units.write(executor, limits).await }
+                )
+                .await?;
 
-        for path in change.replaced() {
-            delete_path_units(&mut transaction, path).await?;
-        }
-        let stored = indexed_unit_count(&mut transaction).await?;
-        validate_indexed_count(stored.saturating_add(change.inserted().len()), self.limits)?;
+                if let DocumentationWrite::Replaced(metadata) = documentation {
+                    let executor = &mut transaction;
+                    rift_core::traced_async!(
+                        component = "lexical",
+                        operation = "lexical.documentation",
+                        { crate::documentation_store::replace(executor, metadata.as_ref()).await }
+                    )
+                    .await?;
+                }
+                stamp(&mut transaction, stamp_with).await?;
 
-        for document in change.inserted() {
-            insert_document(&mut transaction, document, project_location(document)?).await?;
-        }
-
-        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
-        stamp(&mut transaction, tree_revision).await?;
-
-        transaction.commit().await.map_err(storage_error)
+                transaction.commit().await.map_err(storage_error)
+            }
+        )
+        .await
     }
 
     /// Reads validated documentation metadata from the same revision as lexical documents.
@@ -1295,17 +1861,11 @@ impl LexicalSearchIndex {
     > {
         let mut connection = self.database.connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
-        match stored_stamp(&mut transaction).await? {
-            None => return Ok(RevisionScoped::NoRevision),
-            Some(stored) if stored.corpus_revision != CorpusRevision::current() => {
-                return Ok(RevisionScoped::NoRevision);
-            }
-            Some(stored) if stored.tree_revision != tree_revision => {
-                return Ok(RevisionScoped::OtherRevision(stored.tree_revision));
-            }
-            Some(_) => {}
+        let stored = stored_stamp(&mut transaction).await?;
+        if let Some(scoped) = stamp_scope(stored, tree_revision) {
+            return Ok(scoped);
         }
-        crate::documentation_store::read(&mut transaction)
+        crate::documentation_store::read(&mut transaction, self.limits.documentation_bytes_max())
             .await
             .map(RevisionScoped::Matched)
     }
@@ -1359,15 +1919,8 @@ impl LexicalSearchIndex {
         let mut connection = self.database.connection().await?;
         let mut transaction = connection.transaction().await.map_err(storage_error)?;
         let stored = stored_stamp(&mut transaction).await?;
-        match stored {
-            None => return Ok(RevisionScoped::NoRevision),
-            Some(stored) if stored.corpus_revision != CorpusRevision::current() => {
-                return Ok(RevisionScoped::NoRevision);
-            }
-            Some(stored) if stored.tree_revision != tree_revision => {
-                return Ok(RevisionScoped::OtherRevision(stored.tree_revision));
-            }
-            Some(_) => {}
+        if let Some(scoped) = stamp_scope(stored, tree_revision) {
+            return Ok(scoped);
         }
         let Some(expression) = expression else {
             return Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
@@ -1472,8 +2025,8 @@ impl LexicalSearchIndex {
         record.map(decode_document).transpose()
     }
 
-    /// Returns the tree revision stamped by the most recent `replace_all`,
-    /// or `None` before the first successful `replace_all`.
+    /// Returns the tree revision the stored rows answer for, or `None` while no
+    /// publication has landed or a write too large for one transaction is under way.
     ///
     /// # Errors
     ///
@@ -1486,7 +2039,7 @@ impl LexicalSearchIndex {
         let mut connection = self.configured_connection().await?;
         Ok(stored_stamp(&mut connection)
             .await?
-            .map(|stamp| stamp.tree_revision))
+            .and_then(|stamp| stamp.tree_revision))
     }
 }
 
@@ -1578,11 +2131,13 @@ fn reader_refused(error: LexicalIndexError) -> RankingError {
 #[cfg(test)]
 mod tests {
     use super::{
-        LexicalDocumentRecord, LexicalIndexFault, LexicalIndexLimits, LexicalIndexStateRecord,
-        LexicalIndexViolation, LexicalMatch, LexicalRanking, LexicalSearchIndex, MIGRATION_FILES,
-        checked_byte_length, decode_lexical_match, fts_insert_sql, isolated_weights, lexical_error,
+        LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault,
+        LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch,
+        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, checked_byte_length,
+        decode_lexical_match, decode_recorded, isolated_weights, lexical_error,
         lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
-        project_location, rank_weights, require_pragma_row, validate_lexical_batch,
+        project_location, rank_weights, require_pragma_row, searchable_columns,
+        validate_lexical_batch,
     };
     use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
     use rift_ranking::{
@@ -1607,6 +2162,57 @@ mod tests {
             -1.0,
             FieldSet::of(SearchableField::FileContent),
         )
+    }
+
+    /// One unit filed under `path`, carrying `bytes` of declaration source.
+    fn unit_under(path: &str, name: &str, bytes: usize) -> IndexDocument {
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, name)
+            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+        let digest = fields.digest();
+        IndexDocument::new(
+            identity(&format!("{path}#{name}")),
+            DocumentLocation::Project(ProjectPath::new(path).expect("fixture path must be valid")),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )
+        .expect("fixture document must construct")
+    }
+
+    fn fixture_change(paths: &[(&str, usize)], unit_bytes: usize) -> LexicalChange {
+        let replaced = paths
+            .iter()
+            .map(|(path, _)| ProjectPath::new(*path).expect("fixture path must be valid"))
+            .collect::<Vec<_>>();
+        let inserted = paths
+            .iter()
+            .flat_map(|(path, units)| {
+                (0..*units).map(move |index| unit_under(path, &format!("unit{index}"), unit_bytes))
+            })
+            .collect();
+        let recorded = replaced
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    crate::FileDigest::of(path.as_str().as_bytes()),
+                )
+            })
+            .collect();
+        LexicalChange::new(replaced, inserted).with_recorded(recorded)
+    }
+
+    fn part_paths(parts: &[LexicalChange]) -> Vec<Vec<String>> {
+        parts
+            .iter()
+            .map(|part| {
+                part.replaced()
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect()
+            })
+            .collect()
     }
 
     fn symbol_document(name: &str, source: &str) -> IndexDocument {
@@ -1822,11 +2428,7 @@ mod tests {
 
     #[test]
     fn test_the_corpus_migration_declares_the_columns_in_the_order_bm25_weighs_them() {
-        let migration = MIGRATION_FILES
-            .iter()
-            .find(|file| file.name() == "lexical_documents")
-            .expect("the corpus migration must exist");
-        let sql = migration.sql().replace('\n', " ");
+        let sql = rows_migration_sql();
         // `bm25`'s weights are positional, and the weight list is generated from
         // `SearchableField::ALL` while this declaration is written by hand. Asserting
         // that each name appears somewhere would pass on a reordered declaration,
@@ -1836,14 +2438,19 @@ mod tests {
             .and_then(|(_, rest)| rest.split_once(')'))
             .map(|(columns, _)| columns.to_owned())
             .expect("the migration must declare one FTS5 virtual table");
-        let expected = std::iter::once("identity UNINDEXED".to_owned())
-            .chain(SearchableField::ALL.map(|field| field.column().to_owned()))
-            .collect::<Vec<_>>()
+        let expected = SearchableField::ALL
+            .map(|field| field.column().to_owned())
             .join(", ");
         assert!(
             declared.starts_with(&expected),
             "the FTS columns must be declared in the order the weights are rendered:\n\
              declared {declared}\nexpected {expected}"
+        );
+        assert_eq!(searchable_columns(), expected);
+        assert!(
+            declared.contains("content='lexical_documents'")
+                && declared.contains("content_rowid='id'"),
+            "the FTS table must index the typed table's rows by their id: {declared}"
         );
         assert!(
             declared.contains(CORPUS_TOKENIZER),
@@ -1852,11 +2459,41 @@ mod tests {
     }
 
     #[test]
+    fn test_the_typed_table_holds_every_column_the_index_reads_by_name() {
+        let sql = rows_migration_sql();
+        let typed = sql
+            .split_once("CREATE TABLE lexical_documents(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(columns, _)| columns.to_owned())
+            .expect("the migration must declare the typed table");
+        // An external-content index reads `SELECT <content_rowid>, <cols> FROM <content>`
+        // with the FTS column names, so a searchable column the typed table lacks fails
+        // every read of the index rather than one insert.
+        for field in SearchableField::ALL {
+            assert!(
+                typed.contains(&format!(" {} TEXT", field.column())),
+                "the typed table must declare {}: {typed}",
+                field.column()
+            );
+        }
+        assert!(typed.contains("id INTEGER PRIMARY KEY"));
+    }
+
+    /// The migration that declares the rowid-addressed corpus, as one line.
+    fn rows_migration_sql() -> String {
+        MIGRATION_FILES
+            .iter()
+            .find(|file| file.name() == "lexical_rows")
+            .expect("the corpus migration must exist")
+            .sql()
+            .replace('\n', " ")
+    }
+
+    #[test]
     fn test_the_rank_weights_follow_the_declared_field_order() {
         let rendered = rank_weights();
-        let expected = std::iter::once("0".to_owned())
-            .chain(SearchableField::ALL.map(|field| field.rank_weight().to_string()))
-            .collect::<Vec<_>>()
+        let expected = SearchableField::ALL
+            .map(|field| field.rank_weight().to_string())
             .join(", ");
         assert_eq!(rendered, expected);
     }
@@ -1864,17 +2501,7 @@ mod tests {
     #[test]
     fn test_isolated_weights_raise_exactly_one_column() {
         let rendered = isolated_weights(SearchableField::Documentation);
-        assert_eq!(rendered, "0, 0, 0, 0, 0, 1, 0, 0");
-    }
-
-    #[test]
-    fn test_the_insert_places_one_holder_per_declared_column() {
-        let rendered = fts_insert_sql();
-        for field in SearchableField::ALL {
-            assert!(rendered.contains(field.column()));
-        }
-        assert!(rendered.contains("?8"), "every field follows identity");
-        assert!(!rendered.contains("?9"));
+        assert_eq!(rendered, "0, 0, 0, 0, 1, 0, 0");
     }
 
     #[test]
@@ -1966,12 +2593,171 @@ mod tests {
     fn test_lexical_index_state_record_debug_formats_declared_fields() {
         let record = LexicalIndexStateRecord {
             id: 1,
-            tree_revision: "deadbeef".to_owned(),
+            tree_revision: Some("deadbeef".to_owned()),
             corpus_revision: "0f1e2d3c".to_owned(),
+            derivation_revision: "a1b2c3d4".to_owned(),
         };
         let formatted = format!("{record:?}");
         assert!(formatted.contains("deadbeef"));
         assert!(formatted.contains("0f1e2d3c"));
+        assert!(formatted.contains("a1b2c3d4"));
+    }
+
+    #[test]
+    fn test_an_empty_change_splits_into_one_empty_part() {
+        let parts = LexicalChange::default().into_parts_within(10, 1_000);
+        assert_eq!(parts, vec![LexicalChange::default()]);
+    }
+
+    #[test]
+    fn test_a_change_within_both_bounds_stays_one_part() {
+        let change = fixture_change(&[("a.rs", 2), ("b.rs", 3)], 10);
+        let parts = change.clone().into_parts_within(5, 50);
+        assert_eq!(parts, vec![change]);
+    }
+
+    #[test]
+    fn test_a_split_keeps_every_path_whole_and_starts_a_part_at_the_unit_bound() {
+        let change = fixture_change(&[("a.rs", 2), ("b.rs", 3), ("c.rs", 1)], 10);
+        let parts = change.into_parts_within(4, 1_000);
+        assert_eq!(part_paths(&parts), vec![vec!["a.rs"], vec!["b.rs", "c.rs"]]);
+        for part in &parts {
+            for unit in part.inserted() {
+                let DocumentLocation::Project(path) = unit.location() else {
+                    panic!("fixture units are project documents");
+                };
+                assert!(
+                    part.replaced().contains(path),
+                    "{path} left its path's part"
+                );
+            }
+            let recorded: Vec<_> = part
+                .recorded()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(
+                recorded,
+                part.replaced().to_vec(),
+                "a digest travels with its path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_path_past_the_bound_takes_a_part_of_its_own() {
+        let change = fixture_change(&[("a.rs", 1), ("big.json", 7), ("c.rs", 1)], 10);
+        let parts = change.into_parts_within(3, 1_000);
+        assert_eq!(
+            part_paths(&parts),
+            vec![vec!["a.rs"], vec!["big.json"], vec!["c.rs"]]
+        );
+        assert_eq!(parts[1].inserted().len(), 7);
+    }
+
+    #[test]
+    fn test_a_split_starts_a_part_at_the_byte_bound() {
+        let change = fixture_change(&[("a.rs", 1), ("b.rs", 1), ("c.rs", 1)], 40);
+        let parts = change.into_parts_within(100, 100);
+        assert_eq!(part_paths(&parts), vec![vec!["a.rs", "b.rs"], vec!["c.rs"]]);
+    }
+
+    #[test]
+    fn test_units_and_digests_under_no_replaced_path_join_the_last_part() {
+        let stray_path = ProjectPath::new("stray.rs").expect("fixture path must be valid");
+        let (replaced, mut inserted, mut recorded) =
+            fixture_change(&[("a.rs", 2), ("b.rs", 2)], 10).into_parts();
+        inserted.push(unit_under("stray.rs", "stray", 10));
+        recorded.push((stray_path.clone(), crate::FileDigest::of(b"stray")));
+        let parts = LexicalChange::new(replaced, inserted)
+            .with_recorded(recorded)
+            .into_parts_within(2, 1_000);
+        let last = parts.last().expect("a split answers at least one part");
+        assert!(
+            last.inserted()
+                .iter()
+                .any(|unit| unit.location() == &DocumentLocation::Project(stray_path.clone()))
+        );
+        assert!(last.recorded().iter().any(|(path, _)| path == &stray_path));
+    }
+
+    #[test]
+    fn test_a_stamp_names_its_publication_only_when_published() {
+        let published = super::LexicalStamp::published("revision-one", "derivation-a");
+        assert_eq!(published.tree_revision(), Some("revision-one"));
+        assert_eq!(published.derivation_revision(), "derivation-a");
+        let unpublished = super::LexicalStamp::unpublished("derivation-a");
+        assert_eq!(
+            unpublished.tree_revision(),
+            None,
+            "a part committed before the last names no publication"
+        );
+        assert_eq!(unpublished.derivation_revision(), "derivation-a");
+    }
+
+    #[tokio::test]
+    async fn test_an_integer_query_answering_more_than_one_row_refuses_naming_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let mut connection = database.connection().await?;
+        let error = super::single_i64(&mut connection, "SELECT 1 UNION ALL SELECT 2", "probe")
+            .await
+            .expect_err("two rows are not one integer");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        let context = error.context();
+        let probe = context
+            .iter()
+            .find(|entry| entry.key() == "probe")
+            .expect("the refusal names the query it ran");
+        assert!(
+            probe.value().starts_with("unexpected probe rows"),
+            "the refusal carries the rows it read: {}",
+            probe.value()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_recorded_digest_reads_back_as_the_digest_written() {
+        let digest = crate::FileDigest::of(b"pub fn beacon() {}");
+        let record = LexicalFileRecord {
+            project_path: "src/lib.rs".to_owned(),
+            digest: digest.as_bytes().to_vec(),
+        };
+        let (path, read) = decode_recorded(record).expect("a 32-byte digest decodes");
+        assert_eq!(path.as_str(), "src/lib.rs");
+        assert_eq!(read, digest);
+    }
+
+    #[test]
+    fn test_a_recorded_digest_of_another_width_refuses_naming_both_widths() {
+        let record = LexicalFileRecord {
+            project_path: "src/lib.rs".to_owned(),
+            digest: vec![1, 2, 3],
+        };
+        let error = decode_recorded(record).expect_err("a 3-byte digest is not a file digest");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        let rendered = error.to_string();
+        assert!(rendered.contains("3-byte digest"), "{rendered}");
+        assert!(rendered.contains("32 bytes"), "{rendered}");
+    }
+
+    #[test]
+    fn test_a_recorded_path_that_is_not_a_project_path_refuses() {
+        let record = LexicalFileRecord {
+            project_path: "/absolute".to_owned(),
+            digest: vec![0; 32],
+        };
+        let error = decode_recorded(record).expect_err("an absolute path is not a project path");
+        assert_eq!(
+            error.fault().violation(),
+            LexicalIndexViolation::StoredPathInvalid
+        );
     }
 
     #[test]

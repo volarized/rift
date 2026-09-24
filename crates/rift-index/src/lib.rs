@@ -30,7 +30,7 @@ pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalRanking, LexicalSearchIndex, PublishedIndex, RevisionScoped,
+    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalStamp, PublishedIndex, RevisionScoped,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -44,7 +44,9 @@ pub use rift_analysis::documentation::{
     DocumentationCollection, DocumentationError, documentation_context,
     documentation_context_with_budget,
 };
-pub use rift_analysis::documentation::{DocumentationProjection, DocumentationProjectionTarget};
+pub use rift_analysis::documentation::{
+    DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
+};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,

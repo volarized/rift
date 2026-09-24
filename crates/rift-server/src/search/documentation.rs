@@ -1,6 +1,8 @@
 //! Documentation projection over the request's captured project and package sources.
 
-use rift_index::{DocumentationProjection, DocumentationProjectionTarget};
+use rift_index::{
+    DocumentationError, DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
+};
 use rift_protocol::documentation::{
     DocumentationContentIdentity, DocumentationSource, DocumentationSourceIdentity,
     DocumentationStage, DocumentationWarning, DocumentationWarningKind,
@@ -19,37 +21,42 @@ pub(super) struct SearchDocumentation<'a> {
     projection: DocumentationProjection<'a>,
     index: &'a WorkspaceIndex,
     resolution: Resolution<'a>,
+    warnings: Vec<ReadWarning>,
 }
 
 impl<'a> SearchDocumentation<'a> {
+    /// Joins the documentation layers one search projects onto: the project's, the
+    /// `force_include` files', then the dependency packages'.
+    ///
+    /// Each layer was built once by the index that owns it, so joining one costs a
+    /// reference. A layer whose build crossed a bound is left out and the answer warns
+    /// `documentation_unavailable` naming it; the search itself is answered.
     pub(super) fn new(
         index: &'a WorkspaceIndex,
         scope: SearchScope,
         resolution: Resolution<'a>,
-    ) -> Result<Self, ReadError> {
-        let mut projection = DocumentationProjection::default();
+    ) -> Self {
+        let mut joined = JoinedLayers::default();
         if scope != SearchScope::Global {
-            projection
-                .extend_collection(index.documentation())
-                .map_err(ReadFault::documentation)?;
+            joined.join("project", index.documentation_layer());
         }
         if let Some(extra) = resolution.force_include {
-            projection
-                .extend_collection(extra.documentation())
-                .map_err(ReadFault::documentation)?;
+            joined.join("force_include", extra.documentation_layer());
         }
         if let Some(packages) = resolution.packages {
-            for package in packages.packages() {
-                projection
-                    .extend_collection(package.documentation())
-                    .map_err(ReadFault::documentation)?;
-            }
+            joined.join("dependency package", packages.documentation_layer());
         }
-        Ok(Self {
-            projection,
+        Self {
+            projection: joined.projection,
             index,
             resolution,
-        })
+            warnings: joined.warnings,
+        }
+    }
+
+    /// The `documentation_unavailable` warnings for the layers this search left out.
+    pub(super) fn warnings(&self) -> &[ReadWarning] {
+        &self.warnings
     }
 
     pub(super) fn admits(
@@ -134,6 +141,42 @@ impl<'a> SearchDocumentation<'a> {
             distance: None,
             change: None,
         })
+    }
+}
+
+/// The layers one search joined so far, and a warning for each one it left out.
+#[derive(Default)]
+struct JoinedLayers<'a> {
+    projection: DocumentationProjection<'a>,
+    warnings: Vec<ReadWarning>,
+}
+
+impl<'a> JoinedLayers<'a> {
+    fn join(
+        &mut self,
+        documentation: &str,
+        layer: Result<&'a DocumentationLayer<'static>, &DocumentationError>,
+    ) {
+        match layer {
+            Ok(layer) => {
+                let projection = std::mem::take(&mut self.projection);
+                self.projection = projection.with_layer(layer);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    component = "search",
+                    operation = "search.documentation",
+                    documentation,
+                    %error,
+                    "a documentation layer crossed a bound and was left out of the search"
+                );
+                self.warnings.push(ReadWarning::DocumentationUnavailable {
+                    detail: format!(
+                        "the {documentation} documentation was left out of this answer: {error}"
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -235,5 +278,51 @@ fn warn(
                 count: 1,
             },
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rift_core::{SourceVisibility, TextFileInclusion};
+    use rift_index::{DocumentationLayer, WorkspaceIndexLimits};
+
+    use super::{JoinedLayers, ReadWarning, WorkspaceIndex};
+
+    /// A layer that refuses leaves its documentation out of the answer and says so once,
+    /// instead of failing the search that reached for it.
+    #[test]
+    fn a_refused_layer_is_left_out_with_one_warning_naming_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("README.md"),
+            "# Beacon\n\nBeacon docs\n",
+        )?;
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        let collection = index.documentation();
+        let refused = DocumentationLayer::borrowed(&[collection, collection])
+            .expect_err("one source held by two collections refuses the layer");
+
+        let mut joined = JoinedLayers::default();
+        joined.join("project", Err(&refused));
+        let [ReadWarning::DocumentationUnavailable { detail }] = joined.warnings.as_slice() else {
+            return Err(format!(
+                "one warning names the left-out layer: {:?}",
+                joined.warnings
+            )
+            .into());
+        };
+        assert!(
+            detail.starts_with("the project documentation was left out of this answer: "),
+            "the warning names the layer and carries the refusal: {detail}"
+        );
+        Ok(())
     }
 }

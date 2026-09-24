@@ -13,6 +13,17 @@ description = "Persistent filesystem projections and validated source transactio
 # uses it.
 autotests = false
 
+[features]
+# Off by default so a release artifact carries no OpenTelemetry export stack. With it
+# compiled in, `initialize_tracing` still installs no exporter until an operator sets
+# `OTEL_EXPORTER_OTLP_ENDPOINT`.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
+
 [lints]
 workspace = true
 
@@ -21,6 +32,9 @@ clap.workspace = true
 fs4.workspace = true
 indicatif.workspace = true
 jiff.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 reqwest.workspace = true
 rmcp.workspace = true
 semver.workspace = true
@@ -39,6 +53,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 waitpid-any.workspace = true
 

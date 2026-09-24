@@ -58,6 +58,17 @@ dashes:
 conformance binary="":
     uv run --locked --project dev rift-dev conformance {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
 
+# A local OTLP collector for timing `traced!`/`traced_async!` spans. Jaeger v2's OTLP
+# receiver serves gRPC on 4317 and HTTP/protobuf on 4318; its query API and UI serve HTTP
+# on 16686 (https://www.jaegertracing.io/docs/2.11/getting-started/). Point a build at it
+# with `RIFT_OTLP_FILTER=... OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift ...`
+# (the `otlp` feature must be compiled in), then summarize with
+# `uv run --project dev rift-dev trace-summary`. Stop it with `trace-collector-stop` when done.
+trace-collector:
+    docker run --detach --name rift-trace-collector -p 16686:16686 -p 4318:4318 -p 4317:4317 jaegertracing/jaeger:2.21.0
+
+trace-collector-stop:
+    docker rm --force rift-trace-collector
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings

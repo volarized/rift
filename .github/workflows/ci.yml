@@ -320,35 +320,6 @@ jobs:
   # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
   # build break CI never saw). Every OS in the release build matrix needs a
   # compile gate here.
-  rust-release-targets:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: Swatinem/rust-cache@v2.9.2
-      - run: rustup target add "${{ matrix.target }}"
-      - run: >-
-          cargo check --workspace --all-targets --all-features
-          --target "${{ matrix.target }}"
-
   installers:
     strategy:
       fail-fast: false
@@ -375,3 +346,302 @@ jobs:
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
+
+  # One build per release target serves two checks: every workspace target
+  # compiles for it, and that same build runs process exit, election, and the
+  # Windows update publisher, which a Unix runner cannot prove. x86-64 Linux runs
+  # the same tests inside `rust`, from the archive `rust-build` compiled.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: native-${{ matrix.target }}
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: cargo-nextest@0.9.140
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build every target and run the native checks
+        env:
+          RIFT_UPDATE_TEST_BINARY: >-
+            ${{ github.workspace }}/target/${{ matrix.target }}/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
+          RIFT_NATIVE_TESTS: >-
+            binary_id(rift::bin/rift) & (
+            test(=server::tests::stopped_process_does_not_wait_for_a_replacement_election)
+            or test(=server::tests::changed_or_missing_document_does_not_prove_process_exit)
+            or test(=server::tests::already_exited_process_does_not_wait_for_a_building_holder)
+            or test(=server::tests::process_observation_errors_keep_waiting_and_retain_their_cause)
+            or test(=server::tests::await_stopped_times_out_while_the_holder_keeps_the_election)
+            or test(=server::tests::await_election_released_returns_once_the_holder_is_gone)
+            ${{ runner.os == 'Windows' && 'or test(=update::tests::windows_publish_flushes_staging_and_preserves_backup) or test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)' || '' }}
+            )
+        run: >-
+          cargo nextest run --locked --target "${{ matrix.target }}"
+          --workspace --all-targets --all-features --profile ci --no-tests fail
+          ${{ runner.os == 'Windows' && '--run-ignored all' || '' }}
+          -E "$RIFT_NATIVE_TESTS"
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: native-tests-${{ matrix.target }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  # The corpus profile compiles the whole workspace optimized and instrumented,
+  # and the one run that finished inside the former 30-minute job limit did so
+  # by eight seconds. The compile owns a limit of its own, and the job keeps
+  # room past it for the cache save and the archive upload that follow.
+  integration-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # Every pull request builds this job's Rust cache, not only a push to
+      # main, so saving on every run would thrash the one shared key. Restore
+      # stays unconditional; only the save after a push to main updates it.
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      # The archive carries test binaries and the CLI compiled from these exact
+      # Rust inputs; the corpus jobs check out the Python harness and the
+      # pinned trees fresh and pass `--workspace-remap .` to point the
+      # extracted archive at that checkout. A hit here is the same archive a
+      # fresh compile would produce, so a pull request touching only docs,
+      # workflows, or `dev/` skips the ~38-minute build.
+      - uses: actions/cache@v6.1.0
+        id: integration-archive-cache
+        with:
+          path: |
+            target/integration.tar.zst
+            target/integration-cli.tar.zst
+          key: >-
+            integration-archive-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', '.config/nextest.toml', 'justfile') }}
+      - name: Build and archive integrations
+        if: steps.integration-archive-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 38
+        run: just integration-archive
+      # Two artifacts, because the two consumers need different bytes: the
+      # corpus jobs run the instrumented archive, and the artifact job serves
+      # the plain CLI. One artifact made the artifact job download an archive
+      # it never opens.
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: integration-archive
+          path: target/integration.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v6.0.0
+        with:
+          name: integration-cli
+          path: target/integration-cli.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+  corpus:
+    needs: integration-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - repository: fastapi
+            case: workspace
+            test: test_fastapi_corpus
+            minutes: 5
+          - repository: bun
+            case: workspace
+            test: test_bun_workspace
+            minutes: 10
+          - repository: bun
+            case: stop
+            test: test_bun_stop
+            minutes: 10
+          - repository: nextjs
+            case: workspace
+            test: test_nextjs_corpus
+            minutes: 13
+          - repository: nextjs
+            case: churn
+            test: test_nextjs_churn
+            minutes: 13
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: integration-archive
+          path: target
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      - run: rustup component add llvm-tools-preview
+      - name: Install validating client
+        run: uv sync --locked --python 3.12 --project dev
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/rift-corpus
+          key: corpus-${{ matrix.repository }}-${{ hashFiles('crates/rift/tests/corpus/pins.toml') }}
+      - name: Fetch pinned repository
+        run: just corpus-sync "${{ matrix.repository }}"
+      - name: Run corpus suite
+        id: corpus
+        timeout-minutes: ${{ matrix.minutes }}
+        env:
+          RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json
+        run: just corpus-test "${{ matrix.repository }}" "${{ matrix.test }}" target/integration.tar.zst
+      - name: Report corpus coverage
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' }}
+        # `generate-check` validates generated wire bytes; coverage measures maintained Rust source.
+        run: cargo llvm-cov report --nextest-archive-file target/integration.tar.zst --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path target/corpus.lcov
+      # A Dependabot-triggered run reads the Dependabot secret scope, not the
+      # Actions scope that holds `CODECOV_TOKEN` - see the `rust` job's own
+      # coverage uploads above. Skip both uploads so the missing token fails
+      # only the upload, never the corpus suite that already ran.
+      - uses: codecov/codecov-action@v5.5.5
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/corpus.lcov
+          flags: corpus
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: codecov/codecov-action@v5.5.5
+        if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: target/nextest/corpus/junit.xml
+          flags: gate
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: corpus-${{ matrix.repository }}-${{ matrix.case }}
+          path: |
+            target/corpus/
+            target/corpus.lcov
+            target/nextest/corpus/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The supplied binary serves real requests: the artifact and agent checks, the
+  # MCP conformance runner, and cold first use in a container.
+  artifact:
+    needs: integration-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: integration-cli
+          path: target
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: just
+      # The conformance runner is a Bun package; the checks around it drive the
+      # supplied binary through the Python harness. None of them compiles Rust,
+      # and none starts an external language engine: the agent checks use the
+      # embedded `ty`, and the cold container is meant to have no engine at all.
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: conformance-${{ runner.os }}-${{ hashFiles('tools/mcp-conformance/bun.lock') }}
+          restore-keys: conformance-${{ runner.os }}-
+      - run: uv sync --locked --python 3.12 --project dev
+      - name: Extract compiled CLI
+        run: |
+          mkdir -p target/integration-cli
+          tar --zstd -xf target/integration-cli.tar.zst -C target/integration-cli
+      - name: Validate artifact and MCP client
+        run: |
+          just artifact-test --binary target/integration-cli/rift --junit target/integration/artifact.xml
+          just agent-test --binary target/integration-cli/rift --junit target/integration/agent.xml
+          just conformance target/integration-cli/rift
+      - name: Validate cold first use
+        run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: artifact-results
+          path: target/integration/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The one check the `main` ruleset requires. A job whose dependency failed is
+  # skipped, and a skipped job reports success to a required check, so this job
+  # runs under `always()` and refuses any result other than `success`.
+  gate:
+    needs:
+      - docs
+      - rust-build
+      - rust
+      - live
+      - installers
+      - native
+      - integration-build
+      - corpus
+      - artifact
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "$failed"
+            exit 1
+          fi

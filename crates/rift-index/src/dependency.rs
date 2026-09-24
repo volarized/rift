@@ -26,7 +26,9 @@ pub use package::PackageIndex;
 pub use walk::{PackageFiles, package_files};
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
+use rift_analysis::documentation::{DocumentationError, DocumentationLayer};
 use rift_core::SourceUnitId;
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::read::PackageIdentity;
@@ -137,6 +139,9 @@ pub struct DependencyIndex {
     packages: BTreeMap<IdentityKey, PackageIndex>,
     skipped: Vec<SkippedPackage>,
     total_bytes: u64,
+    /// The documentation layer over every held package, built by the first read that
+    /// projects onto it and dropped by the next insert.
+    documentation_layer: OnceLock<Result<DocumentationLayer<'static>, DocumentationError>>,
 }
 
 impl DependencyIndex {
@@ -148,6 +153,7 @@ impl DependencyIndex {
             packages: BTreeMap::new(),
             skipped: Vec::new(),
             total_bytes: 0,
+            documentation_layer: OnceLock::new(),
         }
     }
 
@@ -174,7 +180,38 @@ impl DependencyIndex {
         }
         self.total_bytes = total;
         self.packages.insert(key, package);
+        self.documentation_layer.take();
         Ok(())
+    }
+
+    /// The documentation layer joining every held package's collection, in identity order.
+    ///
+    /// The first call builds the layer; every later call answers the same layer until an
+    /// insert changes the packages, so a read projects onto package documentation without
+    /// rebuilding its mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the build met: two packages holding one block or source, or a
+    /// layer bound crossed. The refusal is kept, so every later call answers it too.
+    pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &DocumentationError> {
+        self.documentation_layer
+            .get_or_init(|| {
+                rift_core::traced!(
+                    component = "documentation",
+                    operation = "documentation.layer",
+                    corpus = "packages",
+                    packages = self.packages.len(),
+                    {
+                        DocumentationLayer::shared(
+                            self.packages
+                                .values()
+                                .map(PackageIndex::documentation_snapshot),
+                        )
+                    }
+                )
+            })
+            .as_ref()
     }
 
     /// Records that `identity` was refused for `reason`.

@@ -3,12 +3,13 @@
 //! concurrent-read isolation require a real file, not an in-memory database.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use rift_core::{ErrorCode, ErrorName, ProjectPath, SourceUnitId};
-use rift_index::{DatabasePool, WorkspaceDatabase};
+use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
+use rift_index::{DatabasePool, FileDigest, WorkspaceDatabase, WorkspaceDigests};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalRanking,
-    LexicalSearchIndex, RevisionScoped,
+    LexicalSearchIndex, LexicalStamp, RevisionScoped,
 };
 use rift_ranking::{
     DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
@@ -902,8 +903,9 @@ struct ConcurrentDocumentRecord {
 struct ConcurrentLexicalIndexStateRecord {
     #[key]
     id: i64,
-    tree_revision: String,
+    tree_revision: Option<String>,
     corpus_revision: String,
+    derivation_revision: String,
 }
 
 async fn open_concurrent_probe(path: &Path) -> toasty::Result<Db> {
@@ -986,21 +988,16 @@ async fn insert_corrupt_lexical_row(
     })
     .exec(&mut probe_connection)
     .await?;
-    let mut insert = toasty::sql::statement(
-        "INSERT INTO lexical_documents_fts(identity, name, qualified_name, identifier_terms, \
-         signature, documentation, declaration_source, file_content) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )
-    .bind(identity.to_owned());
-    for field in SearchableField::ALL {
-        let value = if field == SearchableField::FileContent {
-            content.to_owned()
-        } else {
-            String::new()
-        };
-        insert = insert.bind(value);
-    }
-    insert.exec(&mut probe_connection).await?;
+    // The index reads column values from the typed row its rowid names, so the corrupt
+    // row is indexed from the row just written, the way the store indexes its own.
+    let columns = SearchableField::ALL.map(SearchableField::column).join(", ");
+    toasty::sql::statement(format!(
+        "INSERT INTO lexical_documents_fts(rowid, {columns}) \
+         SELECT id, {columns} FROM lexical_documents WHERE identity = ?1"
+    ))
+    .bind(identity.to_owned())
+    .exec(&mut probe_connection)
+    .await?;
     Ok(())
 }
 
@@ -1201,7 +1198,9 @@ async fn test_lexical_search_index_apply_replaces_one_path_and_keeps_the_rest() 
         "pub fn secondgamma() {}",
     )?;
     let change = LexicalChange::new(vec![ProjectPath::new("moved.rs")?], vec![replacement]);
-    index.apply(&change, "revision-two").await?;
+    index
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
+        .await?;
 
     assert_eq!(
         index.tree_revision().await?,
@@ -1247,7 +1246,9 @@ async fn test_lexical_search_index_apply_deletes_every_chunk_filed_under_one_pat
     );
 
     let change = LexicalChange::new(vec![ProjectPath::new("docs/guide.md")?], Vec::new());
-    index.apply(&change, "revision-two").await?;
+    index
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
+        .await?;
     assert!(
         search_matches(&index, "revision-two", "chapter", 8)
             .await?
@@ -1282,7 +1283,7 @@ async fn test_lexical_search_index_apply_refuses_a_resulting_set_past_units_max(
     // stored set is measured against, not the batch.
     let change = LexicalChange::new(Vec::new(), vec![text_document("docs/c.md", "gammathree")?]);
     let error = index
-        .apply(&change, "revision-two")
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
         .await
         .expect_err("a resulting set past units_max must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::UnitLimit);
@@ -1320,7 +1321,7 @@ async fn test_lexical_search_index_apply_refuses_two_documents_sharing_one_ident
         ],
     );
     let error = index
-        .apply(&change, "revision-two")
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
         .await
         .expect_err("two documents sharing one identity must refuse");
     assert_eq!(
@@ -1350,7 +1351,9 @@ async fn test_lexical_search_index_apply_survives_a_reopen_of_the_same_database(
         vec![ProjectPath::new("docs/a.md")?],
         vec![text_document("docs/a.md", "betatwo")?],
     );
-    index.apply(&change, "revision-two").await?;
+    index
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
+        .await?;
     drop(index);
 
     let reopened = LexicalSearchIndex::attached(
@@ -1495,8 +1498,12 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document
         vec![ProjectPath::new("docs/added.md")?],
         vec![text_document("docs/added.md", "alphaone content")?],
     );
-    index.apply(&change, "revision-two").await?;
-    index.apply(&change, "revision-two").await?;
+    index
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
+        .await?;
+    index
+        .apply(&change, &LexicalStamp::published("revision-two", ""))
+        .await?;
 
     assert_eq!(
         search_matches(&index, "revision-two", "alphaone", 8)
@@ -1504,6 +1511,310 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document
             .len(),
         1,
         "the repeated commit leaves one document, not two rows under one identity"
+    );
+    Ok(())
+}
+
+/// Runs FTS5's own consistency check, comparing the index with the typed rows it reads:
+/// "If the value 1 is inserted into the rank column, the index is also compared to the
+/// content table" (<https://www.sqlite.org/fts5.html>).
+async fn assert_index_matches_rows(path: &Path) -> TestResult {
+    let probe = open_concurrent_probe(path).await?;
+    let mut connection = probe.connection().await?;
+    toasty::sql::statement(
+        "INSERT INTO lexical_documents_fts(lexical_documents_fts, rank) \
+         VALUES('integrity-check', 1)",
+    )
+    .exec(&mut connection)
+    .await?;
+    Ok(())
+}
+
+fn recorded(
+    path: &str,
+    bytes: &[u8],
+) -> Result<(ProjectPath, FileDigest), Box<dyn std::error::Error>> {
+    Ok((ProjectPath::new(path)?, FileDigest::of(bytes)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_recorded() -> TestResult
+{
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    assert_eq!(
+        index.recorded_files("derivation-a").await?,
+        None,
+        "an empty store records nothing"
+    );
+
+    let alpha = recorded("alpha.rs", b"pub fn alpha() {}")?;
+    let beta = recorded("beta.rs", b"pub fn beta() {}")?;
+    let change = LexicalChange::new(
+        vec![alpha.0.clone(), beta.0.clone()],
+        vec![
+            symbol_document(
+                "rift://symbol/rust/alpha.rs/alpha",
+                "alpha.rs",
+                "alpha",
+                "pub fn alpha() {}",
+            )?,
+            symbol_document(
+                "rift://symbol/rust/beta.rs/beta",
+                "beta.rs",
+                "beta",
+                "pub fn beta() {}",
+            )?,
+        ],
+    )
+    .with_recorded(vec![alpha.clone(), beta.clone()]);
+    index
+        .apply(
+            &change,
+            &LexicalStamp::published("revision-one", "derivation-a"),
+        )
+        .await?;
+
+    assert_eq!(
+        index.recorded_files("derivation-a").await?,
+        Some(WorkspaceDigests::new([alpha.clone(), beta])),
+    );
+    assert_eq!(
+        index.recorded_files("derivation-b").await?,
+        None,
+        "rows another derivation stamped are never kept"
+    );
+
+    let removal = LexicalChange::new(vec![ProjectPath::new("beta.rs")?], Vec::new());
+    index
+        .apply(
+            &removal,
+            &LexicalStamp::published("revision-two", "derivation-a"),
+        )
+        .await?;
+    assert_eq!(
+        index.recorded_files("derivation-a").await?,
+        Some(WorkspaceDigests::new([alpha])),
+        "a replaced path the change records nothing for is forgotten"
+    );
+    assert!(
+        search_matches(&index, "revision-two", "beta", 8)
+            .await?
+            .is_empty()
+    );
+    assert_index_matches_rows(&database_path(&directory)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_recorded_files_past_units_max_refuse() -> TestResult {
+    let directory = TempDir::new()?;
+    let database = WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?;
+    let writer = LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+    let files = vec![
+        recorded("a.rs", b"a")?,
+        recorded("b.rs", b"b")?,
+        recorded("c.rs", b"c")?,
+    ];
+    let paths = files.iter().map(|(path, _)| path.clone()).collect();
+    writer
+        .apply(
+            &LexicalChange::new(paths, Vec::new()).with_recorded(files),
+            &LexicalStamp::published("revision-one", "derivation-a"),
+        )
+        .await?;
+
+    // A lowered `units` bound meets a store an earlier run filled under a wider one.
+    let reader =
+        LexicalSearchIndex::attached(database, LexicalIndexLimits::new(2, 65_536, 64, 4, 1_000));
+    let error = reader
+        .recorded_files("derivation-a")
+        .await
+        .expect_err("more recorded files than units_max must refuse, never truncate");
+    assert_eq!(
+        error.fault().violation(),
+        LexicalIndexViolation::RecordLimit
+    );
+    let evidence = error
+        .fault()
+        .limit_evidence()
+        .expect("a record limit carries its evidence");
+    assert_eq!(evidence.field, "lexical.files");
+    assert_eq!((evidence.limit, evidence.required), (2, 3));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_a_whole_replace_records_nothing_a_later_write_can_keep()
+-> TestResult {
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let alpha = recorded("alpha.rs", b"pub fn alpha() {}")?;
+    let change = LexicalChange::new(vec![alpha.0.clone()], Vec::new()).with_recorded(vec![alpha]);
+    index
+        .apply(
+            &change,
+            &LexicalStamp::published("revision-one", "derivation-a"),
+        )
+        .await?;
+    index
+        .replace_all(&[text_document("notes.md", "gamma notes")?], "revision-two")
+        .await?;
+    assert_eq!(index.recorded_files("derivation-a").await?, None);
+    assert_eq!(
+        search_matches(&index, "revision-two", "gamma", 8)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_an_unpublished_stamp_answers_no_revision_and_keeps_its_records()
+-> TestResult {
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    index
+        .replace_all(&[text_document("notes.md", "delta notes")?], "revision-one")
+        .await?;
+    let epsilon = recorded("epsilon.md", b"epsilon notes")?;
+    let part = LexicalChange::new(
+        vec![epsilon.0.clone()],
+        vec![text_document("epsilon.md", "epsilon notes")?],
+    )
+    .with_recorded(vec![epsilon.clone()]);
+    index
+        .apply(&part, &LexicalStamp::unpublished("derivation-a"))
+        .await?;
+
+    assert_eq!(index.tree_revision().await?, None);
+    let query = ParsedQuery::parse("epsilon")?;
+    assert_eq!(
+        index
+            .search("revision-one", &query, QueryPhase::Precise, 8)
+            .await?,
+        RevisionScoped::NoRevision,
+        "rows mid-write answer for no publication, neither the previous nor the next"
+    );
+    assert_eq!(
+        index.recorded_files("derivation-a").await?,
+        Some(WorkspaceDigests::new([epsilon])),
+        "a write stopped between its parts keeps what those parts recorded"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_clear_empties_rows_records_and_the_publication() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let zeta = recorded("zeta.md", b"zeta notes")?;
+    let change = LexicalChange::new(
+        vec![zeta.0.clone()],
+        vec![text_document("zeta.md", "zeta notes")?],
+    )
+    .with_recorded(vec![zeta]);
+    index
+        .apply(
+            &change,
+            &LexicalStamp::published("revision-one", "derivation-a"),
+        )
+        .await?;
+
+    index.clear("derivation-b").await?;
+
+    assert_eq!(index.tree_revision().await?, None);
+    assert_eq!(
+        index.recorded_files("derivation-b").await?,
+        Some(WorkspaceDigests::default())
+    );
+    assert_eq!(index.recorded_files("derivation-a").await?, None);
+    let refill = LexicalChange::new(Vec::new(), vec![text_document("zeta.md", "zeta again")?]);
+    index
+        .apply(
+            &refill,
+            &LexicalStamp::published("revision-two", "derivation-b"),
+        )
+        .await?;
+    assert_eq!(
+        search_matches(&index, "revision-two", "again", 8)
+            .await?
+            .len(),
+        1
+    );
+    assert_index_matches_rows(&path).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_rows() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let chunks = [
+        text_chunk("notes.md#1", "notes.md", "first eta chunk")?,
+        text_chunk("notes.md#2", "notes.md", "second eta chunk")?,
+        symbol_document(
+            "rift://symbol/rust/theta.rs/theta",
+            "theta.rs",
+            "theta",
+            "pub fn theta() {}",
+        )?,
+    ];
+    index.replace_all(&chunks, "revision-one").await?;
+    assert_index_matches_rows(&path).await?;
+
+    let rewritten = LexicalChange::new(
+        vec![ProjectPath::new("notes.md")?],
+        vec![text_chunk("notes.md#1", "notes.md", "only iota chunk")?],
+    );
+    index
+        .apply(
+            &rewritten,
+            &LexicalStamp::published("revision-two", "derivation-a"),
+        )
+        .await?;
+    assert_index_matches_rows(&path).await?;
+    assert!(
+        search_matches(&index, "revision-two", "eta", 8)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        search_matches(&index, "revision-two", "iota", 8)
+            .await?
+            .len(),
+        1
+    );
+
+    index
+        .apply(
+            &rewritten,
+            &LexicalStamp::published("revision-three", "derivation-a"),
+        )
+        .await?;
+    assert_index_matches_rows(&path).await?;
+    assert_eq!(
+        search_matches(&index, "revision-three", "iota", 8)
+            .await?
+            .len(),
+        1,
+        "a change applied twice leaves one indexed row, never two"
     );
     Ok(())
 }

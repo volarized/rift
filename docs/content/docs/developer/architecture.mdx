@@ -413,15 +413,16 @@ their effective language entry selects. The units persist in the workspace datab
 `.rift/db`, stamped with the tree revision that published them.
 
 The rebuilt index becomes current as soon as its syntax index is built, and the units are written
-behind that publication, in one transaction with the stamp. A whole replace on a large workspace
-runs for longer than a read is willing to wait, so the publication never waits for it.
+behind that publication. The store records which bytes each file's rows were derived from, so a
+write, startup's included, touches only the files that moved; the first load of a large workspace
+still runs for longer than a read is willing to wait, so the publication never waits for it.
 
 A search that captures the publication before its transaction lands is ranked by identifier
 matching alone and carries a `lexical_ranking_unavailable` warning naming the tree revision the
 store is still committing; the store's ranking joins the answer once the transaction ends. A
 transaction that refuses leaves the previous rows and stamp intact and is recorded in
-[`rift://logs`](/docs/mcp#resource-logs), and the next publication replaces the whole
-unit set rather than applying its change on top of rows the store missed.
+[`rift://logs`](/docs/mcp#resource-logs), and the next publication compares every file with
+what the store recorded rather than applying its change on top of rows the store missed.
 
 The vector ranking's vectors are not part of that transaction. Embedding one declaration can cost
 more than a read is willing to wait, so vectors are refreshed after the index publishes, and a
@@ -485,7 +486,7 @@ part of the score.
 The index records a corpus revision covering the field shape, the derivation the identifier
 terms were split with, the tokenizer, and the weights. A store stamped with another revision
 holds rows this build cannot read, so it answers as if nothing had been published and the next
-publication replaces it.
+write clears it before it writes.
 
 #### Documentation
 

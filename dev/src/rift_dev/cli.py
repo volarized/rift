@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -19,6 +20,7 @@ from rift_dev import (
     check_dashes,
     check_mcp_conformance,
     check_rust_architecture,
+    trace,
 )
 from rift_dev.config import BinaryOptions, CorpusCase, CorpusName, CorpusOptions
 from rift_dev.corpus_cache import git, measure, pins
@@ -141,3 +143,14 @@ def rust_architecture() -> None:
 def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None:
     """Check prose and source files for banned dash characters."""
     raise typer.Exit(check_dashes.main([str(path) for path in paths or []]))
+
+
+@app.command("trace-summary")
+def trace_summary(
+    base_url: Annotated[str, typer.Option()] = "http://localhost:16686",
+    service: Annotated[str, typer.Option()] = "rift",
+    since_seconds: Annotated[int, typer.Option()] = 3600,
+    search_depth: Annotated[int, typer.Option()] = 200,
+) -> None:
+    """Summarize a local OTLP collector's spans for one service, one JSON line per operation."""
+    trace.main(base_url, service, timedelta(seconds=since_seconds), search_depth)

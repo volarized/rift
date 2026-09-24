@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 ignore.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-rift-analysis = { workspace = true, features = ["collector", "archive"] }
+rift-analysis = { workspace = true, features = ["collector", "archive", "parallel"] }
 rift-core.workspace = true
 rift-dependency.workspace = true
 rift-history.workspace = true
@@ -28,6 +28,7 @@ rift-syntax.workspace = true
 toasty.workspace = true
 toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
+rayon.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
