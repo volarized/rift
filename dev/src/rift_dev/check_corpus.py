@@ -770,7 +770,8 @@ class Corpus:
                     "rift://logs/component/search",
                     lambda rows: any(
                         row.get("message")
-                        == "the lexical commit failed; the next publication replaces the whole unit set"
+                        == "the lexical commit failed; the next publication compares every "
+                        "file with the digests the store recorded"
                         for row in rows
                     ),
                 )
