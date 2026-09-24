@@ -4658,6 +4658,7 @@ dependencies = [
  "ty_ide",
  "ty_project",
  "ty_python_core",
+ "url",
 ]
 
 [[package]]
