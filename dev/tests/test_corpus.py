@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus
+from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     PROBE_PATH,
@@ -87,9 +88,9 @@ class Measurements(unittest.TestCase):
     def test_verified_cache_rejects_tracked_and_untracked_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            git(root, "init", "--quiet")
+            git(root, "init", "--quiet").output_bytes()
             (root / "source.rs").write_text("fn beacon() {}\n")
-            git(root, "add", "source.rs")
+            git(root, "add", "source.rs").output_bytes()
             git(
                 root,
                 "-c",
@@ -102,9 +103,11 @@ class Measurements(unittest.TestCase):
                 "--quiet",
                 "-m",
                 "fixture",
+            ).output_bytes()
+            commit = git(root, "rev-parse", "HEAD").output_bytes().decode().strip()
+            measured = measure(
+                git(root, "ls-tree", "-r", "-l", "-z", commit).output_bytes()
             )
-            commit = git(root, "rev-parse", "HEAD").decode().strip()
-            measured = measure(git(root, "ls-tree", "-r", "-l", "-z", commit))
             pin = Pin("fixture", "owner/repository", "tag", commit, measured, "", 0, 60)
             self.assertEqual(pin.verify(root), measured)
             oversized = dataclasses.replace(
@@ -137,25 +140,34 @@ class CacheHistory(unittest.TestCase):
             root = Path(directory).resolve()
             source = root / "source"
             source.mkdir()
-            git(source, "init", "--quiet")
+            git(source, "init", "--quiet").output_bytes()
             for key, value in (
                 ("user.name", "Corpus"),
                 ("user.email", "corpus@example.invalid"),
                 ("commit.gpgsign", "false"),
                 ("uploadpack.allowFilter", "true"),
             ):
-                git(source, "config", key, value)
+                git(source, "config", key, value).output_bytes()
             (source / "source.rs").write_text("fn before() {}\n")
-            git(source, "add", "source.rs")
-            git(source, "commit", "--quiet", "-m", "before")
-            old_blob = git(source, "rev-parse", "HEAD:source.rs").decode().strip()
+            git(source, "add", "source.rs").output_bytes()
+            git(source, "commit", "--quiet", "-m", "before").output_bytes()
+            old_blob = (
+                git(source, "rev-parse", "HEAD:source.rs")
+                .output_bytes()
+                .decode()
+                .strip()
+            )
             # Fifty retained commits must end at a shallow boundary, not the root.
             for index in range(49):
-                git(source, "commit", "--quiet", "--allow-empty", "-m", str(index))
+                git(
+                    source, "commit", "--quiet", "--allow-empty", "-m", str(index)
+                ).output_bytes()
             (source / "source.rs").write_text("fn after() {}\n")
-            git(source, "commit", "--quiet", "-am", "after")
-            commit = git(source, "rev-parse", "HEAD").decode().strip()
-            measured = measure(git(source, "ls-tree", "-r", "-l", "-z", commit))
+            git(source, "commit", "--quiet", "-am", "after").output_bytes()
+            commit = git(source, "rev-parse", "HEAD").output_bytes().decode().strip()
+            measured = measure(
+                git(source, "ls-tree", "-r", "-l", "-z", commit).output_bytes()
+            )
             pin = Pin("fixture", "owner/repository", "tag", commit, measured, "", 0, 60)
             with patch.dict("os.environ", {"RIFT_CORPUS_DIR": str(root / "cache")}):
                 cached = pin.cache
@@ -169,10 +181,10 @@ class CacheHistory(unittest.TestCase):
                     "--filter=blob:none",
                     source.as_uri(),
                     str(cached),
-                )
-                git(cached, "checkout", "--quiet", "--detach", commit)
+                ).output_bytes()
+                git(cached, "checkout", "--quiet", "--detach", commit).output_bytes()
                 shallow = (cached / ".git/shallow").read_bytes()
-                tree = git(cached, "rev-parse", "HEAD^{tree}")
+                tree = git(cached, "rev-parse", "HEAD^{tree}").output_bytes()
                 self.assertEqual(missing_history_objects(cached, commit), [old_blob])
                 with self.assertRaisesRegex(
                     RuntimeError, "history objects are missing"
@@ -184,31 +196,43 @@ class CacheHistory(unittest.TestCase):
                     pin.checkout(root / "unavailable")
                 self.assertFalse((root / "unavailable").exists())
 
-                git(cached, "remote", "set-url", "origin", (root / "absent").as_uri())
+                git(
+                    cached, "remote", "set-url", "origin", (root / "absent").as_uri()
+                ).output_bytes()
                 with self.assertRaises(RuntimeError):
                     pin.sync()
                 self.assertEqual(missing_history_objects(cached, commit), [old_blob])
-                git(cached, "remote", "set-url", "origin", source.as_uri())
+                git(
+                    cached, "remote", "set-url", "origin", source.as_uri()
+                ).output_bytes()
                 self.assertEqual(pin.sync(), cached)
                 self.assertEqual(pin.verify(cached), measured)
                 self.assertEqual(missing_history_objects(cached, commit), [])
                 self.assertEqual(
-                    git(cached, "cat-file", "blob", old_blob), b"fn before() {}\n"
+                    git(cached, "cat-file", "blob", old_blob).output_bytes(),
+                    b"fn before() {}\n",
                 )
                 self.assertEqual(
-                    git(cached, "rev-parse", "HEAD").decode().strip(), commit
+                    git(cached, "rev-parse", "HEAD").output_bytes().decode().strip(),
+                    commit,
                 )
-                self.assertEqual(git(cached, "rev-parse", "HEAD^{tree}"), tree)
+                self.assertEqual(
+                    git(cached, "rev-parse", "HEAD^{tree}").output_bytes(), tree
+                )
                 self.assertEqual((cached / ".git/shallow").read_bytes(), shallow)
-                self.assertEqual(git(cached, "rev-list", "--count", "HEAD"), b"50\n")
-                git(cached, "remote", "set-url", "origin", (root / "absent").as_uri())
+                self.assertEqual(
+                    git(cached, "rev-list", "--count", "HEAD").output_bytes(), b"50\n"
+                )
+                git(
+                    cached, "remote", "set-url", "origin", (root / "absent").as_uri()
+                ).output_bytes()
                 self.assertEqual(pin.sync(), cached)
 
     def test_missing_object_output_rejects_invalid_records(self) -> None:
         for output in (b"not-an-object\n", b"?abcd\n", b"available object\n"):
             with (
                 self.subTest(output=output),
-                patch("rift_dev.corpus_cache.git", return_value=output),
+                patch.object(GitCommand, "output_bytes", return_value=output),
                 self.assertRaisesRegex(ValueError, "missing history object"),
             ):
                 missing_history_objects(Path(), "a" * 40)

@@ -1,6 +1,6 @@
 set dotenv-load := false
 
-rift_dev := "uv run --locked --python 3.12 --project dev rift-dev"
+rift_dev := "uv run --locked --project dev rift-dev"
 
 format:
     cargo fmt --all --check
@@ -72,9 +72,9 @@ installer-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_installers.py
 
 testing-check:
-    uv run --locked --python 3.12 --project dev ruff check dev
-    uv run --locked --python 3.12 --project dev ty check dev
-    uv run --locked --python 3.12 --project dev pytest dev/tests
+    uv run --locked --project dev ruff check dev
+    uv run --locked --project dev ty check dev
+    uv run --locked --project dev pytest dev/tests
 
 corpus-sync *args:
     {{ rift_dev }} corpus sync {{ args }}

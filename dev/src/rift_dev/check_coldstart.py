@@ -18,15 +18,15 @@ from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import MCPError
 
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
-from rift_dev.release_process import owned_environment, run
+from rift_dev.commands import DockerCommand, owned_environment
 from rift_dev.rift_test_client import (
     Client,
     array_value,
+    current_deadline,
     gate_deadline,
     object_value,
     remaining_seconds,
     require,
-    run_command,
     stderr_log,
 )
 
@@ -67,9 +67,11 @@ cat "$3"
 
 def container_command(name: str, arguments: list[str], timeout: float = 30.0) -> str:
     """Run one command inside the isolated container with bounded output."""
-    return run_command(
-        ["docker", "exec", "--workdir", "/workspace", name, *arguments],
-        timeout_seconds=timeout,
+    return (
+        DockerCommand("exec", "--workdir", "/workspace", name, *arguments)
+        .with_timeout(timeout)
+        .with_deadline(current_deadline())
+        .output()
     )
 
 
@@ -164,8 +166,7 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
                 "cold start requires a Linux ELF executable",
             )
         name = f"rift-cold-{uuid.uuid4().hex}"
-        command = [
-            "docker",
+        command = DockerCommand(
             "run",
             "--detach",
             "--name",
@@ -190,10 +191,12 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             "sh",
             "-c",
             START,
-        ]
+        )
         failure: BaseException | None = None
         try:
-            run_command(command, timeout_seconds=START_SECONDS)
+            command.with_timeout(START_SECONDS).with_deadline(
+                current_deadline()
+            ).output()
             pid = await_publication(name)
             if version is not None:
                 observed = container_command(name, ["/rift", "--version"]).strip()
@@ -231,14 +234,16 @@ async def check_coldstart(binary: Path, image: str, version: str | None = None) 
             failure = error
             try:
                 error.add_note(
-                    run(["docker", "logs", "--tail", "200", name], timeout=10)
+                    DockerCommand("logs", "--tail", "200", name)
+                    .with_timeout(10)
+                    .output()
                 )
             except (RuntimeError, OSError) as log_error:
                 error.add_note(f"container log collection failed: {log_error}")
             raise
         finally:
             try:
-                run(["docker", "rm", "--force", name], timeout=30)
+                DockerCommand("rm", "--force", name).with_timeout(30).output()
             except (RuntimeError, OSError) as cleanup_error:
                 if failure is None:
                     raise

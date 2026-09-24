@@ -26,6 +26,7 @@ from rift_dev import (
     trace,
     worktrees,
 )
+from rift_dev.commands import CommandFailed
 from rift_dev.config import BinaryOptions, CorpusCase, CorpusName, CorpusOptions
 from rift_dev.corpus_cache import git, measure, pins
 from rift_dev.rift_test_client import candidate_binary, run_gate, workspace_version
@@ -126,7 +127,11 @@ def corpus(
             print(
                 json.dumps(
                     dataclasses.asdict(
-                        measure(git(pin.cache, "ls-tree", "-r", "-l", "-z", pin.commit))
+                        measure(
+                            git(
+                                pin.cache, "ls-tree", "-r", "-l", "-z", pin.commit
+                            ).output_bytes()
+                        )
                     )
                 )
             )
@@ -227,3 +232,16 @@ def integration_test() -> None:
     artifact()
     agent()
     conformance()
+
+
+def main() -> None:
+    """Runs one rift-dev command, ending with a failed program's own exit status.
+
+    A streamed program has already printed its output, so the failure adds one
+    line naming the program instead of a traceback.
+    """
+    try:
+        app()
+    except CommandFailed as failure:
+        print(f"error: {failure}", file=sys.stderr)
+        raise SystemExit(failure.status) from None

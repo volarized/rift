@@ -321,7 +321,7 @@ class Corpus:
         """Git applies nested ignore files; Rift's hard floor excludes target directories."""
         listing = git(
             self.root, "ls-files", "--cached", "--others", "--exclude-standard", "-z"
-        )
+        ).output_bytes()
         candidates = [
             path.decode()
             for path in listing.split(b"\0")
@@ -340,9 +340,11 @@ class Corpus:
                 "--no-index",
                 "--stdin",
                 "-z",
-                input_bytes=encoded,
-                accepted=(0, 1),
-            ).split(b"\0")
+            )
+            .with_input(encoded)
+            .with_accepted(0, 1)
+            .output_bytes()
+            .split(b"\0")
         )
         return sum(
             path.encode() not in ignored

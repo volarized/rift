@@ -13,12 +13,13 @@ neither - a pull request from a fork - compiles without sccache and says so.
 from __future__ import annotations
 
 import os
-import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
+
+from rift_dev.commands import Command, CommandFailed
 
 BUCKET = "rift-oss-build-cache"
 KEY_PREFIX = "sccache"
@@ -38,8 +39,6 @@ PAIRS: dict[Mode, tuple[str, str]] = {
         "R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY",
     ),
 }
-
-Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
 
 class Credentials(BaseModel):
@@ -103,10 +102,9 @@ def server_environment(
     }
 
 
-def main(
-    environment: Mapping[str, str] = os.environ, run: Runner = subprocess.run
-) -> int:
+def main() -> int:
     """Start the server and route the job's later compiles through it."""
+    environment = os.environ
     exported = environment.get("GITHUB_ENV")
     if not exported:
         raise ValueError(
@@ -116,12 +114,11 @@ def main(
     if selected is None:
         print("::notice::R2 build cache secrets are absent; compiling without sccache")
         return 0
-    started = run(
-        ["sccache", "--start-server"],
-        env=server_environment(environment, selected),
-        check=False,
-    )
-    if started.returncode != 0:
+    try:
+        Command("sccache", "--start-server").with_environment(
+            server_environment(environment, selected)
+        ).run()
+    except CommandFailed:
         print(
             "::warning::sccache did not start against the R2 build cache; compiling without it"
         )

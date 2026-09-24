@@ -11,35 +11,42 @@ import difflib
 import tempfile
 from pathlib import Path
 
-from rift_dev.commands import REPOSITORY, fail, output, run
+from rift_dev.commands import REPOSITORY, CargoCommand, Command, fail
 
-SCHEMA_EXPORT = ("cargo", "run", "-q", "-p", "rift-schema-export", "--")
 OPENAPI = "docs/public/global-api.openapi.json"
 CLIENT = REPOSITORY / "crates/rift-cloud-client/src/generated.rs"
 CLI_HELP = REPOSITORY / "docs/public/cli-help.txt"
+
+# Longest wait for one `cargo run`, which may first have to build the binary.
+BUILD_SECONDS_MAX = 1800.0
 
 # The commands whose help `docs/public/cli-help.txt` transcribes, in page order.
 HELP_COMMANDS = (("--help",), ("server", "--help"), ("server", "logs", "--help"))
 
 
+def schema_export(*arguments: str) -> CargoCommand:
+    """`rift-schema-export`, built and run through Cargo, with `arguments`."""
+    return CargoCommand("run", "-q", "-p", "rift-schema-export", "--", *arguments)
+
+
 def generate(check: bool) -> None:
     """Writes every generated file, or with `check` fails on the first stale one."""
     if check:
-        run(*SCHEMA_EXPORT, "--check", "docs", "plugins/claude")
-        run(*SCHEMA_EXPORT, "--check", "--analyzer-manifest", ".")
-        run(*SCHEMA_EXPORT, "--global-contract", "docs")
+        schema_export("--check", "docs", "plugins/claude").run()
+        schema_export("--check", "--analyzer-manifest", ".").run()
+        schema_export("--global-contract", "docs").run()
         check_client()
         check_cli_help()
     else:
-        run(*SCHEMA_EXPORT, "docs", "plugins/claude")
-        run(*SCHEMA_EXPORT, "--analyzer-manifest", ".")
+        schema_export("docs", "plugins/claude").run()
+        schema_export("--analyzer-manifest", ".").run()
         write_client(CLIENT)
         CLI_HELP.write_text(cli_help(), encoding="utf-8")
 
 
 def write_client(destination: Path) -> None:
     """Generates the global API client's Rust types into `destination`."""
-    run(
+    Command(
         "oas3-gen",
         "generate",
         "types",
@@ -51,7 +58,7 @@ def write_client(destination: Path) -> None:
         OPENAPI,
         "-o",
         destination,
-    )
+    ).run()
 
 
 def check_client() -> None:
@@ -71,7 +78,9 @@ def cli_help() -> str:
     """The CLI help transcript: each command line, then the help it prints."""
     return "\n".join(
         f"$ rift {' '.join(arguments)}\n"
-        + output("cargo", "run", "-q", "-p", "rift", "--", *arguments)
+        + CargoCommand("run", "-q", "-p", "rift", "--", *arguments)
+        .with_timeout(BUILD_SECONDS_MAX)
+        .output()
         for arguments in HELP_COMMANDS
     )
 
