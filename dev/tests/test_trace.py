@@ -1,143 +1,139 @@
-"""Summarizing recorded `/api/v3/traces` documents needs no live Docker collector.
+"""The in-memory collector reads what Rift's `http-proto` exporter sends.
 
-The fixtures below match the shape a Jaeger v2 collector actually returned when probed
-directly over its documented `/api/v3/traces` HTTP gateway: `traceId`/`spanId` as hex
-strings, `startTimeUnixNano`/`endTimeUnixNano` as decimal nanosecond strings, one
-`resourceSpans` entry per matched span.
+Each request below is an `ExportTraceServiceRequest` built with the OTLP protobuf
+classes and posted over HTTP, the shape `opentelemetry-otlp` writes to
+`/v1/traces`; no Docker or external collector is involved.
 """
 
 from __future__ import annotations
 
+import gzip
+import threading
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
+
+import pytest
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest,
+    ExportTraceServiceResponse,
+)
+from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans, Span
 from rift_dev import trace
 
 
-def span(name: str, start_ns: int, duration_ms: float) -> dict:
-    """One `resourceSpans` entry shaped like Jaeger v2's `/api/v3/traces` response."""
-    end_ns = start_ns + int(duration_ms * 1_000_000)
-    return {
-        "resource": {
-            "attributes": [
-                {"key": "service.name", "value": {"stringValue": "rift"}},
-            ]
-        },
-        "scopeSpans": [
-            {
-                "scope": {"name": "rift"},
-                "spans": [
-                    {
-                        "traceId": f"{start_ns:032x}",
-                        "spanId": f"{start_ns:016x}",
-                        "name": name,
-                        "kind": 1,
-                        "startTimeUnixNano": str(start_ns),
-                        "endTimeUnixNano": str(end_ns),
-                    }
-                ],
-            }
-        ],
-    }
-
-
-def document(*spans: dict) -> dict:
-    """One `/api/v3/traces` streamed document wrapping `spans`."""
-    return {"result": {"resourceSpans": list(spans)}}
-
-
-def test_span_durations_by_operation_groups_by_span_name() -> None:
-    documents = [
-        document(
-            span("index.build", 1_000, 10.0),
-            span("package.index", 2_000, 20.0),
-        ),
-        document(span("index.build", 3_000, 30.0)),
-    ]
-
-    durations = trace.span_durations_by_operation(documents)
-
-    assert durations == {
-        "index.build": [10.0, 30.0],
-        "package.index": [20.0],
-    }
-
-
-def test_summarize_computes_count_total_and_percentiles_per_operation() -> None:
-    documents = [
-        document(
-            span("index.build", 1_000, 10.0),
-            span("index.build", 2_000, 20.0),
-            span("index.build", 3_000, 30.0),
-        )
-    ]
-
-    summaries = trace.summarize(documents)
-
-    assert len(summaries) == 1
-    summary = summaries[0]
-    assert summary.operation == "index.build"
-    assert summary.count == 3
-    assert summary.total_ms == 60.0
-    assert summary.p50_ms == 20.0
-    assert summary.p95_ms == 30.0
-    assert summary.max_ms == 30.0
-
-
-def test_summarize_orders_operations_by_total_duration_descending() -> None:
-    documents = [
-        document(
-            span("package.index", 1_000, 5.0),
-            span("index.build", 2_000, 100.0),
-        )
-    ]
-
-    summaries = trace.summarize(documents)
-
-    assert [summary.operation for summary in summaries] == [
-        "index.build",
-        "package.index",
-    ]
-
-
-def test_summarize_over_no_documents_is_empty() -> None:
-    assert trace.summarize([]) == []
-
-
-def test_operation_timing_as_json_line_round_trips_through_json() -> None:
-    import json
-
-    summary = trace.OperationTiming(
-        operation="index.build",
-        count=3,
-        total_ms=60.0,
-        p50_ms=20.0,
-        p95_ms=30.0,
-        max_ms=30.0,
+def request(*spans: tuple[str, int, float]) -> ExportTraceServiceRequest:
+    """One export request carrying each span as its name, start, and duration."""
+    return ExportTraceServiceRequest(
+        resource_spans=[
+            ResourceSpans(
+                scope_spans=[
+                    ScopeSpans(
+                        spans=[
+                            Span(
+                                name=name,
+                                start_time_unix_nano=start_ns,
+                                end_time_unix_nano=start_ns + int(duration_ms * 1e6),
+                            )
+                            for name, start_ns, duration_ms in spans
+                        ]
+                    )
+                ]
+            )
+        ]
     )
 
-    decoded = json.loads(summary.as_json_line())
 
-    assert decoded == {
-        "operation": "index.build",
-        "count": 3,
-        "total_ms": 60.0,
-        "p50_ms": 20.0,
-        "p95_ms": 30.0,
-        "max_ms": 30.0,
-    }
+@contextmanager
+def collector() -> Iterator[tuple[str, trace.SpanStore]]:
+    """A collector serving on an ephemeral loopback port, and the store it feeds."""
+    store = trace.SpanStore()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), trace.receiver(store))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", store
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
-def test_decode_documents_parses_multiple_concatenated_json_objects() -> None:
-    body = (
-        '{"result": {"resourceSpans": []}}\n'
-        '{"result": {"resourceSpans": [{"scopeSpans": []}]}}'
+def post(
+    url: str,
+    body: bytes,
+    content_type: str = trace.PROTOBUF,
+    encoding: str | None = None,
+) -> tuple[int, bytes]:
+    headers = {"Content-Type": content_type}
+    if encoding:
+        headers["Content-Encoding"] = encoding
+    call = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(call, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def test_exported_spans_are_summarized_per_operation() -> None:
+    with collector() as (url, store):
+        status, body = post(
+            f"{url}/v1/traces",
+            request(
+                ("index.populate", 0, 30.0),
+                ("index.populate", 10, 10.0),
+                ("search", 20, 5.0),
+            ).SerializeToString(),
+        )
+        assert status == 200
+        ExportTraceServiceResponse.FromString(body)
+        summary = store.summary()
+    assert [timing.operation for timing in summary] == ["index.populate", "search"]
+    populate = summary[0]
+    assert populate.count == 2
+    assert populate.total_ms == pytest.approx(40.0)
+    assert populate.max_ms == pytest.approx(30.0)
+
+
+def test_spans_accumulate_across_requests_and_gzip_bodies() -> None:
+    with collector() as (url, store):
+        post(f"{url}/v1/traces", request(("search", 0, 1.0)).SerializeToString())
+        compressed = gzip.compress(request(("search", 5, 3.0)).SerializeToString())
+        status, _ = post(f"{url}/v1/traces", compressed, encoding="gzip")
+        assert status == 200
+        [search] = store.summary()
+    assert search.count == 2
+    assert search.total_ms == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    "path,content_type,body,status",
+    [
+        ("/v1/metrics", trace.PROTOBUF, b"", 404),
+        ("/v1/traces", "application/json", b"{}", 415),
+        ("/v1/traces", trace.PROTOBUF, b"\xff\xff\xff", 400),
+    ],
+)
+def test_a_request_the_collector_cannot_read_is_refused(
+    path: str, content_type: str, body: bytes, status: int
+) -> None:
+    with collector() as (url, store):
+        assert post(f"{url}{path}", body, content_type)[0] == status
+        assert store.summary() == []
+
+
+def test_percentile_uses_nearest_rank() -> None:
+    values = [float(value) for value in range(1, 101)]
+    assert trace.percentile(values, 0.50) == 51.0
+    assert trace.percentile(values, 0.95) == 96.0
+    assert trace.percentile([], 0.50) == 0.0
+
+
+def test_a_timing_prints_as_one_json_line() -> None:
+    [timing] = trace.summarize({"search": [1.23456]})
+    assert timing.as_json_line() == (
+        '{"operation": "search", "count": 1, "total_ms": 1.235, '
+        '"p50_ms": 1.235, "p95_ms": 1.235, "max_ms": 1.235}'
     )
-
-    documents = trace.decode_documents(body)
-
-    assert documents == [
-        {"result": {"resourceSpans": []}},
-        {"result": {"resourceSpans": [{"scopeSpans": []}]}},
-    ]
-
-
-def test_decode_documents_over_blank_body_is_empty() -> None:
-    assert trace.decode_documents("  \n  ") == []

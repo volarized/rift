@@ -167,7 +167,7 @@ macros in `rift-core`. Building with `--features otlp` adds an OTLP/HTTP export 
 those spans to a local collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is
 off by default, so a plain build carries no OpenTelemetry stack.
 
-Start a local Jaeger collector, build with the feature, and point a run at it:
+Start the collector, build with the feature, and point a run at it from a second terminal:
 
 ```sh
 just trace-collector
@@ -175,19 +175,11 @@ cargo build --release -p rift --features otlp
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
 ```
 
-`RIFT_OTLP_FILTER` overrides the export layer's own filter; unset, it keeps Rift's own crates at
-`info`. Summarize what the collector holds, one JSON line per operation:
-
-```sh
-uv run --project dev rift-dev trace-summary
-```
-
-Each line carries the operation's span count, total duration, p50, p95, and max, in
-milliseconds. Stop the collector once you're done:
-
-```sh
-just trace-collector-stop
-```
+`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans on
+port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
+unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once the run is done,
+and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
+milliseconds.
 
 ## Developer tooling
 

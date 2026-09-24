@@ -2,8 +2,8 @@
 //!
 //! Off by default, so a release binary built without `--features otlp` carries no
 //! OpenTelemetry export stack. Compiled in, the process still exports nothing until an
-//! operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` - a local Jaeger started with `just
-//! trace-collector`, or any other OTLP/HTTP receiver.
+//! operator sets `OTEL_EXPORTER_OTLP_ENDPOINT` - the in-memory collector `just
+//! trace-collector` runs, or any other OTLP/HTTP receiver.
 
 #[cfg(feature = "otlp")]
 use opentelemetry::trace::TracerProvider as _;

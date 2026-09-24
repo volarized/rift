@@ -6,7 +6,6 @@ import asyncio
 import dataclasses
 import json
 import sys
-from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -154,15 +153,13 @@ def dashes(paths: Annotated[list[Path] | None, typer.Argument()] = None) -> None
     raise typer.Exit(check_dashes.main([str(path) for path in paths or []]))
 
 
-@app.command("trace-summary")
-def trace_summary(
-    base_url: Annotated[str, typer.Option()] = "http://localhost:16686",
-    service: Annotated[str, typer.Option()] = "rift",
-    since_seconds: Annotated[int, typer.Option()] = 3600,
-    search_depth: Annotated[int, typer.Option()] = 200,
+@app.command("trace-collector")
+def trace_collector(
+    host: Annotated[str, typer.Option()] = "127.0.0.1",
+    port: Annotated[int, typer.Option()] = 4318,
 ) -> None:
-    """Summarize a local OTLP collector's spans for one service, one JSON line per operation."""
-    trace.main(base_url, service, timedelta(seconds=since_seconds), search_depth)
+    """Collect OTLP/HTTP spans in memory; Ctrl-C prints one JSON line per operation."""
+    trace.collect(host, port)
 
 
 @app.command()
