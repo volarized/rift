@@ -7,9 +7,10 @@ title: Testing
 Unit tests, live language-engine and embedding-model suites, and the corpus, artifact, agent, and
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
 pinned Next.js, Bun, and FastAPI repositories. Each release target other than x86-64 Linux builds
-every workspace target once and runs the whole unit suite from that build, so process exit,
-server election, and the Windows update publisher run on the OS they target: a Unix runner cannot
-exercise a Windows Job object or a replace-while-running publication. x86-64 Linux runs the unit
+every workspace target once and runs the unit suite from that build, so every test runs on the OS
+it targets. On Windows the `ci` profile in `.config/nextest.toml` selects the process exit, server
+election, and update publisher tests: a Unix runner cannot exercise a Windows Job object or a
+replace-while-running publication. x86-64 Linux runs the unit
 suite from one instrumented archive, and the corpus checks there reuse one optimized archive
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.

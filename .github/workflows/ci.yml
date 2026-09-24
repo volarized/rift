@@ -410,10 +410,11 @@ jobs:
   # Feature resolution is per target: a dependency graph that compiles on
   # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
   # build break CI never saw). Each release target other than x86-64 Linux
-  # builds every workspace target once and runs the whole unit suite from that
-  # build, so process exit, server election, the Windows update publisher, and
-  # every other test run on the OS they target. x86-64 Linux runs the suite
-  # inside `rust`, from the archive `rust-build` compiled.
+  # builds every workspace target once and runs the unit suite from that build,
+  # so process exit, server election, and every other test run on the OS they
+  # target. On Windows the `ci` profile in `.config/nextest.toml` narrows the run
+  # to process exit, election, and the update publisher. x86-64 Linux runs the
+  # suite inside `rust`, from the archive `rust-build` compiled.
   native:
     strategy:
       fail-fast: false
@@ -427,8 +428,12 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+          # `cryptography`, which the MCP client needs, publishes no Windows
+          # ARM wheel, so `rift-dev` runs on x64 Python under the runner's
+          # x64 emulation; what it starts, sccache, is the native binary.
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            python: cpython-3.12-windows-x86_64-none
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -463,12 +468,13 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
-      # The ci profile's default filter keeps the live and corpus suites out.
-      # Ignored tests run too, except the `_probe` tests, which exist only as
-      # the child processes their parent tests spawn. On Windows that admits
-      # the update publisher's replace-while-running test, which reads the CLI
-      # this same build produced.
+        run: uv run --locked --python ${{ matrix.python || '3.12' }} --project dev rift-dev build-cache
+      # The ci profile's default filter keeps the live and corpus suites out,
+      # and on Windows selects the process and update tests alone. Ignored
+      # tests run too, except the `_probe` tests, which exist only as the child
+      # processes their parent tests spawn. On Windows that admits the update
+      # publisher's replace-while-running test, which reads the CLI this same
+      # build produced.
       - name: Build every target and run the unit suite
         env:
           RIFT_UPDATE_TEST_BINARY: >-
