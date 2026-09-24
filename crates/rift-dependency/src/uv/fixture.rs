@@ -102,6 +102,19 @@ version = "0.27.1"
 source = { registry = "https://pypi.org/simple" }
 "#;
 
+/// The environment directory a degradation names for the manifest in `directory`, as
+/// the resolver spells it: [`ROOT`] joined with each segment by the platform separator.
+pub(super) fn environment_spelling(directory: &[&str]) -> String {
+    directory
+        .iter()
+        .chain([&".venv"])
+        .fold(Path::new(ROOT).to_path_buf(), |path, segment| {
+            path.join(segment)
+        })
+        .display()
+        .to_string()
+}
+
 pub(super) fn project(path: &str) -> ProjectPath {
     ProjectPath(path.to_owned())
 }

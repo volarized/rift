@@ -362,7 +362,8 @@ mod tests {
 
     use super::fixture::{
         ENVIRONMENT, ENVIRONMENT_FILE, REGISTRY, ROOT, SITE_PACKAGES, asked_count, entry,
-        environment_inspector, lockfile_reads, names, project, resolve, single_package_lockfile,
+        environment_inspector, environment_spelling, lockfile_reads, names, project, resolve,
+        single_package_lockfile,
     };
     use super::*;
     use crate::catalog::PackageLocation;
@@ -515,10 +516,11 @@ mod tests {
 
         assert_eq!(
             resolution.degradations,
-            [
-                "tools/pyproject.toml: no environment at /workspace/tools/.venv; packages \
-                 cataloged without source roots"
-            ]
+            [format!(
+                "tools/pyproject.toml: no environment at {}; packages cataloged without source \
+                 roots",
+                environment_spelling(&["tools"])
+            )]
         );
         assert_eq!(
             resolution.entries.len(),
@@ -623,9 +625,13 @@ mod tests {
         assert_eq!(
             resolution.degradations,
             [
-                "pyproject.toml: no environment at /workspace/.venv; packages cataloged without \
-                 source roots",
-                "pyproject.toml: uv.lock pins local-lib without a version; not cataloged",
+                format!(
+                    "pyproject.toml: no environment at {}; packages cataloged without source \
+                     roots",
+                    environment_spelling(&[])
+                ),
+                "pyproject.toml: uv.lock pins local-lib without a version; not cataloged"
+                    .to_owned(),
             ]
         );
         assert!(resolution.entries.is_empty());
@@ -651,9 +657,11 @@ mod tests {
         assert_eq!(
             resolution.degradations,
             [
-                "pyproject.toml: no environment at /workspace/.venv; packages cataloged without \
-                 source roots"
-                    .to_owned(),
+                format!(
+                    "pyproject.toml: no environment at {}; packages cataloged without source \
+                     roots",
+                    environment_spelling(&[])
+                ),
                 format!(
                     "1 of {} packages were not cataloged: at most {PACKAGES_MAX} are cataloged \
                      per workspace",
