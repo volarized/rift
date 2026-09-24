@@ -517,6 +517,13 @@ impl ReadService {
         self.index.digests()
     }
 
+    /// Every file's content digest this snapshot indexed, the files it left out included,
+    /// in project-path order, without hashing any file again.
+    #[must_use]
+    pub fn content_digests(&self) -> WorkspaceDigests {
+        self.index.content_digests()
+    }
+
     /// Workspace orientation snapshot: language totals, the directory tree indexed files sit
     /// under, the most-referenced symbols, entry points, and docs - computed once from this
     /// snapshot's already-loaded index.
@@ -590,6 +597,70 @@ impl ReadService {
     #[must_use]
     pub fn holds_files_below(&self, directory: &CoreProjectPath) -> bool {
         self.index.holds_files_below(directory)
+    }
+
+    /// Builds the next snapshot from a whole scan of the tree, sharing every file whose bytes
+    /// this snapshot already parsed.
+    ///
+    /// The source policy is compiled again, so a rewritten ignore file decides what is
+    /// visible, and the dependency context is read again from the manifests and lockfiles
+    /// that policy makes visible. The language entries, bounds, text selection, history, and
+    /// dependency configuration carry over, which is why a caller rescans only while the
+    /// index-owned configuration is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the root, the policy, or a visible file cannot be indexed
+    /// within bounds.
+    pub fn rescanned(
+        &self,
+        root: &Path,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<Self, ReadError> {
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            mode = "rescan",
+            files_count = tracing::field::Empty,
+            tree_revision = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let built = self.index.rescanned(visibility).and_then(|index| {
+            let source_policy = WorkspaceSourcePolicy::build_with_languages(
+                root,
+                self.index.limits(),
+                visibility,
+                text_inclusion,
+                languages,
+            )?;
+            Ok((index, source_policy))
+        });
+        let (index, source_policy) = built.map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
+        let revisions = captured_revisions(&index);
+        let context = Arc::new(resolved_context(
+            root,
+            &source_policy,
+            &self.dependency_configuration,
+        )?);
+        span.record("files_count", index.file_count());
+        span.record("tree_revision", revisions.wire_tree_revision());
+        span.record("outcome", "ok");
+        Ok(Self {
+            index,
+            revisions,
+            revision: self.revision.clone(),
+            history: self.history.clone(),
+            source_policy: Some(Arc::new(source_policy)),
+            context,
+            packages: self.packages.clone(),
+            dependency_configuration: self.dependency_configuration.clone(),
+        })
     }
 
     /// Builds the next snapshot by reading only the paths `changes` names, sharing every

@@ -118,10 +118,12 @@ its result, so reads never combine state from two index revisions.
 Watcher events advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
 those files, sharing every other file with the previous index. A watch failure, a written
-`.gitignore`, or a directory appearing or disappearing reads the whole workspace instead. A
-written `rift.toml` reads the whole workspace when `[source]`, a language file selection, or
-`[search.text]` inclusion or chunk bound changed. Every other accepted configuration change
-reuses the published tree.
+`.gitignore`, or a directory appearing or disappearing reads the whole workspace instead: the
+rebuild walks the tree and reads and digests every visible file under the ignore files as they
+stand now, and parses only the files whose bytes the previous index did not already parse. A
+written `rift.toml` reads and parses the whole workspace when `[source]`, a language file
+selection, `[search.text]` inclusion or chunk bound, `[dependencies]`, or `[providers.syntax]`
+changed. Every other accepted configuration change reuses the published tree.
 
 Before each current-tree read, the server captures an exact digest of every included workspace
 file, then waits until the published index counter matches its observation. That capture already
@@ -162,64 +164,89 @@ Documentation adapters record source warnings when selected input is malformed o
 A selection above 100,000 content owners, including notebook cells and omitted sources, is refused
 before publication.
 
-The workspace database stores the documentation manifest and reverse symbol references beside
-the lexical rows. Blocks retain byte ranges and digests; excerpts come from the captured source
-after pagination. The same transaction writes documentation metadata, lexical units, and their
-tree revision.
+The workspace database stores the documentation metadata beside the lexical rows, one row per
+source: the source's facts, blocks, links, references, and unresolved spellings, under the digest
+of those bytes. A manifest row carries what describes the whole collection, and each exact
+reference also gets a reverse row filed under its source. Blocks retain byte ranges and digests;
+excerpts come from the captured source after pagination. The transaction that stamps a lexical
+write's tree revision writes its documentation metadata.
 
 The collector keeps parser facts for each selected source in memory. Incremental rebuilds reuse
 facts when source metadata, chunk mappings, extractor revision, and accepted attached symbols match.
 Link and declaration changes invalidate affected blocks; unchanged notebook bytes reuse decoded
 cells. A restart rebuilds parser facts from source.
 
-SQLite keeps one validated documentation snapshot and changes only reverse-reference rows whose
-stored values differ. Those changes share the lexical writer's transaction.
+A write compares each source's digest with the one its row carries and rewrites only the sources
+that moved, removing a source's row and its reverse references together, so an edit to one
+documented file writes that file's row rather than the whole collection.
 
-One transaction writes the units and the stamp together, so the store is never a partial mix of
-two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
-named the files it read deletes those paths' rows and inserts their new ones, which costs one
-delete and one insert batch per changed path instead of a rewrite of every row.
+The store records, beside each file's rows, the digest of the bytes they were derived from, and
+its stamp names what else derived them: the executable, the corpus shape, and the index-owned
+configuration. Every write compares before it writes. A rebuild that named the files it read
+deletes those paths' rows and inserts their new ones. A rebuild that read the whole workspace,
+startup included, compares every file it holds with the recorded digests and writes only the
+files whose bytes moved or that one side lacks, so a restart over an unchanged tree writes the
+stamp and nothing else. A store stamped by another executable or configuration keeps nothing: the
+write clears it first.
 
-The transaction runs behind the publication: the rebuilt index becomes current first, and the
-lexical lane runs the writes it was handed in publication order, one transaction at a time. The
-lane holds a bounded number of writes behind the running one; a write handed to a full lane
-supersedes the held ones, and the store is then owed a whole replace. One process-wide write turn
-serializes index commits, vector batches, and log batches, and each transaction starts with
+The write runs behind the publication: the rebuilt index becomes current first, and the lexical
+lane runs the writes it was handed in publication order, one at a time. The lane holds one write
+behind the running one, and a write handed while one waits merges into it: the union of the files
+both named, derived from the newer publication, leaves the store exactly as running both would. A
+burst of changes therefore costs one write per lane turn. One process-wide write turn serializes
+index commits, vector batches, and log batches, and each transaction starts with
 `BEGIN IMMEDIATE`.
+
+A write commits in transactions of at most
+[`[search.lexical]`](/docs/developer/configuration#search) `transaction_units` units and
+`transaction_size` content bytes, one file's rows always in one transaction. Every transaction
+but the last stamps no tree, so a reader meets no publication rather than a mix of two, and only
+the last names the tree the write answers for. A server that stops during a write aborts one
+transaction: the ones already committed recorded their files' digests with their rows, so the next
+start's comparison writes only the files the stopped write did not reach.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
-server log; the next publication's transaction replaces the whole unit set.
+server log; the next write compares its whole publication with the recorded digests.
 
 The database tables:
 
 - `lexical_documents` - one row per indexed document: a code symbol, or a text file split into
   chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk bound. The row
-  carries the document's identity, path, kind, and content digest beside the searchable
-  fields.
-- `lexical_index_state` - stamps the set with the tree revision that published it and the
-  corpus revision it was built under. One read transaction reads that stamp and runs the query,
-  so a commit landing between the two cannot slip another tree's rows into an answer. A store
-  holding another tree returns no rows at all: either the lane has not committed the captured
-  publication yet, and `search` warns naming that revision, or the publication has since been
-  superseded, and the request recaptures rather than ranking rows it cannot place. A store
-  holding another corpus revision returns no rows either: its columns, derivation, tokenizer,
-  or weights are not this build's.
+  carries an integer `id`, the document's identity, path, kind, and content digest beside the
+  searchable fields.
+- `lexical_files` - one row per file the published index holds, the files it left out
+  included, carrying the SHA-256 of the bytes that file's rows were derived from. A change
+  writes a path's rows and its digest in one transaction.
+- `lexical_index_state` - stamps the set with the tree revision that published it, the corpus
+  revision it was built under, and a digest of what besides the files' bytes derived the rows,
+  which a later write compares before it keeps any row. One read transaction reads that stamp and runs the query, so a commit landing
+  between the two cannot slip another tree's rows into an answer. A store holding another tree
+  returns no rows at all: either the lane has not committed the captured publication yet, and
+  `search` warns naming that revision, or the publication has since been superseded, and the
+  request recaptures rather than ranking rows it cannot place. A store holding another corpus
+  revision returns no rows either: its columns, derivation, tokenizer, or weights are not this
+  build's. A stamp that names no tree answers the same way as an empty store.
 - `lexical_documents_fts` - the [FTS5](https://www.sqlite.org/fts5.html) virtual table over the
-  searchable columns, with `identity` riding unindexed as the join key. Ranking is FTS5's
-  `bm25` with the per-column weights the
-  [architecture page](/docs/developer/architecture#search) lists, comparable only within one
-  search. The same statement asks `bm25` once per column with every other weight zeroed, which
-  is how an answer states that a term landed in documentation rather than in a name. The
-  tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what lets an in-memory
-  adapter tokenize the same text the same way without carrying a folding table of its own.
+  searchable columns. It is an external-content index over `lexical_documents`: it holds the
+  token index alone and reads column values from the row whose `id` is its rowid, so no field
+  is stored twice. FTS5 leaves the two in step to the writer, so a path's index entries are
+  removed with the `'delete'` command while its rows still hold the indexed values, and a
+  document is indexed only after its row is written. Ranking is FTS5's `bm25` with the
+  per-column weights the [architecture page](/docs/developer/architecture#search) lists,
+  comparable only within one search. The same statement asks `bm25` once per column with every
+  other weight zeroed, which is how an answer states that a term landed in documentation rather
+  than in a name. The tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what
+  lets an in-memory adapter tokenize the same text the same way without carrying a folding
+  table of its own.
 - `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
-`lexical_documents` carries an index on `path`. Every named path is replaced, added ones
+`lexical_documents` carries an index on `path`: the index finds a path's rows and their index
+entries without reading the full-text table. Every named path is replaced, added ones
 included: two rebuilds captured from one publication both write what they read, and the second
 leaves what the first left.
 

@@ -17,12 +17,13 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileDigest, LexicalChange, PathChanges, WorkspaceFingerprint, WorkspaceIndexLimits,
-    WorkspaceSourcePolicy,
+    ChangeSet, FileDigest, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
-    LspConfiguration, SearchConfiguration, ServerConfiguration, WorkspaceConfiguration,
+    LspConfiguration, SearchConfiguration, ServerConfiguration, SyntaxConfiguration,
+    WorkspaceConfiguration,
 };
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
@@ -411,11 +412,7 @@ impl ConfigurationState {
         let workspace_bytes_max =
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
-        let syntax = self
-            .accepted
-            .as_ref()
-            .map(|configuration| configuration.providers.syntax.clone())
-            .unwrap_or_default();
+        let syntax = self.syntax_configuration();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
             .map_err(|error| ReadError::from(ReadFault::Index(error)))
@@ -452,11 +449,43 @@ impl ConfigurationState {
     /// The `[dependencies]` table counts as index-owned: the read service resolves its
     /// catalog under the table's resolution policy and gates dependency-scoped lookups on
     /// its switch.
+    ///
+    /// `[providers.syntax]` counts too: its bounds decide which declarations a file's parse
+    /// keeps, so a publication built under other bounds holds other units.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
             || self.text_inclusion() != other.text_inclusion()
             || self.language_file_selections() != other.language_file_selections()
             || self.dependencies_configuration() != other.dependencies_configuration()
+            || self.syntax_configuration() != other.syntax_configuration()
+    }
+
+    /// Digest of every configuration table the index derives its content under: the
+    /// `[source]`, `[search.text]`, `[languages]`, `[dependencies]`, and `[providers.syntax]`
+    /// tables [`Self::index_configuration_differs`] compares, and the `[search.lexical]`
+    /// bounds the lexical lane writes under. An invalid `rift.toml` digests the defaults,
+    /// the configuration every accessor here answers while acceptance refuses the file.
+    pub(crate) fn index_configuration_digest(&self) -> String {
+        let defaults = WorkspaceConfiguration::default();
+        let configuration = self.accepted.as_ref().unwrap_or(&defaults);
+        let tables = serde_json::json!({
+            "source": configuration.source,
+            "text": configuration.search.text,
+            "lexical": configuration.search.lexical,
+            "languages": configuration.languages,
+            "dependencies": configuration.dependencies,
+            "syntax": configuration.providers.syntax,
+        });
+        format!("{:x}", Sha256::digest(tables.to_string().as_bytes()))
+    }
+
+    /// The `[providers.syntax]` bounds from the last acceptance, or the defaults while
+    /// `rift.toml` is invalid.
+    fn syntax_configuration(&self) -> SyntaxConfiguration {
+        self.accepted
+            .as_ref()
+            .map(|configuration| configuration.providers.syntax.clone())
+            .unwrap_or_default()
     }
 
     /// The `[providers.history]` table from the last acceptance, or the
@@ -1355,7 +1384,19 @@ pub(crate) fn build_workspace_candidate(
     let change_set = request.change_set(root, &configuration);
     let candidate = match &change_set {
         ChangeSet::Full => {
-            whole_workspace_candidate(root, limits, configuration, request.epoch, dependencies)?
+            let sharing = request.previous.as_deref().filter(|previous| {
+                !previous
+                    .configuration
+                    .index_configuration_differs(&configuration)
+            });
+            whole_workspace_candidate(
+                root,
+                limits,
+                configuration,
+                request.epoch,
+                dependencies,
+                sharing,
+            )?
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1376,15 +1417,16 @@ pub(crate) fn build_workspace_candidate(
 
 /// What one candidate owes the lexical index before it publishes.
 ///
-/// A whole rebuild cannot name the difference against the stored set, so it replaces that
-/// set; a change set names exactly the paths whose rows move. Deriving the units is the
-/// candidate's own work, so it runs beside the parse rather than inside the commit.
+/// A change set names exactly the paths whose rows move, and deriving their units is the
+/// candidate's own work, so it runs beside the parse rather than inside the commit. A whole
+/// rebuild names no difference: the lane compares every file the publication holds with the
+/// digests the store recorded, and derives units only for the files that differ.
 pub(crate) fn lexical_write(
     published: &PublishedWorkspace,
     change_set: &ChangeSet,
 ) -> LexicalWrite {
     match change_set {
-        ChangeSet::Full => LexicalWrite::Whole(published.reads.index_documents()),
+        ChangeSet::Full => LexicalWrite::Whole,
         ChangeSet::Incremental(changes) => {
             LexicalWrite::Change(published.reads.lexical_change(changes))
         }
@@ -1394,27 +1436,40 @@ pub(crate) fn lexical_write(
 /// Scans every visible file, taking the `[source]` policy `reads` already compiled
 /// rather than compiling a second one - one predicate per snapshot, one walk of the
 /// tree's `.gitignore` files instead of two.
+///
+/// A publication in `sharing` was built under the same index-owned configuration, so every
+/// file whose bytes it already parsed is shared rather than parsed again: a folder event or
+/// an ignore-file write costs a walk, a read, and a digest of the tree, and a parse of the
+/// files that moved.
 fn whole_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
     dependencies: &Arc<PackageBranch>,
+    sharing: Option<&PublishedWorkspace>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let dependencies_configuration = configuration.dependencies_configuration();
-    let reads = ReadService::build_with_languages(
-        root,
-        limits,
-        &visibility,
-        &text_inclusion,
-        &languages,
-        configuration.history_configuration(),
-        dependencies_configuration,
-    )?
+    let reads = match sharing {
+        Some(previous) => {
+            previous
+                .reads
+                .rescanned(root, &visibility, &text_inclusion, &languages)?
+        }
+        None => ReadService::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+            configuration.history_configuration(),
+            dependencies_configuration,
+        )?,
+    }
     .with_packages(Arc::clone(dependencies));
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
@@ -1530,13 +1585,12 @@ pub(crate) const LEXICAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const LEXICAL_UNIT_COMMIT_BUDGET: Duration = Duration::from_millis(1);
 /// The longest deadline any one lexical transaction gets, whatever its unit count.
 pub(crate) const LEXICAL_COMMIT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
-/// Writes the lane holds behind the one it is running. A write handed to a full lane
-/// supersedes every held one, and the store is then owed a whole replace.
-pub(crate) const LEXICAL_COMMITS_MAX: usize = 4;
-/// What the store is owed a whole replace for when a write handed to a full lane dropped
-/// the held ones, as a search's warning renders it.
-const SUPERSEDED_CAUSE: &str = "a write handed to a full lexical lane superseded the held ones, whose rows never reached \
-     the store";
+/// Paths one held write names before it compares the whole publication instead: past
+/// it, reading every recorded digest costs less than deriving each named path.
+pub(crate) const LEXICAL_HELD_PATHS_MAX: usize = 65_536;
+/// Tree revisions one held write answers for, the newest kept. A revision past it reads as
+/// settled, and a request that captured it recaptures the publication the store holds.
+pub(crate) const LEXICAL_HELD_REVISIONS_MAX: usize = 64;
 
 /// The deadline one transaction writing `unit_count` units gets: at least
 /// [`LEXICAL_COMMIT_TIMEOUT`], one [`LEXICAL_UNIT_COMMIT_BUDGET`] per unit when that is
@@ -1549,13 +1603,38 @@ pub(crate) fn commit_deadline(unit_count: usize) -> Duration {
         .clamp(LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX)
 }
 
+/// What besides a file's bytes decides the lexical rows one publication derives: the
+/// executable that derives them, the corpus shape they are written in, and the index-owned
+/// configuration.
+///
+/// The store keeps rows only under the value it stamped them with, so a new binary, a
+/// changed tokenizer or field set, or an edited index-owned table reloads the store once
+/// instead of trusting rows another derivation wrote. The executable's own digest is what
+/// covers derivation code no manifest names.
+pub(crate) fn derivation_revision(
+    executable_digest: &str,
+    configuration: &ConfigurationState,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(executable_digest.as_bytes());
+    hasher.update([0]);
+    hasher.update(rift_ranking::CorpusRevision::current().as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(configuration.index_configuration_digest().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// What one lexical commit writes.
 #[derive(Debug)]
 pub(crate) enum LexicalWrite {
-    /// The whole unit set, replacing whatever is stored.
-    Whole(Vec<IndexDocument>),
-    /// Only the units one change set names.
+    /// Every file the publication holds, compared with the digests the store recorded:
+    /// only a file whose digest differs, or that one side lacks, is written.
+    Whole,
+    /// The units one change set names, derived beside the parse.
     Change(LexicalChange),
+    /// The paths several writes named, derived from the newest of their publications when
+    /// the lane runs them.
+    Paths(BTreeSet<ProjectPath>),
 }
 
 impl LexicalWrite {
@@ -1566,73 +1645,70 @@ impl LexicalWrite {
     /// stamp already names the tree revision the candidate answers under.
     pub(crate) fn is_empty(&self) -> bool {
         match self {
-            Self::Whole(_) => false,
+            Self::Whole => false,
             Self::Change(change) => change.is_empty(),
-        }
-    }
-
-    /// How many units this write moves: every unit a whole replace inserts, or every path
-    /// a change replaces beside every unit it inserts.
-    pub(crate) fn unit_count(&self) -> usize {
-        match self {
-            Self::Whole(units) => units.len(),
-            Self::Change(change) => change
-                .replaced()
-                .len()
-                .saturating_add(change.inserted().len()),
+            Self::Paths(paths) => paths.is_empty(),
         }
     }
 
     /// The write's form, as a record names it.
     const fn form(&self) -> &'static str {
         match self {
-            Self::Whole(_) => "whole",
+            Self::Whole => "whole",
             Self::Change(_) => "change",
+            Self::Paths(_) => "paths",
         }
     }
 
-    /// The write without every unit whose `content` exceeds `unit_bytes_max`, beside the
-    /// units left out.
+    /// This write and a newer one as one write.
     ///
-    /// The store refuses a whole batch over one oversized unit, and a publication cannot
-    /// wait on an operator raising a bound the configuration does not expose. The unit is
-    /// left out of the lexical index instead: its file stays in the syntax index and keeps
-    /// answering `get_symbol` and symbol search, and only its text ranking is absent. A
-    /// change set keeps every replaced path, so the stored units of a file whose one unit
-    /// grew past the bound are still deleted.
-    fn within_unit_bound(self, unit_bytes_max: usize) -> (Self, Vec<IndexDocument>) {
-        let mut left_out = Vec::new();
-        let mut within = |unit: IndexDocument| {
-            if unit.content().len() > unit_bytes_max {
-                left_out.push(unit);
-                None
-            } else {
-                Some(unit)
-            }
+    /// A change replaces whole paths and writing it twice leaves what writing it once left,
+    /// so the union of two writes' paths, derived from the newer publication, leaves the
+    /// store exactly as running both in order would. A whole write on either side stays
+    /// whole, and a union past [`LEXICAL_HELD_PATHS_MAX`] becomes one.
+    fn merged_with(self, newer: Self) -> Self {
+        let (Some(mut paths), Some(newer)) = (self.named_paths(), newer.named_paths()) else {
+            return Self::Whole;
         };
-        let kept = match self {
-            Self::Whole(units) => Self::Whole(units.into_iter().filter_map(&mut within).collect()),
-            Self::Change(change) => {
-                let (replaced, inserted) = change.into_parts();
-                let inserted = inserted.into_iter().filter_map(&mut within).collect();
-                Self::Change(LexicalChange::new(replaced, inserted))
-            }
-        };
-        (kept, left_out)
+        paths.extend(newer);
+        if paths.len() > LEXICAL_HELD_PATHS_MAX {
+            return Self::Whole;
+        }
+        Self::Paths(paths)
     }
 
-    /// Runs this write against `store` as one transaction stamping `tree_revision`.
-    async fn commit_to<Store: LexicalStore>(
-        &self,
-        store: &Store,
-        tree_revision: &str,
-        documentation: &rift_index::DocumentationCollection,
-    ) -> Result<(), SearchError> {
+    /// The paths this write names, or nothing for a whole write.
+    fn named_paths(self) -> Option<BTreeSet<ProjectPath>> {
         match self {
-            Self::Whole(units) => store.replace(units, tree_revision, documentation).await,
-            Self::Change(change) => store.apply(change, tree_revision, documentation).await,
+            Self::Whole => None,
+            Self::Change(change) => Some(change.replaced().iter().cloned().collect()),
+            Self::Paths(paths) => Some(paths),
         }
     }
+}
+
+/// `change` without every unit whose `content` exceeds `unit_bytes_max`, beside the units
+/// left out.
+///
+/// The store refuses a whole batch over one oversized unit, and a publication cannot wait
+/// on an operator raising a bound the configuration does not expose. The unit is left out
+/// of the lexical index instead: its file stays in the syntax index and keeps answering
+/// `get_symbol` and symbol search, and only its text ranking is absent. The change keeps
+/// every replaced path and recorded digest, so the stored units of a file whose one unit
+/// grew past the bound are still deleted, and the file is not derived again until its
+/// bytes change.
+fn within_unit_bound(
+    change: LexicalChange,
+    unit_bytes_max: usize,
+) -> (LexicalChange, Vec<IndexDocument>) {
+    let (replaced, inserted, recorded) = change.into_parts();
+    let (kept, left_out) = inserted
+        .into_iter()
+        .partition(|unit| unit.content().len() <= unit_bytes_max);
+    (
+        LexicalChange::new(replaced, kept).with_recorded(recorded),
+        left_out,
+    )
 }
 
 /// Records each unit one commit left out of the lexical index, once per build, in the
@@ -1653,41 +1729,81 @@ fn record_units_left_out(left_out: &[IndexDocument], unit_bytes_max: usize) {
 
 /// The store one lexical lane writes: the workspace search index, or a test's stand-in.
 pub(crate) trait LexicalStore: Send + Sync + 'static {
-    /// Replaces the stored unit set with `units` and stamps `tree_revision`, in one
-    /// transaction.
-    fn replace(
+    /// The content digest each stored file's rows were derived from under
+    /// `derivation_revision`, or `None` when no stored row can be kept.
+    fn recorded(
         &self,
-        units: &[IndexDocument],
-        tree_revision: &str,
-        documentation: &rift_index::DocumentationCollection,
+        derivation_revision: &str,
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send;
+
+    /// Deletes every row and recorded digest, and stamps no publication under
+    /// `derivation_revision`.
+    fn clear(
+        &self,
+        derivation_revision: &str,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
 
-    /// Applies `change` and stamps `tree_revision`, in one transaction.
+    /// Applies `change` and stamps `stamp` in one transaction, replacing the documentation
+    /// metadata with `documentation` when one is given and keeping it otherwise.
     fn apply(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
-        documentation: &rift_index::DocumentationCollection,
+        stamp: &LexicalStamp,
+        documentation: Option<&rift_index::DocumentationCollection>,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
 }
 
 impl LexicalStore for SearchIndex {
-    fn replace(
+    fn recorded(
         &self,
-        units: &[IndexDocument],
-        tree_revision: &str,
-        documentation: &rift_index::DocumentationCollection,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send {
-        self.replace_lexical_with_documentation(units, tree_revision, documentation)
+        derivation_revision: &str,
+    ) -> impl Future<Output = Result<Option<WorkspaceDigests>, SearchError>> + Send {
+        self.recorded_lexical_files(derivation_revision)
     }
 
-    fn apply(
+    fn clear(
+        &self,
+        derivation_revision: &str,
+    ) -> impl Future<Output = Result<(), SearchError>> + Send {
+        self.clear_lexical(derivation_revision)
+    }
+
+    async fn apply(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
-        documentation: &rift_index::DocumentationCollection,
-    ) -> impl Future<Output = Result<(), SearchError>> + Send {
-        self.apply_lexical_with_documentation(change, tree_revision, documentation)
+        stamp: &LexicalStamp,
+        documentation: Option<&rift_index::DocumentationCollection>,
+    ) -> Result<(), SearchError> {
+        match documentation {
+            Some(documentation) => {
+                self.apply_lexical_with_documentation(change, stamp, documentation)
+                    .await
+            }
+            None => self.apply_lexical(change, stamp).await,
+        }
+    }
+}
+
+/// The bounds one lexical lane writes under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
+pub(crate) struct LexicalLaneBounds {
+    /// Content bytes one unit may carry before it is left out.
+    pub(crate) unit_bytes_max: usize,
+    /// Units one transaction writes, at most, whole files kept together.
+    pub(crate) transaction_units_max: usize,
+    /// Content bytes one transaction writes, at most, whole files kept together.
+    pub(crate) transaction_bytes_max: usize,
+}
+
+impl LexicalLaneBounds {
+    /// The bounds the lexical store's own limits name.
+    pub(crate) fn of(limits: rift_index::LexicalIndexLimits) -> Self {
+        Self {
+            unit_bytes_max: usize::try_from(limits.unit_bytes_max()).unwrap_or(usize::MAX),
+            transaction_units_max: limits.transaction_units_max(),
+            transaction_bytes_max: limits.transaction_bytes_max(),
+        }
     }
 }
 
@@ -1695,28 +1811,56 @@ impl LexicalStore for SearchIndex {
 #[derive(Debug)]
 struct LexicalCommit {
     write: LexicalWrite,
-    /// The publication the write answers for. It names the tree revision the transaction
-    /// stamps, and derives the whole unit set when the store is owed one.
+    /// The publication the write answers for. It names the tree revision the last
+    /// transaction stamps, and derives the units the store is owed.
     published: Arc<PublishedWorkspace>,
+    /// Every tree revision this write answers for once it lands, oldest first: its own,
+    /// and those of the writes merged into it, at most [`LEXICAL_HELD_REVISIONS_MAX`].
+    answers: VecDeque<String>,
 }
 
 impl LexicalCommit {
-    fn tree_revision(&self) -> &str {
-        self.published.reads.tree_revision()
+    fn new(write: LexicalWrite, published: Arc<PublishedWorkspace>) -> Self {
+        let answers = VecDeque::from([published.reads.tree_revision().to_owned()]);
+        Self {
+            write,
+            published,
+            answers,
+        }
+    }
+
+    /// This write and a newer one as one write answering for both, beside the older
+    /// publication the merge no longer needs.
+    fn merged_with(self, newer: Self) -> (Self, Arc<PublishedWorkspace>) {
+        let mut answers = self.answers;
+        answers.extend(newer.answers);
+        let past = answers.len().saturating_sub(LEXICAL_HELD_REVISIONS_MAX);
+        answers.drain(..past);
+        let merged = Self {
+            write: self.write.merged_with(newer.write),
+            published: newer.published,
+            answers,
+        };
+        (merged, self.published)
+    }
+
+    fn answers_for(&self, tree_revision: &str) -> bool {
+        self.answers
+            .iter()
+            .any(|answered| answered == tree_revision)
     }
 }
 
 /// Where one tree revision stands with the lexical lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LexicalCommitState {
-    /// The write for it is held or running: the store holds it once that transaction
-    /// ends.
+    /// The write for it is held or running: the store holds it once that write lands.
     Committing,
     /// No write for it is held or running, and the store missed a commit for the reason
-    /// `cause` renders: the next publication's transaction replaces the whole unit set.
+    /// `cause` renders: the next write compares every file the publication holds with
+    /// the digests the store recorded.
     Owed {
-        /// The refused transaction's own rendering, or the supersession that dropped the
-        /// held writes.
+        /// The refused transaction's own rendering.
         cause: String,
     },
     /// No write for it is held or running, and nothing is owed: the store holds it, or has
@@ -1727,65 +1871,57 @@ pub(crate) enum LexicalCommitState {
 /// What the lane has been handed and not yet run, and what the store is owed.
 #[derive(Debug, Default)]
 struct LexicalBacklog {
-    /// Writes waiting behind the running one, oldest first, at most
-    /// [`LEXICAL_COMMITS_MAX`].
-    held: VecDeque<LexicalCommit>,
-    /// The tree revision whose transaction is running, while one is.
-    running: Option<String>,
-    /// Why the store missed a commit, while it has: a write superseded before it ran, or
-    /// a transaction that failed. The next transaction then replaces the whole unit set.
+    /// The write waiting behind the running one. A write handed while one waits merges
+    /// into it, so the lane holds one write however long the running one takes.
+    held: Option<LexicalCommit>,
+    /// The tree revisions the running write answers for, while one runs.
+    running: Vec<String>,
+    /// Why the store missed a commit, while it has. The next write then compares every file
+    /// its publication holds with the digests the store recorded.
     whole_owed: Option<String>,
     /// Whether the lane's task has ended, so a later write has no one to run it.
     ended: bool,
 }
 
 impl LexicalBacklog {
-    /// Holds `commit` for the task, superseding what a newer write makes moot.
-    ///
-    /// A full backlog is a store that cannot keep up: every held write is dropped for the
-    /// new one, and the store is then owed a whole replace, because the dropped changes'
-    /// rows never reach it. While a whole replace is owed only the newest held write
-    /// matters, since its publication is the one the replace derives from. Returns how
-    /// many held writes were dropped.
-    fn hand(&mut self, commit: LexicalCommit) -> usize {
-        if self.held.len() >= LEXICAL_COMMITS_MAX {
-            self.whole_owed = Some(SUPERSEDED_CAUSE.to_owned());
-        }
-        self.held.push_back(commit);
-        if self.whole_owed.is_none() {
-            return 0;
-        }
-        let dropped = self.held.len().saturating_sub(1);
-        self.held.drain(..dropped);
-        dropped
+    /// Holds `commit` for the task, merging it into the held write when there is one, and
+    /// returns the publication the merge released.
+    fn hand(&mut self, commit: LexicalCommit) -> Option<Arc<PublishedWorkspace>> {
+        let Some(held) = self.held.take() else {
+            self.held = Some(commit);
+            return None;
+        };
+        let (merged, released) = held.merged_with(commit);
+        self.held = Some(merged);
+        Some(released)
     }
 
-    /// Takes the oldest held write for the task, with whether a whole replace is owed.
-    /// The owed replace becomes that transaction's responsibility: a failure hands it
-    /// back through [`Self::owe_whole`].
+    /// Takes the held write for the task, with whether a whole comparison is owed. The owed
+    /// comparison becomes that write's responsibility: a failure hands it back through
+    /// [`Self::owe_whole`].
     fn take_next(&mut self) -> Option<(LexicalCommit, bool)> {
-        let commit = self.held.pop_front()?;
+        let commit = self.held.take()?;
         let whole_owed = self.whole_owed.take().is_some();
-        self.running = Some(commit.tree_revision().to_owned());
+        self.running = commit.answers.iter().cloned().collect();
         Some((commit, whole_owed))
     }
 
     /// Records that the store missed a commit for the reason `cause` renders, so the next
-    /// transaction replaces the whole unit set and only the newest held write still
-    /// matters.
+    /// write compares its whole publication with what the store recorded.
     fn owe_whole(&mut self, cause: String) {
         self.whole_owed = Some(cause);
-        let dropped = self.held.len().saturating_sub(1);
-        self.held.drain(..dropped);
     }
 
     /// Where `tree_revision` stands: held or running, missed, or settled.
     fn state_of(&self, tree_revision: &str) -> LexicalCommitState {
-        let running = self.running.as_deref() == Some(tree_revision);
+        let running = self
+            .running
+            .iter()
+            .any(|answered| answered == tree_revision);
         let held = self
             .held
-            .iter()
-            .any(|commit| commit.tree_revision() == tree_revision);
+            .as_ref()
+            .is_some_and(|commit| commit.answers_for(tree_revision));
         if running || held {
             return LexicalCommitState::Committing;
         }
@@ -1804,8 +1940,8 @@ struct LexicalQueue {
     backlog: SyncMutex<LexicalBacklog>,
     /// Wakes the task when a write lands.
     handed: Notify,
-    /// Wakes every waiter when a commit lands: a transaction ended, success or failure,
-    /// or a write handed to a full lane superseded the held ones. Each moves some tree
+    /// Wakes every waiter when a commit lands: a write ended, success or failure, or a
+    /// merge moved the revisions a held write answers for. Each can move some tree
     /// revision out of `Committing`, which is what a waiter reads again.
     landed: Notify,
 }
@@ -1821,22 +1957,27 @@ impl LexicalQueue {
 /// The lexical lane: one long-lived task owning every write to the lexical index, and the
 /// handle a publication hands its write to.
 ///
-/// A publication hands its write over and returns. The lane runs the writes in the order
-/// they were handed, which is publication order, one transaction at a time: `SQLite`
-/// would otherwise meet two rebuilds' writes as contention rather than as an order. A
-/// request that captures a publication before its transaction lands waits for the
+/// A publication hands its write over and returns. The lane runs one write at a time:
+/// `SQLite` would otherwise meet two rebuilds' writes as contention rather than as an
+/// order. A request that captures a publication before its write lands waits for the
 /// landing under `[server] readiness_timeout`, and answers from identifier matching,
 /// saying so, only once that budget runs out.
 ///
-/// The lane is bounded by [`LEXICAL_COMMITS_MAX`] held writes. A write handed to a full
-/// lane supersedes every held one, and a transaction that fails or is superseded leaves
-/// the store owing a whole replace, which the next transaction pays from its
-/// publication's whole unit set rather than applying a change on top of rows the store
-/// missed.
+/// The lane holds one write behind the running one. A write handed while one waits merges
+/// into it: the population lane coalesces the same way, running the newest publication
+/// rather than a backlog of superseded ones, and a merged write answers for every revision
+/// it absorbed. A burst of publications therefore costs one write per lane turn however
+/// long it runs, and a missed commit costs a comparison of every file with the digests
+/// the store recorded, never a rewrite of every row.
 ///
-/// Vector embedding never rides this lane: a lexical row costs one delete and one insert
-/// batch, while embedding one declaration can run for longer than the freshness wait a
-/// request is bounded by.
+/// Every write runs in parts of at most [`LexicalLaneBounds::transaction_units_max`] units
+/// and [`LexicalLaneBounds::transaction_bytes_max`] bytes. Every part but the last stamps
+/// no publication, so a reader meets no tree rather than a mix of two, and a stop aborts
+/// one part rather than a write of every row.
+///
+/// Vector embedding never rides this lane: a lexical row costs one delete and one insert,
+/// while embedding one declaration can run for longer than the freshness wait a request
+/// is bounded by.
 #[derive(Clone, Debug)]
 pub(crate) struct LexicalLane {
     queue: Arc<LexicalQueue>,
@@ -1844,7 +1985,8 @@ pub(crate) struct LexicalLane {
 
 impl LexicalLane {
     /// Spawns the lane's task over `index` and returns the handle a publication hands its
-    /// write to.
+    /// write to. `executable_digest` names the binary deriving the rows, which the
+    /// derivation revision the store stamps covers.
     ///
     /// The task ends when the server does, racing the same cancellation token the index
     /// supervisor runs under. A write handed over after that is dropped with a debug line:
@@ -1853,27 +1995,29 @@ impl LexicalLane {
         index: Arc<SearchIndex>,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
+        executable_digest: Arc<str>,
     ) -> Self {
-        let unit_bytes_max =
-            usize::try_from(index.lexical_limits().unit_bytes_max()).unwrap_or(usize::MAX);
-        Self::spawn_over(index, unit_bytes_max, blocking, cancellation)
+        let bounds = LexicalLaneBounds::of(index.lexical_limits());
+        Self::spawn_over(index, bounds, blocking, cancellation, executable_digest)
     }
 
-    /// Spawns the lane's task over any [`LexicalStore`] whose per-unit content bound is
-    /// `unit_bytes_max`. Whole unit sets the lane derives itself run on `blocking`.
+    /// Spawns the lane's task over any [`LexicalStore`], writing under `bounds`. Units the
+    /// lane derives itself are derived on `blocking`.
     pub(crate) fn spawn_over<Store: LexicalStore>(
         store: Arc<Store>,
-        unit_bytes_max: usize,
+        bounds: LexicalLaneBounds,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
+        executable_digest: Arc<str>,
     ) -> Self {
         let queue = Arc::new(LexicalQueue::default());
         let task = LexicalTask {
             store,
             blocking,
             queue: Arc::clone(&queue),
-            unit_bytes_max,
+            bounds,
             cancellation,
+            executable_digest,
         };
         tokio::spawn(task.run());
         Self { queue }
@@ -1882,11 +2026,10 @@ impl LexicalLane {
     /// Hands `write` to the lane for `published` and returns, never awaiting the
     /// transaction.
     ///
-    /// A write that changes nothing is dropped unless the store is owed a whole replace:
-    /// the stored stamp already names the tree revision `published` answers under. A
-    /// write handed to a full lane supersedes every held one, and the record says so;
-    /// the superseded revisions are owed from then on, so the waiters on
-    /// [`Self::landed`] are woken to read that.
+    /// A write that changes nothing is dropped unless the store is owed a comparison: the
+    /// stored stamp already names the tree revision `published` answers under. A write
+    /// handed while another waits merges into it, and the waiters on [`Self::landed`] are
+    /// woken to read the revisions the merged write answers for.
     pub(crate) fn request(&self, write: LexicalWrite, published: Arc<PublishedWorkspace>) {
         let tree_revision = published.reads.tree_revision().to_owned();
         let mut backlog = self.queue.locked();
@@ -1903,19 +2046,18 @@ impl LexicalLane {
         if write.is_empty() && backlog.whole_owed.is_none() {
             return;
         }
-        let superseded = backlog.hand(LexicalCommit { write, published });
+        let released = backlog.hand(LexicalCommit::new(write, published));
         drop(backlog);
-        if superseded > 0 {
-            tracing::warn!(
+        if released.is_some() {
+            tracing::debug!(
                 component = "search",
                 operation = "search.commit",
                 tree_revision,
-                superseded,
-                "the lexical lane was handed a write it had no room for, so the held writes \
-                 are superseded and the next transaction replaces the whole unit set"
+                "the lexical lane merged this write into the one it holds"
             );
             self.queue.landed.notify_waiters();
         }
+        drop(released);
         self.queue.handed.notify_one();
     }
 
@@ -1925,8 +2067,8 @@ impl LexicalLane {
         self.queue.locked().state_of(tree_revision)
     }
 
-    /// A wake-up for the lane's next landing: a transaction's end, success or failure, or
-    /// a write superseding the held ones.
+    /// A wake-up for the lane's next landing: a write's end, success or failure, or a
+    /// merge into the held write.
     ///
     /// Created before [`Self::commit_state`] is read, it cannot miss a landing between
     /// that read and its await: tokio's `Notified` "is guaranteed to receive wakeups
@@ -1942,7 +2084,7 @@ impl LexicalLane {
         self.queue.locked().ended
     }
 
-    /// Whether the store is owed a whole replace right now.
+    /// Whether the store is owed a whole comparison right now.
     #[cfg(test)]
     pub(crate) fn owes_whole(&self) -> bool {
         self.queue.locked().whole_owed.is_some()
@@ -1969,24 +2111,25 @@ impl LexicalHandoff {
     }
 }
 
-/// The lane's task: takes each held write in order and runs it as one transaction.
+/// The lane's task: takes each held write in order and runs it.
 struct LexicalTask<Store> {
     store: Arc<Store>,
     blocking: BlockingExecutor,
     queue: Arc<LexicalQueue>,
-    unit_bytes_max: usize,
+    bounds: LexicalLaneBounds,
     cancellation: CancellationToken,
+    executable_digest: Arc<str>,
 }
 
 impl<Store: LexicalStore> LexicalTask<Store> {
     /// Runs held writes until the token is cancelled, then marks the lane ended. Every
-    /// transaction's end, success or failure, wakes the waiters on
-    /// [`LexicalLane::landed`] once the backlog records it.
+    /// write's end, success or failure, wakes the waiters on [`LexicalLane::landed`] once
+    /// the backlog records it.
     async fn run(self) {
         while let Some((commit, whole_owed)) = self.next_commit().await {
             let outcome = self.transaction(commit, whole_owed).await;
             let mut backlog = self.queue.locked();
-            backlog.running = None;
+            backlog.running.clear();
             if let Err(error) = outcome {
                 backlog.owe_whole(error.to_string());
             }
@@ -2012,59 +2155,148 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         }
     }
 
-    /// Runs one write as one transaction, under the deadline its unit count derives.
+    /// Runs one write: derives the change it owes, then commits it in parts, the last one
+    /// stamping the publication and writing its documentation metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the change could not be derived, when a part failed in
+    /// the store, when its task ended without an answer, or when the lane was cancelled
+    /// while it ran. Every one leaves the store owing a whole comparison.
+    ///
+    /// # Cancel safety
+    ///
+    /// The lane's token cancels the part running, never the other way round: the lane
+    /// aborts the part's task and waits for the abort to land before it answers. The abort
+    /// drops the store's future, and with it the write turn it holds and the driver's
+    /// `Transaction`, whose drop sends `ROLLBACK` to its connection's task without waiting
+    /// for it (`toasty::db::Transaction`: "If dropped without calling commit or rollback,
+    /// the transaction is automatically rolled back"). The connection runs the rollback
+    /// after the statement it is executing, so the write turn frees within one statement's
+    /// time. The parts already committed stay: each recorded its paths' digests with their
+    /// rows and stamped no publication, so the next start's comparison
+    /// (`RebuildRequest::initial` publishes a whole write) writes only the paths the
+    /// interrupted write did not reach.
+    async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
+        let LexicalCommit {
+            write, published, ..
+        } = commit;
+        let tree_revision = published.reads.tree_revision().to_owned();
+        let derivation = derivation_revision(&self.executable_digest, &published.configuration);
+        let documentation = published.reads.documentation_snapshot();
+        let write = if whole_owed {
+            LexicalWrite::Whole
+        } else {
+            write
+        };
+        let form = write.form();
+        let change = self
+            .derived(write, published, &derivation)
+            .await
+            .inspect_err(|error| record_commit_failure(&tree_revision, form, error))?;
+        let (change, left_out) = within_unit_bound(change, self.bounds.unit_bytes_max);
+        record_units_left_out(&left_out, self.bounds.unit_bytes_max);
+        // A source selection or resolved reference can change metadata without changing
+        // lexical documents, so the last part stamps and writes metadata even when empty.
+        let parts = change.into_parts_within(
+            self.bounds.transaction_units_max,
+            self.bounds.transaction_bytes_max,
+        );
+        let last = parts.len().saturating_sub(1);
+        for (index, part) in parts.into_iter().enumerate() {
+            let closing = index == last;
+            let stamp = if closing {
+                LexicalStamp::published(&tree_revision, &derivation)
+            } else {
+                LexicalStamp::unpublished(&derivation)
+            };
+            let documentation = closing.then(|| Arc::clone(&documentation));
+            self.part(part, stamp, documentation, &tree_revision, form)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The change `write` owes the store for `published`.
+    ///
+    /// A change set's units were derived beside the parse. Merged paths are derived again
+    /// from the newest publication, on the worker pool. A whole write reads the digests the
+    /// store recorded under `derivation_revision` and compares every file `published` holds
+    /// with them, so only a file whose bytes moved, or that one side lacks, is derived; a
+    /// store holding rows another derivation wrote is cleared first, and every file then
+    /// reads as added.
+    async fn derived(
+        &self,
+        write: LexicalWrite,
+        published: Arc<PublishedWorkspace>,
+        derivation_revision: &str,
+    ) -> Result<LexicalChange, ReadError> {
+        match write {
+            LexicalWrite::Change(change) => {
+                // The prepared write owns its units. Release the publication on the
+                // blocking pool before SQL waits, without blocking the lane on its Drop.
+                drop(tokio::task::spawn_blocking(move || drop(published)));
+                Ok(change)
+            }
+            LexicalWrite::Paths(paths) => {
+                self.blocking
+                    .run("lexical unit derivation", move || {
+                        Ok(published.reads.lexical_change_for(&paths))
+                    })
+                    .await
+            }
+            LexicalWrite::Whole => {
+                let recorded = self.recorded_or_cleared(derivation_revision).await?;
+                self.blocking
+                    .run("lexical unit derivation", move || {
+                        let current = published.reads.content_digests();
+                        let changes = PathChanges::between(&recorded, &current);
+                        Ok(published.reads.lexical_change(&changes))
+                    })
+                    .await
+            }
+        }
+    }
+
+    /// The digests the store recorded under `derivation_revision`, or none once a store
+    /// holding rows another derivation wrote has been cleared.
+    async fn recorded_or_cleared(
+        &self,
+        derivation_revision: &str,
+    ) -> Result<WorkspaceDigests, ReadError> {
+        let store = Arc::clone(&self.store);
+        let derivation = derivation_revision.to_owned();
+        let running = tokio::spawn(async move {
+            if let Some(recorded) = store.recorded(&derivation).await? {
+                return Ok(recorded);
+            }
+            store.clear(&derivation).await?;
+            Ok(WorkspaceDigests::default())
+        });
+        self.store_answer(running).await
+    }
+
+    /// Runs one part as one transaction, under the deadline its unit count derives.
     ///
     /// The transaction runs on its own task: the store executes its statements inline,
     /// so the lane's own task could not observe the deadline while running them. The lane
     /// keeps waiting past the deadline - it records the delay and lets the transaction
     /// end - because a second transaction would only queue behind this one on the
     /// database's write turn.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when the whole set could not be derived, when the transaction
-    /// failed in the store, when its task ended without an answer, or when the lane was
-    /// cancelled while it ran. Every one leaves the store owing a whole replace.
-    ///
-    /// # Cancel safety
-    ///
-    /// The lane's token cancels the transaction, never the other way round: the lane
-    /// aborts the transaction's task and waits for the abort to land before it answers.
-    /// The abort drops the store's future, and with it the write turn it holds and the
-    /// driver's `Transaction`, whose drop sends `ROLLBACK` to its connection's task
-    /// without waiting for it (`toasty::db::Transaction`: "If dropped without calling
-    /// commit or rollback, the transaction is automatically rolled back"). The connection
-    /// runs the rollback after the statement it is executing, so the write turn frees
-    /// within one statement's time. A rolled-back whole replace leaves the store stamped
-    /// with the previous tree revision; the next start's rebuild carries no previous
-    /// publication (`RebuildRequest::initial`), so `RebuildRequest::change_set` answers
-    /// `ChangeSet::Full` and `lexical_write` derives a whole replace from it: the first
-    /// commit after a restart replaces the whole unit set.
-    async fn transaction(&self, commit: LexicalCommit, whole_owed: bool) -> Result<(), ReadError> {
-        let LexicalCommit { write, published } = commit;
-        let tree_revision = published.reads.tree_revision().to_owned();
-        let documentation = published.reads.documentation_snapshot();
-        let write = match (whole_owed, write) {
-            (true, LexicalWrite::Change(_)) => self.whole_set(published).await?,
-            (_, write) => {
-                // The prepared write owns its units. Release the old publication on the
-                // blocking pool before SQL waits, without blocking the lane on its Drop.
-                drop(tokio::task::spawn_blocking(move || drop(published)));
-                write
-            }
-        };
-        let (write, left_out) = write.within_unit_bound(self.unit_bytes_max);
-        record_units_left_out(&left_out, self.unit_bytes_max);
-        // A source selection or resolved reference can change metadata without changing
-        // lexical documents. Commit the revision and metadata even for an empty delta.
-        let deadline = commit_deadline(write.unit_count());
-        let form = write.form();
+    async fn part(
+        &self,
+        part: LexicalChange,
+        stamp: LexicalStamp,
+        documentation: Option<Arc<rift_index::DocumentationCollection>>,
+        tree_revision: &str,
+        form: &'static str,
+    ) -> Result<(), ReadError> {
+        let deadline = commit_deadline(part.replaced().len().saturating_add(part.inserted().len()));
         let store = Arc::clone(&self.store);
-        let stamped = tree_revision.clone();
         let mut running =
-            tokio::spawn(async move { write.commit_to(&*store, &stamped, &documentation).await });
+            tokio::spawn(async move { store.apply(&part, &stamp, documentation.as_deref()).await });
         let ended = tokio::select! {
-            ended = wait_for_transaction(&mut running, &tree_revision, form, deadline) => ended,
+            ended = wait_for_transaction(&mut running, tree_revision, form, deadline) => ended,
             () = self.cancellation.cancelled() => {
                 abort_transaction(running).await;
                 return Err(lexical_unavailable("the lexical lane ended while the transaction ran"));
@@ -2075,22 +2307,27 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             Ok(Err(error)) => ReadFault::unavailable("lexical index commit", error.detail()),
             Err(_) => lexical_unavailable("the lexical transaction's task ended without an answer"),
         };
-        record_commit_failure(&tree_revision, form, &outcome);
+        record_commit_failure(tree_revision, form, &outcome);
         Err(outcome)
     }
 
-    /// The whole unit set `published` derives, on the worker pool.
-    async fn whole_set(
+    /// Waits for one store call running on its own task, aborting it when the lane's token
+    /// is cancelled first.
+    async fn store_answer<T: Send + 'static>(
         &self,
-        published: Arc<PublishedWorkspace>,
-    ) -> Result<LexicalWrite, ReadError> {
-        let tree_revision = published.reads.tree_revision().to_owned();
-        self.blocking
-            .run("lexical unit derivation", move || {
-                Ok(LexicalWrite::Whole(published.reads.index_documents()))
-            })
-            .await
-            .inspect_err(|error| record_commit_failure(&tree_revision, "whole", error))
+        mut running: JoinHandle<Result<T, SearchError>>,
+    ) -> Result<T, ReadError> {
+        tokio::select! {
+            ended = &mut running => match ended {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(error)) => Err(ReadFault::unavailable("lexical index commit", error.detail())),
+                Err(_) => Err(lexical_unavailable("the lexical store's task ended without an answer")),
+            },
+            () = self.cancellation.cancelled() => {
+                abort_transaction(running).await;
+                Err(lexical_unavailable("the lexical lane ended while the store ran"))
+            }
+        }
     }
 }
 
@@ -2110,13 +2347,13 @@ async fn wait_for_transaction(
     }
 }
 
-/// Aborts a running transaction's task and waits for the abort to land, so the future
+/// Aborts a running store call's task and waits for the abort to land, so the future
 /// holding the store's transaction and the write turn is dropped before the lane goes on.
 ///
-/// The join answers with the abort, or with the outcome of a transaction that ended
-/// before the abort reached it. The lane is ending either way and the next start replaces
-/// the whole unit set, so neither answer changes what it does.
-async fn abort_transaction(running: JoinHandle<Result<(), SearchError>>) {
+/// The join answers with the abort, or with the outcome of a call that ended before the
+/// abort reached it. The lane is ending either way and the next start compares what the
+/// store recorded, so neither answer changes what it does.
+async fn abort_transaction<T>(running: JoinHandle<T>) {
     running.abort();
     let _ = running.await;
 }
@@ -2144,7 +2381,8 @@ fn record_commit_failure(tree_revision: &str, form: &'static str, error: &ReadEr
         form,
         error = %error,
         causes,
-        "the lexical commit failed; the next publication replaces the whole unit set"
+        "the lexical commit failed; the next publication compares every file with the \
+         digests the store recorded"
     );
 }
 
@@ -2817,12 +3055,11 @@ pub(crate) mod lexical_double {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rift_index::LexicalChange;
-    use rift_ranking::IndexDocument;
+    use rift_index::{LexicalChange, LexicalStamp, WorkspaceDigests};
     use rift_search::{SearchError, SearchFault, SearchIndex, SearchViolation};
     use tokio::sync::Semaphore;
 
-    use super::LexicalStore;
+    use super::{LexicalLaneBounds, LexicalStore};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -2831,6 +3068,14 @@ pub(crate) mod lexical_double {
     pub(crate) const LANE_ATTEMPTS_MAX: usize = 60;
     /// Wait between two reads of a store the lane has not stamped yet.
     pub(crate) const LANE_POLL: Duration = Duration::from_millis(50);
+    /// Bounds that never leave a unit out and never split a write into parts.
+    pub(crate) const UNBOUNDED: LexicalLaneBounds = LexicalLaneBounds {
+        unit_bytes_max: usize::MAX,
+        transaction_units_max: usize::MAX,
+        transaction_bytes_max: usize::MAX,
+    };
+    /// The executable digest a test lane derives its rows under.
+    pub(crate) const EXECUTABLE_DIGEST: &str = "test-executable";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
     /// one permit before it answers, refusing changes when told to, and writing through to
@@ -2839,6 +3084,7 @@ pub(crate) mod lexical_double {
     pub(crate) struct StoreDouble {
         permits: Semaphore,
         calls: Mutex<Vec<(&'static str, String)>>,
+        applied: Mutex<Vec<Vec<rift_core::ProjectPath>>>,
         refuse_changes: AtomicBool,
         inner: Mutex<Option<Arc<SearchIndex>>>,
         dropped_while_held: AtomicUsize,
@@ -2871,6 +3117,7 @@ pub(crate) mod lexical_double {
             Arc::new(Self {
                 permits: Semaphore::new(0),
                 calls: Mutex::new(Vec::new()),
+                applied: Mutex::new(Vec::new()),
                 refuse_changes: AtomicBool::new(false),
                 inner: Mutex::new(None),
                 dropped_while_held: AtomicUsize::new(0),
@@ -2893,6 +3140,19 @@ pub(crate) mod lexical_double {
         /// Refuses every change write from now on, as a store that failed would.
         pub(crate) fn refuse_changes(&self) {
             self.refuse_changes.store(true, Ordering::SeqCst);
+        }
+
+        /// Accepts change writes again, as a store that recovered would.
+        pub(crate) fn accept_changes(&self) {
+            self.refuse_changes.store(false, Ordering::SeqCst);
+        }
+
+        /// The paths each write asked of the store replaced, in the order asked.
+        pub(crate) fn applied(&self) -> Vec<Vec<rift_core::ProjectPath>> {
+            self.applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// Lets exactly one write, held or still to come, proceed.
@@ -2955,30 +3215,32 @@ pub(crate) mod lexical_double {
     }
 
     impl LexicalStore for StoreDouble {
-        async fn replace(
+        async fn recorded(
             &self,
-            units: &[IndexDocument],
-            tree_revision: &str,
-            documentation: &rift_index::DocumentationCollection,
-        ) -> Result<(), SearchError> {
-            let through = async {
-                match self.attached() {
-                    Some(index) => {
-                        index
-                            .replace_lexical_with_documentation(units, tree_revision, documentation)
-                            .await
-                    }
-                    None => Ok(()),
-                }
-            };
-            self.write("replace", tree_revision, through).await
+            derivation_revision: &str,
+        ) -> Result<Option<WorkspaceDigests>, SearchError> {
+            match self.attached() {
+                Some(index) => index.recorded_lexical_files(derivation_revision).await,
+                None => Ok(None),
+            }
+        }
+
+        async fn clear(&self, derivation_revision: &str) -> Result<(), SearchError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(("clear", String::new()));
+            match self.attached() {
+                Some(index) => index.clear_lexical(derivation_revision).await,
+                None => Ok(()),
+            }
         }
 
         async fn apply(
             &self,
             change: &LexicalChange,
-            tree_revision: &str,
-            documentation: &rift_index::DocumentationCollection,
+            stamp: &LexicalStamp,
+            documentation: Option<&rift_index::DocumentationCollection>,
         ) -> Result<(), SearchError> {
             let through = async {
                 if self.refuse_changes.load(Ordering::SeqCst) {
@@ -2988,14 +3250,15 @@ pub(crate) mod lexical_double {
                     ));
                 }
                 match self.attached() {
-                    Some(index) => {
-                        index
-                            .apply_lexical_with_documentation(change, tree_revision, documentation)
-                            .await
-                    }
+                    Some(index) => index.apply(change, stamp, documentation).await,
                     None => Ok(()),
                 }
             };
+            self.applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(change.replaced().to_vec());
+            let tree_revision = stamp.tree_revision().unwrap_or_default();
             self.write("apply", tree_revision, through).await
         }
     }
@@ -3136,11 +3399,11 @@ pub(crate) mod tests {
     use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, StoreDouble};
     use super::{
         BlockingExecutor, ChangeSet, ConfigurationFingerprint, IndexState, IndexValidation,
-        LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_COMMITS_MAX,
-        LEXICAL_UNIT_COMMIT_BUDGET, LexicalCommitState, LexicalLane, LexicalWrite, PathChanges,
-        PopulationLane, PublishedWorkspace, RebuildOutcome, RebuildRequest, WorkspaceCandidate,
-        build_workspace_candidate, commit_deadline, publish_rebuild, publish_rebuild_after,
-        record_rebuild_failure,
+        LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_HELD_PATHS_MAX,
+        LEXICAL_HELD_REVISIONS_MAX, LEXICAL_UNIT_COMMIT_BUDGET, LexicalCommitState, LexicalLane,
+        LexicalWrite, PathChanges, PopulationLane, PublishedWorkspace, RebuildOutcome,
+        RebuildRequest, WorkspaceCandidate, build_workspace_candidate, commit_deadline,
+        publish_rebuild, publish_rebuild_after, record_rebuild_failure,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -4089,6 +4352,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_whole_workspace_rebuild_rescans_under_unchanged_index_configuration() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::create_dir_all(directory.path().join("fresh"))?;
+        fs::write(directory.path().join("fresh/mod.rs"), "pub fn fresh() {}\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let store = empty_package_branch();
+        let rebuild = |epoch: u64| -> TestResult<Arc<PublishedWorkspace>> {
+            let request = super::RebuildRequest {
+                epoch,
+                work: super::PendingWork::whole_workspace(),
+                previous: Some(Arc::clone(&previous)),
+            };
+            match build_workspace_candidate(directory.path(), limits, &request, &store)? {
+                WorkspaceCandidate::Stable {
+                    published,
+                    change_set,
+                } => {
+                    assert_eq!(
+                        change_set,
+                        ChangeSet::Full,
+                        "a whole observation names no paths"
+                    );
+                    Ok(published)
+                }
+                WorkspaceCandidate::ConfigurationChanged => {
+                    Err("fixture configuration must remain stable".into())
+                }
+            }
+        };
+
+        let rescanned = rebuild(1)?;
+        let fresh = stable_candidate(directory.path(), 1)?;
+        assert_eq!(
+            rescanned.reads.tree_revision(),
+            fresh.reads.tree_revision(),
+            "the rescan answers for the tree a full build answers for"
+        );
+        let params = serde_json::from_value(serde_json::json!({"name": "fresh"}))?;
+        assert_eq!(rescanned.reads.get_symbol(&params)?.hits.len(), 1);
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.syntax]\nmax_file = \"60b\"\n",
+        )?;
+        let reconfigured = rebuild(2)?;
+        assert_ne!(
+            reconfigured.configuration.fingerprint, previous.configuration.fingerprint,
+            "an index-owned change builds under the new configuration"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_change_set_naming_unchanged_bytes_shares_the_previous_read_service() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
@@ -4757,6 +5075,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         committed_through(
             &lane,
@@ -4819,6 +5138,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
 
         let write = super::lexical_write(&published, &ChangeSet::Full);
@@ -4856,9 +5176,10 @@ pub(crate) mod tests {
             let _cancel = cancellation.clone().drop_guard();
             let lane = LexicalLane::spawn_over(
                 Arc::clone(&double),
-                usize::MAX,
+                super::lexical_double::UNBOUNDED,
                 BlockingExecutor::isolated(2, 60_000),
                 cancellation.clone(),
+                Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
             );
             if whole_owed {
                 lane.queue
@@ -4866,15 +5187,13 @@ pub(crate) mod tests {
                     .owe_whole("the previous transaction failed".to_owned());
             }
             lane.request(write, published);
-            let form = if change && !whole_owed {
-                "apply"
+            // A store holding nothing it can keep is cleared before a whole write lands.
+            let expected = if change && !whole_owed {
+                vec![("apply", revision.clone())]
             } else {
-                "replace"
+                vec![("clear", String::new()), ("apply", revision.clone())]
             };
-            assert_eq!(
-                double.calls_within_bound(1).await?,
-                vec![(form, revision.clone())]
-            );
+            assert_eq!(double.calls_within_bound(expected.len()).await?, expected);
             tokio::time::timeout(Duration::from_secs(3), async {
                 while retired.upgrade().is_some() {
                     tokio::task::yield_now().await;
@@ -4892,43 +5211,84 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_whole_write_pays_a_whole_replace_without_deriving_units_again() -> TestResult {
+    async fn a_whole_write_compares_the_recorded_digests_and_writes_only_what_moved() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
-        let published = candidate_declaring(directory.path(), 0, "beacon")?;
-        let revision = published.reads.tree_revision().to_owned();
-        let write = super::lexical_write(&published, &ChangeSet::Full);
+        fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
+        let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
         let double = StoreDouble::new();
         double.attach(Arc::clone(&index));
-        let blocking = BlockingExecutor::isolated(1, 60_000);
-        let occupied = Arc::clone(&blocking.operations).acquire_owned().await?;
         let cancellation = CancellationToken::new();
         let _cancel = cancellation.clone().drop_guard();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
-            blocking,
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-        );
-        lane.queue
-            .locked()
-            .owe_whole("the previous transaction failed".to_owned());
-        lane.request(write, published);
-        assert_eq!(
-            double.calls_within_bound(1).await?,
-            vec![("replace", revision.clone())]
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         double.release_one();
+        lane.request(
+            super::lexical_write(&first, &ChangeSet::Full),
+            Arc::clone(&first),
+        );
+        commit_state_within_bound(
+            &lane,
+            first.reads.tree_revision(),
+            LexicalCommitState::Settled,
+        )
+        .await?;
+        let every = double
+            .applied()
+            .pop()
+            .ok_or("the first whole write reached the store")?;
+        assert!(
+            every.len() >= 2,
+            "a store holding nothing takes every file: {every:?}"
+        );
+
+        let second = candidate_declaring(directory.path(), 1, "secondgamma")?;
+        let revision = second.reads.tree_revision().to_owned();
+        double.release_one();
+        lane.request(super::lexical_write(&second, &ChangeSet::Full), second);
         commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+
+        assert_eq!(
+            double.applied().pop(),
+            Some(vec![rift_core::ProjectPath::new("lib.rs")?]),
+            "the comparison writes the one file whose bytes moved"
+        );
+        assert_eq!(
+            double
+                .calls()
+                .iter()
+                .filter(|(form, _)| *form == "clear")
+                .count(),
+            1,
+            "rows the same derivation stamped are kept, never cleared"
+        );
         assert_eq!(
             index.tree_revision().await?.as_deref(),
             Some(revision.as_str())
         );
-        assert!(!ranked_at(&index, &revision, "beacon", 8).await?.is_empty());
-        assert!(!lane.owes_whole());
+        assert!(
+            !ranked_at(&index, &revision, "secondgamma", 8)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            ranked_at(&index, &revision, "firstbeta", 8)
+                .await?
+                .is_empty()
+        );
+        assert!(
+            !ranked_at(&index, &revision, "keptalpha", 8)
+                .await?
+                .is_empty()
+        );
         cancellation.cancel();
         ended_within_bound(&lane).await?;
-        drop(occupied);
         Ok(())
     }
 
@@ -4973,20 +5333,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_whole_write_leaves_out_every_unit_over_the_bound() -> TestResult {
-        let write = super::LexicalWrite::Whole(vec![
-            unit_of("a.rs", "small", 8)?,
-            unit_of("b.rs", "large", 9)?,
-            unit_of("c.rs", "exact", 8)?,
-        ]);
+    fn a_change_leaves_out_every_unit_over_the_bound() -> TestResult {
+        let paths = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(rift_core::ProjectPath::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        let change = LexicalChange::new(
+            paths,
+            vec![
+                unit_of("a.rs", "small", 8)?,
+                unit_of("b.rs", "large", 9)?,
+                unit_of("c.rs", "exact", 8)?,
+            ],
+        );
 
-        let (kept, left_out) = write.within_unit_bound(8);
+        let (kept, left_out) = super::within_unit_bound(change, 8);
 
-        let super::LexicalWrite::Whole(kept) = kept else {
-            return Err("a whole write stays whole".into());
-        };
         assert_eq!(
-            kept.iter()
+            kept.inserted()
+                .iter()
                 .map(|unit| unit.identity().as_str())
                 .collect::<Vec<_>>(),
             ["small", "exact"]
@@ -5002,27 +5367,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_change_write_keeps_its_replaced_paths_while_leaving_out_the_unit() -> TestResult {
+    fn a_change_keeps_its_replaced_paths_and_digests_while_leaving_out_the_unit() -> TestResult {
         let path = rift_core::ProjectPath::new("grown.rs")?;
-        let write = super::LexicalWrite::Change(LexicalChange::new(
-            vec![path.clone()],
-            vec![unit_of("grown.rs", "grown", 9)?],
-        ));
+        let digest = rift_index::FileDigest::of(b"grown");
+        let change = LexicalChange::new(vec![path.clone()], vec![unit_of("grown.rs", "grown", 9)?])
+            .with_recorded(vec![(path.clone(), digest)]);
 
-        let (kept, left_out) = write.within_unit_bound(8);
+        let (change, left_out) = super::within_unit_bound(change, 8);
 
-        let super::LexicalWrite::Change(change) = kept else {
-            return Err("a change write stays a change".into());
-        };
-        assert_eq!(change.replaced(), [path]);
+        assert_eq!(change.replaced(), std::slice::from_ref(&path));
         assert!(
             change.inserted().is_empty(),
             "the grown unit is left out: {:?}",
             change.inserted()
         );
-        assert!(
-            !change.is_empty(),
-            "the stored units of the grown file are still deleted"
+        assert_eq!(
+            change.recorded(),
+            [(path, digest)],
+            "the file is not derived again until its bytes change"
         );
         assert_eq!(left_out.len(), 1);
         Ok(())
@@ -5046,6 +5408,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -5109,6 +5472,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         committed_through(
             &lane,
@@ -5275,81 +5639,134 @@ pub(crate) mod tests {
         assert_eq!(commit_deadline(usize::MAX), LEXICAL_COMMIT_TIMEOUT_MAX);
     }
 
+    /// Publications of one tree whose `lib.rs` declares a different name each time.
+    fn declaring_publications(
+        root: &std::path::Path,
+        count: u64,
+    ) -> TestResult<Vec<Arc<PublishedWorkspace>>> {
+        (0..count)
+            .map(|epoch| candidate_declaring(root, epoch, &format!("declared{epoch}")))
+            .collect()
+    }
+
     #[test]
-    fn a_backlog_supersedes_at_capacity_and_keeps_the_newest_while_a_whole_is_owed() -> TestResult {
+    fn a_backlog_merges_every_write_handed_while_one_waits_and_answers_for_each() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut publications = Vec::new();
-        for epoch in 0..=LEXICAL_COMMITS_MAX as u64 + 1 {
-            publications.push(candidate_declaring(
-                directory.path(),
-                epoch,
-                &format!("declared{epoch}"),
-            )?);
-        }
+        let publications = declaring_publications(directory.path(), 4)?;
+        let revision = |epoch: usize| publications[epoch].reads.tree_revision().to_owned();
         let commit = |epoch: usize| -> TestResult<super::LexicalCommit> {
-            Ok(super::LexicalCommit {
-                write: change_naming_lib()?,
-                published: Arc::clone(&publications[epoch]),
-            })
+            Ok(super::LexicalCommit::new(
+                change_naming_lib()?,
+                Arc::clone(&publications[epoch]),
+            ))
         };
         let mut backlog = super::LexicalBacklog::default();
-        for epoch in 0..LEXICAL_COMMITS_MAX {
-            assert_eq!(backlog.hand(commit(epoch)?), 0, "the lane has room");
-        }
-        assert_eq!(backlog.held.len(), LEXICAL_COMMITS_MAX);
-        assert!(backlog.whole_owed.is_none());
-        assert_eq!(
-            backlog.state_of(publications[1].reads.tree_revision()),
-            LexicalCommitState::Committing
-        );
-
-        assert_eq!(
-            backlog.hand(commit(LEXICAL_COMMITS_MAX)?),
-            LEXICAL_COMMITS_MAX,
-            "a write handed to a full lane supersedes every held one"
-        );
-        assert!(backlog.whole_owed.is_some());
-        assert_eq!(backlog.held.len(), 1, "only the newest write is held");
-        assert!(matches!(
-            backlog.state_of(publications[1].reads.tree_revision()),
-            LexicalCommitState::Owed { .. }
-        ));
-        assert_eq!(
-            backlog.state_of(publications[LEXICAL_COMMITS_MAX].reads.tree_revision()),
-            LexicalCommitState::Committing
-        );
-
-        let (taken, whole_owed) = backlog.take_next().ok_or("the newest write is held")?;
         assert!(
-            whole_owed,
-            "the owed whole replace becomes the transaction's"
+            backlog.hand(commit(0)?).is_none(),
+            "an empty lane holds the write as it is"
         );
-        assert!(backlog.whole_owed.is_none());
+        let released = backlog.hand(commit(1)?).ok_or("a second write merges")?;
+        assert!(
+            Arc::ptr_eq(&released, &publications[0]),
+            "the merge releases the older publication"
+        );
+        assert!(backlog.hand(commit(2)?).is_some());
+        let held = backlog.held.as_ref().ok_or("one write is held")?;
+        assert!(
+            Arc::ptr_eq(&held.published, &publications[2]),
+            "the merged write derives from the newest publication"
+        );
+        assert!(matches!(held.write, super::LexicalWrite::Paths(_)));
+        for epoch in 0..3 {
+            assert_eq!(
+                backlog.state_of(&revision(epoch)),
+                LexicalCommitState::Committing,
+                "every merged revision is committing"
+            );
+        }
+
+        let (_taken, whole_owed) = backlog.take_next().ok_or("the merged write is held")?;
+        assert!(!whole_owed);
         assert_eq!(
-            backlog.state_of(taken.tree_revision()),
+            backlog.state_of(&revision(0)),
             LexicalCommitState::Committing,
-            "a running transaction is still committing"
+            "a running write answers for every revision merged into it"
         );
-        assert_eq!(backlog.hand(commit(LEXICAL_COMMITS_MAX + 1)?), 0);
         backlog.owe_whole("the store refused".to_owned());
+        backlog.running.clear();
         assert_eq!(
-            backlog.held.len(),
-            1,
-            "a failed transaction keeps only the newest held write"
-        );
-        backlog.running = None;
-        assert_eq!(
-            backlog.state_of(taken.tree_revision()),
+            backlog.state_of(&revision(2)),
             LexicalCommitState::Owed {
                 cause: "the store refused".to_owned()
             }
         );
-        assert!(backlog.take_next().is_some());
+        assert!(backlog.hand(commit(3)?).is_none());
+        let (_taken, whole_owed) = backlog.take_next().ok_or("the next write is held")?;
+        assert!(whole_owed, "the owed comparison becomes the next write's");
+        backlog.running.clear();
         assert_eq!(
-            backlog.state_of(taken.tree_revision()),
+            backlog.state_of(&revision(3)),
             LexicalCommitState::Settled,
             "nothing held, nothing running, nothing owed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_merged_write_stays_whole_once_either_side_is_whole_or_its_paths_pass_the_bound()
+    -> TestResult {
+        let path = |name: &str| rift_core::ProjectPath::new(name);
+        let named = |names: &[&str]| -> TestResult<LexicalWrite> {
+            Ok(LexicalWrite::Paths(
+                names
+                    .iter()
+                    .map(|name| path(name))
+                    .collect::<Result<_, _>>()?,
+            ))
+        };
+        let merged = named(&["a.rs"])?.merged_with(named(&["b.rs", "a.rs"])?);
+        let LexicalWrite::Paths(paths) = merged else {
+            return Err("two named writes merge into their union".into());
+        };
+        assert_eq!(paths.len(), 2);
+        assert!(matches!(
+            LexicalWrite::Whole.merged_with(named(&["a.rs"])?),
+            LexicalWrite::Whole
+        ));
+        assert!(matches!(
+            named(&["a.rs"])?.merged_with(LexicalWrite::Whole),
+            LexicalWrite::Whole
+        ));
+        let many = (0..=LEXICAL_HELD_PATHS_MAX)
+            .map(|index| path(&format!("f{index}.rs")))
+            .collect::<Result<_, _>>()?;
+        assert!(
+            matches!(
+                LexicalWrite::Paths(many).merged_with(named(&["a.rs"])?),
+                LexicalWrite::Whole
+            ),
+            "a union past the bound compares the whole publication instead"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_merged_write_answers_for_the_newest_revisions_within_the_bound() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let publications = declaring_publications(directory.path(), 2)?;
+        let mut held =
+            super::LexicalCommit::new(change_naming_lib()?, Arc::clone(&publications[0]));
+        held.answers = (0..LEXICAL_HELD_REVISIONS_MAX)
+            .map(|index| format!("revision{index}"))
+            .collect();
+        let newer = super::LexicalCommit::new(change_naming_lib()?, Arc::clone(&publications[1]));
+        let (merged, _released) = held.merged_with(newer);
+        assert_eq!(merged.answers.len(), LEXICAL_HELD_REVISIONS_MAX);
+        assert!(
+            !merged.answers_for("revision0"),
+            "the oldest revision falls out first"
+        );
+        assert!(merged.answers_for(publications[1].reads.tree_revision()));
         Ok(())
     }
 
@@ -5369,9 +5786,10 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         double.release_one();
         committed_through(
@@ -5424,19 +5842,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_failing_commit_leads_to_a_whole_replace_on_the_next_publication() -> TestResult {
+    async fn a_failing_commit_leads_to_a_whole_comparison_on_the_next_publication() -> TestResult {
         let directory = tempfile::tempdir()?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
         let second = candidate_declaring(directory.path(), 1, "secondgamma")?;
         let third = candidate_declaring(directory.path(), 2, "thirddelta")?;
         let double = StoreDouble::new();
-        double.refuse_changes();
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -5447,7 +5865,7 @@ pub(crate) mod tests {
             super::lexical_write(&first, &ChangeSet::Full),
             Arc::clone(&first),
         );
-        double.calls_within_bound(1).await?;
+        double.calls_within_bound(2).await?;
         commit_state_within_bound(
             &lane,
             first.reads.tree_revision(),
@@ -5455,6 +5873,7 @@ pub(crate) mod tests {
         )
         .await?;
 
+        double.refuse_changes();
         double.release_one();
         lane.request(change_naming_lib()?, Arc::clone(&second));
         let cause = owed_within_bound(&lane, second.reads.tree_revision()).await?;
@@ -5464,7 +5883,7 @@ pub(crate) mod tests {
         );
         assert!(
             lane.owes_whole(),
-            "a failed change leaves a whole replace owed"
+            "a failed change leaves a whole comparison owed"
         );
         let recorded = queued_records(&mut drain);
         let failure = recorded
@@ -5478,17 +5897,20 @@ pub(crate) mod tests {
             failure.fields()
         );
 
+        double.accept_changes();
         double.release_one();
         lane.request(change_naming_lib()?, Arc::clone(&third));
-        let calls = double.calls_within_bound(3).await?;
+        let calls = double.calls_within_bound(5).await?;
         assert_eq!(
             calls,
             vec![
-                ("replace", first.reads.tree_revision().to_owned()),
+                ("clear", String::new()),
+                ("apply", first.reads.tree_revision().to_owned()),
                 ("apply", second.reads.tree_revision().to_owned()),
-                ("replace", third.reads.tree_revision().to_owned()),
+                ("clear", String::new()),
+                ("apply", third.reads.tree_revision().to_owned()),
             ],
-            "the publication after a failed change commits the whole set"
+            "the publication after a failed change compares its whole tree with the store"
         );
         commit_state_within_bound(
             &lane,
@@ -5498,7 +5920,7 @@ pub(crate) mod tests {
         .await?;
         assert!(
             !lane.owes_whole(),
-            "a landed whole replace pays what was owed"
+            "a landed whole comparison pays what was owed"
         );
         cancellation.cancel();
         Ok(())
@@ -5513,16 +5935,17 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let write = super::lexical_write(&published, &ChangeSet::Full);
-        let deadline = commit_deadline(write.unit_count());
+        let write = change_naming_lib()?;
+        let deadline = commit_deadline(1);
         assert_eq!(
             deadline, LEXICAL_COMMIT_TIMEOUT,
             "a small set gets the floor"
@@ -5573,9 +5996,10 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -5599,7 +6023,7 @@ pub(crate) mod tests {
         );
         let LexicalCommitState::Owed { cause } = lane.commit_state(published.reads.tree_revision())
         else {
-            return Err("an aborted transaction leaves a whole replace owed".into());
+            return Err("an aborted transaction leaves a whole comparison owed".into());
         };
         assert!(
             cause.contains("the lexical lane ended while the transaction ran"),
@@ -5616,9 +6040,10 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -5643,7 +6068,7 @@ pub(crate) mod tests {
         );
         let LexicalCommitState::Owed { cause } = lane.commit_state(published.reads.tree_revision())
         else {
-            return Err("an aborted transaction leaves a whole replace owed".into());
+            return Err("an aborted transaction leaves a whole comparison owed".into());
         };
         assert!(
             cause.contains("the lexical lane ended while the transaction ran"),
@@ -5652,83 +6077,285 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn a_write_handed_to_a_full_lane_supersedes_the_held_ones() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let mut publications = Vec::new();
-        for epoch in 0..=LEXICAL_COMMITS_MAX as u64 + 1 {
-            publications.push(candidate_declaring(
-                directory.path(),
-                epoch,
-                &format!("declared{epoch}"),
-            )?);
+    /// Bounds that write every file in a transaction of its own.
+    const ONE_FILE_PER_PART: super::LexicalLaneBounds = super::LexicalLaneBounds {
+        unit_bytes_max: usize::MAX,
+        transaction_units_max: 1,
+        transaction_bytes_max: usize::MAX,
+    };
+
+    /// A tree of three declaring files and the publication of it.
+    fn three_file_publication(root: &std::path::Path) -> TestResult<Arc<PublishedWorkspace>> {
+        for (file, declaration) in [
+            ("a.rs", "alphaone"),
+            ("b.rs", "betatwo"),
+            ("c.rs", "gammathree"),
+        ] {
+            fs::write(root.join(file), format!("pub fn {declaration}() {{}}\n"))?;
         }
+        stable_candidate(root, 0)
+    }
+
+    #[tokio::test]
+    async fn a_write_past_the_transaction_bound_commits_in_parts_and_stamps_the_last() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let published = three_file_publication(directory.path())?;
+        let revision = published.reads.tree_revision().to_owned();
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let double = StoreDouble::new();
+        double.attach(Arc::clone(&index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            ONE_FILE_PER_PART,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            published,
+        );
+
+        double.release_one();
+        double.calls_within_bound(3).await?;
+        assert_eq!(
+            index.tree_revision().await?,
+            None,
+            "a part before the last stamps no publication"
+        );
+        assert_eq!(lane.commit_state(&revision), LexicalCommitState::Committing);
+
+        for _part in 0..16 {
+            double.release_one();
+        }
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        let calls = double.calls();
+        let applies: Vec<&String> = calls
+            .iter()
+            .filter(|(form, _)| *form == "apply")
+            .map(|(_, stamped)| stamped)
+            .collect();
+        assert!(applies.len() >= 3, "every file commits alone: {calls:?}");
+        let (last, earlier) = applies.split_last().ok_or("the write reached the store")?;
+        assert!(
+            earlier.iter().all(|stamped| stamped.is_empty()),
+            "{calls:?}"
+        );
+        assert_eq!(**last, revision, "the last part stamps the publication");
+        for declaration in ["alphaone", "betatwo", "gammathree"] {
+            assert!(
+                !ranked_at(&index, &revision, declaration, 8)
+                    .await?
+                    .is_empty()
+            );
+        }
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_parts_keeps_whole_files_and_the_next_start_writes_the_rest()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = three_file_publication(directory.path())?;
+        let revision = published.reads.tree_revision().to_owned();
+        let derivation = super::derivation_revision(
+            super::lexical_double::EXECUTABLE_DIGEST,
+            &published.configuration,
+        );
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let stopped = StoreDouble::new();
+        stopped.attach(Arc::clone(&index));
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&stopped),
+            ONE_FILE_PER_PART,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        stopped.release_one();
+        stopped.calls_within_bound(3).await?;
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
+        assert_eq!(
+            stopped.dropped_while_held(),
+            1,
+            "the stop aborts the held part"
+        );
+        assert_eq!(index.tree_revision().await?, None);
+        let kept = index
+            .recorded_lexical_files(&derivation)
+            .await?
+            .ok_or("the committed part recorded its file")?;
+        assert_eq!(kept.len(), 1, "one part landed before the stop");
+
+        let restarted = StoreDouble::new();
+        restarted.attach(Arc::clone(&index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&restarted),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+        restarted.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            published,
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        let written = restarted.applied().pop().ok_or("the restart wrote once")?;
+        for (path, _digest) in kept.iter() {
+            assert!(
+                !written.contains(path),
+                "{path} was already written: {written:?}"
+            );
+        }
+        assert!(
+            restarted.calls().iter().all(|(form, _)| *form != "clear"),
+            "the restart keeps the rows the stopped write left"
+        );
+        assert_eq!(
+            index.tree_revision().await?.as_deref(),
+            Some(revision.as_str())
+        );
+        for declaration in ["alphaone", "betatwo", "gammathree"] {
+            assert!(
+                !ranked_at(&index, &revision, declaration, 8)
+                    .await?
+                    .is_empty()
+            );
+        }
+        cancellation.cancel();
+        Ok(())
+    }
+
+    #[test]
+    fn the_derivation_revision_moves_with_the_executable_and_each_index_owned_table() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let accepted = |text: Option<&str>| -> TestResult<super::ConfigurationState> {
+            let path = directory.path().join("rift.toml");
+            match text {
+                Some(text) => fs::write(&path, text)?,
+                None => {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            Ok(super::ConfigurationState::accept(directory.path()))
+        };
+        let base = accepted(None)?;
+        let revision = super::derivation_revision("executable-a", &base);
+        assert_eq!(revision, super::derivation_revision("executable-a", &base));
+        assert_ne!(revision, super::derivation_revision("executable-b", &base));
+        for table in [
+            "[source]\nfiles = 1000\n",
+            "[search.text]\nmax_chunk = \"2kb\"\n",
+            "[search.lexical]\ntransaction_units = 200\n",
+            "[providers.syntax]\nmax_file = \"60b\"\n",
+            "[languages.rust]\nenabled = false\n",
+        ] {
+            let state = accepted(Some(table))?;
+            assert!(state.accepted.is_ok(), "{table} must be accepted");
+            assert_ne!(
+                super::derivation_revision("executable-a", &state),
+                revision,
+                "{table} decides the rows"
+            );
+        }
+        let server = accepted(Some("[server]\nnum_workers = 2\n"))?;
+        assert!(server.accepted.is_ok());
+        assert_eq!(
+            super::derivation_revision("executable-a", &server),
+            revision,
+            "a table that derives nothing keeps the stored rows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_syntax_bound_change_is_an_index_configuration_change() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let before = super::ConfigurationState::accept(directory.path());
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.syntax]\nmax_file = \"60b\"\n",
+        )?;
+        let after = super::ConfigurationState::accept(directory.path());
+        assert!(after.accepted.is_ok());
+        assert!(before.index_configuration_differs(&after));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_handed_while_one_runs_merge_into_one_write_answering_for_each() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let publications = declaring_publications(directory.path(), 4)?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // The first write runs and holds the lane at the store's gate.
-        lane.request(
-            super::lexical_write(&publications[0], &ChangeSet::Full),
-            Arc::clone(&publications[0]),
-        );
+        lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
         double.calls_within_bound(1).await?;
-        for publication in &publications[1..=LEXICAL_COMMITS_MAX] {
+        for publication in &publications[1..] {
             lane.request(change_naming_lib()?, Arc::clone(publication));
         }
-        let newest = &publications[LEXICAL_COMMITS_MAX + 1];
-        lane.request(change_naming_lib()?, Arc::clone(newest));
-        assert!(
-            lane.owes_whole(),
-            "superseding held writes owes a whole replace"
-        );
-        assert_eq!(
-            lane.commit_state(publications[2].reads.tree_revision()),
-            LexicalCommitState::Owed {
-                cause: super::SUPERSEDED_CAUSE.to_owned()
-            },
-            "a superseded publication is owed, never committing"
-        );
-        assert_eq!(
-            lane.commit_state(newest.reads.tree_revision()),
-            LexicalCommitState::Committing
-        );
+        assert!(!lane.owes_whole(), "merging held writes owes nothing");
+        for publication in &publications {
+            assert_eq!(
+                lane.commit_state(publication.reads.tree_revision()),
+                LexicalCommitState::Committing
+            );
+        }
         let recorded = queued_records(&mut drain);
-        let superseded = recorded
-            .iter()
-            .find(|record| record.message().contains("superseded"))
-            .ok_or("the supersession must be recorded")?;
         assert!(
-            superseded.fields().contains("\"superseded\":\"4\""),
-            "the record counts the dropped writes: {}",
-            superseded.fields()
+            recorded
+                .iter()
+                .any(|record| record.message().contains("merged this write")),
+            "the merge is recorded"
         );
 
         double.release_one();
         double.release_one();
+        let newest = &publications[3];
         let calls = double.calls_within_bound(2).await?;
         assert_eq!(
             calls,
             vec![
-                ("replace", publications[0].reads.tree_revision().to_owned()),
-                ("replace", newest.reads.tree_revision().to_owned()),
+                ("apply", publications[0].reads.tree_revision().to_owned()),
+                ("apply", newest.reads.tree_revision().to_owned()),
             ],
-            "the superseded writes never reach the store, and the newest commits whole"
+            "the held writes land as one, stamped with the newest revision"
         );
-        commit_state_within_bound(
-            &lane,
-            newest.reads.tree_revision(),
-            LexicalCommitState::Settled,
-        )
-        .await?;
+        for publication in &publications[1..] {
+            commit_state_within_bound(
+                &lane,
+                publication.reads.tree_revision(),
+                LexicalCommitState::Settled,
+            )
+            .await?;
+        }
         cancellation.cancel();
         Ok(())
     }
@@ -5744,9 +6371,10 @@ pub(crate) mod tests {
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         lane.request(change_naming_lib()?, Arc::clone(&published));
         double.calls_within_bound(1).await?;
@@ -5772,55 +6400,35 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A write handed to a full lane wakes the waiters: the superseded revisions are owed
-    /// from then on, and a waiter reads that instead of waiting on a commit that never
-    /// runs.
+    /// A write merged into the held one wakes the waiters, which read every merged revision
+    /// as still committing rather than settled.
     #[tokio::test]
-    async fn a_superseding_write_wakes_the_waiters_on_the_landing() -> TestResult {
+    async fn a_merging_write_wakes_the_waiters_on_the_landing() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut publications = Vec::new();
-        for epoch in 0..=LEXICAL_COMMITS_MAX as u64 + 1 {
-            publications.push(candidate_declaring(
-                directory.path(),
-                epoch,
-                &format!("declared{epoch}"),
-            )?);
-        }
+        let publications = declaring_publications(directory.path(), 3)?;
         let double = StoreDouble::new();
         let cancellation = CancellationToken::new();
         let lane = LexicalLane::spawn_over(
             Arc::clone(&double),
-            usize::MAX,
+            super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
-        lane.request(
-            super::lexical_write(&publications[0], &ChangeSet::Full),
-            Arc::clone(&publications[0]),
-        );
+        lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
         double.calls_within_bound(1).await?;
-        for publication in &publications[1..=LEXICAL_COMMITS_MAX] {
-            lane.request(change_naming_lib()?, Arc::clone(publication));
-        }
-        let held = publications[LEXICAL_COMMITS_MAX].reads.tree_revision();
+        lane.request(change_naming_lib()?, Arc::clone(&publications[1]));
+        let held = publications[1].reads.tree_revision();
         let landed = lane.landed();
+
+        lane.request(change_naming_lib()?, Arc::clone(&publications[2]));
+        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, landed)
+            .await
+            .map_err(|_| "a merging hand-off wakes the waiters")?;
         assert_eq!(
             lane.commit_state(held),
             LexicalCommitState::Committing,
-            "the last held write is still committing"
-        );
-
-        let newest = &publications[LEXICAL_COMMITS_MAX + 1];
-        lane.request(change_naming_lib()?, Arc::clone(newest));
-        tokio::time::timeout(LEXICAL_COMMIT_TIMEOUT / 10, landed)
-            .await
-            .map_err(|_| "a superseding hand-off wakes the waiters")?;
-        assert_eq!(
-            lane.commit_state(held),
-            LexicalCommitState::Owed {
-                cause: super::SUPERSEDED_CAUSE.to_owned()
-            },
-            "the woken waiter reads the superseded revision as owed"
+            "the woken waiter reads the merged revision as still committing"
         );
         cancellation.cancel();
         Ok(())
@@ -5843,6 +6451,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         committed_through(
             &lane,
@@ -5887,6 +6496,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         committed_through(
             &lane,
@@ -5931,6 +6541,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
 
         let empty =
@@ -5965,6 +6576,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         cancellation.cancel();
         ended_within_bound(&lane).await?;
@@ -6254,6 +6866,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
         );
         committed_through(
             &lane,

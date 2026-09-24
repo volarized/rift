@@ -151,3 +151,11 @@ overflow-checks = true
 # and sha2 at opt-level 0 needs about four seconds for it; optimized, well under one.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# gemm-common's `vmulq_f16` is an `#[inline]` fp16 `asm!` without a `target_feature`
+# of its own: it assembles only once inlined into an fp16 caller. At opt-level 0 it is
+# emitted alone, and aarch64 Linux and Windows reject it ("instruction requires:
+# fullfp16"); Apple targets enable fp16 by default. The native checks build every
+# workspace target in this profile on both.
+[profile.dev.package.gemm-f16]
+opt-level = 3

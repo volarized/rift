@@ -1192,7 +1192,8 @@ fn is_repository_word(word: &str) -> bool {
         })
 }
 
-/// The `[search.lexical]` table: how many units the lexical index holds.
+/// The `[search.lexical]` table: how many units the lexical index holds, and how many one
+/// transaction writes.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LexicalSearchConfiguration {
@@ -1202,12 +1203,23 @@ pub struct LexicalSearchConfiguration {
     #[schemars(range(min = 1_000, max = 50_000_000))]
     #[serde(default = "default_lexical_units_max")]
     pub units_max: u64,
+    /// Most units one lexical transaction writes, 100 to 1000000. A write
+    /// larger than this commits in several transactions, and the tree it
+    /// answers for is stamped by the last. One file's units always share a
+    /// transaction, so a file holding more units takes one of its own.
+    #[schemars(range(min = 100, max = 1_000_000))]
+    pub transaction_units: u64,
+    /// Most content one lexical transaction writes, 1mb to 1gb, counted and
+    /// applied the way `transaction_units` is.
+    pub transaction_size: ByteSize,
 }
 
 impl Default for LexicalSearchConfiguration {
     fn default() -> Self {
         Self {
             units_max: LEXICAL_UNITS_MAX_DEFAULT,
+            transaction_units: LEXICAL_TRANSACTION_UNITS_DEFAULT,
+            transaction_size: ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT),
         }
     }
 }
@@ -1215,12 +1227,26 @@ impl Default for LexicalSearchConfiguration {
 impl LexicalSearchConfiguration {
     /// This table's numeric bounds, in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        first_out_of_range([(
-            "search.lexical.units_max",
-            self.units_max,
-            LEXICAL_UNITS_MAX_MIN,
-            LEXICAL_UNITS_MAX_MAX,
-        )])
+        first_out_of_range([
+            (
+                "search.lexical.units_max",
+                self.units_max,
+                LEXICAL_UNITS_MAX_MIN,
+                LEXICAL_UNITS_MAX_MAX,
+            ),
+            (
+                "search.lexical.transaction_units",
+                self.transaction_units,
+                LEXICAL_TRANSACTION_UNITS_MIN,
+                LEXICAL_TRANSACTION_UNITS_MAX,
+            ),
+            (
+                "search.lexical.transaction_size",
+                self.transaction_size.bytes(),
+                LEXICAL_TRANSACTION_BYTES_MIN,
+                LEXICAL_TRANSACTION_BYTES_MAX,
+            ),
+        ])
     }
 }
 
@@ -1771,6 +1797,21 @@ pub const LEXICAL_UNITS_MAX_MAX: u64 = 50_000_000;
 /// file, text chunk, and declaration, so a workspace of some hundred
 /// thousand files fits.
 pub const LEXICAL_UNITS_MAX_DEFAULT: u64 = 1_000_000;
+/// `search.lexical.transaction_units` accepted, at least.
+pub const LEXICAL_TRANSACTION_UNITS_MIN: u64 = 100;
+/// `search.lexical.transaction_units` accepted, at most.
+pub const LEXICAL_TRANSACTION_UNITS_MAX: u64 = 1_000_000;
+/// `search.lexical.transaction_units` when the key is absent. Five thousand units of the bun
+/// corpus write and commit in under half a second, so a server asked to stop meets a
+/// transaction that ends well inside its stop bound.
+pub const LEXICAL_TRANSACTION_UNITS_DEFAULT: u64 = 5_000;
+/// `search.lexical.transaction_size` accepted, at least.
+pub const LEXICAL_TRANSACTION_BYTES_MIN: u64 = 1 << 20;
+/// `search.lexical.transaction_size` accepted, at most.
+pub const LEXICAL_TRANSACTION_BYTES_MAX: u64 = 1 << 30;
+/// `search.lexical.transaction_size` when the key is absent: sixteen of the largest text
+/// chunks `[search.text] max_chunk` accepts by default.
+pub const LEXICAL_TRANSACTION_BYTES_DEFAULT: u64 = 16 << 20;
 
 /// What stands in for a credential an endpoint value carried.
 const CREDENTIAL_REDACTED: &str = "[redacted]";
@@ -3030,6 +3071,11 @@ mod tests {
         assert_eq!(vector.max_vectors, 200_000);
         assert_eq!(configuration.search.pool_slots, 4);
         assert_eq!(configuration.search.lexical.units_max, 1_000_000);
+        assert_eq!(configuration.search.lexical.transaction_units, 5_000);
+        assert_eq!(
+            configuration.search.lexical.transaction_size,
+            ByteSize::from_bytes(16 << 20)
+        );
         assert_eq!(ranking.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
@@ -4322,6 +4368,70 @@ mod tests {
             configuration.search.lexical.units_max = units_max;
             assert_eq!(configuration.validate(), Ok(()));
         }
+    }
+
+    #[test]
+    fn test_search_lexical_transaction_bounds_are_enforced() {
+        let mut configuration = WorkspaceConfiguration::default();
+        for units in [
+            LEXICAL_TRANSACTION_UNITS_MIN - 1,
+            LEXICAL_TRANSACTION_UNITS_MAX + 1,
+        ] {
+            configuration.search.lexical.transaction_units = units;
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.lexical.transaction_units",
+                        ..
+                    })
+                ),
+                "transaction_units {units} must be refused"
+            );
+        }
+        configuration.search.lexical.transaction_units = LEXICAL_TRANSACTION_UNITS_DEFAULT;
+        for bytes in [
+            LEXICAL_TRANSACTION_BYTES_MIN - 1,
+            LEXICAL_TRANSACTION_BYTES_MAX + 1,
+        ] {
+            configuration.search.lexical.transaction_size = ByteSize::from_bytes(bytes);
+            assert!(
+                matches!(
+                    configuration.validate(),
+                    Err(ConfigurationViolation::LimitOutOfRange {
+                        field: "search.lexical.transaction_size",
+                        ..
+                    })
+                ),
+                "transaction_size {bytes} must be refused"
+            );
+        }
+        for (units, bytes) in [
+            (LEXICAL_TRANSACTION_UNITS_MIN, LEXICAL_TRANSACTION_BYTES_MIN),
+            (LEXICAL_TRANSACTION_UNITS_MAX, LEXICAL_TRANSACTION_BYTES_MAX),
+        ] {
+            configuration.search.lexical.transaction_units = units;
+            configuration.search.lexical.transaction_size = ByteSize::from_bytes(bytes);
+            assert_eq!(configuration.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn test_search_lexical_transaction_bounds_deserialize_beside_the_unit_bound() {
+        let written = json!({
+            "search": { "lexical": { "transaction_units": 200, "transaction_size": "8mb" } }
+        });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the transaction bounds deserialize");
+        assert_eq!(configuration.search.lexical.transaction_units, 200);
+        assert_eq!(
+            configuration.search.lexical.transaction_size,
+            ByteSize::from_bytes(8 << 20)
+        );
+        assert_eq!(
+            configuration.search.lexical.units_max,
+            LEXICAL_UNITS_MAX_DEFAULT
+        );
     }
 
     #[test]

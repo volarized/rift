@@ -557,8 +557,21 @@
     },
     "LexicalSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.lexical]` table: how many units the lexical index holds.",
+      "description": "The `[search.lexical]` table: how many units the lexical index holds, and how many one\ntransaction writes.",
       "properties": {
+        "transaction_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "16mb",
+          "description": "Most content one lexical transaction writes, 1mb to 1gb, counted and\napplied the way `transaction_units` is."
+        },
+        "transaction_units": {
+          "default": 5000,
+          "description": "Most units one lexical transaction writes, 100 to 1000000. A write\nlarger than this commits in several transactions, and the tree it\nanswers for is stamped by the last. One file's units always share a\ntransaction, so a file holding more units takes one of its own.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": "integer"
+        },
         "units_max": {
           "default": 1000000,
           "description": "Most units the lexical index holds: one per indexed file, text chunk,\nand declaration, 1000 to 50000000. A workspace past it refuses its\nrebuild naming this key.",
@@ -879,6 +892,8 @@
         "lexical": {
           "$ref": "#/$defs/LexicalSearchConfiguration",
           "default": {
+            "transaction_size": "16mb",
+            "transaction_units": 5000,
             "units_max": 1000000
           },
           "description": "How many units the lexical index holds."
@@ -1275,6 +1290,8 @@
       "default": {
         "busy_timeout": "5s",
         "lexical": {
+          "transaction_size": "16mb",
+          "transaction_units": 5000,
           "units_max": 1000000
         },
         "pool_slots": 4,
