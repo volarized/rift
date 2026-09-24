@@ -5,7 +5,7 @@ import { type ExplodedKind, ExplodedObject } from "@/components/exploded-object"
 import { LineObject, type LineObjectKind } from "@/components/line-object";
 import { Logo } from "@/components/logo";
 import { Reveal } from "@/components/reveal";
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 const SHELL = "mx-auto w-full max-w-190 px-6 sm:px-7";
@@ -87,7 +87,7 @@ const DIFFERENCES: {
   {
     statement: "Source from the project and its dependencies.",
     title: "Dependency discovery",
-    body: "Rift finds installed dependencies and makes their public declarations available beside project source.",
+    body: "Rift finds installed dependencies and makes their public declarations and docs discoverable together with project source.",
     line: "shimizu",
     // The butterfly stands in the x - z plane; turn it to face the camera.
     tilt: 1.5,
@@ -149,7 +149,7 @@ export default function HomePage() {
         <div className="grid gap-5">
           <Statement>Agents depend on context and tooling.</Statement>
           <Body className="text-balance">
-            rift provides contextual, parser-precise codebase reading tools.
+            rift provides contextual, precise and well-structured codebase reading tools.
           </Body>
         </div>
       </Section>
@@ -199,22 +199,23 @@ export default function HomePage() {
           scroll and unpicked again on the way back up */}
       <Section wide tall className="md:grid-cols-2 md:items-center md:gap-20">
         <div className="grid gap-9">
-          <Statement className="max-w-125">Time to create things. Differently</Statement>
+          <Statement className="max-w-125 text-[clamp(1.5rem,8vw,2.75rem)] md:text-[clamp(1.75rem,4vw,2.75rem)]">
+            Bring understanding and cohesiveness to your agentic workflow
+          </Statement>
           <div className="flex flex-wrap items-center gap-3">
-            <Link href="/docs" className="flex items-center gap-2 text-sm font-medium">
-              <Button variant="outline" size="lg" className="w-fit text-base">
-                Read documentation
-                <ArrowRightIcon weight="bold" className="h-4 w-4" />
-              </Button>
+            <Link
+              href="/docs/installation"
+              className={cn(buttonVariants({ variant: "outline", size: "lg" }), "text-base")}
+            >
+              Install
+              <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Link>
             <Link
-              href="mailto:contact@volar.sh"
-              className="flex items-center gap-2 text-sm font-medium"
+              href="/docs"
+              className={cn(buttonVariants({ variant: "outline", size: "lg" }), "text-base")}
             >
-              <Button variant="outline" size="lg" className="w-fit text-base">
-                Contact us
-                <ArrowRightIcon weight="bold" className="h-4 w-4" />
-              </Button>
+              Read the docs
+              <ArrowRightIcon weight="bold" className="h-4 w-4" />
             </Link>
           </div>
         </div>

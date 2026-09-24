@@ -159,21 +159,26 @@
  * entry reveal and components/line-object.tsx for the r3f line objects.
  */
 
-/*
- * The home nav mark must land on the same pixel as the docs sidebar mark:
- * the sidebar puts it at x = 3px gutter + 16px padding, y = 16px into a 64px
- * row. Below md both layouts already agree (56px bar, 16px inset).
- */
+/* Match the docs layout width and include the header border in its height.
+ * The sticky home header already occupies space in the document flow. */
+#nd-home-layout {
+  --fd-layout-width: 97rem;
+}
+
+#nd-nav nav {
+  height: calc(3.5rem - 1px);
+}
+
 @media (min-width: 48rem) {
-  #nd-nav > * {
-    max-width: none;
+  #nd-nav {
+    height: calc(4rem + 1px);
   }
+
+  /* The sidebar's fixed-width content extends across its 1px end border,
+   * putting its 16px inset at x = 15px within the centered docs layout. */
   #nd-nav nav {
     height: 4rem;
-    padding-inline-start: 19px;
-  }
-  #nd-home-layout {
-    padding-top: 4rem;
+    padding-inline-start: 15px;
   }
 }
 
