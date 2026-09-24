@@ -280,3 +280,49 @@ fn warn(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rift_core::{SourceVisibility, TextFileInclusion};
+    use rift_index::{DocumentationLayer, WorkspaceIndexLimits};
+
+    use super::{JoinedLayers, ReadWarning, WorkspaceIndex};
+
+    /// A layer that refuses leaves its documentation out of the answer and says so once,
+    /// instead of failing the search that reached for it.
+    #[test]
+    fn a_refused_layer_is_left_out_with_one_warning_naming_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("README.md"),
+            "# Beacon\n\nBeacon docs\n",
+        )?;
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        let collection = index.documentation();
+        let refused = DocumentationLayer::borrowed(&[collection, collection])
+            .expect_err("one source held by two collections refuses the layer");
+
+        let mut joined = JoinedLayers::default();
+        joined.join("project", Err(&refused));
+        let [ReadWarning::DocumentationUnavailable { detail }] = joined.warnings.as_slice() else {
+            return Err(format!(
+                "one warning names the left-out layer: {:?}",
+                joined.warnings
+            )
+            .into());
+        };
+        assert!(
+            detail.starts_with("the project documentation was left out of this answer: "),
+            "the warning names the layer and carries the refusal: {detail}"
+        );
+        Ok(())
+    }
+}
