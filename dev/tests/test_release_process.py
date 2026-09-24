@@ -84,6 +84,14 @@ class ProcessTests(unittest.TestCase):
                     stderr=subprocess.DEVNULL,
                 )
                 child = psutil.Process(process.pid)
+                # Popen returns once the child has forked, and observation matches the
+                # owner token in the environment the child carries only after exec.
+                exec_deadline = time.monotonic() + 5
+                while OWNER_ENV not in child.environ():
+                    self.assertLess(
+                        time.monotonic(), exec_deadline, "the child never ran exec"
+                    )
+                    time.sleep(0.01)
                 process_iter.return_value = [child, psutil.Process(os.getpid())]
             assert child is not None
             self.assertTrue(
