@@ -1208,25 +1208,45 @@ impl LexicalSearchIndex {
                     self.limits.documentation_bytes_max(),
                 )?;
 
-                let mut access = self.database.writing().await?;
+                let mut access = rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.write_turn",
+                    { self.database.writing().await }
+                )
+                .await?;
                 let mut transaction = access.transaction().await?;
 
-                toasty::sql::statement("DELETE FROM lexical_documents_fts")
-                    .exec(&mut transaction)
-                    .await
-                    .map_err(storage_error)?;
-                LexicalDocumentRecord::all()
-                    .delete()
-                    .exec(&mut transaction)
-                    .await
-                    .map_err(storage_error)?;
+                let executor = &mut transaction;
+                rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.documents",
+                    documents = documents.len(),
+                    {
+                        toasty::sql::statement("DELETE FROM lexical_documents_fts")
+                            .exec(&mut *executor)
+                            .await
+                            .map_err(storage_error)?;
+                        LexicalDocumentRecord::all()
+                            .delete()
+                            .exec(&mut *executor)
+                            .await
+                            .map_err(storage_error)?;
+                        for document in documents {
+                            insert_document(&mut *executor, document, project_location(document)?)
+                                .await?;
+                        }
+                        Ok::<(), LexicalIndexError>(())
+                    }
+                )
+                .await?;
 
-                for document in documents {
-                    insert_document(&mut transaction, document, project_location(document)?)
-                        .await?;
-                }
-
-                crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
+                let executor = &mut transaction;
+                rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.documentation",
+                    { crate::documentation_store::replace(executor, metadata.as_ref()).await }
+                )
+                .await?;
                 stamp(&mut transaction, tree_revision).await?;
 
                 transaction.commit().await.map_err(storage_error)
