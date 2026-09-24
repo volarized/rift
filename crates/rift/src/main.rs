@@ -407,9 +407,11 @@ mod tests {
         command.build();
         assert_eq!(command.get_name(), "rift");
         assert!(command.get_about().is_some());
+        // Windows adds the hidden `__cleanup-update` subcommand, which help never lists.
         assert_eq!(
             command
                 .get_subcommands()
+                .filter(|subcommand| !subcommand.is_hide_set())
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
             ["mcp", "server", "update", "install", "steer", "help"]

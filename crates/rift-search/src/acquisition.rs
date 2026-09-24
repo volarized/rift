@@ -1257,9 +1257,11 @@ mod tests {
             COMMIT,
             "the files carry the resolved commit, not the `{DEFAULT_REVISION}` asked for"
         );
+        // Both sides render through `Debug`, which escapes a Windows separator as `\\`.
         let rendered = format!("{files:?}");
+        let snapshot_rendered = format!("{snapshot:?}");
         assert!(
-            rendered.contains(&snapshot.display().to_string()),
+            rendered.contains(snapshot_rendered.trim_matches('"')),
             "the returned paths point into the snapshot: {rendered}"
         );
         Ok(())
