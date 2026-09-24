@@ -1,62 +1,30 @@
 set dotenv-load := false
 
+rift_dev := "uv run --locked --python 3.12 --project dev rift-dev"
+
 format:
     cargo fmt --all --check
 
 generate:
-    cargo run -q -p rift-schema-export -- docs plugins/claude
-    cargo run -q -p rift-schema-export -- --analyzer-manifest .
-    oas3-gen generate types -q --enum-mode relaxed --no-ordered-collections -i docs/public/global-api.openapi.json -o crates/rift-cloud-client/src/generated.rs
-    printf '$ rift --help\n' > docs/public/cli-help.txt
-    cargo run -q -p rift -- --help >> docs/public/cli-help.txt
-    printf '\n$ rift server --help\n' >> docs/public/cli-help.txt
-    cargo run -q -p rift -- server --help >> docs/public/cli-help.txt
-    printf '\n$ rift server logs --help\n' >> docs/public/cli-help.txt
-    cargo run -q -p rift -- server logs --help >> docs/public/cli-help.txt
+    {{ rift_dev }} generate
 
 generate-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo run -q -p rift-schema-export -- --check docs plugins/claude
-    cargo run -q -p rift-schema-export -- --check --analyzer-manifest .
-    cargo run -q -p rift-schema-export -- --global-contract docs
-    generated="$(mktemp)"
-    fresh="$(mktemp)"
-    trap 'rm -f "$generated" "$fresh"' EXIT
-    oas3-gen generate types -q --enum-mode relaxed --no-ordered-collections -i docs/public/global-api.openapi.json -o "$generated"
-    diff -u crates/rift-cloud-client/src/generated.rs "$generated"
-    printf '$ rift --help\n' > "$fresh"
-    cargo run -q -p rift -- --help >> "$fresh"
-    printf '\n$ rift server --help\n' >> "$fresh"
-    cargo run -q -p rift -- server --help >> "$fresh"
-    printf '\n$ rift server logs --help\n' >> "$fresh"
-    cargo run -q -p rift -- server logs --help >> "$fresh"
-    cmp -s docs/public/cli-help.txt "$fresh" || {
-        echo "error: \`docs/public/cli-help.txt\` does not match the CLI help; regenerate it with \`just generate\`" >&2
-        exit 1
-    }
+    {{ rift_dev }} generate --check
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null
     cargo check --workspace --all-targets --all-features --locked
-    uv run --locked --project dev rift-dev rust-architecture
+    {{ rift_dev }} rust-architecture
 
-# The em-dash ban, over every surface a reader meets: the docs pages, the
-# app shell and the components it renders, the prose inside the crates, the
-# README, the artifacts `just generate` writes, and the CI configuration's
-# own comments. The scanner itself is not among them: it spells the banned
-# characters.
-dashes:
-    uv run --locked --project dev rift-dev dashes \
-        docs/content docs/src/app docs/src/components crates README.md \
-        docs/public .github plugins .claude-plugin
+dashes *args:
+    {{ rift_dev }} dashes {{ args }}
 
 # The MCP specification's own conformance runner, over a throwaway workspace
 # one foreground server serves. `tools/mcp-conformance/expected-failures.yml`
 # carries the scenarios the served surface fails today; anything else fails
 # the gate.
-conformance binary="":
-    uv run --locked --project dev rift-dev conformance {{ if binary == "" { "" } else { "--binary " + quote(binary) } }}
+conformance *args:
+    {{ rift_dev }} conformance {{ args }}
 
 # A local OTLP collector for timing `traced!`/`traced_async!` spans. Jaeger v2's OTLP
 # receiver serves gRPC on 4317 and HTTP/protobuf on 4318; its query API and UI serve HTTP
@@ -85,14 +53,7 @@ audit:
     cargo deny check
 
 clean:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    git worktree list --porcelain | sed -n 's/^worktree //p' | while read -r tree; do
-        if [ -f "$tree/Cargo.toml" ]; then
-            echo "cleaning $tree"
-            cargo clean --manifest-path "$tree/Cargo.toml" || echo "skipped $tree: broken checkout"
-        fi
-    done
+    {{ rift_dev }} clean
 
 # Archive the unit and live suites once; both execution jobs reuse these
 # binaries. The execution job's limit counts the transfer as well as the run, so
@@ -103,48 +64,11 @@ clean:
 fast-archive:
     cargo llvm-cov nextest-archive --workspace --all-targets --all-features --locked --profile ci --archive-file target/fast.tar.zst --zstd-level 9 -E 'not binary(/^corpus_/)'
 
-# The directory cargo-llvm-cov builds into and nextest extracts an archive into.
-# Nextest will not create it, so it exists before an archive run. Cargo writes a
-# target directory's `CACHEDIR.TAG` only when it creates that directory itself,
-# and cargo-llvm-cov refuses to clean stale objects out of one carrying no tag:
-# a report taken over an uncleaned directory counts every source file twice,
-# once from a stale object with no hits, and the floor fails on a green suite.
-[private]
-coverage-target:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    target="${CARGO_LLVM_COV_TARGET_DIR:-target/llvm-cov-target}"
-    mkdir -p "$target"
-    tag="$target/CACHEDIR.TAG"
-    if [ ! -f "$tag" ]; then
-        {
-            echo "Signature: 8a477f597d28d172789f06886806bc55"
-            echo "# This file is a cache directory tag created by cargo."
-            echo "# For information about cache directory tags see https://bford.info/cachedir/"
-        } > "$tag"
-    fi
+test *args:
+    {{ rift_dev }} test unit {{ args }}
 
-# Unit tests use local fixtures and require no language servers or model downloads.
-# `generate-check` validates generated wire bytes; coverage measures maintained Rust source.
-test archive="": coverage-target
-    cargo llvm-cov nextest {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap ." } }} --profile ci --no-tests fail --ignore-filename-regex '(^|/)crates/rift-cloud-client/src/generated\.rs$' --lcov --output-path lcov.info --fail-under-lines 86
-
-# The live suites drive real language engines. They read the same build the unit
-# suites do, so they reuse the fast archive instead of an optimized build of
-# their own: what they exercise is the engine, not the speed of Rift's own code.
-#
-# They report no coverage. Measured against the unit report on one tree, the eight
-# live tests reach three lines it does not, out of 78,757, so the report they add
-# is a workspace-wide one whose lines are almost all zero. Uploading it made a
-# pull request's patch figure read from whichever job reported first.
-# Nextest extracts an archive into a directory it opens rather than creates, and a
-# missing one refuses the run with exit code 96.
-[private]
-live-archive-target:
-    mkdir -p target/live-archive
-
-live-test archive="": live-archive-target
-    RIFT_ENGINE_LIVE=1 RIFT_LIVE_SEARCH=1 cargo nextest run --profile live --no-tests fail {{ if archive == "" { "--workspace --all-targets --all-features --locked" } else { "--archive-file " + quote(archive) + " --extract-to target/live-archive --extract-overwrite --workspace-remap ." } }}
+live-test *args:
+    {{ rift_dev }} test live {{ args }}
 
 release-test:
     uv run --locked --project tools/rift-release pytest tools/rift-release/tests/test_release.py
@@ -157,8 +81,8 @@ testing-check:
     uv run --locked --python 3.12 --project dev ty check dev
     uv run --locked --python 3.12 --project dev pytest dev/tests
 
-corpus-sync name="":
-    uv run --locked --python 3.12 --project dev rift-dev corpus sync {{ if name == "" { "" } else { quote(name) } }}
+corpus-sync *args:
+    {{ rift_dev }} corpus sync {{ args }}
 
 # One archive supplies every integration job. Save the plain CLI before test builds.
 # The archive carries the corpus suites and nothing else. `--all-targets` built
@@ -171,56 +95,24 @@ integration-archive:
     tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
     cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
-corpus-test name test_name="" archive="": coverage-target
-    cargo llvm-cov nextest --no-report --profile corpus --no-tests fail --run-ignored all {{ if archive == "" { "--locked -p rift --test " + quote("corpus_" + name) + " --cargo-profile corpus" } else { "--archive-file " + quote(archive) + " --extract-overwrite --workspace-remap . -E " + quote("binary(=corpus_" + name + ")") } }} {{ if test_name == "" { "" } else { "-- --exact " + quote(test_name) } }}
+corpus-test *args:
+    {{ rift_dev }} test corpus {{ args }}
 
 artifact-test *args:
-    uv run --locked --python 3.12 --project dev rift-dev artifact {{ args }}
+    {{ rift_dev }} artifact {{ args }}
 
 agent-test *args:
-    uv run --locked --python 3.12 --project dev rift-dev agent {{ args }}
+    {{ rift_dev }} agent {{ args }}
 
 coldstart-test *args:
-    uv run --locked --python 3.12 --project dev rift-dev coldstart {{ args }}
+    {{ rift_dev }} coldstart {{ args }}
 
-# Corpus servers run sequentially on development machines.
 integration-test:
-    just corpus-sync
-    just corpus-test fastapi
-    just corpus-test bun
-    just corpus-test nextjs
-    just live-test
-    just artifact-test
-    just agent-test
-    just conformance
+    {{ rift_dev }} integration-test
 
 rust-gate: format dashes generate-check check clippy docs doctest audit test release-test installer-test testing-check
 
-# One signed tag on the commit `origin/main` names right now. The recipe reads
-# that commit from the remote, so the local checkout's branch and its uncommitted
-# work decide nothing. Pushing the tag starts `rift-release`: six target
-# archives, the checksum manifest, the GitHub release, and the docs deploy.
+# One signed tag on the commit `origin/main` names right now; pushing it starts
+# `rift-release`.
 release tag:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    tag={{ quote(tag) }}
-    if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-        echo "error: release tag must match vX.Y.Z: $tag" >&2
-        exit 1
-    fi
-    if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-        echo "error: origin already carries $tag" >&2
-        exit 1
-    fi
-    git fetch --quiet origin main
-    commit="$(git rev-parse FETCH_HEAD)"
-    declared="$(git show "$commit:Cargo.toml" \
-        | sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p')"
-    if [ "$declared" != "${tag#v}" ]; then
-        echo "error: origin/main declares $declared; bump the workspace version before tagging $tag" >&2
-        exit 1
-    fi
-    echo "tagging $(git --no-pager log -1 --format='%h %s' "$commit")"
-    git tag --sign --message "Rift $tag" "$tag" "$commit"
-    git push --quiet origin "refs/tags/$tag" || { git tag --delete "$tag"; exit 1; }
-    echo "$tag pushed; watch with: gh run list --workflow rift-release"
+    {{ rift_dev }} release {{ tag }}

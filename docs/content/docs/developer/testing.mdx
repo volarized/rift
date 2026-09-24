@@ -200,7 +200,8 @@ uv run --locked --project dev rift-dev corpus sync
 uv run --locked --project dev rift-dev agent --binary target/release/rift
 ```
 
-The justfile wraps the same commands for local work and CI. Package checks run with:
+The justfile wraps the same commands for local work and CI: a recipe that is more than a few
+plain commands is a `rift-dev` command, and the recipe calls it. Package checks run with:
 
 ```sh
 just testing-check

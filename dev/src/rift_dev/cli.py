@@ -20,13 +20,22 @@ from rift_dev import (
     check_dashes,
     check_mcp_conformance,
     check_rust_architecture,
+    generated,
+    release_tag,
+    suites,
     trace,
+    worktrees,
 )
 from rift_dev.config import BinaryOptions, CorpusCase, CorpusName, CorpusOptions
 from rift_dev.corpus_cache import git, measure, pins
 from rift_dev.rift_test_client import candidate_binary, run_gate, workspace_version
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+test_app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+app.add_typer(test_app, name="test", help="Run the Rust test suites.")
+ArchiveArgument = Annotated[
+    Path | None, typer.Argument(help="A nextest archive CI compiled; omit to build.")
+]
 PathOption = Annotated[Path | None, typer.Option()]
 StringOption = Annotated[str | None, typer.Option()]
 
@@ -154,3 +163,63 @@ def trace_summary(
 ) -> None:
     """Summarize a local OTLP collector's spans for one service, one JSON line per operation."""
     trace.main(base_url, service, timedelta(seconds=since_seconds), search_depth)
+
+
+@app.command()
+def generate(
+    check: Annotated[
+        bool, typer.Option(help="Fail on a stale generated file instead of writing.")
+    ] = False,
+) -> None:
+    """Write the schemas, analyzer manifest, API client, and CLI help transcript."""
+    generated.generate(check)
+
+
+@app.command()
+def clean() -> None:
+    """Clean the Cargo build output of every worktree of this repository."""
+    worktrees.clean()
+
+
+@app.command()
+def release(tag: Annotated[str, typer.Argument()]) -> None:
+    """Sign TAG onto the commit origin/main names and push it."""
+    release_tag.release(tag)
+
+
+@test_app.command("unit")
+def unit_tests(archive: ArchiveArgument = None) -> None:
+    """Run the unit suite under coverage, held to the line floor."""
+    suites.unit(archive)
+
+
+@test_app.command("live")
+def live_tests(archive: ArchiveArgument = None) -> None:
+    """Run the live language-engine and model suites."""
+    suites.live(archive)
+
+
+@test_app.command("corpus")
+def corpus_tests(
+    name: Annotated[CorpusName, typer.Argument()],
+    test_name: Annotated[str, typer.Argument()] = "",
+    archive: ArchiveArgument = None,
+) -> None:
+    """Run one pinned repository's corpus suite, or TEST_NAME alone."""
+    suites.corpus(name, test_name or None, archive)
+
+
+@app.command("integration-test")
+def integration_test() -> None:
+    """Run the corpus, live, artifact, agent, and conformance checks in turn.
+
+    Corpus servers run one after another on a development machine.
+    """
+    for pin in pins().values():
+        print(pin.sync(), flush=True)
+    for name in ("fastapi", "bun", "nextjs"):
+        suites.corpus(name, None, None)
+    suites.live(None)
+    artifact()
+    agent()
+    conformance()
