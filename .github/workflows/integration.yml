@@ -1,7 +1,7 @@
 # Native tests: process exit, election, and the Windows update publisher, run
 # on the actual compiled binary for each of the six release targets.
-# `integration-build`, `corpus`, and `artifact` moved into `ci.yml`, which runs
-# them on every pull request as well as this workflow's own triggers.
+# `integration-build`, `corpus`, and `artifact` run from `ci.yml`, on every
+# pull request and push to `main`.
 name: integration
 
 on:

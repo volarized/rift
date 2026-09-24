@@ -583,3 +583,31 @@ jobs:
           path: target/integration/
           if-no-files-found: error
           retention-days: 7
+
+  # The one check the `main` ruleset requires. A job whose dependency failed is
+  # skipped, and a skipped job reports success to a required check, so this job
+  # runs under `always()` and refuses any result other than `success`.
+  gate:
+    needs:
+      - docs
+      - rust-build
+      - rust
+      - live
+      - rust-release-targets
+      - installers
+      - integration-build
+      - corpus
+      - artifact
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "$failed"
+            exit 1
+          fi
