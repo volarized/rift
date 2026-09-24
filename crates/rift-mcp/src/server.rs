@@ -1721,7 +1721,10 @@ impl RiftMcp {
             return self.change_search(params, change).await;
         }
         let Some(rev) = params.rev.clone() else {
-            return self.current_tree_search(params).await;
+            return rift_core::traced_async!(component = "search", operation = "search.request", {
+                self.current_tree_search(params).await
+            })
+            .await;
         };
         // The search index only ever holds the current tree, so a revision-addressed
         // search never consults it.
@@ -1816,9 +1819,17 @@ impl RiftMcp {
                 .await?;
             ranking = self.ranking(&params, &resolved.published, deadline).await?;
         }
+        let requested = &params;
         let (resolved, ranking, references) = tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.current_tree_references(resolved, ranking, &params, deadline)),
+            Box::pin(rift_core::traced_async!(
+                component = "search",
+                operation = "search.references",
+                {
+                    self.current_tree_references(resolved, ranking, requested, deadline)
+                        .await
+                }
+            )),
         )
         .await
         .map_err(|_| {
@@ -1982,13 +1993,16 @@ impl RiftMcp {
         references: Arc<EngineReferences>,
         dependency_context: Arc<rift_dependency::DependencyContext>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        self.current_tree_read(resolved, move |reads| {
-            reads.search_with_references_and_dependency_context(
-                &params,
-                &answer,
-                &references,
-                &dependency_context,
-            )
+        rift_core::traced_async!(component = "search", operation = "search.read", {
+            self.current_tree_read(resolved, move |reads| {
+                reads.search_with_references_and_dependency_context(
+                    &params,
+                    &answer,
+                    &references,
+                    &dependency_context,
+                )
+            })
+            .await
         })
         .await
     }
@@ -2111,8 +2125,11 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let (searched, commit_state) = self
-            .store_answer(index, tree_revision, &parsed, deadline)
+        let (searched, commit_state) =
+            rift_core::traced_async!(component = "search", operation = "search.store", {
+                self.store_answer(index, tree_revision, &parsed, deadline)
+                    .await
+            })
             .await?;
         Ok(ranking_of(
             searched,
