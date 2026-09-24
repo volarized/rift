@@ -12,6 +12,7 @@ from typing import Annotated, Literal
 import typer
 
 from rift_dev import (
+    build_cache,
     check_agent,
     check_artifact,
     check_coldstart,
@@ -139,6 +140,12 @@ def corpus(
                     pin, options.binary, destination, options.case
                 ).run()
             )
+
+
+@app.command("build-cache")
+def start_build_cache() -> None:
+    """Start sccache against the R2 build cache for the rest of a CI job."""
+    raise typer.Exit(build_cache.main())
 
 
 @app.command("rust-architecture")

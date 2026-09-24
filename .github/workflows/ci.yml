@@ -86,6 +86,113 @@ jobs:
       # images. Drop the ignores once fumadocs picks up a fixed image-size.
       - run: bun audit --audit-level=high --ignore=GHSA-w3rx-r6r6-pgpr --ignore=GHSA-5p2g-fcmc-qvqq
 
+  # Every check that feeds no test job: formatting, generated files, crate
+  # boundaries, Clippy, Rust documentation and its examples, dependency policy,
+  # and the Python tooling. Only `gate` waits for it, so it runs beside the builds
+  # the test jobs wait for instead of ahead of them.
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # sccache holds the compiled crates; this cache keeps only the Cargo
+      # registry and the Git dependencies, and only a push to main writes it.
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: checks
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            dev/uv.lock
+            tools/rift-release/uv.lock
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: just,oas3-gen@0.28.0,cargo-audit,cargo-deny,sccache@0.18.0
+      - run: >-
+          rustup toolchain install 1.98 --profile minimal
+          --component rustfmt,clippy
+      # The R2 secrets reach this step alone, and the sccache server it starts
+      # holds them for every later compile. The Actions scope holds the write
+      # pair and the Dependabot scope the read pair; a fork receives neither.
+      # See `dev/src/rift_dev/build_cache.py`.
+      - name: Start the build cache
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+
+      - run: just format
+        timeout-minutes: 1
+      - run: just dashes
+        timeout-minutes: 1
+      - run: just audit
+        timeout-minutes: 1
+      - run: just testing-check
+        timeout-minutes: 1
+      # These checks invoke the compiler. Their cold builds belong within the
+      # build budget, so correctness does not depend on finding a previous cache.
+      - run: just generate-check
+      - run: just check
+      - run: just clippy
+      - run: just docs
+      - run: just doctest
+      - name: Test release tooling
+        id: release_tests
+        timeout-minutes: 1
+        run: just release-test
+        env:
+          PYTEST_ADDOPTS: >-
+            --junitxml=release.junit.xml -o junit_family=legacy
+      - name: Test installers
+        id: installer_tests
+        timeout-minutes: 1
+        run: just installer-test
+        env:
+          PYTEST_ADDOPTS: >-
+            --junitxml=installers.junit.xml -o junit_family=legacy
+
+      # Codecov uploads are skipped on Dependabot runs. A Dependabot-triggered
+      # workflow reads the Dependabot secret scope, not the Actions scope that
+      # holds `CODECOV_TOKEN`, so the upload fails with "Token required because
+      # branch is protected" and `fail_ci_if_error` turns that into a red
+      # check on every dependency pull request. A dependency bump adds no source
+      # lines to cover, so skipping the upload loses no report.
+      - name: Upload release test results
+        if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: release.junit.xml
+          flags: release
+          name: rift-release
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload installer test results
+        if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
+        uses: codecov/codecov-action@v5.5.5
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: installers.junit.xml
+          flags: installers
+          name: rift-installers
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
+
+  # One instrumented archive of every workspace test target: `rust` runs the unit
+  # suite from it and `live` the language-engine suites.
   rust-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -95,27 +202,32 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          cache-on-failure: true
+          shared-key: rust-build
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: |
-            dev/uv.lock
-            tools/rift-release/uv.lock
+          cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.87.16
         with:
-          tool: just,oas3-gen@0.28.0,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140,sccache@0.18.0
       - run: >-
           rustup toolchain install 1.98 --profile minimal
           --component rustfmt,clippy
+      # The R2 secrets reach this step alone, and the sccache server it starts
+      # holds them for every later compile. The Actions scope holds the write
+      # pair and the Dependabot scope the read pair; a fork receives neither.
+      # See `dev/src/rift_dev/build_cache.py`.
+      - name: Start the build cache
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
 
-      # These checks invoke the compiler. Their cold builds belong within the
-      # build budget, so correctness does not depend on finding a previous cache.
-      - run: just generate-check
-      - run: just check
-      - run: just clippy
-      - run: just docs
-      - run: just doctest
       - name: Archive unit tests
         run: just fast-archive
       - uses: actions/upload-artifact@v6.0.0
@@ -126,6 +238,9 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
 
   rust:
     needs: rust-build
@@ -152,12 +267,10 @@ jobs:
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: |
-            dev/uv.lock
-            tools/rift-release/uv.lock
+          cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.87.16
         with:
-          tool: just,cargo-audit,cargo-deny,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
 
       # `rustup help toolchain install` documents a comma-separated component
       # list. Install every CI component from the pinned release in one step.
@@ -166,45 +279,11 @@ jobs:
           --component rustfmt,clippy,llvm-tools-preview
 
       # Test binaries come from this revision's build archive.
-      - run: just format
-        timeout-minutes: 1
-      - run: just dashes
-        timeout-minutes: 1
-      - run: just audit
-        timeout-minutes: 1
-      - run: just testing-check
-        timeout-minutes: 1
       - run: just test target/fast.tar.zst
         id: rust_tests
         timeout-minutes: 10
         env:
           NEXTEST_PROFILE: ci
-      - name: Test release tooling
-        id: release_tests
-        timeout-minutes: 1
-        run: just release-test
-        env:
-          PYTEST_ADDOPTS: >-
-            --junitxml=release.junit.xml -o junit_family=legacy
-
-      # Codecov uploads are skipped on Dependabot runs. A Dependabot-triggered
-      # workflow reads the Dependabot secret scope, not the Actions scope that
-      # holds `CODECOV_TOKEN`, so the upload fails with "Token required because
-      # branch is protected" and `fail_ci_if_error` turns that into a red
-      # `rust` check on every dependency pull request. A dependency bump adds
-      # no source lines to cover, so skipping the upload loses no report.
-      - name: Upload release test results
-        if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: release.junit.xml
-          flags: release
-          name: rift-release
-          report_type: test_results
-          token: ${{ secrets.CODECOV_TOKEN }}
-
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
         uses: actions/upload-artifact@v6.0.0
@@ -216,26 +295,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Test installers
-        id: installer_tests
-        timeout-minutes: 1
-        run: just installer-test
-        env:
-          PYTEST_ADDOPTS: >-
-            --junitxml=installers.junit.xml -o junit_family=legacy
-
-      - name: Upload installer test results
-        if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
-        with:
-          disable_search: true
-          fail_ci_if_error: true
-          files: installers.junit.xml
-          flags: installers
-          name: rift-installers
-          report_type: test_results
-          token: ${{ secrets.CODECOV_TOKEN }}
-
+      # Dependabot runs skip the uploads; see the note in `checks`.
       - name: Upload CLI coverage
         if: ${{ github.actor != 'dependabot[bot]' }}
         uses: codecov/codecov-action@v5.5.5
@@ -287,6 +347,10 @@ jobs:
         with:
           name: fast-build
           path: target
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.87.16
         with:
           tool: just,cargo-nextest@0.9.140
@@ -316,10 +380,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Feature resolution is per target: a dependency graph that compiles on
-  # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
-  # build break CI never saw). Every OS in the release build matrix needs a
-  # compile gate here.
   installers:
     strategy:
       fail-fast: false
@@ -347,10 +407,13 @@ jobs:
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py
 
-  # One build per release target serves two checks: every workspace target
-  # compiles for it, and that same build runs process exit, election, and the
-  # Windows update publisher, which a Unix runner cannot prove. x86-64 Linux runs
-  # the same tests inside `rust`, from the archive `rust-build` compiled.
+  # Feature resolution is per target: a dependency graph that compiles on
+  # Linux proves nothing about the Windows graph (v0.0.2 shipped a Windows
+  # build break CI never saw). Each release target other than x86-64 Linux
+  # builds every workspace target once and runs the whole unit suite from that
+  # build, so process exit, server election, the Windows update publisher, and
+  # every other test run on the OS they target. x86-64 Linux runs the suite
+  # inside `rust`, from the archive `rust-build` compiled.
   native:
     strategy:
       fail-fast: false
@@ -367,7 +430,7 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -378,30 +441,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           shared-key: native-${{ matrix.target }}
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.87.16
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest@0.9.140,sccache@0.18.0
       - name: Install target
         run: rustup target add "${{ matrix.target }}"
-      - name: Build every target and run the native checks
+      # The R2 secrets reach this step alone, and the sccache server it starts
+      # holds them for every later compile. The Actions scope holds the write
+      # pair and the Dependabot scope the read pair; a fork receives neither.
+      # See `dev/src/rift_dev/build_cache.py`.
+      - name: Start the build cache
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+      # The ci profile's default filter keeps the live and corpus suites out.
+      # Ignored tests run too, except the `_probe` tests, which exist only as
+      # the child processes their parent tests spawn. On Windows that admits
+      # the update publisher's replace-while-running test, which reads the CLI
+      # this same build produced.
+      - name: Build every target and run the unit suite
         env:
           RIFT_UPDATE_TEST_BINARY: >-
             ${{ github.workspace }}/target/${{ matrix.target }}/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
-          RIFT_NATIVE_TESTS: >-
-            binary_id(rift::bin/rift) & (
-            test(=server::tests::stopped_process_does_not_wait_for_a_replacement_election)
-            or test(=server::tests::changed_or_missing_document_does_not_prove_process_exit)
-            or test(=server::tests::already_exited_process_does_not_wait_for_a_building_holder)
-            or test(=server::tests::process_observation_errors_keep_waiting_and_retain_their_cause)
-            or test(=server::tests::await_stopped_times_out_while_the_holder_keeps_the_election)
-            or test(=server::tests::await_election_released_returns_once_the_holder_is_gone)
-            ${{ runner.os == 'Windows' && 'or test(=update::tests::windows_publish_flushes_staging_and_preserves_backup) or test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)' || '' }}
-            )
         run: >-
           cargo nextest run --locked --target "${{ matrix.target }}"
           --workspace --all-targets --all-features --profile ci --no-tests fail
-          ${{ runner.os == 'Windows' && '--run-ignored all' || '' }}
-          -E "$RIFT_NATIVE_TESTS"
+          --run-ignored all -E 'not test(/_probe$/)'
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
@@ -409,51 +484,64 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: error
           retention-days: 7
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
 
-  # The corpus profile compiles the whole workspace optimized and instrumented,
-  # and the one run that finished inside the former 30-minute job limit did so
-  # by eight seconds. The compile owns a limit of its own, and the job keeps
-  # room past it for the cache save and the archive upload that follow.
+  # The corpus profile compiles the whole workspace optimized. The corpus jobs
+  # run an instrumented archive and the artifact job serves the plain CLI, and
+  # the two builds share no compiled workspace crate, so each has a job of its
+  # own and neither consumer waits for the build it never opens. Each compile
+  # owns a limit, and its job keeps room past it for the upload that follows.
   integration-build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      # Every pull request builds this job's Rust cache, not only a push to
-      # main, so saving on every run would thrash the one shared key. Restore
-      # stays unconditional; only the save after a push to main updates it.
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           shared-key: integration
+          cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
       - uses: taiki-e/install-action@v2.87.16
         with:
-          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
-      # The archive carries test binaries and the CLI compiled from these exact
-      # Rust inputs; the corpus jobs check out the Python harness and the
-      # pinned trees fresh and pass `--workspace-remap .` to point the
-      # extracted archive at that checkout. A hit here is the same archive a
-      # fresh compile would produce, so a pull request touching only docs,
-      # workflows, or `dev/` skips the ~38-minute build.
+          tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140,sccache@0.18.0
+      # The archive carries test binaries compiled from these exact Rust
+      # inputs; the corpus jobs check out the Python harness and the pinned
+      # trees fresh and pass `--workspace-remap .` to point the extracted
+      # archive at that checkout. A hit here is the same archive a fresh
+      # compile would produce, so a pull request touching only docs,
+      # workflows, or `dev/` skips the build.
       - uses: actions/cache@v6.1.0
         id: integration-archive-cache
         with:
-          path: |
-            target/integration.tar.zst
-            target/integration-cli.tar.zst
+          path: target/integration.tar.zst
           key: >-
             integration-archive-${{ runner.os }}-${{ runner.arch }}-${{
             hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', '.config/nextest.toml', 'justfile') }}
-      - name: Build and archive integrations
+      # The R2 secrets reach this step alone, and the sccache server it starts
+      # holds them for every later compile. The Actions scope holds the write
+      # pair and the Dependabot scope the read pair; a fork receives neither.
+      # See `dev/src/rift_dev/build_cache.py`.
+      - name: Start the build cache
         if: steps.integration-archive-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 38
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+      - name: Build and archive the corpus suites
+        if: steps.integration-archive-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
         run: just integration-archive
-      # Two artifacts, because the two consumers need different bytes: the
-      # corpus jobs run the instrumented archive, and the artifact job serves
-      # the plain CLI. One artifact made the artifact job download an archive
-      # it never opens.
       - uses: actions/upload-artifact@v6.0.0
         with:
           name: integration-archive
@@ -461,6 +549,54 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
+
+  integration-cli:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: integration-cli
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: just,sccache@0.18.0
+      # Keyed like the corpus archive: the same Rust inputs produce the same CLI.
+      - uses: actions/cache@v6.1.0
+        id: integration-cli-cache
+        with:
+          path: target/integration-cli.tar.zst
+          key: >-
+            integration-cli-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', 'justfile') }}
+      # The R2 secrets reach this step alone, and the sccache server it starts
+      # holds them for every later compile. The Actions scope holds the write
+      # pair and the Dependabot scope the read pair; a fork receives neither.
+      # See `dev/src/rift_dev/build_cache.py`.
+      - name: Start the build cache
+        if: steps.integration-cli-cache.outputs.cache-hit != 'true'
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+      - name: Build and archive the CLI
+        if: steps.integration-cli-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: just integration-cli
       - uses: actions/upload-artifact@v6.0.0
         with:
           name: integration-cli
@@ -468,6 +604,9 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
 
   corpus:
     needs: integration-build
@@ -568,7 +707,7 @@ jobs:
   # The supplied binary serves real requests: the artifact and agent checks, the
   # MCP conformance runner, and cold first use in a container.
   artifact:
-    needs: integration-build
+    needs: integration-cli
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -624,12 +763,14 @@ jobs:
   gate:
     needs:
       - docs
+      - checks
       - rust-build
       - rust
       - live
       - installers
       - native
       - integration-build
+      - integration-cli
       - corpus
       - artifact
     if: ${{ always() }}

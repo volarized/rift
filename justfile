@@ -79,15 +79,17 @@ testing-check:
 corpus-sync *args:
     {{ rift_dev }} corpus sync {{ args }}
 
-# One archive supplies every integration job. Save the plain CLI before test builds.
+# The plain CLI the artifact job serves, from the corpus profile.
+integration-cli:
+    cargo build --locked --profile corpus -p rift
+    tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
+
 # The archive carries the corpus suites and nothing else. `--all-targets` built
 # and linked every test binary in the workspace, and each one links the whole
 # workspace; the live suites moved to the fast archive, which is built once for
 # every pull request. `dev/tests/test_delivery.py` refuses a selection that
 # leaves out a suite the corpus profile runs.
 integration-archive:
-    cargo build --locked --profile corpus -p rift
-    tar --zstd -cf target/integration-cli.tar.zst -C target/corpus rift
     cargo llvm-cov nextest-archive --workspace --all-features --locked --cargo-profile corpus --profile corpus --archive-file target/integration.tar.zst --test corpus_bun --test corpus_fastapi --test corpus_nextjs
 
 corpus-test *args:
