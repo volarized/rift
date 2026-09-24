@@ -1178,32 +1178,41 @@ impl LexicalSearchIndex {
         tree_revision: &str,
         documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
     ) -> Result<(), LexicalIndexError> {
-        validate_lexical_batch(documents, self.limits)?;
-        let metadata = documentation
-            .map(crate::documentation_store::EncodedDocumentation::new)
-            .transpose()?;
+        rift_core::traced_async!(
+            component = "lexical",
+            operation = "lexical.commit",
+            mode = "replace",
+            {
+                validate_lexical_batch(documents, self.limits)?;
+                let metadata = documentation
+                    .map(crate::documentation_store::EncodedDocumentation::new)
+                    .transpose()?;
 
-        let mut access = self.database.writing().await?;
-        let mut transaction = access.transaction().await?;
+                let mut access = self.database.writing().await?;
+                let mut transaction = access.transaction().await?;
 
-        toasty::sql::statement("DELETE FROM lexical_documents_fts")
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
-        LexicalDocumentRecord::all()
-            .delete()
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
+                toasty::sql::statement("DELETE FROM lexical_documents_fts")
+                    .exec(&mut transaction)
+                    .await
+                    .map_err(storage_error)?;
+                LexicalDocumentRecord::all()
+                    .delete()
+                    .exec(&mut transaction)
+                    .await
+                    .map_err(storage_error)?;
 
-        for document in documents {
-            insert_document(&mut transaction, document, project_location(document)?).await?;
-        }
+                for document in documents {
+                    insert_document(&mut transaction, document, project_location(document)?)
+                        .await?;
+                }
 
-        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
-        stamp(&mut transaction, tree_revision).await?;
+                crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
+                stamp(&mut transaction, tree_revision).await?;
 
-        transaction.commit().await.map_err(storage_error)
+                transaction.commit().await.map_err(storage_error)
+            }
+        )
+        .await
     }
 
     /// Applies one change set's documents and stamps `tree_revision`, in one transaction.
@@ -1257,28 +1266,40 @@ impl LexicalSearchIndex {
         tree_revision: &str,
         documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
     ) -> Result<(), LexicalIndexError> {
-        validate_lexical_units(change.inserted(), self.limits)?;
-        let metadata = documentation
-            .map(crate::documentation_store::EncodedDocumentation::new)
-            .transpose()?;
+        rift_core::traced_async!(
+            component = "lexical",
+            operation = "lexical.commit",
+            mode = "apply",
+            {
+                validate_lexical_units(change.inserted(), self.limits)?;
+                let metadata = documentation
+                    .map(crate::documentation_store::EncodedDocumentation::new)
+                    .transpose()?;
 
-        let mut access = self.database.writing().await?;
-        let mut transaction = access.transaction().await?;
+                let mut access = self.database.writing().await?;
+                let mut transaction = access.transaction().await?;
 
-        for path in change.replaced() {
-            delete_path_units(&mut transaction, path).await?;
-        }
-        let stored = indexed_unit_count(&mut transaction).await?;
-        validate_indexed_count(stored.saturating_add(change.inserted().len()), self.limits)?;
+                for path in change.replaced() {
+                    delete_path_units(&mut transaction, path).await?;
+                }
+                let stored = indexed_unit_count(&mut transaction).await?;
+                validate_indexed_count(
+                    stored.saturating_add(change.inserted().len()),
+                    self.limits,
+                )?;
 
-        for document in change.inserted() {
-            insert_document(&mut transaction, document, project_location(document)?).await?;
-        }
+                for document in change.inserted() {
+                    insert_document(&mut transaction, document, project_location(document)?)
+                        .await?;
+                }
 
-        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
-        stamp(&mut transaction, tree_revision).await?;
+                crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
+                stamp(&mut transaction, tree_revision).await?;
 
-        transaction.commit().await.map_err(storage_error)
+                transaction.commit().await.map_err(storage_error)
+            }
+        )
+        .await
     }
 
     /// Reads validated documentation metadata from the same revision as lexical documents.

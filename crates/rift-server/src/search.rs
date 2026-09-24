@@ -519,7 +519,13 @@ impl ReadService {
             criteria.target,
             SearchParamsTarget::Documentation | SearchParamsTarget::All
         )
-        .then(|| SearchDocumentation::new(index, scope, documentation_resolution))
+        .then(|| {
+            rift_core::traced!(
+                component = "search",
+                operation = "search.documentation_projection",
+                { SearchDocumentation::new(index, scope, documentation_resolution) }
+            )
+        })
         .transpose()?;
         let screen = CandidateScreen {
             index,
@@ -529,13 +535,10 @@ impl ReadService {
             resolution,
             documentation: documentation.as_ref(),
         };
-        let mut inputs = vec![identifier_input(
-            index,
-            matcher,
-            root,
-            query,
-            sources,
-            fetch_limit,
+        let mut inputs = vec![rift_core::traced!(
+            component = "search",
+            operation = "search.identifier_ranking",
+            { identifier_input(index, matcher, root, query, sources, fetch_limit) }
         )?];
         inputs.extend(store.precise().iter().cloned());
         inputs.extend(package_inputs(
@@ -546,7 +549,12 @@ impl ReadService {
             criteria.target,
         ));
         let screened = screen.projected(&inputs, query)?;
-        let mut ranked = fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit);
+        let mut ranked = rift_core::traced!(
+            component = "search",
+            operation = "search.fusion",
+            phase = "precise",
+            { fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit) }
+        );
         // The widened inputs are built only when the precise phase came up short,
         // because ranking every package's documents again is work the full pool
         // would throw away.
@@ -560,17 +568,24 @@ impl ReadService {
                 criteria.target,
             ));
             let screened = screen.projected(&widened, query)?;
-            let broad = fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit);
+            let broad = rift_core::traced!(
+                component = "search",
+                operation = "search.fusion",
+                phase = "broad",
+                { fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit) }
+            );
             ranked.append_phase(broad, fetch_limit);
         }
-        resolve_ranked_hits(
-            index,
-            criteria,
-            resolution,
-            documentation.as_ref(),
-            &ranked,
-            results,
-        )?;
+        rift_core::traced!(component = "search", operation = "search.hit_resolution", {
+            resolve_ranked_hits(
+                index,
+                criteria,
+                resolution,
+                documentation.as_ref(),
+                &ranked,
+                results,
+            )
+        })?;
         Ok(ranked.truncated_at())
     }
 

@@ -1286,31 +1286,49 @@ impl WorkspaceIndex {
             languages,
             text_inclusion,
         )?);
-        let classified = discover(&root, limits, visibility, &language)?;
-        let mut workspace_bytes = 0_usize;
-        let mut contents = IndexContents::default();
-        for (path, provider) in classified.source {
-            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                IndexRead::Included(text_file) => {
-                    contents.hold_source_file(text_file, &path, provider, limits.syntax())?;
+        let classified = rift_core::traced!(component = "index", operation = "index.discover", {
+            discover(&root, limits, visibility, &language)
+        })?;
+        let (files, text_files, left_out, warnings, fingerprint, semantics) =
+            rift_core::traced!(component = "index", operation = "index.parse", {
+                let mut workspace_bytes = 0_usize;
+                let mut contents = IndexContents::default();
+                for (path, provider) in classified.source {
+                    match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
+                        IndexRead::Included(text_file) => {
+                            contents.hold_source_file(
+                                text_file,
+                                &path,
+                                provider,
+                                limits.syntax(),
+                            )?;
+                        }
+                        IndexRead::Skipped(warning) => contents.leave_out(warning),
+                    }
                 }
-                IndexRead::Skipped(warning) => contents.leave_out(warning),
-            }
-        }
-        for path in classified.text {
-            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                IndexRead::Included(file) => contents.hold_text_file(file),
-                IndexRead::Skipped(warning) => contents.leave_out(warning),
-            }
-        }
-        let BuiltContents {
-            files,
-            text_files,
-            left_out,
-            warnings,
-            fingerprint,
-            semantics,
-        } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+                for path in classified.text {
+                    match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
+                        IndexRead::Included(file) => contents.hold_text_file(file),
+                        IndexRead::Skipped(warning) => contents.leave_out(warning),
+                    }
+                }
+                let BuiltContents {
+                    files,
+                    text_files,
+                    left_out,
+                    warnings,
+                    fingerprint,
+                    semantics,
+                } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+                (
+                    files,
+                    text_files,
+                    left_out,
+                    warnings,
+                    fingerprint,
+                    semantics,
+                )
+            });
         let declarations = crate::documentation::declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
@@ -1625,31 +1643,38 @@ impl WorkspaceIndex {
     /// covers source units read for one request, not the persistent lexical index.
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
-        let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
-        let mut left_out = LeftOut::default();
-        for file in self.files() {
-            for symbol in file.syntax().symbols() {
-                documents.extend(symbol_document(file, symbol, &mut left_out));
+        rift_core::traced!(
+            component = "index",
+            operation = "index.lexical_units",
+            files = self.files.len(),
+            {
+                let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
+                let mut left_out = LeftOut::default();
+                for file in self.files() {
+                    for symbol in file.syntax().symbols() {
+                        documents.extend(symbol_document(file, symbol, &mut left_out));
+                    }
+                }
+                for file in self.text_files() {
+                    if is_notebook_path(file.path()) {
+                        continue;
+                    }
+                    push_text_documents(
+                        &mut documents,
+                        file,
+                        self.text_chunk_bytes_max(),
+                        &mut left_out,
+                    );
+                }
+                documents.extend(crate::documentation::cell_documents(
+                    &self.notebooks,
+                    self.text_chunk_bytes_max_usize(),
+                    &mut left_out,
+                ));
+                left_out.report();
+                documents
             }
-        }
-        for file in self.text_files() {
-            if is_notebook_path(file.path()) {
-                continue;
-            }
-            push_text_documents(
-                &mut documents,
-                file,
-                self.text_chunk_bytes_max(),
-                &mut left_out,
-            );
-        }
-        documents.extend(crate::documentation::cell_documents(
-            &self.notebooks,
-            self.text_chunk_bytes_max_usize(),
-            &mut left_out,
-        ));
-        left_out.report();
-        documents
+        )
     }
 
     /// Records this index's declarations against every identifier `query` carried.

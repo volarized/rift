@@ -215,7 +215,15 @@ impl PackageBranch {
             Vec::with_capacity(entries.len());
         for entry in &entries {
             if entry.source_root().is_some() {
-                built.push((entry.identity().clone(), analyzed(entry, &request.limits)));
+                let identity = entry.identity().clone();
+                let outcome = rift_core::traced!(
+                    component = "dependency",
+                    operation = "package.analyze",
+                    manager = identity.manager.as_str(),
+                    name = identity.name.as_str(),
+                    { analyzed(entry, &request.limits) }
+                );
+                built.push((identity, outcome));
             }
         }
         let mut index = self.write()?;
