@@ -2667,6 +2667,47 @@ mod tests {
     }
 
     #[test]
+    fn test_a_stamp_names_its_publication_only_when_published() {
+        let published = super::LexicalStamp::published("revision-one", "derivation-a");
+        assert_eq!(published.tree_revision(), Some("revision-one"));
+        assert_eq!(published.derivation_revision(), "derivation-a");
+        let unpublished = super::LexicalStamp::unpublished("derivation-a");
+        assert_eq!(
+            unpublished.tree_revision(),
+            None,
+            "a part committed before the last names no publication"
+        );
+        assert_eq!(unpublished.derivation_revision(), "derivation-a");
+    }
+
+    #[tokio::test]
+    async fn test_an_integer_query_answering_more_than_one_row_refuses_naming_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
+        )
+        .await?;
+        let mut connection = database.connection().await?;
+        let error = super::single_i64(&mut connection, "SELECT 1 UNION ALL SELECT 2", "probe")
+            .await
+            .expect_err("two rows are not one integer");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        let context = error.context();
+        let probe = context
+            .iter()
+            .find(|entry| entry.key() == "probe")
+            .expect("the refusal names the query it ran");
+        assert!(
+            probe.value().starts_with("unexpected probe rows"),
+            "the refusal carries the rows it read: {}",
+            probe.value()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_a_recorded_digest_reads_back_as_the_digest_written() {
         let digest = crate::FileDigest::of(b"pub fn beacon() {}");
         let record = LexicalFileRecord {
