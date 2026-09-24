@@ -127,7 +127,7 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+        run: uv run --locked --project dev rift-dev build-cache
 
       - run: just format
         timeout-minutes: 1
@@ -226,7 +226,7 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+        run: uv run --locked --project dev rift-dev build-cache
 
       - name: Archive unit tests
         run: just fast-archive
@@ -401,7 +401,7 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 1
         run: >-
-          uv run --locked --python 3.12 --project dev pytest
+          uv run --locked --project dev pytest
           dev/tests/test_release_process.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
@@ -468,7 +468,7 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python ${{ matrix.python || '3.12' }} --project dev rift-dev build-cache
+        run: uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev rift-dev build-cache
       # The ci profile's default filter keeps the live and corpus suites out,
       # and on Windows selects the process and update tests alone. Ignored
       # tests run too, except the `_probe` tests, which exist only as the child
@@ -543,7 +543,7 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+        run: uv run --locked --project dev rift-dev build-cache
       - name: Build and archive the corpus suites
         if: steps.integration-archive-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
@@ -598,7 +598,7 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-        run: uv run --locked --python 3.12 --project dev rift-dev build-cache
+        run: uv run --locked --project dev rift-dev build-cache
       - name: Build and archive the CLI
         if: steps.integration-cli-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
@@ -659,7 +659,7 @@ jobs:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
       - run: rustup component add llvm-tools-preview
       - name: Install validating client
-        run: uv sync --locked --python 3.12 --project dev
+        run: uv sync --locked --project dev
       - uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/rift-corpus
@@ -743,7 +743,7 @@ jobs:
           path: ~/.bun/install/cache
           key: conformance-${{ runner.os }}-${{ hashFiles('tools/mcp-conformance/bun.lock') }}
           restore-keys: conformance-${{ runner.os }}-
-      - run: uv sync --locked --python 3.12 --project dev
+      - run: uv sync --locked --project dev
       - name: Extract compiled CLI
         run: |
           mkdir -p target/integration-cli
