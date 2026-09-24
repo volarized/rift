@@ -1144,7 +1144,10 @@ impl ReadService {
             root: self.index.root(),
             visible: &visible,
             resolution: ResolutionPolicy::from(&self.dependency_configuration),
-            limits: DependencyIndexLimits::from(&self.dependency_configuration),
+            limits: DependencyIndexLimits {
+                syntax: self.index.limits().syntax(),
+                ..DependencyIndexLimits::from(&self.dependency_configuration)
+            },
             context: dependency_context,
         })
     }
@@ -1186,7 +1189,10 @@ impl ReadService {
             root: self.index.root(),
             visible: &visible,
             resolution: ResolutionPolicy::from(&configuration),
-            limits: DependencyIndexLimits::from(&configuration),
+            limits: DependencyIndexLimits {
+                syntax: self.index.limits().syntax(),
+                ..DependencyIndexLimits::from(&configuration)
+            },
             context: dependency_context,
         })
     }
@@ -1261,7 +1267,12 @@ impl ReadService {
     /// Returns [`ReadError`] when `[providers.history]` is disabled or the
     /// workspace's version control cannot serve a walk start.
     fn symbol_timelines(&self) -> Result<SymbolTimelines, ReadError> {
-        SymbolTimelines::open(self.index.root(), self.revision.as_ref(), &self.history)
+        SymbolTimelines::open(
+            self.index.root(),
+            self.revision.as_ref(),
+            &self.history,
+            self.index.limits().syntax(),
+        )
     }
 }
 

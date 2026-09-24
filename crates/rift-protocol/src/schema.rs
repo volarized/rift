@@ -594,6 +594,23 @@ pub fn declare_execution_ranges(schema: &mut Schema) {
     }
 }
 
+/// A [`SyntaxConfiguration`](crate::configuration::SyntaxConfiguration)
+/// states its `ByteSize` ceiling as `rift:range` on the key: schema
+/// validation alone cannot compare `"64mb"` against a ceiling, so the server
+/// enforces the bound at load and the schema carries it for readers.
+pub fn declare_syntax_ranges(schema: &mut Schema) {
+    use crate::configuration::{ByteSize, SYNTAX_FILE_BYTES_MAX, SyntaxConfiguration};
+    annotate_property(
+        schema,
+        property!(SyntaxConfiguration, max_file),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(1),
+            &ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
+        ),
+    );
+}
+
 /// A [`ServerConfiguration`](crate::configuration::ServerConfiguration)
 /// states its `Duration` ceiling as `rift:range` on the key: schema
 /// validation alone cannot compare `"30s"` against a ceiling, so the server

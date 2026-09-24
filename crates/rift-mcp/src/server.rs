@@ -3348,9 +3348,8 @@ mod tests {
     async fn build_skips_one_oversized_file_and_serves_its_warning() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
-        let limits =
-            WorkspaceIndexLimits::new(8, 1, 4096, 8, 32).map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), limits).await?;
+        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"1b\"\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
 
         assert!(result.hits.is_empty());
@@ -3449,10 +3448,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "")?;
-        let tight =
-            WorkspaceIndexLimits::new(4, 60, 60, 4, 100).map_err(|error| error.to_string())?;
-        let server = RiftMcp::build(directory.path(), tight).await?;
+        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"60b\"\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
         fs::write(&path, oversized)?;

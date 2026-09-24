@@ -9,7 +9,8 @@
 //! `stale_index` naming the key. A workspace past `units_max` serves, and `search` answers
 //! from identifier matching with `lexical_ranking_unavailable` naming the key and its
 //! maximum. A workspace holding one file past the syntax depth bound still answers
-//! `search` from its other file, with the deep file absent; a force-included file the
+//! `search` from its other file, with the deep file absent, and raising
+//! `[providers.syntax] max_depth` indexes it; a force-included file the
 //! Contribution contract refuses is left out the same way, and the answer names it. A
 //! `force_include` matching more files than its bound refuses naming the field, the bound,
 //! and the count.
@@ -184,6 +185,35 @@ async fn a_file_past_a_syntax_bound_is_left_out_and_the_rest_serves() -> TestRes
     assert!(
         !hit_paths(&absent).contains(&"src/deep.rs"),
         "the deep file answers no search: {absent:#}"
+    );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_raised_providers_syntax_bound_indexes_the_file_the_default_leaves_out() -> TestResult {
+    let deep = deep_source();
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            ("src/lib.rs", "pub fn beacon() {}\n"),
+            ("src/deep.rs", deep.as_str()),
+        ],
+        Some("[providers.syntax]\nmax_depth = 2048\n".to_owned()),
+    )
+    .await?;
+
+    let answer = search_until(
+        &client,
+        "deep",
+        "the deep file never answered search",
+        |answer| hit_paths(answer).contains(&"src/deep.rs"),
+    )
+    .await?;
+    assert!(
+        hit_paths(&answer).contains(&"src/deep.rs"),
+        "the raised depth bound indexes the deep file: {answer:#}"
     );
 
     client.cancel().await?;

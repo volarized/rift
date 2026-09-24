@@ -66,6 +66,18 @@ pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
 /// Revisions the history provider may walk from the current head, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
+/// Bytes of one source a syntax provider parses when `providers.syntax.max_file` is absent.
+pub const SYNTAX_FILE_BYTES_DEFAULT: u64 = 4 << 20;
+/// Bytes `providers.syntax.max_file` may hold, at most.
+pub const SYNTAX_FILE_BYTES_MAX: u64 = 64 << 20;
+/// Syntax nodes one source may produce when `providers.syntax.max_nodes` is absent.
+pub const SYNTAX_NODES_DEFAULT: u64 = 250_000;
+/// Syntax nodes `providers.syntax.max_nodes` may allow, at most.
+pub const SYNTAX_NODES_MAX: u64 = 100_000_000;
+/// Nesting one source may reach when `providers.syntax.max_depth` is absent.
+pub const SYNTAX_DEPTH_DEFAULT: u64 = 512;
+/// Nesting `providers.syntax.max_depth` may allow, at most.
+pub const SYNTAX_DEPTH_MAX: u64 = 65_536;
 /// Bytes an `[search.vector.embedding]` model value may hold, at most.
 pub const EMBEDDING_MODEL_BYTES_MAX: usize = 128;
 
@@ -471,6 +483,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.global.violation())
             .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
+            .or_else(|| self.providers.syntax.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
             .or_else(|| self.dependencies.violation())
@@ -851,6 +864,62 @@ impl LogsConfiguration {
 pub struct ProvidersConfiguration {
     /// The history provider's budget.
     pub history: HistoryConfiguration,
+    /// The bounds every syntax provider parses one source under.
+    pub syntax: SyntaxConfiguration,
+}
+
+/// The `[providers.syntax]` table. A syntax provider's cost scales with the
+/// source it parses, so each source is bounded by size, node count, and
+/// nesting depth; a source past any bound is left out of the index.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_syntax_ranges)]
+pub struct SyntaxConfiguration {
+    /// Bytes of one source a provider parses, 1b to 64mb.
+    pub max_file: ByteSize,
+    /// Syntax nodes one source may produce.
+    #[schemars(range(min = 1, max = 100_000_000))]
+    pub max_nodes: u64,
+    /// Nesting one source's syntax tree may reach.
+    #[schemars(range(min = 1, max = 65_536))]
+    pub max_depth: u64,
+}
+
+impl Default for SyntaxConfiguration {
+    fn default() -> Self {
+        Self {
+            max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_DEFAULT),
+            max_nodes: SYNTAX_NODES_DEFAULT,
+            max_depth: SYNTAX_DEPTH_DEFAULT,
+        }
+    }
+}
+
+impl SyntaxConfiguration {
+    /// The table's bounds in key order.
+    #[must_use]
+    pub fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "providers.syntax.max_file",
+                self.max_file.bytes(),
+                1,
+                SYNTAX_FILE_BYTES_MAX,
+            ),
+            (
+                "providers.syntax.max_nodes",
+                self.max_nodes,
+                1,
+                SYNTAX_NODES_MAX,
+            ),
+            (
+                "providers.syntax.max_depth",
+                self.max_depth,
+                1,
+                SYNTAX_DEPTH_MAX,
+            ),
+        ])
+    }
 }
 
 /// The `[providers.history]` table. The history provider's cost scales with
@@ -3054,6 +3123,50 @@ mod tests {
                 "unexpected violation {violation:?}"
             );
         }
+    }
+
+    /// One way to break a syntax bound, and the field the refusal names.
+    type SyntaxBoundCase = (fn(&mut SyntaxConfiguration), &'static str);
+
+    #[test]
+    fn test_syntax_bounds_are_enforced_at_both_edges() {
+        let breaks: [SyntaxBoundCase; 4] = [
+            (
+                |syntax| syntax.max_file = ByteSize::from_bytes(0),
+                "providers.syntax.max_file",
+            ),
+            (
+                |syntax| syntax.max_file = ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX + 1),
+                "providers.syntax.max_file",
+            ),
+            (
+                |syntax| syntax.max_nodes = SYNTAX_NODES_MAX + 1,
+                "providers.syntax.max_nodes",
+            ),
+            (|syntax| syntax.max_depth = 0, "providers.syntax.max_depth"),
+        ];
+        for (break_bound, expected_field) in breaks {
+            let mut configuration = WorkspaceConfiguration::default();
+            break_bound(&mut configuration.providers.syntax);
+            let violation = configuration
+                .validate()
+                .expect_err("the broken bound must refuse the configuration");
+            assert_eq!(
+                violation
+                    .evidence()
+                    .first()
+                    .map(|(key, value)| (*key, value.clone())),
+                Some(("field", expected_field.to_owned())),
+                "unexpected violation {violation:?}"
+            );
+        }
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.providers.syntax = SyntaxConfiguration {
+            max_file: ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
+            max_nodes: SYNTAX_NODES_MAX,
+            max_depth: SYNTAX_DEPTH_MAX,
+        };
+        assert_eq!(configuration.validate(), Ok(()));
     }
 
     #[test]

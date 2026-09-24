@@ -754,6 +754,15 @@
             "max_revisions": 500
           },
           "description": "The history provider's budget."
+        },
+        "syntax": {
+          "$ref": "#/$defs/SyntaxConfiguration",
+          "default": {
+            "max_depth": 512,
+            "max_file": "4mb",
+            "max_nodes": 250000
+          },
+          "description": "The bounds every syntax provider parses one source under."
         }
       },
       "type": "object"
@@ -1063,6 +1072,38 @@
       },
       "type": "object"
     },
+    "SyntaxConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[providers.syntax]` table. A syntax provider's cost scales with the\nsource it parses, so each source is bounded by size, node count, and\nnesting depth; a source past any bound is left out of the index.",
+      "properties": {
+        "max_depth": {
+          "default": 512,
+          "description": "Nesting one source's syntax tree may reach.",
+          "format": "uint64",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_file": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Bytes of one source a provider parses, 1b to 64mb.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "1b"
+          }
+        },
+        "max_nodes": {
+          "default": 250000,
+          "description": "Syntax nodes one source may produce.",
+          "format": "uint64",
+          "maximum": 100000000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "TextSearchConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, and `max_chunk`\nbounds the lexical units derived from them.",
@@ -1220,6 +1261,11 @@
         "history": {
           "enabled": true,
           "max_revisions": 500
+        },
+        "syntax": {
+          "max_depth": 512,
+          "max_file": "4mb",
+          "max_nodes": 250000
         }
       },
       "description": "Bounds and switches for the built-in providers."

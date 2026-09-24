@@ -447,6 +447,28 @@ walk's cost scales with how far back it reaches. The history provider computes a
 [`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory) timeline inside that depth; a
 revision beyond it contributes no version.
 
+<VersionBadge version="v0.0.44" />
+
+A syntax provider's cost grows with the source it parses, so `[providers.syntax]` bounds each
+source every syntax provider takes:
+
+```toml
+[providers.syntax]
+max_file = "4mb"
+max_nodes = 250000
+max_depth = 512
+```
+
+- `max_file` bounds the bytes of one source, 1b to 64mb
+- `max_nodes` bounds the syntax nodes one source produces, 1 to 100000000
+- `max_depth` bounds how deep one source's syntax tree nests, 1 to 65536
+
+A source past any bound is left out of the index while the rest of the workspace serves: a
+generated file of deeply nested literals answers no [`search`](/docs/mcp#tool-search), and
+every other file still does. The server records each such file under
+`rift server logs --component index`, with the path and the bound it crossed; raise that key to
+index the file.
+
 Provider configuration does not set merge order or freshness. A provider rebuilding after a file
 change can serve its previous immutable revision; the result then carries a `stale_index` entry
 in `warnings` naming the two tree revision digests.

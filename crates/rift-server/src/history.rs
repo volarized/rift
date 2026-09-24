@@ -63,6 +63,7 @@ impl SymbolTimelines {
         root: &Path,
         revision: Option<&RevisionId>,
         history: &HistoryConfiguration,
+        syntax: SyntaxLimits,
     ) -> Result<Self, ReadError> {
         if !history.enabled {
             return Err(ReadFault::unsupported(
@@ -94,7 +95,7 @@ impl SymbolTimelines {
             repository,
             start,
             revisions_max,
-            syntax: SyntaxLimits::default(),
+            syntax,
             walks: HashMap::new(),
             parses: HashMap::new(),
         })
@@ -603,9 +604,13 @@ mod tests {
     fn timelines_sharing_one_path_walk_once_and_parse_each_blob_once() -> TestResult {
         let (directory, service) = shared_path_fixture()?;
         let provider = CountingProvider::new();
-        let mut timelines =
-            SymbolTimelines::open(directory.path(), None, &HistoryConfiguration::default())
-                .map_err(|error| error.to_string())?;
+        let mut timelines = SymbolTimelines::open(
+            directory.path(),
+            None,
+            &HistoryConfiguration::default(),
+            SyntaxLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
         for name in ["beacon_one", "beacon_two"] {
             let matches = service
                 .index()
@@ -640,8 +645,9 @@ mod tests {
             enabled: false,
             max_revisions: 500,
         };
-        let error = SymbolTimelines::open(directory.path(), None, &disabled)
-            .expect_err("a disabled provider must refuse before any repository access");
+        let error =
+            SymbolTimelines::open(directory.path(), None, &disabled, SyntaxLimits::default())
+                .expect_err("a disabled provider must refuse before any repository access");
         assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
     }
 
@@ -649,8 +655,13 @@ mod tests {
     fn open_refuses_an_unborn_head() {
         let directory = tempfile::tempdir().expect("temp dir");
         rift_history::fixture::init(directory.path());
-        let error = SymbolTimelines::open(directory.path(), None, &HistoryConfiguration::default())
-            .expect_err("a repository without commits resolves no HEAD");
+        let error = SymbolTimelines::open(
+            directory.path(),
+            None,
+            &HistoryConfiguration::default(),
+            SyntaxLimits::default(),
+        )
+        .expect_err("a repository without commits resolves no HEAD");
         assert!(matches!(error.fault(), ReadFault::History(_)));
     }
 
@@ -661,8 +672,8 @@ mod tests {
         service: &ReadService,
         history: &HistoryConfiguration,
     ) -> TestResult<SymbolHistory> {
-        let mut timelines =
-            SymbolTimelines::open(root, None, history).map_err(|error| error.to_string())?;
+        let mut timelines = SymbolTimelines::open(root, None, history, SyntaxLimits::default())
+            .map_err(|error| error.to_string())?;
         let matches = service
             .index()
             .symbols("beacon_one", 5)

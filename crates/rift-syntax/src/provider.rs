@@ -1,17 +1,36 @@
 //! The contract every language syntax provider serves.
 
 use rift_core::{Error, ProjectPath};
+use rift_protocol::configuration::{
+    SYNTAX_DEPTH_DEFAULT, SYNTAX_FILE_BYTES_DEFAULT, SYNTAX_NODES_DEFAULT, SyntaxConfiguration,
+};
 use rift_protocol::read::{Language, NodeFacet};
 
 use crate::document::SyntaxDocument;
 use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault};
 
-/// Default maximum bytes accepted from one source.
-pub(crate) const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-/// Default maximum syntax nodes accepted from one parsed source.
-pub(crate) const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
-/// Default maximum syntax depth accepted from one parsed source.
-pub(crate) const SYNTAX_DEPTH_MAX_DEFAULT: usize = 512;
+/// Bytes accepted from one source under the default `[providers.syntax]` table.
+pub(crate) const SOURCE_BYTES_MAX_DEFAULT: usize = bound(SYNTAX_FILE_BYTES_DEFAULT);
+/// Syntax nodes accepted from one source under the default `[providers.syntax]` table.
+pub(crate) const SYNTAX_NODES_MAX_DEFAULT: usize = bound(SYNTAX_NODES_DEFAULT);
+/// Syntax depth accepted from one source under the default `[providers.syntax]` table.
+pub(crate) const SYNTAX_DEPTH_MAX_DEFAULT: usize = bound(SYNTAX_DEPTH_DEFAULT);
+
+/// One configured bound as an in-memory count. A bound past the address space
+/// saturates: no source larger than memory can be parsed anyway, and
+/// configuration acceptance keeps every key far below it.
+const fn bound(value: u64) -> usize {
+    if value > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the branch above proves the value fits in usize"
+        )]
+        let fitted = value as usize;
+        fitted
+    }
+}
 
 /// Source accepted to sans-I/O syntax analysis.
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +84,20 @@ impl SyntaxLimits {
         SYNTAX_NODES_MAX_DEFAULT,
         SYNTAX_DEPTH_MAX_DEFAULT,
     );
+
+    /// The bounds one `[providers.syntax]` table states.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] naming the first zero bound; configuration
+    /// acceptance refuses such a table before it reaches this call.
+    pub fn from_configuration(configuration: &SyntaxConfiguration) -> Result<Self, SyntaxError> {
+        Self::new(
+            bound(configuration.max_file.bytes()),
+            bound(configuration.max_nodes),
+            bound(configuration.max_depth),
+        )
+    }
 
     /// Constructs bounds from compile-time constants.
     ///
@@ -196,5 +229,30 @@ mod tests {
         assert_eq!(accepted.source_bytes_max(), 3);
         assert_eq!(accepted.syntax_nodes_max(), 4);
         assert_eq!(accepted.syntax_depth_max(), 5);
+    }
+
+    #[test]
+    fn test_from_configuration_reads_every_key_and_defaults_match_the_table() {
+        use rift_protocol::configuration::ByteSize;
+
+        assert_eq!(
+            SyntaxLimits::from_configuration(&SyntaxConfiguration::default()),
+            Ok(SyntaxLimits::DEFAULT)
+        );
+        let configured = SyntaxLimits::from_configuration(&SyntaxConfiguration {
+            max_file: ByteSize::from_bytes(16 << 20),
+            max_nodes: 5_000_000,
+            max_depth: 2_048,
+        })
+        .expect("positive bounds");
+        assert_eq!(
+            configured,
+            SyntaxLimits::new(16 << 20, 5_000_000, 2_048).expect("bounds")
+        );
+        let zero = SyntaxConfiguration {
+            max_nodes: 0,
+            ..SyntaxConfiguration::default()
+        };
+        assert!(SyntaxLimits::from_configuration(&zero).is_err());
     }
 }
