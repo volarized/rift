@@ -426,14 +426,21 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
+          # rustc links a proc-macro DLL with `/DEBUG` and no `/Brepro`, so
+          # link.exe stamps every build with a new timestamp and PDB signature.
+          # sccache hashes that DLL into the key of each crate using the macro,
+          # and none of those crates ever hit. `/Brepro` makes the link
+          # reproducible.
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            rustflags: -C link-arg=/Brepro
           # `cryptography`, which the MCP client needs, publishes no Windows
           # ARM wheel, so `rift-dev` runs on x64 Python under the runner's
           # x64 emulation; what it starts, sccache, is the native binary.
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             python: cpython-3.12-windows-x86_64-none
+            rustflags: -C link-arg=/Brepro
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
@@ -455,8 +462,13 @@ jobs:
       - uses: taiki-e/install-action@v2.87.16
         with:
           tool: cargo-nextest@0.9.140,sccache@0.18.0
-      - name: Install target
-        run: rustup target add "${{ matrix.target }}"
+      # Each runner builds for its own host, so the build passes no
+      # `--target`: with one, cargo keeps RUSTFLAGS from proc-macros and build
+      # scripts. The toolchain's host is therefore held to the matrix target.
+      - name: Install the toolchain for this target
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustc --print host-tuple | grep -Fx "${{ matrix.target }}"
       # The R2 secrets reach this step alone, and the sccache server it starts
       # holds them for every later compile. The Actions scope holds the write
       # pair and the Dependabot scope the read pair; a fork receives neither.
@@ -480,9 +492,10 @@ jobs:
       - name: Build every target and run the unit suite
         env:
           RIFT_UPDATE_TEST_BINARY: >-
-            ${{ github.workspace }}/target/${{ matrix.target }}/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
+            ${{ github.workspace }}/target/debug/rift${{ runner.os == 'Windows' && '.exe' || '' }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
-          cargo nextest run --locked --target "${{ matrix.target }}"
+          cargo nextest run --locked
           --workspace --all-targets --all-features --profile ci --no-tests fail
           --run-ignored all -E 'not test(/_probe$/)'
       - uses: actions/upload-artifact@v6.0.0

@@ -4751,8 +4751,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = super::workspace_watcher(directory.path(), &validation)
-            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let watcher = unwatched()?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
         let dependencies = empty_package_branch();
@@ -4814,8 +4813,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = super::workspace_watcher(directory.path(), &validation)
-            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let watcher = unwatched()?;
         let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
@@ -7008,8 +7006,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = super::workspace_watcher(directory.path(), &validation)
-            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let watcher = unwatched()?;
 
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
         // epoch 1 is forced to queue behind it - a deterministic gate between the
@@ -7093,6 +7090,17 @@ pub(crate) mod tests {
         validation.cancellation.cancel();
         supervisor.await?;
         Ok(())
+    }
+
+    /// A watcher on no path, for a supervisor test that moves the epoch itself.
+    ///
+    /// A watcher on the test's directory can report the file the test wrote just before
+    /// it started - FSEvents did on macOS - and that report moves the epoch past the one
+    /// the test observes.
+    fn unwatched() -> TestResult<notify::RecommendedWatcher> {
+        Ok(notify::recommended_watcher(
+            |_: notify::Result<notify::Event>| {},
+        )?)
     }
 
     /// The supervisor context the cancellation tests drive, over `blocking` sized to one
@@ -7217,8 +7225,7 @@ pub(crate) mod tests {
             current: stable_candidate(directory.path(), 0)?,
             failure: None,
         }));
-        let watcher = super::workspace_watcher(directory.path(), &validation)
-            .map_err(|error| format!("watcher must start: {error:?}"))?;
+        let watcher = unwatched()?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
         let dependencies = empty_package_branch();
         let context = cancellation_context(
