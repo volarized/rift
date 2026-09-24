@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use rift_dependency::{CatalogEntry, DependencyContext};
 use rift_index::{DependencyIndex, DependencyIndexLimits, PackageIndex, package_files};
 use rift_protocol::dependencies::PackageContextEntry;
@@ -211,21 +212,25 @@ impl PackageBranch {
             .filter(|entry| selected.contains(&selector(entry.identity())))
             .collect();
         let mut indexed = 0_u64;
-        let mut built: Vec<(PackageIdentity, Result<PackageIndex, String>)> =
-            Vec::with_capacity(entries.len());
-        for entry in &entries {
-            if entry.source_root().is_some() {
+        // Each package is analyzed from its own source root alone, so the analyses run
+        // across the rayon pool; the inserts below stay in catalog order. A rayon worker
+        // holds no ambient span, so each analysis names `package.index` as its parent.
+        let built: Vec<(PackageIdentity, Result<PackageIndex, String>)> = entries
+            .par_iter()
+            .filter(|entry| entry.source_root().is_some())
+            .map(|entry| {
                 let identity = entry.identity().clone();
                 let outcome = rift_core::traced!(
+                    parent: &span,
                     component = "dependency",
                     operation = "package.analyze",
                     manager = identity.manager.as_str(),
                     name = identity.name.as_str(),
                     { analyzed(entry, &request.limits) }
                 );
-                built.push((identity, outcome));
-            }
-        }
+                (identity, outcome)
+            })
+            .collect();
         let mut index = self.write()?;
         let mut skipped = 0_usize;
         for (identity, outcome) in built {
