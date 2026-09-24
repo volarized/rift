@@ -121,17 +121,25 @@ impl PackageAnalysisFault {
 }
 
 impl Fault for PackageAnalysisFault {
+    /// A syntax failure delegates to the underlying syntax error's identity when the source
+    /// downcasts to one. The declaration bound is a declared resource limit, so the same
+    /// package reaches it on every retry.
     fn name(&self) -> ErrorName {
-        if self.violation == PackageAnalysisViolation::Syntax {
-            return self
+        match self.violation {
+            PackageAnalysisViolation::Syntax => self
                 .source
                 .as_deref()
                 .and_then(|source| source.downcast_ref::<rift_syntax::SyntaxError>())
                 .map_or(ErrorName::Wire(ErrorCode::InternalError), |error| {
                     error.name()
-                });
+                }),
+            PackageAnalysisViolation::PackageDeclarationsExceeded => {
+                ErrorName::Wire(ErrorCode::LimitExceeded)
+            }
+            PackageAnalysisViolation::Identity | PackageAnalysisViolation::Provider => {
+                ErrorName::Wire(ErrorCode::InternalError)
+            }
         }
-        ErrorName::Wire(ErrorCode::InternalError)
     }
 
     fn context(&self) -> Vec<ErrorContext> {
@@ -1600,6 +1608,33 @@ mod tests {
             unsupported.fault().violation(),
             super::PackageAnalysisViolation::Syntax
         );
+    }
+
+    #[test]
+    fn a_package_past_the_declaration_bound_names_the_limit() {
+        use rift_core::{ErrorCode, ErrorName, RetryDirective};
+        use std::fmt::Write as _;
+
+        let per_file = super::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT / 2 + 1;
+        let source = (0..per_file).fold(String::new(), |mut source, index| {
+            writeln!(source, "def f{index}():\n    pass").expect("a string write succeeds");
+            source
+        });
+        let files = vec![("pkg/a.py", source.as_str()), ("pkg/b.py", source.as_str())];
+        let raised = rift_syntax::SyntaxLimits::new(8 << 20, 4_000_000, 512).expect("bounds");
+        let Err(error) = package_result(ShippedLanguage::Python, files, Some(raised)) else {
+            panic!("a package past the declaration bound must be refused");
+        };
+        assert_eq!(
+            error.fault().violation(),
+            super::PackageAnalysisViolation::PackageDeclarationsExceeded
+        );
+        assert_eq!(
+            error.fault().path().map(ProjectPath::as_str),
+            Some("pkg/b.py")
+        );
+        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
+        assert_eq!(error.descriptor().retry(), RetryDirective::Never);
     }
 
     #[test]
