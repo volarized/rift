@@ -3,8 +3,9 @@
 //! concurrent-read isolation require a real file, not an in-memory database.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use rift_core::{ErrorCode, ErrorName, ProjectPath, SourceUnitId};
+use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
 use rift_index::{DatabasePool, FileDigest, WorkspaceDatabase, WorkspaceDigests};
 use rift_index::{
     LexicalChange, LexicalIndexLimits, LexicalIndexViolation, LexicalMatch, LexicalRanking,
@@ -1605,6 +1606,44 @@ async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_rec
             .is_empty()
     );
     assert_index_matches_rows(&database_path(&directory)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lexical_search_index_recorded_files_past_units_max_refuse() -> TestResult {
+    let directory = TempDir::new()?;
+    let database = WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?;
+    let writer = LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+    let files = vec![
+        recorded("a.rs", b"a")?,
+        recorded("b.rs", b"b")?,
+        recorded("c.rs", b"c")?,
+    ];
+    let paths = files.iter().map(|(path, _)| path.clone()).collect();
+    writer
+        .apply(
+            &LexicalChange::new(paths, Vec::new()).with_recorded(files),
+            &LexicalStamp::published("revision-one", "derivation-a"),
+        )
+        .await?;
+
+    // A lowered `units` bound meets a store an earlier run filled under a wider one.
+    let reader =
+        LexicalSearchIndex::attached(database, LexicalIndexLimits::new(2, 65_536, 64, 4, 1_000));
+    let error = reader
+        .recorded_files("derivation-a")
+        .await
+        .expect_err("more recorded files than units_max must refuse, never truncate");
+    assert_eq!(
+        error.fault().violation(),
+        LexicalIndexViolation::RecordLimit
+    );
+    let evidence = error
+        .fault()
+        .limit_evidence()
+        .expect("a record limit carries its evidence");
+    assert_eq!(evidence.field, "lexical.files");
+    assert_eq!((evidence.limit, evidence.required), (2, 3));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
