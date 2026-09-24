@@ -175,23 +175,36 @@ cells. A restart rebuilds parser facts from source.
 SQLite keeps one validated documentation snapshot and changes only reverse-reference rows whose
 stored values differ. Those changes share the lexical writer's transaction.
 
-One transaction writes the units and the stamp together, so the store is never a partial mix of
-two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
-named the files it read deletes those paths' rows and inserts their new ones, which costs one
-delete and one insert batch per changed path instead of a rewrite of every row.
+The store records, beside each file's rows, the digest of the bytes they were derived from, and
+its stamp names what else derived them: the executable, the corpus shape, and the index-owned
+configuration. Every write compares before it writes. A rebuild that named the files it read
+deletes those paths' rows and inserts their new ones. A rebuild that read the whole workspace,
+startup included, compares every file it holds with the recorded digests and writes only the
+files whose bytes moved or that one side lacks, so a restart over an unchanged tree writes the
+stamp and nothing else. A store stamped by another executable or configuration keeps nothing: the
+write clears it first.
 
-The transaction runs behind the publication: the rebuilt index becomes current first, and the
-lexical lane runs the writes it was handed in publication order, one transaction at a time. The
-lane holds a bounded number of writes behind the running one; a write handed to a full lane
-supersedes the held ones, and the store is then owed a whole replace. One process-wide write turn
-serializes index commits, vector batches, and log batches, and each transaction starts with
+The write runs behind the publication: the rebuilt index becomes current first, and the lexical
+lane runs the writes it was handed in publication order, one at a time. The lane holds one write
+behind the running one, and a write handed while one waits merges into it: the union of the files
+both named, derived from the newer publication, leaves the store exactly as running both would. A
+burst of changes therefore costs one write per lane turn. One process-wide write turn serializes
+index commits, vector batches, and log batches, and each transaction starts with
 `BEGIN IMMEDIATE`.
+
+A write commits in transactions of at most
+[`[search.lexical]`](/docs/developer/configuration#search) `transaction_units` units and
+`transaction_size` content bytes, one file's rows always in one transaction. Every transaction
+but the last stamps no tree, so a reader meets no publication rather than a mix of two, and only
+the last names the tree the write answers for. A server that stops during a write aborts one
+transaction: the ones already committed recorded their files' digests with their rows, so the next
+start's comparison writes only the files the stopped write did not reach.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
-server log; the next publication's transaction replaces the whole unit set.
+server log; the next write compares its whole publication with the recorded digests.
 
 The database tables:
 

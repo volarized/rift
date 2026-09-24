@@ -25,13 +25,16 @@
 //! holds the values they were indexed from, and indexes a typed row only after
 //! it is written.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LimitEvidence, ProjectPath, fault_label,
 };
-use rift_protocol::configuration::LEXICAL_UNITS_MAX_DEFAULT;
+use rift_protocol::configuration::{
+    LEXICAL_TRANSACTION_BYTES_DEFAULT, LEXICAL_TRANSACTION_UNITS_DEFAULT, LEXICAL_UNITS_MAX_DEFAULT,
+};
 use rift_ranking::{
     CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
     IndexCapabilities, IndexDocument, IndexReader, ParsedQuery, PublicationFormat, QueryPhase,
@@ -357,12 +360,14 @@ pub struct LexicalIndexLimits {
     pool_slots: u32,
     busy_timeout_ms: u32,
     documentation_bytes_max: usize,
+    transaction_units_max: usize,
+    transaction_bytes_max: usize,
 }
 
 impl LexicalIndexLimits {
     /// Constructs explicit lexical index bounds.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         units_max: u32,
         unit_bytes_max: u32,
         matches_max: u32,
@@ -376,7 +381,36 @@ impl LexicalIndexLimits {
             pool_slots,
             busy_timeout_ms,
             documentation_bytes_max: crate::documentation_store::METADATA_BYTES_MAX,
+            transaction_units_max: bound_u64_as_usize(LEXICAL_TRANSACTION_UNITS_DEFAULT),
+            transaction_bytes_max: bound_u64_as_usize(LEXICAL_TRANSACTION_BYTES_DEFAULT),
         }
+    }
+
+    /// Bounds the units and content bytes one transaction writes. A write past either
+    /// commits in several transactions, one file's units always in one.
+    #[must_use]
+    pub const fn with_transaction_bounds(
+        self,
+        transaction_units_max: usize,
+        transaction_bytes_max: usize,
+    ) -> Self {
+        Self {
+            transaction_units_max,
+            transaction_bytes_max,
+            ..self
+        }
+    }
+
+    /// Returns the most units one transaction writes.
+    #[must_use]
+    pub const fn transaction_units_max(self) -> usize {
+        self.transaction_units_max
+    }
+
+    /// Returns the most content bytes one transaction writes.
+    #[must_use]
+    pub const fn transaction_bytes_max(self) -> usize {
+        self.transaction_bytes_max
     }
 
     /// Bounds the encoded documentation metadata one commit stores. A commit whose
@@ -654,6 +688,12 @@ pub(crate) fn batch_limit_error(
 /// Maps one Toasty operating failure onto [`LexicalIndexViolation::Storage`].
 pub(crate) fn storage_error(source: toasty::Error) -> LexicalIndexError {
     lexical_error_caused_by(LexicalIndexViolation::Storage, None, source)
+}
+
+/// Narrows an accepted `u64` bound into `usize`, answering the platform's ceiling for a
+/// bound no in-memory collection could reach anyway.
+pub(crate) fn bound_u64_as_usize(bound: u64) -> usize {
+    usize::try_from(bound).unwrap_or(usize::MAX)
 }
 
 /// Widens a `u32` domain bound into `usize` for in-memory comparisons; `u32`
@@ -1315,6 +1355,55 @@ impl LexicalChange {
         self.replaced.is_empty() && self.inserted.is_empty() && self.recorded.is_empty()
     }
 
+    /// This change as consecutive parts, each writing at most `units_max` units and
+    /// `bytes_max` content bytes, in replaced-path order.
+    ///
+    /// A path's deletion, its units, and its recorded digest always land in one part, so
+    /// applying the parts in order leaves exactly what applying the whole change leaves,
+    /// and a store that stops between two parts holds whole paths alone. A path whose own
+    /// units pass either bound takes a part of its own. A unit filed under a path the
+    /// change does not replace joins the last part. An empty change answers one empty
+    /// part, since the part that lands last is what stamps the store.
+    #[must_use]
+    pub fn into_parts_within(self, units_max: usize, bytes_max: usize) -> Vec<Self> {
+        let Self {
+            replaced,
+            inserted,
+            recorded,
+        } = self;
+        let mut units_by_path: BTreeMap<ProjectPath, Vec<IndexDocument>> = BTreeMap::new();
+        let mut unfiled = Vec::new();
+        for unit in inserted {
+            match unit.location() {
+                DocumentLocation::Project(path) if replaced.contains(path) => {
+                    units_by_path.entry(path.clone()).or_default().push(unit);
+                }
+                DocumentLocation::Project(_) | DocumentLocation::Unit(_) => unfiled.push(unit),
+            }
+        }
+        let mut digests: BTreeMap<ProjectPath, FileDigest> = recorded.into_iter().collect();
+        let mut parts = vec![Self::default()];
+        let mut room = PartRoom::new(units_max, bytes_max);
+        for path in replaced {
+            let units = units_by_path.remove(&path).unwrap_or_default();
+            if !room.admits(&units) {
+                parts.push(Self::default());
+                room = PartRoom::new(units_max, bytes_max);
+            }
+            room.take(&units);
+            let last = parts.len() - 1;
+            let part = &mut parts[last];
+            part.recorded
+                .extend(digests.remove(&path).map(|digest| (path.clone(), digest)));
+            part.replaced.push(path);
+            part.inserted.extend(units);
+        }
+        let last = parts.len() - 1;
+        parts[last].inserted.extend(unfiled);
+        parts[last].recorded.extend(digests);
+        parts
+    }
+
     /// The change as its three halves, for a caller that rebuilds it over a narrowed
     /// unit list.
     #[must_use]
@@ -1327,6 +1416,48 @@ impl LexicalChange {
     ) {
         (self.replaced, self.inserted, self.recorded)
     }
+}
+
+/// What one part of a split change has left to hold, in units and content bytes.
+///
+/// A part that holds nothing yet admits any path, which is what lets a path larger than
+/// either bound take a part of its own.
+struct PartRoom {
+    units_left: usize,
+    bytes_left: usize,
+    empty: bool,
+}
+
+impl PartRoom {
+    const fn new(units_max: usize, bytes_max: usize) -> Self {
+        Self {
+            units_left: units_max,
+            bytes_left: bytes_max,
+            empty: true,
+        }
+    }
+
+    /// Whether this part can take one path's `units` whole.
+    fn admits(&self, units: &[IndexDocument]) -> bool {
+        let fits_units = units.len() <= self.units_left;
+        let fits_bytes = content_bytes(units) <= self.bytes_left;
+        self.empty || (fits_units && fits_bytes)
+    }
+
+    /// Counts one path's `units` against this part.
+    fn take(&mut self, units: &[IndexDocument]) {
+        self.units_left = self.units_left.saturating_sub(units.len());
+        self.bytes_left = self.bytes_left.saturating_sub(content_bytes(units));
+        self.empty = false;
+    }
+}
+
+/// The content bytes `units` carry together.
+fn content_bytes(units: &[IndexDocument]) -> usize {
+    units
+        .iter()
+        .map(|unit| unit.content().len())
+        .fold(0, usize::saturating_add)
 }
 
 /// What one lexical transaction stamps the store with.
@@ -1985,12 +2116,13 @@ fn reader_refused(error: LexicalIndexError) -> RankingError {
 #[cfg(test)]
 mod tests {
     use super::{
-        LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault, LexicalIndexLimits,
-        LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch, LexicalRanking,
-        LexicalSearchIndex, MIGRATION_FILES, checked_byte_length, decode_lexical_match,
-        decode_recorded, isolated_weights, lexical_error, lexical_error_caused_by,
-        lexical_search_column_types, lexical_search_sql, matched_fields, project_location,
-        rank_weights, require_pragma_row, searchable_columns, validate_lexical_batch,
+        LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault,
+        LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch,
+        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, checked_byte_length,
+        decode_lexical_match, decode_recorded, isolated_weights, lexical_error,
+        lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
+        project_location, rank_weights, require_pragma_row, searchable_columns,
+        validate_lexical_batch,
     };
     use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
     use rift_ranking::{
@@ -2015,6 +2147,57 @@ mod tests {
             -1.0,
             FieldSet::of(SearchableField::FileContent),
         )
+    }
+
+    /// One unit filed under `path`, carrying `bytes` of declaration source.
+    fn unit_under(path: &str, name: &str, bytes: usize) -> IndexDocument {
+        let fields = DocumentFields::empty()
+            .with(SearchableField::Name, name)
+            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+        let digest = fields.digest();
+        IndexDocument::new(
+            identity(&format!("{path}#{name}")),
+            DocumentLocation::Project(ProjectPath::new(path).expect("fixture path must be valid")),
+            DocumentKind::Symbol,
+            digest,
+            fields,
+        )
+        .expect("fixture document must construct")
+    }
+
+    fn fixture_change(paths: &[(&str, usize)], unit_bytes: usize) -> LexicalChange {
+        let replaced = paths
+            .iter()
+            .map(|(path, _)| ProjectPath::new(*path).expect("fixture path must be valid"))
+            .collect::<Vec<_>>();
+        let inserted = paths
+            .iter()
+            .flat_map(|(path, units)| {
+                (0..*units).map(move |index| unit_under(path, &format!("unit{index}"), unit_bytes))
+            })
+            .collect();
+        let recorded = replaced
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    crate::FileDigest::of(path.as_str().as_bytes()),
+                )
+            })
+            .collect();
+        LexicalChange::new(replaced, inserted).with_recorded(recorded)
+    }
+
+    fn part_paths(parts: &[LexicalChange]) -> Vec<Vec<String>> {
+        parts
+            .iter()
+            .map(|part| {
+                part.replaced()
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect()
+            })
+            .collect()
     }
 
     fn symbol_document(name: &str, source: &str) -> IndexDocument {
@@ -2403,6 +2586,84 @@ mod tests {
         assert!(formatted.contains("deadbeef"));
         assert!(formatted.contains("0f1e2d3c"));
         assert!(formatted.contains("a1b2c3d4"));
+    }
+
+    #[test]
+    fn test_an_empty_change_splits_into_one_empty_part() {
+        let parts = LexicalChange::default().into_parts_within(10, 1_000);
+        assert_eq!(parts, vec![LexicalChange::default()]);
+    }
+
+    #[test]
+    fn test_a_change_within_both_bounds_stays_one_part() {
+        let change = fixture_change(&[("a.rs", 2), ("b.rs", 3)], 10);
+        let parts = change.clone().into_parts_within(5, 50);
+        assert_eq!(parts, vec![change]);
+    }
+
+    #[test]
+    fn test_a_split_keeps_every_path_whole_and_starts_a_part_at_the_unit_bound() {
+        let change = fixture_change(&[("a.rs", 2), ("b.rs", 3), ("c.rs", 1)], 10);
+        let parts = change.into_parts_within(4, 1_000);
+        assert_eq!(part_paths(&parts), vec![vec!["a.rs"], vec!["b.rs", "c.rs"]]);
+        for part in &parts {
+            for unit in part.inserted() {
+                let DocumentLocation::Project(path) = unit.location() else {
+                    panic!("fixture units are project documents");
+                };
+                assert!(
+                    part.replaced().contains(path),
+                    "{path} left its path's part"
+                );
+            }
+            let recorded: Vec<_> = part
+                .recorded()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(
+                recorded,
+                part.replaced().to_vec(),
+                "a digest travels with its path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_path_past_the_bound_takes_a_part_of_its_own() {
+        let change = fixture_change(&[("a.rs", 1), ("big.json", 7), ("c.rs", 1)], 10);
+        let parts = change.into_parts_within(3, 1_000);
+        assert_eq!(
+            part_paths(&parts),
+            vec![vec!["a.rs"], vec!["big.json"], vec!["c.rs"]]
+        );
+        assert_eq!(parts[1].inserted().len(), 7);
+    }
+
+    #[test]
+    fn test_a_split_starts_a_part_at_the_byte_bound() {
+        let change = fixture_change(&[("a.rs", 1), ("b.rs", 1), ("c.rs", 1)], 40);
+        let parts = change.into_parts_within(100, 100);
+        assert_eq!(part_paths(&parts), vec![vec!["a.rs", "b.rs"], vec!["c.rs"]]);
+    }
+
+    #[test]
+    fn test_units_and_digests_under_no_replaced_path_join_the_last_part() {
+        let stray_path = ProjectPath::new("stray.rs").expect("fixture path must be valid");
+        let (replaced, mut inserted, mut recorded) =
+            fixture_change(&[("a.rs", 2), ("b.rs", 2)], 10).into_parts();
+        inserted.push(unit_under("stray.rs", "stray", 10));
+        recorded.push((stray_path.clone(), crate::FileDigest::of(b"stray")));
+        let parts = LexicalChange::new(replaced, inserted)
+            .with_recorded(recorded)
+            .into_parts_within(2, 1_000);
+        let last = parts.last().expect("a split answers at least one part");
+        assert!(
+            last.inserted()
+                .iter()
+                .any(|unit| unit.location() == &DocumentLocation::Project(stray_path.clone()))
+        );
+        assert!(last.recorded().iter().any(|(path, _)| path == &stray_path));
     }
 
     #[test]

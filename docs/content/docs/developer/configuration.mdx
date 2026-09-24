@@ -665,12 +665,21 @@ file, text chunk, and declaration, 1000 to 50000000:
 ```toml
 [search.lexical]
 units_max = 1000000
+transaction_units = 5000
+transaction_size = "16mb"
 ```
 
 A workspace past it publishes its index without the lexical ranking: the store refuses the
 commit, and `search` answers from identifier matching with a `lexical_ranking_unavailable`
 warning naming `units_max`, the observed count, and the maximum. Raise the key, or narrow
 [`[source]`](/docs/developer/configuration#source) so fewer files reach the index.
+
+`transaction_units`, 100 to 1000000, and `transaction_size`, 1mb to 1gb, bound one
+transaction of a lexical write. A write past either commits in several transactions, and the
+last one stamps the tree it answers for. One file's units always share a transaction, so a
+file holding more takes one of its own. The bounds are what a server asked to stop waits on:
+it aborts the transaction running, and the next start writes what that transaction did not
+reach.
 
 One unit holds at most 1mb of content. A declaration past that - a bundled source file whose
 whole body is one declaration, for example - is left out of the lexical index rather than

@@ -220,6 +220,10 @@ fn lexical_index_limits(search: &SearchConfiguration) -> LexicalIndexLimits {
         pool_slots,
         busy_timeout_ms,
     )
+    .with_transaction_bounds(
+        usize::try_from(search.lexical.transaction_units).unwrap_or(usize::MAX),
+        usize::try_from(search.lexical.transaction_size.bytes()).unwrap_or(usize::MAX),
+    )
 }
 
 /// Which embedding one `[search.vector.embedding]` table selects, and what it needs
@@ -1047,9 +1051,9 @@ fn ranking_of(
         (_, LexicalCommitState::Owed { cause }) => Some(SearchRanking::unavailable(
             &bounded_detail(
                 format!(
-                    "the lexical index missed a commit and replaces its whole unit set under \
-                     the next publication, so the answer for tree revision {tree_revision} \
-                     was ranked by identifier matching alone: {cause}"
+                    "the lexical index missed a commit and compares every file with the \
+                     digests it recorded under the next publication, so the answer for tree \
+                     revision {tree_revision} was ranked by identifier matching alone: {cause}"
                 ),
                 WARNING_DETAIL_BYTES_MAX,
             ),
@@ -1413,11 +1417,17 @@ impl RiftMcp {
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
-        spawn_lexical: impl FnOnce(Arc<SearchIndex>, BlockingExecutor, CancellationToken) -> LexicalLane,
+        spawn_lexical: impl FnOnce(
+            Arc<SearchIndex>,
+            BlockingExecutor,
+            CancellationToken,
+            Arc<str>,
+        ) -> LexicalLane,
     ) -> Result<AssembledServer, ReadError> {
         let identity = crate::identity::product_identity()
             .await
             .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
+        let executable_digest: Arc<str> = Arc::from(identity.executable_digest.as_str());
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
@@ -1444,7 +1454,9 @@ impl RiftMcp {
             &validation,
             &published,
             lexical_write,
-            |index, cancellation| spawn_lexical(index, blocking.clone(), cancellation),
+            |index, cancellation| {
+                spawn_lexical(index, blocking.clone(), cancellation, executable_digest)
+            },
         );
         // The log store shares the database owner without depending on index readiness. Its
         // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
@@ -5204,9 +5216,15 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
-            move |index, blocking, cancellation| {
+            move |index, blocking, cancellation, executable_digest| {
                 gate.attach(index);
-                LexicalLane::spawn_over(gate, usize::MAX, blocking, cancellation)
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    executable_digest,
+                )
             },
         )
         .await?;
