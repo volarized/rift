@@ -1592,10 +1592,8 @@ fn query_line<'source>(
     let mut offset: u64 = 0;
     for (index, raw_line) in line::lines_inclusive(content).enumerate() {
         let text = line::without_ending(raw_line);
-        if terms
-            .iter()
-            .any(|term| text.to_lowercase().contains(term.as_str()))
-        {
+        let lowered = text.to_lowercase();
+        if terms.iter().any(|term| lowered.contains(term.as_str())) {
             let start = offset;
             let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
             let line_number = u64::try_from(index + 1).unwrap_or(u64::MAX);

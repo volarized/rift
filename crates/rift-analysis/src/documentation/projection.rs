@@ -805,6 +805,10 @@ fn caused_by(
 
 /// Picks the narrowest block containing the located match, ties broken by source, start,
 /// then block identity; with no located match, the first mapping.
+///
+/// A located range depends on the identity and the source alone, and one identity can map
+/// onto every block of one source - a heading onto each block under it - so `locate` runs
+/// once per distinct source rather than once per mapping.
 fn choose_mapping<'layer, F>(
     mappings: &[ResolvedMapping<'layer>],
     identity: &DocumentIdentity,
@@ -813,10 +817,20 @@ fn choose_mapping<'layer, F>(
 where
     F: FnMut(&DocumentIdentity, &DocumentationContentIdentity) -> Option<TextRange>,
 {
+    let mut located_sources: Vec<(&DocumentationContentIdentity, Option<TextRange>)> = Vec::new();
     let mut located = false;
     let mut best: Option<ResolvedMapping<'layer>> = None;
     for mapping in mappings {
-        let Some(range) = locate(identity, &mapping.block.source) else {
+        let source = &mapping.block.source;
+        let range =
+            if let Some((_, range)) = located_sources.iter().find(|(seen, _)| *seen == source) {
+                range.clone()
+            } else {
+                let range = locate(identity, source);
+                located_sources.push((source, range.clone()));
+                range
+            };
+        let Some(range) = range else {
             continue;
         };
         located = true;
@@ -1562,6 +1576,50 @@ mod tests {
             .project(&inputs, DocumentationProjectionTarget::All, |_, _| None)
             .expect("all projection");
         assert_eq!(result[0].order()[0].identity(), &package_owner);
+    }
+
+    #[test]
+    fn locate_runs_once_per_source_an_identity_maps_onto() {
+        let source = source(
+            "docs/guide.md",
+            "0123456789abcdefghij",
+            DocumentationSourceFormat::Markdown,
+        );
+        let blocks = [("first", 0, 5), ("second", 5, 10), ("third", 10, 20)]
+            .into_iter()
+            .map(|(name, start, end)| {
+                block(
+                    &source,
+                    name,
+                    TextRange { start, end },
+                    Vec::new(),
+                    &["Guide"],
+                    None,
+                )
+            })
+            .collect();
+        let collection = collection(vec![source], blocks);
+        let projection = DocumentationProjection::new(&collection).expect("projection");
+        let heading = rift_core::symbol_identity("markdown", "docs/guide.md", "Guide");
+        let mut calls = 0;
+        let projected = projection
+            .project(
+                &[input(&heading, FieldSet::EMPTY)],
+                DocumentationProjectionTarget::Documentation,
+                |_, _| {
+                    calls += 1;
+                    Some(TextRange { start: 6, end: 8 })
+                },
+            )
+            .expect("projection");
+        assert_eq!(calls, 1);
+        assert_eq!(
+            projection
+                .block(projected[0].order()[0].identity())
+                .expect("located block")
+                .identity,
+            content_digest(b"second")
+        );
     }
 
     #[test]
