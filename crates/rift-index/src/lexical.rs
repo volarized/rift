@@ -308,6 +308,7 @@ pub struct LexicalIndexLimits {
     matches_max: u32,
     pool_slots: u32,
     busy_timeout_ms: u32,
+    documentation_bytes_max: usize,
 }
 
 impl LexicalIndexLimits {
@@ -326,7 +327,24 @@ impl LexicalIndexLimits {
             matches_max,
             pool_slots,
             busy_timeout_ms,
+            documentation_bytes_max: crate::documentation_store::METADATA_BYTES_MAX,
         }
+    }
+
+    /// Bounds the encoded documentation metadata one commit stores. A commit whose
+    /// metadata encodes past it stores its lexical documents without the metadata.
+    #[must_use]
+    pub const fn with_documentation_bytes_max(self, documentation_bytes_max: usize) -> Self {
+        Self {
+            documentation_bytes_max,
+            ..self
+        }
+    }
+
+    /// Returns the encoded documentation metadata bytes one commit stores, at most.
+    #[must_use]
+    pub const fn documentation_bytes_max(self) -> usize {
+        self.documentation_bytes_max
     }
 
     /// Returns maximum indexed documents accepted per `replace_all`.
@@ -1161,7 +1179,8 @@ impl LexicalSearchIndex {
     ///
     /// # Errors
     ///
-    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    /// Refuses invalid document batches or storage failure. Metadata that encodes past
+    /// [`LexicalIndexLimits::documentation_bytes_max`] is left out of the commit instead.
     pub async fn replace_all_with_documentation(
         &self,
         documents: &[IndexDocument],
@@ -1184,9 +1203,10 @@ impl LexicalSearchIndex {
             mode = "replace",
             {
                 validate_lexical_batch(documents, self.limits)?;
-                let metadata = documentation
-                    .map(crate::documentation_store::EncodedDocumentation::new)
-                    .transpose()?;
+                let metadata = crate::documentation_store::encode_within(
+                    documentation,
+                    self.limits.documentation_bytes_max(),
+                )?;
 
                 let mut access = self.database.writing().await?;
                 let mut transaction = access.transaction().await?;
@@ -1249,7 +1269,8 @@ impl LexicalSearchIndex {
     ///
     /// # Errors
     ///
-    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    /// Refuses invalid document batches or storage failure. Metadata that encodes past
+    /// [`LexicalIndexLimits::documentation_bytes_max`] is left out of the commit instead.
     pub async fn apply_with_documentation(
         &self,
         change: &LexicalChange,
@@ -1272,9 +1293,10 @@ impl LexicalSearchIndex {
             mode = "apply",
             {
                 validate_lexical_units(change.inserted(), self.limits)?;
-                let metadata = documentation
-                    .map(crate::documentation_store::EncodedDocumentation::new)
-                    .transpose()?;
+                let metadata = crate::documentation_store::encode_within(
+                    documentation,
+                    self.limits.documentation_bytes_max(),
+                )?;
 
                 let mut access = self.database.writing().await?;
                 let mut transaction = access.transaction().await?;
@@ -1326,7 +1348,7 @@ impl LexicalSearchIndex {
             }
             Some(_) => {}
         }
-        crate::documentation_store::read(&mut transaction)
+        crate::documentation_store::read(&mut transaction, self.limits.documentation_bytes_max())
             .await
             .map(RevisionScoped::Matched)
     }

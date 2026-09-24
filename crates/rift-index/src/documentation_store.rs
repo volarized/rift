@@ -12,8 +12,12 @@ use crate::lexical::{
     storage_error,
 };
 
-/// Maximum encoded documentation metadata retained by one workspace publication.
-const METADATA_BYTES_MAX: usize = 64 * 1_024 * 1_024;
+/// Encoded documentation metadata one workspace publication stores, at most.
+///
+/// The fastapi corpus tree, whose documentation is translated into a dozen languages,
+/// encodes 103 MB for 124,000 blocks; the bound holds it with room for the collection's
+/// block bound to fill.
+pub(crate) const METADATA_BYTES_MAX: usize = 256 * 1_024 * 1_024;
 const MANIFEST_ID: i64 = 1;
 
 #[derive(Debug, toasty::Model)]
@@ -40,21 +44,23 @@ pub(crate) struct EncodedDocumentation {
 }
 
 impl EncodedDocumentation {
-    pub(crate) fn new(collection: &DocumentationCollection) -> Result<Self, LexicalIndexError> {
-        let mut writer = MetadataWriter {
-            bytes: Vec::new(),
-            limit: METADATA_BYTES_MAX,
-            exceeded: false,
-        };
-        let encoded = serde_json::to_writer(&mut writer, collection.index());
-        if writer.exceeded {
+    /// Encodes one collection's metadata within `bytes_max` encoded bytes.
+    ///
+    /// Encoding runs to the end even past the bound, keeping no bytes beyond it, so a
+    /// refusal reports the size the metadata measured.
+    fn within(
+        collection: &DocumentationCollection,
+        bytes_max: usize,
+    ) -> Result<Self, LexicalIndexError> {
+        let mut writer = MetadataWriter::new(bytes_max);
+        serde_json::to_writer(&mut writer, collection.index()).map_err(invalid_metadata)?;
+        if writer.exceeded() {
             return Err(batch_limit_error(
                 "documentation.bytes",
-                METADATA_BYTES_MAX as u64 + 1,
-                METADATA_BYTES_MAX as u64,
+                writer.written as u64,
+                bytes_max as u64,
             ));
         }
-        encoded.map_err(invalid_metadata)?;
         let payload = String::from_utf8(writer.bytes).map_err(invalid_metadata)?;
         let references = collection
             .index()
@@ -77,23 +83,69 @@ impl EncodedDocumentation {
     }
 }
 
+/// Encodes the metadata one commit stores, leaving it out when it crosses `bytes_max`.
+///
+/// Metadata past the bound never fails the commit it rides: the lexical documents commit
+/// without it, the stored metadata is cleared instead of left describing an older tree,
+/// and a warning names the size the encoding measured.
+///
+/// # Errors
+///
+/// Returns [`LexicalIndexError`] when the metadata cannot be encoded at all.
+pub(crate) fn encode_within(
+    documentation: Option<&DocumentationCollection>,
+    bytes_max: usize,
+) -> Result<Option<EncodedDocumentation>, LexicalIndexError> {
+    let Some(collection) = documentation else {
+        return Ok(None);
+    };
+    match EncodedDocumentation::within(collection, bytes_max) {
+        Ok(encoded) => Ok(Some(encoded)),
+        Err(error) if error.fault().violation() == LexicalIndexViolation::RecordLimit => {
+            tracing::warn!(
+                component = "search",
+                operation = "search.commit",
+                %error,
+                "documentation metadata crossed its byte bound and was left out of the commit"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Collects encoded bytes up to a bound and counts every byte past it.
 struct MetadataWriter {
     bytes: Vec<u8>,
     limit: usize,
-    exceeded: bool,
+    written: usize,
+}
+
+impl MetadataWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            written: 0,
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.written > self.limit
+    }
 }
 
 impl Write for MetadataWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-            self.exceeded = true;
-            return Err(std::io::Error::other(
-                "documentation metadata exceeds byte bound",
-            ));
+        self.written = self.written.saturating_add(bytes.len());
+        if self.exceeded() {
+            self.bytes = Vec::new();
+        } else {
+            self.bytes.extend_from_slice(bytes);
         }
-        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
@@ -221,6 +273,7 @@ fn previous_reference_rows(
 /// Decodes and revalidates metadata within the caller's revision-scoped transaction.
 pub(crate) async fn read(
     executor: &mut dyn Executor,
+    bytes_max: usize,
 ) -> Result<Option<DocumentationCollection>, LexicalIndexError> {
     let record = DocumentationManifestRecord::filter_by_id(MANIFEST_ID)
         .first()
@@ -230,11 +283,11 @@ pub(crate) async fn read(
     let Some(record) = record else {
         return Ok(None);
     };
-    if record.payload.len() > METADATA_BYTES_MAX {
+    if record.payload.len() > bytes_max {
         return Err(batch_limit_error(
             "documentation.bytes",
             record.payload.len() as u64,
-            METADATA_BYTES_MAX as u64,
+            bytes_max as u64,
         ));
     }
     let index: DocumentationIndex =
@@ -257,73 +310,86 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn metadata_encoding_accepts_exact_bound_and_refuses_growth() {
-        let mut writer = MetadataWriter {
-            bytes: Vec::new(),
-            limit: 4,
-            exceeded: false,
-        };
+    fn metadata_writer_keeps_the_exact_bound_and_counts_past_it() {
+        let mut writer = MetadataWriter::new(4);
         writer.write_all(b"text").expect("exact bound");
-        assert!(!writer.exceeded);
-        assert!(writer.write_all(b"!").is_err());
-        assert!(writer.exceeded);
+        assert!(!writer.exceeded());
         assert_eq!(writer.bytes, b"text");
+        writer
+            .write_all(b"!!")
+            .expect("counting continues past the bound");
+        assert!(writer.exceeded());
+        assert_eq!(writer.written, 6);
+        assert!(writer.bytes.is_empty());
     }
 
+    /// Regression for #363: the refusal reports the encoded size it measured, not the
+    /// bound plus one.
     #[test]
-    fn metadata_encoding_refuses_collection_over_serialized_bound() {
-        let collection = large_metadata_collection();
-        let Err(error) = EncodedDocumentation::new(&collection) else {
+    fn metadata_encoding_past_the_bound_reports_the_measured_size() {
+        let metadata = collection("Guide.\n");
+        let measured = serde_json::to_vec(metadata.index())
+            .expect("fixture metadata encodes")
+            .len();
+        let Err(error) = EncodedDocumentation::within(&metadata, measured - 1) else {
             panic!("serialized metadata over bound must be refused");
         };
         assert_eq!(
             error.fault().violation(),
             crate::LexicalIndexViolation::RecordLimit
         );
+        assert!(
+            error.to_string().contains(&format!("observed {measured}")),
+            "refusal must name the measured size {measured}: {error}"
+        );
+        assert!(EncodedDocumentation::within(&metadata, measured).is_ok());
     }
 
-    fn large_metadata_collection() -> rift_analysis::documentation::DocumentationCollection {
-        use rift_protocol::documentation::{
-            DocumentationContentIdentity, DocumentationSelectionReason, DocumentationSource,
-            DocumentationSourceFormat, DocumentationSourceIdentity,
-        };
-        use rift_protocol::read::{ProjectPath, SourceKind, SourceLocationKind, SymbolOrigin};
+    /// Regression for #363: metadata past the bound leaves the commit's lexical documents
+    /// stored and clears the metadata an earlier commit stored.
+    #[tokio::test]
+    async fn metadata_past_the_bound_commits_lexical_documents_without_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{LexicalIndexLimits, LexicalSearchIndex, RevisionScoped};
 
-        let digest = rift_analysis::documentation::content_digest(b"");
-        let origin = SymbolOrigin {
-            location: Some(SourceLocationKind::Project),
-            package: None,
-            source_kind: SourceKind::Authored,
-        };
-        let mut sources = Vec::with_capacity(70_000);
-        for index in 0..70_000 {
-            let prefix = format!("source-{index:05}/");
-            let path = format!("{prefix}{}.txt", "x".repeat(996 - prefix.len()));
-            sources.push(DocumentationSource {
-                identity: DocumentationContentIdentity {
-                    source: DocumentationSourceIdentity::Project {
-                        path: ProjectPath(path),
-                    },
-                    cell: None,
-                },
-                revision: digest.clone(),
-                content_digest: digest.clone(),
-                origin: origin.clone(),
-                format: DocumentationSourceFormat::Text,
-                media_type: "text/plain".into(),
-                selection: DocumentationSelectionReason::Workspace,
-                byte_length: 0,
-                language: None,
-                physical_ranges: Vec::new(),
-                license: None,
-            });
-        }
-        rift_analysis::documentation::DocumentationCollection::from_candidate_blocks(
-            rift_analysis::documentation::documentation_revision(),
-            sources,
-            Vec::new(),
+        let temp = tempfile::tempdir()?;
+        let database = crate::WorkspaceDatabase::open(
+            &temp.path().join("index.db"),
+            crate::DatabasePool::new(2, 1000),
         )
-        .expect("bounded empty source records form valid metadata")
+        .await?;
+        let path = rift_core::ProjectPath::new("README.md")?;
+        let text = "quartzterm guide\n";
+        let metadata = collection(text);
+        let document = index_document(&path, text, "digest")?;
+        let fits = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default(),
+        );
+        fits.replace_all_with_documentation(std::slice::from_ref(&document), "tree1", &metadata)
+            .await?;
+        let store = LexicalSearchIndex::attached(
+            std::sync::Arc::clone(&database),
+            LexicalIndexLimits::default().with_documentation_bytes_max(64),
+        );
+        store
+            .replace_all_with_documentation(std::slice::from_ref(&document), "tree2", &metadata)
+            .await?;
+        assert!(matches!(
+            store.documentation("tree2").await?,
+            RevisionScoped::Matched(None)
+        ));
+        assert!(read_reference_rows(&database).await?.is_empty());
+        let identity = rift_ranking::DocumentIdentity::new("README.md")?;
+        assert_eq!(store.content(&identity).await?.as_deref(), Some(text));
+        store
+            .apply_with_documentation(&crate::LexicalChange::default(), "tree3", &metadata)
+            .await?;
+        assert!(matches!(
+            store.documentation("tree3").await?,
+            RevisionScoped::Matched(None)
+        ));
+        Ok(())
     }
 
     #[tokio::test]
@@ -335,7 +401,7 @@ mod tests {
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
-        let encoded = EncodedDocumentation::new(&collection("Guide.\n"))?;
+        let encoded = EncodedDocumentation::within(&collection("Guide.\n"), METADATA_BYTES_MAX)?;
         let mut access = database.writing().await?;
         let mut transaction = access.transaction().await?;
         let row_limit = i64::from(rift_protocol::documentation::DOCUMENTATION_REFERENCES_MAX);
@@ -424,9 +490,10 @@ mod tests {
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
+        let bytes_max = 4_096;
         let store = LexicalSearchIndex::attached(
             std::sync::Arc::clone(&database),
-            LexicalIndexLimits::default(),
+            LexicalIndexLimits::default().with_documentation_bytes_max(bytes_max),
         );
         assert!(matches!(
             store.documentation("tree").await?,
@@ -440,7 +507,7 @@ mod tests {
             store.documentation("tree").await?,
             RevisionScoped::Matched(Some(_))
         ));
-        let oversized_payload = "x".repeat(METADATA_BYTES_MAX + 1);
+        let oversized_payload = "x".repeat(bytes_max + 1);
         let mut access = database.writing().await?;
         let mut transaction = access.transaction().await?;
         toasty::sql::statement("UPDATE documentation_manifest SET payload = ?1 WHERE id = 1")
@@ -707,8 +774,8 @@ mod tests {
         );
         let prior = reference_collection("api.md", "Use `Compass`, then `Compass`.\n")?;
         let current = reference_collection("api.md", "Use `Apex`, then `Compass`.\n")?;
-        let prior_encoded = EncodedDocumentation::new(&prior)?;
-        let current_encoded = EncodedDocumentation::new(&current)?;
+        let prior_encoded = EncodedDocumentation::within(&prior, METADATA_BYTES_MAX)?;
+        let current_encoded = EncodedDocumentation::within(&current, METADATA_BYTES_MAX)?;
         let mut prior_rows = prior_encoded.references.clone();
         prior_rows.sort_by(|left, right| left.0.cmp(&right.0));
         store
