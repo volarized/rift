@@ -3078,7 +3078,8 @@ pub(crate) mod lexical_double {
     pub(crate) const EXECUTABLE_DIGEST: &str = "test-executable";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
-    /// one permit before it answers, refusing changes when told to, and writing through to
+    /// one permit before it answers, refusing changes or recorded-digest reads when told to,
+    /// and writing through to
     /// the attached index when one is held. A write whose future is dropped while the
     /// store still holds it is counted, so a test can prove an abort reached it.
     pub(crate) struct StoreDouble {
@@ -3086,6 +3087,7 @@ pub(crate) mod lexical_double {
         calls: Mutex<Vec<(&'static str, String)>>,
         applied: Mutex<Vec<Vec<rift_core::ProjectPath>>>,
         refuse_changes: AtomicBool,
+        refuse_reads: AtomicBool,
         inner: Mutex<Option<Arc<SearchIndex>>>,
         dropped_while_held: AtomicUsize,
     }
@@ -3119,6 +3121,7 @@ pub(crate) mod lexical_double {
                 calls: Mutex::new(Vec::new()),
                 applied: Mutex::new(Vec::new()),
                 refuse_changes: AtomicBool::new(false),
+                refuse_reads: AtomicBool::new(false),
                 inner: Mutex::new(None),
                 dropped_while_held: AtomicUsize::new(0),
             })
@@ -3145,6 +3148,16 @@ pub(crate) mod lexical_double {
         /// Accepts change writes again, as a store that recovered would.
         pub(crate) fn accept_changes(&self) {
             self.refuse_changes.store(false, Ordering::SeqCst);
+        }
+
+        /// Refuses every recorded-digest read until [`Self::accept_reads`].
+        pub(crate) fn refuse_reads(&self) {
+            self.refuse_reads.store(true, Ordering::SeqCst);
+        }
+
+        /// Answers recorded-digest reads again, as a store that recovered would.
+        pub(crate) fn accept_reads(&self) {
+            self.refuse_reads.store(false, Ordering::SeqCst);
         }
 
         /// The paths each write asked of the store replaced, in the order asked.
@@ -3219,6 +3232,12 @@ pub(crate) mod lexical_double {
             &self,
             derivation_revision: &str,
         ) -> Result<Option<WorkspaceDigests>, SearchError> {
+            if self.refuse_reads.load(Ordering::SeqCst) {
+                return Err(SearchError::new(
+                    SearchFault::new(SearchViolation::StoreFailed)
+                        .about("the double refuses reads"),
+                ));
+            }
             match self.attached() {
                 Some(index) => index.recorded_lexical_files(derivation_revision).await,
                 None => Ok(None),
@@ -5747,6 +5766,12 @@ pub(crate) mod tests {
             ),
             "a union past the bound compares the whole publication instead"
         );
+        assert!(
+            named(&[])?.is_empty(),
+            "a write naming no path owes the store nothing"
+        );
+        assert!(!named(&["a.rs"])?.is_empty());
+        assert!(!LexicalWrite::Whole.is_empty());
         Ok(())
     }
 
@@ -5834,6 +5859,65 @@ pub(crate) mod tests {
         commit_state_within_bound(
             &lane,
             current.reads.tree_revision(),
+            LexicalCommitState::Settled,
+        )
+        .await?;
+        cancellation.cancel();
+        Ok(())
+    }
+
+    /// A whole write reads the digests the store recorded before it opens a transaction, so a
+    /// store that refuses the read leaves the comparison owed with the store's own cause,
+    /// and the next publication compares again once the store answers.
+    #[tokio::test]
+    async fn a_refused_recorded_digest_read_leaves_the_whole_comparison_owed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
+        let second = candidate_declaring(directory.path(), 1, "secondgamma")?;
+        let double = StoreDouble::new();
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+
+        double.refuse_reads();
+        lane.request(
+            super::lexical_write(&first, &ChangeSet::Full),
+            Arc::clone(&first),
+        );
+        let cause = owed_within_bound(&lane, first.reads.tree_revision()).await?;
+        assert!(
+            cause.contains("the double refuses reads"),
+            "the owed cause is the store's own: {cause}"
+        );
+        assert!(
+            lane.owes_whole(),
+            "a refused read leaves the comparison owed"
+        );
+        assert!(
+            double.calls().is_empty(),
+            "no transaction opens without the recorded digests"
+        );
+
+        double.accept_reads();
+        double.release_one();
+        lane.request(change_naming_lib()?, Arc::clone(&second));
+        let calls = double.calls_within_bound(2).await?;
+        assert_eq!(
+            calls,
+            vec![
+                ("clear", String::new()),
+                ("apply", second.reads.tree_revision().to_owned()),
+            ],
+            "the next publication compares its whole tree with the store"
+        );
+        commit_state_within_bound(
+            &lane,
+            second.reads.tree_revision(),
             LexicalCommitState::Settled,
         )
         .await?;
