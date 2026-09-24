@@ -232,7 +232,11 @@ async fn a_skipped_token_check_serves_a_request_the_default_refuses() -> TestRes
     shutdown.cancel();
     stopped_within_deadline(server).await?;
 
+    // The second server binds the port the first one released, so a client
+    // reused from the first would send on its pooled connection to the stopped
+    // server and read a reset.
     let (shutdown, checked) = served(directory.path()).await?;
+    let http = reqwest::Client::new();
     let refused = http
         .post(mcp_url(&checked))
         .header("Content-Type", "application/json")
