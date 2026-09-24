@@ -200,6 +200,23 @@ fn tar_symlink_and_hard_link_entries_are_skipped_and_named() -> TestResult {
 }
 
 #[test]
+fn link_naming_the_archive_root_is_refused() -> TestResult {
+    let bytes = tar_bytes(&[("./", b"", tar::EntryType::Symlink)])?;
+    assert_eq!(
+        read_archive(
+            &bytes,
+            ArchiveFormat::TarGzip,
+            &ArchiveDigest::Sha256(Sha256::digest(&bytes).into()),
+            None,
+            ArchiveLimits::default(),
+        )
+        .expect_err("a link cannot name the archive root"),
+        ArchiveError::UnsafePath
+    );
+    Ok(())
+}
+
+#[test]
 fn zip_symlink_entry_is_skipped_and_named() -> TestResult {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     archive.start_file("release/a", zip::write::SimpleFileOptions::default())?;
@@ -469,6 +486,21 @@ fn zip_paths_modes_crc_and_declared_member_count_are_checked() -> TestResult {
         read_zip_fixture(&bytes, ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?)
             .expect_err("declared count must be checked before allocation"),
         ArchiveError::MemberLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn zip_encrypted_entry_is_refused_as_unsupported() -> TestResult {
+    let mut bytes = zip_bytes("release/a", b"text")?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice()))?;
+    let header_start = usize::try_from(archive.by_index(0)?.central_header_start())?;
+    drop(archive);
+    // Set the encrypted bit in the central-directory general-purpose flags.
+    bytes[header_start + 8] |= 1;
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("encrypted ZIP member"),
+        ArchiveError::UnsupportedEntry
     );
     Ok(())
 }
