@@ -105,10 +105,10 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | `just integration-archive` | Build one CLI and test archive for integration jobs |
 | `just integration-test` | Live language engines, models, corpus repositories, and served binary checks |
 
-Unit tests, live language-engine suites, and the corpus, artifact, and agent checks all run on
-pull requests and pushes to `main`. Native tests across the six release targets still run on
-`main` after merge and on manual dispatch. CI reuses compiled test archives and caches
-dependencies.
+Unit tests, live language-engine suites, the corpus, artifact, and agent checks, and the native
+checks on every release target all run on pull requests and pushes to `main`. Each target builds
+once, and every check that can share a build runs from it: CI reuses compiled test archives and
+caches dependencies.
 See [Testing](docs/content/docs/developer/testing.mdx) for prerequisites and commands.
 
 Run the developer package directly with:
