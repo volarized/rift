@@ -1,12 +1,14 @@
 ---
 title: Installation
-description: Install Rift and connect an MCP client.
+description: Install rift and configure your agent to use it in your project.
 ---
 
-Rift runs locally in the folder containing your codebase. Install the binary, then configure
-Claude Code or another MCP client to launch `rift mcp` in that folder.
+Rift runs on your machine alongside your agents. To use it in a project, install the executable
+and configure your agent to launch it from the folder containing your codebase.
 
 ## Install
+
+Choose the command for your platform and run it in your terminal:
 
 <PlatformTabs>
 
@@ -32,10 +34,13 @@ The installer downloads the latest verified release for your platform and instal
 current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
 release tag.
 
+If the installer asks you to add its installation directory to `PATH`, add that directory so your
+terminal and agent can find `rift`.
+
 ## MCP configuration
 
-An MCP client launches `rift mcp` in the folder containing the codebase. Register it in the
-client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
+Once rift is installed, your agent needs to know how to start it. In Claude Code, add the
+following server entry to `.mcp.json` in your project root:
 
 ```json
 {
@@ -48,16 +53,17 @@ client's MCP configuration - for Claude Code, `.mcp.json` in the project root:
 }
 ```
 
+The `command` names the installed executable, and `args` selects its MCP mode. Your agent launches
+`rift mcp` from the project folder, so rift builds its local index from that project's codebase.
+
+For another MCP client, configure it to launch the same command from your project folder.
+If you're using Claude Code, [Agentic usage](/docs/agentic-usage) explains how to install the Rift
+skill that teaches your agent which tool to call.
+
 ## Update
+
+To update an existing installation, run:
 
 ```sh
 rift update
 ```
-
-The command downloads the latest verified release for your platform and replaces the current
-executable. While it runs, the command reports each stage on the terminal: the release it found,
-the download with its byte progress, checksum verification, extraction, and installation.
-
-## CLI
-
-<CliHelp />

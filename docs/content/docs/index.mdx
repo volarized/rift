@@ -1,57 +1,56 @@
 ---
 title: Rift
-description: Read and discover code through Rift's MCP tools.
+description: Overview of the rift toolkit.
 ---
-
-<VersionBadge
-  version="v0.0.44"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 Rift is an agentic development toolkit for reading and discovering codebases.
 
-Rift provides [MCP](https://modelcontextprotocol.io/specification/2026-07-28) agents structured
-reads for various programming languages in the project workspace.
+If you're new to rift, we suggest starting from [installing it](/docs/installation) and
+[configuring your agent](/docs/installation#mcp-configuration) to use it in your project. For a better
+user experience, the [skills](/docs/agentic-usage) could be of much help.
 
-<Callout type="info">
-Rift supports Rust, Python, JavaScript and TypeScript (including TSX), Markdown, JSON, YAML, and TOML.
-</Callout>
+If you're interested in the core ideas and concepts behind rift, please read the
+[vision page](/docs/vision).
 
-[Installation](/docs/installation) connects Rift to your MCP client.
-[Agentic usage](/docs/agentic-usage) installs the skill that teaches Claude Code which tool to call.
-The [MCP surface](/docs/mcp) defines each tool and resource.
-The [vision](/docs/vision) page shows how source and provider facts contribute to a read.
+This page provides a very high-level overview of rift's capabilities.
 
 ## Reads
 
-Rift reads the source files in the folder where the MCP client launches `rift mcp`. Later calls
-include filesystem changes made by a formatter or another process.
+When rift is running alongside your agents, it builds a local index of your project. This index is
+located purely on your machine, and changes together with it, as the codebase grows and changes
+over time.
+
+### Map
+
+The first thing an agent usually does is try to understand the repository structure. Indeed, you
+can put such facts into some kind of `AGENTS.md` file or skills, but usually they quickly get out
+of sync as the project grows.
+
+To simplify discovery, rift provides a map resource, which deterministically goes through the
+repository and provides a nice, up-to-date structure and context information about the project
+in a compact form.
+
+The agent reads this information through the [`rift://map`](/docs/mcp#resource-map) MCP resource.
 
 ### Search
 
-When you know what the code does but not its name, ask your agent to search for it:
+To avoid grepping through the entire codebase on a given task, rift provides a search capability
+which returns precise, fact-close information about the repository structure.
 
-> Use Rift to find all information about server startup.
+At the same time, there are almost no projects without dependencies, and using these dependencies
+is crucial for good codebase quality and effective context usage.
 
-The agent calls [`search`](/docs/mcp#tool-search) with the query `server startup`, which
-returns matching declarations and source lines with their paths.
+Search is also connected to the global index, allowing your agent to retrieve facts about relevant
+dependencies and their versions from it. The global index is based on top-used OSS dependencies
+for various languages.
 
-### Retrieve symbol
+The agent uses the [`search`](/docs/mcp#tool-search) MCP tool to search project source and dependencies.
 
-When you know the declaration name, ask for it directly:
+### Symbol retrieval
 
-> Use Rift to retrieve the `ReadService` declaration.
+When an agent precisely knows which symbol to look up (usually found via search), it can "zoom in"
+on a certain specific symbol. A symbol is practically a class or a function from a certain library
+(local or remote); retrieving it returns precise information about it, such as source code,
+documentation and signature.
 
-The agent calls [`get_symbol`](/docs/mcp#tool-get_symbol), which returns the declaration
-and its source excerpt. It can pass a returned path and byte position to
-[`nodes`](/docs/mcp#tool-nodes) when it needs the surrounding syntax structure.
-
-The [MCP reference](/docs/mcp#reads) defines request fields and result shapes for client
-integrations. The [index architecture](/docs/developer/architecture#index) explains how Rift keeps those
-reads aligned with filesystem changes.
-
-
-## Developer documentation
-
-The [developer documentation](/docs/developer) explains how the server builds its index,
-accepts workspace configuration, and serves requests.
+The agent retrieves this information through the [`get_symbol`](/docs/mcp#tool-get_symbol) MCP tool.
