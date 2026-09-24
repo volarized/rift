@@ -37,6 +37,12 @@ impl FileDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// The digest [`Self::as_bytes`] returned, read back from a store that recorded it.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +67,11 @@ mod tests {
             }
             assert_ne!(states[0], states[1]);
         }
+    }
+
+    #[test]
+    fn a_digest_read_back_from_its_bytes_is_the_digest_recorded() {
+        let recorded = FileDigest::of(b"pub fn beacon() {}\n");
+        assert_eq!(FileDigest::from_bytes(*recorded.as_bytes()), recorded);
     }
 }

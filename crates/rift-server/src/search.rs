@@ -598,12 +598,30 @@ impl ReadService {
     /// and one it found gone appears only in the first. Replacing rather than adding is
     /// what lets the same change set be written twice: two rebuilds captured from one
     /// publication both write what they read, and the second leaves what the first left.
+    ///
+    /// Each named path this snapshot holds is recorded with its content digest, so a later
+    /// process can compare its own build with what the store derived its rows from.
     #[must_use]
     pub fn lexical_change(&self, changes: &PathChanges) -> LexicalChange {
-        LexicalChange::new(
-            changes.paths().cloned().collect(),
-            self.index().index_documents_for(changes.indexed()),
-        )
+        self.lexical_change_for(changes.paths())
+    }
+
+    /// Derives the lexical write for `paths`, whatever moved them: the stored units under
+    /// every path go, and the units and content digests this snapshot holds for them land.
+    ///
+    /// A path this snapshot no longer holds contributes nothing but its deletion.
+    #[must_use]
+    pub fn lexical_change_for<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a ProjectPath>,
+    ) -> LexicalChange {
+        let replaced: Vec<ProjectPath> = paths.into_iter().cloned().collect();
+        let recorded = replaced
+            .iter()
+            .filter_map(|path| Some((path.clone(), self.file_digest(path)?)))
+            .collect();
+        let inserted = self.index().index_documents_for(&replaced);
+        LexicalChange::new(replaced, inserted).with_recorded(recorded)
     }
 
     /// Pairs each symbol unit in `units` with the declaration the vector ranking embeds for

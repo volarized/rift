@@ -517,6 +517,13 @@ impl ReadService {
         self.index.digests()
     }
 
+    /// Every file's content digest this snapshot indexed, the files it left out included,
+    /// in project-path order, without hashing any file again.
+    #[must_use]
+    pub fn content_digests(&self) -> WorkspaceDigests {
+        self.index.content_digests()
+    }
+
     /// Workspace orientation snapshot: language totals, the directory tree indexed files sit
     /// under, the most-referenced symbols, entry points, and docs - computed once from this
     /// snapshot's already-loaded index.

@@ -307,6 +307,7 @@ mod tests {
         DocumentationCollection, DocumentationReferenceRecord, EncodedDocumentation,
         METADATA_BYTES_MAX, MetadataWriter, replace,
     };
+    use crate::LexicalStamp;
     use std::io::Write;
 
     #[test]
@@ -383,7 +384,11 @@ mod tests {
         let identity = rift_ranking::DocumentIdentity::new("README.md")?;
         assert_eq!(store.content(&identity).await?.as_deref(), Some(text));
         store
-            .apply_with_documentation(&crate::LexicalChange::default(), "tree3", &metadata)
+            .apply_with_documentation(
+                &crate::LexicalChange::default(),
+                &LexicalStamp::published("tree3", ""),
+                &metadata,
+            )
             .await?;
         assert!(matches!(
             store.documentation("tree3").await?,
@@ -591,7 +596,11 @@ mod tests {
             &[],
         )?;
         store
-            .apply_with_documentation(&LexicalChange::new(vec![path], Vec::new()), "tree2", &empty)
+            .apply_with_documentation(
+                &LexicalChange::new(vec![path], Vec::new()),
+                &LexicalStamp::published("tree2", ""),
+                &empty,
+            )
             .await?;
         let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
             panic!("new metadata must load");
@@ -741,7 +750,11 @@ mod tests {
 
         let updated = reference_collection("a.md", "Use `Compass`.\n\nAdditional paragraph.\n")?;
         store
-            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &updated)
+            .apply_with_documentation(
+                &crate::LexicalChange::default(),
+                &LexicalStamp::published("tree2", ""),
+                &updated,
+            )
             .await?;
         let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
             panic!("updated metadata publication must be available");
@@ -786,7 +799,11 @@ mod tests {
         let mut current_rows = current_encoded.references.clone();
         current_rows.sort_by(|left, right| left.0.cmp(&right.0));
         store
-            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &current)
+            .apply_with_documentation(
+                &crate::LexicalChange::default(),
+                &LexicalStamp::published("tree2", ""),
+                &current,
+            )
             .await?;
         assert_eq!(read_reference_rows(&database).await?, current_rows);
 
@@ -875,7 +892,11 @@ mod tests {
 
         let current = collection("current metadata");
         store
-            .apply_with_documentation(&crate::LexicalChange::default(), "tree2", &current)
+            .apply_with_documentation(
+                &crate::LexicalChange::default(),
+                &LexicalStamp::published("tree2", ""),
+                &current,
+            )
             .await?;
         let RevisionScoped::Matched(Some(loaded)) = store.documentation("tree2").await? else {
             panic!("replacement must publish validated current metadata");

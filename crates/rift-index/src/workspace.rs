@@ -1679,6 +1679,32 @@ impl WorkspaceIndex {
         keyed_digests(&self.files, &self.text_files, &self.left_out)
     }
 
+    /// Every file's content digest this build holds, the files it left out included, in
+    /// project-path order.
+    ///
+    /// [`Self::digests`] hashes each file's bytes again into the file-state digest an
+    /// observation compares; this reads the content digest the build already took, the
+    /// one [`Self::digest`] answers per path. It is what the lexical store records beside
+    /// a file's rows, and what a later build compares itself against before it writes.
+    #[must_use]
+    pub fn content_digests(&self) -> WorkspaceDigests {
+        WorkspaceDigests::new(
+            self.left_out
+                .iter()
+                .map(|(path, state)| (path.clone(), state.content))
+                .chain(
+                    self.text_files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.digest())),
+                )
+                .chain(
+                    self.files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.digest())),
+                ),
+        )
+    }
+
     /// The tree revision this build's syntax-indexed files fold to, at full SHA-256
     /// length: each file's path and content digest in project-path order. A request-time
     /// capture of the same tree folds to the same value.

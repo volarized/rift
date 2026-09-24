@@ -1613,9 +1613,9 @@ impl LexicalWrite {
         let kept = match self {
             Self::Whole(units) => Self::Whole(units.into_iter().filter_map(&mut within).collect()),
             Self::Change(change) => {
-                let (replaced, inserted) = change.into_parts();
+                let (replaced, inserted, recorded) = change.into_parts();
                 let inserted = inserted.into_iter().filter_map(&mut within).collect();
-                Self::Change(LexicalChange::new(replaced, inserted))
+                Self::Change(LexicalChange::new(replaced, inserted).with_recorded(recorded))
             }
         };
         (kept, left_out)
@@ -1687,7 +1687,11 @@ impl LexicalStore for SearchIndex {
         tree_revision: &str,
         documentation: &rift_index::DocumentationCollection,
     ) -> impl Future<Output = Result<(), SearchError>> + Send {
-        self.apply_lexical_with_documentation(change, tree_revision, documentation)
+        let stamp = rift_index::LexicalStamp::published(tree_revision, "");
+        async move {
+            self.apply_lexical_with_documentation(change, &stamp, documentation)
+                .await
+        }
     }
 }
 
@@ -2989,8 +2993,9 @@ pub(crate) mod lexical_double {
                 }
                 match self.attached() {
                     Some(index) => {
+                        let stamp = rift_index::LexicalStamp::published(tree_revision, "");
                         index
-                            .apply_lexical_with_documentation(change, tree_revision, documentation)
+                            .apply_lexical_with_documentation(change, &stamp, documentation)
                             .await
                     }
                     None => Ok(()),
