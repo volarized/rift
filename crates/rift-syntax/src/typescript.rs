@@ -14,9 +14,7 @@ use rift_protocol::read::{Language, NodeFacet};
 use crate::document::SyntaxDocument;
 use crate::ecmascript::{self, EcmaScriptKinds};
 use crate::failure::SyntaxError;
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Which pinned tree-sitter-typescript grammar a provider instance reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +26,10 @@ pub enum TypeScriptDialect {
 }
 
 impl TypeScriptDialect {
-    /// The provider instance the registry ships for this dialect, under the
-    /// declared default bounds.
+    /// The provider instance the registry ships for this dialect.
     #[must_use]
     pub fn provider(self) -> TypeScriptSyntaxProvider {
-        TypeScriptSyntaxProvider::new(self, TYPESCRIPT_SYNTAX_LIMITS_DEFAULT)
+        TypeScriptSyntaxProvider::new(self)
     }
 
     fn language(self) -> Language {
@@ -71,48 +68,34 @@ impl TypeScriptDialect {
 pub struct TypeScriptSyntaxProvider {
     dialect: TypeScriptDialect,
     language: Language,
-    limits: SyntaxLimits,
 }
 
 impl TypeScriptSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one TypeScript
-    /// source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider for one dialect with explicit bounds.
+    /// Constructs the provider for one dialect.
     #[must_use]
-    pub fn new(dialect: TypeScriptDialect, limits: SyntaxLimits) -> Self {
+    pub fn new(dialect: TypeScriptDialect) -> Self {
         Self {
             dialect,
             language: dialect.language(),
-            limits,
         }
     }
 }
-
-/// The TypeScript providers' declared default bounds, proven positive at
-/// compile time.
-const TYPESCRIPT_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    TypeScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
 
 impl SyntaxProvider for TypeScriptSyntaxProvider {
     fn language(&self) -> &Language {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
         ecmascript::analyze(
             &self.language,
             &self.dialect.grammar(),
             self.dialect.kinds(),
-            self.limits,
+            limits,
             source,
         )
     }
@@ -137,22 +120,21 @@ mod tests {
     fn analyze(text: &str) -> SyntaxDocument {
         TypeScriptDialect::TypeScript
             .provider()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("TypeScript fixture must parse")
     }
 
     #[test]
-    fn test_providers_declare_language_dialect_and_byte_bound() {
+    fn test_providers_declare_language_and_dialect() {
         let typescript = TypeScriptDialect::TypeScript.provider();
         assert_eq!(typescript.language().name, "typescript");
         assert_eq!(typescript.language().dialect, None);
-        assert_eq!(
-            typescript.source_bytes_max(),
-            TypeScriptSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
 
         let tsx = TypeScriptDialect::Tsx.provider();
         assert_eq!(tsx.language().name, "typescript");
@@ -296,10 +278,13 @@ mod tests {
         let tsx_path = ProjectPath::new("src/Banner.tsx").expect("valid fixture path");
         let document = TypeScriptDialect::Tsx
             .provider()
-            .analyze(SyntaxSource {
-                path: &tsx_path,
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &tsx_path,
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("TSX fixture must parse");
         assert!(!document.has_errors());
         let facts = document
@@ -334,10 +319,13 @@ mod tests {
         let tsx_path = ProjectPath::new("src/App.tsx").expect("valid fixture path");
         let through_tsx = TypeScriptDialect::Tsx
             .provider()
-            .analyze(SyntaxSource {
-                path: &tsx_path,
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &tsx_path,
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("TSX fixture must parse through the tsx dialect");
         assert!(!through_tsx.has_errors());
         assert_eq!(through_tsx.language().dialect.as_deref(), Some("tsx"));
@@ -351,10 +339,13 @@ mod tests {
 
         let through_typescript = TypeScriptDialect::TypeScript
             .provider()
-            .analyze(SyntaxSource {
-                path: &tsx_path,
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &tsx_path,
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("the parse itself completes; the tree carries the errors");
         assert!(
             through_typescript.has_errors(),
@@ -372,11 +363,12 @@ mod tests {
     #[test]
     fn test_provider_enforces_source_node_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
-            TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript, limits).analyze(
+            TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript).analyze(
                 SyntaxSource {
                     path: &path(),
                     text,
                 },
+                limits,
             )
         };
         let source_error = bounded(

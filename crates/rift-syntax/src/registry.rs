@@ -23,7 +23,6 @@ struct RegisteredLanguage {
 struct SyntaxRegistry {
     entries: Vec<RegisteredLanguage>,
     extensions: Vec<&'static str>,
-    file_bytes_max_default: usize,
 }
 
 impl SyntaxRegistry {
@@ -63,17 +62,9 @@ impl SyntaxRegistry {
                 provider,
             });
         }
-        let file_bytes_max_default = entries
-            .iter()
-            .map(|entry| entry.provider.source_bytes_max())
-            .max()
-            .unwrap_or_else(|| {
-                unreachable!("a non-empty definition set must have a maximum source byte bound")
-            });
         Self {
             entries,
             extensions,
-            file_bytes_max_default,
         }
     }
 }
@@ -105,11 +96,15 @@ pub fn shipped_languages()
 /// no shipped definition claims it.
 #[must_use]
 pub fn provider_for_extension(extension: &str) -> Option<&'static dyn SyntaxProvider> {
+    entry_for_extension(extension).map(|entry| entry.provider.as_ref())
+}
+
+/// The registered language claiming `extension`.
+fn entry_for_extension(extension: &str) -> Option<&'static RegisteredLanguage> {
     registry()
         .entries
         .iter()
         .find(|entry| entry.definition.extensions().contains(&extension))
-        .map(|entry| entry.provider.as_ref())
 }
 
 /// The provider filing facts under `language`; `None` when no shipped
@@ -127,12 +122,12 @@ pub fn source_file_extensions() -> &'static [&'static str] {
     &registry().extensions
 }
 
-/// The largest per-source byte bound any shipped provider accepts by
-/// default. The workspace's default per-file bound derives from it, so no
-/// provider's default is unreachable under the scan.
+/// The per-source byte bound every provider parses under by default. The
+/// workspace's default per-file bound derives from it, so the scan admits
+/// every file a provider accepts.
 #[must_use]
-pub fn file_bytes_max_default() -> usize {
-    registry().file_bytes_max_default
+pub const fn file_bytes_max_default() -> usize {
+    crate::provider::SOURCE_BYTES_MAX_DEFAULT
 }
 
 #[cfg(test)]
@@ -144,8 +139,7 @@ mod tests {
     use crate::document::SyntaxDocument;
     use crate::failure::SyntaxError;
     use crate::language::ShippedLanguage;
-    use crate::provider::SyntaxSource;
-    use crate::rust::RustSyntaxProvider;
+    use crate::provider::{SyntaxLimits, SyntaxSource};
 
     fn rust() -> Language {
         Language {
@@ -212,22 +206,17 @@ mod tests {
     }
 
     #[test]
-    fn test_file_bytes_max_default_is_the_largest_declared_provider_bound() {
-        assert_eq!(
-            file_bytes_max_default(),
-            RustSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
-    }
-
-    #[test]
     fn test_registry_analyzes_through_the_trait_object() {
         let path = ProjectPath::new("src/lib.rs").expect("valid fixture path");
         let provider = provider_for_extension("rs").expect("the rust provider claims rs");
         let document = provider
-            .analyze(SyntaxSource {
-                path: &path,
-                text: "pub fn beacon() {}",
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "pub fn beacon() {}",
+                },
+                SyntaxLimits::default(),
+            )
             .expect("fixture must parse");
         assert_eq!(document.language(), &rust());
         assert_eq!(document.symbols()[0].name, "beacon");
@@ -245,11 +234,11 @@ mod tests {
             &self.language
         }
 
-        fn source_bytes_max(&self) -> usize {
-            1
-        }
-
-        fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        fn analyze(
+            &self,
+            source: SyntaxSource<'_>,
+            _limits: SyntaxLimits,
+        ) -> Result<SyntaxDocument, SyntaxError> {
             Ok(SyntaxDocument::new(
                 self.language.clone(),
                 source.path.clone(),

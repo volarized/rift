@@ -168,7 +168,12 @@ impl WorkspaceIndex {
             )?;
             match class {
                 ClassifiedPath::Source(provider) => {
-                    contents.hold_source_file(text_file, &context_path, provider)?;
+                    contents.hold_source_file(
+                        text_file,
+                        &context_path,
+                        provider,
+                        limits.syntax(),
+                    )?;
                 }
                 ClassifiedPath::Text => contents.hold_text_file(text_file),
             }

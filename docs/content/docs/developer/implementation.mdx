@@ -152,6 +152,29 @@ through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surfa
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
 
+Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
+bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its
+collector feature enables syntax parsers; readers can validate stored metadata and project ranked
+identities without linking parsers or storage code.
+
+Documentation adapters record source warnings when selected input is malformed or exceeds the
+4 MiB source limit or remaining 512 MiB collection limit. Other accepted sources remain available.
+A selection above 100,000 content owners, including notebook cells and omitted sources, is refused
+before publication.
+
+The workspace database stores the documentation manifest and reverse symbol references beside
+the lexical rows. Blocks retain byte ranges and digests; excerpts come from the captured source
+after pagination. The same transaction writes documentation metadata, lexical units, and their
+tree revision.
+
+The collector keeps parser facts for each selected source in memory. Incremental rebuilds reuse
+facts when source metadata, chunk mappings, extractor revision, and accepted attached symbols match.
+Link and declaration changes invalidate affected blocks; unchanged notebook bytes reuse decoded
+cells. A restart rebuilds parser facts from source.
+
+SQLite keeps one validated documentation snapshot and changes only reverse-reference rows whose
+stored values differ. Those changes share the lexical writer's transaction.
+
 One transaction writes the units and the stamp together, so the store is never a partial mix of
 two trees. A rebuild that read the whole workspace replaces the whole unit set; a rebuild that
 named the files it read deletes those paths' rows and inserts their new ones, which costs one
@@ -363,7 +386,7 @@ adding a language is one definition plus one list entry.
 
 <VersionBadge version="v0.0.39" />
 
-One package's source reaches the index through the package analyzer in `rift-index`, which
+One package's source reaches the index through the package analyzer in `rift-analysis`, which
 holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
 providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
 the declarations, and renders one `PackagePublication`. That publication is the logical package
@@ -383,7 +406,7 @@ added, replaced, and removed records by identity and digest alone. A publication
 by package-relative path and source unit, so no machine's directory layout reaches a consumer.
 
 The analyzer manifest is generated beside the served schemas and committed at
-`crates/rift-index/src/dependency/analyzer-manifest.json`, so a change to any of those files
+`crates/rift-analysis/src/analyzer-manifest.json`, so a change to any of those files
 that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
 exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 

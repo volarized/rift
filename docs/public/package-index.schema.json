@@ -26,6 +26,185 @@
       ],
       "type": "object"
     },
+    "DocumentationBlock": {
+      "additionalProperties": false,
+      "description": "Documentation metadata addressing bytes held by an existing content owner.",
+      "properties": {
+        "chunks": {
+          "description": "Existing ranked documents intersecting this block, in source order.",
+          "items": {
+            "$ref": "#/$defs/DocumentationChunk"
+          },
+          "type": "array"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of the block's exact bytes."
+        },
+        "heading_path": {
+          "description": "Headings owning the block, in increasing depth order.",
+          "items": {
+            "$ref": "#/$defs/DocumentationHeading"
+          },
+          "type": "array"
+        },
+        "identity": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of canonical source identity and structural position."
+        },
+        "kind": {
+          "$ref": "#/$defs/DocumentationBlockKind",
+          "description": "Whether the range carries prose or code."
+        },
+        "language": {
+          "description": "Authored code language, when supplied by the format.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "One-based line where the block starts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Exact range in the regular source or decoded notebook cell."
+        },
+        "source": {
+          "$ref": "#/$defs/DocumentationContentIdentity",
+          "description": "Source record containing revision, format, origin, and license facts."
+        },
+        "symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SymbolId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Owning declaration for an attached comment."
+        }
+      },
+      "required": [
+        "identity",
+        "source",
+        "content_digest",
+        "range",
+        "line",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "DocumentationBlockKind": {
+      "description": "The content a documentation block addresses.",
+      "oneOf": [
+        {
+          "const": "prose",
+          "description": "Authored prose and its markup.",
+          "type": "string"
+        },
+        {
+          "const": "code",
+          "description": "Authored code without execution or inferred name resolution.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationChunk": {
+      "additionalProperties": false,
+      "description": "A baseline search document intersecting one block.",
+      "properties": {
+        "identity": {
+          "description": "Existing symbol or text document identity.",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Exact content range held by this document."
+        }
+      },
+      "required": [
+        "identity",
+        "range"
+      ],
+      "type": "object"
+    },
+    "DocumentationContentIdentity": {
+      "additionalProperties": false,
+      "description": "One content owner: a regular source or decoded notebook cell.",
+      "properties": {
+        "cell": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotebookCell"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Decoded cell when the parent source is a notebook."
+        },
+        "source": {
+          "$ref": "#/$defs/DocumentationSourceIdentity",
+          "description": "Original workspace file or package source unit."
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "DocumentationCoverage": {
+      "additionalProperties": false,
+      "description": "Counts recording what one collection parsed or omitted.",
+      "properties": {
+        "omitted": {
+          "description": "Sources omitted because their format or content was refused.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parsed": {
+          "description": "Sources whose supported structure was parsed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected": {
+          "description": "Accepted source records before extraction.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "description": "Sources whose output reached a collection bound.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "selected",
+        "parsed",
+        "omitted",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "DocumentationDigest": {
+      "description": "Full lowercase SHA-256 digest for documentation content and identity.",
+      "examples": [
+        "3f9a1c2e7b4d6a09876543210fedcba9876543210fedcba9876543210fedcba"
+      ],
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
     "DocumentationFormat": {
       "description": "Which markup the text is written in, since whoever displays a doc comment is the one that\nrenders it.",
       "oneOf": [
@@ -37,6 +216,686 @@
         {
           "const": "markdown",
           "description": "Markdown as authored in the source.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationHeading": {
+      "additionalProperties": false,
+      "description": "One heading in a block's ordered section path.",
+      "properties": {
+        "level": {
+          "description": "Heading depth established by the format parser.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Heading identity, including the parser's duplicate-heading disambiguator.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "name"
+      ],
+      "type": "object"
+    },
+    "DocumentationIndex": {
+      "additionalProperties": false,
+      "description": "Documentation metadata published alongside an existing search corpus.",
+      "properties": {
+        "blocks": {
+          "description": "Blocks in source, range, kind, and identity order.",
+          "items": {
+            "$ref": "#/$defs/DocumentationBlock"
+          },
+          "type": "array"
+        },
+        "coverage": {
+          "$ref": "#/$defs/DocumentationCoverage",
+          "description": "Counts describing the accepted collection."
+        },
+        "documentation_revision": {
+          "$ref": "#/$defs/Digest",
+          "description": "Revision of extraction, identity, linking, and chunk rules."
+        },
+        "links": {
+          "description": "Authored links and their resolution.",
+          "items": {
+            "$ref": "#/$defs/DocumentationLink"
+          },
+          "type": "array"
+        },
+        "references": {
+          "description": "Exact references used by symbol reads.",
+          "items": {
+            "$ref": "#/$defs/DocumentationReference"
+          },
+          "type": "array"
+        },
+        "selection_digest": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of sorted source identities, content digests, formats, and origins."
+        },
+        "sources": {
+          "description": "Source facts in content identity order.",
+          "items": {
+            "$ref": "#/$defs/DocumentationSource"
+          },
+          "type": "array"
+        },
+        "unresolved_references": {
+          "description": "Unresolved spellings used for incremental invalidation.",
+          "items": {
+            "$ref": "#/$defs/DocumentationReferenceCandidate"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "description": "Source-specific incomplete conditions.",
+          "items": {
+            "$ref": "#/$defs/DocumentationWarning"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "documentation_revision",
+        "selection_digest",
+        "sources",
+        "blocks",
+        "links",
+        "references",
+        "unresolved_references",
+        "coverage",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "DocumentationLicense": {
+      "additionalProperties": false,
+      "description": "License metadata supplied by the source adapter.",
+      "properties": {
+        "expression": {
+          "description": "Declared expression; collection does not infer a license from source text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "description": "License files whose bytes the adapter verified.",
+          "items": {
+            "$ref": "#/$defs/DocumentationLicenseFile"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentationLicenseFile": {
+      "additionalProperties": false,
+      "description": "One license file's address and byte digest.",
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of the license file's original bytes."
+        },
+        "path": {
+          "$ref": "#/$defs/ProjectPath",
+          "description": "Path relative to the source's project or package root."
+        }
+      },
+      "required": [
+        "path",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "DocumentationLink": {
+      "additionalProperties": false,
+      "description": "One authored link and its exact location inside a block.",
+      "properties": {
+        "authored": {
+          "description": "Authored destination text.",
+          "type": "string"
+        },
+        "block": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Block containing the link."
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Destination range in the block's content owner."
+        },
+        "resolution": {
+          "$ref": "#/$defs/DocumentationLinkResolution",
+          "description": "Exact target or reason the link remains unresolved."
+        }
+      },
+      "required": [
+        "block",
+        "authored",
+        "range",
+        "resolution"
+      ],
+      "type": "object"
+    },
+    "DocumentationLinkResolution": {
+      "description": "The result of resolving one authored destination.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An exact target exists in the accepted source set.",
+          "properties": {
+            "state": {
+              "const": "resolved",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/DocumentationTarget",
+              "description": "The identified destination."
+            }
+          },
+          "required": [
+            "state",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The destination does not establish an exact target.",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/DocumentationUnresolvedReason",
+              "description": "Bounded classification of the unresolved destination."
+            },
+            "state": {
+              "const": "unresolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DocumentationReference": {
+      "additionalProperties": false,
+      "description": "An exact declaration reference authored inside standalone documentation.",
+      "properties": {
+        "authored": {
+          "description": "Exact authored spelling.",
+          "type": "string"
+        },
+        "block": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Block containing this reference."
+        },
+        "evidence": {
+          "$ref": "#/$defs/DocumentationReferenceEvidence",
+          "description": "Rule that established the target."
+        },
+        "identity": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of block, target, evidence, spelling, and occurrence ordinal."
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Reference range in its content owner."
+        },
+        "target": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "Exact declaration this reference describes."
+        }
+      },
+      "required": [
+        "identity",
+        "block",
+        "target",
+        "range",
+        "authored",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "DocumentationReferenceCandidate": {
+      "additionalProperties": false,
+      "description": "An inline code candidate retained for later declaration changes.",
+      "properties": {
+        "authored": {
+          "description": "Authored declaration spelling.",
+          "type": "string"
+        },
+        "block": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Block containing the candidate."
+        },
+        "language": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Language"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared language limiting candidate declarations, when present."
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Exact source range of the inline code content."
+        },
+        "reason": {
+          "$ref": "#/$defs/DocumentationUnresolvedReason",
+          "description": "Why no exact declaration was selected."
+        }
+      },
+      "required": [
+        "block",
+        "range",
+        "authored",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "DocumentationReferenceEvidence": {
+      "description": "Evidence establishing a documentation reference, ordered strongest first.",
+      "oneOf": [
+        {
+          "const": "provider",
+          "description": "A typed contribution naming an exact declaration.",
+          "type": "string"
+        },
+        {
+          "const": "authored_link",
+          "description": "An authored link resolving to one declaration location.",
+          "type": "string"
+        },
+        {
+          "const": "qualified_name",
+          "description": "Inline code equal to one declaration's qualified name.",
+          "type": "string"
+        },
+        {
+          "const": "unique_name",
+          "description": "Inline code equal to one unique declaration name.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationSelectionReason": {
+      "description": "Why the caller selected this source.",
+      "oneOf": [
+        {
+          "const": "workspace",
+          "description": "Visible documentation in the captured workspace.",
+          "type": "string"
+        },
+        {
+          "const": "package_archive",
+          "description": "Source selected from one exact package's acquired bytes.",
+          "type": "string"
+        },
+        {
+          "const": "attached_comment",
+          "description": "Comment supplied by its declaration's syntax provider.",
+          "type": "string"
+        },
+        {
+          "const": "cloud_resolver",
+          "description": "Source supplied by a cloud resolver.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationSource": {
+      "additionalProperties": false,
+      "description": "Source facts shared by every block belonging to one content owner.",
+      "properties": {
+        "byte_length": {
+          "description": "Exact content length in UTF-8 bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Digest of the content owner's exact bytes."
+        },
+        "format": {
+          "$ref": "#/$defs/DocumentationSourceFormat",
+          "description": "Parser selected for these bytes."
+        },
+        "identity": {
+          "$ref": "#/$defs/DocumentationContentIdentity",
+          "description": "Canonical address of the bytes block ranges use."
+        },
+        "language": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Language"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared source language, when known."
+        },
+        "license": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DocumentationLicense"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "License facts recorded by the source adapter."
+        },
+        "media_type": {
+          "description": "Media type supplied by the source adapter.",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/SymbolOrigin",
+          "description": "Ownership and generation facts supplied by the caller."
+        },
+        "physical_ranges": {
+          "description": "Original JSON string-token ranges for a decoded notebook cell, in source order.",
+          "items": {
+            "$ref": "#/$defs/TextRange"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/DocumentationDigest",
+          "description": "Source revision supplied by the caller."
+        },
+        "selection": {
+          "$ref": "#/$defs/DocumentationSelectionReason",
+          "description": "Why the source adapter selected these bytes."
+        }
+      },
+      "required": [
+        "identity",
+        "revision",
+        "content_digest",
+        "origin",
+        "format",
+        "media_type",
+        "selection",
+        "byte_length"
+      ],
+      "type": "object"
+    },
+    "DocumentationSourceFormat": {
+      "description": "The selected source's format.",
+      "oneOf": [
+        {
+          "const": "markdown",
+          "description": "Markdown block and inline syntax.",
+          "type": "string"
+        },
+        {
+          "const": "mdx",
+          "description": "Recognized Markdown ranges inside MDX.",
+          "type": "string"
+        },
+        {
+          "const": "restructured_text",
+          "description": "Supported reStructuredText block and reference syntax.",
+          "type": "string"
+        },
+        {
+          "const": "text",
+          "description": "Plain text paragraphs.",
+          "type": "string"
+        },
+        {
+          "const": "notebook",
+          "description": "Selected markdown and code cells from a notebook.",
+          "type": "string"
+        },
+        {
+          "const": "attached_comment",
+          "description": "Documentation attached by a syntax provider.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationSourceIdentity": {
+      "description": "The selected source's canonical address.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A visible workspace file.",
+          "properties": {
+            "kind": {
+              "const": "project",
+              "type": "string"
+            },
+            "path": {
+              "$ref": "#/$defs/ProjectPath",
+              "description": "Path relative to the workspace root."
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A source unit supplied by an exact package adapter.",
+          "properties": {
+            "kind": {
+              "const": "package",
+              "type": "string"
+            },
+            "unit": {
+              "$ref": "#/$defs/SourceUnitId",
+              "description": "Canonical package source identity."
+            }
+          },
+          "required": [
+            "kind",
+            "unit"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DocumentationStage": {
+      "description": "The collection step reporting incomplete documentation.",
+      "oneOf": [
+        {
+          "const": "source",
+          "description": "Source selection and byte validation.",
+          "type": "string"
+        },
+        {
+          "const": "extract",
+          "description": "Format parsing and block extraction.",
+          "type": "string"
+        },
+        {
+          "const": "resolve",
+          "description": "Authored link and declaration reference resolution.",
+          "type": "string"
+        },
+        {
+          "const": "index",
+          "description": "Mapping metadata to existing ranked documents.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationTarget": {
+      "description": "An authored link's resolved destination.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A collected documentation block.",
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/DocumentationDigest",
+              "description": "Stable block identity."
+            },
+            "kind": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "identity"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A location inside one content owner.",
+          "properties": {
+            "kind": {
+              "const": "source",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange",
+              "description": "Target range in its original content."
+            },
+            "source": {
+              "$ref": "#/$defs/DocumentationContentIdentity",
+              "description": "Target content owner."
+            }
+          },
+          "required": [
+            "kind",
+            "source",
+            "range"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One exact declaration.",
+          "properties": {
+            "kind": {
+              "const": "symbol",
+              "type": "string"
+            },
+            "symbol": {
+              "$ref": "#/$defs/SymbolId",
+              "description": "Target declaration identity."
+            }
+          },
+          "required": [
+            "kind",
+            "symbol"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DocumentationUnresolvedReason": {
+      "description": "Why an authored link or inline code candidate remains unresolved.",
+      "oneOf": [
+        {
+          "const": "missing",
+          "description": "No selected source or declaration names this target.",
+          "type": "string"
+        },
+        {
+          "const": "ambiguous",
+          "description": "More than one declaration satisfies the exact spelling.",
+          "type": "string"
+        },
+        {
+          "const": "external",
+          "description": "Destination uses an external scheme; collection performs no fetch.",
+          "type": "string"
+        },
+        {
+          "const": "fragment",
+          "description": "Fragment has no explicit authored target.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "Target is outside the accepted path or identity form.",
+          "type": "string"
+        }
+      ]
+    },
+    "DocumentationWarning": {
+      "additionalProperties": false,
+      "description": "One bounded warning with repeated conditions counted per source.",
+      "properties": {
+        "count": {
+          "description": "Number of items omitted or truncated for this condition.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/DocumentationWarningKind",
+          "description": "Typed condition the caller can inspect."
+        },
+        "source": {
+          "$ref": "#/$defs/DocumentationContentIdentity",
+          "description": "Source whose documentation is incomplete."
+        },
+        "stage": {
+          "$ref": "#/$defs/DocumentationStage",
+          "description": "Collection step reporting the condition."
+        }
+      },
+      "required": [
+        "source",
+        "stage",
+        "kind",
+        "count"
+      ],
+      "type": "object"
+    },
+    "DocumentationWarningKind": {
+      "description": "Why one documentation source is incomplete.",
+      "oneOf": [
+        {
+          "const": "source_unavailable",
+          "description": "Source bytes or their format are unavailable.",
+          "type": "string"
+        },
+        {
+          "const": "source_truncated",
+          "description": "Retained source ends before an addressed range.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_format",
+          "description": "Format and extension do not select a supported parser.",
+          "type": "string"
+        },
+        {
+          "const": "malformed_source",
+          "description": "Parser refused malformed source.",
+          "type": "string"
+        },
+        {
+          "const": "omitted_range",
+          "description": "Recognized syntax was excluded from documentation metadata.",
+          "type": "string"
+        },
+        {
+          "const": "limit_exceeded",
+          "description": "A configured or format bound stopped output.",
           "type": "string"
         }
       ]
@@ -94,6 +953,85 @@
       "minLength": 27,
       "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
       "type": "string"
+    },
+    "NotebookCell": {
+      "additionalProperties": false,
+      "description": "A selected cell addressed within its parent notebook.",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/NotebookCellIdentity",
+          "description": "Authored identifier or original cell position."
+        },
+        "kind": {
+          "$ref": "#/$defs/NotebookCellKind",
+          "description": "Which content the cell carries."
+        }
+      },
+      "required": [
+        "identity",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "NotebookCellIdentity": {
+      "description": "The authored cell identifier or its position when no identifier exists.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A valid identifier stored in the notebook.",
+          "properties": {
+            "id": {
+              "description": "Identifier accepted by the notebook format.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "authored",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The cell's zero-based position in its notebook.",
+          "properties": {
+            "index": {
+              "description": "Position among every cell, including unselected cells.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "indexed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "index"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "NotebookCellKind": {
+      "description": "The selected notebook cell's content kind.",
+      "oneOf": [
+        {
+          "const": "markdown",
+          "description": "Markdown source decoded from a markdown cell.",
+          "type": "string"
+        },
+        {
+          "const": "code",
+          "description": "Source decoded from a code cell, without execution.",
+          "type": "string"
+        }
+      ]
     },
     "PackageAnalysisWarning": {
       "description": "What an analyzer run could not do.",
@@ -396,6 +1334,10 @@
           "$ref": "#/$defs/SymbolOrigin",
           "description": "Where the declaration came from: the package, and whether it was authored."
         },
+        "presentation": {
+          "$ref": "#/$defs/Symbol",
+          "description": "Normalized read symbol assembled from provider Contributions."
+        },
         "public": {
           "description": "Whether the declaration is public under its language's own rules. A consumer\nanswering a package read serves public declarations alone.",
           "type": "boolean"
@@ -439,6 +1381,7 @@
       },
       "required": [
         "symbol",
+        "presentation",
         "origin",
         "unit",
         "name",
@@ -670,6 +1613,272 @@
       "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
       "type": "string"
     },
+    "Symbol": {
+      "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
+      "properties": {
+        "container": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SymbolId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
+        },
+        "document_local": {
+          "default": false,
+          "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
+          "type": "boolean"
+        },
+        "documentation": {
+          "default": [],
+          "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
+          "items": {
+            "$ref": "#/$defs/Documentation"
+          },
+          "type": "array"
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions",
+          "default": {},
+          "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
+        },
+        "facets": {
+          "default": [],
+          "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
+          "items": {
+            "$ref": "#/$defs/SymbolFacet"
+          },
+          "type": "array"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SymbolId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind",
+          "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
+        },
+        "language": {
+          "$ref": "#/$defs/Language",
+          "description": "The language this symbol belongs to."
+        },
+        "modifiers": {
+          "default": [],
+          "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/SymbolOrigin",
+          "default": {
+            "location": "project",
+            "source_kind": "authored"
+          },
+          "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
+        },
+        "signatures": {
+          "default": [],
+          "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
+          "items": {
+            "$ref": "#/$defs/Signature"
+          },
+          "type": "array"
+        },
+        "types": {
+          "default": [],
+          "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
+          "items": {
+            "$ref": "#/$defs/TypeBinding"
+          },
+          "type": "array"
+        },
+        "visibility": {
+          "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "language",
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "SymbolFacet": {
+      "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
+      "oneOf": [
+        {
+          "const": "namespace",
+          "description": "A named scope that groups declarations.",
+          "type": "string"
+        },
+        {
+          "const": "module",
+          "description": "A compilation or import unit.",
+          "type": "string"
+        },
+        {
+          "const": "type",
+          "description": "Names a type.",
+          "type": "string"
+        },
+        {
+          "const": "value",
+          "description": "Holds a runtime value.",
+          "type": "string"
+        },
+        {
+          "const": "callable",
+          "description": "Can be invoked.",
+          "type": "string"
+        },
+        {
+          "const": "member",
+          "description": "Belongs to a containing type.",
+          "type": "string"
+        },
+        {
+          "const": "member_container",
+          "description": "Owns members of its own.",
+          "type": "string"
+        },
+        {
+          "const": "parameter",
+          "description": "A declared input of a callable.",
+          "type": "string"
+        },
+        {
+          "const": "type_parameter",
+          "description": "A generic parameter a declaration abstracts over.",
+          "type": "string"
+        },
+        {
+          "const": "constructible",
+          "description": "Instances of it can be created.",
+          "type": "string"
+        },
+        {
+          "const": "extensible",
+          "description": "Other types can inherit from it.",
+          "type": "string"
+        },
+        {
+          "const": "implementable",
+          "description": "Other types can fulfil it.",
+          "type": "string"
+        },
+        {
+          "const": "macro",
+          "description": "Expands at compile time.",
+          "type": "string"
+        },
+        {
+          "const": "test",
+          "description": "Exercises other code as a test.",
+          "type": "string"
+        },
+        {
+          "const": "annotation",
+          "description": "Decorates other declarations.",
+          "type": "string"
+        },
+        {
+          "const": "extension",
+          "description": "Adds members to a type declared elsewhere.",
+          "type": "string"
+        },
+        {
+          "const": "variant",
+          "description": "One case of an enumeration.",
+          "type": "string"
+        },
+        {
+          "const": "enumeration",
+          "description": "A closed set of variants.",
+          "type": "string"
+        },
+        {
+          "const": "alias",
+          "description": "Another name for an existing symbol.",
+          "type": "string"
+        },
+        {
+          "const": "property",
+          "description": "A member accessed like a field but backed by code.",
+          "type": "string"
+        },
+        {
+          "const": "abstract",
+          "description": "Declared without a complete implementation.",
+          "type": "string"
+        },
+        {
+          "const": "constructor",
+          "description": "Creates instances of its container.",
+          "type": "string"
+        },
+        {
+          "const": "static",
+          "description": "Belongs to the type rather than an instance.",
+          "type": "string"
+        },
+        {
+          "const": "mutable",
+          "description": "Its value can change after initialization.",
+          "type": "string"
+        },
+        {
+          "const": "public",
+          "description": "Visible outside its declaring scope.",
+          "type": "string"
+        },
+        {
+          "const": "deprecated",
+          "description": "Marked as discouraged for new use.",
+          "type": "string"
+        },
+        {
+          "const": "entrypoint",
+          "description": "Where execution starts.",
+          "type": "string"
+        },
+        {
+          "const": "operator",
+          "description": "Invoked through operator syntax.",
+          "type": "string"
+        },
+        {
+          "const": "async",
+          "description": "Runs asynchronously.",
+          "type": "string"
+        },
+        {
+          "const": "generator",
+          "description": "Yields a sequence of values over time.",
+          "type": "string"
+        }
+      ]
+    },
     "SymbolId": {
       "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
       "examples": [
@@ -890,6 +2099,10 @@
       "$ref": "#/$defs/Digest",
       "description": "The analyzer that produced it: the digest of the grammar versions and extraction\nsource the run depended on. Two publications with equal package bytes and equal\n`analyzer_revision` are equal."
     },
+    "documentation": {
+      "$ref": "#/$defs/DocumentationIndex",
+      "description": "Documentation facts over the selected source units."
+    },
     "documents": {
       "description": "Every search document, in document identity order.",
       "items": {
@@ -944,7 +2157,8 @@
     "source_digest",
     "units",
     "symbols",
-    "documents"
+    "documents",
+    "documentation"
   ],
   "title": "PackagePublication",
   "type": "object"

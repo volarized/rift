@@ -1,6 +1,7 @@
 //! Checked `CommonMark` and GFM examples against Markdown documentation facts.
 
 use rift_core::ProjectPath;
+use rift_syntax::SyntaxLimits;
 use rift_syntax::{
     MarkdownBlockKind, MarkdownBlockStructure, MarkdownLinkKind, MarkdownSyntaxProvider,
     SyntaxProvider, SyntaxSource,
@@ -9,10 +10,13 @@ use rift_syntax::{
 fn analyze(path: &str, source: &str) -> rift_syntax::SyntaxDocument {
     let path = ProjectPath::new(path).expect("fixture path is valid");
     MarkdownSyntaxProvider::default()
-        .analyze(SyntaxSource {
-            path: &path,
-            text: source,
-        })
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            SyntaxLimits::default(),
+        )
         .expect("bounded fixture parses")
 }
 
@@ -150,10 +154,13 @@ fn full_commonmark_and_gfm_corpora_parse_with_bounded_source_ranges() {
     for (corpus, cases) in [("CommonMark", commonmark), ("GFM", gfm)] {
         for (number, source) in cases {
             let path = format!("docs/{corpus}-{number}.md");
-            match MarkdownSyntaxProvider::default().analyze(SyntaxSource {
-                path: &ProjectPath::new(path).expect("generated path is valid"),
-                text: &source,
-            }) {
+            match MarkdownSyntaxProvider::default().analyze(
+                SyntaxSource {
+                    path: &ProjectPath::new(path).expect("generated path is valid"),
+                    text: &source,
+                },
+                SyntaxLimits::default(),
+            ) {
                 Ok(document) => {
                     let facts = document.markdown_facts().expect("Markdown facts");
                     if !facts.error_ranges().is_empty() {

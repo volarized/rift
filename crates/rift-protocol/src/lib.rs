@@ -10,6 +10,7 @@ pub mod canonical;
 pub mod configuration;
 pub mod dependencies;
 pub mod diagnostic;
+pub mod documentation;
 pub mod error;
 pub mod index;
 pub mod lock;

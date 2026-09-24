@@ -15,9 +15,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::documentation::DocumentationIndex;
 use crate::read::{
     Digest, Documentation, ExactKind, Language, PackageIdentity, ProjectPath, Signature,
-    SourceUnitId, SymbolId, SymbolOrigin, TextRange,
+    SourceUnitId, Symbol, SymbolId, SymbolOrigin, TextRange,
 };
 
 /// The publication shape this revision of the analyzer emits.
@@ -28,7 +29,7 @@ use crate::read::{
 /// It changes only when the publication shape or a record identity changes in a way a
 /// consumer cannot read past: a consumer that meets a higher revision than it knows
 /// refuses the publication rather than reading fields it cannot place.
-pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 1;
+pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 2;
 
 /// Source units one publication may carry.
 pub const PACKAGE_UNITS_MAX: u32 = 100_000;
@@ -72,6 +73,8 @@ pub struct PackagePublication {
     /// Every search document, in document identity order.
     #[schemars(length(max = 1_100_000))]
     pub documents: Vec<PackageDocument>,
+    /// Documentation facts over the selected source units.
+    pub documentation: DocumentationIndex,
     /// What the analyzer could not do, in the order it met each. Absent when the run
     /// analyzed every selected file whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -110,6 +113,8 @@ pub struct PackageSourceUnit {
 pub struct PackageSymbol {
     /// The declaration's identity.
     pub symbol: SymbolId,
+    /// Normalized read symbol assembled from provider Contributions.
+    pub presentation: Symbol,
     /// Where the declaration came from: the package, and whether it was authored.
     pub origin: SymbolOrigin,
     /// The unit the declaration was read from.

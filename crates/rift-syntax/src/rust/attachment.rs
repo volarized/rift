@@ -274,6 +274,7 @@ fn gap_permits_attachment(previous_text: &str, gap: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::SyntaxLimits;
     use rift_core::ProjectPath;
 
     use super::super::RustSyntaxProvider;
@@ -287,10 +288,13 @@ mod tests {
 
     fn symbols(text: &str) -> Vec<SyntaxSymbol> {
         RustSyntaxProvider::default()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("fixture must parse")
             .symbols()
             .to_vec()

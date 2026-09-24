@@ -20,6 +20,7 @@ use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
 
+use crate::documentation_store::{DocumentationManifestRecord, DocumentationReferenceRecord};
 use crate::lexical::{LexicalDocumentRecord, LexicalIndexStateRecord};
 use crate::lexical::{
     LexicalIndexError, MIGRATIONS, bound_as_usize, lexical_error_caused_by, require_pragma_row,
@@ -95,6 +96,8 @@ impl WorkspaceDatabase {
             .models(toasty::models!(
                 LexicalDocumentRecord,
                 LexicalIndexStateRecord,
+                DocumentationManifestRecord,
+                DocumentationReferenceRecord,
                 VectorRecord,
                 LogRecordRow
             ))

@@ -10,6 +10,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+rift-analysis = { path = "crates/rift-analysis", default-features = false }
 rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }
 rift-dependency = { path = "crates/rift-dependency" }
@@ -75,6 +76,8 @@ tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "=2.5.8"
+tree-sitter-rst = "=0.2.0"
 validator = { version = "0.21", features = ["derive"] }
 waitpid-any = "=0.3.0"
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation"] }

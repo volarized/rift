@@ -44,9 +44,11 @@
                       "supported_features": [
                         "resolutions",
                         "search",
-                        "symbols"
+                        "symbols",
+                        "documentation_search",
+                        "symbol_documentation"
                       ],
-                      "publication_format": "rift-package-index-v1",
+                      "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
                       "required_search_fields": [
@@ -73,7 +75,8 @@
                         "candidate_pool_max": 1000,
                         "warnings_max": 32,
                         "source_bytes_max": 1048576
-                      }
+                      },
+                      "documentation_revision": "0123abcd"
                     }
                   }
                 }
@@ -517,6 +520,29 @@
                     ],
                     "phase": "precise"
                   }
+                },
+                "documentation": {
+                  "summary": "Documentation search request",
+                  "value": {
+                    "query": "Serde",
+                    "terms": [
+                      {
+                        "text": "Serde",
+                        "phrase": false,
+                        "prefix": false
+                      }
+                    ],
+                    "identifiers": [],
+                    "packages": [
+                      {
+                        "manager": "cargo",
+                        "name": "serde",
+                        "version": "1.0.219"
+                      }
+                    ],
+                    "phase": "precise",
+                    "target": "documentation"
+                  }
                 }
               }
             }
@@ -569,10 +595,77 @@
                         }
                       ],
                       "warnings": [],
-                      "publication_format": "rift-package-index-v1",
+                      "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
-                      "next_cursor": "eyJwYWdlIjoyfQ"
+                      "next_cursor": "eyJwYWdlIjoyfQ",
+                      "documentation_revision": "0123abcd"
+                    }
+                  },
+                  "documentation": {
+                    "summary": "Documentation search response",
+                    "value": {
+                      "items": [
+                        {
+                          "target": "documentation",
+                          "package": {
+                            "manager": "cargo",
+                            "name": "serde",
+                            "version": "1.0.219"
+                          },
+                          "documentation": {
+                            "block": {
+                              "identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                              "source": {
+                                "source": {
+                                  "kind": "package",
+                                  "unit": "rift://source/cargo/serde-1.0.219/README.md"
+                                }
+                              },
+                              "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                              "range": {
+                                "start": 0,
+                                "end": 13
+                              },
+                              "line": 1,
+                              "kind": "prose"
+                            },
+                            "source": {
+                              "identity": {
+                                "source": {
+                                  "kind": "package",
+                                  "unit": "rift://source/cargo/serde-1.0.219/README.md"
+                                }
+                              },
+                              "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                              "content_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "cargo",
+                                  "name": "serde",
+                                  "version": "1.0.219"
+                                },
+                                "source_kind": "authored"
+                              },
+                              "format": "markdown",
+                              "media_type": "text/markdown",
+                              "selection": "package_archive",
+                              "byte_length": 13
+                            },
+                            "documentation_revision": "0123abcd"
+                          },
+                          "contributing_fields": [
+                            "documentation",
+                            "content"
+                          ]
+                        }
+                      ],
+                      "warnings": [],
+                      "publication_format": "rift-package-index-v2",
+                      "analyzer_revision": "2026-09-22",
+                      "corpus_revision": "2026-09-22",
+                      "documentation_revision": "0123abcd"
                     }
                   }
                 }
@@ -823,10 +916,11 @@
                         }
                       ],
                       "warnings": [],
-                      "publication_format": "rift-package-index-v1",
+                      "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
-                      "next_cursor": null
+                      "next_cursor": null,
+                      "documentation_revision": "0123abcd"
                     }
                   }
                 }
@@ -1747,7 +1841,7 @@
         "description": "Publication format used by the package index.",
         "type": "string",
         "enum": [
-          "rift-package-index-v1",
+          "rift-package-index-v2",
           "unknown"
         ]
       },
@@ -1969,6 +2063,20 @@
           },
           "bounds": {
             "$ref": "#/components/schemas/CapabilityBounds"
+          },
+          "documentation_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 8,
+                "pattern": "^[0-9a-f]{8}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Documentation revision used for documentation reads."
           }
         },
         "required": [
@@ -2125,6 +2233,15 @@
               "precise",
               "broad"
             ]
+          },
+          "target": {
+            "description": "Which package results may be returned. Omitted, symbol.",
+            "type": "string",
+            "enum": [
+              "symbol",
+              "documentation",
+              "all"
+            ]
           }
         },
         "required": [
@@ -2216,7 +2333,7 @@
           "items": {
             "description": "Ranked package declarations.",
             "items": {
-              "$ref": "#/components/schemas/PackageSearchHit"
+              "$ref": "#/components/schemas/PackageSearchItem"
             },
             "type": "array",
             "maxItems": 200
@@ -2251,6 +2368,20 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 128
+          },
+          "documentation_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 8,
+                "pattern": "^[0-9a-f]{8}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Documentation revision used for this page."
           }
         },
         "required": [
@@ -2288,11 +2419,12 @@
             "items": {
               "type": "string",
               "enum": [
-                "source"
+                "source",
+                "documentation"
               ]
             },
             "type": "array",
-            "maxItems": 1
+            "maxItems": 2
           },
           "packages": {
             "description": "Selected exact package versions.",
@@ -2341,6 +2473,17 @@
               "null"
             ],
             "maxLength": 1048576
+          },
+          "documentation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DocumentationContext"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact documentation references, when requested."
           }
         },
         "required": [
@@ -2395,6 +2538,20 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 128
+          },
+          "documentation_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 8,
+                "pattern": "^[0-9a-f]{8}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Documentation revision used for this page."
           }
         },
         "required": [
@@ -2477,6 +2634,720 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 256
+      },
+      "Digest": {
+        "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+        "examples": [
+          "3f9a1c2e"
+        ],
+        "pattern": "^[0-9a-f]{8}$",
+        "type": "string"
+      },
+      "DocumentationBlock": {
+        "additionalProperties": false,
+        "description": "Documentation metadata addressing bytes held by an existing content owner.",
+        "properties": {
+          "chunks": {
+            "description": "Existing ranked documents intersecting this block, in source order.",
+            "items": {
+              "$ref": "#/components/schemas/DocumentationChunk"
+            },
+            "type": "array"
+          },
+          "content_digest": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Digest of the block's exact bytes."
+          },
+          "heading_path": {
+            "description": "Headings owning the block, in increasing depth order.",
+            "items": {
+              "$ref": "#/components/schemas/DocumentationHeading"
+            },
+            "type": "array"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Digest of canonical source identity and structural position."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DocumentationBlockKind",
+            "description": "Whether the range carries prose or code."
+          },
+          "language": {
+            "description": "Authored code language, when supplied by the format.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "description": "One-based line where the block starts.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Exact range in the regular source or decoded notebook cell."
+          },
+          "source": {
+            "$ref": "#/components/schemas/DocumentationContentIdentity",
+            "description": "Source record containing revision, format, origin, and license facts."
+          },
+          "symbol": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SymbolId"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owning declaration for an attached comment."
+          }
+        },
+        "required": [
+          "identity",
+          "source",
+          "content_digest",
+          "range",
+          "line",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "DocumentationBlockKind": {
+        "description": "The content a documentation block addresses.",
+        "type": "string",
+        "enum": [
+          "prose",
+          "code"
+        ],
+        "x-enum-descriptions": [
+          "Authored prose and its markup.",
+          "Authored code without execution or inferred name resolution."
+        ]
+      },
+      "DocumentationChunk": {
+        "additionalProperties": false,
+        "description": "A baseline search document intersecting one block.",
+        "properties": {
+          "identity": {
+            "description": "Existing symbol or text document identity.",
+            "type": "string"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Exact content range held by this document."
+          }
+        },
+        "required": [
+          "identity",
+          "range"
+        ],
+        "type": "object"
+      },
+      "DocumentationContentIdentity": {
+        "additionalProperties": false,
+        "description": "One content owner: a regular source or decoded notebook cell.",
+        "properties": {
+          "cell": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NotebookCell"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Decoded cell when the parent source is a notebook."
+          },
+          "source": {
+            "$ref": "#/components/schemas/DocumentationSourceIdentity",
+            "description": "Original workspace file or package source unit."
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "DocumentationContext": {
+        "additionalProperties": false,
+        "description": "Bounded documentation context requested for one exact declaration.",
+        "properties": {
+          "documentation_revision": {
+            "$ref": "#/components/schemas/Digest",
+            "description": "Documentation revision used for the reverse reference lookup."
+          },
+          "references": {
+            "description": "References ordered by evidence, source, block range, and identity.",
+            "items": {
+              "$ref": "#/components/schemas/DocumentationReferenceHit"
+            },
+            "maxItems": 32,
+            "type": "array"
+          },
+          "truncated": {
+            "description": "Whether the reference count or total excerpt bytes reached its bound.",
+            "type": "boolean"
+          },
+          "warnings": {
+            "description": "Incomplete source conditions for requested excerpts.",
+            "items": {
+              "$ref": "#/components/schemas/DocumentationWarning"
+            },
+            "maxItems": 256,
+            "type": "array"
+          }
+        },
+        "required": [
+          "documentation_revision",
+          "references",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "DocumentationHeading": {
+        "additionalProperties": false,
+        "description": "One heading in a block's ordered section path.",
+        "properties": {
+          "level": {
+            "description": "Heading depth established by the format parser.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Heading identity, including the parser's duplicate-heading disambiguator.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "name"
+        ],
+        "type": "object"
+      },
+      "DocumentationHit": {
+        "additionalProperties": false,
+        "description": "One documentation block projected from its existing content owner.",
+        "properties": {
+          "block": {
+            "$ref": "#/components/schemas/DocumentationBlock",
+            "description": "Exact block metadata, including source identity and range."
+          },
+          "documentation_revision": {
+            "$ref": "#/components/schemas/Digest",
+            "description": "Documentation revision under which this block was published."
+          },
+          "source": {
+            "$ref": "#/components/schemas/DocumentationSource",
+            "description": "Origin, revision, format, and license of the content owner."
+          }
+        },
+        "required": [
+          "block",
+          "source",
+          "documentation_revision"
+        ],
+        "type": "object"
+      },
+      "DocumentationLicense": {
+        "additionalProperties": false,
+        "description": "License metadata supplied by the source adapter.",
+        "properties": {
+          "expression": {
+            "description": "Declared expression; collection does not infer a license from source text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "description": "License files whose bytes the adapter verified.",
+            "items": {
+              "$ref": "#/components/schemas/DocumentationLicenseFile"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "DocumentationLicenseFile": {
+        "additionalProperties": false,
+        "description": "One license file's address and byte digest.",
+        "properties": {
+          "digest": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Digest of the license file's original bytes."
+          },
+          "path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Path relative to the source's project or package root."
+          }
+        },
+        "required": [
+          "path",
+          "digest"
+        ],
+        "type": "object"
+      },
+      "DocumentationReference": {
+        "additionalProperties": false,
+        "description": "An exact declaration reference authored inside standalone documentation.",
+        "properties": {
+          "authored": {
+            "description": "Exact authored spelling.",
+            "type": "string"
+          },
+          "block": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Block containing this reference."
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/DocumentationReferenceEvidence",
+            "description": "Rule that established the target."
+          },
+          "identity": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Digest of block, target, evidence, spelling, and occurrence ordinal."
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Reference range in its content owner."
+          },
+          "target": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "Exact declaration this reference describes."
+          }
+        },
+        "required": [
+          "identity",
+          "block",
+          "target",
+          "range",
+          "authored",
+          "evidence"
+        ],
+        "type": "object"
+      },
+      "DocumentationReferenceEvidence": {
+        "description": "Evidence establishing a documentation reference, ordered strongest first.",
+        "type": "string",
+        "enum": [
+          "provider",
+          "authored_link",
+          "qualified_name",
+          "unique_name"
+        ],
+        "x-enum-descriptions": [
+          "A typed contribution naming an exact declaration.",
+          "An authored link resolving to one declaration location.",
+          "Inline code equal to one declaration's qualified name.",
+          "Inline code equal to one unique declaration name."
+        ]
+      },
+      "DocumentationReferenceHit": {
+        "additionalProperties": false,
+        "description": "One exact declaration reference and the documentation containing it.",
+        "properties": {
+          "documentation": {
+            "$ref": "#/components/schemas/DocumentationHit",
+            "description": "Source block and its origin facts."
+          },
+          "excerpt": {
+            "description": "Bytes read from the existing content owner within the response bound.",
+            "maxLength": 16384,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference": {
+            "$ref": "#/components/schemas/DocumentationReference",
+            "description": "Exact reference evidence, never a repeated name lookup."
+          }
+        },
+        "required": [
+          "reference",
+          "documentation"
+        ],
+        "type": "object"
+      },
+      "DocumentationSelectionReason": {
+        "description": "Why the caller selected this source.",
+        "type": "string",
+        "enum": [
+          "workspace",
+          "package_archive",
+          "attached_comment",
+          "cloud_resolver"
+        ],
+        "x-enum-descriptions": [
+          "Visible documentation in the captured workspace.",
+          "Source selected from one exact package's acquired bytes.",
+          "Comment supplied by its declaration's syntax provider.",
+          "Source supplied by a cloud resolver."
+        ]
+      },
+      "DocumentationSource": {
+        "additionalProperties": false,
+        "description": "Source facts shared by every block belonging to one content owner.",
+        "properties": {
+          "byte_length": {
+            "description": "Exact content length in UTF-8 bytes.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "content_digest": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Digest of the content owner's exact bytes."
+          },
+          "format": {
+            "$ref": "#/components/schemas/DocumentationSourceFormat",
+            "description": "Parser selected for these bytes."
+          },
+          "identity": {
+            "$ref": "#/components/schemas/DocumentationContentIdentity",
+            "description": "Canonical address of the bytes block ranges use."
+          },
+          "language": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Language"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Declared source language, when known."
+          },
+          "license": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DocumentationLicense"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "License facts recorded by the source adapter."
+          },
+          "media_type": {
+            "description": "Media type supplied by the source adapter.",
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SymbolOrigin",
+            "description": "Ownership and generation facts supplied by the caller."
+          },
+          "physical_ranges": {
+            "description": "Original JSON string-token ranges for a decoded notebook cell, in source order.",
+            "items": {
+              "$ref": "#/components/schemas/TextRange"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/DocumentationDigest",
+            "description": "Source revision supplied by the caller."
+          },
+          "selection": {
+            "$ref": "#/components/schemas/DocumentationSelectionReason",
+            "description": "Why the source adapter selected these bytes."
+          }
+        },
+        "required": [
+          "identity",
+          "revision",
+          "content_digest",
+          "origin",
+          "format",
+          "media_type",
+          "selection",
+          "byte_length"
+        ],
+        "type": "object"
+      },
+      "DocumentationSourceFormat": {
+        "description": "The selected source's format.",
+        "type": "string",
+        "enum": [
+          "markdown",
+          "mdx",
+          "restructured_text",
+          "text",
+          "notebook",
+          "attached_comment"
+        ],
+        "x-enum-descriptions": [
+          "Markdown block and inline syntax.",
+          "Recognized Markdown ranges inside MDX.",
+          "Supported reStructuredText block and reference syntax.",
+          "Plain text paragraphs.",
+          "Selected markdown and code cells from a notebook.",
+          "Documentation attached by a syntax provider."
+        ]
+      },
+      "DocumentationSourceIdentity": {
+        "description": "The selected source's canonical address.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "A visible workspace file.",
+            "properties": {
+              "kind": {
+                "const": "project",
+                "type": "string"
+              },
+              "path": {
+                "$ref": "#/components/schemas/ProjectPath",
+                "description": "Path relative to the workspace root."
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A source unit supplied by an exact package adapter.",
+            "properties": {
+              "kind": {
+                "const": "package",
+                "type": "string"
+              },
+              "unit": {
+                "$ref": "#/components/schemas/SourceUnitId",
+                "description": "Canonical package source identity."
+              }
+            },
+            "required": [
+              "kind",
+              "unit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "DocumentationStage": {
+        "description": "The collection step reporting incomplete documentation.",
+        "type": "string",
+        "enum": [
+          "source",
+          "extract",
+          "resolve",
+          "index"
+        ],
+        "x-enum-descriptions": [
+          "Source selection and byte validation.",
+          "Format parsing and block extraction.",
+          "Authored link and declaration reference resolution.",
+          "Mapping metadata to existing ranked documents."
+        ]
+      },
+      "DocumentationWarning": {
+        "additionalProperties": false,
+        "description": "One bounded warning with repeated conditions counted per source.",
+        "properties": {
+          "count": {
+            "description": "Number of items omitted or truncated for this condition.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DocumentationWarningKind",
+            "description": "Typed condition the caller can inspect."
+          },
+          "source": {
+            "$ref": "#/components/schemas/DocumentationContentIdentity",
+            "description": "Source whose documentation is incomplete."
+          },
+          "stage": {
+            "$ref": "#/components/schemas/DocumentationStage",
+            "description": "Collection step reporting the condition."
+          }
+        },
+        "required": [
+          "source",
+          "stage",
+          "kind",
+          "count"
+        ],
+        "type": "object"
+      },
+      "DocumentationWarningKind": {
+        "description": "Why one documentation source is incomplete.",
+        "type": "string",
+        "enum": [
+          "source_unavailable",
+          "source_truncated",
+          "unsupported_format",
+          "malformed_source",
+          "omitted_range",
+          "limit_exceeded"
+        ],
+        "x-enum-descriptions": [
+          "Source bytes or their format are unavailable.",
+          "Retained source ends before an addressed range.",
+          "Format and extension do not select a supported parser.",
+          "Parser refused malformed source.",
+          "Recognized syntax was excluded from documentation metadata.",
+          "A configured or format bound stopped output."
+        ]
+      },
+      "NotebookCell": {
+        "additionalProperties": false,
+        "description": "A selected cell addressed within its parent notebook.",
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/NotebookCellIdentity",
+            "description": "Authored identifier or original cell position."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NotebookCellKind",
+            "description": "Which content the cell carries."
+          }
+        },
+        "required": [
+          "identity",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "NotebookCellIdentity": {
+        "description": "The authored cell identifier or its position when no identifier exists.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "A valid identifier stored in the notebook.",
+            "properties": {
+              "id": {
+                "description": "Identifier accepted by the notebook format.",
+                "type": "string"
+              },
+              "kind": {
+                "const": "authored",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The cell's zero-based position in its notebook.",
+            "properties": {
+              "index": {
+                "description": "Position among every cell, including unselected cells.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "indexed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "index"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "NotebookCellKind": {
+        "description": "The selected notebook cell's content kind.",
+        "type": "string",
+        "enum": [
+          "markdown",
+          "code"
+        ],
+        "x-enum-descriptions": [
+          "Markdown source decoded from a markdown cell.",
+          "Source decoded from a code cell, without execution."
+        ]
+      },
+      "ProjectPath": {
+        "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+        "examples": [
+          "src/lib.rs"
+        ],
+        "maxLength": 1000,
+        "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+        "type": "string"
+      },
+      "PackageDocumentationHit": {
+        "additionalProperties": true,
+        "description": "One documentation block returned by search.",
+        "properties": {
+          "target": {
+            "const": "documentation",
+            "type": "string"
+          },
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          },
+          "documentation": {
+            "$ref": "#/components/schemas/DocumentationHit"
+          },
+          "contributing_fields": {
+            "description": "Fields that contributed to ranking.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "documentation",
+                "content",
+                "unknown"
+              ]
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "source": {
+            "description": "The block source excerpt when requested, bounded across the response page.",
+            "type": "string",
+            "maxLength": 16384
+          }
+        },
+        "required": [
+          "target",
+          "package",
+          "documentation",
+          "contributing_fields"
+        ],
+        "type": "object"
+      },
+      "PackageSearchItem": {
+        "description": "One symbol or documentation result.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PackageSearchHit"
+          },
+          {
+            "$ref": "#/components/schemas/PackageDocumentationHit"
+          }
+        ]
+      },
+      "DocumentationDigest": {
+        "description": "Full lowercase SHA-256 digest for documentation content and identity.",
+        "examples": [
+          "3f9a1c2e7b4d6a09876543210fedcba9876543210fedcba9876543210fedcba"
+        ],
+        "maxLength": 64,
+        "minLength": 64,
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
       }
     },
     "headers": {

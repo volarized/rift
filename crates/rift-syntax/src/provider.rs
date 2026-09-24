@@ -6,6 +6,8 @@ use rift_protocol::read::{Language, NodeFacet};
 use crate::document::SyntaxDocument;
 use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault};
 
+/// Default maximum bytes accepted from one source.
+pub(crate) const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
 /// Default maximum syntax nodes accepted from one parsed source.
 pub(crate) const SYNTAX_NODES_MAX_DEFAULT: usize = 250_000;
 /// Default maximum syntax depth accepted from one parsed source.
@@ -57,13 +59,19 @@ impl SyntaxLimits {
         })
     }
 
-    /// Constructs bounds from a provider's declared constants.
+    /// The bounds every provider parses under unless the caller supplies others.
+    pub const DEFAULT: Self = Self::declared(
+        SOURCE_BYTES_MAX_DEFAULT,
+        SYNTAX_NODES_MAX_DEFAULT,
+        SYNTAX_DEPTH_MAX_DEFAULT,
+    );
+
+    /// Constructs bounds from compile-time constants.
     ///
     /// # Panics
     ///
-    /// Panics when a declared bound is zero. A provider declares its default
-    /// bounds in a `const` item, so the check evaluates at compile time and
-    /// a zero constant fails the build, not a request.
+    /// Panics when a bound is zero. [`Self::DEFAULT`] evaluates it in a
+    /// `const` item, so a zero default fails the build, not a request.
     pub(crate) const fn declared(
         source_bytes_max: usize,
         syntax_nodes_max: usize,
@@ -89,18 +97,43 @@ impl SyntaxLimits {
     }
 
     /// Returns maximum accepted source bytes.
-    pub(crate) const fn source_bytes_max(self) -> usize {
+    #[must_use]
+    pub const fn source_bytes_max(self) -> usize {
         self.source_bytes_max
     }
 
     /// Returns maximum accepted syntax nodes.
-    pub(crate) const fn syntax_nodes_max(self) -> usize {
+    #[must_use]
+    pub const fn syntax_nodes_max(self) -> usize {
         self.syntax_nodes_max
     }
 
     /// Returns maximum accepted syntax depth.
-    pub(crate) const fn syntax_depth_max(self) -> usize {
+    #[must_use]
+    pub const fn syntax_depth_max(self) -> usize {
         self.syntax_depth_max
+    }
+
+    /// Refuses a source larger than these bounds accept, before any parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] naming the source's size and the bound when it is larger.
+    pub(crate) fn admit_source(self, source: SyntaxSource<'_>) -> Result<(), SyntaxError> {
+        if source.text.len() > self.source_bytes_max {
+            return Err(Error::new(SyntaxFault::SourceTooLarge {
+                path: Some(source.path.clone()),
+                source_bytes: source.text.len(),
+                source_bytes_max: self.source_bytes_max,
+            }));
+        }
+        Ok(())
+    }
+}
+
+impl Default for SyntaxLimits {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -112,16 +145,17 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
     /// The language identity this provider files facts under.
     fn language(&self) -> &Language;
 
-    /// Maximum source bytes this provider accepts in one analysis.
-    fn source_bytes_max(&self) -> usize;
-
-    /// Parses source and extracts named nodes and declarations.
+    /// Parses source under `limits` and extracts named nodes and declarations.
     ///
     /// # Errors
     ///
     /// Returns [`SyntaxError`] for incompatible grammar, cancellation, or an
     /// exceeded bound.
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError>;
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError>;
 
     /// Portable structural facets for one grammar node kind.
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet>;

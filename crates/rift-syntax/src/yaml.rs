@@ -49,9 +49,7 @@ use tree_sitter::{Node, Parser};
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
-use crate::provider::{
-    SYNTAX_DEPTH_MAX_DEFAULT, SYNTAX_NODES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource,
-};
+use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Grammar spelling of a `document`.
 const DOCUMENT_KIND: &str = "document";
@@ -324,37 +322,16 @@ impl GrammarRules for YamlRules {
 #[derive(Debug, Clone)]
 pub struct YamlSyntaxProvider {
     language: Language,
-    limits: SyntaxLimits,
 }
 
-impl YamlSyntaxProvider {
-    /// Default maximum bytes this provider accepts from one YAML source.
-    pub const SOURCE_BYTES_MAX_DEFAULT: usize = 4 * 1_024 * 1_024;
-
-    /// Constructs provider with explicit bounds.
-    #[must_use]
-    pub fn new(limits: SyntaxLimits) -> Self {
+impl Default for YamlSyntaxProvider {
+    fn default() -> Self {
         Self {
             language: Language {
                 name: "yaml".to_owned(),
                 dialect: None,
             },
-            limits,
         }
-    }
-}
-
-/// The YAML provider's declared default bounds, proven positive at compile
-/// time.
-const YAML_SYNTAX_LIMITS_DEFAULT: SyntaxLimits = SyntaxLimits::declared(
-    YamlSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT,
-    SYNTAX_NODES_MAX_DEFAULT,
-    SYNTAX_DEPTH_MAX_DEFAULT,
-);
-
-impl Default for YamlSyntaxProvider {
-    fn default() -> Self {
-        Self::new(YAML_SYNTAX_LIMITS_DEFAULT)
     }
 }
 
@@ -363,18 +340,12 @@ impl SyntaxProvider for YamlSyntaxProvider {
         &self.language
     }
 
-    fn source_bytes_max(&self) -> usize {
-        self.limits.source_bytes_max()
-    }
-
-    fn analyze(&self, source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
-        if source.text.len() > self.limits.source_bytes_max() {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: Some(source.path.clone()),
-                source_bytes: source.text.len(),
-                source_bytes_max: self.limits.source_bytes_max(),
-            }));
-        }
+    fn analyze(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+    ) -> Result<SyntaxDocument, SyntaxError> {
+        limits.admit_source(source)?;
         let grammar = yaml_grammar();
         let mut parser = Parser::new();
         parser
@@ -386,13 +357,8 @@ impl SyntaxProvider for YamlSyntaxProvider {
             })
         })?;
         let rules = YamlRules::new(yaml_kinds(), tree.root_node());
-        let (nodes, symbols) = extract::extract(
-            tree.root_node(),
-            source,
-            self.limits,
-            &self.language,
-            &rules,
-        )?;
+        let (nodes, symbols) =
+            extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
         Ok(SyntaxDocument::new(
             self.language.clone(),
             source.path.clone(),
@@ -459,10 +425,13 @@ mod tests {
 
     fn analyze(text: &str) -> SyntaxDocument {
         YamlSyntaxProvider::default()
-            .analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            .analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                SyntaxLimits::default(),
+            )
             .expect("YAML fixture must parse")
     }
 
@@ -499,14 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_declares_language_and_byte_bound() {
+    fn test_provider_declares_language() {
         let provider = YamlSyntaxProvider::default();
         assert_eq!(provider.language().name, "yaml");
         assert_eq!(provider.language().dialect, None);
-        assert_eq!(
-            provider.source_bytes_max(),
-            YamlSyntaxProvider::SOURCE_BYTES_MAX_DEFAULT
-        );
     }
 
     /// Block and flow entries qualify through their key path with
@@ -745,10 +710,13 @@ mod tests {
     #[test]
     fn test_provider_enforces_source_node_and_depth_limits() {
         let bounded = |limits: SyntaxLimits, text: &str| {
-            YamlSyntaxProvider::new(limits).analyze(SyntaxSource {
-                path: &path(),
-                text,
-            })
+            YamlSyntaxProvider::default().analyze(
+                SyntaxSource {
+                    path: &path(),
+                    text,
+                },
+                limits,
+            )
         };
         let source_error = bounded(
             SyntaxLimits::new(3, 10, 10).expect("positive limits"),

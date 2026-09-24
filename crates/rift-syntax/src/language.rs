@@ -98,8 +98,8 @@ pub trait LanguageDefinition: std::fmt::Debug + Send + Sync {
     /// with `[languages.<identity>] include`.
     fn extensions(&self) -> &'static [&'static str];
 
-    /// The syntax provider parsing this language's sources, under its
-    /// declared default bounds.
+    /// The syntax provider parsing this language's sources; each analysis
+    /// receives the bounds it parses under.
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider>;
 }
 

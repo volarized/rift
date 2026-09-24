@@ -76,7 +76,7 @@ pub fn symbol_identity(language_segment: &str, path: &str, qualified_name: &str)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSymbolIdentity {
     language_segment: String,
-    path: ProjectPath,
+    path: String,
     qualified_name: String,
 }
 
@@ -87,9 +87,9 @@ impl ParsedSymbolIdentity {
         &self.language_segment
     }
 
-    /// Returns decoded project path from wire identity.
+    /// Returns the decoded project path or resolver and source-unit key.
     #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
+    pub fn path(&self) -> &str {
         &self.path
     }
 
@@ -151,7 +151,11 @@ pub fn parse_symbol_identity(value: &str) -> Result<ParsedSymbolIdentity, Symbol
     if path.is_empty() || qualified_name.is_empty() {
         return Err(SymbolIdentityError);
     }
-    let path = ProjectPath::new(path).map_err(|_| SymbolIdentityError)?;
+    if ProjectPath::new(&path).is_err()
+        && SourceUnitId::parse(&format!("{SOURCE_UNIT_URI_PREFIX}{encoded_path}")).is_err()
+    {
+        return Err(SymbolIdentityError);
+    }
     let parsed = ParsedSymbolIdentity {
         language_segment: language_segment.to_owned(),
         path,
@@ -641,7 +645,7 @@ mod tests {
         let identity = symbol_identity("rust", "src/café mod.rs", "Rift::separated name");
         let parsed = parse_symbol_identity(&identity).expect("canonical symbol identity");
         assert_eq!(parsed.language_segment(), "rust");
-        assert_eq!(parsed.path().as_str(), "src/café mod.rs");
+        assert_eq!(parsed.path(), "src/café mod.rs");
         assert_eq!(parsed.qualified_name(), "Rift::separated name");
         assert_eq!(parsed.wire_identity(), identity);
         let oversized = format!("rift://symbol/rust/src/lib.rs/{}", "x".repeat(8192));
@@ -662,6 +666,20 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn parse_symbol_identity_accepts_bounded_package_paths() {
+        let path = format!("cargo/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
+        assert!(ProjectPath::new(&path).is_err());
+        let identity = symbol_identity("rust", &path, "serve");
+        let parsed = parse_symbol_identity(&identity).expect("package symbol identity");
+        assert_eq!(parsed.path(), path);
+        assert_eq!(parsed.qualified_name(), "serve");
+        assert_eq!(parsed.wire_identity(), identity);
+
+        let oversized_key = format!("cargo/{}", "x".repeat(4_097));
+        assert!(parse_symbol_identity(&symbol_identity("rust", &oversized_key, "serve")).is_err());
     }
 
     #[test]

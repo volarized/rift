@@ -3921,8 +3921,10 @@ mod tests {
         // file-content column is the only one that could have placed it.
         let file_hit = results
             .iter()
-            .find(|hit| hit["hit"]["target"] == "file" && hit["path"] == json!("guide.txt"))
-            .ok_or_else(|| format!("guide.txt text-file hit missing: {structured:#}"))?;
+            .find(|hit| {
+                hit["hit"]["target"] == "documentation" && hit["path"] == json!("guide.txt")
+            })
+            .ok_or_else(|| format!("guide.txt documentation hit missing: {structured:#}"))?;
         assert_eq!(file_hit["matched_by"], json!(["content"]));
 
         // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
@@ -4173,7 +4175,7 @@ mod tests {
         let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
         let message = data.message.as_ref();
         assert!(
-            message.contains("field target, accepted all, file, symbol"),
+            message.contains("field target, accepted all, documentation, file, symbol"),
             "{message}"
         );
         assert!(

@@ -17,12 +17,26 @@ pub enum PackageLocation {
     Stdlib,
 }
 
+/// Local bytes available for one package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogSource {
+    /// Installed package directory.
+    Directory(PathBuf),
+    /// Already-present Cargo archive and its lockfile SHA-256 digest.
+    Archive {
+        /// Path to the already-present archive.
+        path: PathBuf,
+        /// SHA-256 checksum from the Cargo lockfile.
+        sha256: [u8; 32],
+    },
+}
+
 /// One package a resolver cataloged.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogEntry {
     identity: PackageIdentity,
     location: PackageLocation,
-    source_root: Option<PathBuf>,
+    source: Option<CatalogSource>,
     direct: bool,
     language: Language,
 }
@@ -38,7 +52,7 @@ impl CatalogEntry {
         Self {
             identity,
             location,
-            source_root: None,
+            source: None,
             direct: false,
             language,
         }
@@ -46,7 +60,7 @@ impl CatalogEntry {
 
     /// One dependency entry with its source root and whether a manifest declares it.
     #[must_use]
-    pub const fn dependency(
+    pub fn dependency(
         identity: PackageIdentity,
         language: Language,
         source_root: Option<PathBuf>,
@@ -55,7 +69,7 @@ impl CatalogEntry {
         Self {
             identity,
             location: PackageLocation::Dependency,
-            source_root,
+            source: source_root.map(CatalogSource::Directory),
             direct: declared_directly,
             language,
         }
@@ -64,7 +78,14 @@ impl CatalogEntry {
     /// Records the directory holding the package's source on this machine.
     #[must_use]
     pub fn with_source_root(mut self, source_root: PathBuf) -> Self {
-        self.source_root = Some(source_root);
+        self.source = Some(CatalogSource::Directory(source_root));
+        self
+    }
+
+    /// Records an already-present Cargo archive with its lockfile digest.
+    #[must_use]
+    pub fn with_source_archive(mut self, path: PathBuf, sha256: [u8; 32]) -> Self {
+        self.source = Some(CatalogSource::Archive { path, sha256 });
         self
     }
 
@@ -91,7 +112,16 @@ impl CatalogEntry {
     /// holds its bytes.
     #[must_use]
     pub fn source_root(&self) -> Option<&Path> {
-        self.source_root.as_deref()
+        match &self.source {
+            Some(CatalogSource::Directory(path)) => Some(path),
+            Some(CatalogSource::Archive { .. }) | None => None,
+        }
+    }
+
+    /// Local package bytes selected by this catalog entry.
+    #[must_use]
+    pub const fn source(&self) -> Option<&CatalogSource> {
+        self.source.as_ref()
     }
 
     /// Whether a workspace manifest declares the package directly.
@@ -272,8 +302,8 @@ fn identity_key(identity: &PackageIdentity) -> (String, String, String) {
 
 /// Folds a second entry of one identity into the standing one.
 fn merge_into(standing: &mut CatalogEntry, entry: CatalogEntry) {
-    if standing.source_root.is_none() {
-        standing.source_root = entry.source_root;
+    if !matches!(&standing.source, Some(CatalogSource::Directory(_))) && entry.source.is_some() {
+        standing.source = entry.source;
     }
     standing.direct |= entry.direct;
 }

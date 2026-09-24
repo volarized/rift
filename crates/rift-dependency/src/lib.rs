@@ -30,7 +30,8 @@ mod fixture;
 pub use bun::BunResolver;
 pub use cargo::CargoResolver;
 pub use catalog::{
-    CatalogEntry, Degradation, DependencyCatalog, PackageLocation, Resolution, resolve_catalog,
+    CatalogEntry, CatalogSource, Degradation, DependencyCatalog, PackageLocation, Resolution,
+    resolve_catalog,
 };
 pub use context::{ContextAnswer, DependencyContext, resolve_context};
 pub use npm::NpmResolver;

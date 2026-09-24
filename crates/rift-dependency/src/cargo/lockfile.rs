@@ -24,6 +24,8 @@ const CARGO_HOME_VARIABLE: &str = "CARGO_HOME";
 const CARGO_HOME_DIRECTORY_NAME: &str = ".cargo";
 /// Registry package sources below Cargo's home, one directory per index.
 const REGISTRY_SOURCE_PATH: &str = "registry/src";
+/// Registry archives below Cargo's home, one directory per index.
+const REGISTRY_CACHE_PATH: &str = "registry/cache";
 /// Git checkouts below Cargo's home, one directory per repository, then per revision.
 const GIT_CHECKOUTS_PATH: &str = "git/checkouts";
 /// The repository suffix a git URL may carry and a checkout directory name drops.
@@ -48,6 +50,8 @@ pub(super) struct LockedPackage {
     pub(super) name: String,
     pub(super) version: String,
     pub(super) source: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
     #[serde(default)]
     dependencies: Vec<String>,
 }
@@ -114,20 +118,54 @@ fn lockfile_entries(
         let Some(source) = package.source.as_deref().and_then(locked_source) else {
             continue;
         };
-        let source_root = match source {
+        let entry = match source {
             LockedSource::Registry => {
-                cache.registry_root(inspector, &package.name, &package.version)
+                let root = cache.registry_root(inspector, &package.name, &package.version);
+                let mut entry = CatalogEntry::dependency(
+                    package_identity(CARGO_MANAGER, &package.name, &package.version),
+                    rust_language(),
+                    root,
+                    direct.contains(package.name.as_str()),
+                );
+                if entry.source_root().is_none()
+                    && let Some(digest) = package.checksum.as_deref().and_then(parse_sha256)
+                    && let Some(path) =
+                        cache.registry_archive(inspector, &package.name, &package.version)
+                {
+                    entry = entry.with_source_archive(path, digest);
+                }
+                entry
             }
-            LockedSource::Git(source) => cache.git_root(inspector, source),
+            LockedSource::Git(source) => CatalogEntry::dependency(
+                package_identity(CARGO_MANAGER, &package.name, &package.version),
+                rust_language(),
+                cache.git_root(inspector, source),
+                direct.contains(package.name.as_str()),
+            ),
         };
-        entries.push(CatalogEntry::dependency(
-            package_identity(CARGO_MANAGER, &package.name, &package.version),
-            rust_language(),
-            source_root,
-            direct.contains(package.name.as_str()),
-        ));
+        entries.push(entry);
     }
     entries
+}
+
+fn parse_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let pair = std::str::from_utf8(pair).ok()?;
+        digest[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(digest)
+}
+
+/// One cache index's matching `.crate` archive, probed without reading archive bytes.
+fn cached_registry_archive(inspector: &mut dyn Inspector, archive: &Path) -> bool {
+    !matches!(
+        inspector.read_file(archive, 0),
+        crate::resolver::FileObservation::Absent
+    )
 }
 
 /// The names the workspace's own packages depend on.
@@ -149,6 +187,8 @@ fn declared_dependencies(lockfile: &Lockfile) -> BTreeSet<&str> {
 struct CargoCache {
     registry_source: Option<PathBuf>,
     index_directories: Vec<String>,
+    registry_cache: Option<PathBuf>,
+    cache_directories: Vec<String>,
     checkouts: Option<PathBuf>,
     checkout_directories: Vec<String>,
 }
@@ -162,11 +202,14 @@ impl CargoCache {
             return Self::default();
         };
         let registry_source = home.join(REGISTRY_SOURCE_PATH);
+        let registry_cache = home.join(REGISTRY_CACHE_PATH);
         let checkouts = home.join(GIT_CHECKOUTS_PATH);
         Self {
             index_directories: inspector.list_directory(&registry_source, DIRECTORY_ENTRIES_MAX),
+            cache_directories: inspector.list_directory(&registry_cache, DIRECTORY_ENTRIES_MAX),
             checkout_directories: inspector.list_directory(&checkouts, DIRECTORY_ENTRIES_MAX),
             registry_source: Some(registry_source),
+            registry_cache: Some(registry_cache),
             checkouts: Some(checkouts),
         }
     }
@@ -184,6 +227,20 @@ impl CargoCache {
             .iter()
             .map(|index| registry_source.join(index).join(&directory_name))
             .find(|candidate| inspector.directory_exists(candidate))
+    }
+
+    fn registry_archive(
+        &self,
+        inspector: &mut dyn Inspector,
+        name: &str,
+        version: &str,
+    ) -> Option<PathBuf> {
+        let cache = self.registry_cache.as_ref()?;
+        let archive = format!("{name}-{version}.crate");
+        self.cache_directories
+            .iter()
+            .map(|index| cache.join(index).join(&archive))
+            .find(|candidate| cached_registry_archive(inspector, candidate))
     }
 
     /// The first checkout of the source's repository holding its revision.
@@ -402,6 +459,35 @@ mod tests {
                 "/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228"
             ))
         );
+    }
+
+    #[test]
+    fn test_resolve_uses_matching_cached_archive_when_source_directory_is_absent() {
+        use crate::catalog::CatalogSource;
+
+        let checksum = "ab".repeat(32);
+        let lockfile = WORKSPACE_LOCKFILE
+            .replace("checksum = \"0000\"", &format!("checksum = \"{checksum}\""));
+        let archive = format!("{CARGO_HOME}/registry/cache/{INDEX_DIRECTORY}/serde-1.0.228.crate");
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/Cargo.lock"), lockfile)
+            .with_file(&archive, b"already cached")
+            .with_environment("CARGO_HOME", CARGO_HOME);
+
+        let resolution = resolve(&["Cargo.toml"], &mut inspector);
+        let serde = entry(&resolution, "serde");
+        assert_eq!(serde.source_root(), None);
+        assert_eq!(
+            serde.source(),
+            Some(&CatalogSource::Archive {
+                path: PathBuf::from(archive.clone()),
+                sha256: [0xab; 32],
+            })
+        );
+        assert!(inspector.asked.contains(&format!("read {archive}")));
+        assert!(inspector.asked.iter().any(|asked| {
+            asked.contains("cargo metadata --format-version 1 --locked --offline")
+        }));
     }
 
     #[test]

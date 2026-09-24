@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, Extensions, IndexRevision,
     PortableSymbolFacts, ProviderId, SymbolId, SymbolRecord, SymbolResolution,
 };
+use rift_protocol::read::{SourceLocationKind, Symbol, SymbolId as WireSymbolId, SymbolOrigin};
 
 use crate::NormalizedGraph;
 
@@ -130,6 +131,59 @@ impl AssembledSymbol {
     #[must_use]
     pub fn disagreements(&self) -> &[PresentationDisagreement] {
         &self.disagreements
+    }
+
+    /// Converts normalized provider facts into one read symbol.
+    #[must_use]
+    pub fn to_protocol_symbol(&self, facts: &PortableSymbolFacts) -> Symbol {
+        let mut extension_values = BTreeMap::new();
+        for (_, extensions) in &self.namespaced {
+            for (key, value) in &extensions.0 {
+                extension_values
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        Symbol {
+            id: self
+                .identity
+                .as_ref()
+                .map(|identity| WireSymbolId(identity.as_str().to_owned())),
+            language: facts.language().clone(),
+            name: facts.name().to_owned(),
+            kind: facts.kind().clone(),
+            facets: facts.symbol_facets().to_vec(),
+            origin: wire_symbol_origin(&self.origin),
+            container: self
+                .container
+                .as_ref()
+                .map(|container| WireSymbolId(container.as_str().to_owned())),
+            modifiers: facts.modifier_words().to_vec(),
+            visibility: facts.visibility_spelling().map(str::to_owned),
+            types: facts.type_bindings().to_vec(),
+            signatures: facts.signatures_slice().to_vec(),
+            documentation: facts.documentation_blocks().to_vec(),
+            extensions: Extensions(extension_values),
+            document_local: facts.is_document_local(),
+        }
+    }
+}
+
+fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
+    let location = origin.location();
+    SymbolOrigin {
+        location: location.map(|location| match location {
+            rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
+            rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
+            rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+            rift_core::SourceLocation::External {} => SourceLocationKind::External,
+        }),
+        package: location.and_then(|location| match location {
+            rift_core::SourceLocation::Project { package } => package.clone(),
+            rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
+            rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
+        }),
+        source_kind: origin.source_kind(),
     }
 }
 
@@ -563,6 +617,39 @@ mod tests {
                 .expect("contribution")
                 .origin()
         );
+    }
+
+    #[test]
+    fn protocol_symbol_preserves_extensions_and_external_origin() {
+        let graph = graph();
+        let record = graph
+            .records()
+            .iter()
+            .find(|record| record.identity().is_some())
+            .expect("established record");
+        let mut assembled =
+            SymbolAssembler::assemble(&graph, record, &[]).expect("assembled symbol");
+        let key = rift_core::ExtensionKey("org.rift.history".to_owned());
+        let value = rift_core::ExtensionValue {
+            version: 1,
+            data: serde_json::json!({"commit": "abc123"}),
+        };
+        assembled.namespaced.push((
+            provider("git"),
+            Extensions(BTreeMap::from([(key.clone(), value.clone())])),
+        ));
+        assembled.origin =
+            ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
+                .expect("external origin");
+
+        let symbol = assembled.to_protocol_symbol(assembled.facts().expect("portable facts"));
+
+        assert_eq!(symbol.extensions.0.get(&key), Some(&value));
+        assert_eq!(
+            symbol.origin.location,
+            Some(rift_protocol::read::SourceLocationKind::External)
+        );
+        assert!(symbol.origin.package.is_none());
     }
 
     #[test]

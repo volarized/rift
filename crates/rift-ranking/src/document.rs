@@ -325,6 +325,15 @@ impl DocumentIdentity {
         Self::new(format!("{unit}{UNIT_QUALIFIER_SEPARATOR}{qualified_name}"))
     }
 
+    /// Names one projected documentation block by its stable digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RankingError`] when the identity runs past [`IDENTITY_BYTES_MAX`].
+    pub fn for_documentation_block(digest: &str) -> Result<Self, RankingError> {
+        Self::new(format!("\u{1f}documentation-block/{digest}"))
+    }
+
     /// The source unit and the qualified name inside it, or `None` for an identity that
     /// names no package declaration.
     #[must_use]
@@ -621,6 +630,9 @@ impl CorpusRevision {
         hasher.update(CORPUS_TOKENIZER.as_bytes());
         hasher.update(b"\n");
         hasher.update(IDENTIFIER_DERIVATION.as_bytes());
+        // Required documentation sources, derived notebook cells, and block projection
+        // change the corpus while preserving existing symbol and regular file identities.
+        hasher.update(b"\ndocumentation-blocks-v1\n");
         hasher.update(b"\n");
         for field in SearchableField::ALL {
             hasher.update(field.column().as_bytes());
@@ -705,6 +717,17 @@ mod tests {
     fn test_an_identity_at_the_byte_bound_is_accepted() {
         let value = "i".repeat(IDENTITY_BYTES_MAX);
         assert_eq!(identity(&value).as_str().len(), IDENTITY_BYTES_MAX);
+    }
+
+    #[test]
+    fn documentation_block_identity_uses_private_namespace() {
+        let document =
+            DocumentIdentity::for_documentation_block("0123456789abcdef0123456789abcdef")
+                .expect("block identity fits");
+        assert_eq!(
+            document.as_str(),
+            "\u{1f}documentation-block/0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ use tracing::Instrument as _;
     clippy::all,
     clippy::match_same_arms,
     clippy::missing_errors_doc,
+    clippy::must_use_candidate,
     clippy::wildcard_imports,
     unreachable_pub,
     unused_imports,
@@ -41,14 +42,20 @@ use tracing::Instrument as _;
 #[rustfmt::skip]
 mod generated;
 pub use generated::{
-    Capabilities, CapabilityBounds, Documentation, DocumentationFormat, ExactKind, Extensions,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, IdentifierMatchClass, Language,
-    ListPackageSymbolsRequest, ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId,
-    PackageAvailability, PackageContextEntry, PackageIdentity, PackageResolutionRequest,
+    Capabilities, CapabilityBounds, Documentation, DocumentationBlock, DocumentationBlockKind,
+    DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
+    DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
+    DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
+    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
+    ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
+    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
+    PackageDocumentationHitContributingField, PackageIdentity, PackageResolutionRequest,
     PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase, PackageSymbol,
-    PackageSymbolPage, PackageSymbolRequest, Parameter, ProblemDetails, PublicationFormat,
-    QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
+    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
+    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
+    PackageSymbolRequestInclude, Parameter, ProblemDetails, PublicationFormat, QueryTerm,
+    ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
     SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, Signature,
     SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
     SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
@@ -370,13 +377,15 @@ struct RawResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackageSearchPages {
     /// Ordered, duplicate-free candidates.
-    pub items: Vec<PackageSearchHit>,
+    pub items: Vec<PackageSearchItem>,
     /// First distinct warnings in page order.
     pub warnings: Vec<Warning>,
     /// Analyzer revision shared by every page.
     pub analyzer_revision: String,
     /// Corpus revision shared by every page.
     pub corpus_revision: String,
+    /// Documentation revision shared by every page that returns documentation.
+    pub documentation_revision: Option<String>,
 }
 
 /// Symbol pages assembled under one capability and candidate bound.
@@ -390,6 +399,8 @@ pub struct PackageSymbolPages {
     pub analyzer_revision: String,
     /// Corpus revision shared by every page.
     pub corpus_revision: String,
+    /// Documentation revision shared by every page that returns documentation.
+    pub documentation_revision: Option<String>,
 }
 
 impl GlobalClient {
@@ -724,6 +735,7 @@ impl GlobalClient {
         let mut hits = Vec::new();
         let mut warnings = Vec::new();
         let mut revisions = None;
+        let mut seen_identities = HashSet::new();
         let mut seen_cursors = HashSet::new();
         loop {
             let page = self
@@ -733,17 +745,15 @@ impl GlobalClient {
                 &mut revisions,
                 &page.analyzer_revision,
                 &page.corpus_revision,
+                page.documentation_revision.as_deref(),
             ) {
                 self.record_failure().await;
                 return Err(error);
             }
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
-                let identity = search_hit_identity(&hit);
-                if hits
-                    .iter()
-                    .any(|item: &PackageSearchHit| search_hit_identity(item) == identity)
-                {
+                let identity = search_hit_identity(&hit)?;
+                if !seen_identities.insert(identity) {
                     self.record_failure().await;
                     return Err(ClientError::InvalidResponseField {
                         field: "duplicate_item",
@@ -796,6 +806,7 @@ impl GlobalClient {
                 &mut revisions,
                 &page.analyzer_revision,
                 &page.corpus_revision,
+                page.documentation_revision.as_deref(),
             ) {
                 self.record_failure().await;
                 return Err(error);
@@ -1086,7 +1097,7 @@ impl ResponseMeta {
 }
 
 fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
-    if value.publication_format != PublicationFormat::RiftPackageIndexV1 {
+    if value.publication_format != PublicationFormat::RiftPackageIndexV2 {
         return Err(ClientError::InvalidResponseField {
             field: "publication_format",
         });
@@ -1126,6 +1137,18 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         || value.corpus_revision.len() > 128
     {
         return Err(ClientError::InvalidResponseField { field: "revision" });
+    }
+    let documentation_supported = supports_feature(value, "documentation_search")
+        || supports_feature(value, "symbol_documentation");
+    if documentation_supported
+        != value
+            .documentation_revision
+            .as_deref()
+            .is_some_and(valid_revision_digest)
+    {
+        return Err(ClientError::InvalidResponseField {
+            field: "documentation_revision",
+        });
     }
     let bounds = &value.bounds;
     let bounds_ok = positive_within(bounds.request_body_bytes_max, REQUEST_BODY_BYTES_MAX)
@@ -1172,6 +1195,20 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
     Ok(())
 }
 
+fn supports_feature(capabilities: &Capabilities, feature: &str) -> bool {
+    capabilities
+        .supported_features
+        .iter()
+        .any(|supported| supported == feature)
+}
+
+fn valid_revision_digest(value: &str) -> bool {
+    value.len() == 8
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_resolution_request_for_capabilities(
     request: &PackageResolutionRequest,
     capabilities: &Capabilities,
@@ -1193,6 +1230,17 @@ fn validate_search_request_for_capabilities(
     cursor: Option<&str>,
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
+    let target = request
+        .target
+        .as_ref()
+        .unwrap_or(&PackageSearchRequestTarget::Symbol);
+    if matches!(
+        target,
+        PackageSearchRequestTarget::Documentation | PackageSearchRequestTarget::All
+    ) && !supports_feature(capabilities, "documentation_search")
+    {
+        return Err(ClientError::InvalidRequest { field: "target" });
+    }
     let bounds = &capabilities.bounds;
     if request.query.len() > smaller_bound(bounds.query_bytes_max, QUERY_BYTES_MAX) {
         return Err(ClientError::InvalidRequest { field: "query" });
@@ -1222,6 +1270,14 @@ fn validate_symbol_request_for_capabilities(
     cursor: Option<&str>,
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
+    if request
+        .include
+        .as_ref()
+        .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation))
+        && !supports_feature(capabilities, "symbol_documentation")
+    {
+        return Err(ClientError::InvalidRequest { field: "include" });
+    }
     if request.name.len() > smaller_bound(capabilities.bounds.query_bytes_max, QUERY_BYTES_MAX) {
         return Err(ClientError::InvalidRequest { field: "name" });
     }
@@ -1417,7 +1473,7 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     if request
         .include
         .as_ref()
-        .is_some_and(|values| values.len() > 1 || values.iter().any(|value| value != "source"))
+        .is_some_and(|values| values.len() > 2)
     {
         return Err(ClientError::InvalidRequest { field: "include" });
     }
@@ -1462,34 +1518,74 @@ fn validate_search_page(
     page: &PackageSearchPage,
     cursor: Option<&str>,
 ) -> Result<(), ClientError> {
-    validate_page_metadata(
-        capabilities,
-        &page.publication_format,
-        &page.analyzer_revision,
-        &page.corpus_revision,
-        page.next_cursor.as_deref(),
-        &page.warnings,
-    )?;
+    let target = request
+        .target
+        .as_ref()
+        .unwrap_or(&PackageSearchRequestTarget::Symbol);
+    let documentation_requested = matches!(
+        target,
+        PackageSearchRequestTarget::Documentation | PackageSearchRequestTarget::All
+    );
+    PageMetadata {
+        publication_format: &page.publication_format,
+        analyzer_revision: &page.analyzer_revision,
+        corpus_revision: &page.corpus_revision,
+        documentation_revision: page.documentation_revision.as_deref(),
+        next_cursor: page.next_cursor.as_deref(),
+        warnings: &page.warnings,
+    }
+    .validate(capabilities, documentation_requested)?;
     let packages: HashSet<_> = request.packages.iter().map(package_key).collect();
     let mut seen = HashSet::new();
+    let mut documentation_bytes = 0_usize;
     for hit in &page.items {
-        if hit.source.is_some() && !includes_source(request.include.as_deref()) {
-            return Err(ClientError::InvalidResponseField { field: "source" });
+        match hit {
+            PackageSearchItem::Search(hit) => {
+                if target == &PackageSearchRequestTarget::Documentation {
+                    return Err(ClientError::InvalidResponseField { field: "target" });
+                }
+                if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+                    return Err(ClientError::InvalidResponseField { field: "source" });
+                }
+                let qualified_name = validate_hit_common(
+                    &hit.package,
+                    &hit.symbol,
+                    HitLocation {
+                        unit: &hit.unit,
+                        range: &hit.range,
+                        line: hit.line,
+                        source: hit.source.as_deref(),
+                    },
+                    &packages,
+                    smaller_bound(capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX),
+                )?;
+                validate_search_match_class(request, hit, &qualified_name)?;
+            }
+            PackageSearchItem::Documentation(hit) => {
+                if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+                    return Err(ClientError::InvalidResponseField { field: "source" });
+                }
+                documentation_bytes += hit.source.as_ref().map_or(0, String::len);
+                validate_documentation_bytes(documentation_bytes)?;
+                if !documentation_requested
+                    || !supports_feature(capabilities, "documentation_search")
+                    || !packages.contains(&package_key(&hit.package))
+                    || page.documentation_revision.as_deref()
+                        != Some(hit.documentation.documentation_revision.as_str())
+                {
+                    return Err(ClientError::InvalidResponseField {
+                        field: "documentation",
+                    });
+                }
+                if hit.contributing_fields.is_empty() {
+                    return Err(ClientError::InvalidResponseField {
+                        field: "contributing_fields",
+                    });
+                }
+                PackageSearchCandidate::try_from(PackageSearchItem::Documentation(hit.clone()))?;
+            }
         }
-        let qualified_name = validate_hit_common(
-            &hit.package,
-            &hit.symbol,
-            HitLocation {
-                unit: &hit.unit,
-                range: &hit.range,
-                line: hit.line,
-                source: hit.source.as_deref(),
-            },
-            &packages,
-            smaller_bound(capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX),
-        )?;
-        validate_search_match_class(request, hit, &qualified_name)?;
-        let key = search_hit_identity(hit);
+        let key = search_hit_identity(hit)?;
         if !seen.insert(key) {
             return Err(ClientError::InvalidResponseField {
                 field: "duplicate_item",
@@ -1510,18 +1606,29 @@ fn validate_symbol_page(
     page: &PackageSymbolPage,
     cursor: Option<&str>,
 ) -> Result<(), ClientError> {
-    validate_page_metadata(
-        capabilities,
-        &page.publication_format,
-        &page.analyzer_revision,
-        &page.corpus_revision,
-        page.next_cursor.as_deref(),
-        &page.warnings,
-    )?;
+    let documentation_requested = request
+        .include
+        .as_ref()
+        .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation));
+    PageMetadata {
+        publication_format: &page.publication_format,
+        analyzer_revision: &page.analyzer_revision,
+        corpus_revision: &page.corpus_revision,
+        documentation_revision: page.documentation_revision.as_deref(),
+        next_cursor: page.next_cursor.as_deref(),
+        warnings: &page.warnings,
+    }
+    .validate(capabilities, documentation_requested)?;
     let packages: HashSet<_> = request.packages.iter().map(package_key).collect();
     let mut seen = HashSet::new();
+    let mut documentation_bytes = 0_usize;
     for hit in &page.items {
-        if hit.source.is_some() && !includes_source(request.include.as_deref()) {
+        if documentation_requested != hit.documentation.is_some() {
+            return Err(ClientError::InvalidResponseField {
+                field: "documentation",
+            });
+        }
+        if hit.source.is_some() && !includes_symbol_source(request.include.as_deref()) {
             return Err(ClientError::InvalidResponseField { field: "source" });
         }
         if request
@@ -1544,6 +1651,33 @@ fn validate_symbol_page(
             smaller_bound(capabilities.bounds.source_bytes_max, SOURCE_BYTES_MAX),
         )?;
         validate_symbol_match_class(request, hit, &qualified_name)?;
+        if let Some(context) = &hit.documentation {
+            for reference in &context.references {
+                documentation_bytes += reference.excerpt.as_ref().map_or(0, String::len);
+                validate_documentation_bytes(documentation_bytes)?;
+            }
+            let symbol_id = hit
+                .symbol
+                .id
+                .as_deref()
+                .ok_or(ClientError::InvalidResponseField {
+                    field: "symbol_identity",
+                })?;
+            let symbol_id = rift_protocol::read::SymbolId(symbol_id.to_owned());
+            let protocol_context = crate::domain::protocol_documentation_context(context.clone())?;
+            crate::domain::validate_documentation_context(
+                &protocol_context,
+                &symbol_id,
+                &domain::package_identity(&hit.package),
+            )?;
+            if page.documentation_revision.as_deref()
+                != Some(context.documentation_revision.as_str())
+            {
+                return Err(ClientError::InvalidResponseField {
+                    field: "documentation_revision",
+                });
+            }
+        }
         if !seen.insert(symbol_hit_identity(hit)) {
             return Err(ClientError::InvalidResponseField {
                 field: "duplicate_item",
@@ -1558,46 +1692,79 @@ fn validate_symbol_page(
     Ok(())
 }
 
-fn validate_page_metadata(
-    capabilities: &Capabilities,
-    publication_format: &PublicationFormat,
-    analyzer_revision: &str,
-    corpus_revision: &str,
-    next_cursor: Option<&str>,
-    warnings: &[Warning],
-) -> Result<(), ClientError> {
-    if publication_format != &capabilities.publication_format {
-        return Err(ClientError::InvalidResponseField {
-            field: "publication_format",
-        });
-    }
-    if analyzer_revision.is_empty()
-        || analyzer_revision.len() > 128
-        || corpus_revision != capabilities.corpus_revision
-    {
-        return Err(ClientError::InvalidResponseField { field: "revision" });
-    }
-    if next_cursor.is_some_and(|value| {
-        value.is_empty()
-            || value.len() > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
-    }) {
-        return Err(ClientError::InvalidResponseField { field: "cursor" });
-    }
-    if warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
-        || warnings.iter().any(|warning| {
-            warning
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.is_empty() || detail.len() > 1024)
-        })
-    {
-        return Err(ClientError::InvalidResponseField { field: "warnings" });
+fn validate_documentation_bytes(bytes: usize) -> Result<(), ClientError> {
+    if bytes > rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize {
+        return Err(ClientError::InvalidResponseField { field: "source" });
     }
     Ok(())
 }
 
+struct PageMetadata<'a> {
+    publication_format: &'a PublicationFormat,
+    analyzer_revision: &'a str,
+    corpus_revision: &'a str,
+    documentation_revision: Option<&'a str>,
+    next_cursor: Option<&'a str>,
+    warnings: &'a [Warning],
+}
+
+impl PageMetadata<'_> {
+    fn validate(
+        &self,
+        capabilities: &Capabilities,
+        documentation_required: bool,
+    ) -> Result<(), ClientError> {
+        if self.publication_format != &capabilities.publication_format {
+            return Err(ClientError::InvalidResponseField {
+                field: "publication_format",
+            });
+        }
+        if self.analyzer_revision.is_empty()
+            || self.analyzer_revision.len() > 128
+            || self.corpus_revision != capabilities.corpus_revision
+        {
+            return Err(ClientError::InvalidResponseField { field: "revision" });
+        }
+        match (
+            self.documentation_revision,
+            capabilities.documentation_revision.as_deref(),
+        ) {
+            (Some(actual), Some(expected))
+                if actual == expected && valid_revision_digest(actual) => {}
+            (None, _) if !documentation_required => {}
+            _ => {
+                return Err(ClientError::InvalidResponseField {
+                    field: "documentation_revision",
+                });
+            }
+        }
+        if self.next_cursor.is_some_and(|value| {
+            value.is_empty()
+                || value.len()
+                    > smaller_bound(capabilities.bounds.cursor_bytes_max, CURSOR_BYTES_MAX)
+        }) {
+            return Err(ClientError::InvalidResponseField { field: "cursor" });
+        }
+        if self.warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
+            || self.warnings.iter().any(|warning| {
+                warning
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.is_empty() || detail.len() > 1024)
+            })
+        {
+            return Err(ClientError::InvalidResponseField { field: "warnings" });
+        }
+        Ok(())
+    }
+}
+
 fn includes_source(include: Option<&[String]>) -> bool {
     include.is_some_and(|fields| fields.iter().any(|field| field == "source"))
+}
+
+fn includes_symbol_source(include: Option<&[PackageSymbolRequestInclude]>) -> bool {
+    include.is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Source))
 }
 
 #[derive(Clone, Copy)]
@@ -1815,17 +1982,26 @@ fn positive_within(value: i64, local: usize) -> bool {
 }
 
 fn validate_assembled_revision(
-    revisions: &mut Option<(String, String)>,
+    revisions: &mut Option<(String, String, Option<String>)>,
     analyzer_revision: &str,
     corpus_revision: &str,
+    documentation_revision: Option<&str>,
 ) -> Result<(), ClientError> {
     match revisions {
-        Some((analyzer, corpus)) if analyzer != analyzer_revision || corpus != corpus_revision => {
+        Some((analyzer, corpus, documentation))
+            if analyzer != analyzer_revision
+                || corpus != corpus_revision
+                || documentation.as_deref() != documentation_revision =>
+        {
             Err(ClientError::InvalidResponseField { field: "revision" })
         }
         Some(_) => Ok(()),
         None => {
-            *revisions = Some((analyzer_revision.to_owned(), corpus_revision.to_owned()));
+            *revisions = Some((
+                analyzer_revision.to_owned(),
+                corpus_revision.to_owned(),
+                documentation_revision.map(str::to_owned),
+            ));
             Ok(())
         }
     }
@@ -1842,49 +2018,67 @@ fn extend_warnings(target: &mut Vec<Warning>, warnings: Vec<Warning>) {
     }
 }
 
-fn assembled_revisions(revisions: Option<(String, String)>) -> (String, String) {
+fn assembled_revisions(
+    revisions: Option<(String, String, Option<String>)>,
+) -> (String, String, Option<String>) {
     revisions.unwrap_or_default()
 }
 
 fn search_pages(
-    items: Vec<PackageSearchHit>,
+    items: Vec<PackageSearchItem>,
     warnings: Vec<Warning>,
-    revisions: Option<(String, String)>,
+    revisions: Option<(String, String, Option<String>)>,
 ) -> PackageSearchPages {
-    let (analyzer_revision, corpus_revision) = assembled_revisions(revisions);
+    let (analyzer_revision, corpus_revision, documentation_revision) =
+        assembled_revisions(revisions);
     PackageSearchPages {
         items,
         warnings,
         analyzer_revision,
         corpus_revision,
+        documentation_revision,
     }
 }
 
 fn symbol_pages(
     items: Vec<PackageSymbol>,
     warnings: Vec<Warning>,
-    revisions: Option<(String, String)>,
+    revisions: Option<(String, String, Option<String>)>,
 ) -> PackageSymbolPages {
-    let (analyzer_revision, corpus_revision) = assembled_revisions(revisions);
+    let (analyzer_revision, corpus_revision, documentation_revision) =
+        assembled_revisions(revisions);
     PackageSymbolPages {
         items,
         warnings,
         analyzer_revision,
         corpus_revision,
+        documentation_revision,
     }
 }
 
-fn search_hit_identity(hit: &PackageSearchHit) -> (String, String, String, String) {
-    let symbol_id = match &hit.symbol.id {
-        Some(value) => value.clone(),
-        None => hit.symbol.name.clone(),
+fn search_hit_identity(
+    hit: &PackageSearchItem,
+) -> Result<(String, String, String, String), ClientError> {
+    let (package, identity) = match hit {
+        PackageSearchItem::Search(hit) => {
+            let symbol_id = hit
+                .symbol
+                .id
+                .clone()
+                .unwrap_or_else(|| hit.symbol.name.clone());
+            (hit.package.clone(), format!("{}:{symbol_id}", hit.unit))
+        }
+        PackageSearchItem::Documentation(hit) => {
+            let identity = rift_ranking::DocumentIdentity::for_documentation_block(
+                &hit.documentation.block.identity,
+            )
+            .map_err(|_| ClientError::InvalidResponseField {
+                field: "documentation.identity",
+            })?;
+            (hit.package.clone(), identity.as_str().to_owned())
+        }
     };
-    (
-        hit.package.manager.clone(),
-        hit.package.name.clone(),
-        hit.package.version.clone(),
-        format!("{}:{symbol_id}", hit.unit),
-    )
+    Ok((package.manager, package.name, package.version, identity))
 }
 
 fn symbol_hit_identity(hit: &PackageSymbol) -> (String, String, String, String) {

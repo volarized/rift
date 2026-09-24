@@ -14,6 +14,7 @@ use schemars::generate::SchemaSettings;
 use serde_json::{Value, json};
 
 use rift_protocol::dependencies::{DEPENDENCIES_PACKAGES_MAX, PackageContextEntry};
+use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
 use rift_protocol::read::{PackageIdentity, SourceUnitId, Symbol, SymbolId};
 use rift_ranking::{
     IDENTIFIER_CANDIDATES_MAX, PARSED_QUERY_MEMBERS_MAX, QUERY_BYTES_MAX, QUERY_TERM_BYTES_MAX,
@@ -471,6 +472,8 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<SourceUnitId>();
     let _ = generator.subschema_for::<Symbol>();
     let _ = generator.subschema_for::<SymbolId>();
+    let _ = generator.subschema_for::<DocumentationHit>();
+    let _ = generator.subschema_for::<DocumentationContext>();
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.

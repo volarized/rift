@@ -201,6 +201,9 @@ pub struct GetSymbolHit {
     /// The symbol's timeline, present when `include` names `history`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
+    /// Exact documentation references, present only when `include` names `documentation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<crate::documentation::DocumentationContext>,
 }
 
 /// One optional `get_symbol` hit field the caller may opt into through `include`.
@@ -213,6 +216,8 @@ pub enum GetSymbolInclude {
     Source,
     /// The hit's version-control timeline.
     History,
+    /// Bounded documentation referring to the exact declaration.
+    Documentation,
 }
 
 /// Gets declarations by name and returns them with their bodies inline, so one call replaces
@@ -894,6 +899,11 @@ pub const SOURCE_WARNINGS_MAX: usize = 8;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
 pub enum ReadWarning {
+    /// Documentation collection or excerpt output omitted part of a selected source.
+    Documentation {
+        /// Bounded source identity, stage, failure label, and omitted count.
+        warning: crate::documentation::DocumentationWarning,
+    },
     /// The answer was computed from an index that lags the tree the read captured. Facts
     /// derived from the index may miss the newest writes; the digests state which two
     /// trees disagree. When the two digests are equal, the tree moved in recorded files

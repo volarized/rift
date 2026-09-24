@@ -240,6 +240,11 @@ pub struct SearchHit {
 #[serde(tag = "target", deny_unknown_fields, rename_all = "snake_case")]
 #[schemars(transform = schema::declare_search_hit_target_file_empty_defaults)]
 pub enum SearchHitTarget {
+    /// A documentation block projected from an existing text or symbol document.
+    Documentation {
+        /// Block, source, and collector revision answering this match.
+        documentation: Box<crate::documentation::DocumentationHit>,
+    },
     /// A symbol hit: the declaration a provider resolved.
     Symbol {
         /// The declaration that matched.
@@ -486,6 +491,8 @@ pub enum SearchParamsTarget {
     Symbol,
     /// Only tree entries may match.
     File,
+    /// Only collected documentation blocks may match.
+    Documentation,
     /// Any entity kind may match.
     All,
 }

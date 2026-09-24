@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
+pub use rift_analysis::IndexedFile;
+use rift_analysis::documentation::DocumentationCollection;
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT,
     WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
@@ -20,6 +22,7 @@ use rift_core::{
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
+use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
     SOURCE_DECLARATIONS_FIELD, SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD,
@@ -33,7 +36,7 @@ use rift_ranking::{
     ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField, identifier_terms, match_class,
 };
 use rift_syntax::{
-    SyntaxDocument, SyntaxError, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol,
+    SyntaxError, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol,
     SyntaxViolation, registry,
 };
 use serde::Serialize;
@@ -41,6 +44,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
+use crate::documentation::NotebookFiles;
 use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::LimitBreach;
@@ -64,6 +68,7 @@ pub struct WorkspaceIndexLimits {
     declarations_max: usize,
     directory_depth_max: usize,
     results_max: usize,
+    syntax: SyntaxLimits,
 }
 
 impl WorkspaceIndexLimits {
@@ -90,6 +95,7 @@ impl WorkspaceIndexLimits {
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max,
             results_max,
+            syntax: SyntaxLimits::default(),
         }
         .validated()
     }
@@ -170,6 +176,22 @@ impl WorkspaceIndexLimits {
     pub(crate) const fn workspace_bytes_max(self) -> usize {
         self.workspace_bytes_max
     }
+
+    /// Parses every source under `syntax`; the per-file byte bound follows its source bound,
+    /// so the walk admits every file a provider accepts.
+    #[must_use]
+    pub const fn with_syntax(self, syntax: SyntaxLimits) -> Self {
+        Self {
+            file_bytes_max: syntax.source_bytes_max(),
+            syntax,
+            ..self
+        }
+    }
+
+    /// Syntax bounds every source parses under.
+    pub(crate) const fn syntax(self) -> SyntaxLimits {
+        self.syntax
+    }
 }
 
 impl Default for WorkspaceIndexLimits {
@@ -181,6 +203,7 @@ impl Default for WorkspaceIndexLimits {
             declarations_max: WORKSPACE_DECLARATIONS_MAX_DEFAULT,
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
+            syntax: SyntaxLimits::default(),
         }
     }
 }
@@ -443,54 +466,6 @@ pub(crate) fn index_error_caused_by(
     })
 }
 
-/// One immutable file enriched with syntax facts.
-///
-/// `Eq` is not derived: `syntax` carries [`SyntaxDocument`], which is not `Eq`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexedFile {
-    path: ProjectPath,
-    source: String,
-    digest: FileDigest,
-    executable: bool,
-    syntax: SyntaxDocument,
-}
-
-impl IndexedFile {
-    /// Returns project-relative path.
-    #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
-        &self.path
-    }
-
-    /// Returns complete UTF-8 source.
-    #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
-    /// Returns the digest of the bytes this file was indexed from.
-    ///
-    /// The digest is taken from the bytes the index actually read, so a publication's
-    /// digests always name the publication's own source - a file that moved again while
-    /// the index was building is caught by the next observation instead.
-    #[must_use]
-    pub const fn digest(&self) -> FileDigest {
-        self.digest
-    }
-
-    /// Whether this file was executable when the index captured it.
-    #[must_use]
-    pub const fn executable(&self) -> bool {
-        self.executable
-    }
-
-    /// Returns syntax facts.
-    #[must_use]
-    pub const fn syntax(&self) -> &SyntaxDocument {
-        &self.syntax
-    }
-}
-
 /// One immutable visible UTF-8 file in the baseline content catalog.
 ///
 /// A file over `[search.text].max_chunk` lands here whole. Search unit
@@ -586,6 +561,12 @@ impl ReadableSymbol {
     #[must_use]
     pub const fn facts(&self) -> &PortableSymbolFacts {
         &self.facts
+    }
+
+    /// Returns the read symbol carried by the normalized presentation.
+    #[must_use]
+    pub fn to_protocol_symbol(&self) -> rift_protocol::read::Symbol {
+        self.assembled.to_protocol_symbol(&self.facts)
     }
 }
 
@@ -1072,8 +1053,8 @@ impl LeftOutFileState {
 
     fn of_indexed(file: &IndexedFile) -> Self {
         Self {
-            content: file.digest,
-            state: FileDigest::of_file_state(file.source.as_bytes(), file.executable),
+            content: file.digest(),
+            state: FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
         }
     }
 }
@@ -1127,8 +1108,9 @@ impl IndexContents {
         text_file: TextSourceFile,
         context_path: &Path,
         provider: &dyn SyntaxProvider,
+        syntax: SyntaxLimits,
     ) -> Result<(), WorkspaceIndexError> {
-        match syntax_read(&text_file, context_path, provider)? {
+        match syntax_read(&text_file, context_path, provider, syntax)? {
             IndexRead::Included(file) => {
                 self.files.insert(file.path().clone(), Arc::new(file));
                 self.hold_text_file(text_file);
@@ -1235,6 +1217,8 @@ pub struct WorkspaceIndex {
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
+    documentation: Arc<DocumentationCollection>,
+    notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
 }
 
@@ -1290,7 +1274,7 @@ impl WorkspaceIndex {
         for (path, provider) in classified.source {
             match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
                 IndexRead::Included(text_file) => {
-                    contents.hold_source_file(text_file, &path, provider)?;
+                    contents.hold_source_file(text_file, &path, provider, limits.syntax())?;
                 }
                 IndexRead::Skipped(warning) => contents.leave_out(warning),
             }
@@ -1309,6 +1293,14 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
         } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+        let declarations = crate::documentation::declarations(&files, &semantics);
+        let (documentation, notebooks) = crate::documentation::build(
+            &files,
+            &text_files,
+            &declarations,
+            checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            None,
+        )?;
         Ok(Self {
             root,
             files,
@@ -1320,6 +1312,8 @@ impl WorkspaceIndex {
             text_inclusion: text_inclusion.clone(),
             fingerprint,
             semantics,
+            documentation: Arc::new(documentation),
+            notebooks,
             warnings,
         })
     }
@@ -1360,6 +1354,14 @@ impl WorkspaceIndex {
             self.limits.declarations_max(),
             Some(self.semantics.graph()),
         )?;
+        let declarations = crate::documentation::declarations(&files, &semantics);
+        let (documentation, notebooks) = crate::documentation::build(
+            &files,
+            &text_files,
+            &declarations,
+            checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
+            Some((&self.documentation, &self.notebooks)),
+        )?;
         Ok(Self {
             root: self.root.clone(),
             files,
@@ -1371,6 +1373,8 @@ impl WorkspaceIndex {
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
             semantics,
+            documentation: Arc::new(documentation),
+            notebooks,
             warnings,
         })
     }
@@ -1392,7 +1396,12 @@ impl WorkspaceIndex {
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
             IndexRead::Included(text_file) => match class {
                 ClassifiedPath::Source(provider) => {
-                    contents.hold_source_file(text_file, &absolute, provider)?;
+                    contents.hold_source_file(
+                        text_file,
+                        &absolute,
+                        provider,
+                        self.limits.syntax(),
+                    )?;
                 }
                 ClassifiedPath::Text => contents.hold_text_file(text_file),
             },
@@ -1434,6 +1443,14 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
         } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+        let declarations = crate::documentation::declarations(&files, &semantics);
+        let (documentation, notebooks) = crate::documentation::build(
+            &files,
+            &text_files,
+            &declarations,
+            checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
+            None,
+        )?;
         Ok(Self {
             root,
             files,
@@ -1445,6 +1462,8 @@ impl WorkspaceIndex {
             text_inclusion,
             fingerprint,
             semantics,
+            documentation: Arc::new(documentation),
+            notebooks,
             warnings,
         })
     }
@@ -1469,6 +1488,34 @@ impl WorkspaceIndex {
     /// Returns baseline text files in project-path order.
     pub fn text_files(&self) -> impl ExactSizeIterator<Item = &TextSourceFile> {
         self.text_files.values().map(AsRef::as_ref)
+    }
+
+    /// Returns the validated documentation metadata for this workspace snapshot.
+    #[must_use]
+    pub fn documentation(&self) -> &DocumentationCollection {
+        &self.documentation
+    }
+
+    /// Keeps this snapshot's documentation collection alive for one publication.
+    #[must_use]
+    pub fn documentation_snapshot(&self) -> Arc<DocumentationCollection> {
+        Arc::clone(&self.documentation)
+    }
+
+    /// Returns bytes addressed by one documentation content owner.
+    #[must_use]
+    pub fn documentation_content(&self, identity: &DocumentationContentIdentity) -> Option<&str> {
+        let DocumentationSourceIdentity::Project { path } = &identity.source else {
+            return None;
+        };
+        let path = rift_core::ProjectPath::new(path.0.as_str()).ok()?;
+        if identity.cell.is_some() {
+            return crate::documentation::content(&self.notebooks, identity);
+        }
+        self.files
+            .get(&path)
+            .map(|file| file.source())
+            .or_else(|| self.text_files.get(&path).map(|file| file.content()))
     }
 
     /// How many source files this index holds.
@@ -1562,6 +1609,9 @@ impl WorkspaceIndex {
             }
         }
         for file in self.text_files() {
+            if is_notebook_path(file.path()) {
+                continue;
+            }
             push_text_documents(
                 &mut documents,
                 file,
@@ -1569,6 +1619,11 @@ impl WorkspaceIndex {
                 &mut left_out,
             );
         }
+        documents.extend(crate::documentation::cell_documents(
+            &self.notebooks,
+            self.text_chunk_bytes_max_usize(),
+            &mut left_out,
+        ));
         left_out.report();
         documents
     }
@@ -1629,18 +1684,27 @@ impl WorkspaceIndex {
         &self,
         paths: impl IntoIterator<Item = &'a ProjectPath>,
     ) -> Vec<IndexDocument> {
+        let paths = paths.into_iter().cloned().collect::<BTreeSet<_>>();
         let mut units = Vec::new();
         let mut left_out = LeftOut::default();
-        for path in paths {
+        for path in &paths {
             if let Some(file) = self.files.get(path) {
                 for symbol in file.syntax().symbols() {
                     units.extend(symbol_document(file, symbol, &mut left_out));
                 }
             }
-            if let Some(file) = self.text_files.get(path) {
+            if let Some(file) = self.text_files.get(path)
+                && !is_notebook_path(file.path())
+            {
                 push_text_documents(&mut units, file, self.text_chunk_bytes_max(), &mut left_out);
             }
         }
+        units.extend(crate::documentation::cell_documents_for(
+            &self.notebooks,
+            self.text_chunk_bytes_max_usize(),
+            &paths,
+            &mut left_out,
+        ));
         units
     }
 
@@ -1778,6 +1842,10 @@ impl WorkspaceIndex {
     /// Chunk bound applied to baseline text when lexical units are derived.
     fn text_chunk_bytes_max(&self) -> u64 {
         self.text_inclusion.chunk_bytes_max()
+    }
+
+    fn text_chunk_bytes_max_usize(&self) -> usize {
+        checked_chunk_bytes_max(self.text_chunk_bytes_max())
     }
 
     /// Returns syntax nodes covering byte position.
@@ -1951,7 +2019,12 @@ impl WorkspaceIndex {
             if let Some(ClassifiedPath::Source(provider)) =
                 self.language.classifies(&context_path)?
             {
-                files.push(indexed_file_from_catalog(file, &context_path, provider)?);
+                files.push(indexed_file_from_catalog(
+                    file,
+                    &context_path,
+                    provider,
+                    self.limits.syntax(),
+                )?);
             }
         }
         Self::from_parts(
@@ -2773,7 +2846,7 @@ fn read_file(
     let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
     let mut file = included_file(project_path, bytes, path, provider, limits, workspace_bytes)?;
-    file.executable = metadata_is_executable(&metadata);
+    file.set_executable(metadata_is_executable(&metadata));
     Ok(file)
 }
 
@@ -2783,8 +2856,9 @@ fn syntax_read(
     file: &TextSourceFile,
     context_path: &Path,
     provider: &dyn SyntaxProvider,
+    limits: SyntaxLimits,
 ) -> Result<IndexRead<IndexedFile>, WorkspaceIndexError> {
-    match indexed_file_from_catalog(file, context_path, provider) {
+    match indexed_file_from_catalog(file, context_path, provider, limits) {
         Ok(indexed) => Ok(IndexRead::Included(indexed)),
         Err(error) => match error.fault().left_out_file(file.path().clone()) {
             Some(warning) => Ok(IndexRead::left_out(warning)),
@@ -2797,22 +2871,26 @@ pub(crate) fn indexed_file_from_catalog(
     file: &TextSourceFile,
     context_path: &Path,
     provider: &dyn SyntaxProvider,
+    limits: SyntaxLimits,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
     let syntax = provider
-        .analyze(SyntaxSource {
-            path: file.path(),
-            text: file.content(),
-        })
+        .analyze(
+            SyntaxSource {
+                path: file.path(),
+                text: file.content(),
+            },
+            limits,
+        )
         .map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
         })?;
-    Ok(IndexedFile {
-        path: file.path().clone(),
-        source: file.content().to_owned(),
-        digest: file.digest(),
-        executable: file.executable(),
+    Ok(IndexedFile::new(
+        file.path().clone(),
+        file.content().to_owned(),
+        file.digest(),
+        file.executable(),
         syntax,
-    })
+    ))
 }
 
 /// Includes one provider-backed file under the workspace bounds.
@@ -2844,20 +2922,24 @@ pub(crate) fn included_file(
     }
     let source = source_utf8(bytes, context_path)?;
     let syntax = provider
-        .analyze(SyntaxSource {
-            path: &project_path,
-            text: &source,
-        })
+        .analyze(
+            SyntaxSource {
+                path: &project_path,
+                text: &source,
+            },
+            limits.syntax(),
+        )
         .map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
         })?;
-    Ok(IndexedFile {
-        path: project_path,
-        digest: FileDigest::of(source.as_bytes()),
+    let digest = FileDigest::of(source.as_bytes());
+    Ok(IndexedFile::new(
+        project_path,
         source,
-        executable: false,
+        digest,
+        false,
         syntax,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -3155,7 +3237,7 @@ fn bounded_field(value: &str, bytes_max: usize) -> String {
 /// The file keeps answering `get_symbol` and identifier search; only its place in the
 /// searchable corpus is absent, and the log says which path lost it. A package index
 /// leaves an oversized document out the same way.
-fn document(
+pub(crate) fn document(
     identity: String,
     path: &ProjectPath,
     kind: DocumentKind,
@@ -3194,7 +3276,7 @@ pub(crate) struct LeftOut {
 
 impl LeftOut {
     /// Counts one refusal, keeping the first path and violation for the record.
-    fn record(&mut self, path: &ProjectPath, error: &rift_ranking::RankingError) {
+    pub(crate) fn record(&mut self, path: &ProjectPath, error: &rift_ranking::RankingError) {
         self.count += 1;
         if self.first.is_none() {
             self.first = Some((path.as_str().to_owned(), error.to_string()));
@@ -3225,11 +3307,15 @@ impl LeftOut {
 /// A file document's `name` is the file name a caller would type, extension and all, so
 /// `vision.mdx` reaches its file. The host-absolute root never enters it: two clones of
 /// one tree publish the same name.
-fn file_name(path: &ProjectPath) -> Option<String> {
+pub(crate) fn file_name(path: &ProjectPath) -> Option<String> {
     Path::new(path.as_str())
         .file_name()
         .and_then(OsStr::to_str)
         .map(str::to_owned)
+}
+
+fn is_notebook_path(path: &ProjectPath) -> bool {
+    Path::new(path.as_str()).extension().and_then(OsStr::to_str) == Some("ipynb")
 }
 
 /// Whether `content_bytes` bytes of text-file content exceed `chunk_bytes_max`, the bound
@@ -3324,6 +3410,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use rift_syntax::SyntaxDocument;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
 
     #[test]
@@ -4910,16 +4997,18 @@ mod tests {
     #[test]
     fn test_read_file_classifies_syntax_and_non_nfc_path_failures() {
         let directory = fixture();
-        let limits = WorkspaceIndexLimits::default();
+        let strict_limits = WorkspaceIndexLimits {
+            syntax: SyntaxLimits::new(1, 1, 1).expect("positive bounds"),
+            ..WorkspaceIndexLimits::default()
+        };
         let mut bytes = 0;
-        let strict_parser =
-            RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let parser = RustSyntaxProvider::default();
         let source_path = directory.path().join("src/lib.rs");
         let syntax_error = read_file(
             directory.path(),
             &source_path,
-            &strict_parser,
-            limits,
+            &parser,
+            strict_limits,
             &mut bytes,
         )
         .expect_err("syntax byte bound");
@@ -4935,9 +5024,9 @@ mod tests {
             "a syntax failure must keep the underlying syntax classification"
         );
 
-        let parser = RustSyntaxProvider::default();
         let decomposed = directory.path().join("src/cafe\u{301}.rs");
         fs::write(&decomposed, "fn accent() {}").expect("decomposed source");
+        let limits = WorkspaceIndexLimits::default();
         let path_error = read_file(directory.path(), &decomposed, &parser, limits, &mut bytes)
             .expect_err("non-NFC project path");
         assert_eq!(
@@ -5921,10 +6010,11 @@ mod tests {
             "a syntax fault with no provider refusal behind it fails the build"
         );
 
-        let strict = RustSyntaxProvider::new(SyntaxLimits::new(1, 1, 1).expect("positive bounds"));
+        let strict = SyntaxLimits::new(1, 1, 1).expect("positive bounds");
         let text = TextSourceFile::from_content(path.clone(), "pub fn deep() {}\n".to_owned());
-        let refused = indexed_file_from_catalog(&text, context, &strict)
-            .expect_err("the provider's byte bound refuses the file");
+        let refused =
+            indexed_file_from_catalog(&text, context, &RustSyntaxProvider::default(), strict)
+                .expect_err("the syntax byte bound refuses the file");
         assert_eq!(
             refused.fault().left_out_file(path.clone()),
             Some(WorkspaceIndexWarning::SyntaxTooLarge {
@@ -5946,11 +6036,11 @@ mod tests {
             &self.language
         }
 
-        fn source_bytes_max(&self) -> usize {
-            4_096
-        }
-
-        fn analyze(&self, _source: SyntaxSource<'_>) -> Result<SyntaxDocument, SyntaxError> {
+        fn analyze(
+            &self,
+            _source: SyntaxSource<'_>,
+            _limits: SyntaxLimits,
+        ) -> Result<SyntaxDocument, SyntaxError> {
             Err(rift_core::Error::new(
                 rift_syntax::SyntaxFault::UnknownNodeKind {
                     kind: "beacon".to_owned(),
@@ -5972,7 +6062,12 @@ mod tests {
                 .expect("rust is a language"),
         };
 
-        let Err(error) = syntax_read(&text, Path::new("/workspace/lib.rs"), &provider) else {
+        let Err(error) = syntax_read(
+            &text,
+            Path::new("/workspace/lib.rs"),
+            &provider,
+            SyntaxLimits::default(),
+        ) else {
             panic!("a provider fault outside its bounds fails the build");
         };
 
@@ -6077,6 +6172,152 @@ mod tests {
             rebuilt.file(&source).is_some(),
             "the rebuild keeps every claimed path it shares with the previous index"
         );
+    }
+
+    #[test]
+    fn test_documentation_metadata_tracks_edit_rename_delete_and_relink() {
+        use rift_protocol::documentation::{
+            DocumentationLinkResolution, DocumentationSourceIdentity,
+        };
+
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(root.join("README.md"), "# Guide\n\n[Notes](notes.md)\n").expect("guide");
+        fs::write(root.join("notes.md"), "# Notes\n\nOld text.\n").expect("notes");
+        let inclusion = TextFileInclusion::new(Vec::new(), 1_024);
+        let index = indexed(root, &inclusion);
+        let path_of = |path: &str| DocumentationSourceIdentity::Project {
+            path: rift_protocol::read::ProjectPath(path.to_owned()),
+        };
+        let link_resolves = |index: &WorkspaceIndex| {
+            index.documentation().index().links.iter().any(|link| {
+                link.authored == "notes.md"
+                    && matches!(
+                        link.resolution,
+                        DocumentationLinkResolution::Resolved { .. }
+                    )
+            })
+        };
+        assert!(link_resolves(&index), "selected local source resolves");
+
+        fs::write(root.join("notes.md"), "# Revised\n\nChanged text.\n").expect("edit source");
+        fs::rename(root.join("notes.md"), root.join("moved.md")).expect("rename source");
+        let changes = resolved(&index, root, &["notes.md", "moved.md"]);
+        let renamed = index.rebuilt(&changes).expect("metadata rebuild");
+        assert!(
+            renamed
+                .documentation()
+                .index()
+                .sources
+                .iter()
+                .any(|source| source.identity.source == path_of("moved.md"))
+        );
+        assert!(
+            !renamed
+                .documentation()
+                .index()
+                .sources
+                .iter()
+                .any(|source| source.identity.source == path_of("notes.md"))
+        );
+        assert!(
+            !link_resolves(&renamed),
+            "old destination becomes unresolved"
+        );
+
+        fs::write(root.join("README.md"), "# Guide\n\n[Notes](moved.md)\n").expect("relink");
+        let changes = resolved(&renamed, root, &["README.md"]);
+        let relinked = renamed.rebuilt(&changes).expect("relink rebuild");
+        assert!(
+            relinked.documentation().index().links.iter().any(|link| {
+                link.authored == "moved.md"
+                    && matches!(
+                        link.resolution,
+                        DocumentationLinkResolution::Resolved { .. }
+                    )
+            }),
+            "new destination resolves"
+        );
+
+        fs::remove_file(root.join("moved.md")).expect("delete source");
+        let changes = resolved(&relinked, root, &["moved.md"]);
+        let deleted = relinked.rebuilt(&changes).expect("delete rebuild");
+        assert!(
+            !deleted
+                .documentation()
+                .index()
+                .sources
+                .iter()
+                .any(|source| source.identity.source == path_of("moved.md"))
+        );
+        assert!(
+            deleted
+                .documentation()
+                .index()
+                .links
+                .iter()
+                .any(|link| link.authored == "moved.md"
+                    && matches!(
+                        link.resolution,
+                        DocumentationLinkResolution::Unresolved { .. }
+                    )),
+            "deleted destination leaves unresolved link metadata"
+        );
+    }
+
+    #[test]
+    fn test_documentation_selection_rebuild_resolves_new_plain_text_target() {
+        use rift_protocol::documentation::{
+            DocumentationContentIdentity, DocumentationLinkResolution, DocumentationSourceIdentity,
+        };
+        use rift_protocol::read::SourceUnitId;
+
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(root.join("README.md"), "# Guide\n\n[Notes](notes.txt)\n").expect("guide");
+        fs::write(root.join("notes.txt"), "Plain notes.\n").expect("notes");
+        let empty = TextFileInclusion::new(Vec::new(), 1_024);
+        let before = indexed(root, &empty);
+        assert!(
+            !before
+                .documentation()
+                .index()
+                .sources
+                .iter()
+                .any(|source| matches!(source.identity.source, DocumentationSourceIdentity::Project { ref path } if path.0 == "notes.txt"))
+        );
+        assert!(before.documentation().index().links.iter().any(|link| {
+            link.authored == "notes.txt"
+                && matches!(
+                    link.resolution,
+                    DocumentationLinkResolution::Unresolved { .. }
+                )
+        }));
+
+        let all_text = TextFileInclusion::new(vec!["**".to_owned()], 1_024);
+        let after = indexed(root, &all_text);
+        assert!(
+            after
+                .documentation()
+                .index()
+                .sources
+                .iter()
+                .any(|source| matches!(source.identity.source, DocumentationSourceIdentity::Project { ref path } if path.0 == "notes.txt"))
+        );
+        assert!(after.documentation().index().links.iter().any(|link| {
+            link.authored == "notes.txt"
+                && matches!(
+                    link.resolution,
+                    DocumentationLinkResolution::Resolved { .. }
+                )
+        }));
+        let package_owner = DocumentationContentIdentity {
+            source: DocumentationSourceIdentity::Package {
+                unit: SourceUnitId("rift://source/cargo/example@1.0.0/src/lib.rs".into()),
+            },
+            cell: None,
+        };
+        assert_eq!(after.documentation_content(&package_owner), None);
     }
 
     #[test]
@@ -6639,7 +6880,12 @@ mod tests {
         for name in ["a.rs", "b.rs", "c.rs"] {
             let file = declaring_file(name, 3);
             contents
-                .hold_source_file(file, &root.path().join(name), provider)
+                .hold_source_file(
+                    file,
+                    &root.path().join(name),
+                    provider,
+                    SyntaxLimits::default(),
+                )
                 .expect("the catalog holds the file");
         }
         let built = built_contents(root.path(), contents.sorted(), 4, None)
@@ -6685,7 +6931,12 @@ mod tests {
         for name in ["a.rs", "b.rs"] {
             let file = declaring_file(name, 3);
             contents
-                .hold_source_file(file, &root.path().join(name), provider)
+                .hold_source_file(
+                    file,
+                    &root.path().join(name),
+                    provider,
+                    SyntaxLimits::default(),
+                )
                 .expect("the catalog holds the file");
         }
         let built = built_contents(root.path(), contents.sorted(), 6, None)

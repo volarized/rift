@@ -10,8 +10,8 @@ use rift_cloud_client::{
     ClientError, Config, ConfigError, GlobalClient, PackageAvailability as WireAvailability,
     PackageContextEntry as WireContextEntry, PackageIdentity as WirePackageIdentity,
     PackageResolutionRequest, PackageSearchCandidate, PackageSearchRequest,
-    PackageSearchRequestPhase, PackageSymbolCandidate, PackageSymbolRequest, QueryTerm, Warning,
-    WarningCode,
+    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbolCandidate,
+    PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
 };
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
@@ -232,6 +232,9 @@ pub(crate) async fn package_search(
     query: &ParsedQuery,
     packages: &[WirePackageIdentity],
 ) -> Result<GlobalSearchCandidates, ClientError> {
+    if params.target == rift_protocol::read::SearchParamsTarget::File {
+        return Ok(GlobalSearchCandidates::default());
+    }
     let page_limit = rift_cloud_client::PAGE_LIMIT_MAX;
     let precise_page = client
         .search_packages_pages(
@@ -305,11 +308,15 @@ fn extend_page_warnings(target: &mut Vec<ReadWarning>, warnings: Vec<Warning>) {
     }
 }
 
-fn symbol_include(params: &GetSymbolParams) -> Option<Vec<String>> {
-    params
-        .include
-        .contains(&GetSymbolInclude::Source)
-        .then(|| vec!["source".to_owned()])
+fn symbol_include(params: &GetSymbolParams) -> Option<Vec<PackageSymbolRequestInclude>> {
+    let mut fields = Vec::new();
+    if params.include.contains(&GetSymbolInclude::Source) {
+        fields.push(PackageSymbolRequestInclude::Source);
+    }
+    if params.include.contains(&GetSymbolInclude::Documentation) {
+        fields.push(PackageSymbolRequestInclude::Documentation);
+    }
+    (!fields.is_empty()).then_some(fields)
 }
 
 fn search_request(
@@ -344,6 +351,14 @@ fn search_request(
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
+        },
+        target: match params.target {
+            rift_protocol::read::SearchParamsTarget::Symbol
+            | rift_protocol::read::SearchParamsTarget::File => None,
+            rift_protocol::read::SearchParamsTarget::Documentation => {
+                Some(PackageSearchRequestTarget::Documentation)
+            }
+            rift_protocol::read::SearchParamsTarget::All => Some(PackageSearchRequestTarget::All),
         },
     }
 }
@@ -624,6 +639,9 @@ fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ClientError> {
                     .clone(),
             ),
             SearchHitTarget::Node { node } => DocumentIdentity::new(node.0.clone()),
+            SearchHitTarget::Documentation { documentation } => {
+                DocumentIdentity::for_documentation_block(&documentation.block.identity.0)
+            }
         };
     identity.map_err(|_| ClientError::InvalidResponseField {
         field: "search_identity",
@@ -655,6 +673,7 @@ fn search_hit_key(hit: &SearchHit) -> &str {
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
+        SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
     }
 }
 
@@ -1226,6 +1245,105 @@ mod tests {
         let broad = search_request(&params, &query, &[], QueryPhase::Broad);
         assert!(broad.terms.iter().all(|term| term.prefix));
         assert_eq!(broad.include, Some(vec!["source".to_owned()]));
+    }
+
+    #[test]
+    fn documentation_requests_preserve_targets_and_symbol_includes() {
+        use rift_cloud_client::{PackageSearchRequestTarget, PackageSymbolRequestInclude};
+
+        let query = ParsedQuery::parse("compass").expect("query");
+        for (target, expected) in [
+            ("symbol", None),
+            ("file", None),
+            (
+                "documentation",
+                Some(PackageSearchRequestTarget::Documentation),
+            ),
+            ("all", Some(PackageSearchRequestTarget::All)),
+        ] {
+            let params = serde_json::from_value(serde_json::json!({
+                "query": "compass", "target": target
+            }))
+            .expect("search request");
+            assert_eq!(
+                search_request(&params, &query, &[], QueryPhase::Precise).target,
+                expected
+            );
+        }
+        let params = serde_json::from_value(serde_json::json!({
+            "name": "Compass", "include": ["documentation", "source"]
+        }))
+        .expect("symbol request");
+        assert_eq!(
+            super::symbol_include(&params),
+            Some(vec![
+                PackageSymbolRequestInclude::Source,
+                PackageSymbolRequestInclude::Documentation
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn file_search_returns_no_remote_candidates_with_a_disabled_client() {
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "compass", "target": "file"
+        }))
+        .expect("file search request");
+        let query = ParsedQuery::parse("compass").expect("query");
+        let candidates = super::package_search(&client, &params, &query, &[])
+            .await
+            .expect("file search does not call remote client");
+        assert_eq!(candidates, super::GlobalSearchCandidates::default());
+    }
+
+    #[test]
+    fn documentation_order_uses_block_identity() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(directory.path().join("guide.txt"), "First.\n\nSecond.\n")
+            .expect("documentation source");
+        let index = rift_index::WorkspaceIndex::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::new(vec!["guide.txt".to_owned()], 1024),
+        )
+        .expect("workspace index");
+        let metadata = index.documentation().index();
+        let mut hits = metadata
+            .blocks
+            .iter()
+            .map(|block| {
+                serde_json::from_value(serde_json::json!({
+                    "hit": {"target": "documentation", "documentation": {
+                        "documentation_revision": metadata.documentation_revision,
+                        "block": block, "source": metadata.sources[0]
+                    }},
+                    "path": "guide.txt", "range": block.range, "line": block.line
+                }))
+                .expect("documentation hit")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        let mut expected = metadata
+            .blocks
+            .iter()
+            .map(|block| block.identity.0.as_str())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        for order in [super::ResultOrder::Identity, super::ResultOrder::Path] {
+            hits.reverse();
+            super::order_search_hits(&mut hits, order);
+            assert_eq!(
+                hits.iter().map(super::search_hit_key).collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]

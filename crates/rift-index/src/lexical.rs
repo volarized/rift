@@ -142,6 +142,15 @@ file_content, tokenize='unicode61 remove_diacritics 0')
 -- #[toasty::breakpoint]
 ALTER TABLE lexical_index_state ADD COLUMN corpus_revision TEXT NOT NULL DEFAULT ''",
     ),
+    MigrationFile::new(
+        6,
+        "documentation_metadata",
+        "CREATE TABLE documentation_manifest(id BIGINT PRIMARY KEY NOT NULL, payload TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL, position BIGINT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_target ON documentation_references(target)",
+    ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 
@@ -1144,7 +1153,35 @@ impl LexicalSearchIndex {
         documents: &[IndexDocument],
         tree_revision: &str,
     ) -> Result<(), LexicalIndexError> {
+        self.replace_all_metadata(documents, tree_revision, None)
+            .await
+    }
+
+    /// Replaces lexical documents and validated documentation metadata in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    pub async fn replace_all_with_documentation(
+        &self,
+        documents: &[IndexDocument],
+        tree_revision: &str,
+        documentation: &rift_analysis::documentation::DocumentationCollection,
+    ) -> Result<(), LexicalIndexError> {
+        self.replace_all_metadata(documents, tree_revision, Some(documentation))
+            .await
+    }
+
+    async fn replace_all_metadata(
+        &self,
+        documents: &[IndexDocument],
+        tree_revision: &str,
+        documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
+    ) -> Result<(), LexicalIndexError> {
         validate_lexical_batch(documents, self.limits)?;
+        let metadata = documentation
+            .map(crate::documentation_store::EncodedDocumentation::new)
+            .transpose()?;
 
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
@@ -1163,6 +1200,7 @@ impl LexicalSearchIndex {
             insert_document(&mut transaction, document, project_location(document)?).await?;
         }
 
+        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
         stamp(&mut transaction, tree_revision).await?;
 
         transaction.commit().await.map_err(storage_error)
@@ -1195,7 +1233,34 @@ impl LexicalSearchIndex {
         change: &LexicalChange,
         tree_revision: &str,
     ) -> Result<(), LexicalIndexError> {
+        self.apply_metadata(change, tree_revision, None).await
+    }
+
+    /// Applies lexical changes and replaces their documentation metadata atomically.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid document batches, metadata byte excess, or storage failure.
+    pub async fn apply_with_documentation(
+        &self,
+        change: &LexicalChange,
+        tree_revision: &str,
+        documentation: &rift_analysis::documentation::DocumentationCollection,
+    ) -> Result<(), LexicalIndexError> {
+        self.apply_metadata(change, tree_revision, Some(documentation))
+            .await
+    }
+
+    async fn apply_metadata(
+        &self,
+        change: &LexicalChange,
+        tree_revision: &str,
+        documentation: Option<&rift_analysis::documentation::DocumentationCollection>,
+    ) -> Result<(), LexicalIndexError> {
         validate_lexical_units(change.inserted(), self.limits)?;
+        let metadata = documentation
+            .map(crate::documentation_store::EncodedDocumentation::new)
+            .transpose()?;
 
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
@@ -1210,9 +1275,39 @@ impl LexicalSearchIndex {
             insert_document(&mut transaction, document, project_location(document)?).await?;
         }
 
+        crate::documentation_store::replace(&mut transaction, metadata.as_ref()).await?;
         stamp(&mut transaction, tree_revision).await?;
 
         transaction.commit().await.map_err(storage_error)
+    }
+
+    /// Reads validated documentation metadata from the same revision as lexical documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage refusal for corrupt metadata or database failure.
+    pub async fn documentation(
+        &self,
+        tree_revision: &str,
+    ) -> Result<
+        RevisionScoped<Option<rift_analysis::documentation::DocumentationCollection>>,
+        LexicalIndexError,
+    > {
+        let mut connection = self.database.connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        match stored_stamp(&mut transaction).await? {
+            None => return Ok(RevisionScoped::NoRevision),
+            Some(stored) if stored.corpus_revision != CorpusRevision::current() => {
+                return Ok(RevisionScoped::NoRevision);
+            }
+            Some(stored) if stored.tree_revision != tree_revision => {
+                return Ok(RevisionScoped::OtherRevision(stored.tree_revision));
+            }
+            Some(_) => {}
+        }
+        crate::documentation_store::read(&mut transaction)
+            .await
+            .map(RevisionScoped::Matched)
     }
 
     /// Searches the documents stamped with `tree_revision`, best matches first.

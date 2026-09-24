@@ -241,36 +241,7 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
-/// Whether every byte of `text` is a lowercase hex digit.
-fn is_lowercase_hex(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// Walks `value`, refusing a bare 64-character lowercase-hex string anywhere on the wire: the
-/// only digest form the wire now carries is the eight-character witness.
-fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
-    match value {
-        Value::String(text) => assert!(
-            !(text.len() == 64 && is_lowercase_hex(text)),
-            "{context} must not carry a bare 64-character digest, only the 8-character wire \
-             form: {text}"
-        ),
-        Value::Array(items) => {
-            for item in items {
-                assert_no_bare_sha256_digest(item, context);
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values() {
-                assert_no_bare_sha256_digest(item, context);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
-}
-
-/// Proves one tool result carries no oversized digest and no non-project source-unit
+/// Proves one tool result carries no non-project source-unit
 /// resolver, that every `search` hit names exactly one location, and that a read result
 /// warns only what it is entitled to.
 ///
@@ -294,7 +265,7 @@ fn assert_no_bare_sha256_digest(value: &Value, context: &str) {
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
     let reaches_dependencies = matches!(request["scope"].as_str(), Some("global" | "all"));
-    assert_no_bare_sha256_digest(structured, &context);
+    // Schema validation above checks the separate revision and documentation digest forms.
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
     if reaches_dependencies {
         assert_dependency_warnings_only(structured);
