@@ -6,6 +6,9 @@ OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto` feature), once
 receiver: it accepts `POST /v1/traces`, keeps each span's name and duration in
 memory, and prints one JSON line per operation when it stops. Rift's macros name a
 span after its operation, so grouping by span name groups by operation.
+
+The receiver is a Starlette application that uvicorn serves on one asyncio event
+loop, so requests are handled one await at a time and the store needs no lock.
 """
 
 from __future__ import annotations
@@ -14,17 +17,19 @@ import gzip
 import json
 import signal
 import sys
-import threading
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 
+import uvicorn
 from google.protobuf.message import DecodeError
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
     ExportTraceServiceResponse,
 )
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 
 TRACES_PATH = "/v1/traces"
 PROTOBUF = "application/x-protobuf"
@@ -91,61 +96,45 @@ def summarize(durations: Mapping[str, list[float]]) -> list[OperationTiming]:
 
 
 class SpanStore:
-    """The durations of every span received, by operation, shared across requests."""
+    """The durations of every span received, by operation."""
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
         self.durations: dict[str, list[float]] = {}
 
     def record(self, body: bytes) -> None:
         """Decodes one export request and keeps its spans' durations."""
         request = ExportTraceServiceRequest.FromString(body)
-        with self.lock:
-            for name, duration in span_durations(request):
-                self.durations.setdefault(name, []).append(duration)
+        for name, duration in span_durations(request):
+            self.durations.setdefault(name, []).append(duration)
 
     def summary(self) -> list[OperationTiming]:
         """The per-operation summary of every span received so far."""
-        with self.lock:
-            return summarize(
-                {name: list(values) for name, values in self.durations.items()}
+        return summarize(self.durations)
+
+
+def receiver(store: SpanStore) -> Starlette:
+    """The application that feeds OTLP/HTTP export requests into `store`.
+
+    Starlette answers any other path with 404 and any other method with 405.
+    """
+
+    async def export(request: Request) -> Response:
+        if request.headers.get("content-type", "").split(";")[0] != PROTOBUF:
+            return PlainTextResponse(f"the collector reads {PROTOBUF}", 415)
+        body = await request.body()
+        if request.headers.get("content-encoding") == "gzip":
+            body = gzip.decompress(body)
+        try:
+            store.record(body)
+        except DecodeError:
+            return PlainTextResponse(
+                "the body is not an ExportTraceServiceRequest", 400
             )
+        return Response(
+            ExportTraceServiceResponse().SerializeToString(), media_type=PROTOBUF
+        )
 
-
-def receiver(store: SpanStore) -> type[BaseHTTPRequestHandler]:
-    """The request handler that feeds OTLP/HTTP export requests into `store`."""
-
-    class Receiver(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            if self.path != TRACES_PATH:
-                self.send_error(404, f"spans are exported to {TRACES_PATH}")
-                return
-            if self.headers.get("Content-Type", "").split(";")[0] != PROTOBUF:
-                self.send_error(415, f"the collector reads {PROTOBUF}")
-                return
-            length = self.headers.get("Content-Length")
-            if length is None:
-                self.send_error(411, "an export request carries its Content-Length")
-                return
-            body = self.rfile.read(int(length))
-            if self.headers.get("Content-Encoding") == "gzip":
-                body = gzip.decompress(body)
-            try:
-                store.record(body)
-            except DecodeError:
-                self.send_error(400, "the body is not an ExportTraceServiceRequest")
-                return
-            response = ExportTraceServiceResponse().SerializeToString()
-            self.send_response(200)
-            self.send_header("Content-Type", PROTOBUF)
-            self.send_header("Content-Length", str(len(response)))
-            self.end_headers()
-            self.wfile.write(response)
-
-        def log_message(self, format: str, *args: Any) -> None:
-            """Keeps the terminal for the summary; one line per export is noise."""
-
-    return Receiver
+    return Starlette(routes=[Route(TRACES_PATH, export, methods=["POST"])])
 
 
 def interrupt(*_: object) -> None:
@@ -154,21 +143,28 @@ def interrupt(*_: object) -> None:
 
 
 def collect(host: str, port: int) -> None:
-    """Serves until interrupted, then prints one JSON line per operation."""
+    """Serves until interrupted, then prints one JSON line per operation.
+
+    uvicorn stops on Ctrl-C or SIGTERM and then raises the signal again under
+    the handler it found. SIGTERM's handler here turns that into the same
+    `KeyboardInterrupt` Ctrl-C raises, so either ends at the summary.
+    """
     store = SpanStore()
-    server = ThreadingHTTPServer((host, port), receiver(store))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            receiver(store), host=host, port=port, lifespan="off", log_level="warning"
+        )
+    )
     signal.signal(signal.SIGTERM, interrupt)
     print(
-        f"collecting OTLP/HTTP spans at http://{host}:{server.server_port}{TRACES_PATH}; "
+        f"collecting OTLP/HTTP spans at http://{host}:{port}{TRACES_PATH}; "
         "Ctrl-C prints the summary",
         file=sys.stderr,
         flush=True,
     )
     try:
-        server.serve_forever()
+        server.run()
     except KeyboardInterrupt:
         pass
-    finally:
-        server.server_close()
     for timing in store.summary():
         print(timing.as_json_line())

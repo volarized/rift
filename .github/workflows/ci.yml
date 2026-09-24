@@ -402,7 +402,7 @@ jobs:
         timeout-minutes: 1
         run: >-
           uv run --locked --project dev pytest
-          dev/tests/test_release_process.py
+          dev/tests/test_commands.py
       - run: >-
           uv run --locked --project tools/rift-release pytest
           tools/rift-release/tests/test_installers.py

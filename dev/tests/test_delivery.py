@@ -13,7 +13,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +20,7 @@ from typing import Any
 
 import tomllib
 import yaml
+from rift_dev.commands import Command
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPOSITORY / ".github/workflows"
@@ -186,15 +186,13 @@ def classified(updated: str) -> str:
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "output"
         output.touch()
-        subprocess.run(
-            ["bash", "-e", "-c", script],
-            check=True,
-            env={
+        Command("bash", "-e", "-c", script).with_environment(
+            {
                 "PATH": os.environ["PATH"],
                 "UPDATED": updated,
                 "GITHUB_OUTPUT": str(output),
-            },
-        )
+            }
+        ).output()
         written = dict(
             line.split("=", 1)
             for line in output.read_text(encoding="utf-8").splitlines()

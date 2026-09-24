@@ -11,10 +11,13 @@ dependencies = [
     "pywin32==312; sys_platform == 'win32'",
     "typer==0.27.2",
     "pydantic==2.13.5",
+    "dulwich==1.2.15",
+    "starlette==1.6.0",
+    "uvicorn==0.53.0",
 ]
 
 [project.scripts]
-rift-dev = "rift_dev.cli:app"
+rift-dev = "rift_dev.cli:main"
 
 [build-system]
 requires = ["hatchling"]

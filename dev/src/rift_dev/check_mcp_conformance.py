@@ -23,14 +23,20 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
-import signal
-import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
-REPOSITORY = Path(__file__).resolve().parents[3]
+from rift_dev.commands import (
+    REPOSITORY,
+    CargoCommand,
+    Command,
+    CommandFailed,
+    Process,
+)
+
 TOOL_DIRECTORY = REPOSITORY / "tools" / "mcp-conformance"
 EXPECTED_FAILURES = TOOL_DIRECTORY / "expected-failures.yml"
 
@@ -47,8 +53,10 @@ STOP_SECONDS_MAX = 30.0
 # Longest wait for `bun install` and for one runner invocation.
 INSTALL_SECONDS_MAX = 300.0
 RUNNER_SECONDS_MAX = 300.0
-# Longest wait for the `rift` binary to build.
+# Longest wait for the `rift` binary to build, and the most JSON its build
+# messages may take: one line per compiled crate, a few kilobytes each.
 BUILD_SECONDS_MAX = 1800.0
+BUILD_OUTPUT_BYTES_MAX = 64 * 1024 * 1024
 
 FIXTURE_CONFIGURATION = """[search.vector]
 disabled = true
@@ -78,27 +86,15 @@ def build_server_binary(*, release: bool = False, target: str | None = None) -> 
     the compiler; the server itself then runs with the served workspace as
     its working directory, which is the root `rift server` serves.
     """
-    command = [
-        "cargo",
-        "build",
-        "--locked",
-        "-p",
-        "rift",
-        "--message-format=json-render-diagnostics",
-    ]
+    command = CargoCommand(
+        "build", "--locked", "-p", "rift", "--message-format=json-render-diagnostics"
+    ).with_timeout(BUILD_SECONDS_MAX)
     if release:
-        command.append("--release")
+        command.with_args("--release")
     if target is not None:
-        command.extend(["--target", target])
-    completed = subprocess.run(
-        command,
-        cwd=REPOSITORY,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=BUILD_SECONDS_MAX,
-    )
-    for line in completed.stdout.splitlines():
+        command.with_args("--target", target)
+    messages = command.with_output_limit(BUILD_OUTPUT_BYTES_MAX).output()
+    for line in messages.splitlines():
         try:
             message = json.loads(line)
         except ValueError:
@@ -112,33 +108,24 @@ def build_server_binary(*, release: bool = False, target: str | None = None) -> 
     raise RuntimeError("the build reported no rift executable")
 
 
-def start_server(binary: Path, root: Path, log_path: Path) -> subprocess.Popen[bytes]:
-    """Start a foreground server over `root` with the token check off.
+@contextmanager
+def started_server(binary: Path, root: Path, log_path: Path) -> Iterator[Process]:
+    """A foreground server over `root` with the token check off, owned until the end.
 
-    The child leads its own process group, so the stop reaches it whatever
-    the run did.
+    Its output goes to `log_path`. On the way out the server gets the interrupt
+    it stops on, and whatever outlasts `STOP_SECONDS_MAX` is ended with it.
     """
-    command = [
-        str(binary),
-        "server",
-        "start",
-        "--foreground",
-        "--auth",
-        "skip",
-    ]
-    log = log_path.open("wb")
-    return subprocess.Popen(
-        command,
-        cwd=root,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    command = Command(
+        binary, "server", "start", "--foreground", "--auth", "skip"
+    ).with_cwd(root)
+    with log_path.open("wb") as log, command.spawn(log) as server:
+        try:
+            yield server
+        finally:
+            stop_server(server)
 
 
-def await_published_port(
-    server: subprocess.Popen[bytes], root: Path, log_path: Path
-) -> int:
+def await_published_port(server: Process, root: Path, log_path: Path) -> int:
     """The port the started server published, waiting up to the bound.
 
     Raises when the server exits first or the bound passes; either way the
@@ -173,64 +160,46 @@ def read_log(log_path: Path) -> str:
     return log_path.read_text(encoding="utf-8", errors="replace")
 
 
-def stop_server(server: subprocess.Popen[bytes]) -> None:
-    """End the server's process group, bounded, whatever the run did.
+def stop_server(server: Process) -> None:
+    """Interrupt the server, the signal a foreground server stops on, within a bound.
 
-    The interrupt is what a foreground server stops on, so it is sent first;
-    a group that outlasts the bound is ended outright.
+    A server still running at the bound is left to `Command.spawn`, which ends
+    its whole process group.
     """
     if server.poll() is not None:
         return
-    end_group(server, signal.SIGINT)
+    server.interrupt()
     try:
         server.wait(timeout=STOP_SECONDS_MAX)
-        return
-    except subprocess.TimeoutExpired:
+    except TimeoutError:
         pass
-    end_group(server, getattr(signal, "SIGKILL", signal.SIGTERM))
-    server.wait(timeout=STOP_SECONDS_MAX)
-
-
-def end_group(server: subprocess.Popen[bytes], number: int) -> None:
-    """Signal the server's whole process group, falling back to the child."""
-    try:
-        os.killpg(os.getpgid(server.pid), number)
-    except (AttributeError, OSError):
-        if number == getattr(signal, "SIGKILL", None):
-            server.kill()
-        else:
-            server.terminate()
 
 
 def install_runner() -> None:
     """Install the pinned runner, refusing a lockfile the manifest outgrew."""
-    subprocess.run(
-        ["bun", "install", "--frozen-lockfile"],
-        cwd=TOOL_DIRECTORY,
-        check=True,
-        timeout=INSTALL_SECONDS_MAX,
-    )
+    Command("bun", "install", "--frozen-lockfile").with_cwd(
+        TOOL_DIRECTORY
+    ).with_timeout(INSTALL_SECONDS_MAX).run()
 
 
 def run_suite(port: int) -> int:
     """Run the suite against the served port, printing the runner's output."""
-    completed = subprocess.run(
-        [
-            "bunx",
-            "conformance",
-            "server",
-            "--url",
-            f"http://127.0.0.1:{port}/api/mcp",
-            "--requirements",
-            REQUIREMENTS_REVISION,
-            "--expected-failures",
-            str(EXPECTED_FAILURES),
-        ],
-        cwd=TOOL_DIRECTORY,
-        check=False,
-        timeout=RUNNER_SECONDS_MAX,
+    runner = Command(
+        "bunx",
+        "conformance",
+        "server",
+        "--url",
+        f"http://127.0.0.1:{port}/api/mcp",
+        "--requirements",
+        REQUIREMENTS_REVISION,
+        "--expected-failures",
+        EXPECTED_FAILURES,
     )
-    return completed.returncode
+    try:
+        runner.with_cwd(TOOL_DIRECTORY).with_timeout(RUNNER_SECONDS_MAX).run()
+    except CommandFailed as failure:
+        return failure.status
+    return 0
 
 
 def main(supplied: Path | None = None) -> int:
@@ -251,9 +220,6 @@ def main(supplied: Path | None = None) -> int:
         # the server refuses to start, naming `server.log` as the file that
         # moved between two scans.
         log_path = Path(log_directory) / "server.log"
-        server = start_server(binary, root, log_path)
-        try:
+        with started_server(binary, root, log_path) as server:
             port = await_published_port(server, root, log_path)
             return run_suite(port)
-        finally:
-            stop_server(server)

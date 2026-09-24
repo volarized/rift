@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from rift_dev.commands import REPOSITORY, run
+from rift_dev.commands import REPOSITORY, CargoCommand
 from rift_dev.config import CorpusName
 
 # `generate-check` validates the generated client's bytes, so coverage measures
@@ -70,8 +70,7 @@ def unit(archive: Path | None) -> None:
     downloads.
     """
     coverage_target()
-    run(
-        "cargo",
+    CargoCommand(
         "llvm-cov",
         "nextest",
         *archive_selection(
@@ -88,7 +87,7 @@ def unit(archive: Path | None) -> None:
         "lcov.info",
         "--fail-under-lines",
         COVERAGE_FLOOR,
-    )
+    ).run()
 
 
 def live(archive: Path | None) -> None:
@@ -116,17 +115,9 @@ def live(archive: Path | None) -> None:
             "--workspace-remap",
             ".",
         ]
-    run(
-        "cargo",
-        "nextest",
-        "run",
-        "--profile",
-        "live",
-        "--no-tests",
-        "fail",
-        *selection,
-        env={"RIFT_ENGINE_LIVE": "1", "RIFT_LIVE_SEARCH": "1"},
-    )
+    CargoCommand(
+        "nextest", "run", "--profile", "live", "--no-tests", "fail", *selection
+    ).with_env(RIFT_ENGINE_LIVE="1", RIFT_LIVE_SEARCH="1").run()
 
 
 def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> None:
@@ -149,8 +140,7 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
             "-E",
             f"binary(={binary})",
         ]
-    run(
-        "cargo",
+    command = CargoCommand(
         "llvm-cov",
         "nextest",
         "--no-report",
@@ -161,5 +151,7 @@ def corpus(name: CorpusName, test_name: str | None, archive: Path | None) -> Non
         "--run-ignored",
         "all",
         *selection,
-        *(["--", "--exact", test_name] if test_name else []),
     )
+    if test_name:
+        command.with_args("--", "--exact", test_name)
+    command.run()

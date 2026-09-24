@@ -11,8 +11,8 @@ from pathlib import Path, PurePosixPath
 
 import tomllib
 
+from rift_dev.commands import GitCommand
 from rift_dev.config import CorpusPins
-from rift_dev.release_process import run_bytes
 
 PINS = Path(__file__).resolve().parents[3] / "crates/rift/tests/corpus/pins.toml"
 GIT_SECONDS_MAX = 600.0
@@ -64,16 +64,18 @@ class Pin:
 
     def _verify_tree(self, root: Path) -> Measurement:
         """Verify the pinned bytes before any repair fetch changes the object store."""
-        head = git(root, "rev-parse", "HEAD").decode().strip()
+        head = git(root, "rev-parse", "HEAD").output_bytes().decode().strip()
         if head != self.commit:
             raise RuntimeError(
                 f"{self.name}: expected commit {self.commit}, observed {head}"
             )
         if git(
             root, "status", "--porcelain", "--untracked-files=all", "--ignored=matching"
-        ):
+        ).output_bytes():
             raise RuntimeError(f"{self.name}: cached checkout changed; restore {root}")
-        observed = measure(git(root, "ls-tree", "-r", "-l", "-z", self.commit))
+        observed = measure(
+            git(root, "ls-tree", "-r", "-l", "-z", self.commit).output_bytes()
+        )
         if observed != self.measurement:
             raise RuntimeError(
                 f"{self.name}: expected {self.measurement}, observed {observed}; remeasure the pin"
@@ -106,7 +108,7 @@ class Pin:
                     "--no-tags",
                     "origin",
                     self.commit,
-                )
+                ).output_bytes()
             self.verify(destination)
             return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -115,14 +117,14 @@ class Pin:
         ) as temporary:
             checkout = Path(temporary) / "checkout"
             checkout.mkdir()
-            git(checkout, "init", "--quiet")
+            git(checkout, "init", "--quiet").output_bytes()
             git(
                 checkout,
                 "remote",
                 "add",
                 "origin",
                 f"https://github.com/{self.repository}.git",
-            )
+            ).output_bytes()
             git(
                 checkout,
                 "fetch",
@@ -131,8 +133,8 @@ class Pin:
                 "--no-tags",
                 "origin",
                 self.commit,
-            )
-            git(checkout, "checkout", "--quiet", "--detach", self.commit)
+            ).output_bytes()
+            git(checkout, "checkout", "--quiet", "--detach", self.commit).output_bytes()
             self.verify(checkout)
             checkout.rename(destination)
         return destination
@@ -149,14 +151,14 @@ class Pin:
             shutil.copytree(self.cache, destination, symlinks=True)
         elif depth == 1:
             destination.mkdir()
-            git(destination, "init", "--quiet")
+            git(destination, "init", "--quiet").output_bytes()
             git(
                 destination,
                 "remote",
                 "add",
                 "origin",
                 f"https://github.com/{self.repository}.git",
-            )
+            ).output_bytes()
             git(
                 destination,
                 "fetch",
@@ -165,8 +167,10 @@ class Pin:
                 "--no-tags",
                 "origin",
                 self.commit,
-            )
-            git(destination, "checkout", "--quiet", "--detach", self.commit)
+            ).output_bytes()
+            git(
+                destination, "checkout", "--quiet", "--detach", self.commit
+            ).output_bytes()
         else:
             raise ValueError("corpus depth must be 1 or 50")
         self.verify(destination)
@@ -174,28 +178,23 @@ class Pin:
 
 def missing_history_objects(root: Path, commit: str) -> list[str]:
     """Read missing IDs without Git fetching them or printing every available object."""
-    missing = git(
-        root, "rev-list", "--quiet", "--objects", "--missing=print", commit
-    ).splitlines()
+    missing = (
+        git(root, "rev-list", "--quiet", "--objects", "--missing=print", commit)
+        .output_bytes()
+        .splitlines()
+    )
     for row in missing:
         if re.fullmatch(rb"\?[0-9a-f]{40}", row) is None:
             raise ValueError(f"invalid missing history object: {row!r}")
     return [row[1:].decode("ascii") for row in missing]
 
 
-def git(
-    root: Path,
-    *arguments: str,
-    input_bytes: bytes | None = None,
-    accepted: tuple[int, ...] = (0,),
-) -> bytes:
-    """Run Git with inherited environment and byte-exact bounded streams."""
-    return run_bytes(
-        ["git", "-C", str(root), *arguments],
-        timeout=GIT_SECONDS_MAX,
-        input_bytes=input_bytes,
-        accepted=accepted,
-        output_bytes_max=GIT_OUTPUT_BYTES_MAX,
+def git(root: Path, *arguments: str) -> GitCommand:
+    """Git over one corpus checkout, bounded for the largest pinned repository."""
+    return (
+        GitCommand(root, *arguments)
+        .with_timeout(GIT_SECONDS_MAX)
+        .with_output_limit(GIT_OUTPUT_BYTES_MAX)
     )
 
 

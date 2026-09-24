@@ -12,8 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
-import tempfile
 import threading
 import time
 import traceback
@@ -31,12 +29,13 @@ from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
-from rift_dev.check_mcp_conformance import REPOSITORY, build_server_binary
-from rift_dev.release_process import (
+from rift_dev.check_mcp_conformance import build_server_binary
+from rift_dev.commands import (
+    REPOSITORY,
+    Command,
     Drain,
+    Process,
     owned_environment,
-    owned_process,
-    run,
     termination_handler,
 )
 
@@ -100,23 +99,13 @@ def outside_workspace(path: Path, root: Path) -> None:
     )
 
 
-def run_command(
-    command: Sequence[str],
-    *,
-    cwd: Path | None = None,
-    env: Mapping[str, str] | None = None,
-    timeout_seconds: float = 30.0,
-) -> str:
-    """Run a bounded command with inherited environment and an explicit overlay."""
-    environment = dict(os.environ)
-    environment.update(env or {})
-    return run(
-        command,
-        cwd=cwd,
-        environment=environment,
-        timeout=timeout_seconds,
-        deadline=_GATE_DEADLINE.get(),
-    )
+def current_deadline() -> float | None:
+    """The monotonic deadline of the gate the caller runs under, if any.
+
+    A command a gate starts carries it through `Command.with_deadline`, so the
+    command cannot outlive the gate's budget.
+    """
+    return _GATE_DEADLINE.get()
 
 
 def candidate_binary(binary: Path | None, target: str | None = None) -> Path:
@@ -142,7 +131,12 @@ def workspace_version() -> str:
 def verify_version(binary: Path, version: str) -> None:
     """Require the supplied executable to report exactly the expected release version."""
     expected = f"rift {version.removeprefix('v')}"
-    observed = run_command([str(binary.resolve()), "--version"]).strip()
+    observed = (
+        Command(binary.resolve(), "--version")
+        .with_deadline(current_deadline())
+        .output()
+        .strip()
+    )
     require(observed == expected, f"expected {expected!r}, received {observed!r}")
 
 
@@ -365,7 +359,7 @@ class Server:
         self.startup_seconds = startup_seconds
         self.env = dict(os.environ)
         self.env.update(env or {})
-        self.process: subprocess.Popen[bytes]
+        self.process: Process
         self.port = 0
         self._process_stack = ExitStack()
         self._owner: psutil.Process | None = None
@@ -384,23 +378,14 @@ class Server:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._process_stack.enter_context(termination_handler())
-            with tempfile.TemporaryFile() as stdin:
-                self.process = self._process_stack.enter_context(
-                    owned_process(
-                        [
-                            str(self.binary),
-                            "server",
-                            "start",
-                            "--foreground",
-                            "--auth",
-                            "skip",
-                        ],
-                        self.env,
-                        self.root,
-                        stdin,
-                        stderr=subprocess.STDOUT,
-                    )
+            server = (
+                Command(
+                    self.binary, "server", "start", "--foreground", "--auth", "skip"
                 )
+                .with_cwd(self.root)
+                .with_environment(self.env)
+            )
+            self.process = self._process_stack.enter_context(server.spawn())
             try:
                 self._owner = psutil.Process(self.process.pid)
             except psutil.NoSuchProcess:
@@ -531,18 +516,15 @@ class Server:
         self._observe_descendants()
         budget = remaining_seconds(max(0.0, deadline - time.monotonic()))
         require(budget > 0, "server stop exceeded its deadline")
-        run_command(
-            [str(self.binary), "server", "stop"],
-            cwd=self.root,
-            env=self.env,
-            timeout_seconds=budget,
-        )
+        Command(self.binary, "server", "stop").with_cwd(self.root).with_environment(
+            self.env
+        ).with_timeout(budget).with_deadline(current_deadline()).output()
         # The CLI waits for election release. Process exit may follow it.
         try:
             self.process.wait(
                 timeout=remaining_seconds(max(0.0, deadline - time.monotonic()))
             )
-        except subprocess.TimeoutExpired as error:
+        except TimeoutError as error:
             raise AssertionError(
                 "server stop returned while its process remained alive"
             ) from error
