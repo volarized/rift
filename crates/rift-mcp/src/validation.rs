@@ -7095,7 +7095,7 @@ pub(crate) mod tests {
     /// A watcher on no path, for a supervisor test that moves the epoch itself.
     ///
     /// A watcher on the test's directory can report the file the test wrote just before
-    /// it started - FSEvents did on macOS - and that report moves the epoch past the one
+    /// it started - `FSEvents` did on macOS - and that report moves the epoch past the one
     /// the test observes.
     fn unwatched() -> TestResult<notify::RecommendedWatcher> {
         Ok(notify::recommended_watcher(
