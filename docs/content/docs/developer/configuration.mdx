@@ -22,6 +22,35 @@ the server's OS permissions on its first request. Inspect the file before runnin
 Each section states its defaults below its example. Durations take `ms`, `s`, `m`, `h`, or `d`;
 byte sizes take `b`, `kb`, `mb`, `gb`, or `tb` - binary units, so `1kb` is 1024 bytes.
 
+## Environment variables
+
+<VersionBadge version="v0.0.44" />
+
+A CI job or a container often needs one bound raised without editing the workspace's
+`rift.toml`. Every key has an environment variable for that: `RIFT_`, then the key's path with
+its members joined by `_` and uppercased. `[providers.syntax] max_nodes` is
+`RIFT_PROVIDERS_SYNTAX_MAX_NODES`, and `[server] port_range.min` is
+`RIFT_SERVER_PORT_RANGE_MIN`:
+
+```sh
+RIFT_PROVIDERS_SYNTAX_MAX_NODES=5000000 RIFT_PROVIDERS_SYNTAX_MAX_FILE=16mb rift server start
+```
+
+- a variable's value replaces the file's value for its key; a key no variable names keeps the
+  file's value, or its default
+- a key that takes text, such as a size or a duration, takes the value as written, such as
+  `16mb`; any other key takes one TOML value, such as `5000000`, `true`, or `["vendor/**"]`
+- the merged configuration passes the same checks the file does, so a value outside its range
+  fails with `configuration_invalid` naming the variable
+- a variable that starts with a table's prefix, such as `RIFT_PROVIDERS_`, and names none of its
+  keys fails the same way, listing the variables that table accepts - a misspelled key can't be
+  silently ignored
+- the tables whose entries you name, `[languages.<name>]` and `[lsp.<name>]`, have no variables
+
+The server reads the variables from the environment of the `rift server start` or `rift mcp`
+that started it. A running server keeps that environment, so a changed variable applies after
+`rift server stop` and the next start.
+
 ## Server
 
 <VersionBadge version="v0.0.8" />

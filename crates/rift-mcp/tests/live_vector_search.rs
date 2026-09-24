@@ -1,6 +1,6 @@
 //! Live integration: the vector search tier against the real model hub.
 //!
-//! `RIFT_SEARCH_LIVE=1 cargo test -p rift-mcp --test live_vector_search`
+//! `RIFT_LIVE_SEARCH=1 cargo test -p rift-mcp --test live_vector_search`
 //! runs the suite; without the variable every test skips visibly. This is the
 //! one suite that lets a fixture keep the shipped `[search.vector]` table, so
 //! it is the one that proves what every other fixture turns off: the weights are

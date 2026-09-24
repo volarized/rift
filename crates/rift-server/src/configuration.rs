@@ -1,236 +1,93 @@
-//! Loads and validates the workspace's `rift.toml`.
+//! Loads and validates the workspace's `rift.toml` and the environment
+//! variables that override it.
 //!
-//! The file's shape and bounds are the protocol's
-//! [`WorkspaceConfiguration`]; this module owns the filesystem half: reading
-//! the file, refusing one the model cannot accept, and treating a missing
-//! file as the default configuration.
+//! The document's shape and the variables naming its keys are accepted by
+//! [`rift_core::acceptance`]; this module owns the filesystem half, reading
+//! the file and treating a missing one as no document, and the workspace's
+//! own value bounds.
 
 use std::path::Path;
 
-use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
-use rift_core::line::lines_inclusive;
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
-use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
-use rift_protocol::schema::{
-    DocumentStep, ExpectedShape, configuration_schema, document_steps, expected_shape, named_member,
+use rift_core::Error;
+pub use rift_core::acceptance::{
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault,
 };
+use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
+use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
-/// Bytes a `rift.toml` may hold, at most. The file states bounded tables
-/// and language entries; one this large is not configuration.
-pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
-
-/// One configuration failure: why the workspace's `rift.toml` cannot be
-/// accepted.
-#[derive(Debug)]
-pub enum ConfigurationFault {
-    /// The file exists but its bytes could not be read.
-    Unreadable {
-        /// The file's path.
-        path: String,
-        /// The rendered I/O failure.
-        io: String,
-    },
-    /// A directory stands where the configuration file belongs. Reading it
-    /// can never succeed by retrying: the operator must remove or replace
-    /// it with the file.
-    IsDirectory {
-        /// The directory's path.
-        path: String,
-    },
-    /// The file is larger than configuration can be.
-    Oversized {
-        /// The file's size in bytes.
-        bytes: u64,
-        /// The accepted maximum in bytes.
-        bytes_max: u64,
-    },
-    /// The file is not the documented TOML shape: a syntax error, an
-    /// unknown key, a missing required key, or a malformed value.
-    Malformed {
-        /// Where the parser stopped, as `line <n> column <n>`. Absent when
-        /// the parser named no position in the file.
-        location: Option<String>,
-        /// The documented key the parser stopped inside, members joined by
-        /// `.`. Absent when it stopped before reaching one.
-        key: Option<String>,
-        /// What the documented shape accepts there, and a value it takes.
-        /// Boxed so one refusal's evidence does not widen every configuration
-        /// `Result` the crate returns.
-        shape: Box<ExpectedShape>,
-    },
-    /// The file parsed and one of its values breaks a documented bound.
-    Invalid(ConfigurationViolation),
-}
-
-impl Fault for ConfigurationFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Unreadable { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::IsDirectory { .. }
-            | Self::Oversized { .. }
-            | Self::Malformed { .. }
-            | Self::Invalid(_) => ErrorName::Wire(ErrorCode::ConfigurationInvalid),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("file", WORKSPACE_CONFIGURATION_FILE)];
-        match self {
-            Self::Unreadable { path, io } => {
-                context.push(ErrorContext::new("path", path.clone()));
-                context.push(ErrorContext::new("io", io.clone()));
-            }
-            Self::IsDirectory { path } => {
-                context.push(ErrorContext::new("path", path.clone()));
-                context.push(ErrorContext::new("detail", "the path is a directory"));
-            }
-            Self::Oversized { bytes, bytes_max } => {
-                context.push(ErrorContext::new("bytes", bytes.to_string()));
-                context.push(ErrorContext::new("bytes_max", bytes_max.to_string()));
-            }
-            Self::Malformed {
-                location,
-                key,
-                shape,
-            } => {
-                if let Some(key) = key {
-                    context.push(ErrorContext::new("key", key.clone()));
-                }
-                if let Some(location) = location {
-                    context.push(ErrorContext::new("location", location.clone()));
-                }
-                if !shape.accepted().is_empty() {
-                    context.push(ErrorContext::new("accepted", shape.accepted().join(", ")));
-                }
-                if let Some(example) = shape.example() {
-                    context.push(ErrorContext::new("example", example.to_string()));
-                }
-            }
-            Self::Invalid(violation) => context.extend(violation.context()),
-        }
-        context
-    }
-}
-
-/// Opaque configuration failure.
-pub type ConfigurationError = Error<ConfigurationFault>;
-
-/// Reads `<root>/rift.toml` into the validated configuration. A missing
-/// file is the default configuration; any other failure names what to fix.
+/// Reads `<root>/rift.toml` and the process's `RIFT_*` variables into the
+/// validated configuration. A missing file is no document: the defaults, and
+/// any variable overriding them.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigurationError`] when the file cannot be read, is larger
-/// than configuration can be, is not the documented shape, or breaks a
-/// documented bound.
+/// than configuration can be, or is not the documented shape; when a
+/// variable naming a key is malformed or names no key; or when a value breaks
+/// a documented bound.
 pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, ConfigurationError> {
+    let document = read_document(root)?;
+    accept_workspace(
+        document.as_deref(),
+        &ConfigurationEnvironment::from_process(),
+    )
+}
+
+/// The file's text, or `None` when the workspace has no `rift.toml`.
+fn read_document(root: &Path) -> Result<Option<String>, ConfigurationError> {
     let path = root.join(WORKSPACE_CONFIGURATION_FILE);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(WorkspaceConfiguration::default());
-        }
-        Err(_) if path.is_dir() => {
-            return Err(Error::new(ConfigurationFault::IsDirectory {
-                path: path.display().to_string(),
-            }));
-        }
-        Err(error) => {
-            return Err(Error::new(ConfigurationFault::Unreadable {
-                path: path.display().to_string(),
-                io: error.to_string(),
-            }));
-        }
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) if path.is_dir() => Err(Error::new(ConfigurationFault::IsDirectory {
+            path: path.display().to_string(),
+        })),
+        Err(error) => Err(Error::new(ConfigurationFault::Unreadable {
+            path: path.display().to_string(),
+            io: error.to_string(),
+        })),
+    }
+}
+
+/// Accepts one workspace configuration: the document and variables, then
+/// every value bound and the log capture filter. A refusal of a bound names
+/// the variables that overrode a key, since the broken value may be theirs.
+fn accept_workspace(
+    document: Option<&str>,
+    environment: &ConfigurationEnvironment,
+) -> Result<WorkspaceConfiguration, ConfigurationError> {
+    let (configuration, variables) =
+        accept_configuration::<WorkspaceConfiguration>(document, environment)?.into_parts();
+    let invalid = |violation| {
+        Error::new(ConfigurationFault::Invalid {
+            violation,
+            variables: variables.clone(),
+        })
     };
-    accept_configuration(&raw)
-}
-
-/// Reads the documented shape out of one configuration text.
-///
-/// A refusal names the key the parser stopped inside, where in the file it
-/// stopped, what the documented shape accepts there, and a value it takes.
-/// The parser's own account is not carried: it speaks of Rust types and serde
-/// grammar, which name nothing the operator can write in `rift.toml`.
-fn accept_shape(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
-    let deserializer = match toml::Deserializer::parse(raw) {
-        Ok(deserializer) => deserializer,
-        Err(error) => return Err(malformed(raw, error.span(), &[])),
-    };
-    match serde_path_to_error::deserialize(deserializer) {
-        Ok(configuration) => Ok(configuration),
-        Err(refused) => {
-            let steps = document_steps(refused.path());
-            Err(malformed(raw, refused.inner().span(), &steps))
-        }
-    }
-}
-
-/// One refusal of the documented shape, described against the schema the
-/// workspace publishes.
-fn malformed(
-    raw: &str,
-    span: Option<std::ops::Range<usize>>,
-    steps: &[DocumentStep<'_>],
-) -> ConfigurationError {
-    let shape = expected_shape(&configuration_schema(), steps);
-    Error::new(ConfigurationFault::Malformed {
-        location: span.map(|span| position_of(raw, span.start)),
-        key: named_member(&steps[..shape.followed()]),
-        shape: Box::new(shape),
-    })
-}
-
-/// Where one byte offset stands in the file, counting lines and columns from
-/// one, the way an editor does.
-fn position_of(raw: &str, offset: usize) -> String {
-    let mut line = 1;
-    let mut consumed = 0;
-    for text in lines_inclusive(raw) {
-        if consumed + text.len() > offset {
-            break;
-        }
-        consumed += text.len();
-        line += 1;
-    }
-    let column = raw[consumed..offset.min(raw.len())].chars().count() + 1;
-    format!("line {line} column {column}")
-}
-
-/// Accepts one configuration text: size bound, shape, then value bounds.
-/// Split from the read so every refusal path is testable without a
-/// filesystem.
-fn accept_configuration(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
-    let bytes = raw.len() as u64;
-    if bytes > CONFIGURATION_FILE_BYTES_MAX {
-        return Err(Error::new(ConfigurationFault::Oversized {
-            bytes,
-            bytes_max: CONFIGURATION_FILE_BYTES_MAX,
-        }));
-    }
-    let configuration = accept_shape(raw)?;
-    configuration
-        .validate()
-        .map_err(|violation| Error::new(ConfigurationFault::Invalid(violation)))?;
+    configuration.validate().map_err(invalid)?;
     tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture).map_err(|error| {
-        Error::new(ConfigurationFault::Invalid(
-            ConfigurationViolation::LogCaptureInvalid {
-                capture: configuration.logs.capture.clone(),
-                detail: error.to_string(),
-            },
-        ))
+        invalid(ConfigurationViolation::LogCaptureInvalid {
+            capture: configuration.logs.capture.clone(),
+            detail: error.to_string(),
+        })
     })?;
     Ok(configuration)
 }
 
 #[cfg(test)]
 mod tests {
+    /// Accepts one document with no variable overriding it.
+    fn accept(raw: &str) -> Result<WorkspaceConfiguration, ConfigurationError> {
+        accept_workspace(Some(raw), &ConfigurationEnvironment::default())
+    }
+
     /// The repository's own `rift.toml`, exercised so the committed file accepts cleanly
     /// under the exact model this module validates against.
     #[test]
     fn test_repository_rift_toml_accepts_cleanly() {
         let raw = include_str!("../../../rift.toml");
-        let configuration =
-            accept_configuration(raw).expect("the repository's rift.toml must accept cleanly");
+        let configuration = accept(raw).expect("the repository's rift.toml must accept cleanly");
         assert!(configuration.source.include.is_empty());
         let excluded: Vec<&str> = configuration
             .source
@@ -298,6 +155,7 @@ download_timeout = "5m"
     }
 
     use super::*;
+    use rift_core::{ErrorCode, ErrorName};
     use rift_protocol::configuration::{
         ByteSize, Duration, EmbeddingConfiguration, WorkspaceConfiguration,
     };
@@ -312,16 +170,15 @@ download_timeout = "5m"
 
     #[test]
     fn test_vector_candidate_bounds_parse_from_toml() {
-        let configuration =
-            accept_configuration("[search.vector]\ncandidates = 100\ncandidates_per_file = 8\n")
-                .expect("both candidate bounds must be accepted");
+        let configuration = accept("[search.vector]\ncandidates = 100\ncandidates_per_file = 8\n")
+            .expect("both candidate bounds must be accepted");
         assert_eq!(configuration.search.vector.candidates, 100);
         assert_eq!(configuration.search.vector.candidates_per_file, 8);
     }
 
     #[test]
     fn test_unknown_key_is_refused_as_malformed() {
-        let error = accept_configuration("[execution]\nmax_codes = \"16kb\"\n")
+        let error = accept("[execution]\nmax_codes = \"16kb\"\n")
             .expect_err("an unknown key must refuse the file");
         assert!(matches!(
             error.fault(),
@@ -352,8 +209,7 @@ download_timeout = "5m"
 
     #[test]
     fn test_toml_syntax_error_is_refused_as_malformed() {
-        let error =
-            accept_configuration("[execution\n").expect_err("a syntax error must refuse the file");
+        let error = accept("[execution\n").expect_err("a syntax error must refuse the file");
         assert!(matches!(
             error.fault(),
             ConfigurationFault::Malformed { .. }
@@ -370,7 +226,7 @@ download_timeout = "5m"
     /// `Duration` are names only this repository holds.
     #[test]
     fn test_a_value_of_the_wrong_shape_names_its_key_and_a_value_it_takes() {
-        let error = accept_configuration("[server]\nnum_workers = \"four\"\n")
+        let error = accept("[server]\nnum_workers = \"four\"\n")
             .expect_err("a value of the wrong shape must refuse the file");
         let message = error.to_string();
         assert!(
@@ -391,23 +247,11 @@ download_timeout = "5m"
         );
     }
 
-    /// A position is counted the way an editor counts, from one, and a byte
-    /// offset inside a line lands on that line.
-    #[test]
-    fn test_a_position_counts_lines_and_columns_from_one() {
-        let raw = "alpha\nbeta\ngamma\n";
-        assert_eq!(position_of(raw, 0), "line 1 column 1");
-        assert_eq!(position_of(raw, 6), "line 2 column 1");
-        assert_eq!(position_of(raw, 9), "line 2 column 4");
-        assert_eq!(position_of(raw, raw.len()), "line 4 column 1");
-    }
-
     #[test]
     fn test_oversized_file_is_refused_before_parsing() {
         let oversized = "# padding\n".repeat(1 << 15);
         assert!(oversized.len() as u64 > CONFIGURATION_FILE_BYTES_MAX);
-        let error =
-            accept_configuration(&oversized).expect_err("an oversized file must be refused");
+        let error = accept(&oversized).expect_err("an oversized file must be refused");
         assert!(matches!(
             error.fault(),
             ConfigurationFault::Oversized { .. }
@@ -471,17 +315,45 @@ download_timeout = "5m"
 
     #[test]
     fn test_invalid_log_capture_filter_is_refused() {
-        let error = accept_configuration("[logs]\ncapture = \"[\"\n")
+        let error = accept("[logs]\ncapture = \"[\"\n")
             .expect_err("an invalid tracing filter must refuse the file");
         assert!(
             matches!(
                 error.fault(),
-                ConfigurationFault::Invalid(ConfigurationViolation::LogCaptureInvalid {
-                    capture,
-                    detail,
-                }) if capture == "[" && !detail.is_empty()
+                ConfigurationFault::Invalid {
+                    violation: ConfigurationViolation::LogCaptureInvalid { capture, detail },
+                    ..
+                } if capture == "[" && !detail.is_empty()
             ),
             "unexpected configuration failure: {error:?}"
         );
+    }
+
+    #[test]
+    fn test_a_bound_broken_by_a_variable_names_the_variable() {
+        let environment =
+            ConfigurationEnvironment::from_variables([("RIFT_PROVIDERS_SYNTAX_MAX_NODES", "0")]);
+        let error = accept_workspace(Some("[providers.history]\nenabled = true\n"), &environment)
+            .expect_err("zero nodes breaks the documented bound");
+        assert!(
+            matches!(
+                error.fault(),
+                ConfigurationFault::Invalid { variables, .. }
+                    if variables == &["RIFT_PROVIDERS_SYNTAX_MAX_NODES"]
+            ),
+            "unexpected configuration failure: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_variable_prevails_over_the_file() {
+        let environment = ConfigurationEnvironment::from_variables([(
+            "RIFT_PROVIDERS_SYNTAX_MAX_NODES",
+            "5000000",
+        )]);
+        let configuration =
+            accept_workspace(Some("[providers.syntax]\nmax_nodes = 1000\n"), &environment)
+                .expect("the variable's value is in bounds");
+        assert_eq!(configuration.providers.syntax.max_nodes, 5_000_000);
     }
 }

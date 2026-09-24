@@ -82,12 +82,127 @@ mod keyword {
     pub(super) const ITEMS: &str = "items";
     pub(super) const EXAMPLES: &str = "examples";
     pub(super) const NULL: &str = "null";
+    pub(super) const STRING: &str = "string";
+    pub(super) const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
 }
 
 /// References and unions one schema walk follows before it answers with what
 /// it has reached. A model may refer to itself, and a caller reaches the walk
 /// by sending one value the schema refuses, so the walk is bounded.
 const SCHEMA_REFERENCES_MAX: usize = 32;
+
+/// Members one key enumeration follows from the document root; configuration
+/// tables nest three deep.
+const DECLARED_KEY_DEPTH_MAX: usize = 8;
+/// Keys one enumeration returns, at most.
+const DECLARED_KEYS_MAX: usize = 1_024;
+
+/// One key a configuration schema declares by a fixed name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredKey {
+    path: Vec<String>,
+    textual: bool,
+}
+
+impl DeclaredKey {
+    /// Member names from the document root to the key, such as
+    /// `["providers", "syntax", "max_nodes"]`.
+    #[must_use]
+    pub fn path(&self) -> &[String] {
+        &self.path
+    }
+
+    /// Whether the key takes text alone, such as `"4mb"` or a URL: a value
+    /// written outside the document is then the text itself, not a TOML value.
+    #[must_use]
+    pub const fn is_textual(&self) -> bool {
+        self.textual
+    }
+}
+
+/// Every key a configuration schema declares by a fixed name, in member order.
+///
+/// A member holding a table contributes the table's own keys. A table whose
+/// members the caller names, such as `[languages]`, declares no fixed member
+/// and contributes no key. The walk follows at most `DECLARED_KEY_DEPTH_MAX`
+/// members from the root and returns at most `DECLARED_KEYS_MAX` keys.
+#[must_use]
+pub fn declared_keys(schema: &Value) -> Vec<DeclaredKey> {
+    let mut keys = Vec::new();
+    let mut pending = vec![(resolved(schema, schema), Vec::new())];
+    while let Some((node, path)) = pending.pop() {
+        if keys.len() == DECLARED_KEYS_MAX {
+            break;
+        }
+        match node.get(keyword::PROPERTIES).and_then(Value::as_object) {
+            Some(members) if path.len() < DECLARED_KEY_DEPTH_MAX => {
+                push_members(&mut pending, schema, members, &path);
+            }
+            Some(_) => {}
+            None if path.is_empty() || is_named_table(node) => {}
+            None => keys.push(DeclaredKey {
+                textual: is_textual(node),
+                path,
+            }),
+        }
+    }
+    keys
+}
+
+/// The members a configuration schema's root declares, such as `server` and
+/// `languages`, in member order.
+#[must_use]
+pub fn declared_tables(schema: &Value) -> Vec<String> {
+    resolved(schema, schema)
+        .get(keyword::PROPERTIES)
+        .and_then(Value::as_object)
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Queues one table's members so the walk pops them in member order.
+fn push_members<'schema>(
+    pending: &mut Vec<(&'schema Value, Vec<String>)>,
+    root: &'schema Value,
+    members: &'schema serde_json::Map<String, Value>,
+    path: &[String],
+) {
+    for (name, member) in members.iter().rev() {
+        let mut member_path = path.to_vec();
+        member_path.push(name.clone());
+        pending.push((resolved(root, member), member_path));
+    }
+}
+
+/// Whether a schema is a table whose members the caller names: an object
+/// with no fixed member and a schema for every other one.
+fn is_named_table(node: &Value) -> bool {
+    node.get(keyword::ADDITIONAL_PROPERTIES)
+        .is_some_and(Value::is_object)
+}
+
+/// Whether every value a schema accepts is text: its type is `string`, or it
+/// is a closed set of strings, or each of its union's branches is textual.
+fn is_textual(node: &Value) -> bool {
+    let branches = value_branches(node);
+    if !branches.is_empty() {
+        return branches.into_iter().all(is_textual);
+    }
+    if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
+        return values.iter().all(Value::is_string);
+    }
+    if let Some(constant) = node.get(keyword::CONST) {
+        return constant.is_string();
+    }
+    match node.get(keyword::TYPE) {
+        Some(Value::String(kind)) => kind == keyword::STRING,
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .filter(|kind| kind.as_str() != Some(keyword::NULL))
+            .all(|kind| kind.as_str() == Some(keyword::STRING)),
+        _ => false,
+    }
+}
 
 /// One step of the path into a document the server refused.
 ///
@@ -1973,5 +2088,35 @@ mod tests {
                 "{model}.{name} must stay required: {schema:#}"
             );
         }
+    }
+
+    #[test]
+    fn test_declared_keys_follow_tables_and_skip_named_tables() {
+        let keys = super::declared_keys(&super::configuration_schema());
+        let find = |dotted: &str| {
+            keys.iter()
+                .find(|key| key.path().join(".") == dotted)
+                .map(super::DeclaredKey::is_textual)
+        };
+        assert_eq!(find("providers.syntax.max_file"), Some(true));
+        assert_eq!(find("providers.syntax.max_nodes"), Some(false));
+        assert_eq!(find("dependencies.resolution"), Some(true));
+        assert_eq!(find("search.vector.embedding"), Some(false));
+        assert_eq!(find("server.port_range.min"), Some(false));
+        assert_eq!(
+            find("server.port_range"),
+            None,
+            "a table contributes its own keys"
+        );
+        assert!(
+            keys.iter()
+                .all(|key| !["languages", "lsp"].contains(&key.path()[0].as_str())),
+            "a table whose members the caller names declares no fixed key"
+        );
+        let mut dotted: Vec<String> = keys.iter().map(|key| key.path().join(".")).collect();
+        let listed = dotted.len();
+        dotted.sort();
+        dotted.dedup();
+        assert_eq!(dotted.len(), listed, "every key appears once");
     }
 }
