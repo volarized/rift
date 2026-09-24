@@ -1386,6 +1386,26 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The documentation this read projects onto crossed a bound, so no documentation\nblock joins the answer: declarations and files answer as they would without it.\nThe condition holds until the documentation it names changes.",
+                "properties": {
+                  "code": {
+                    "const": "documentation_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
                 "properties": {
                   "captured_tree_revision": {
@@ -3859,6 +3879,26 @@
                 "required": [
                   "code",
                   "warning"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The documentation this read projects onto crossed a bound, so no documentation\nblock joins the answer: declarations and files answer as they would without it.\nThe condition holds until the documentation it names changes.",
+                "properties": {
+                  "code": {
+                    "const": "documentation_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
                 ],
                 "type": "object"
               },
@@ -6540,6 +6580,26 @@
                 "required": [
                   "code",
                   "warning"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The documentation this read projects onto crossed a bound, so no documentation\nblock joins the answer: declarations and files answer as they would without it.\nThe condition holds until the documentation it names changes.",
+                "properties": {
+                  "code": {
+                    "const": "documentation_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
                 ],
                 "type": "object"
               },

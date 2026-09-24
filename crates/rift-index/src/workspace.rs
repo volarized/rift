@@ -5,12 +5,14 @@ use std::fs;
 use std::io::Read as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
 pub use rift_analysis::IndexedFile;
-use rift_analysis::documentation::DocumentationCollection;
+use rift_analysis::documentation::{
+    DocumentationCollection, DocumentationError, DocumentationLayer,
+};
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT,
     WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
@@ -1236,6 +1238,9 @@ pub struct WorkspaceIndex {
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
     documentation: Arc<DocumentationCollection>,
+    /// The documentation layer over `documentation`, built by the first read that projects
+    /// onto it; the next publication is a new index and builds its own.
+    documentation_layer: OnceLock<Result<DocumentationLayer<'static>, DocumentationError>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
 }
@@ -1349,6 +1354,7 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1410,6 +1416,7 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1499,6 +1506,7 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1536,6 +1544,21 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn documentation(&self) -> &DocumentationCollection {
         &self.documentation
+    }
+
+    /// The documentation layer over this snapshot's collection.
+    ///
+    /// The first call builds the layer and every later call answers it, so the reads one
+    /// publication serves share its mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the build met, kept for every later call: a layer bound
+    /// crossed.
+    pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &DocumentationError> {
+        self.documentation_layer
+            .get_or_init(|| DocumentationLayer::shared([Arc::clone(&self.documentation)]))
+            .as_ref()
     }
 
     /// Keeps this snapshot's documentation collection alive for one publication.

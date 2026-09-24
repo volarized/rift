@@ -44,7 +44,9 @@ pub use rift_analysis::documentation::{
     DocumentationCollection, DocumentationError, documentation_context,
     documentation_context_with_budget,
 };
-pub use rift_analysis::documentation::{DocumentationProjection, DocumentationProjectionTarget};
+pub use rift_analysis::documentation::{
+    DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
+};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,

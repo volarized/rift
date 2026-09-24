@@ -277,7 +277,7 @@ impl ReadService {
                         .as_deref()
                         .or(package_indexes.ranking.as_deref()),
                 },
-                &mut results,
+                (&mut results, &mut warnings),
             )?;
         }
         let mut traversal_report = TraversalReport::default();
@@ -494,7 +494,7 @@ impl ReadService {
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
         packages: SearchDependencies<'_>,
-        results: &mut Vec<SearchHit>,
+        (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, ReadError> {
         let index = self.index();
         let root = index.root();
@@ -525,8 +525,10 @@ impl ReadService {
                 operation = "search.documentation_projection",
                 { SearchDocumentation::new(index, scope, documentation_resolution) }
             )
-        })
-        .transpose()?;
+        });
+        if let Some(documentation) = &documentation {
+            warnings.extend(documentation.warnings().iter().cloned());
+        }
         let screen = CandidateScreen {
             index,
             matcher,

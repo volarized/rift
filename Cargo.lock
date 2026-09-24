@@ -4390,6 +4390,7 @@ version = "0.0.44"
 dependencies = [
  "flate2",
  "percent-encoding",
+ "rayon",
  "rift-core",
  "rift-protocol",
  "rift-provider",

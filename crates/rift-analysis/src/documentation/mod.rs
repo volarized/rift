@@ -24,7 +24,10 @@ mod rst;
 pub use failure::{DocumentationError, DocumentationFault, DocumentationViolation};
 pub use input::{DocumentationInput, DocumentationSourceSet, check_documentation_source_count};
 pub use links::{DocumentationFragment, linked_blocks, resolve_links};
-pub use projection::{DocumentationProjection, DocumentationProjectionTarget};
+pub use projection::{
+    DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget, LAYER_BLOCKS_MAX,
+    LAYER_MAPPINGS_MAX,
+};
 pub use publication::{
     DocumentationChanges, DocumentationCollection, DocumentationLinkChanges,
     DocumentationLinkReplacement, DocumentationRecordChanges, DocumentationSourceChanges,

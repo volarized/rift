@@ -904,6 +904,15 @@ pub enum ReadWarning {
         /// Bounded source identity, stage, failure label, and omitted count.
         warning: crate::documentation::DocumentationWarning,
     },
+    /// The documentation this read projects onto crossed a bound, so no documentation
+    /// block joins the answer: declarations and files answer as they would without it.
+    /// The condition holds until the documentation it names changes.
+    DocumentationUnavailable {
+        /// Which documentation was left out and the bound it crossed - prose for a
+        /// reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The answer was computed from an index that lags the tree the read captured. Facts
     /// derived from the index may miss the newest writes; the digests state which two
     /// trees disagree. When the two digests are equal, the tree moved in recorded files

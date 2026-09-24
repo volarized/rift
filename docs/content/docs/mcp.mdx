@@ -69,6 +69,10 @@ The search ranking tiers carry their own warnings:
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
+- `documentation_unavailable` - the documentation this search projects onto crossed a bound, so
+  no documentation block joins the answer and declarations and files answer as they would without
+  it. The `detail` names the documentation left out - the project's, the `force_include` files',
+  or the dependency packages' - and the bound it crossed.
 - `query_narrowed` - the query carried more terms and quoted phrases than `terms_max`, so the
   server dropped the shortest unquoted terms and ranked the answer by the rest. Every quoted
   phrase is kept. Shorten `query`, or quote the terms that must be matched.
