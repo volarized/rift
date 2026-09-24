@@ -7,6 +7,8 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
 pub use rift_analysis::IndexedFile;
@@ -1130,7 +1132,14 @@ impl IndexContents {
         provider: &dyn SyntaxProvider,
         syntax: SyntaxLimits,
     ) -> Result<(), WorkspaceIndexError> {
-        match syntax_read(&text_file, context_path, provider, syntax)? {
+        let parsed = syntax_read(&text_file, context_path, provider, syntax)?;
+        self.hold_parsed_source(text_file, parsed);
+        Ok(())
+    }
+
+    /// Holds one cataloged file with the syntax outcome already read for it.
+    fn hold_parsed_source(&mut self, text_file: TextSourceFile, parsed: IndexRead<IndexedFile>) {
+        match parsed {
             IndexRead::Included(file) => {
                 self.files.insert(file.path().clone(), Arc::new(file));
                 self.hold_text_file(text_file);
@@ -1139,6 +1148,66 @@ impl IndexContents {
                 self.left_out
                     .insert(text_file.path().clone(), LeftOutFileState::of(&text_file));
                 self.warnings.push(warning);
+            }
+        }
+    }
+
+    /// Reads and parses every source path a provider claimed, in walk order.
+    ///
+    /// Each batch of [`SOURCE_BATCH_FILES`] paths is read and parsed across the rayon
+    /// pool, then held in walk order: `workspace_bytes` counts each kept file before its
+    /// parse outcome is held, so the `workspace_bytes_max` refusal and every other failure
+    /// name the path a sequential read would name. The refusal stops the build after the
+    /// batch that crossed it, so at most one batch is read past the bound.
+    fn hold_parsed_sources(
+        &mut self,
+        root: &Path,
+        sources: &[(PathBuf, &'static dyn SyntaxProvider)],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        for batch in sources.chunks(SOURCE_BATCH_FILES) {
+            let read: Vec<Result<IndexRead<ParsedSource>, WorkspaceIndexError>> = batch
+                .par_iter()
+                .map(|(path, provider)| ParsedSource::read(root, path, *provider, limits))
+                .collect();
+            for ((path, _), read) in batch.iter().zip(read) {
+                match read? {
+                    IndexRead::Included(ParsedSource { text_file, parsed }) => {
+                        let length = text_file.content().len();
+                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                        self.hold_parsed_source(text_file, parsed?);
+                    }
+                    IndexRead::Skipped(warning) => self.leave_out(warning),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads every text path, in walk order, batched across the rayon pool the way
+    /// [`Self::hold_parsed_sources`] batches sources.
+    fn hold_read_texts(
+        &mut self,
+        root: &Path,
+        texts: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        for batch in texts.chunks(SOURCE_BATCH_FILES) {
+            let read: Vec<Result<IndexRead<TextSourceFile>, WorkspaceIndexError>> = batch
+                .par_iter()
+                .map(|path| catalog_file(root, path, limits))
+                .collect();
+            for (path, read) in batch.iter().zip(read) {
+                match read? {
+                    IndexRead::Included(text_file) => {
+                        let length = text_file.content().len();
+                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                        self.hold_text_file(text_file);
+                    }
+                    IndexRead::Skipped(warning) => self.leave_out(warning),
+                }
             }
         }
         Ok(())
@@ -1298,25 +1367,13 @@ impl WorkspaceIndex {
             rift_core::traced!(component = "index", operation = "index.parse", {
                 let mut workspace_bytes = 0_usize;
                 let mut contents = IndexContents::default();
-                for (path, provider) in classified.source {
-                    match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                        IndexRead::Included(text_file) => {
-                            contents.hold_source_file(
-                                text_file,
-                                &path,
-                                provider,
-                                limits.syntax(),
-                            )?;
-                        }
-                        IndexRead::Skipped(warning) => contents.leave_out(warning),
-                    }
-                }
-                for path in classified.text {
-                    match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                        IndexRead::Included(file) => contents.hold_text_file(file),
-                        IndexRead::Skipped(warning) => contents.leave_out(warning),
-                    }
-                }
+                contents.hold_parsed_sources(
+                    &root,
+                    &classified.source,
+                    limits,
+                    &mut workspace_bytes,
+                )?;
+                contents.hold_read_texts(&root, &classified.text, limits, &mut workspace_bytes)?;
                 let BuiltContents {
                     files,
                     text_files,
@@ -2688,14 +2745,46 @@ pub fn capture_digests_with_languages(
 
 /// Reads one path class into captured file states: each kept file's project path, its
 /// file-state digest, and its content digest, in walk order.
+///
+/// Files are read and hashed across the rayon pool, and no file's bytes outlive its own
+/// digest, so the capture holds one file per worker. The kept lengths are then summed in
+/// walk order: the `workspace_bytes_max` refusal names the path a sequential read would
+/// name, and an earlier path's failure wins over a later one's.
 fn capture_path_class(
     workspace_bytes: &mut usize,
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
 ) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+    let read: Vec<Result<Option<CapturedFile>, WorkspaceIndexError>> = paths
+        .par_iter()
+        .map(|path| CapturedFile::read(path, limits))
+        .collect();
     let mut captured = Vec::with_capacity(paths.len());
-    for path in paths {
+    for (path, file) in paths.iter().zip(read) {
+        let Some(file) = file? else {
+            continue;
+        };
+        count_workspace_bytes(workspace_bytes, file.length, path, limits)?;
+        captured.push((project_path_below(root, path)?, file.state, file.content));
+    }
+    Ok(captured)
+}
+
+/// One file's captured digests, and the byte length it counts against the workspace.
+struct CapturedFile {
+    length: usize,
+    state: FileDigest,
+    content: FileDigest,
+}
+
+impl CapturedFile {
+    /// Reads and hashes the file at `path`, or answers nothing for a file the index leaves
+    /// out: past `file_bytes_max`, holding a NUL byte, or not UTF-8.
+    fn read(
+        path: &Path,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<Option<Self>, WorkspaceIndexError> {
         let handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
         })?;
@@ -2707,26 +2796,16 @@ fn capture_path_class(
             || bytes.contains(&0)
             || std::str::from_utf8(&bytes).is_err()
         {
-            continue;
+            return Ok(None);
         }
-        *workspace_bytes = workspace_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
-        if *workspace_bytes > limits.workspace_bytes_max() {
-            return Err(index_error_over_limit(
-                WorkspaceIndexViolation::WorkspaceTooLarge,
-                path,
-                SOURCE_WORKSPACE_SIZE_FIELD,
-                *workspace_bytes,
-                limits.workspace_bytes_max(),
-            ));
-        }
-        let project_path = project_path_below(root, path)?;
         let (content, state) =
             FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
-        captured.push((project_path, state, content));
+        Ok(Some(Self {
+            length: bytes.len(),
+            state,
+            content,
+        }))
     }
-    Ok(captured)
 }
 
 impl WorkspaceDigests {
@@ -3040,12 +3119,79 @@ fn read_text_file(
     Ok(file)
 }
 
-/// Reads one baseline catalog candidate with bounded binary detection.
+/// Source or text paths one parallel batch of the index build reads.
+///
+/// A batch is the unit the build reads ahead of its in-order fold, so it bounds how far
+/// the reads run past a `workspace_bytes_max` refusal.
+const SOURCE_BATCH_FILES: usize = 512;
+
+/// Counts one kept file's bytes against `workspace_bytes_max`.
+fn count_workspace_bytes(
+    workspace_bytes: &mut usize,
+    length: usize,
+    context_path: &Path,
+    limits: WorkspaceIndexLimits,
+) -> Result<(), WorkspaceIndexError> {
+    *workspace_bytes = workspace_bytes
+        .checked_add(length)
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
+    if *workspace_bytes > limits.workspace_bytes_max() {
+        return Err(index_error_over_limit(
+            WorkspaceIndexViolation::WorkspaceTooLarge,
+            context_path,
+            SOURCE_WORKSPACE_SIZE_FIELD,
+            *workspace_bytes,
+            limits.workspace_bytes_max(),
+        ));
+    }
+    Ok(())
+}
+
+/// One source file read on a pool worker, with its parse outcome kept for the in-order
+/// fold: a parse failure is reported only after the file's bytes were counted.
+struct ParsedSource {
+    text_file: TextSourceFile,
+    parsed: Result<IndexRead<IndexedFile>, WorkspaceIndexError>,
+}
+
+impl ParsedSource {
+    /// Reads one source file and parses it with the provider that claimed it.
+    fn read(
+        root: &Path,
+        path: &Path,
+        provider: &dyn SyntaxProvider,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<IndexRead<Self>, WorkspaceIndexError> {
+        Ok(match catalog_file(root, path, limits)? {
+            IndexRead::Included(text_file) => {
+                let parsed = syntax_read(&text_file, path, provider, limits.syntax());
+                IndexRead::Included(Self { text_file, parsed })
+            }
+            IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+        })
+    }
+}
+
+/// Reads one baseline catalog candidate with bounded binary detection, counting it
+/// against `workspace_bytes_max`.
 fn read_catalog_file(
     root: &Path,
     path: &Path,
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
+) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
+    let read = catalog_file(root, path, limits)?;
+    if let IndexRead::Included(file) = &read {
+        count_workspace_bytes(workspace_bytes, file.content().len(), path, limits)?;
+    }
+    Ok(read)
+}
+
+/// Reads one baseline catalog candidate with bounded binary detection, counting no bytes.
+fn catalog_file(
+    root: &Path,
+    path: &Path,
+    limits: WorkspaceIndexLimits,
 ) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
     let handle = fs::File::open(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
@@ -3070,7 +3216,8 @@ fn read_catalog_file(
             WorkspaceIndexWarning::InvalidUtf8Source(project_path),
         ));
     }
-    let mut file = included_text_file(project_path, bytes, path, limits, workspace_bytes)?;
+    let content = source_utf8(bytes, path)?;
+    let mut file = TextSourceFile::from_content(project_path, content);
     file.executable = metadata_is_executable(&metadata);
     Ok(IndexRead::Included(file))
 }
@@ -3112,18 +3259,7 @@ pub(crate) fn included_text_file(
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
 ) -> Result<TextSourceFile, WorkspaceIndexError> {
-    *workspace_bytes = workspace_bytes
-        .checked_add(bytes.len())
-        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
-    if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(index_error_over_limit(
-            WorkspaceIndexViolation::WorkspaceTooLarge,
-            context_path,
-            SOURCE_WORKSPACE_SIZE_FIELD,
-            *workspace_bytes,
-            limits.workspace_bytes_max,
-        ));
-    }
+    count_workspace_bytes(workspace_bytes, bytes.len(), context_path, limits)?;
     let content = source_utf8(bytes, context_path)?;
     Ok(TextSourceFile::from_content(project_path, content))
 }

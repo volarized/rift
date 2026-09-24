@@ -28,6 +28,7 @@ rift-syntax.workspace = true
 toasty.workspace = true
 toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
+rayon.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

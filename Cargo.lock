@@ -4484,6 +4484,7 @@ version = "0.0.44"
 dependencies = [
  "flate2",
  "ignore",
+ "rayon",
  "rift-analysis",
  "rift-core",
  "rift-dependency",
@@ -4632,6 +4633,7 @@ version = "0.0.44"
 dependencies = [
  "lsp-types",
  "percent-encoding",
+ "rayon",
  "rift-core",
  "rift-dependency",
  "rift-history",
