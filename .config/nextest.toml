@@ -41,25 +41,6 @@ global-timeout = "480s"
 fail-fast = false
 failure-output = "immediate-final"
 
-# Every release target runs the unit suite natively except Windows, where part of
-# the suite fails today. A Windows build runs the tests that prove what only
-# Windows can: process exit, server election, and the update publisher's Job
-# object and replace-while-running publication.
-[[profile.ci.overrides]]
-platform = 'cfg(windows)'
-default-filter = '''
-binary_id(rift::bin/rift) & (
-    test(=server::tests::stopped_process_does_not_wait_for_a_replacement_election)
-    | test(=server::tests::changed_or_missing_document_does_not_prove_process_exit)
-    | test(=server::tests::already_exited_process_does_not_wait_for_a_building_holder)
-    | test(=server::tests::process_observation_errors_keep_waiting_and_retain_their_cause)
-    | test(=server::tests::await_stopped_times_out_while_the_holder_keeps_the_election)
-    | test(=server::tests::await_election_released_returns_once_the_holder_is_gone)
-    | test(=update::tests::windows_publish_flushes_staging_and_preserves_backup)
-    | test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)
-)
-'''
-
 [profile.ci.junit]
 path = "junit.xml"
 
