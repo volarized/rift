@@ -387,13 +387,33 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+      # Every pull request builds this job's Rust cache, not only a push to
+      # main, so saving on every run would thrash the one shared key. Restore
+      # stays unconditional; only the save after a push to main updates it.
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           shared-key: integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2.87.16
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.140
+      # The archive carries test binaries and the CLI compiled from these exact
+      # Rust inputs; the corpus jobs check out the Python harness and the
+      # pinned trees fresh and pass `--workspace-remap .` to point the
+      # extracted archive at that checkout. A hit here is the same archive a
+      # fresh compile would produce, so a pull request touching only docs,
+      # workflows, or `dev/` skips the ~38-minute build.
+      - uses: actions/cache@v6.1.0
+        id: integration-archive-cache
+        with:
+          path: |
+            target/integration.tar.zst
+            target/integration-cli.tar.zst
+          key: >-
+            integration-archive-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', '.config/nextest.toml', 'justfile') }}
       - name: Build and archive integrations
+        if: steps.integration-archive-cache.outputs.cache-hit != 'true'
         timeout-minutes: 38
         run: just integration-archive
       # Two artifacts, because the two consumers need different bytes: the
