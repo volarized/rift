@@ -1421,8 +1421,11 @@ fn identity_key(identity: &PackageIdentity) -> (&str, &str, &str) {
 
 /// The warnings an answer whose `scope` reaches packages carries: the
 /// `global_index_unavailable` entry every such answer rides with, then at most
-/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order and
-/// `package_context_degraded` in resolver order together, skipped packages first.
+/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order,
+/// `package_context_degraded` in resolver order, and `package_unavailable` in identity
+/// order together, in that order. A workspace can name thousands of packages this machine
+/// holds no source for; their count rides `global_index_unavailable`, so the bound cuts
+/// the per-package entries rather than the fact.
 ///
 /// No global package index exists, so the first warning states what the local fallback
 /// produced rather than promising a service that is not there.
@@ -1439,12 +1442,6 @@ pub(crate) fn package_warnings(
             fallback.indexed, fallback.unresolved
         ),
     }];
-    warnings.extend(fallback.unavailable.into_iter().map(|package| {
-        ReadWarning::PackageUnavailable {
-            package,
-            reason: "package source is unavailable on this machine".to_owned(),
-        }
-    }));
     let skipped_packages: &[SkippedPackage] = index.map_or(&[], DependencyIndex::skipped);
     let mut skipped: Vec<&SkippedPackage> = skipped_packages.iter().collect();
     skipped.sort_by(|left, right| identity_key(&left.identity).cmp(&identity_key(&right.identity)));
@@ -1462,7 +1459,20 @@ pub(crate) fn package_warnings(
                 resolver: degradation.resolver.as_str().to_owned(),
                 reason: degradation.reason.clone(),
             });
-    warnings.extend(skipped.chain(degraded).take(DEPENDENCY_WARNINGS_MAX));
+    let unavailable =
+        fallback
+            .unavailable
+            .into_iter()
+            .map(|package| ReadWarning::PackageUnavailable {
+                package,
+                reason: "package source is unavailable on this machine".to_owned(),
+            });
+    warnings.extend(
+        skipped
+            .chain(degraded)
+            .chain(unavailable)
+            .take(DEPENDENCY_WARNINGS_MAX),
+    );
     warnings
 }
 
@@ -3663,6 +3673,87 @@ pub fn compute() -> i32 {
             "the degraded resolvers fill what the bound leaves: {rendered:?}"
         );
         Ok(())
+    }
+
+    /// Twelve packages with no source on this machine ride as eight `package_unavailable`
+    /// warnings in identity order, while `global_index_unavailable` keeps the full count
+    /// (#364: a Bun workspace carried 3,155 of them on every documentation answer).
+    #[test]
+    fn package_warnings_cap_unavailable_packages_and_keep_their_count() {
+        let unavailable: Vec<PackageIdentity> = (0..12)
+            .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
+            .collect();
+        let fallback = crate::packages::PackageFallback {
+            indexed: 0,
+            unresolved: 12,
+            unavailable: unavailable.clone(),
+        };
+
+        let warnings = super::package_warnings(
+            None,
+            &rift_dependency::DependencyContext::default(),
+            fallback,
+        );
+
+        assert_eq!(warnings.len(), DEPENDENCY_WARNINGS_MAX + 1, "{warnings:?}");
+        assert!(
+            matches!(
+                &warnings[0],
+                ReadWarning::GlobalIndexUnavailable { detail, .. } if detail.contains("12 named no source")
+            ),
+            "{:?}",
+            warnings[0]
+        );
+        let named: Vec<&PackageIdentity> = warnings[1..]
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::PackageUnavailable { package, .. } => Some(package),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<&PackageIdentity> =
+            unavailable.iter().take(DEPENDENCY_WARNINGS_MAX).collect();
+        assert_eq!(named, expected);
+    }
+
+    /// Skipped packages and degraded resolvers take the bound before unavailable packages:
+    /// a refusal or a failed resolver is what an operator acts on, and the unavailable
+    /// count already rides `global_index_unavailable`.
+    #[test]
+    fn package_warnings_order_skipped_then_degraded_then_unavailable() {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
+        index.skip(identity("cargo", "refused", "1.0.0"), "refused".to_owned());
+        let context = degraded_context();
+        let degradations = context.degradations().len();
+        let fallback = crate::packages::PackageFallback {
+            indexed: 0,
+            unresolved: 12,
+            unavailable: (0..12)
+                .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
+                .collect(),
+        };
+
+        let warnings = super::package_warnings(Some(&index), &context, fallback);
+
+        let kinds: Vec<&str> = warnings[1..]
+            .iter()
+            .map(|warning| match warning {
+                ReadWarning::PackageSkipped { .. } => "skipped",
+                ReadWarning::PackageContextDegraded { .. } => "degraded",
+                ReadWarning::PackageUnavailable { .. } => "unavailable",
+                _ => "other",
+            })
+            .collect();
+        let expected: Vec<&str> = std::iter::once("skipped")
+            .chain(std::iter::repeat_n("degraded", degradations))
+            .chain(std::iter::repeat("unavailable"))
+            .take(DEPENDENCY_WARNINGS_MAX)
+            .collect();
+        assert!(
+            degradations >= 1,
+            "the fixture degrades one resolver at least"
+        );
+        assert_eq!(kinds, expected);
     }
 
     /// A holder that panics with the write side held poisons the store; the next reader

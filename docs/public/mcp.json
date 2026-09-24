@@ -2007,7 +2007,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning, `package_context_degraded`, and\n`package_unavailable` together ride one answer, this one first, in package identity\norder.",
                 "properties": {
                   "code": {
                     "const": "package_skipped",
@@ -4505,7 +4505,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning, `package_context_degraded`, and\n`package_unavailable` together ride one answer, this one first, in package identity\norder.",
                 "properties": {
                   "code": {
                     "const": "package_skipped",
@@ -7206,7 +7206,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together\nride one answer, this one first, in package identity order.",
+                "description": "The local package index refused one package, so none of its declarations answers.\nRides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` of this warning, `package_context_degraded`, and\n`package_unavailable` together ride one answer, this one first, in package identity\norder.",
                 "properties": {
                   "code": {
                     "const": "package_skipped",

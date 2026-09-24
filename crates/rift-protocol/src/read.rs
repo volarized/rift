@@ -882,8 +882,9 @@ pub struct ProjectPath(
 );
 
 /// Most package and dependency-context warnings one answer carries together. Local reads
-/// order skipped packages before degraded resolvers. Routed global reads order unavailable
-/// packages and degraded resolvers before packages absent from the global publication.
+/// order skipped packages, then degraded resolvers, then unavailable packages. Routed global
+/// reads order unavailable packages and degraded resolvers before packages absent from the
+/// global publication.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
 /// Maximum package count carried by one global fallback summary.
@@ -1150,8 +1151,9 @@ pub enum ReadWarning {
     },
     /// The local package index refused one package, so none of its declarations answers.
     /// Rides only an answer whose `scope` reaches packages; at most
-    /// `DEPENDENCY_WARNINGS_MAX` of this warning and `package_context_degraded` together
-    /// ride one answer, this one first, in package identity order.
+    /// `DEPENDENCY_WARNINGS_MAX` of this warning, `package_context_degraded`, and
+    /// `package_unavailable` together ride one answer, this one first, in package identity
+    /// order.
     PackageSkipped {
         /// The package the index refused.
         package: PackageIdentity,
