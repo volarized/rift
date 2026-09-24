@@ -15,14 +15,15 @@ flag_management:
 # they had almost none of to give: measured on one tree they reached three lines
 # the unit report did not, out of 78,757.
 #
-# The corpus job joined `ci` and carries its own coverage upload alongside the CLI
-# job's, so the wait is two builds again - this time for `cli` and `corpus`, not
-# `cli` and `live`. `dev/tests/test_delivery.py` refuses a count that disagrees
-# with the coverage uploads `ci` performs, so a third coverage job has to settle
-# this again rather than silently reopen the window.
+# The corpus job runs in `ci` as five matrix legs, and each leg uploads its own
+# `corpus` report beside the CLI job's `cli` report, so one run sends six builds.
+# Waiting for two let Codecov compute a pull request's patch from two corpus legs
+# before the CLI report landed. `dev/tests/test_delivery.py` counts every coverage
+# upload step once per matrix leg and refuses a wait that disagrees, so a new leg or
+# coverage job has to settle this again rather than silently reopen the window.
 codecov:
   notify:
-    after_n_builds: 2
+    after_n_builds: 6
 
 coverage:
   precision: 2
@@ -43,7 +44,7 @@ coverage:
 comment:
   layout: "reach, diff, flags, files"
   require_changes: false
-  after_n_builds: 2
+  after_n_builds: 6
 
 github_checks:
   annotations: true
