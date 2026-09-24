@@ -6025,6 +6025,37 @@ mod tests {
         )
     }
 
+    /// The lexical store records each file's content digest beside its rows, so a file the
+    /// build left out still needs one: without it, every later build would count that file
+    /// as new and write it again.
+    #[test]
+    fn test_content_digests_name_every_file_the_build_held_or_left_out() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(root.join("src/deep.rs"), deep_source()).expect("deep source");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("text file");
+        let index = indexed(
+            root,
+            &TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024),
+        );
+        let digests = index.content_digests();
+        let entries: Vec<(&str, FileDigest)> = digests
+            .iter()
+            .map(|(path, digest)| (path.as_str(), digest))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("notes.txt", FileDigest::of(b"plain notes\n")),
+                ("src/deep.rs", FileDigest::of(deep_source().as_bytes())),
+                ("src/lib.rs", FileDigest::of(b"pub fn kept() {}\n")),
+            ],
+            "the text file, the left-out file, and the parsed file each carry their bytes' digest"
+        );
+    }
+
     #[test]
     fn test_build_leaves_a_file_past_a_syntax_bound_out_and_keeps_the_rest() {
         let directory = tempfile::tempdir().expect("workspace");
