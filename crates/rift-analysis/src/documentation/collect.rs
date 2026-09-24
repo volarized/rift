@@ -70,6 +70,51 @@ pub fn collect_documentation_incremental(
     build_collection(sources, output, cache, resolution_cache)
 }
 
+/// One source's extraction key and facts: reused from `previous` when the key matches,
+/// extracted otherwise.
+type ExtractedSource = Result<(DocumentationDigest, Arc<Collected>), DocumentationError>;
+
+/// Extracts every source's facts, in source order.
+///
+/// Each source's facts depend on its own bytes and the declarations alone, so with the
+/// `parallel` feature they are extracted across the rayon pool; the merge that applies
+/// the collection's bounds stays in source order.
+fn extract_sources(
+    previous: Option<&DocumentationCollection>,
+    sources: &[DocumentationInput<'_>],
+    declarations: &[DocumentationDeclaration<'_>],
+    attached: &BTreeMap<
+        rift_protocol::documentation::DocumentationContentIdentity,
+        Vec<(
+            rift_protocol::read::SymbolId,
+            rift_protocol::read::TextRange,
+        )>,
+    >,
+) -> Vec<ExtractedSource> {
+    let extract = |input: &DocumentationInput<'_>| -> ExtractedSource {
+        let key = extraction_key(
+            input,
+            attached.get(&input.source().identity).map(Vec::as_slice),
+        )?;
+        let facts = previous
+            .and_then(DocumentationCollection::extraction_cache)
+            .and_then(|previous| previous.sources.get(&input.source().identity))
+            .filter(|cached| cached.key == key)
+            .map_or_else(
+                || extract_source_facts(input, declarations),
+                |cached| Ok(Arc::clone(&cached.facts)),
+            )?;
+        Ok((key, facts))
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+        sources.par_iter().map(extract).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    sources.iter().map(extract).collect()
+}
+
 fn collect_source_facts(
     previous: Option<&DocumentationCollection>,
     sources: &DocumentationSourceSet<'_>,
@@ -84,19 +129,9 @@ fn collect_source_facts(
 ) -> Result<(Collected, ExtractionCache), DocumentationError> {
     let mut output = Collected::default();
     let mut cache = ExtractionCache::default();
-    for input in sources.sources() {
-        let key = extraction_key(
-            input,
-            attached.get(&input.source().identity).map(Vec::as_slice),
-        )?;
-        let facts = previous
-            .and_then(DocumentationCollection::extraction_cache)
-            .and_then(|previous| previous.sources.get(&input.source().identity))
-            .filter(|cached| cached.key == key)
-            .map_or_else(
-                || extract_source_facts(input, declarations),
-                |cached| Ok(Arc::clone(&cached.facts)),
-            )?;
+    let extracted = extract_sources(previous, sources.sources(), declarations, attached);
+    for (input, extracted) in sources.sources().iter().zip(extracted) {
+        let (key, facts) = extracted?;
         if merge_source(input, &mut output, &facts)
             && cache
                 .warning_count
