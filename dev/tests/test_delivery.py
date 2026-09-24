@@ -354,8 +354,19 @@ class CacheOwnership(unittest.TestCase):
 
 def coverage_uploads() -> list[tuple[str, str]]:
     """Every `ci` step that uploads coverage, as job and flag."""
+    return [(job_name, flag) for job_name, flag, _legs in coverage_upload_steps()]
+
+
+def coverage_builds() -> int:
+    """How many coverage reports one `ci` run sends: a step inside a matrix job
+    uploads once per leg, and Codecov counts each upload as one build."""
+    return sum(legs for _job, _flag, legs in coverage_upload_steps())
+
+
+def coverage_upload_steps() -> list[tuple[str, str, int]]:
+    """Every `ci` step that uploads coverage, as job, flag, and matrix legs."""
     document = workflow_documents()[COVERAGE_WORKFLOW]
-    uploads: list[tuple[str, str]] = []
+    uploads: list[tuple[str, str, int]] = []
     for job_name, job in (document.get("jobs") or {}).items():
         for step in job.get("steps") or []:
             if not step.get("uses", "").startswith(CODECOV_ACTION):
@@ -363,8 +374,35 @@ def coverage_uploads() -> list[tuple[str, str]]:
             inputs = step.get("with") or {}
             if inputs.get("report_type"):
                 continue
-            uploads.append((job_name, str(inputs.get("flags", ""))))
+            uploads.append(
+                (job_name, str(inputs.get("flags", "")), matrix_legs(job_name, job))
+            )
     return uploads
+
+
+def matrix_legs(job_name: str, job: dict) -> int:
+    """How many runs one job's matrix expands to; a job without a matrix runs once.
+
+    An `include`-only matrix runs one leg per entry, and a matrix of axes runs their
+    product. A matrix mixing axes with `include` or `exclude` can add or drop legs
+    in ways this count does not model, so it is refused rather than guessed.
+    """
+    matrix = (job.get("strategy") or {}).get("matrix") or {}
+    include = matrix.get("include") or []
+    axes = [
+        values for key, values in matrix.items() if key not in ("include", "exclude")
+    ]
+    if not axes:
+        return max(len(include), 1)
+    if include or matrix.get("exclude"):
+        raise AssertionError(
+            f"job `{job_name}` mixes matrix axes with include or exclude; "
+            "count its coverage uploads by hand"
+        )
+    legs = 1
+    for values in axes:
+        legs *= len(values)
+    return legs
 
 
 class CoverageNotifications(unittest.TestCase):
@@ -375,10 +413,10 @@ class CoverageNotifications(unittest.TestCase):
         return int(codecov["codecov"]["notify"]["after_n_builds"])
 
     def test_codecov_waits_for_every_coverage_upload(self) -> None:
-        uploads = coverage_uploads()
+        uploads = coverage_upload_steps()
         self.assertEqual(
             self.expected_builds(),
-            len(uploads),
+            coverage_builds(),
             f"{COVERAGE_WORKFLOW} uploads coverage from {uploads}; "
             "`codecov.notify.after_n_builds` names how many to wait for, or a "
             "status is computed from a fraction of the run",
