@@ -49,9 +49,32 @@ pub(crate) async fn served_relative_workspace(
     files: &[(&str, &str)],
     lsp_configuration: Option<String>,
 ) -> TestResult<ServedWorkspace> {
-    let directory = laid_out_workspace(files, lsp_configuration)?;
+    let directory = laid_out_workspace_in(&relative_workspace_parent()?, files, lsp_configuration)?;
     let (client, server_task) = served_root(&relative_spelling(directory.path())?).await?;
     Ok((directory, client, server_task))
+}
+
+/// The directory a relative-root workspace is created in: the system temporary
+/// directory when it shares the working directory's volume, and that volume's root
+/// otherwise.
+///
+/// A relative spelling cannot leave its volume. A Windows runner checks the repository
+/// out on `D:` while its temporary directory is on `C:`, and no `..` chain from the
+/// test's working directory reaches `C:`. The volume root stays outside the checkout,
+/// whose ignore rules the embedded `ty` engine would apply to a workspace below it.
+fn relative_workspace_parent() -> TestResult<PathBuf> {
+    let volume_root = |path: &Path| -> PathBuf {
+        path.components()
+            .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+            .collect()
+    };
+    let current = std::env::current_dir()?;
+    let temporary = std::env::temp_dir();
+    if volume_root(&current) == volume_root(&temporary) {
+        Ok(temporary)
+    } else {
+        Ok(volume_root(&current))
+    }
 }
 
 /// One temporary workspace holding `files` and a `rift.toml`: tables that keep vector
@@ -63,7 +86,16 @@ fn laid_out_workspace(
     files: &[(&str, &str)],
     lsp_configuration: Option<String>,
 ) -> TestResult<tempfile::TempDir> {
-    let directory = tempfile::tempdir()?;
+    laid_out_workspace_in(&std::env::temp_dir(), files, lsp_configuration)
+}
+
+/// [`laid_out_workspace`] below `parent`.
+fn laid_out_workspace_in(
+    parent: &Path,
+    files: &[(&str, &str)],
+    lsp_configuration: Option<String>,
+) -> TestResult<tempfile::TempDir> {
+    let directory = tempfile::tempdir_in(parent)?;
     for (name, source) in files {
         let path = directory.path().join(name);
         if let Some(parent) = path.parent() {
