@@ -197,10 +197,18 @@ impl DependencyIndex {
     pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &DocumentationError> {
         self.documentation_layer
             .get_or_init(|| {
-                DocumentationLayer::shared(
-                    self.packages
-                        .values()
-                        .map(PackageIndex::documentation_snapshot),
+                rift_core::traced!(
+                    component = "documentation",
+                    operation = "documentation.layer",
+                    corpus = "packages",
+                    packages = self.packages.len(),
+                    {
+                        DocumentationLayer::shared(
+                            self.packages
+                                .values()
+                                .map(PackageIndex::documentation_snapshot),
+                        )
+                    }
                 )
             })
             .as_ref()

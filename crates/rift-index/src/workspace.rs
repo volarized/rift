@@ -1557,7 +1557,14 @@ impl WorkspaceIndex {
     /// crossed.
     pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &DocumentationError> {
         self.documentation_layer
-            .get_or_init(|| DocumentationLayer::shared([Arc::clone(&self.documentation)]))
+            .get_or_init(|| {
+                rift_core::traced!(
+                    component = "documentation",
+                    operation = "documentation.layer",
+                    corpus = "project",
+                    { DocumentationLayer::shared([Arc::clone(&self.documentation)]) }
+                )
+            })
             .as_ref()
     }
 
