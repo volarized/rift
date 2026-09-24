@@ -118,10 +118,12 @@ its result, so reads never combine state from two index revisions.
 Watcher events advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
 those files, sharing every other file with the previous index. A watch failure, a written
-`.gitignore`, or a directory appearing or disappearing reads the whole workspace instead. A
-written `rift.toml` reads the whole workspace when `[source]`, a language file selection, or
-`[search.text]` inclusion or chunk bound changed. Every other accepted configuration change
-reuses the published tree.
+`.gitignore`, or a directory appearing or disappearing reads the whole workspace instead: the
+rebuild walks the tree and reads and digests every visible file under the ignore files as they
+stand now, and parses only the files whose bytes the previous index did not already parse. A
+written `rift.toml` reads and parses the whole workspace when `[source]`, a language file
+selection, `[search.text]` inclusion or chunk bound, `[dependencies]`, or `[providers.syntax]`
+changed. Every other accepted configuration change reuses the published tree.
 
 Before each current-tree read, the server captures an exact digest of every included workspace
 file, then waits until the published index counter matches its observation. That capture already

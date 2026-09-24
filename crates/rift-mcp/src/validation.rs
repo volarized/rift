@@ -1384,7 +1384,19 @@ pub(crate) fn build_workspace_candidate(
     let change_set = request.change_set(root, &configuration);
     let candidate = match &change_set {
         ChangeSet::Full => {
-            whole_workspace_candidate(root, limits, configuration, request.epoch, dependencies)?
+            let sharing = request.previous.as_deref().filter(|previous| {
+                !previous
+                    .configuration
+                    .index_configuration_differs(&configuration)
+            });
+            whole_workspace_candidate(
+                root,
+                limits,
+                configuration,
+                request.epoch,
+                dependencies,
+                sharing,
+            )?
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1424,27 +1436,40 @@ pub(crate) fn lexical_write(
 /// Scans every visible file, taking the `[source]` policy `reads` already compiled
 /// rather than compiling a second one - one predicate per snapshot, one walk of the
 /// tree's `.gitignore` files instead of two.
+///
+/// A publication in `sharing` was built under the same index-owned configuration, so every
+/// file whose bytes it already parsed is shared rather than parsed again: a folder event or
+/// an ignore-file write costs a walk, a read, and a digest of the tree, and a parse of the
+/// files that moved.
 fn whole_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
     dependencies: &Arc<PackageBranch>,
+    sharing: Option<&PublishedWorkspace>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let limits = configuration.index_limits(limits)?;
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let dependencies_configuration = configuration.dependencies_configuration();
-    let reads = ReadService::build_with_languages(
-        root,
-        limits,
-        &visibility,
-        &text_inclusion,
-        &languages,
-        configuration.history_configuration(),
-        dependencies_configuration,
-    )?
+    let reads = match sharing {
+        Some(previous) => {
+            previous
+                .reads
+                .rescanned(root, &visibility, &text_inclusion, &languages)?
+        }
+        None => ReadService::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+            configuration.history_configuration(),
+            dependencies_configuration,
+        )?,
+    }
     .with_packages(Arc::clone(dependencies));
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
@@ -4322,6 +4347,61 @@ pub(crate) mod tests {
             paths,
             vec!["lib.rs", "other.rs"],
             "the superseded attempt's paths return beside what landed while it ran"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_whole_workspace_rebuild_rescans_under_unchanged_index_configuration() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::create_dir_all(directory.path().join("fresh"))?;
+        fs::write(directory.path().join("fresh/mod.rs"), "pub fn fresh() {}\n")?;
+        let limits = WorkspaceIndexLimits::default();
+        let store = empty_package_branch();
+        let rebuild = |epoch: u64| -> TestResult<Arc<PublishedWorkspace>> {
+            let request = super::RebuildRequest {
+                epoch,
+                work: super::PendingWork::whole_workspace(),
+                previous: Some(Arc::clone(&previous)),
+            };
+            match build_workspace_candidate(directory.path(), limits, &request, &store)? {
+                WorkspaceCandidate::Stable {
+                    published,
+                    change_set,
+                } => {
+                    assert_eq!(
+                        change_set,
+                        ChangeSet::Full,
+                        "a whole observation names no paths"
+                    );
+                    Ok(published)
+                }
+                WorkspaceCandidate::ConfigurationChanged => {
+                    Err("fixture configuration must remain stable".into())
+                }
+            }
+        };
+
+        let rescanned = rebuild(1)?;
+        let fresh = stable_candidate(directory.path(), 1)?;
+        assert_eq!(
+            rescanned.reads.tree_revision(),
+            fresh.reads.tree_revision(),
+            "the rescan answers for the tree a full build answers for"
+        );
+        let params = serde_json::from_value(serde_json::json!({"name": "fresh"}))?;
+        assert_eq!(rescanned.reads.get_symbol(&params)?.hits.len(), 1);
+
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.syntax]\nmax_file = \"60b\"\n",
+        )?;
+        let reconfigured = rebuild(2)?;
+        assert_ne!(
+            reconfigured.configuration.fingerprint, previous.configuration.fingerprint,
+            "an index-owned change builds under the new configuration"
         );
         Ok(())
     }
