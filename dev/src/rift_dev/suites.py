@@ -17,8 +17,10 @@ from rift_dev.config import CorpusName
 GENERATED_CLIENT = r"(^|/)crates/rift-cloud-client/src/generated\.rs$"
 COVERAGE_FLOOR = "86"
 
-# Cargo writes a target directory's `CACHEDIR.TAG` only when it creates that
-# directory itself.
+# Every cache directory tag opens with this fixed signature, the MD5 of
+# `.IsCacheDirectory` (https://bford.info/cachedir/). `cargo clean --target-dir`
+# reads those 43 bytes and refuses a directory without them. Cargo writes the tag
+# only when it creates a target directory itself.
 CACHEDIR_TAG = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by cargo.\n"
@@ -32,9 +34,10 @@ def coverage_target() -> None:
     """Creates the directory cargo-llvm-cov builds into and nextest extracts into.
 
     Nextest will not create it, so it exists before an archive run. cargo-llvm-cov
-    refuses to clean stale objects out of a directory carrying no `CACHEDIR.TAG`:
-    a report taken over an uncleaned directory counts every source file twice,
-    once from a stale object with no hits, and the floor fails on a green suite.
+    cleans stale objects through `cargo clean`, which refuses a directory carrying
+    no `CACHEDIR.TAG`, and cargo-llvm-cov only warns: a report taken over the
+    uncleaned directory counts every source file twice, once from a stale object
+    with no hits, and the floor fails on a green suite.
     """
     target = Path(
         os.environ.get(
