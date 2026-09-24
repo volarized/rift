@@ -99,6 +99,7 @@ impl Default for ArchiveLimits {
 pub struct ArchiveFiles {
     digest: FileDigest,
     files: BTreeMap<ProjectPath, Vec<u8>>,
+    skipped_links: Vec<ProjectPath>,
 }
 
 impl ArchiveFiles {
@@ -118,6 +119,15 @@ impl ArchiveFiles {
     #[must_use]
     pub fn into_files(self) -> BTreeMap<ProjectPath, Vec<u8>> {
         self.files
+    }
+
+    /// Paths of symbolic and hard link entries the archive held; never read, never followed.
+    ///
+    /// A skipped link counts toward `ArchiveLimits::members`, the same bound that limits
+    /// files and directories; it has no separate bound.
+    #[must_use]
+    pub fn skipped_links(&self) -> &[ProjectPath] {
+        &self.skipped_links
     }
 }
 
@@ -142,7 +152,7 @@ pub enum ArchiveError {
     UnsafePath,
     /// Multiple members name the same normalized path.
     DuplicatePath,
-    /// Archive contains a link, special file, encryption, or sparse file.
+    /// Archive contains a device, FIFO, encrypted, or sparse entry.
     UnsupportedEntry,
     /// Archive member lies outside the caller's exact release root.
     RootMismatch,
@@ -172,7 +182,9 @@ impl std::error::Error for ArchiveError {}
 ///
 /// `root` names an exact top-level directory from release metadata. `None` preserves paths.
 /// Directories count toward the member bound but never become files. Extended tar headers count
-/// toward both byte and member bounds before the tar library interprets them.
+/// toward both byte and member bounds before the tar library interprets them. A symbolic or
+/// hard link entry is skipped rather than refused: it never becomes a file, its target is
+/// never opened, and its path is carried in [`ArchiveFiles::skipped_links`].
 ///
 /// # Errors
 /// Returns [`ArchiveError`] when the digest, paths, member types, container, or bounds fail.
@@ -202,24 +214,28 @@ pub fn read_archive(
     let expanded_max = limits
         .expanded_bytes
         .min(bytes.len().saturating_mul(limits.expansion_ratio));
-    let files = match format {
+    let (files, skipped_links) = match format {
         ArchiveFormat::TarGzip => read_tar(bytes, root, limits, expanded_max)?,
         ArchiveFormat::Zip => read_zip(bytes, root, limits, expanded_max)?,
     };
     Ok(ArchiveFiles {
         digest: FileDigest::of(bytes),
         files,
+        skipped_links,
     })
 }
 
 const TAR_EXTENSION_BYTES_MAX: u64 = 16 * 1024;
+
+/// Regular files and skipped-link paths extracted from one archive container.
+type ArchiveContents = (BTreeMap<ProjectPath, Vec<u8>>, Vec<ProjectPath>);
 
 fn read_tar(
     bytes: &[u8],
     root: Option<&str>,
     limits: ArchiveLimits,
     expanded_max: usize,
-) -> Result<BTreeMap<ProjectPath, Vec<u8>>, ArchiveError> {
+) -> Result<ArchiveContents, ArchiveError> {
     let mut expanded = Vec::new();
     flate2::read::MultiGzDecoder::new(bytes)
         .take(u64::try_from(expanded_max).map_err(|_| ArchiveError::ExpandedLimit)? + 1)
@@ -243,7 +259,8 @@ fn read_tar(
         let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
         let kind = entry.header().entry_type();
         let extension = kind.is_gnu_longname() || kind.is_pax_local_extensions();
-        if !kind.is_file() && !kind.is_dir() && !extension {
+        let link = kind.is_symlink() || kind.is_hard_link();
+        if !kind.is_file() && !kind.is_dir() && !extension && !link {
             return Err(ArchiveError::UnsupportedEntry);
         }
         if entry.size()
@@ -281,11 +298,16 @@ fn read_tar(
         let path = std::str::from_utf8(&entry.path_bytes())
             .map_err(|_| ArchiveError::UnsafePath)?
             .to_owned();
-        let directory = entry.header().entry_type().is_dir();
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            output.push_skipped_link(&path)?;
+            continue;
+        }
+        let directory = kind.is_dir();
         let size = entry.size();
         output.push(&path, directory, size, &mut entry)?;
     }
-    Ok(output.files)
+    Ok(output.into_files_and_skipped_links())
 }
 
 fn read_zip(
@@ -293,7 +315,7 @@ fn read_zip(
     root: Option<&str>,
     limits: ArchiveLimits,
     expanded_max: usize,
-) -> Result<BTreeMap<ProjectPath, Vec<u8>>, ArchiveError> {
+) -> Result<ArchiveContents, ArchiveError> {
     let refused = Cell::new(None);
     let metadata = Cell::new(true);
     let declared_members = Cell::new(None);
@@ -323,12 +345,17 @@ fn read_zip(
         let mut entry = archive
             .by_index(index)
             .map_err(|_| ArchiveError::InvalidArchive)?;
+        if entry.encrypted() {
+            return Err(ArchiveError::UnsupportedEntry);
+        }
+        if entry.is_symlink() {
+            let path = entry.name().to_owned();
+            output.push_skipped_link(&path)?;
+            continue;
+        }
         let directory = entry.is_dir();
         let file_type = entry.unix_mode().unwrap_or(0) & 0o170_000;
-        if entry.encrypted()
-            || entry.is_symlink()
-            || ![0, 0o100_000, 0o040_000].contains(&file_type)
-            || (file_type == 0o040_000 && !directory)
+        if ![0, 0o100_000, 0o040_000].contains(&file_type) || (file_type == 0o040_000 && !directory)
         {
             return Err(ArchiveError::UnsupportedEntry);
         }
@@ -336,7 +363,7 @@ fn read_zip(
         let size = entry.size();
         output.push(&path, directory, size, &mut entry)?;
     }
-    Ok(output.files)
+    Ok(output.into_files_and_skipped_links())
 }
 
 // zip 8.6 allocates its central-directory Vec before exposing `len()`. Its fixed-size
@@ -425,6 +452,7 @@ struct ArchiveOutput<'a> {
     remaining: usize,
     seen: BTreeMap<String, bool>,
     files: BTreeMap<ProjectPath, Vec<u8>>,
+    skipped_links: Vec<ProjectPath>,
 }
 
 impl<'a> ArchiveOutput<'a> {
@@ -435,16 +463,14 @@ impl<'a> ArchiveOutput<'a> {
             remaining,
             seen: BTreeMap::new(),
             files: BTreeMap::new(),
+            skipped_links: Vec::new(),
         }
     }
 
-    fn push(
-        &mut self,
-        path: &str,
-        directory: bool,
-        size: u64,
-        reader: &mut impl Read,
-    ) -> Result<(), ArchiveError> {
+    /// Normalizes an archive path, registers it against paths already seen, and returns the
+    /// path relative to the caller's exact archive root. Shared by regular members and
+    /// skipped links, so both draw duplicate-path and root-mismatch refusals from one place.
+    fn accept_path(&mut self, path: &str, directory: bool) -> Result<String, ArchiveError> {
         if path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| part == "..")
         {
             return Err(ArchiveError::UnsafePath);
@@ -479,16 +505,28 @@ impl<'a> ArchiveOutput<'a> {
         }
         let relative = if let Some(root) = self.root {
             if full.as_str() == root && directory {
-                ""
+                String::new()
             } else {
                 full.as_str()
                     .strip_prefix(root)
                     .and_then(|path| path.strip_prefix('/'))
                     .ok_or(ArchiveError::RootMismatch)?
+                    .to_owned()
             }
         } else {
-            full.as_str()
+            full.as_str().to_owned()
         };
+        Ok(relative)
+    }
+
+    fn push(
+        &mut self,
+        path: &str,
+        directory: bool,
+        size: u64,
+        reader: &mut impl Read,
+    ) -> Result<(), ArchiveError> {
+        let relative = self.accept_path(path, directory)?;
         let size = usize::try_from(size).map_err(|_| ArchiveError::MemberLimit)?;
         if size > self.limits.member_bytes {
             return Err(ArchiveError::MemberLimit);
@@ -517,6 +555,22 @@ impl<'a> ArchiveOutput<'a> {
         self.remaining -= size;
         self.files.insert(path, content);
         Ok(())
+    }
+
+    /// Registers a symbolic or hard link entry's path without reading its target or content.
+    /// The link never becomes a file and its target is never opened.
+    fn push_skipped_link(&mut self, path: &str) -> Result<(), ArchiveError> {
+        let relative = self.accept_path(path, false)?;
+        if relative.is_empty() {
+            return Err(ArchiveError::UnsafePath);
+        }
+        let path = ProjectPath::new(relative).map_err(|_| ArchiveError::UnsafePath)?;
+        self.skipped_links.push(path);
+        Ok(())
+    }
+
+    fn into_files_and_skipped_links(self) -> ArchiveContents {
+        (self.files, self.skipped_links)
     }
 }
 
