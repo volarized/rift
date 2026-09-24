@@ -47,6 +47,21 @@ nix = { version = "0.31.3", features = ["signal"] }
 notify = "=8.2.0"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
+# The otlp feature's export stack. tracing-opentelemetry pins the opentelemetry minor it
+# builds against (0.34.0 requires opentelemetry ^0.33.0), and opentelemetry_sdk /
+# opentelemetry-otlp move in lockstep with opentelemetry itself, so every member is
+# pinned exactly rather than left to drift independently.
+opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
+    "http-proto",
+    "reqwest-client",
+    "trace",
+] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = [
+    "experimental_trace_batch_span_processor_with_async_runtime",
+    "rt-tokio",
+    "trace",
+] }
 percent-encoding = "2.3.1"
 rayon = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
@@ -75,6 +90,7 @@ toml = { version = "1.1.4", default-features = false, features = ["parse", "serd
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["rt"] }
 tracing = "0.1.44"
+tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "=2.5.8"
 tree-sitter-rst = "=0.2.0"

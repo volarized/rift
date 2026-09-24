@@ -6,6 +6,7 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod install;
+mod otlp;
 mod progress;
 mod server;
 mod steer;
@@ -99,7 +100,8 @@ async fn main() -> ExitCode {
     let serves = cli.records_logs();
     let logs = serves.then(|| rift_mcp::logs_configuration(Path::new(".")));
     let stderr = stderr_policy(serves, std::io::stderr().is_terminal());
-    let drain = initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
+    let (drain, otlp_export) =
+        initialize_tracing(logs.as_ref().map(|logs| logs.capture.as_str()), stderr);
     let retention_records = logs.map_or(0, |logs| logs.retention_records);
     let succeeded = match run(cli, drain, retention_records).await {
         Ok(Some(outcome)) => {
@@ -112,6 +114,9 @@ async fn main() -> ExitCode {
             false
         }
     };
+    // Flushes buffered spans before either exit path: the normal return below drops
+    // every other local first, and `process::exit` past it runs no destructor at all.
+    otlp_export.shutdown();
     if serves {
         // A foreground server's index build, a lane's pass, or a lexical transaction can
         // still be running when serving ends. Returning would drop the runtime, and that
@@ -163,7 +168,14 @@ fn stderr_policy(serves: bool, terminal: bool) -> StderrPolicy {
 ///
 /// The returned drain exists only for a foreground server. Other commands install no
 /// recording layer and allocate no log queue.
-fn initialize_tracing(capture: Option<&str>, stderr: StderrPolicy) -> Option<rift_mcp::LogDrain> {
+///
+/// The returned [`otlp::Export`] is a no-op handle unless the `otlp` feature is compiled
+/// in and `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; the caller shuts it down
+/// before the process exits either way.
+fn initialize_tracing(
+    capture: Option<&str>,
+    stderr: StderrPolicy,
+) -> (Option<rift_mcp::LogDrain>, otlp::Export) {
     let (sink, drain) = match capture {
         Some(capture) => {
             let (sink, drain) = rift_mcp::log_capture();
@@ -177,6 +189,7 @@ fn initialize_tracing(capture: Option<&str>, stderr: StderrPolicy) -> Option<rif
         StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
         StderrPolicy::Bounded => BoxMakeWriter::new(rift_mcp::BoundedStderr::default()),
     };
+    let (otlp_layer, otlp_export) = otlp::layer();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -188,8 +201,9 @@ fn initialize_tracing(capture: Option<&str>, stderr: StderrPolicy) -> Option<rif
                 ),
         )
         .with(sink)
+        .with(otlp_layer)
         .init();
-    drain
+    (drain, otlp_export)
 }
 
 #[derive(Debug)]
