@@ -392,36 +392,76 @@ impl DocumentationCollection {
                 &self.index.sources,
                 previous.map(|p| p.index.sources.as_slice()),
             ),
-            blocks: changes(&blocks, &prior_blocks),
+            blocks: keyed_changes(&blocks, &prior_blocks),
             links: link_changes(
                 &self.index.links,
                 previous.map(|p| p.index.links.as_slice()),
             ),
-            references: changes(&references, &prior_references),
+            references: keyed_changes(&references, &prior_references),
         }
     }
 }
 
-/// Added, replaced, and removed identities for one metadata record family.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct DocumentationRecordChanges {
-    /// Records absent from the prior collection.
-    pub added: Vec<DocumentationDigest>,
-    /// Stable identities whose content or metadata changed.
-    pub replaced: Vec<DocumentationDigest>,
-    /// Prior records absent from the current collection.
-    pub removed: Vec<DocumentationDigest>,
+/// Keys added, replaced, or removed between a current keyed set and a prior one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KeyedChanges<K> {
+    /// Keys only the current set holds.
+    pub added: Vec<K>,
+    /// Keys both sets hold under unequal values.
+    pub replaced: Vec<K>,
+    /// Keys only the prior set holds.
+    pub removed: Vec<K>,
 }
 
+impl<K> Default for KeyedChanges<K> {
+    fn default() -> Self {
+        Self {
+            added: Vec::new(),
+            replaced: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+}
+
+impl<K> KeyedChanges<K> {
+    /// Whether the two sets held the same keys under equal values.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.replaced.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Added, replaced, and removed identities for one metadata record family.
+pub type DocumentationRecordChanges = KeyedChanges<DocumentationDigest>;
+
 /// Source identities added, replaced, or removed by one collection.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct DocumentationSourceChanges {
-    /// Source identities absent from the prior collection.
-    pub added: Vec<DocumentationContentIdentity>,
-    /// Stable source identities whose accepted metadata changed.
-    pub replaced: Vec<DocumentationContentIdentity>,
-    /// Prior source identities absent from the current collection.
-    pub removed: Vec<DocumentationContentIdentity>,
+pub type DocumentationSourceChanges = KeyedChanges<DocumentationContentIdentity>;
+
+/// Compares a current keyed set with a prior one, in key order.
+///
+/// A key only the current set holds is added, one both hold under unequal values is
+/// replaced, and one only the prior set holds is removed. Work is one lookup per key of
+/// either set. Every documentation record family, and a store comparing what it recorded
+/// with what it is about to write, answers through this one comparison.
+#[must_use]
+pub fn keyed_changes<K: Ord + Clone, T: PartialEq>(
+    current: &BTreeMap<&K, &T>,
+    previous: &BTreeMap<&K, &T>,
+) -> KeyedChanges<K> {
+    let mut changes = KeyedChanges::default();
+    for (key, value) in current {
+        match previous.get(key) {
+            None => changes.added.push((*key).clone()),
+            Some(before) if before != value => changes.replaced.push((*key).clone()),
+            Some(_) => {}
+        }
+    }
+    changes.removed = previous
+        .keys()
+        .filter(|key| !current.contains_key(*key))
+        .map(|key| (*key).clone())
+        .collect();
+    changes
 }
 
 /// Authored links added, replaced, or removed by one collection.
@@ -470,20 +510,7 @@ fn source_changes(
         .flatten()
         .map(|source| (&source.identity, source))
         .collect();
-    let mut changes = DocumentationSourceChanges::default();
-    for (identity, source) in &current {
-        match previous.get(identity) {
-            None => changes.added.push((*identity).clone()),
-            Some(before) if before != source => changes.replaced.push((*identity).clone()),
-            Some(_) => {}
-        }
-    }
-    changes.removed = previous
-        .keys()
-        .filter(|identity| !current.contains_key(*identity))
-        .map(|identity| (*identity).clone())
-        .collect();
-    changes
+    keyed_changes(&current, &previous)
 }
 
 type LinkAddress = (DocumentationDigest, u64, u64);
@@ -524,26 +551,6 @@ fn link_changes(
 
 fn link_address(link: &DocumentationLink) -> LinkAddress {
     (link.block.clone(), link.range.start, link.range.end)
-}
-
-fn changes<T: PartialEq>(
-    current: &BTreeMap<&DocumentationDigest, &T>,
-    previous: &BTreeMap<&DocumentationDigest, &T>,
-) -> DocumentationRecordChanges {
-    let mut changes = DocumentationRecordChanges::default();
-    for (identity, value) in current {
-        match previous.get(identity) {
-            None => changes.added.push((*identity).clone()),
-            Some(before) if before != value => changes.replaced.push((*identity).clone()),
-            Some(_) => {}
-        }
-    }
-    changes.removed = previous
-        .keys()
-        .filter(|identity| !current.contains_key(*identity))
-        .map(|identity| (*identity).clone())
-        .collect();
-    changes
 }
 
 fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError> {

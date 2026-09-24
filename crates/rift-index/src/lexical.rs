@@ -202,6 +202,21 @@ CREATE TABLE lexical_index_state(
         derivation_revision TEXT NOT NULL
     )",
     ),
+    MigrationFile::new(
+        8,
+        "documentation_sources",
+        "DROP TABLE documentation_references
+-- #[toasty::breakpoint]
+DELETE FROM documentation_manifest
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_sources(identity TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, payload TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE TABLE documentation_references(identity TEXT PRIMARY KEY NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, block TEXT NOT NULL)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_target ON documentation_references(target)
+-- #[toasty::breakpoint]
+CREATE INDEX documentation_references_source ON documentation_references(source)",
+    ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 

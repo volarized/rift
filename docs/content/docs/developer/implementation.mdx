@@ -164,18 +164,21 @@ Documentation adapters record source warnings when selected input is malformed o
 A selection above 100,000 content owners, including notebook cells and omitted sources, is refused
 before publication.
 
-The workspace database stores the documentation manifest and reverse symbol references beside
-the lexical rows. Blocks retain byte ranges and digests; excerpts come from the captured source
-after pagination. The same transaction writes documentation metadata, lexical units, and their
-tree revision.
+The workspace database stores the documentation metadata beside the lexical rows, one row per
+source: the source's facts, blocks, links, references, and unresolved spellings, under the digest
+of those bytes. A manifest row carries what describes the whole collection, and each exact
+reference also gets a reverse row filed under its source. Blocks retain byte ranges and digests;
+excerpts come from the captured source after pagination. The transaction that stamps a lexical
+write's tree revision writes its documentation metadata.
 
 The collector keeps parser facts for each selected source in memory. Incremental rebuilds reuse
 facts when source metadata, chunk mappings, extractor revision, and accepted attached symbols match.
 Link and declaration changes invalidate affected blocks; unchanged notebook bytes reuse decoded
 cells. A restart rebuilds parser facts from source.
 
-SQLite keeps one validated documentation snapshot and changes only reverse-reference rows whose
-stored values differ. Those changes share the lexical writer's transaction.
+A write compares each source's digest with the one its row carries and rewrites only the sources
+that moved, removing a source's row and its reverse references together, so an edit to one
+documented file writes that file's row rather than the whole collection.
 
 The store records, beside each file's rows, the digest of the bytes they were derived from, and
 its stamp names what else derived them: the executable, the corpus shape, and the index-owned

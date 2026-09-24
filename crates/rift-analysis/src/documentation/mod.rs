@@ -31,7 +31,7 @@ pub use projection::{
 pub use publication::{
     DocumentationChanges, DocumentationCollection, DocumentationLinkChanges,
     DocumentationLinkReplacement, DocumentationRecordChanges, DocumentationSourceChanges,
-    validate_documentation_context, validate_documentation_hit,
+    KeyedChanges, keyed_changes, validate_documentation_context, validate_documentation_hit,
 };
 pub use references::{
     DocumentationDeclaration, ResolvedDocumentationReferences, resolve_references,
