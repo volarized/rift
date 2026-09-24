@@ -6,7 +6,10 @@ title: Testing
 
 Unit tests, live language-engine and embedding-model suites, and the corpus, artifact, agent, and
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
-pinned Next.js, Bun, and FastAPI repositories. The `gate` job waits for every other `ci.yml` job
+pinned Next.js, Bun, and FastAPI repositories. The native checks build the binary on each of the
+six release targets and prove process exit, server election, and the Windows update publisher on
+it, because a Unix runner cannot exercise a Windows Job object or a replace-while-running
+publication. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
 
 ## Unit tests

@@ -45,9 +45,9 @@ RUST_CACHE = "Swatinem/rust-cache@"
 CODECOV_ACTION = "codecov/codecov-action@"
 
 # The workflow whose coverage uploads a pull request's Codecov status is computed
-# from. `integration` runs on main alone and adds to a commit Codecov already
-# reported on.
+# from, and whose `gate` job is the one check the `main` ruleset requires.
 COVERAGE_WORKFLOW = "ci.yml"
+GATE_JOB = "gate"
 
 # The nextest group that serializes the suites taking one machine-global
 # resource, and the resource itself: the loopback range an elected server binds.
@@ -459,6 +459,20 @@ def jobs_with_step_limits() -> list[tuple[str, str, int, list[int]]]:
             if steps:
                 bounded.append((name, job_name, job_limit, steps))
     return bounded
+
+
+class RequiredGate(unittest.TestCase):
+    """The ruleset requires `gate` alone, so `gate` has to wait on every job."""
+
+    def test_the_gate_needs_every_other_job(self) -> None:
+        jobs = workflow_documents()[COVERAGE_WORKFLOW]["jobs"]
+        needed = set(jobs[GATE_JOB]["needs"])
+        others = set(jobs) - {GATE_JOB}
+        self.assertEqual(
+            needed,
+            others,
+            "a job outside the gate's needs merges red without the ruleset seeing it",
+        )
 
 
 class JobBudgets(unittest.TestCase):
