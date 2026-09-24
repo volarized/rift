@@ -2231,6 +2231,20 @@ pub(crate) mod tests {
         Ok((directory, service))
     }
 
+    /// The content digests are the ones the build took from each file's bytes, so a
+    /// comparison against the lexical store's recorded digests reads no file again.
+    #[test]
+    fn content_digests_answer_the_digest_of_each_indexed_files_bytes() -> TestResult {
+        let (directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let bytes = fs::read(directory.path().join("src/lib.rs"))?;
+        assert_eq!(
+            service.content_digests().get(&path),
+            Some(rift_index::FileDigest::of(&bytes))
+        );
+        Ok(())
+    }
+
     /// `ReadService::relationships` is a pass-through onto the underlying index's own
     /// store: an independently built [`WorkspaceIndex`] over the identical source must
     /// report the same adjacency the service serves.
