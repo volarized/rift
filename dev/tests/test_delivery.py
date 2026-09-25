@@ -47,6 +47,7 @@ CODECOV_ACTION = "codecov/codecov-action@"
 # The workflow whose coverage uploads a pull request's Codecov status is computed
 # from, and whose `gate` job is the one check the `main` ruleset requires.
 COVERAGE_WORKFLOW = "ci.yml"
+RELEASE_WORKFLOW = "rift-release.yml"
 GATE_JOB = "gate"
 
 # The nextest group that serializes the suites taking one machine-global
@@ -713,10 +714,11 @@ class BuildCacheKey(unittest.TestCase):
     def test_every_compiling_job_starts_the_build_cache_first(self) -> None:
         """A job restoring the Cargo registry with `Swatinem/rust-cache` is one
         that compiles, and none of its steps before the build cache runs Cargo."""
-        jobs = workflow_documents()[COVERAGE_WORKFLOW]["jobs"]
+        documents = workflow_documents()
         compiling = {
-            name: job["steps"]
-            for name, job in jobs.items()
+            f"{workflow}:{name}": job["steps"]
+            for workflow in (COVERAGE_WORKFLOW, RELEASE_WORKFLOW)
+            for name, job in documents[workflow]["jobs"].items()
             if any(step.get("uses", "").startswith(RUST_CACHE) for step in job["steps"])
         }
         self.assertTrue(compiling, "no ci job restores the Cargo registry")
