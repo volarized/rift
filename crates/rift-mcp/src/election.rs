@@ -207,6 +207,13 @@ impl ElectionGuard {
 
     /// Writes `bytes` to a fresh temp file in `.rift` and renames it over
     /// the document path.
+    ///
+    /// The rename is `std::fs::rename`, not `NamedTempFile::persist`: on
+    /// Windows `persist` calls `MoveFileExW` alone, which refuses with
+    /// `Access is denied` to replace a document a concurrent [`probe`] holds
+    /// open, while `std::fs::rename` retries that refusal as a POSIX-semantics
+    /// rename, which replaces it. A staged file the rename leaves behind is
+    /// removed best effort.
     fn stage_and_rename(&self, bytes: &[u8]) -> Result<(), ElectionError> {
         let stage_failed = |error: io::Error| {
             ElectionFault::storage("stage lock document", &self.state_directory, error)
@@ -216,8 +223,13 @@ impl ElectionGuard {
         restrict_to_owner(staged.as_file()).map_err(stage_failed)?;
         staged.as_file().write_all(bytes).map_err(stage_failed)?;
         staged.as_file().sync_all().map_err(stage_failed)?;
-        staged.persist(&self.document_path).map_err(|error| {
-            ElectionFault::storage("publish lock document", &self.document_path, error.error)
+        let staged = staged
+            .into_temp_path()
+            .keep()
+            .map_err(|error| stage_failed(error.error))?;
+        std::fs::rename(&staged, &self.document_path).map_err(|error| {
+            let _ = std::fs::remove_file(&staged);
+            ElectionFault::storage("publish lock document", &self.document_path, error)
         })?;
         Ok(())
     }

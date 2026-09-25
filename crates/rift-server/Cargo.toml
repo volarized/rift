@@ -37,6 +37,7 @@ toml.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 ty_project.workspace = true
 ty_ide.workspace = true

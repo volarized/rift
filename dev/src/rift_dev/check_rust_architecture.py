@@ -6,8 +6,9 @@ import difflib
 import json
 import pathlib
 import re
-import subprocess
 from typing import Any
+
+from rift_dev.commands import CargoCommand
 
 # Cargo runs a test function only from a target it compiles, so a file holding one
 # of these attributes is a suite rather than a helper another suite includes.
@@ -83,15 +84,9 @@ EXPECTED_EDGES = {
 
 def cargo_metadata() -> dict[str, Any]:
     """Load workspace package metadata from Cargo."""
-    process = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-        capture_output=True,
-        check=False,
-        text=True,
+    return json.loads(
+        CargoCommand("metadata", "--no-deps", "--format-version", "1").output()
     )
-    if process.returncode != 0:
-        raise RuntimeError(process.stderr.strip() or "cargo metadata failed")
-    return json.loads(process.stdout)
 
 
 def rift_packages(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -193,29 +188,21 @@ STORAGE_CRATES = frozenset(
 
 def resolved_closure(name: str) -> set[str]:
     """Return every crate the resolved dependency graph reaches from `name`."""
-    process = subprocess.run(
-        [
-            "cargo",
-            "tree",
-            "--package",
-            name,
-            "--edges",
-            "normal",
-            "--prefix",
-            "none",
-            "--no-dedupe",
-            "--format",
-            "{p}",
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-    if process.returncode != 0:
-        raise RuntimeError(process.stderr.strip() or "cargo tree failed")
+    tree = CargoCommand(
+        "tree",
+        "--package",
+        name,
+        "--edges",
+        "normal",
+        "--prefix",
+        "none",
+        "--no-dedupe",
+        "--format",
+        "{p}",
+    ).output()
     return {
         line.split()[0]
-        for line in process.stdout.splitlines()
+        for line in tree.splitlines()
         if line.strip() and not line.startswith("[")
     }
 

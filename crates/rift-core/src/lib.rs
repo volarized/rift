@@ -25,6 +25,7 @@ pub use tracing;
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
+    is_absolute_program,
 };
 pub use digest::FileDigest;
 pub use error::{

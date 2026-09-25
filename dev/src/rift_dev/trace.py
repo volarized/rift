@@ -1,25 +1,38 @@
-"""Summarize spans a local OTLP collector holds, one JSON line per operation.
+"""Collect Rift's exported spans in memory and summarize them per operation.
 
-Jaeger v2 serves its documented HTTP query gateway at `/api/v3/*`
-(https://github.com/jaegertracing/jaeger-idl/blob/main/proto/api_v3/query_service.proto);
-the pre-v2 `/api/traces` JSON API answers 404 on a v2 collector. `/api/v3/traces` streams
-one or more JSON documents, each shaped `{"result": {"resourceSpans": [...]}}` in OTLP's
-own JSON encoding - `traceId`/`spanId` as hex strings, `startTimeUnixNano` and
-`endTimeUnixNano` as decimal nanosecond strings - so parsing walks that nested shape
-rather than a Jaeger-specific one. `rift`'s own `traced!`/`traced_async!` macros name a
-span after its `operation`, so grouping by a span's `name` field groups by operation.
+`rift` built with `--features otlp` exports its `traced!`/`traced_async!` spans over
+OTLP/HTTP, protobuf-encoded (`opentelemetry-otlp`'s `http-proto` feature), once
+`OTEL_EXPORTER_OTLP_ENDPOINT` names a receiver. The collector here is that
+receiver: it accepts `POST /v1/traces`, keeps each span's name and duration in
+memory, and prints one JSON line per operation when it stops. Rift's macros name a
+span after its operation, so grouping by span name groups by operation.
+
+The receiver is a Starlette application that uvicorn serves on one asyncio event
+loop, so requests are handled one await at a time and the store needs no lock.
 """
 
 from __future__ import annotations
 
+import gzip
 import json
-import urllib.error
-import urllib.parse
-import urllib.request
+import signal
+import sys
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 
-REQUEST_TIMEOUT_SECONDS = 10.0
+import uvicorn
+from google.protobuf.message import DecodeError
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+    ExportTraceServiceRequest,
+    ExportTraceServiceResponse,
+)
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
+
+TRACES_PATH = "/v1/traces"
+PROTOBUF = "application/x-protobuf"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,44 +60,13 @@ class OperationTiming:
         )
 
 
-def decode_documents(body: str) -> list[dict]:
-    """Parses one or more concatenated top-level JSON documents from a streamed body.
-
-    The gRPC-gateway streaming endpoints write consecutive JSON values with no
-    separator between them; a small result fits in one, so plain `json.loads` covers
-    that case, and this handles a body carrying more than one without requiring one.
-    """
-    decoder = json.JSONDecoder()
-    documents = []
-    text = body.strip()
-    index = 0
-    while index < len(text):
-        document, end = decoder.raw_decode(text, index)
-        documents.append(document)
-        index = end
-        while index < len(text) and text[index].isspace():
-            index += 1
-    return documents
-
-
-def span_durations_by_operation(documents: list[dict]) -> dict[str, list[float]]:
-    """Every span's duration in milliseconds, keyed by its `name`.
-
-    `documents` is [`decode_documents`]'s output: each entry carries
-    `result.resourceSpans[].scopeSpans[].spans[]`, OTLP's nested span layout.
-    """
-    durations: dict[str, list[float]] = {}
-    for document in documents:
-        for resource_spans in document.get("result", {}).get("resourceSpans", []):
-            for scope_spans in resource_spans.get("scopeSpans", []):
-                for span in scope_spans.get("spans", []):
-                    name = span.get("name")
-                    if name is None:
-                        continue
-                    start = int(span["startTimeUnixNano"])
-                    end = int(span["endTimeUnixNano"])
-                    durations.setdefault(name, []).append((end - start) / 1_000_000)
-    return durations
+def span_durations(request: ExportTraceServiceRequest) -> Iterator[tuple[str, float]]:
+    """Every span in one export request, as its name and duration in milliseconds."""
+    for resource_spans in request.resource_spans:
+        for scope_spans in resource_spans.scope_spans:
+            for span in scope_spans.spans:
+                nanoseconds = span.end_time_unix_nano - span.start_time_unix_nano
+                yield span.name, nanoseconds / 1_000_000
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -96,9 +78,8 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
-def summarize(documents: list[dict]) -> list[OperationTiming]:
+def summarize(durations: Mapping[str, list[float]]) -> list[OperationTiming]:
     """One [`OperationTiming`] per operation name, highest total duration first."""
-    by_operation = span_durations_by_operation(documents)
     summaries = [
         OperationTiming(
             operation=name,
@@ -108,43 +89,82 @@ def summarize(documents: list[dict]) -> list[OperationTiming]:
             p95_ms=percentile(values, 0.95),
             max_ms=max(values),
         )
-        for name, values in by_operation.items()
+        for name, values in durations.items()
     ]
     summaries.sort(key=lambda summary: summary.total_ms, reverse=True)
     return summaries
 
 
-def fetch_traces(
-    base_url: str, service: str, since: timedelta, search_depth: int
-) -> list[dict]:
-    """Every `/api/v3/traces` document the collector holds for `service` since `since` ago.
+class SpanStore:
+    """The durations of every span received, by operation."""
 
-    A collector holding no matching trace answers HTTP 404 with an error body, not an
-    empty result - observed directly against a Jaeger v2 collector - so that status
-    means zero traces here, not a request failure.
+    def __init__(self) -> None:
+        self.durations: dict[str, list[float]] = {}
+
+    def record(self, body: bytes) -> None:
+        """Decodes one export request and keeps its spans' durations."""
+        request = ExportTraceServiceRequest.FromString(body)
+        for name, duration in span_durations(request):
+            self.durations.setdefault(name, []).append(duration)
+
+    def summary(self) -> list[OperationTiming]:
+        """The per-operation summary of every span received so far."""
+        return summarize(self.durations)
+
+
+def receiver(store: SpanStore) -> Starlette:
+    """The application that feeds OTLP/HTTP export requests into `store`.
+
+    Starlette answers any other path with 404 and any other method with 405.
     """
-    now = datetime.now(UTC)
-    query = urllib.parse.urlencode(
-        {
-            "query.service_name": service,
-            "query.start_time_min": (now - since).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "query.start_time_max": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "query.search_depth": search_depth,
-        }
+
+    async def export(request: Request) -> Response:
+        if request.headers.get("content-type", "").split(";")[0] != PROTOBUF:
+            return PlainTextResponse(f"the collector reads {PROTOBUF}", 415)
+        body = await request.body()
+        if request.headers.get("content-encoding") == "gzip":
+            body = gzip.decompress(body)
+        try:
+            store.record(body)
+        except DecodeError:
+            return PlainTextResponse(
+                "the body is not an ExportTraceServiceRequest", 400
+            )
+        return Response(
+            ExportTraceServiceResponse().SerializeToString(), media_type=PROTOBUF
+        )
+
+    return Starlette(routes=[Route(TRACES_PATH, export, methods=["POST"])])
+
+
+def interrupt(*_: object) -> None:
+    """Ends the collector on SIGTERM the way Ctrl-C does, so the summary prints."""
+    raise KeyboardInterrupt
+
+
+def collect(host: str, port: int) -> None:
+    """Serves until interrupted, then prints one JSON line per operation.
+
+    uvicorn stops on Ctrl-C or SIGTERM and then raises the signal again under
+    the handler it found. SIGTERM's handler here turns that into the same
+    `KeyboardInterrupt` Ctrl-C raises, so either ends at the summary.
+    """
+    store = SpanStore()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            receiver(store), host=host, port=port, lifespan="off", log_level="warning"
+        )
     )
-    url = f"{base_url.rstrip('/')}/api/v3/traces?{query}"
+    signal.signal(signal.SIGTERM, interrupt)
+    print(
+        f"collecting OTLP/HTTP spans at http://{host}:{port}{TRACES_PATH}; "
+        "Ctrl-C prints the summary",
+        file=sys.stderr,
+        flush=True,
+    )
     try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return []
-        raise
-    return decode_documents(body)
-
-
-def main(base_url: str, service: str, since: timedelta, search_depth: int) -> None:
-    """Fetches, summarizes, and prints one JSON line per operation to stdout."""
-    documents = fetch_traces(base_url, service, since, search_depth)
-    for summary in summarize(documents):
-        print(summary.as_json_line())
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    for timing in store.summary():
+        print(timing.as_json_line())

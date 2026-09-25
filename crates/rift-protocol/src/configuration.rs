@@ -2607,7 +2607,13 @@ fn is_environment_key(key: &str) -> bool {
 
 /// Whether `program` is an absolute path on any platform the workspace can
 /// run on: a `/` root, a backslash, or a drive prefix.
-fn is_absolute_program(program: &str) -> bool {
+///
+/// Acceptance refuses such a program in `rift.toml`, and an engine launch
+/// refuses it again through this same classifier, so both answer alike on
+/// every platform: `Path::is_absolute` calls `/usr/bin/engine` relative on
+/// Windows and `C:\engine.exe` relative on Unix.
+#[must_use]
+pub fn is_absolute_program(program: &str) -> bool {
     match program.as_bytes() {
         [b'/' | b'\\', ..] => true,
         [drive, b':', ..] if drive.is_ascii_alphabetic() => true,

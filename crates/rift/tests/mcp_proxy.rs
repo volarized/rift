@@ -202,9 +202,12 @@ async fn concurrent_proxies_share_one_elected_server() -> TestResult {
     Ok(())
 }
 
+/// The fixture keeps the default serving range: a second server is elected in the
+/// same workspace, and the range lets it bind whether or not the first server's
+/// port is free yet.
 #[tokio::test]
 async fn proxy_session_reconnects_after_a_server_restart() -> TestResult {
-    let directory = workspace()?;
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 

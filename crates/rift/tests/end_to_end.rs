@@ -15,8 +15,8 @@ mod harness;
 mod rust_engine;
 
 use harness::{
-    StopOnDrop, TestResult, laid_out_workspace, proxied_call, proxy_client, require_success,
-    run_rift,
+    StopOnDrop, TestResult, assigned_port_key, laid_out_workspace, proxied_call, proxy_client,
+    require_success, run_rift,
 };
 use serde_json::json;
 
@@ -48,7 +48,7 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
             ),
             ("justfile", "build:\n\tcargo fmt --all --check\n"),
         ],
-        "",
+        &assigned_port_key()?,
     )?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);

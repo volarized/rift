@@ -102,7 +102,9 @@ fn run_without_arguments_writes_default_output_directory() -> TestResult {
     )?;
     assert_eq!(manifest, skill::plugin_manifest());
 
-    let stdout = String::from_utf8(output.stdout)?;
+    // The exporter prints each written path in the platform's spelling, which on Windows
+    // joins the default directory and the file's own path with a backslash.
+    let stdout = String::from_utf8(output.stdout)?.replace(std::path::MAIN_SEPARATOR, "/");
     assert!(stdout.starts_with("wrote "));
     assert!(stdout.contains("docs/public/mcp.json"));
     assert!(stdout.contains("docs/public/rift.schema.json"));

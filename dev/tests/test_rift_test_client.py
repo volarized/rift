@@ -8,14 +8,15 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 from unittest.mock import AsyncMock
 
 import psutil
 import pytest
 from jsonschema import ValidationError
 from mcp import ClientSession, types
-from rift_dev.rift_test_client import Client, Server, outside_workspace, run_command
+from rift_dev.commands import Command, Process
+from rift_dev.rift_test_client import Client, Server, outside_workspace
 
 SCHEMA = {
     "type": "object",
@@ -112,12 +113,12 @@ def test_commands_preserve_coverage_environment_and_overlays(
     monkeypatch.setenv("LLVM_PROFILE_FILE", "/tmp/rift-%p-%m.profraw")
     monkeypatch.setenv("RIFT_TEST_VALUE", "inherited")
     code = "import json,os; print(json.dumps([os.environ['LLVM_PROFILE_FILE'],os.environ['RIFT_TEST_VALUE']]))"
-    assert json.loads(run_command([sys.executable, "-c", code])) == [
+    assert json.loads(Command(sys.executable, "-c", code).output()) == [
         "/tmp/rift-%p-%m.profraw",
         "inherited",
     ]
     assert json.loads(
-        run_command([sys.executable, "-c", code], env={"RIFT_TEST_VALUE": "overlay"})
+        Command(sys.executable, "-c", code).with_env(RIFT_TEST_VALUE="overlay").output()
     ) == [
         "/tmp/rift-%p-%m.profraw",
         "overlay",
@@ -259,7 +260,7 @@ while not pathlib.Path('stop.release').exists():
         wait = server.process.wait
         budgets: list[float] = []
 
-        def release_and_wait(timeout: float | None = None) -> int:
+        def release_and_wait(timeout: float) -> int:
             if server.process.poll() is None:
                 assert (root / "stop.request").exists()
                 assert timeout is not None
@@ -298,7 +299,6 @@ def test_junit_records_success_and_failure(tmp_path: Path, fails: bool) -> None:
 
 
 def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
-    import subprocess
     import tempfile
     from unittest.mock import Mock
 
@@ -307,7 +307,7 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     server = Server(tmp_path / "rift", root, tmp_path / "server.log")
-    process = Mock(spec=subprocess.Popen)
+    process = Mock(spec=Process)
     with tempfile.TemporaryFile() as source:
         source.write(b"x" * (LOG_BYTES_MAX + 1))
         source.seek(0)
@@ -356,7 +356,6 @@ def test_junit_keeps_terminal_output_valid_xml(tmp_path: Path) -> None:
 def test_connection_accepts_only_a_verified_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_stop: bool
 ) -> None:
-    import subprocess
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
     from unittest.mock import Mock
@@ -366,7 +365,7 @@ def test_connection_accepts_only_a_verified_stop(
     root = tmp_path / "workspace"
     root.mkdir()
     server = Server(tmp_path / "rift", root, tmp_path / "server.log")
-    process = Mock(spec=subprocess.Popen)
+    process = Mock(spec=Process)
     process.poll.return_value = None
     process.returncode = 0
     server.process = process
@@ -381,7 +380,7 @@ def test_connection_accepts_only_a_verified_stop(
     monkeypatch.setattr(rift_test_client, "stdio_client", transport)
     monkeypatch.setattr(rift_test_client, "ClientSession", lambda *args: session)
     monkeypatch.setattr(Client, "initialize", AsyncMock())
-    monkeypatch.setattr(rift_test_client, "run_command", lambda *args, **kwargs: "")
+    monkeypatch.setattr(Command, "output", lambda command: "")
 
     async def operation() -> None:
         async with server.connect():
@@ -399,16 +398,14 @@ def test_connection_accepts_only_a_verified_stop(
 def test_concurrent_connections_preserve_separate_proxy_logs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import subprocess
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
-    from typing import TextIO
     from unittest.mock import Mock
 
     from rift_dev import rift_test_client
 
     server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
-    process = Mock(spec=subprocess.Popen)
+    process = Mock(spec=Process)
     process.poll.return_value = None
     process.returncode = None
     server.process = process
@@ -453,25 +450,23 @@ def test_explicit_proxy_log_cannot_enter_served_workspace(tmp_path: Path) -> Non
 
 
 def test_sdk_stderr_overflow_is_bounded(tmp_path: Path) -> None:
-    import subprocess
-
+    import anyio
     from rift_dev.rift_test_client import LOG_BYTES_MAX, stderr_log
 
     path = tmp_path / "mcp.log"
+    # The SDK's stdio transport starts its server through `anyio.open_process`
+    # with this log as stderr; `anyio.run_process` does the same.
+    program = f"import os; os.write(2, b'x' * {LOG_BYTES_MAX + 1})"
+
+    async def transport(log: TextIO) -> None:
+        with anyio.fail_after(5):
+            await anyio.run_process([sys.executable, "-c", program], stderr=log)
+
     with (
         pytest.raises(RuntimeError, match="SDK stderr collection failed"),
         stderr_log(path) as log,
     ):
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                f"import os; os.write(2, b'x' * {LOG_BYTES_MAX + 1})",
-            ],
-            stderr=log,
-            check=True,
-            timeout=5,
-        )
+        anyio.run(transport, log)
     assert path.stat().st_size == LOG_BYTES_MAX
 
 
@@ -544,14 +539,13 @@ def test_nested_gate_keeps_and_restores_the_earlier_deadline(
 
 
 def test_gate_deadline_limits_a_synchronous_command() -> None:
-    from rift_dev.rift_test_client import gate_deadline
+    from rift_dev.rift_test_client import current_deadline, gate_deadline
 
     async def operation() -> None:
         async with gate_deadline("artifact", 0.1):
-            run_command(
-                [sys.executable, "-c", "import time; time.sleep(30)"],
-                timeout_seconds=30,
-            )
+            Command(sys.executable, "-c", "import time; time.sleep(30)").with_timeout(
+                30
+            ).with_deadline(current_deadline()).output()
 
     with pytest.raises(RuntimeError, match="exceeded"):
         asyncio.run(operation())
@@ -561,7 +555,6 @@ def test_gate_deadline_limits_a_synchronous_command() -> None:
 def test_stop_deadline_includes_observation_and_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
-    import subprocess
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -572,10 +565,10 @@ def test_stop_deadline_includes_observation_and_validation(
         rift_test_client, "time", SimpleNamespace(monotonic=lambda: clock[0])
     )
     server = Server(tmp_path / "rift", tmp_path / "workspace", tmp_path / "server.log")
-    process = Mock(spec=subprocess.Popen)
+    process = Mock(spec=Process)
     process.returncode = 0
     server.process = process
-    monkeypatch.setattr(rift_test_client, "run_command", lambda *args, **kwargs: "")
+    monkeypatch.setattr(Command, "output", lambda command: "")
 
     def exceed_deadline() -> None:
         clock[0] += 6.0

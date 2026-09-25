@@ -13,7 +13,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +20,7 @@ from typing import Any
 
 import tomllib
 import yaml
+from rift_dev.commands import Command
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPOSITORY / ".github/workflows"
@@ -95,6 +95,12 @@ WAIT_SECONDS = {"millis": 0.001, "secs": 1.0, "mins": 60.0}
 # A nextest timeout is written as a count and a unit suffix.
 TIMEOUT_PERIOD = re.compile(r"^(\d+)(ms|s|m)$")
 TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
+
+# The command that starts sccache against the R2 build cache, the secrets only
+# its step may read, and a step that runs Cargo or a recipe that does.
+BUILD_CACHE_COMMAND = "rift-dev build-cache"
+BUILD_CACHE_SECRET = re.compile(r"secrets\.R2_BUILD_CACHE_[A-Z_]+")
+CARGO_COMMAND = re.compile(r"(?:^|\s)(?:cargo|just)\s")
 
 # The workflow that merges a dependency pull request without a human, the step
 # that decides whether a bump may take that path, and the output it decides it
@@ -180,15 +186,13 @@ def classified(updated: str) -> str:
     with tempfile.TemporaryDirectory() as directory:
         output = Path(directory) / "output"
         output.touch()
-        subprocess.run(
-            ["bash", "-e", "-c", script],
-            check=True,
-            env={
+        Command("bash", "-e", "-c", script).with_environment(
+            {
                 "PATH": os.environ["PATH"],
                 "UPDATED": updated,
                 "GITHUB_OUTPUT": str(output),
-            },
-        )
+            }
+        ).output()
         written = dict(
             line.split("=", 1)
             for line in output.read_text(encoding="utf-8").splitlines()
@@ -678,3 +682,55 @@ class HubSuitesOutliveTheWaitsTheyDeclare(unittest.TestCase):
                     f"{binary} can wait {declared}s and is ended at "
                     f"{suite_deadline(binary)}s, so its own failure never prints",
                 )
+
+
+class BuildCacheKey(unittest.TestCase):
+    """The R2 key reaches the step that starts sccache, and every job that
+    compiles starts it before its first compile.
+
+    The server that step starts holds the key for the rest of the job, so a
+    secret mapped anywhere else hands the key to a process that never needed
+    it, and a compile that runs before the server starts reaches no cache.
+    """
+
+    def test_only_the_build_cache_step_reads_the_r2_secrets(self) -> None:
+        offenders: list[str] = []
+        for name, document in workflow_documents().items():
+            if BUILD_CACHE_SECRET.search(yaml.safe_dump(document.get("env") or {})):
+                offenders.append(f"{name}: workflow env")
+            for job_name, job in (document.get("jobs") or {}).items():
+                if BUILD_CACHE_SECRET.search(yaml.safe_dump(job.get("env") or {})):
+                    offenders.append(f"{name}:{job_name}: job env")
+                for step in job.get("steps") or []:
+                    if BUILD_CACHE_SECRET.search(
+                        yaml.safe_dump(step)
+                    ) and BUILD_CACHE_COMMAND not in step.get("run", ""):
+                        offenders.append(f"{name}:{job_name}: {step.get('name')}")
+        self.assertEqual(
+            offenders, [], "an R2 secret reaches a step that does not start sccache"
+        )
+
+    def test_every_compiling_job_starts_the_build_cache_first(self) -> None:
+        """A job restoring the Cargo registry with `Swatinem/rust-cache` is one
+        that compiles, and none of its steps before the build cache runs Cargo."""
+        jobs = workflow_documents()[COVERAGE_WORKFLOW]["jobs"]
+        compiling = {
+            name: job["steps"]
+            for name, job in jobs.items()
+            if any(step.get("uses", "").startswith(RUST_CACHE) for step in job["steps"])
+        }
+        self.assertTrue(compiling, "no ci job restores the Cargo registry")
+        for name, steps in compiling.items():
+            with self.subTest(job=name):
+                starts = [
+                    index
+                    for index, step in enumerate(steps)
+                    if BUILD_CACHE_COMMAND in step.get("run", "")
+                ]
+                self.assertTrue(starts, f"{name} compiles without the build cache")
+                early = [
+                    step.get("name") or step["run"]
+                    for step in steps[: starts[0]]
+                    if CARGO_COMMAND.search(step.get("run", ""))
+                ]
+                self.assertEqual(early, [], f"{name} compiles before sccache starts")

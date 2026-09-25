@@ -6,13 +6,22 @@ title: Testing
 
 Unit tests, live language-engine and embedding-model suites, and the corpus, artifact, agent, and
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
-pinned Next.js, Bun, and FastAPI repositories. The native checks build every workspace target once
-on each release target other than x86-64 Linux, then prove process exit, server election, and the
-Windows update publisher from that same build, because a Unix runner cannot exercise a Windows
-Job object or a replace-while-running publication. x86-64 Linux runs those tests in the unit
-suite, and the corpus, artifact, agent, and cold-start checks there reuse one optimized build
+pinned Next.js, Bun, and FastAPI repositories. Each release target other than x86-64 Linux builds
+every workspace target once and runs the unit suite from that build, so every test runs on the OS
+it targets. On Windows the `ci` profile in `.config/nextest.toml` leaves out nine server and proxy
+tests: a detached server there inherits the output pipes of the `rift` process that started it, so a
+test that reads that process's output to its end waits for the server to exit
+([issue #388](https://github.com/volarized/rift/issues/388)). x86-64 Linux runs the unit
+suite from one instrumented archive, and the corpus checks there reuse one optimized archive
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
+
+CI compiles through [sccache](https://github.com/mozilla/sccache), which keeps compiled crates in
+the `rift-oss-build-cache` R2 bucket, so a job compiles only the crates whose inputs changed since
+a cached build. On Windows the native jobs link with `/Brepro`: without it, every proc-macro build
+carries a new timestamp, and each crate that uses the macro misses the cache.
+`rift-dev build-cache` starts it; a run without the bucket's secrets, such as a pull request from
+a fork, compiles everything.
 
 ## Unit tests
 
@@ -58,9 +67,10 @@ just integration-test
 unit suites do, so CI runs them on every pull request from the same archive `just fast-archive`
 writes: what they exercise is the engine integration, which any change can break. The corpus
 suites need the optimized build and run from their own archive: `just integration-archive` writes
-the CLI and an instrumented archive of the corpus suites alone. That archive is cached on the
-exact Rust inputs that produce it, so a pull request that leaves Rust source and configuration
-untouched reuses the build instead of compiling it again.
+an instrumented archive of the corpus suites alone, and `just integration-cli` the plain CLI the
+artifact checks serve. Each is cached on the exact Rust inputs that produce it, so a pull request
+that leaves Rust source and configuration untouched reuses the build instead of compiling it
+again.
 
 For one corpus repository, fetch its pinned source and run its suite:
 
@@ -167,7 +177,7 @@ macros in `rift-core`. Building with `--features otlp` adds an OTLP/HTTP export 
 those spans to a local collector once `OTEL_EXPORTER_OTLP_ENDPOINT` names one - the feature is
 off by default, so a plain build carries no OpenTelemetry stack.
 
-Start a local Jaeger collector, build with the feature, and point a run at it:
+Start the collector, build with the feature, and point a run at it from a second terminal:
 
 ```sh
 just trace-collector
@@ -175,19 +185,11 @@ cargo build --release -p rift --features otlp
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 target/release/rift server start --foreground
 ```
 
-`RIFT_OTLP_FILTER` overrides the export layer's own filter; unset, it keeps Rift's own crates at
-`info`. Summarize what the collector holds, one JSON line per operation:
-
-```sh
-uv run --project dev rift-dev trace-summary
-```
-
-Each line carries the operation's span count, total duration, p50, p95, and max, in
-milliseconds. Stop the collector once you're done:
-
-```sh
-just trace-collector-stop
-```
+`just trace-collector` runs `rift-dev trace-collector`, which receives the exported spans on
+port 4318 and keeps them in memory. `RIFT_OTLP_FILTER` overrides the export layer's own filter;
+unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once the run is done,
+and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
+milliseconds.
 
 ## Developer tooling
 
@@ -200,7 +202,8 @@ uv run --locked --project dev rift-dev corpus sync
 uv run --locked --project dev rift-dev agent --binary target/release/rift
 ```
 
-The justfile wraps the same commands for local work and CI. Package checks run with:
+The justfile wraps the same commands for local work and CI: a recipe that is more than a few
+plain commands is a `rift-dev` command, and the recipe calls it. Package checks run with:
 
 ```sh
 just testing-check

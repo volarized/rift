@@ -50,12 +50,17 @@ fn product_identity_for(executable: &Path) -> io::Result<ProductIdentity> {
     })
 }
 
+/// The SHA-256 of the executable's bytes, refusing anything but a bounded regular file.
+///
+/// The path's kind is read before the open: Windows refuses to open a directory at
+/// all without backup semantics, so the open would report `Access is denied`
+/// where the path is simply not a file.
 fn executable_digest(executable: &Path) -> io::Result<String> {
-    let file = fs::File::open(executable)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
+    if !fs::metadata(executable)?.is_file() {
         return Err(io::Error::other("current executable is not a regular file"));
     }
+    let file = fs::File::open(executable)?;
+    let metadata = file.metadata()?;
     if metadata.len() == 0 || metadata.len() > CURRENT_EXECUTABLE_BYTES_MAX {
         return Err(io::Error::other(format!(
             "current executable size {} is outside 1..={CURRENT_EXECUTABLE_BYTES_MAX} bytes",

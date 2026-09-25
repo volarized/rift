@@ -1,12 +1,12 @@
 //! Real-binary contract of `rift server start|stop|restart|status`.
 //!
 //! Every test drives the compiled `rift` binary against a throwaway
-//! workspace fixture. The servers share the loopback election port range,
-//! which the machine holds once, so the `election` nextest group admits one
-//! of these tests at a time and keeps "the old port is free again"
-//! assertions honest. Each fixture's `rift.toml` accepts a 60-second idle
-//! timeout as an orphan-safety net, and a drop guard stops any server a
-//! failed test leaves behind.
+//! workspace fixture, whose server binds a port the operating system assigned
+//! rather than the first free port of the default range concurrent suites
+//! share. The `election` nextest group admits one of these tests at a time.
+//! Each fixture's `rift.toml` accepts a 60-second idle timeout as an
+//! orphan-safety net, and a drop guard stops any server a failed test leaves
+//! behind.
 
 use std::error::Error;
 use std::fs;
@@ -78,16 +78,39 @@ fn stale_identity() -> ProductIdentity {
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 /// A workspace fixture: one Rust source and a `rift.toml` that turns the vector
-/// ranking off and whose `[server]` idle timeout reaps any orphaned server within a
-/// minute.
+/// ranking off, whose `[server]` idle timeout reaps any orphaned server within a
+/// minute, and whose server binds an [`assigned_port`].
 fn workspace() -> TestResult<tempfile::TempDir> {
+    workspace_with_server_keys(&format!("port = {}\n", assigned_port()?))
+}
+
+/// The same fixture on the default serving range: a second server elected in the
+/// workspace binds whether or not the first server's port is free yet.
+fn workspace_on_the_default_range() -> TestResult<tempfile::TempDir> {
+    workspace_with_server_keys("")
+}
+
+/// The fixture with `keys` added to its `[server]` table.
+fn workspace_with_server_keys(keys: &str) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n"),
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{keys}"),
     )?;
     Ok(directory)
+}
+
+/// A loopback port the operating system assigned a moment ago and released.
+///
+/// Nextest runs each test in its own process, in parallel, and a server on the
+/// default range binds its first free port, so servers from concurrent suites
+/// hand ports between them; a fixture pins a port of its own instead.
+fn assigned_port() -> TestResult<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 /// Fills the fixture with [`LARGE_FIXTURE_FILES`] Rust files under `src`, each declaring
@@ -799,7 +822,7 @@ fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
 
 #[test]
 fn restart_replaces_the_serving_process() -> TestResult {
-    let directory = workspace()?;
+    let directory = workspace_on_the_default_range()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
