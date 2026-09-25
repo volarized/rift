@@ -5,8 +5,10 @@ description: From repository discovery to precise edit targets.
 
 import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
 import { Card, Cards } from "fumadocs-ui/components/card";
+import { File, Files, Folder } from "fumadocs-ui/components/files";
 import { Tabs, Tab } from "fumadocs-ui/components/tabs";
 import { AgentWorkflow } from "@/components/agent-workflow";
+import { Badge } from "@/components/ui/badge";
 import { BookOpenIcon, FileTextIcon, GearIcon } from "@phosphor-icons/react/ssr";
 
 The main interface for agents to work with rift is the Model Context Protocol, aka
@@ -37,8 +39,48 @@ local index as the agent changes project files, ready for the next read.
 
 <AgentWorkflow />
 
-The examples below use a sample project containing `src/config.rs`. If you need complete tool
-responses, limits, or failure behavior, see the [MCP reference](/docs/developer/protocol/mcp).
+Let's assume we're working with the following example project:
+
+<div className="not-prose @container my-6" aria-label="Example project">
+<div className="grid overflow-hidden border bg-fd-card @min-[40rem]:grid-cols-[11rem_minmax(0,1fr)]">
+<div className="min-w-0 border-b @min-[40rem]:border-r @min-[40rem]:border-b-0">
+<div className="flex h-10 items-center justify-between border-b px-3 text-sm">
+  <span>Files</span>
+  <Badge variant="outline" className="text-muted-foreground">Rust</Badge>
+</div>
+<Files className="rounded-none border-0 bg-transparent p-2 font-mono">
+  <File name="Cargo.toml" />
+  <File name="README.md" />
+  <File name="rift.toml" />
+  <Folder name="src" defaultOpen>
+    <File name="config.rs" className="rounded-none bg-fd-accent text-fd-accent-foreground" />
+    <File name="error.rs" />
+    <File name="main.rs" />
+  </Folder>
+</Files>
+</div>
+<div className="min-w-0 [&>figure]:m-0 [&>figure]:rounded-none [&>figure]:border-0 [&>figure]:shadow-none [&_pre]:w-full [&_pre]:break-words [&_pre]:whitespace-pre-wrap">
+
+```rust title="src/config.rs (excerpt)"
+use std::path::Path;
+
+use crate::error::ConfigError;
+
+/// Workspace configuration read from `rift.toml`.
+pub struct Config {
+    pub root: std::path::PathBuf,
+}
+
+/// Loads the workspace configuration from `rift.toml`.
+pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
+    let text = std::fs::read_to_string(path)?;
+    parse_config(&text)
+}
+```
+
+</div>
+</div>
+</div>
 
 ## Map [#resource-map]
 
