@@ -623,15 +623,8 @@ impl SearchIndex {
         self.limits.lexical()
     }
 
-    /// Replaces the lexical unit set and embeds every declaration handed over.
-    ///
-    /// This is the pass that establishes a set rather than following one: the
-    /// vector it writes for a declaration is the vector this encoder produces
-    /// Replaces the whole lexical set and stamps `tree_revision`, in one transaction.
-    ///
-    /// Startup and every rebuild that reads the whole workspace take this path: a set the
-    /// index cannot name the difference against is cheaper to write whole than to
-    /// reconcile row by row.
+    /// Replaces the whole lexical set and stamps `tree_revision`, in one transaction,
+    /// recording no file digest.
     ///
     /// # Errors
     ///
@@ -668,8 +661,46 @@ impl SearchIndex {
             .map_err(store_failed)
     }
 
-    /// Applies one change set's lexical units and stamps `tree_revision`, in one
-    /// transaction.
+    /// The content digest each stored file's lexical rows were derived from, when those
+    /// rows were derived under `derivation_revision`; `None` when no stored row can be
+    /// kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses the read.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes.
+    pub async fn recorded_lexical_files(
+        &self,
+        derivation_revision: &str,
+    ) -> Result<Option<rift_index::WorkspaceDigests>, SearchError> {
+        self.lexical
+            .recorded_files(derivation_revision)
+            .await
+            .map_err(store_failed)
+    }
+
+    /// Deletes every lexical row and recorded digest and stamps no publication under
+    /// `derivation_revision`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation before the commit leaves every row and the stamp intact.
+    pub async fn clear_lexical(&self, derivation_revision: &str) -> Result<(), SearchError> {
+        self.lexical
+            .clear(derivation_revision)
+            .await
+            .map_err(store_failed)
+    }
+
+    /// Applies one change set's lexical units and digests and stamps `stamp`, in one
+    /// transaction, leaving the documentation metadata as it is.
     ///
     /// A rebuild that named the files it read pays one delete and one insert batch per
     /// changed path, against a rewrite of every indexed unit.
@@ -684,10 +715,10 @@ impl SearchIndex {
     pub async fn apply_lexical(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
+        stamp: &rift_index::LexicalStamp,
     ) -> Result<(), SearchError> {
         self.lexical
-            .apply(change, tree_revision)
+            .apply(change, stamp)
             .await
             .map_err(store_failed)
     }
@@ -700,11 +731,11 @@ impl SearchIndex {
     pub async fn apply_lexical_with_documentation(
         &self,
         change: &LexicalChange,
-        tree_revision: &str,
+        stamp: &rift_index::LexicalStamp,
         documentation: &rift_index::DocumentationCollection,
     ) -> Result<(), SearchError> {
         self.lexical
-            .apply_with_documentation(change, tree_revision, documentation)
+            .apply_with_documentation(change, stamp, documentation)
             .await
             .map_err(store_failed)
     }

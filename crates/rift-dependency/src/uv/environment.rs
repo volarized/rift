@@ -402,7 +402,7 @@ mod tests {
 
     use super::super::fixture::{
         ENVIRONMENT, ENVIRONMENT_FILE, INTERPRETER_PREFIX, ROOT, SITE_PACKAGES, STDLIB_DIRECTORY,
-        WORKSPACE_LOCKFILE, entry, environment_inspector, project, resolve,
+        WORKSPACE_LOCKFILE, entry, environment_inspector, environment_spelling, project, resolve,
         single_package_lockfile, with_environment,
     };
     use super::*;
@@ -653,10 +653,10 @@ mod tests {
 
         assert_eq!(
             resolution.degradations,
-            [
-                "pyproject.toml: no environment at /workspace/.venv; packages cataloged without \
-                 source roots"
-            ]
+            [format!(
+                "pyproject.toml: no environment at {}; packages cataloged without source roots",
+                environment_spelling(&[])
+            )]
         );
         assert_eq!(resolution.entries.len(), 7, "no standard library entry");
         assert!(
@@ -682,8 +682,9 @@ mod tests {
         assert_eq!(
             resolution.degradations,
             [format!(
-                "pyproject.toml: pyvenv.cfg at /workspace/.venv holds {} bytes, past the \
+                "pyproject.toml: pyvenv.cfg at {} holds {} bytes, past the \
                  {ENVIRONMENT_FILE_BYTES_MAX} byte bound; packages cataloged without source roots",
+                environment_spelling(&[]),
                 ENVIRONMENT_FILE_BYTES_MAX + 1
             )]
         );
@@ -791,10 +792,11 @@ mod tests {
 
         assert_eq!(
             resolution.degradations,
-            [
-                "pyproject.toml: no site-packages below /workspace/.venv; packages cataloged \
-                 without source roots"
-            ]
+            [format!(
+                "pyproject.toml: no site-packages below {}; packages cataloged without source \
+                 roots",
+                environment_spelling(&[])
+            )]
         );
         assert_eq!(resolution.entries.len(), 8);
         assert!(
@@ -885,10 +887,11 @@ mod tests {
 
         assert_eq!(
             resolution.degradations,
-            [
-                "pyproject.toml: pyvenv.cfg at /workspace/.venv names no version_info; no \
-                 standard library entry"
-            ]
+            [format!(
+                "pyproject.toml: pyvenv.cfg at {} names no version_info; no standard library \
+                 entry",
+                environment_spelling(&[])
+            )]
         );
         assert_eq!(resolution.entries.len(), 7);
         assert!(

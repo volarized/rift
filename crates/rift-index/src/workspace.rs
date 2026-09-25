@@ -5,12 +5,16 @@ use std::fs;
 use std::io::Read as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{DirEntry, Match, Walk, WalkBuilder};
 pub use rift_analysis::IndexedFile;
-use rift_analysis::documentation::DocumentationCollection;
+use rift_analysis::documentation::{
+    DocumentationCollection, DocumentationError, DocumentationLayer,
+};
 use rift_core::constants::{
     READ_RESULTS_MAX_DEFAULT, VCS_IGNORE_FILE, WORKSPACE_BYTES_MAX_DEFAULT,
     WORKSPACE_CONFIGURATION_FILE, WORKSPACE_DECLARATIONS_MAX_DEFAULT,
@@ -1128,15 +1132,87 @@ impl IndexContents {
         provider: &dyn SyntaxProvider,
         syntax: SyntaxLimits,
     ) -> Result<(), WorkspaceIndexError> {
-        match syntax_read(&text_file, context_path, provider, syntax)? {
+        let parsed = shared_read(syntax_read(&text_file, context_path, provider, syntax)?);
+        self.hold_parsed_source(text_file, parsed);
+        Ok(())
+    }
+
+    /// Holds one cataloged file with the syntax outcome already read for it.
+    fn hold_parsed_source(
+        &mut self,
+        text_file: TextSourceFile,
+        parsed: IndexRead<Arc<IndexedFile>>,
+    ) {
+        match parsed {
             IndexRead::Included(file) => {
-                self.files.insert(file.path().clone(), Arc::new(file));
+                self.files.insert(file.path().clone(), file);
                 self.hold_text_file(text_file);
             }
             IndexRead::Skipped(warning) => {
                 self.left_out
                     .insert(text_file.path().clone(), LeftOutFileState::of(&text_file));
                 self.warnings.push(warning);
+            }
+        }
+    }
+
+    /// Reads and parses every source path a provider claimed, in walk order.
+    ///
+    /// Each batch of [`SOURCE_BATCH_FILES`] paths is read and parsed across the rayon
+    /// pool, then held in walk order: `workspace_bytes` counts each kept file before its
+    /// parse outcome is held, so the `workspace_bytes_max` refusal and every other failure
+    /// name the path a sequential read would name. The refusal stops the build after the
+    /// batch that crossed it, so at most one batch is read past the bound.
+    fn hold_parsed_sources(
+        &mut self,
+        root: &Path,
+        sources: &[(PathBuf, &'static dyn SyntaxProvider)],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+        previous: Option<&WorkspaceIndex>,
+    ) -> Result<(), WorkspaceIndexError> {
+        for batch in sources.chunks(SOURCE_BATCH_FILES) {
+            let read: Vec<Result<IndexRead<ParsedSource>, WorkspaceIndexError>> = batch
+                .par_iter()
+                .map(|(path, provider)| ParsedSource::read(root, path, *provider, limits, previous))
+                .collect();
+            for ((path, _), read) in batch.iter().zip(read) {
+                match read? {
+                    IndexRead::Included(ParsedSource { text_file, parsed }) => {
+                        let length = text_file.content().len();
+                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                        self.hold_parsed_source(text_file, parsed?);
+                    }
+                    IndexRead::Skipped(warning) => self.leave_out(warning),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads every text path, in walk order, batched across the rayon pool the way
+    /// [`Self::hold_parsed_sources`] batches sources.
+    fn hold_read_texts(
+        &mut self,
+        root: &Path,
+        texts: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        for batch in texts.chunks(SOURCE_BATCH_FILES) {
+            let read: Vec<Result<IndexRead<TextSourceFile>, WorkspaceIndexError>> = batch
+                .par_iter()
+                .map(|path| catalog_file(root, path, limits))
+                .collect();
+            for (path, read) in batch.iter().zip(read) {
+                match read? {
+                    IndexRead::Included(text_file) => {
+                        let length = text_file.content().len();
+                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                        self.hold_text_file(text_file);
+                    }
+                    IndexRead::Skipped(warning) => self.leave_out(warning),
+                }
             }
         }
         Ok(())
@@ -1236,6 +1312,9 @@ pub struct WorkspaceIndex {
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
     documentation: Arc<DocumentationCollection>,
+    /// The documentation layer over `documentation`, built by the first read that projects
+    /// onto it; the next publication is a new index and builds its own.
+    documentation_layer: OnceLock<Result<DocumentationLayer<'static>, DocumentationError>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
 }
@@ -1280,29 +1359,54 @@ impl WorkspaceIndex {
         languages: &LanguageFileSelections,
     ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
-        let composition = composition()?;
         let language = Arc::new(WorkspaceLanguagePolicy::build(
             &root,
             languages,
             text_inclusion,
         )?);
-        let classified = discover(&root, limits, visibility, &language)?;
-        let mut workspace_bytes = 0_usize;
-        let mut contents = IndexContents::default();
-        for (path, provider) in classified.source {
-            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                IndexRead::Included(text_file) => {
-                    contents.hold_source_file(text_file, &path, provider, limits.syntax())?;
-                }
-                IndexRead::Skipped(warning) => contents.leave_out(warning),
-            }
-        }
-        for path in classified.text {
-            match read_catalog_file(&root, &path, limits, &mut workspace_bytes)? {
-                IndexRead::Included(file) => contents.hold_text_file(file),
-                IndexRead::Skipped(warning) => contents.leave_out(warning),
-            }
-        }
+        Self::scanned(root, limits, visibility, language, text_inclusion, None)
+    }
+
+    /// Builds the next index from a whole scan of the tree under `visibility`, sharing every
+    /// source file whose bytes and executable bit this index already parsed.
+    ///
+    /// A folder created or removed, a directory renamed, or an ignore file rewritten names
+    /// no set of files a rebuild could read alone, so the whole tree is walked and every
+    /// visible file read and digested again, under the visibility the ignore files decide
+    /// now. Parsing is what the scan saves: a file this index parsed from the same bytes is
+    /// shared, not parsed again. The caller keeps this index's language entries, bounds,
+    /// and text selection, so it rescans only when index-owned configuration is unchanged;
+    /// a configuration change takes a full build instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for I/O, syntax, or an exceeded bound, exactly as a
+    /// full build does.
+    pub fn rescanned(&self, visibility: &SourceVisibility) -> Result<Self, WorkspaceIndexError> {
+        Self::scanned(
+            self.root.clone(),
+            self.limits,
+            visibility,
+            Arc::clone(&self.language),
+            &self.text_inclusion,
+            Some(self),
+        )
+    }
+
+    /// Walks, reads, and parses every visible file under `root`, sharing what `previous`
+    /// parsed from the same bytes.
+    fn scanned(
+        root: PathBuf,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        language: Arc<WorkspaceLanguagePolicy>,
+        text_inclusion: &TextFileInclusion,
+        previous: Option<&Self>,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let composition = composition()?;
+        let classified = rift_core::traced!(component = "index", operation = "index.discover", {
+            discover(&root, limits, visibility, &language)
+        })?;
         let BuiltContents {
             files,
             text_files,
@@ -1310,14 +1414,31 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+        } = rift_core::traced!(component = "index", operation = "index.parse", {
+            let mut workspace_bytes = 0_usize;
+            let mut contents = IndexContents::default();
+            contents.hold_parsed_sources(
+                &root,
+                &classified.source,
+                limits,
+                &mut workspace_bytes,
+                previous,
+            )?;
+            contents.hold_read_texts(&root, &classified.text, limits, &mut workspace_bytes)?;
+            built_contents(
+                &root,
+                contents.sorted(),
+                limits.declarations_max(),
+                previous.map(|index| index.semantics.graph()),
+            )
+        })?;
         let declarations = crate::documentation::declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
             &text_files,
             &declarations,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
-            None,
+            previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
         Ok(Self {
             root,
@@ -1331,9 +1452,19 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
+    }
+
+    /// The file this index parsed from the same bytes, with the same executable bit, at
+    /// the same path, when there is one.
+    fn parsed_as(&self, text_file: &TextSourceFile) -> Option<Arc<IndexedFile>> {
+        let held = self.files.get(text_file.path())?;
+        let same_bytes = held.digest() == text_file.digest();
+        let same_mode = held.executable() == text_file.executable();
+        (same_bytes && same_mode).then(|| Arc::clone(held))
     }
 
     /// Builds the next index by reading only the paths `changes` names, sharing every
@@ -1392,6 +1523,7 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1481,6 +1613,7 @@ impl WorkspaceIndex {
             fingerprint,
             semantics,
             documentation: Arc::new(documentation),
+            documentation_layer: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1518,6 +1651,28 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn documentation(&self) -> &DocumentationCollection {
         &self.documentation
+    }
+
+    /// The documentation layer over this snapshot's collection.
+    ///
+    /// The first call builds the layer and every later call answers it, so the reads one
+    /// publication serves share its mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the build met, kept for every later call: a layer bound
+    /// crossed.
+    pub fn documentation_layer(&self) -> Result<&DocumentationLayer<'static>, &DocumentationError> {
+        self.documentation_layer
+            .get_or_init(|| {
+                rift_core::traced!(
+                    component = "documentation",
+                    operation = "documentation.layer",
+                    corpus = "project",
+                    { DocumentationLayer::shared([Arc::clone(&self.documentation)]) }
+                )
+            })
+            .as_ref()
     }
 
     /// Keeps this snapshot's documentation collection alive for one publication.
@@ -1574,6 +1729,32 @@ impl WorkspaceIndex {
         keyed_digests(&self.files, &self.text_files, &self.left_out)
     }
 
+    /// Every file's content digest this build holds, the files it left out included, in
+    /// project-path order.
+    ///
+    /// [`Self::digests`] hashes each file's bytes again into the file-state digest an
+    /// observation compares; this reads the content digest the build already took, the
+    /// one [`Self::digest`] answers per path. It is what the lexical store records beside
+    /// a file's rows, and what a later build compares itself against before it writes.
+    #[must_use]
+    pub fn content_digests(&self) -> WorkspaceDigests {
+        WorkspaceDigests::new(
+            self.left_out
+                .iter()
+                .map(|(path, state)| (path.clone(), state.content))
+                .chain(
+                    self.text_files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.digest())),
+                )
+                .chain(
+                    self.files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.digest())),
+                ),
+        )
+    }
+
     /// The tree revision this build's syntax-indexed files fold to, at full SHA-256
     /// length: each file's path and content digest in project-path order. A request-time
     /// capture of the same tree folds to the same value.
@@ -1625,31 +1806,38 @@ impl WorkspaceIndex {
     /// covers source units read for one request, not the persistent lexical index.
     #[must_use]
     pub fn index_documents(&self) -> Vec<IndexDocument> {
-        let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
-        let mut left_out = LeftOut::default();
-        for file in self.files() {
-            for symbol in file.syntax().symbols() {
-                documents.extend(symbol_document(file, symbol, &mut left_out));
+        rift_core::traced!(
+            component = "index",
+            operation = "index.lexical_units",
+            files = self.files.len(),
+            {
+                let mut documents = Vec::with_capacity(self.files.len() + self.text_files.len());
+                let mut left_out = LeftOut::default();
+                for file in self.files() {
+                    for symbol in file.syntax().symbols() {
+                        documents.extend(symbol_document(file, symbol, &mut left_out));
+                    }
+                }
+                for file in self.text_files() {
+                    if is_notebook_path(file.path()) {
+                        continue;
+                    }
+                    push_text_documents(
+                        &mut documents,
+                        file,
+                        self.text_chunk_bytes_max(),
+                        &mut left_out,
+                    );
+                }
+                documents.extend(crate::documentation::cell_documents(
+                    &self.notebooks,
+                    self.text_chunk_bytes_max_usize(),
+                    &mut left_out,
+                ));
+                left_out.report();
+                documents
             }
-        }
-        for file in self.text_files() {
-            if is_notebook_path(file.path()) {
-                continue;
-            }
-            push_text_documents(
-                &mut documents,
-                file,
-                self.text_chunk_bytes_max(),
-                &mut left_out,
-            );
-        }
-        documents.extend(crate::documentation::cell_documents(
-            &self.notebooks,
-            self.text_chunk_bytes_max_usize(),
-            &mut left_out,
-        ));
-        left_out.report();
-        documents
+        )
     }
 
     /// Records this index's declarations against every identifier `query` carried.
@@ -2633,14 +2821,46 @@ pub fn capture_digests_with_languages(
 
 /// Reads one path class into captured file states: each kept file's project path, its
 /// file-state digest, and its content digest, in walk order.
+///
+/// Files are read and hashed across the rayon pool, and no file's bytes outlive its own
+/// digest, so the capture holds one file per worker. The kept lengths are then summed in
+/// walk order: the `workspace_bytes_max` refusal names the path a sequential read would
+/// name, and an earlier path's failure wins over a later one's.
 fn capture_path_class(
     workspace_bytes: &mut usize,
     root: &Path,
     paths: &[PathBuf],
     limits: WorkspaceIndexLimits,
 ) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+    let read: Vec<Result<Option<CapturedFile>, WorkspaceIndexError>> = paths
+        .par_iter()
+        .map(|path| CapturedFile::read(path, limits))
+        .collect();
     let mut captured = Vec::with_capacity(paths.len());
-    for path in paths {
+    for (path, file) in paths.iter().zip(read) {
+        let Some(file) = file? else {
+            continue;
+        };
+        count_workspace_bytes(workspace_bytes, file.length, path, limits)?;
+        captured.push((project_path_below(root, path)?, file.state, file.content));
+    }
+    Ok(captured)
+}
+
+/// One file's captured digests, and the byte length it counts against the workspace.
+struct CapturedFile {
+    length: usize,
+    state: FileDigest,
+    content: FileDigest,
+}
+
+impl CapturedFile {
+    /// Reads and hashes the file at `path`, or answers nothing for a file the index leaves
+    /// out: past `file_bytes_max`, holding a NUL byte, or not UTF-8.
+    fn read(
+        path: &Path,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<Option<Self>, WorkspaceIndexError> {
         let handle = fs::File::open(path).map_err(|error| {
             index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
         })?;
@@ -2652,26 +2872,16 @@ fn capture_path_class(
             || bytes.contains(&0)
             || std::str::from_utf8(&bytes).is_err()
         {
-            continue;
+            return Ok(None);
         }
-        *workspace_bytes = workspace_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, path))?;
-        if *workspace_bytes > limits.workspace_bytes_max() {
-            return Err(index_error_over_limit(
-                WorkspaceIndexViolation::WorkspaceTooLarge,
-                path,
-                SOURCE_WORKSPACE_SIZE_FIELD,
-                *workspace_bytes,
-                limits.workspace_bytes_max(),
-            ));
-        }
-        let project_path = project_path_below(root, path)?;
         let (content, state) =
             FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
-        captured.push((project_path, state, content));
+        Ok(Some(Self {
+            length: bytes.len(),
+            state,
+            content,
+        }))
     }
-    Ok(captured)
 }
 
 impl WorkspaceDigests {
@@ -2985,12 +3195,95 @@ fn read_text_file(
     Ok(file)
 }
 
-/// Reads one baseline catalog candidate with bounded binary detection.
+/// Source or text paths one parallel batch of the index build reads.
+///
+/// A batch is the unit the build reads ahead of its in-order fold, so it bounds how far
+/// the reads run past a `workspace_bytes_max` refusal.
+const SOURCE_BATCH_FILES: usize = 512;
+
+/// Counts one kept file's bytes against `workspace_bytes_max`.
+fn count_workspace_bytes(
+    workspace_bytes: &mut usize,
+    length: usize,
+    context_path: &Path,
+    limits: WorkspaceIndexLimits,
+) -> Result<(), WorkspaceIndexError> {
+    *workspace_bytes = workspace_bytes
+        .checked_add(length)
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
+    if *workspace_bytes > limits.workspace_bytes_max() {
+        return Err(index_error_over_limit(
+            WorkspaceIndexViolation::WorkspaceTooLarge,
+            context_path,
+            SOURCE_WORKSPACE_SIZE_FIELD,
+            *workspace_bytes,
+            limits.workspace_bytes_max(),
+        ));
+    }
+    Ok(())
+}
+
+/// One source file read on a pool worker, with its parse outcome kept for the in-order
+/// fold: a parse failure is reported only after the file's bytes were counted.
+struct ParsedSource {
+    text_file: TextSourceFile,
+    parsed: Result<IndexRead<Arc<IndexedFile>>, WorkspaceIndexError>,
+}
+
+impl ParsedSource {
+    /// Reads one source file and parses it with the provider that claimed it, or takes the
+    /// file `previous` parsed from the same bytes at the same path.
+    fn read(
+        root: &Path,
+        path: &Path,
+        provider: &dyn SyntaxProvider,
+        limits: WorkspaceIndexLimits,
+        previous: Option<&WorkspaceIndex>,
+    ) -> Result<IndexRead<Self>, WorkspaceIndexError> {
+        Ok(match catalog_file(root, path, limits)? {
+            IndexRead::Included(text_file) => {
+                let parsed = match previous.and_then(|index| index.parsed_as(&text_file)) {
+                    Some(shared) => Ok(IndexRead::Included(shared)),
+                    None => {
+                        syntax_read(&text_file, path, provider, limits.syntax()).map(shared_read)
+                    }
+                };
+                IndexRead::Included(Self { text_file, parsed })
+            }
+            IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+        })
+    }
+}
+
+/// One syntax outcome, holding an included file behind the `Arc` a publication shares it
+/// through.
+fn shared_read(read: IndexRead<IndexedFile>) -> IndexRead<Arc<IndexedFile>> {
+    match read {
+        IndexRead::Included(file) => IndexRead::Included(Arc::new(file)),
+        IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+    }
+}
+
+/// Reads one baseline catalog candidate with bounded binary detection, counting it
+/// against `workspace_bytes_max`.
 fn read_catalog_file(
     root: &Path,
     path: &Path,
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
+) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
+    let read = catalog_file(root, path, limits)?;
+    if let IndexRead::Included(file) = &read {
+        count_workspace_bytes(workspace_bytes, file.content().len(), path, limits)?;
+    }
+    Ok(read)
+}
+
+/// Reads one baseline catalog candidate with bounded binary detection, counting no bytes.
+fn catalog_file(
+    root: &Path,
+    path: &Path,
+    limits: WorkspaceIndexLimits,
 ) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
     let handle = fs::File::open(path).map_err(|error| {
         index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
@@ -3015,7 +3308,8 @@ fn read_catalog_file(
             WorkspaceIndexWarning::InvalidUtf8Source(project_path),
         ));
     }
-    let mut file = included_text_file(project_path, bytes, path, limits, workspace_bytes)?;
+    let content = source_utf8(bytes, path)?;
+    let mut file = TextSourceFile::from_content(project_path, content);
     file.executable = metadata_is_executable(&metadata);
     Ok(IndexRead::Included(file))
 }
@@ -3057,18 +3351,7 @@ pub(crate) fn included_text_file(
     limits: WorkspaceIndexLimits,
     workspace_bytes: &mut usize,
 ) -> Result<TextSourceFile, WorkspaceIndexError> {
-    *workspace_bytes = workspace_bytes
-        .checked_add(bytes.len())
-        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
-    if *workspace_bytes > limits.workspace_bytes_max {
-        return Err(index_error_over_limit(
-            WorkspaceIndexViolation::WorkspaceTooLarge,
-            context_path,
-            SOURCE_WORKSPACE_SIZE_FIELD,
-            *workspace_bytes,
-            limits.workspace_bytes_max,
-        ));
-    }
+    count_workspace_bytes(workspace_bytes, bytes.len(), context_path, limits)?;
     let content = source_utf8(bytes, context_path)?;
     Ok(TextSourceFile::from_content(project_path, content))
 }
@@ -3630,6 +3913,92 @@ mod tests {
             next.fingerprint(),
             "replacing one file's bytes changes workspace identity"
         );
+    }
+
+    #[test]
+    fn test_rescanned_shares_every_file_whose_bytes_it_already_parsed() {
+        let directory = fixture();
+        let root = directory.path();
+        fs::write(root.join("src/other.rs"), "pub fn other() {}\n").expect("second source");
+        let index = indexed(root, &TextFileInclusion::default());
+        fs::write(root.join("src/lib.rs"), "pub struct Rift;\n").expect("edited source");
+        fs::create_dir_all(root.join("src/fresh")).expect("new directory");
+        fs::write(root.join("src/fresh/mod.rs"), "pub fn fresh() {}\n").expect("new source");
+
+        let next = index
+            .rescanned(&SourceVisibility::default())
+            .expect("the rescan must land");
+
+        let path = |value: &str| ProjectPath::new(value).expect("fixture path");
+        let before = index.file(&path("src/other.rs")).expect("indexed before");
+        let after = next.file(&path("src/other.rs")).expect("indexed after");
+        assert!(
+            std::ptr::eq(before, after),
+            "a file whose bytes did not move is shared rather than parsed again"
+        );
+        assert_eq!(
+            next.file(&path("src/lib.rs"))
+                .expect("edited file")
+                .source(),
+            "pub struct Rift;\n"
+        );
+        assert!(
+            next.file(&path("src/fresh/mod.rs")).is_some(),
+            "a new directory's file is read"
+        );
+        let fresh = indexed(root, &TextFileInclusion::default());
+        assert_eq!(
+            next.fingerprint(),
+            fresh.fingerprint(),
+            "a rescan and a full build of one tree agree"
+        );
+        assert_eq!(next.tree_revision(), fresh.tree_revision());
+    }
+
+    #[test]
+    fn test_rescanned_reads_visibility_from_a_rewritten_ignore_file() {
+        let directory = fixture();
+        let root = directory.path();
+        fs::write(root.join("src/other.rs"), "pub fn other() {}\n").expect("second source");
+        let index = indexed(root, &TextFileInclusion::default());
+        fs::write(root.join(".gitignore"), "src/other.rs\n").expect("ignore file");
+
+        let next = index
+            .rescanned(&SourceVisibility::default())
+            .expect("the rescan must land");
+
+        let path = |value: &str| ProjectPath::new(value).expect("fixture path");
+        assert!(
+            next.file(&path("src/other.rs")).is_none(),
+            "the ignored file leaves"
+        );
+        assert!(std::ptr::eq(
+            index.file(&path("src/lib.rs")).expect("indexed before"),
+            next.file(&path("src/lib.rs")).expect("indexed after"),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rescanned_parses_a_file_whose_mode_changed_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = fixture();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        let lib = root.join("src/lib.rs");
+        fs::set_permissions(&lib, fs::Permissions::from_mode(0o755)).expect("executable bit");
+
+        let next = index
+            .rescanned(&SourceVisibility::default())
+            .expect("the rescan must land");
+
+        let path = ProjectPath::new("src/lib.rs").expect("fixture path");
+        let after = next.file(&path).expect("indexed after");
+        assert!(!std::ptr::eq(
+            index.file(&path).expect("indexed before"),
+            after
+        ));
+        assert!(after.executable());
     }
 
     #[test]
@@ -5806,6 +6175,37 @@ mod tests {
             open = "(".repeat(DEEP_NESTING),
             close = ")".repeat(DEEP_NESTING),
         )
+    }
+
+    /// The lexical store records each file's content digest beside its rows, so a file the
+    /// build left out still needs one: without it, every later build would count that file
+    /// as new and write it again.
+    #[test]
+    fn test_content_digests_name_every_file_the_build_held_or_left_out() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(root.join("src/deep.rs"), deep_source()).expect("deep source");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("text file");
+        let index = indexed(
+            root,
+            &TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024),
+        );
+        let digests = index.content_digests();
+        let entries: Vec<(&str, FileDigest)> = digests
+            .iter()
+            .map(|(path, digest)| (path.as_str(), digest))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("notes.txt", FileDigest::of(b"plain notes\n")),
+                ("src/deep.rs", FileDigest::of(deep_source().as_bytes())),
+                ("src/lib.rs", FileDigest::of(b"pub fn kept() {}\n")),
+            ],
+            "the text file, the left-out file, and the parsed file each carry their bytes' digest"
+        );
     }
 
     #[test]

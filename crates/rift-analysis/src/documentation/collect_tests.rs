@@ -736,7 +736,7 @@ fn rst_double_underscore_reference_range_omits_markers() {
 #[test]
 fn parser_bound_omits_one_source_and_collects_next_source() {
     let mut nested = String::new();
-    for _ in 0..100_001 {
+    for _ in 0..=rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX {
         nested.push_str("item.\n\n");
     }
     let rst = DocumentationInput::new(source("guide.rst", &nested), &nested).expect("RST source");

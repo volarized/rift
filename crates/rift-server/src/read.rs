@@ -517,6 +517,13 @@ impl ReadService {
         self.index.digests()
     }
 
+    /// Every file's content digest this snapshot indexed, the files it left out included,
+    /// in project-path order, without hashing any file again.
+    #[must_use]
+    pub fn content_digests(&self) -> WorkspaceDigests {
+        self.index.content_digests()
+    }
+
     /// Workspace orientation snapshot: language totals, the directory tree indexed files sit
     /// under, the most-referenced symbols, entry points, and docs - computed once from this
     /// snapshot's already-loaded index.
@@ -590,6 +597,70 @@ impl ReadService {
     #[must_use]
     pub fn holds_files_below(&self, directory: &CoreProjectPath) -> bool {
         self.index.holds_files_below(directory)
+    }
+
+    /// Builds the next snapshot from a whole scan of the tree, sharing every file whose bytes
+    /// this snapshot already parsed.
+    ///
+    /// The source policy is compiled again, so a rewritten ignore file decides what is
+    /// visible, and the dependency context is read again from the manifests and lockfiles
+    /// that policy makes visible. The language entries, bounds, text selection, history, and
+    /// dependency configuration carry over, which is why a caller rescans only while the
+    /// index-owned configuration is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when the root, the policy, or a visible file cannot be indexed
+    /// within bounds.
+    pub fn rescanned(
+        &self,
+        root: &Path,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<Self, ReadError> {
+        let span = tracing::info_span!(
+            "index.build",
+            component = "index",
+            mode = "rescan",
+            files_count = tracing::field::Empty,
+            tree_revision = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let built = self.index.rescanned(visibility).and_then(|index| {
+            let source_policy = WorkspaceSourcePolicy::build_with_languages(
+                root,
+                self.index.limits(),
+                visibility,
+                text_inclusion,
+                languages,
+            )?;
+            Ok((index, source_policy))
+        });
+        let (index, source_policy) = built.map_err(|source| {
+            span.record("outcome", "error");
+            ReadFault::index(source)
+        })?;
+        let revisions = captured_revisions(&index);
+        let context = Arc::new(resolved_context(
+            root,
+            &source_policy,
+            &self.dependency_configuration,
+        )?);
+        span.record("files_count", index.file_count());
+        span.record("tree_revision", revisions.wire_tree_revision());
+        span.record("outcome", "ok");
+        Ok(Self {
+            index,
+            revisions,
+            revision: self.revision.clone(),
+            history: self.history.clone(),
+            source_policy: Some(Arc::new(source_policy)),
+            context,
+            packages: self.packages.clone(),
+            dependency_configuration: self.dependency_configuration.clone(),
+        })
     }
 
     /// Builds the next snapshot by reading only the paths `changes` names, sharing every
@@ -1421,8 +1492,11 @@ fn identity_key(identity: &PackageIdentity) -> (&str, &str, &str) {
 
 /// The warnings an answer whose `scope` reaches packages carries: the
 /// `global_index_unavailable` entry every such answer rides with, then at most
-/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order and
-/// `package_context_degraded` in resolver order together, skipped packages first.
+/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order,
+/// `package_context_degraded` in resolver order, and `package_unavailable` in identity
+/// order together, in that order. A workspace can name thousands of packages this machine
+/// holds no source for; their count rides `global_index_unavailable`, so the bound cuts
+/// the per-package entries rather than the fact.
 ///
 /// No global package index exists, so the first warning states what the local fallback
 /// produced rather than promising a service that is not there.
@@ -1439,12 +1513,6 @@ pub(crate) fn package_warnings(
             fallback.indexed, fallback.unresolved
         ),
     }];
-    warnings.extend(fallback.unavailable.into_iter().map(|package| {
-        ReadWarning::PackageUnavailable {
-            package,
-            reason: "package source is unavailable on this machine".to_owned(),
-        }
-    }));
     let skipped_packages: &[SkippedPackage] = index.map_or(&[], DependencyIndex::skipped);
     let mut skipped: Vec<&SkippedPackage> = skipped_packages.iter().collect();
     skipped.sort_by(|left, right| identity_key(&left.identity).cmp(&identity_key(&right.identity)));
@@ -1462,7 +1530,20 @@ pub(crate) fn package_warnings(
                 resolver: degradation.resolver.as_str().to_owned(),
                 reason: degradation.reason.clone(),
             });
-    warnings.extend(skipped.chain(degraded).take(DEPENDENCY_WARNINGS_MAX));
+    let unavailable =
+        fallback
+            .unavailable
+            .into_iter()
+            .map(|package| ReadWarning::PackageUnavailable {
+                package,
+                reason: "package source is unavailable on this machine".to_owned(),
+            });
+    warnings.extend(
+        skipped
+            .chain(degraded)
+            .chain(unavailable)
+            .take(DEPENDENCY_WARNINGS_MAX),
+    );
     warnings
 }
 
@@ -2148,6 +2229,20 @@ pub(crate) mod tests {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    /// The content digests are the ones the build took from each file's bytes, so a
+    /// comparison against the lexical store's recorded digests reads no file again.
+    #[test]
+    fn content_digests_answer_the_digest_of_each_indexed_files_bytes() -> TestResult {
+        let (directory, service) = fixture()?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let bytes = fs::read(directory.path().join("src/lib.rs"))?;
+        assert_eq!(
+            service.content_digests().get(&path),
+            Some(rift_index::FileDigest::of(&bytes))
+        );
+        Ok(())
     }
 
     /// `ReadService::relationships` is a pass-through onto the underlying index's own
@@ -3663,6 +3758,87 @@ pub fn compute() -> i32 {
             "the degraded resolvers fill what the bound leaves: {rendered:?}"
         );
         Ok(())
+    }
+
+    /// Twelve packages with no source on this machine ride as eight `package_unavailable`
+    /// warnings in identity order, while `global_index_unavailable` keeps the full count
+    /// (#364: a Bun workspace carried 3,155 of them on every documentation answer).
+    #[test]
+    fn package_warnings_cap_unavailable_packages_and_keep_their_count() {
+        let unavailable: Vec<PackageIdentity> = (0..12)
+            .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
+            .collect();
+        let fallback = crate::packages::PackageFallback {
+            indexed: 0,
+            unresolved: 12,
+            unavailable: unavailable.clone(),
+        };
+
+        let warnings = super::package_warnings(
+            None,
+            &rift_dependency::DependencyContext::default(),
+            fallback,
+        );
+
+        assert_eq!(warnings.len(), DEPENDENCY_WARNINGS_MAX + 1, "{warnings:?}");
+        assert!(
+            matches!(
+                &warnings[0],
+                ReadWarning::GlobalIndexUnavailable { detail, .. } if detail.contains("12 named no source")
+            ),
+            "{:?}",
+            warnings[0]
+        );
+        let named: Vec<&PackageIdentity> = warnings[1..]
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::PackageUnavailable { package, .. } => Some(package),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<&PackageIdentity> =
+            unavailable.iter().take(DEPENDENCY_WARNINGS_MAX).collect();
+        assert_eq!(named, expected);
+    }
+
+    /// Skipped packages and degraded resolvers take the bound before unavailable packages:
+    /// a refusal or a failed resolver is what an operator acts on, and the unavailable
+    /// count already rides `global_index_unavailable`.
+    #[test]
+    fn package_warnings_order_skipped_then_degraded_then_unavailable() {
+        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
+        index.skip(identity("cargo", "refused", "1.0.0"), "refused".to_owned());
+        let context = degraded_context();
+        let degradations = context.degradations().len();
+        let fallback = crate::packages::PackageFallback {
+            indexed: 0,
+            unresolved: 12,
+            unavailable: (0..12)
+                .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
+                .collect(),
+        };
+
+        let warnings = super::package_warnings(Some(&index), &context, fallback);
+
+        let kinds: Vec<&str> = warnings[1..]
+            .iter()
+            .map(|warning| match warning {
+                ReadWarning::PackageSkipped { .. } => "skipped",
+                ReadWarning::PackageContextDegraded { .. } => "degraded",
+                ReadWarning::PackageUnavailable { .. } => "unavailable",
+                _ => "other",
+            })
+            .collect();
+        let expected: Vec<&str> = std::iter::once("skipped")
+            .chain(std::iter::repeat_n("degraded", degradations))
+            .chain(std::iter::repeat("unavailable"))
+            .take(DEPENDENCY_WARNINGS_MAX)
+            .collect();
+        assert!(
+            degradations >= 1,
+            "the fixture degrades one resolver at least"
+        );
+        assert_eq!(kinds, expected);
     }
 
     /// A holder that panics with the write side held poisons the store; the next reader

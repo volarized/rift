@@ -585,6 +585,36 @@ async fn incremental_pass(
         .await
 }
 
+/// The digests an apply records are what the next build compares its files against, so
+/// the store answers them back unchanged, and a clear leaves none for any build to keep.
+#[tokio::test]
+async fn recorded_lexical_files_answer_what_an_apply_recorded_until_a_clear() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), limits()).await?;
+    let path = ProjectPath::new("src/lib.rs")?;
+    let digest = rift_index::FileDigest::of(b"pub fn beacon() {}");
+    let change = rift_index::LexicalChange::new(vec![path.clone()], Vec::new())
+        .with_recorded(vec![(path.clone(), digest)]);
+    index
+        .apply_lexical(
+            &change,
+            &rift_index::LexicalStamp::published(REVISION, "derivation-a"),
+        )
+        .await?;
+    assert_eq!(
+        index.recorded_lexical_files("derivation-a").await?,
+        Some(rift_index::WorkspaceDigests::new([(path, digest)]))
+    );
+
+    index.clear_lexical("derivation-a").await?;
+    assert_eq!(
+        index.recorded_lexical_files("derivation-a").await?,
+        Some(rift_index::WorkspaceDigests::new([])),
+        "a clear keeps the derivation stamp and records no file"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_fresh_path_starts_preparing_and_reopening_reads_what_was_left() -> TestResult {
     let root = workspace()?;

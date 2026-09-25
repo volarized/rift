@@ -1335,6 +1335,14 @@ async fn test_fixture_retry_after_beyond_deadline_does_not_repeat() {
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
 }
 
+/// Connect bound under which a refused loopback port still answers as refused.
+///
+/// Windows answers a refused connect only after it resends the SYN, which takes about
+/// two seconds on loopback; a shorter bound reports the refusal as a deadline there.
+const REFUSAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Request bound above [`REFUSAL_CONNECT_TIMEOUT`], so the connect decides the answer.
+const REFUSAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[tokio::test]
 async fn test_fixture_connection_refusal_is_bounded() {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1345,8 +1353,8 @@ async fn test_fixture_connection_refusal_is_bounded() {
     let client = GlobalClient::new(Config {
         endpoint: format!("http://{address}/rift/rest"),
         attempts: 1,
-        connect_timeout: Duration::from_millis(100),
-        request_timeout: Duration::from_secs(1),
+        connect_timeout: REFUSAL_CONNECT_TIMEOUT,
+        request_timeout: REFUSAL_REQUEST_TIMEOUT,
         ..Config::default()
     })
     .expect("fixture client");

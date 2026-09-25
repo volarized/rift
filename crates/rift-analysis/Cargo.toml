@@ -14,6 +14,7 @@ workspace = true
 default = ["collector"]
 collector = ["dep:rift-provider", "dep:rift-syntax", "dep:strum", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
 archive = ["dep:flate2", "dep:tar", "dep:zip"]
+parallel = ["dep:rayon"]
 
 [dependencies]
 rift-core.workspace = true
@@ -29,6 +30,7 @@ tree-sitter = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 url.workspace = true
 percent-encoding.workspace = true
+rayon = { workspace = true, optional = true }
 tree-sitter-rst = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }

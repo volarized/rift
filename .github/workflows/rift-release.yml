@@ -40,25 +40,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `registry` names the `main` job whose Cargo registry this target
+        # restores: the native job for the same target, and on x86-64 Linux,
+        # which has none, the job that builds the same `rift` package there.
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            binary: target/x86_64-unknown-linux-gnu/release/rift
+            binary: target/release/rift
+            registry: integration-cli
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            binary: target/aarch64-unknown-linux-gnu/release/rift
+            binary: target/release/rift
+            registry: native-aarch64-unknown-linux-gnu
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            binary: target/x86_64-apple-darwin/release/rift
+            binary: target/release/rift
+            registry: native-x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
-            binary: target/aarch64-apple-darwin/release/rift
+            binary: target/release/rift
+            registry: native-aarch64-apple-darwin
+          # See ci.yml's native job: without `/Brepro`, link.exe gives every
+          # proc-macro build new bytes, and its dependents miss the cache.
           - os: windows-2025
             target: x86_64-pc-windows-msvc
-            binary: target/x86_64-pc-windows-msvc/release/rift.exe
+            binary: target/release/rift.exe
+            registry: native-x86_64-pc-windows-msvc
+            rustflags: -C link-arg=/Brepro
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            binary: target/aarch64-pc-windows-msvc/release/rift.exe
+            binary: target/release/rift.exe
+            registry: native-aarch64-pc-windows-msvc
+            rustflags: -C link-arg=/Brepro
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
@@ -72,15 +85,45 @@ jobs:
       - uses: astral-sh/setup-uv@v7.6.0
         with:
           enable-cache: true
-          cache-dependency-glob: tools/rift-release/uv.lock
+          cache-dependency-glob: |
+            dev/uv.lock
+            tools/rift-release/uv.lock
+      # A tag restores the registry `main` saved and saves nothing: no later
+      # tag could restore a cache written under this one.
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          shared-key: release-${{ matrix.target }}
-      - name: Install target
-        run: rustup target add "${{ matrix.target }}"
+          shared-key: ${{ matrix.registry }}
+          cache-targets: false
+          save-if: false
+      - uses: taiki-e/install-action@v2.87.16
+        with:
+          tool: sccache@0.18.0
+      # The build passes no `--target`, so RUSTFLAGS reaches proc-macros too;
+      # every runner builds for its own host, which this holds to the target.
+      - name: Install the toolchain for this target
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustc --print host-tuple | grep -Fx "${{ matrix.target }}"
+      # The same R2 build cache CI compiles through, started the same way; see
+      # `dev/src/rift_dev/build_cache.py`. The release profile shares no object
+      # with CI's builds, so a tag reuses what earlier tags compiled.
+      - name: Start the build cache
+        env:
+          R2_BUILD_CACHE_ENDPOINT: ${{ secrets.R2_BUILD_CACHE_ENDPOINT }}
+          R2_BUILD_CACHE_READ_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_READ_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
+          R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
+          R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
+        run: uv run --locked --project dev rift-dev build-cache
       - name: Build release binary
         timeout-minutes: 30
-        run: cargo build --release --locked --target "${{ matrix.target }}" --package rift
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --package rift
+      - name: Report the build cache
+        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
+        run: sccache --show-stats
       - name: Package release archive
         run: >-
           uv run --locked --project tools/rift-release rift-release package

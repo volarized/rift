@@ -160,10 +160,8 @@ fn normalized_duplicates_and_file_parent_collisions_are_refused() -> TestResult 
 }
 
 #[test]
-fn links_and_special_files_are_refused() -> TestResult {
+fn devices_fifos_and_sparse_files_are_refused() -> TestResult {
     for kind in [
-        tar::EntryType::Symlink,
-        tar::EntryType::Link,
         tar::EntryType::Fifo,
         tar::EntryType::Char,
         tar::EntryType::Block,
@@ -175,6 +173,92 @@ fn links_and_special_files_are_refused() -> TestResult {
             ArchiveError::UnsupportedEntry
         );
     }
+    Ok(())
+}
+
+#[test]
+fn tar_symlink_and_hard_link_entries_are_skipped_and_named() -> TestResult {
+    let bytes = tar_bytes(&[
+        ("release/a", b"text", tar::EntryType::Regular),
+        ("release/link.txt", b"", tar::EntryType::Symlink),
+        ("release/hard.txt", b"", tar::EntryType::Link),
+    ])?;
+    let files = read(&bytes, ArchiveLimits::default())?;
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(
+        files
+            .files()
+            .get(&ProjectPath::new("a")?)
+            .map(Vec::as_slice),
+        Some(b"text".as_slice())
+    );
+    assert_eq!(
+        files.skipped_links(),
+        &[ProjectPath::new("link.txt")?, ProjectPath::new("hard.txt")?]
+    );
+    Ok(())
+}
+
+#[test]
+fn link_naming_the_archive_root_is_refused() -> TestResult {
+    let bytes = tar_bytes(&[("./", b"", tar::EntryType::Symlink)])?;
+    assert_eq!(
+        read_archive(
+            &bytes,
+            ArchiveFormat::TarGzip,
+            &ArchiveDigest::Sha256(Sha256::digest(&bytes).into()),
+            None,
+            ArchiveLimits::default(),
+        )
+        .expect_err("a link cannot name the archive root"),
+        ArchiveError::UnsafePath
+    );
+    Ok(())
+}
+
+#[test]
+fn zip_symlink_entry_is_skipped_and_named() -> TestResult {
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    archive.start_file("release/a", zip::write::SimpleFileOptions::default())?;
+    archive.write_all(b"text")?;
+    archive.add_symlink(
+        "release/link.txt",
+        "a",
+        zip::write::SimpleFileOptions::default(),
+    )?;
+    let bytes = archive.finish()?.into_inner();
+    let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+    assert_eq!(files.files().len(), 1);
+    assert_eq!(
+        files
+            .files()
+            .get(&ProjectPath::new("a")?)
+            .map(Vec::as_slice),
+        Some(b"text".as_slice())
+    );
+    assert_eq!(files.skipped_links(), &[ProjectPath::new("link.txt")?]);
+    Ok(())
+}
+
+#[test]
+fn skipped_link_count_is_bounded_by_the_member_limit() -> TestResult {
+    let exact = tar_bytes(&[
+        ("release/a", b"1234", tar::EntryType::Regular),
+        ("release/link", b"", tar::EntryType::Symlink),
+    ])?;
+    let files = read(&exact, ArchiveLimits::new(exact.len(), 16_384, 4, 2, 200)?)?;
+    assert_eq!(files.skipped_links(), &[ProjectPath::new("link")?]);
+
+    let over = tar_bytes(&[
+        ("release/a", b"1234", tar::EntryType::Regular),
+        ("release/link", b"", tar::EntryType::Symlink),
+        ("release/link2", b"", tar::EntryType::Symlink),
+    ])?;
+    assert_eq!(
+        read(&over, ArchiveLimits::new(over.len(), 16_384, 4, 2, 200)?)
+            .expect_err("archive must be refused"),
+        ArchiveError::MemberLimit
+    );
     Ok(())
 }
 
@@ -392,10 +476,9 @@ fn zip_paths_modes_crc_and_declared_member_count_are_checked() -> TestResult {
     bytes[header_start + 5] = 3;
     bytes[header_start + 38..header_start + 42]
         .copy_from_slice(&(0o120_777_u32 << 16).to_le_bytes());
-    assert_eq!(
-        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("ZIP symlink"),
-        ArchiveError::UnsupportedEntry
-    );
+    let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+    assert!(files.files().is_empty());
+    assert_eq!(files.skipped_links(), &[ProjectPath::new("a")?]);
     let mut bytes = zip_bytes("release/a", b"text")?;
     let footer = bytes.len() - 22;
     bytes[footer + 8..footer + 12].copy_from_slice(&[0xfe, 0xff, 0xfe, 0xff]);
@@ -403,6 +486,21 @@ fn zip_paths_modes_crc_and_declared_member_count_are_checked() -> TestResult {
         read_zip_fixture(&bytes, ArchiveLimits::new(bytes.len(), 8192, 1024, 1, 200)?)
             .expect_err("declared count must be checked before allocation"),
         ArchiveError::MemberLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn zip_encrypted_entry_is_refused_as_unsupported() -> TestResult {
+    let mut bytes = zip_bytes("release/a", b"text")?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_slice()))?;
+    let header_start = usize::try_from(archive.by_index(0)?.central_header_start())?;
+    drop(archive);
+    // Set the encrypted bit in the central-directory general-purpose flags.
+    bytes[header_start + 8] |= 1;
+    assert_eq!(
+        read_zip_fixture(&bytes, ArchiveLimits::default()).expect_err("encrypted ZIP member"),
+        ArchiveError::UnsupportedEntry
     );
     Ok(())
 }

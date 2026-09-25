@@ -677,6 +677,10 @@ The search ranking tiers carry their own warnings:
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
+- `documentation_unavailable` - the documentation this search projects onto crossed a bound, so
+  no documentation block joins the answer and declarations and files answer as they would without
+  it. The `detail` names the documentation left out - the project's, the `force_include` files',
+  or the dependency packages' - and the bound it crossed.
 - `query_narrowed` - the query carried more terms and quoted phrases than `terms_max`, so the
   server dropped the shortest unquoted terms and ranked the answer by the rest. Every quoted
   phrase is kept. Shorten `query`, or quote the terms that must be matched.
@@ -720,10 +724,12 @@ Package-scope answers can carry these global routing warnings:
 The local package-index path can also report `global_index_unavailable` when no global package
 index answered. Routed `rift mcp` reads use the typed warnings above.
 
-An answer carries at most eight `package_skipped` and `package_context_degraded` warnings
-together: the skipped packages first, in package identity order, then the degraded resolvers
-in resolver order. The `source_unavailable` bound above is separate, so an answer can carry
-eight of each.
+An answer carries at most eight `package_skipped`, `package_context_degraded`, and
+`package_unavailable` warnings together: the skipped packages first, in package identity order,
+then the degraded resolvers in resolver order, then the unavailable packages in package identity
+order. `global_index_unavailable` keeps the count of packages this machine holds no source for,
+so the bound cuts the per-package entries and not the count. The `source_unavailable` bound
+above is separate, so an answer can carry eight of each.
 
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 

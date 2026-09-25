@@ -43,9 +43,28 @@ pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 pub(crate) const LIBRARY: &str = "pub fn beacon() {}\n";
 
 /// A workspace fixture: one Rust source and a `rift.toml` whose
-/// `[server]` idle timeout reaps any orphaned server within a minute.
+/// `[server]` idle timeout reaps any orphaned server within a minute and
+/// whose server binds an [`assigned_port`].
 pub(crate) fn workspace() -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(&[("lib.rs", LIBRARY)], "")
+    laid_out_workspace(&[("lib.rs", LIBRARY)], &assigned_port_key()?)
+}
+
+/// A loopback port the operating system assigned a moment ago and released.
+///
+/// Nextest runs each test in its own process, in parallel, and a server on the
+/// default range binds its first free port, so servers from concurrent suites
+/// hand ports between them; a fixture pins a port of its own instead.
+pub(crate) fn assigned_port() -> TestResult<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+/// The `[server]` key pinning an [`assigned_port`], as `laid_out_workspace`
+/// takes it.
+pub(crate) fn assigned_port_key() -> TestResult<String> {
+    Ok(format!("port = {}\n", assigned_port()?))
 }
 
 /// The cargo project the real rust-analyzer end-to-end cases serve:
@@ -76,7 +95,11 @@ pub(crate) fn rust_project() -> Vec<(&'static str, &'static str)> {
 pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
     laid_out_workspace(
         &rust_project(),
-        &crate::rust_engine::rust_engine_configuration(),
+        &format!(
+            "{}{}",
+            assigned_port_key()?,
+            crate::rust_engine::rust_engine_configuration()
+        ),
     )
 }
 

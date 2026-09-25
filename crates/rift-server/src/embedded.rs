@@ -390,31 +390,25 @@ fn file_at(database: &ProjectDatabase, uri: &Value) -> Result<File, AnswerRefusa
 }
 
 /// The filesystem path one `file://` URI spells.
+///
+/// The session spells a Windows document `file:///C:/dir/file.py`, whose path
+/// is `C:\dir\file.py`: the drive is the URI path's first segment.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let decoded: String = percent_encoding::percent_decode_str(rest)
-        .decode_utf8()
-        .ok()?
-        .into_owned();
-    Some(PathBuf::from(decoded))
+    let uri = url::Url::parse(uri).ok()?;
+    if uri.scheme() != "file" {
+        return None;
+    }
+    uri.to_file_path().ok()
 }
 
-/// The `file://` URI one path spells, percent-escaping what RFC 3986 keeps
-/// out of a path segment.
-fn path_to_uri(path: &Path) -> String {
-    const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
-        .add(b' ')
-        .add(b'"')
-        .add(b'#')
-        .add(b'%')
-        .add(b'<')
-        .add(b'>')
-        .add(b'?')
-        .add(b'`');
-    format!(
-        "file://{}",
-        percent_encoding::utf8_percent_encode(&path.to_string_lossy(), ESCAPED)
-    )
+/// The `file://` URI one absolute path spells, percent-escaping what RFC 3986
+/// keeps out of a path segment; a Windows drive becomes the first segment.
+fn path_to_uri(path: &Path) -> Result<String, AnswerRefusal> {
+    url::Url::from_file_path(path)
+        .map(String::from)
+        .map_err(|()| {
+            AnswerRefusal::Invalid(format!("path spells no file URI: {}", path.display()))
+        })
 }
 
 /// The byte offset one LSP position addresses in `text`.
@@ -501,7 +495,7 @@ fn target_location(
             |_| system_path.as_std_path().to_path_buf(),
             |relative| exchange.spelled_root.join(relative),
         );
-    let uri = path_to_uri(&spelled);
+    let uri = path_to_uri(&spelled)?;
     let text = source_text(database, file);
     let range = range_at(text.as_str(), range)?;
     Ok(Some((uri, range)))
@@ -556,13 +550,40 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// The URI an absolute path spells in this module's tests.
+    fn uri_of(path: &Path) -> String {
+        path_to_uri(path).expect("an absolute path spells a file URI")
+    }
+
     #[test]
     fn test_uri_and_path_spell_each_other_with_escapes_kept() {
-        let path = Path::new("/workspace/py sources/module one.py");
-        let uri = path_to_uri(path);
-        assert_eq!(uri, "file:///workspace/py%20sources/module%20one.py");
-        assert_eq!(uri_to_path(&uri), Some(path.to_path_buf()));
+        let path = std::env::temp_dir()
+            .join("py sources")
+            .join("module one.py");
+        let uri = uri_of(&path);
+        assert!(uri.starts_with("file:///"), "{uri}");
+        assert!(uri.ends_with("/py%20sources/module%20one.py"), "{uri}");
+        assert_eq!(uri_to_path(&uri), Some(path));
         assert_eq!(uri_to_path("http://example"), None);
+        assert!(path_to_uri(Path::new("relative.py")).is_err());
+    }
+
+    /// The session addresses a document through `rift-lsp`'s [`rift_lsp::TreeRoot`],
+    /// and the engine reads back the file that URI was spelled from. On Windows the
+    /// root spells as `file:///C:/...`, which a strip of `file://` read as `/C:/...`.
+    #[test]
+    fn test_a_session_document_uri_names_the_file_it_was_spelled_from() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let root = rift_lsp::TreeRoot::new(directory.path()).expect("an absolute root");
+        let project_path =
+            rift_core::ProjectPath::new("pkg/service.py").expect("a valid project path");
+        let uri = root
+            .document_uri(&project_path)
+            .expect("the root spells a document URI");
+        assert_eq!(
+            uri_to_path(uri.as_str()),
+            Some(directory.path().join("pkg").join("service.py"))
+        );
     }
 
     #[test]
@@ -633,7 +654,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "textDocument/diagnostic",
-            "params": { "textDocument": { "uri": path_to_uri(&path) } },
+            "params": { "textDocument": { "uri": uri_of(&path) } },
         });
         let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
         else {
@@ -669,7 +690,7 @@ mod tests {
             "from a import helper\n\nhelper()\n",
         )
         .expect("fixture b");
-        let uri = path_to_uri(&directory.path().join("a.py"));
+        let uri = uri_of(&directory.path().join("a.py"));
         let request = |position: Value| {
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -698,7 +719,7 @@ mod tests {
             locations.iter().all(|location| {
                 location["uri"]
                     .as_str()
-                    .is_some_and(|uri| uri.starts_with(&path_to_uri(directory.path())))
+                    .is_some_and(|uri| uri.starts_with(&uri_of(directory.path())))
             }),
             "answers echo the caller's own root spelling: {reply:#}"
         );
@@ -794,7 +815,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 8,
             "method": "textDocument/diagnostic",
-            "params": { "textDocument": { "uri": path_to_uri(&path) } },
+            "params": { "textDocument": { "uri": uri_of(&path) } },
         });
         let Handled::Reply(reply) = handle_message(&message, directory.path(), &empty_documents())
         else {
@@ -817,7 +838,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture directory");
         let path = directory.path().join("service.py");
         std::fs::write(&path, "count: int = 1\n").expect("fixture");
-        let uri = path_to_uri(&path);
+        let uri = uri_of(&path);
         let pull = |id: i64, uri: &str| {
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -854,7 +875,7 @@ mod tests {
 
         let created_path = directory.path().join("fresh.py");
         std::fs::write(&created_path, "flag: bool = 7\n").expect("created fixture");
-        let created_uri = path_to_uri(&created_path);
+        let created_uri = uri_of(&created_path);
         let open_created = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
@@ -889,7 +910,7 @@ mod tests {
         let open = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
-            "params": { "textDocument": { "uri": path_to_uri(&path), "text": "x = 1\n" } },
+            "params": { "textDocument": { "uri": uri_of(&path), "text": "x = 1\n" } },
         });
         assert!(matches!(
             handle_message(&open, directory.path(), &empty_documents()),

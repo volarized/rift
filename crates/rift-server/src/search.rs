@@ -277,7 +277,7 @@ impl ReadService {
                         .as_deref()
                         .or(package_indexes.ranking.as_deref()),
                 },
-                &mut results,
+                (&mut results, &mut warnings),
             )?;
         }
         let mut traversal_report = TraversalReport::default();
@@ -494,7 +494,7 @@ impl ReadService {
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
         packages: SearchDependencies<'_>,
-        results: &mut Vec<SearchHit>,
+        (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, ReadError> {
         let index = self.index();
         let root = index.root();
@@ -519,8 +519,16 @@ impl ReadService {
             criteria.target,
             SearchParamsTarget::Documentation | SearchParamsTarget::All
         )
-        .then(|| SearchDocumentation::new(index, scope, documentation_resolution))
-        .transpose()?;
+        .then(|| {
+            rift_core::traced!(
+                component = "search",
+                operation = "search.documentation_projection",
+                { SearchDocumentation::new(index, scope, documentation_resolution) }
+            )
+        });
+        if let Some(documentation) = &documentation {
+            warnings.extend(documentation.warnings().iter().cloned());
+        }
         let screen = CandidateScreen {
             index,
             matcher,
@@ -529,13 +537,10 @@ impl ReadService {
             resolution,
             documentation: documentation.as_ref(),
         };
-        let mut inputs = vec![identifier_input(
-            index,
-            matcher,
-            root,
-            query,
-            sources,
-            fetch_limit,
+        let mut inputs = vec![rift_core::traced!(
+            component = "search",
+            operation = "search.identifier_ranking",
+            { identifier_input(index, matcher, root, query, sources, fetch_limit) }
         )?];
         inputs.extend(store.precise().iter().cloned());
         inputs.extend(package_inputs(
@@ -546,7 +551,12 @@ impl ReadService {
             criteria.target,
         ));
         let screened = screen.projected(&inputs, query)?;
-        let mut ranked = fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit);
+        let mut ranked = rift_core::traced!(
+            component = "search",
+            operation = "search.fusion",
+            phase = "precise",
+            { fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit) }
+        );
         // The widened inputs are built only when the precise phase came up short,
         // because ranking every package's documents again is work the full pool
         // would throw away.
@@ -560,17 +570,24 @@ impl ReadService {
                 criteria.target,
             ));
             let screened = screen.projected(&widened, query)?;
-            let broad = fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit);
+            let broad = rift_core::traced!(
+                component = "search",
+                operation = "search.fusion",
+                phase = "broad",
+                { fuse(&screened, store.weights(), QueryPhase::Broad, fetch_limit) }
+            );
             ranked.append_phase(broad, fetch_limit);
         }
-        resolve_ranked_hits(
-            index,
-            criteria,
-            resolution,
-            documentation.as_ref(),
-            &ranked,
-            results,
-        )?;
+        rift_core::traced!(component = "search", operation = "search.hit_resolution", {
+            resolve_ranked_hits(
+                index,
+                criteria,
+                resolution,
+                documentation.as_ref(),
+                &ranked,
+                results,
+            )
+        })?;
         Ok(ranked.truncated_at())
     }
 
@@ -581,12 +598,30 @@ impl ReadService {
     /// and one it found gone appears only in the first. Replacing rather than adding is
     /// what lets the same change set be written twice: two rebuilds captured from one
     /// publication both write what they read, and the second leaves what the first left.
+    ///
+    /// Each named path this snapshot holds is recorded with its content digest, so a later
+    /// process can compare its own build with what the store derived its rows from.
     #[must_use]
     pub fn lexical_change(&self, changes: &PathChanges) -> LexicalChange {
-        LexicalChange::new(
-            changes.paths().cloned().collect(),
-            self.index().index_documents_for(changes.indexed()),
-        )
+        self.lexical_change_for(changes.paths())
+    }
+
+    /// Derives the lexical write for `paths`, whatever moved them: the stored units under
+    /// every path go, and the units and content digests this snapshot holds for them land.
+    ///
+    /// A path this snapshot no longer holds contributes nothing but its deletion.
+    #[must_use]
+    pub fn lexical_change_for<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a ProjectPath>,
+    ) -> LexicalChange {
+        let replaced: Vec<ProjectPath> = paths.into_iter().cloned().collect();
+        let recorded = replaced
+            .iter()
+            .filter_map(|path| Some((path.clone(), self.file_digest(path)?)))
+            .collect();
+        let inserted = self.index().index_documents_for(&replaced);
+        LexicalChange::new(replaced, inserted).with_recorded(recorded)
     }
 
     /// Pairs each symbol unit in `units` with the declaration the vector ranking embeds for
@@ -1575,10 +1610,8 @@ fn query_line<'source>(
     let mut offset: u64 = 0;
     for (index, raw_line) in line::lines_inclusive(content).enumerate() {
         let text = line::without_ending(raw_line);
-        if terms
-            .iter()
-            .any(|term| text.to_lowercase().contains(term.as_str()))
-        {
+        let lowered = text.to_lowercase();
+        if terms.iter().any(|term| lowered.contains(term.as_str())) {
             let start = offset;
             let end = start.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
             let line_number = u64::try_from(index + 1).unwrap_or(u64::MAX);

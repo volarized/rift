@@ -45,16 +45,32 @@ const PINNED_PORT_CONFIGURATION: &str = r"
 port = 11777
 ";
 
+/// A loopback port the operating system assigned a moment ago and released.
+///
+/// Nextest runs each test in its own process, in parallel, so servers binding the first
+/// free port of the default range hand ports between tests; each test serves on a port of
+/// its own instead.
+fn assigned_port() -> TestResult<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
 /// One workspace whose `rift.toml` turns the vector ranking off and then carries
-/// `configuration`, so a suite about ports never reaches the model hub.
+/// `configuration`, so a suite about ports never reaches the model hub. Without a
+/// configuration, the `[server]` table pins an [`assigned_port`].
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    let mut contents = hermetic_search::VECTOR_DISABLED.to_owned();
-    if let Some(configuration) = configuration {
-        contents.push_str(configuration);
-    }
-    fs::write(directory.path().join("rift.toml"), contents)?;
+    let configuration = match configuration {
+        Some(configuration) => configuration.to_owned(),
+        None => format!("[server]\nport = {}\n", assigned_port()?),
+    };
+    fs::write(
+        directory.path().join("rift.toml"),
+        format!("{}{configuration}", hermetic_search::VECTOR_DISABLED),
+    )?;
     Ok(directory)
 }
 
@@ -232,7 +248,8 @@ async fn a_skipped_token_check_serves_a_request_the_default_refuses() -> TestRes
     shutdown.cancel();
     stopped_within_deadline(server).await?;
 
-    let (shutdown, checked) = served(directory.path()).await?;
+    let checked_directory = workspace_with(None)?;
+    let (shutdown, checked) = served(checked_directory.path()).await?;
     let refused = http
         .post(mcp_url(&checked))
         .header("Content-Type", "application/json")

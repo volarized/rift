@@ -321,6 +321,15 @@ async fn get_symbol(
     call_tool(client, "get_symbol", args).await
 }
 
+/// The `[global]` connect bound under which a refused loopback port still answers as
+/// refused.
+///
+/// Windows answers a refused connect only after it resends the SYN, which takes about
+/// two seconds on loopback; a shorter bound reports the refusal as a timeout there.
+const REFUSAL_CONNECT_TIMEOUT: &str = "10s";
+/// The `[global]` request bound above [`REFUSAL_CONNECT_TIMEOUT`].
+const REFUSAL_REQUEST_TIMEOUT: &str = "20s";
+
 #[tokio::test]
 async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -329,7 +338,8 @@ async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() ->
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"http://127.0.0.1:{port}/rift/rest\"\n\
          token_env = \"RIFT_TEST_GLOBAL_TOKEN\"\nattempts = 1\n\
-         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\
+         request_timeout = \"{REFUSAL_REQUEST_TIMEOUT}\"\n\
+         connect_timeout = \"{REFUSAL_CONNECT_TIMEOUT}\"\n\
          [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n"
     );
     let (_directory, client, server_task) = served_workspace(
@@ -367,17 +377,20 @@ async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() ->
     Ok(())
 }
 
+/// How long the fixture holds a resolution. A server that ignored the one-second
+/// request deadline could answer only after it, and one that honors the deadline answers
+/// well before it, however slow the machine running the test.
+const RESOLUTION_DELAY: Duration = Duration::from_secs(10);
+
 #[tokio::test]
 async fn request_deadline_bounds_global_resolution() -> TestResult {
-    let fixture = GlobalFixture::start_with_resolution_delay(
-        SymbolFixture::Valid,
-        Some(Duration::from_secs(4)),
-    )
-    .await?;
+    let fixture =
+        GlobalFixture::start_with_resolution_delay(SymbolFixture::Valid, Some(RESOLUTION_DELAY))
+            .await?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"5s\"\nconnect_timeout = \"100ms\"\n\n\
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
          [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n",
         fixture.endpoint
     );
@@ -398,7 +411,11 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     .await?;
     let started = tokio::time::Instant::now();
     let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
-    assert!(started.elapsed() < Duration::from_secs(3));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < RESOLUTION_DELAY,
+        "the request deadline must end the resolution wait: elapsed={elapsed:?}"
+    );
     let warning = answer["warnings"]
         .as_array()
         .into_iter()

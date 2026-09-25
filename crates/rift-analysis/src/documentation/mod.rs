@@ -24,11 +24,14 @@ mod rst;
 pub use failure::{DocumentationError, DocumentationFault, DocumentationViolation};
 pub use input::{DocumentationInput, DocumentationSourceSet, check_documentation_source_count};
 pub use links::{DocumentationFragment, linked_blocks, resolve_links};
-pub use projection::{DocumentationProjection, DocumentationProjectionTarget};
+pub use projection::{
+    DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget, LAYER_BLOCKS_MAX,
+    LAYER_MAPPINGS_MAX,
+};
 pub use publication::{
     DocumentationChanges, DocumentationCollection, DocumentationLinkChanges,
     DocumentationLinkReplacement, DocumentationRecordChanges, DocumentationSourceChanges,
-    validate_documentation_context, validate_documentation_hit,
+    KeyedChanges, keyed_changes, validate_documentation_context, validate_documentation_hit,
 };
 pub use references::{
     DocumentationDeclaration, ResolvedDocumentationReferences, resolve_references,

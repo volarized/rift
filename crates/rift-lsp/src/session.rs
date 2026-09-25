@@ -1470,11 +1470,14 @@ fn require(served: bool, capability: &str) -> Result<(), EngineError> {
 }
 
 /// Refuses an empty program and an absolute executable path.
+///
+/// "Absolute" is what configuration acceptance refuses, on every platform: a
+/// `/` root, a backslash, or a drive prefix.
 fn refuse_program(program: &str) -> Result<(), EngineError> {
     if program.is_empty() {
         return Err(Error::new(EngineFault::ProgramEmpty));
     }
-    if Path::new(program).is_absolute() {
+    if rift_core::is_absolute_program(program) {
         return Err(Error::new(EngineFault::ProgramAbsolute {
             program: program.to_owned(),
         }));

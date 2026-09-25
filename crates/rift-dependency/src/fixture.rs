@@ -10,7 +10,10 @@ use crate::resolver::{
 /// An inspector answering from scripted files, directories, commands, and environment.
 ///
 /// Every question a resolver asks lands in `asked`, so a test can assert what the
-/// resolver read and, as important, what it never touched.
+/// resolver read and, as important, what it never touched. A path in a question is
+/// spelled with `/` between its components on every platform: a resolver joins with
+/// the platform separator, and on Windows `/workspace` joined with `bun.lock` reads
+/// `/workspace\bun.lock`.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedInspector {
     files: BTreeMap<PathBuf, Vec<u8>>,
@@ -113,9 +116,16 @@ impl RecordedInspector {
     }
 }
 
+/// `path` with `/` between its components, the spelling every recorded question uses.
+fn spelled(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
 impl StaticInputs for RecordedInspector {
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
-        self.asked.push(format!("read {}", path.display()));
+        self.asked.push(format!("read {}", spelled(path)));
         match self.files.get(path) {
             None => FileObservation::Absent,
             Some(bytes) if bytes.len() as u64 > bytes_max => FileObservation::OverBound {
@@ -128,12 +138,12 @@ impl StaticInputs for RecordedInspector {
 
 impl Inspector for RecordedInspector {
     fn directory_exists(&mut self, path: &Path) -> bool {
-        self.asked.push(format!("exists {}", path.display()));
+        self.asked.push(format!("exists {}", spelled(path)));
         self.directories.contains(path)
     }
 
     fn list_directory(&mut self, path: &Path, entries_max: usize) -> Vec<String> {
-        self.asked.push(format!("list {}", path.display()));
+        self.asked.push(format!("list {}", spelled(path)));
         let mut names: BTreeSet<String> = BTreeSet::new();
         for candidate in self.directories.iter().chain(self.files.keys()) {
             if candidate.parent() == Some(path)
@@ -149,7 +159,7 @@ impl Inspector for RecordedInspector {
         let rendered = command.rendered();
         self.asked.push(format!(
             "run {rendered} in {}",
-            command.working_directory.display()
+            spelled(&command.working_directory)
         ));
         self.commands
             .get(&rendered)

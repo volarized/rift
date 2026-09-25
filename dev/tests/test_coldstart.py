@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
 from rift_dev import check_coldstart
+from rift_dev.commands import Command, DockerCommand
 
 
 def test_failed_container_start_still_attempts_cleanup(
@@ -19,21 +19,11 @@ def test_failed_container_start_still_attempts_cleanup(
     binary.write_bytes(b"\x7fELFbinary")
     commands: list[list[str]] = []
 
-    def failed_run(
-        command: Sequence[str],
-        *,
-        cwd: Path | None = None,
-        env: Mapping[str, str] | None = None,
-        timeout_seconds: float = 30.0,
-    ) -> str:
-        commands.append(list(command))
-        raise RuntimeError(f"failed {command[1]}")
+    def failed_output(command: Command) -> str:
+        commands.append(command.argv)
+        raise RuntimeError(f"failed {command.arguments[0]}")
 
-    def failed_cleanup(command: Sequence[str], *, timeout: float) -> str:
-        return failed_run(command, timeout_seconds=timeout)
-
-    monkeypatch.setattr(check_coldstart, "run_command", failed_run)
-    monkeypatch.setattr(check_coldstart, "run", failed_cleanup)
+    monkeypatch.setattr(DockerCommand, "output", failed_output)
     with pytest.raises(RuntimeError, match="failed run") as captured:
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
     assert [command[1] for command in commands] == ["run", "logs", "rm"]
@@ -51,30 +41,29 @@ def test_expired_gate_still_removes_container(
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from rift_dev import release_process, rift_test_client
+    from rift_dev import commands, rift_test_client
 
     binary = tmp_path / "rift"
     binary.write_bytes(b"\x7fELFbinary")
     clock = [100.0]
     fake_time = SimpleNamespace(monotonic=lambda: clock[0])
     monkeypatch.setattr(rift_test_client, "time", fake_time)
-    monkeypatch.setattr(release_process, "time", fake_time)
+    monkeypatch.setattr(commands, "time", fake_time)
     monkeypatch.setattr(check_coldstart, "COLDSTART_SECONDS", 1.0)
     process = Mock(side_effect=AssertionError("expired deadline started a process"))
-    monkeypatch.setattr(release_process, "owned_process", process)
-    cleanup: list[tuple[str, float]] = []
+    monkeypatch.setattr(commands, "owned_process", process)
+    cleanup: list[tuple[str, float | None]] = []
+    captured_output = Command.output
 
-    def expire(command: Sequence[str], *, timeout_seconds: float) -> str:
-        clock[0] += 2.0
-        return rift_test_client.run_command(command, timeout_seconds=timeout_seconds)
-
-    def collect(command: Sequence[str], *, timeout: float) -> str:
+    def output(command: Command) -> str:
+        if command.arguments[0] == "run":
+            clock[0] += 2.0
+            return captured_output(command)
         assert rift_test_client.remaining_seconds(1.0) == 0.0
-        cleanup.append((command[1], timeout))
+        cleanup.append((command.arguments[0], command.timeout_seconds))
         return ""
 
-    monkeypatch.setattr(check_coldstart, "run_command", expire)
-    monkeypatch.setattr(check_coldstart, "run", collect)
+    monkeypatch.setattr(DockerCommand, "output", output)
     with pytest.raises(RuntimeError, match="command deadline expired"):
         asyncio.run(check_coldstart.check_coldstart(binary, "ubuntu:24.04"))
     assert cleanup == [("logs", 10), ("rm", 30)]
@@ -92,7 +81,7 @@ def test_stop_waits_for_delayed_process_exit_and_status(
     import threading
     import time
 
-    from rift_dev.release_process import owned_process, run
+    from rift_dev.commands import owned_process
 
     request = tmp_path / "stop.request"
     status = tmp_path / "server.exit"
@@ -124,7 +113,7 @@ def test_stop_waits_for_delayed_process_exit_and_status(
             assert arguments[4:] == ["/rift", str(process.pid), "/server.exit"]
             assert 0 < timeout <= check_coldstart.STOP_SECONDS
             command = [*arguments[:4], str(binary), str(process.pid), str(status)]
-            return run(command, timeout=timeout)
+            return Command(*command).with_timeout(timeout).output()
 
         monkeypatch.setattr(check_coldstart, "container_command", inside)
         try:

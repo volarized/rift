@@ -1,4 +1,9 @@
-"""Prove command limits, byte streams, environment inheritance, and descendant cleanup."""
+"""Prove command limits, byte streams, environment inheritance, and descendant cleanup.
+
+Three tests start a process the way the MCP SDK's stdio transport does, through
+`anyio.open_process`, because `owned_environment` exists for processes a
+transport starts outside `Command`.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,6 @@ import json
 import os
 import selectors
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -16,18 +20,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import anyio
 import psutil
-from rift_dev.release_process import (
+from rift_dev.commands import (
     OUTPUT_BYTES_MAX,
+    OWNER_ENV,
+    Command,
     Drain,
     owned_environment,
     owned_process,
-    run,
-    run_bytes,
     signal_group,
     termination_handler,
 )
-from rift_dev.release_process_unix import OWNER_ENV
+
+SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 
 class ProcessTests(unittest.TestCase):
@@ -42,7 +48,7 @@ class ProcessTests(unittest.TestCase):
         try:
             with (
                 tempfile.TemporaryFile() as stdin,
-                patch("rift_dev.release_process_unix.PROCESS_COUNT_MAX", 0),
+                patch("rift_dev.commands.PROCESS_COUNT_MAX", 0),
                 self.assertRaisesRegex(RuntimeError, "observation exceeded"),
                 owned_process(
                     [sys.executable, "-c", program], None, None, stdin
@@ -65,34 +71,34 @@ class ProcessTests(unittest.TestCase):
 
     @unittest.skipIf(sys.platform == "win32", "Unix transport process observation")
     def test_observation_failure_keeps_already_captured_transport_child(self) -> None:
-        child: psutil.Process | None = None
-        process: subprocess.Popen[bytes] | None = None
-        try:
+        async def observe() -> psutil.Process:
             with (
                 self.assertRaisesRegex(RuntimeError, "observation exceeded"),
-                patch("rift_dev.release_process_unix.PROCESS_COUNT_MAX", 1),
-                patch(
-                    "rift_dev.release_process_unix.psutil.process_iter"
-                ) as process_iter,
+                patch("rift_dev.commands.PROCESS_COUNT_MAX", 1),
+                patch("rift_dev.commands.psutil.process_iter") as process_iter,
                 owned_environment({}) as environment,
             ):
-                process = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(60)"],
-                    env=environment,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                process = await anyio.open_process(
+                    SLEEPER, env=environment, start_new_session=True
                 )
                 child = psutil.Process(process.pid)
+                # The process starts before exec, and observation matches the owner
+                # token in the environment the child carries only after exec.
+                exec_deadline = time.monotonic() + 5
+                while OWNER_ENV not in child.environ():
+                    self.assertLess(
+                        time.monotonic(), exec_deadline, "the child never ran exec"
+                    )
+                    await anyio.sleep(0.01)
                 process_iter.return_value = [child, psutil.Process(os.getpid())]
-            assert child is not None
-            self.assertTrue(
-                not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
-            )
-        finally:
-            if process is not None:
-                process.kill()
-                process.wait(timeout=5)
+            with anyio.fail_after(5):
+                await process.aclose()
+            return child
+
+        child = anyio.run(observe)
+        self.assertTrue(
+            not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+        )
 
     @unittest.skipIf(sys.platform == "win32", "Windows jobs own detached children")
     def test_detached_child_is_found_after_immediate_parent_exit(self) -> None:
@@ -103,7 +109,9 @@ class ProcessTests(unittest.TestCase):
             "print(child.pid,flush=True)"
         )
         for _ in range(10):
-            pid = int(run([sys.executable, "-c", program], timeout=5).strip())
+            pid = int(
+                Command(sys.executable, "-c", program).with_timeout(5).output().strip()
+            )
             try:
                 child = psutil.Process(pid)
                 try:
@@ -118,13 +126,15 @@ class ProcessTests(unittest.TestCase):
     def test_nested_command_keeps_outer_owner_with_replaced_environment(self) -> None:
         previous = os.environ.get(OWNER_ENV)
         program = (
-            "import json,os,sys; from rift_dev.release_process import run; "
-            "from rift_dev.release_process_unix import OWNER_ENV; "
-            "inner=run([sys.executable,'-c', 'import os,sys; print(os.environ[sys.argv[1]])',OWNER_ENV],environment={}); "
+            "import json,os,sys; from rift_dev.commands import Command; "
+            "from rift_dev.commands import OWNER_ENV; "
+            "inner=Command(sys.executable,'-c','import os,sys; print(os.environ[sys.argv[1]])',OWNER_ENV).with_environment({}).output(); "
             "print(json.dumps({'outer':os.environ[OWNER_ENV].split(','),'inner':inner.strip().split(',')}))"
         )
         document = json.loads(
-            run([sys.executable, "-c", program], cwd=Path(__file__).parent)
+            Command(sys.executable, "-c", program)
+            .with_cwd(Path(__file__).parent)
+            .output()
         )
         self.assertTrue(set(document["outer"]) < set(document["inner"]))
         self.assertEqual(len(document["inner"]), len(document["outer"]) + 1)
@@ -138,15 +148,16 @@ class ProcessTests(unittest.TestCase):
             "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
             "print(child.pid,flush=True)"
         )
+
+        async def transport(environment: dict[str, str]) -> bytes:
+            with anyio.fail_after(5):
+                result = await anyio.run_process(
+                    [sys.executable, "-c", program], env=environment
+                )
+            return result.stdout
+
         with owned_environment({}) as environment:
-            result = subprocess.run(
-                [sys.executable, "-c", program],
-                env=environment,
-                capture_output=True,
-                check=True,
-                timeout=5,
-            )
-            pid = int(result.stdout.strip())
+            pid = int(anyio.run(transport, environment).strip())
         try:
             child = psutil.Process(pid)
             try:
@@ -175,7 +186,7 @@ class ProcessTests(unittest.TestCase):
             process.stderr.close()
         with (
             patch(
-                "rift_dev.release_process.os.killpg",
+                "rift_dev.commands.os.killpg",
                 side_effect=PermissionError("denied"),
             ),
             self.assertRaisesRegex(PermissionError, "denied"),
@@ -190,7 +201,8 @@ class ProcessTests(unittest.TestCase):
             "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()); raise SystemExit(1)",
         ]
         self.assertEqual(
-            run_bytes(command, input_bytes=payload, accepted=(0, 1)), payload
+            Command(*command).with_input(payload).with_accepted(0, 1).output_bytes(),
+            payload,
         )
 
     def test_reader_failure_reaches_owner(self) -> None:
@@ -207,7 +219,9 @@ class ProcessTests(unittest.TestCase):
 
     def test_parent_exit_reaps_child_that_keeps_stdout_open(self) -> None:
         program = "import subprocess,sys; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(child.pid,flush=True)"
-        pid = int(run([sys.executable, "-c", program], timeout=5).strip())
+        pid = int(
+            Command(sys.executable, "-c", program).with_timeout(5).output().strip()
+        )
         try:
             child = psutil.Process(pid)
             self.assertEqual(child.status(), psutil.STATUS_ZOMBIE)
@@ -227,7 +241,7 @@ class ProcessTests(unittest.TestCase):
                 "os.kill(os.getppid(),signal.SIGTERM); time.sleep(30)"
             )
             with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
-                run([sys.executable, "-c", program, str(path)], timeout=5)
+                Command(sys.executable, "-c", program, path).with_timeout(5).output()
             pid = int(path.read_text())
             try:
                 child = psutil.Process(pid)
@@ -244,14 +258,14 @@ class ProcessTests(unittest.TestCase):
         with (
             termination_handler(),
             selectors.DefaultSelector() as selector,
-            subprocess.Popen([sys.executable, "-c", program]) as child,
+            Command(sys.executable, "-c", program).spawn() as child,
             self.assertRaisesRegex(RuntimeError, "SIGTERM"),
         ):
             selector.select(timeout=2)
         self.assertEqual(child.returncode, 0)
 
     def test_child_environment_is_inherited_or_replaced_explicitly(self) -> None:
-        # subprocess requires SystemRoot for Windows side-by-side assemblies.
+        # A Windows process needs SystemRoot for side-by-side assemblies.
         replacement = (
             {"SystemRoot": os.environ["SystemRoot"]} if sys.platform == "win32" else {}
         )
@@ -261,15 +275,15 @@ class ProcessTests(unittest.TestCase):
             "import os; print(os.environ.get('RIFT_GATE_TEST', 'absent'))",
         ]
         with patch.dict(os.environ, {"RIFT_GATE_TEST": "inherited"}):
-            self.assertEqual(run(command).strip(), "inherited")
+            self.assertEqual(Command(*command).output().strip(), "inherited")
             self.assertEqual(
-                run(
-                    command,
-                    environment=dict(os.environ) | {"RIFT_GATE_TEST": "overlay"},
-                ).strip(),
+                Command(*command).with_env(RIFT_GATE_TEST="overlay").output().strip(),
                 "overlay",
             )
-            self.assertEqual(run(command, environment=replacement).strip(), "absent")
+            self.assertEqual(
+                Command(*command).with_environment(replacement).output().strip(),
+                "absent",
+            )
 
     def test_failed_timed_out_and_flooding_children_fail_gate(self) -> None:
         for program in [
@@ -278,18 +292,18 @@ class ProcessTests(unittest.TestCase):
             f"import sys; sys.stdout.write('x' * {OUTPUT_BYTES_MAX + 1}); sys.stdout.flush()",
         ]:
             with self.subTest(program=program), self.assertRaises(RuntimeError):
-                run([sys.executable, "-c", program], timeout=0.5)
+                Command(sys.executable, "-c", program).with_timeout(0.5).output()
 
     def test_shared_deadline_cannot_reset_for_a_later_command(self) -> None:
         deadline = time.monotonic() - 1.0
         with self.assertRaisesRegex(RuntimeError, "deadline expired"):
-            run([sys.executable, "-c", "raise SystemExit(0)"], deadline=deadline)
+            Command(sys.executable, "-c", "raise SystemExit(0)").with_deadline(
+                deadline
+            ).output()
         with self.assertRaisesRegex(RuntimeError, "exceeded"):
-            run(
-                [sys.executable, "-c", "import time; time.sleep(10)"],
-                timeout=5.0,
-                deadline=time.monotonic() + 0.1,
-            )
+            Command(sys.executable, "-c", "import time; time.sleep(10)").with_timeout(
+                5.0
+            ).with_deadline(time.monotonic() + 0.1).output()
 
     def test_timeout_unwinds_nested_process_owners(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -300,16 +314,14 @@ class ProcessTests(unittest.TestCase):
                 "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
             )
             parent = (
-                "import sys; from rift_dev.release_process import run; "
-                "run([sys.executable, '-c', sys.argv[1], sys.argv[2]], timeout=30)"
+                "import sys; from rift_dev.commands import Command; "
+                "Command(sys.executable, '-c', sys.argv[1], sys.argv[2]).with_timeout(30).output()"
             )
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "exceeded"):
-                run(
-                    [sys.executable, "-c", parent, child, str(path)],
-                    cwd=Path(__file__).parent,
-                    timeout=1,
-                )
+                Command(sys.executable, "-c", parent, child, path).with_cwd(
+                    Path(__file__).parent
+                ).with_timeout(1).output()
             self.assertLess(time.monotonic() - started, 13)
             pid = int(path.read_text())
             try:

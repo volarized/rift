@@ -10,11 +10,13 @@ takes explicit paths while a change is still in progress:
 
     uv run --project dev rift-dev dashes [PATH ...]
 
-With no PATH arguments the script scans the default reader-facing surfaces
-relative to the current directory: docs/content, docs/src/app, crates,
-README.md. Do not point it at .claude: skill files quote the banned characters
-on purpose (corpus evidence stays verbatim), and the directory is skipped when
-reached through a scanned parent.
+With no PATH arguments the script scans every surface a reader meets, relative
+to the current directory: the docs pages, the app shell and the components it
+renders, the prose inside the crates, the README, the artifacts `just generate`
+writes, and the CI configuration's own comments. The scanner itself is not among
+them: it spells the banned characters. Do not point it at .claude: skill files
+quote the banned characters on purpose (corpus evidence stays verbatim), and the
+directory is skipped when reached through a scanned parent.
 """
 
 from __future__ import annotations
@@ -26,7 +28,17 @@ EM_DASH = "\u2014"
 EN_DASH = "\u2013"
 DASH_NAMES = {EM_DASH: "em-dash U+2014", EN_DASH: "en-dash U+2013"}
 
-DEFAULT_TARGETS = ("docs/content", "docs/src/app", "crates", "README.md")
+DEFAULT_TARGETS = (
+    "docs/content",
+    "docs/src/app",
+    "docs/src/components",
+    "crates",
+    "README.md",
+    "docs/public",
+    ".github",
+    "plugins",
+    ".claude-plugin",
+)
 SKIP_DIRS = {
     ".git",
     ".claude",

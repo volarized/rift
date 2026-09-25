@@ -7,8 +7,11 @@
 //! refusal the registry's identity, explanation, and rendering. It also
 //! holds [`SourceVisibility`]: `rift-index` has no dependency on
 //! `rift-protocol`, so the workspace's `[source]` table is translated into
-//! this plain value here, beside the wire type it comes from.
+//! this plain value here, beside the wire type it comes from. For the same
+//! reason it passes on [`is_absolute_program`], the classifier acceptance
+//! refuses a configured program with, to the engine launch in `rift-lsp`.
 
+pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
     ConfigurationViolation, LanguageConfiguration, SearchConfiguration, UnitParseError,
     WorkspaceConfiguration,

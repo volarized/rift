@@ -11,13 +11,21 @@ mod measurement;
 mod name;
 mod path;
 mod semantic;
+mod trace;
 
 pub mod constants;
 pub mod line;
 
+/// Re-exported so [`traced!`](crate::traced!) and [`traced_async!`](crate::traced_async!)
+/// can reach `tracing`'s own span macros and types (`span!`, `Level`, `Instrument`)
+/// through `$crate::tracing`, without requiring every crate that calls either macro to
+/// import `tracing` under that exact name itself.
+pub use tracing;
+
 pub use capture::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 pub use configuration::{
     LanguageFileSelection, LanguageFileSelections, SourceVisibility, TextFileInclusion,
+    is_absolute_program,
 };
 pub use digest::FileDigest;
 pub use error::{

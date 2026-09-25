@@ -1024,12 +1024,29 @@ mod tests {
         pool.shutdown().await;
     }
 
+    /// A program no machine running these tests provides.
+    const MISSING_PROGRAM: &str = "rift-engine-that-does-not-exist";
+
+    /// What the platform answers when asked to start [`MISSING_PROGRAM`].
+    ///
+    /// The cause a record carries is the platform's own: Unix reports the operating error
+    /// `No such file or directory (os error 2)`, and Rust's Windows spawn searches `PATH`
+    /// itself and answers `program not found` before any operating call.
+    fn missing_program_cause() -> String {
+        std::process::Command::new(MISSING_PROGRAM)
+            .spawn()
+            .map_or_else(
+                |error| error.to_string(),
+                |_child| "the program must not exist".to_owned(),
+            )
+    }
+
     /// A configured program that does not exist reaches the caller as `launch_failed`, and
     /// the workspace log names the program and the operating error behind it. Cold first use
     /// read `rift://logs/component/engine` after exactly this refusal and found it empty.
     #[tokio::test]
     async fn a_missing_program_is_recorded_with_its_cause() {
-        let (failure, recorded) = start_refusal("rift-engine-that-does-not-exist", 1).await;
+        let (failure, recorded) = start_refusal(MISSING_PROGRAM, 1).await;
         assert!(
             matches!(failure.fault(), EngineFault::LaunchFailed { .. }),
             "a missing program answers launch_failed: {failure:?}"
@@ -1038,8 +1055,8 @@ mod tests {
         assert!(record.starts_with("WARN"), "{record}");
         assert!(
             record.contains("component=\"engine\"")
-                && record.contains("program=\"rift-engine-that-does-not-exist\"")
-                && record.contains("No such file or directory"),
+                && record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
+                && record.contains(&missing_program_cause()),
             "the record names the component, the program and the cause: {record}"
         );
     }
@@ -1048,11 +1065,11 @@ mod tests {
     /// spent, which is the outcome and not the reason the caller was refused.
     #[tokio::test]
     async fn the_spent_restart_budget_names_the_failure_it_surfaces() {
-        let (_, recorded) = start_refusal("rift-engine-that-does-not-exist", 1).await;
+        let (_, recorded) = start_refusal(MISSING_PROGRAM, 1).await;
         let record = recorded.naming("restart budget is spent");
         assert!(
-            record.contains("program=\"rift-engine-that-does-not-exist\"")
-                && record.contains("No such file or directory"),
+            record.contains(&format!("program=\"{MISSING_PROGRAM}\""))
+                && record.contains(&missing_program_cause()),
             "the budget record carries the cause: {record}"
         );
     }
