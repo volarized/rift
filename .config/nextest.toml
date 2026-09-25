@@ -1,4 +1,4 @@
-nextest-version = "0.9.140"
+nextest-version = "0.9.145"
 
 [store]
 dir = "target/nextest"
@@ -65,16 +65,6 @@ and not (binary_id(rift::mcp_proxy) & (
     | test(=proxy_stderr_carries_lifecycle_lines_and_never_the_token)
 ))
 '''
-
-# The Intel macOS runner has three cores, and nextest starts its first batch of
-# test processes at once. Twice a test with no process left to hold its output
-# failed the 200 ms leak window there: a `rift-server` unit test that starts
-# none, and `install_cli`'s first case, whose `rift install` had already exited.
-# A descendant that really leaks holds the pipes for as long as it lives, so a
-# second still fails it.
-[[profile.ci.overrides]]
-platform = 'cfg(all(target_os = "macos", target_arch = "x86_64"))'
-leak-timeout = { period = "1s", result = "fail" }
 
 [profile.ci.junit]
 path = "junit.xml"
