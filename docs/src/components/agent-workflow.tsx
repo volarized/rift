@@ -36,7 +36,7 @@ const steps = [
     direction: "right",
   },
   {
-    title: "Symbol retrieval",
+    title: "Symbols",
     address: "get_symbol",
     href: "#tool-get_symbol",
     description: "Read the declaration, source, and documentation.",
@@ -96,8 +96,8 @@ export function AgentWorkflow() {
       <p id="agent-workflow-description" className="sr-only">
         Read the map, search, retrieve a symbol, inspect nodes, then edit with the agent's tools.
         Rift detects project file changes and updates the local index, closing the cycle back to the
-        map and subsequent reads. Search and symbol retrieval also draw dependency facts from the
-        global index. Each card links to its documentation.
+        map and subsequent reads. Search and Symbols also draw dependency facts from the global
+        index. Each card links to its documentation.
       </p>
       <div className="mb-6 @min-[40rem]:mb-0 @min-[40rem]:grid @min-[40rem]:grid-cols-3 @min-[40rem]:gap-x-8">
         <aside
@@ -110,8 +110,8 @@ export function AgentWorkflow() {
             icon={<GlobeHemisphereWestIcon aria-hidden="true" />}
             className="rounded-none border-dashed shadow-none"
           >
-            Public declarations and docs for project dependencies, supplied to Search and Symbol
-            retrieval through rift.
+            Public declarations and docs for project dependencies, supplied to Search and Symbols
+            through rift.
           </Card>
           <div
             aria-hidden="true"
