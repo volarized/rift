@@ -1,7 +1,7 @@
 # Documentation site
 
 This directory contains the Fumadocs site for Rift. Hand-written pages live under
-`content/docs`; installation, the MCP surface, and agentic usage are top-level pages, while
+`content/docs`; installation, the MCP surface, and usage are top-level pages, while
 architecture, implementation, configuration, testing, and protocol details live under
 `content/docs/developer`. `public/mcp.json` carries the served MCP tool surface exported from
 the Rust workspace.

@@ -1,431 +1,186 @@
 ---
 title: MCP
+description: From repository discovery to precise edit targets.
 ---
 
-<VersionBadge
-  version="v0.0.13"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
+import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
+import { Card, Cards } from "fumadocs-ui/components/card";
+import { Callout } from "fumadocs-ui/components/callout";
+import { AgentWorkflow } from "@/components/agent-workflow";
+import { ExampleProject } from "@/components/example-project";
+import { SymbolExample } from "@/components/symbol-example";
+import { WorkspaceMapExample } from "@/components/workspace-map-example";
+import { BookOpenIcon, FileTextIcon, GearIcon } from "@phosphor-icons/react/ssr";
 
-`rift mcp` serves MCP over stdio for harnesses that launch servers as subprocesses. Stdout carries
-MCP frames; the process writes tracing events to stderr.
+The main interface for agents to work with rift is the Model Context Protocol, aka
+[MCP](https://modelcontextprotocol.io/specification/2026-07-28). The local `rift mcp` process is
+launched via a CLI command by your agent (see [Usage](/docs/agentic-usage)).
 
-Requests do not open connection-scoped sessions. Each request carries its arguments; the server holds no per-caller state between calls.
+<Accordions className="text-sm">
+<Accordion title="Details">
 
-A tool result rides MCP
-[`structuredContent`](https://modelcontextprotocol.io/specification/draft/server/tools#structured-content),
-typed by the tool's declared output schema, with the
-same JSON mirrored as a `text` block for harnesses that ignore it.
-[`ErrorData`](/docs/developer/protocol/reference#ErrorData) travels as the
-[JSON-RPC error](https://www.jsonrpc.org/specification#error_object)
-object's `data`, under code `-32000`. The exported schema at
-[`mcp.json`](https://volar.sh/rift/mcp.json) is the authoritative served shape.
+We're using MCP because it's the de-facto standard in the agent infrastructure. However, MCP
+requests are stateless, while rift needs a live local index running in the background.
 
-## Reads
+Therefore, we start a long-running `rift server`, which can handle multiple MCP clients (agents)
+and starts automatically. See [CLI commands](/docs/developer/implementation#rift-server) for server
+controls.
 
-Callers read code through these tools:
+</Accordion>
+</Accordions>
 
-| Tool | Result |
+Rift follows the MCP specifications, and all inputs and outputs have a strictly defined JSON
+schema, available [here](https://volar.sh/rift/mcp.json).
+
+An agent working on an unfamiliar project first needs to understand its structure, then find
+and read the code relevant to its task. Rift provides context before an edit and updates its
+local index as the agent changes project files, ready for the next read.
+
+## Typical workflow [#agent-workflow-caption]
+
+<AgentWorkflow />
+
+Let's assume we're working with the following example project:
+
+<ExampleProject />
+
+## Map [#resource-map]
+
+Before searching, the agent is advised to read the map.
+The map describes the project that the local index serves: its directories, languages,
+documentation paths, and dependencies.
+
+For any task, directories help the agent choose where to search.
+Documentation paths point to project guidance, while dependency entries identify the packages
+and versions used by the project.
+
+For the example project, a map can look like this:
+
+<WorkspaceMapExample />
+
+<Callout type="info">
+
+Rift updates the map when it publishes a new index, so later reads follow changes to the project.
+The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
+entry points and relationships, and when they are available.
+
+</Callout>
+
+## Search [#tool-search]
+
+Once the agent knows where to look, `search` finds code by a name, a phrase, or a description
+of its behavior. A search for configuration loading can start with:
+
+```json
+{ "query": "load configuration", "include": ["source"], "limit": 5 }
+```
+
+Each result identifies what matched and where it was found. A declaration result includes its
+symbol name and identity, so the agent can use that name with [get_symbol](#tool-get_symbol)
+to read it in more detail.
+
+### Full-text search (FTS) [#search-fulltext]
+
+Full-text search matches words in declaration names, signatures, documentation, source code,
+and included text files. Rift also recognizes identifier words, so `loadConfig` can find
+`load_config`.
+
+Double quotes keep a phrase together. For example, the agent can look for this wording in
+indexed content:
+
+```json
+{ "query": "\"workspace configuration\"", "include": ["source"] }
+```
+
+Results include `matched_by`, which identifies the fields that matched. The agent can narrow
+the result kind with `target`: `symbol` for declarations, `documentation` for collected
+documentation, or `file` for file results; the default, `all`, allows every kind.
+
+### Hybrid search [#search-hybrid]
+
+An agent can describe a behavior without knowing the words used in its implementation.
+Hybrid search combines identifier and full-text matches with vector ranking, which compares
+the query's meaning with indexed declarations.
+
+For example, the agent can ask where the project reads its settings:
+
+```json
+{ "query": "read project settings from disk", "target": "symbol", "limit": 5 }
+```
+
+This uses the same `query` argument as full-text search. When vector ranking is available,
+it contributes to the combined result order. The [search configuration](/docs/developer/configuration#search)
+controls ranking weights, embedding options, and included text files.
+
+<Accordions>
+<Accordion title="Ranking details">
+
+`include: ["score"]` exposes the ranking value for comparison within one answer.
+A result tagged `matched_by: ["ranked"]` can come from vector ranking without a literal text match.
+
+While vectors are being prepared, or when their model cannot load, results carry a warning.
+Identifier and full-text matching remain available independently of vector ranking.
+The [read reference](/docs/developer/protocol/mcp#reads) describes these warnings.
+
+</Accordion>
+</Accordions>
+
+### More search options
+
+The agent can narrow the files it searches, look into dependencies, follow references,
+or compare committed revisions. These options use the same `search` tool:
+
+<Accordions>
+<Accordion title="Path filters" id="search-paths">
+
+The map can help the agent restrict a search to the relevant part of the repository.
+`paths.include` selects project-relative paths, and `paths.exclude` removes matches from that selection:
+
+```json
+{
+  "query": "load configuration",
+  "paths": { "include": ["src/**"], "exclude": ["src/generated/**"] },
+  "include": ["source"]
+}
+```
+
+Here, `paths.include` selects files, while the top-level `include` asks for source excerpts.
+If a needed file is excluded from the index, `paths.force_include` can request an on-demand
+search, subject to the [search limits](/docs/developer/protocol/mcp#search).
+
+</Accordion>
+<Accordion title="Dependencies" id="search-scope">
+
+Reading project code often leads to a library call. The agent can search public declarations
+in the project's dependencies by changing `scope`:
+
+| Scope | Searches |
 | --- | --- |
-| [`get_symbol`](#tool-get_symbol) | declarations and their source by known name |
-| [`search`](#tool-search) | ranked files and symbols across the workspace tree |
-| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
+| `local` | Project code, the default |
+| `global` | Public declarations of the project's dependency packages |
+| `all` | Both project code and dependency declarations |
 
-The index never follows or indexes a symlink, so no read returns one; the file a link points
-at answers under its own path.
-
-`get_symbol` and `search` page by `page_index`. The request names the zero-based page under its
-`limit`, at most 10,000, and the result's `pagination` carries the served `page_index` and the
-true `total_pages`; a larger `limit` is refused as `invalid_request` naming the field. The server
-retains no capture between pages: each page is computed from the request, and a `page_index` past
-the last page returns an empty page whose `pagination` still carries the true `total_pages`.
-
-Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
-from an index that lags the tree the read captured, and names the two tree revision digests that
-disagree.
-
-A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
-naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
-the tree moved in recorded files outside the syntax-indexed ones or in the configuration file, and
-`detail` says which.
-
-The search ranking tiers carry their own warnings:
-
-- `vector_index_preparing` - the vector ranking holds no vectors for the tree this answer
-  was read from: the pass over that tree is still running, or the tree was published after
-  the corpus the ranking holds was described. A query sharing no token with the code it
-  describes reaches nothing until that pass lands; `prepared` and `total` state how far it
-  has got, and an answer carrying no such warning is one the vector ranking took part in.
-- `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
-  server: the model weights could not be acquired, or the model failed to load.
-- `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
-  missed a commit, failed to load, or holds no indexed tree; the `detail` names which, and the
-  tree revision. Ranking falls back to identifier matching, so a query phrased as prose finds
-  nothing; the tier is read under the answer's own tree revision, so one that has moved past it
-  is recaptured rather than warned about, a case a caller cannot otherwise tell apart from a
-  tier that searched and found nothing. A read waits for a commit in flight until its
-  `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
-  budget with everything else the read waits for.
-- `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
-  past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
-  that did; a narrower `query` brings the rest inside the bound.
-- `documentation_unavailable` - the documentation this search projects onto crossed a bound, so
-  no documentation block joins the answer and declarations and files answer as they would without
-  it. The `detail` names the documentation left out - the project's, the `force_include` files',
-  or the dependency packages' - and the bound it crossed.
-- `query_narrowed` - the query carried more terms and quoted phrases than `terms_max`, so the
-  server dropped the shortest unquoted terms and ranked the answer by the rest. Every quoted
-  phrase is kept. Shorten `query`, or quote the terms that must be matched.
-- `results_truncated` - the server reached `results_max`, its result bound, before ordering and
-  paging. The bound covers both the candidates one read ranks and the hits it returns, so what
-  it cut never reaches any page and `total_pages` counts only what fit. The warning means the
-  bound was reached: a read that cut nothing else but filled the candidate pool carries it too.
-  A narrower `query` or `paths` brings the read inside the bound.
-
-A `symbol_disagreement` warning names a symbol whose selected presentation and at least one
-provider's own facts disagree.
-
-A `source_unavailable` warning names a file the index left out - bytes that are not valid UTF-8,
-a file past its per-file bound, or a syntax tree the provider refused - so it answers no search or
-lookup while every other file stays available. An answer carries at most eight of them, in
-project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
-and counts the rest, and `rift://logs` names each.
-
-Package-scope answers can carry these global routing warnings:
-
-- `global_access_disabled` - `[global].enabled` is `false`, so every selected package uses local
-  indexing. `fallback_indexed` and `fallback_unresolved` count the local result.
-- `global_api_unavailable` - the global API could not answer. `failure_class` identifies the
-  bounded failure, and `fallback_indexed` and `fallback_unresolved` count local fallback results.
-- `global_publication_incompatible` - the global API publication format or corpus revision is not
-  supported by this client. The warning carries `failure_class` and local fallback counts.
-- `global_response_invalid` - the global API response is invalid or truncated. The warning carries
-  `failure_class` and local fallback counts.
-- `global_page_warning` - a valid global page carried a bounded condition. `warning_code` identifies
-  it and optional `detail` explains it.
-- `package_absent` - a valid global resolution did not name an exact `package`, so local indexing
-  serves it.
-- `package_requirement_absent` - a valid global resolution did not resolve the declared `entry`,
-  so local indexing serves it.
-- `package_unavailable` - local fallback could not serve `package`; `reason` states why.
-- `package_skipped` - the local package index refused `package` for `reason`, so none of its
-  declarations answers.
-- `package_context_degraded` - `resolver` read less than its manifests and lockfiles state,
-  for `reason`, so the dependency context can miss packages.
-
-The local package-index path can also report `global_index_unavailable` when no global package
-index answered. Routed `rift mcp` reads use the typed warnings above.
-
-An answer carries at most eight `package_skipped`, `package_context_degraded`, and
-`package_unavailable` warnings together: the skipped packages first, in package identity order,
-then the degraded resolvers in resolver order, then the unavailable packages in package identity
-order. `global_index_unavailable` keeps the count of packages this machine holds no source for,
-so the bound cuts the per-package entries and not the count. The `source_unavailable` bound
-above is separate, so an answer can carry eight of each.
-
-Every read carries an optional `rev`, and reads the workspace tree when it is absent.
-
-### Revision-addressed reads [#revision-reads]
-
-<VersionBadge
-  version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
-`main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
-git objects, with no checkout, and indexes that commit's tree under the same
-[`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan. A revision
-read answers from committed bytes, so uncommitted working-tree changes never appear in it.
-
-This `get_symbol` request reads a declaration as it stands on `main`, whatever the working tree
-currently holds:
+For example, a project using Tokio can search its dependency declarations for `spawn_blocking`:
 
 ```json
-{ "name": "ReadService", "rev": "main" }
+{ "query": "spawn_blocking", "scope": "global", "target": "symbol", "limit": 5 }
 ```
 
-A revision search refuses `force_include`: reaching index-excluded files is a walk of the
-working tree, which a revision does not have.
+Rift uses the project's manifests and lockfiles to select packages. A package result identifies
+its package and version, and carries `unit` instead of a local `path`.
+See [package scope](/docs/developer/protocol/mcp#search-scope) for resolution and fallback behavior.
 
-A workspace with no git repository refuses a revision read and names the remedy:
+</Accordion>
+<Accordion title="Relationship traversal" id="search-traversal">
 
-**Error:**
-
-```json
-{
-  "code": "capability_unavailable",
-  "message": "no configured provider serves this request: workspace /Users/alice/projects/charming-aurora, requires a git repository - run `git init`, or omit `rev` to read the current tree; adjust the request to a served capability, or configure a provider that serves it",
-  "retry": "operator_action",
-  "phase": "read"
-}
-```
-
-An unknown revision refuses with `resource_not_found`, and
-[`[providers.history]`](/docs/developer/configuration#providers) owns the capability: `enabled = false`
-refuses every revision read.
-
-<McpTool name="get_symbol" />
-
-<VersionBadge version="v0.0.13" />
-
-`include` selects the optional fields a hit carries: `source` - the node identity and
-declaration excerpt - and `history` - the version-control timeline. An omitted `include`
-defaults to `["source"]`; an explicit empty list carries neither.
-
-`include: ["history"]` attaches the symbol's version-control timeline as a
-[`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory). The server follows first parents
-from the served revision along the declaration's current path, bounded by the `max_revisions`
-key in [`[providers.history]`](/docs/developer/configuration#providers) and by a shallow clone's
-boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
-`signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
-parsed, or where the symbol is absent, contributes no version. `complete` says whether the
-walk reached the repository's first commit; `false` means one of those bounds ended it first,
-so revisions older than the listed ones may have touched the symbol.
-
-### Package scope [#get_symbol-scope]
-
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
-
-`scope` selects which corpus the lookup searches, by what the corpus holds rather than by
-where it is stored. `local`, the default, searches the workspace tree. `global` searches the
-public declarations of the workspace's dependency packages. `all` searches both and lists a
-project hit before a package hit of equal rank.
-
-A package hit carries `unit` in place of `path`: the
-[`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file, spelled
-`rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
-package. The hit carries neither `node` nor `history`.
-
-<VersionBadge version="v0.0.43" />
-
-A `local` read reaches no package declaration and resolves no package. The first `global` or
-`all` read resolves the workspace's dependency context, then asks the configured global REST API
-for capabilities and package resolution. A valid response serves available package declarations
-from the global service and sends missing packages to local indexing under the
-[`[dependencies]`](/docs/developer/configuration#dependencies) bounds.
-
-When the REST API is unavailable, the server selects affected packages for local indexing and adds
-`global_api_unavailable`, including its bounded `failure_class` and fallback counts. Disabled
-access adds `global_access_disabled`; a valid resolution that names no remote package adds
-`package_absent` or `package_requirement_absent`. Callers still reach this route through the local
-`rift mcp` and `rift server` processes; they do not connect to a global MCP or server directly.
-
-The server refuses `rev` together with a scope beyond `local` as `invalid_request`: package
-facts are served for the current tree alone.
-
-This lookup reaches the `helper` crate a workspace's `Cargo.toml` names by path:
-
-**Request:**
-
-```json
-{ "name": "helper_beacon", "scope": "global" }
-```
-
-**Response:**
-
-```json
-{
-  "hits": [
-    {
-      "symbol": {
-        "id": "rift://symbol/rust/cargo/helper@0.1.0/src/lib.rs/helper_beacon",
-        "language": "rust",
-        "name": "helper_beacon",
-        "kind": "function",
-        "facets": ["value", "callable", "public"],
-        "visibility": "pub",
-        "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
-        "origin": {
-          "location": "dependency",
-          "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
-          "source_kind": "authored"
-        }
-      },
-      "unit": "rift://source/cargo/helper@0.1.0/src/lib.rs",
-      "range": { "start": 0, "end": 25 },
-      "line": 1,
-      "source": "pub fn helper_beacon() {}"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 },
-  "warnings": [
-    {
-      "code": "global_api_unavailable",
-      "failure_class": "connection",
-      "fallback_indexed": 1,
-      "fallback_unresolved": 0
-    }
-  ]
-}
-```
-
-<McpTool name="search" />
-
-`search` takes a lexical `query`, narrowed or extended by a `paths` selector. `paths.include` and
-`paths.exclude` glob the project-relative path - the same glob engine backs the workspace's
-[`[source]`](/docs/developer/configuration#source) policy - narrowing the indexed candidates before
-scoring.
-
-`paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
-index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
-request - the bound counts the files the request reaches outside the index, so a glob whose
-matches the index already holds adds none. A request whose `paths.force_include` matches more
-than that refuses with `limit_exceeded` rather than searching a silently truncated set; the
-`limit` evidence names `paths.force_include`, the bound, and the match count.
-
-The top-level `include` field is a separate selector: it requests extra payload per hit instead
-of narrowing which files are searched. `source` attaches the excerpt around the hit; `score`
-attaches the fused ranking value used to order the page, comparable only within this one answer.
-
-This request narrows the search to the tests tree, then reaches one file the workspace's
-`[source]` policy excludes from the index:
-
-```json
-{
-  "query": "test_fit",
-  "paths": {
-    "include": ["tests/**"],
-    "force_include": ["tests/legacy/test_solver.py"]
-  }
-}
-```
-
-### Full-text search [#search-fulltext]
-
-<VersionBadge
-  version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-`query` matches declaration names, qualified names, signatures, attached documentation,
-declaration sources, and file contents through a full-text index, and the identifiers it
-carries against the indexed names. A multi-word query is answered first by the documents
-carrying every term; only when that leaves the answer short do documents carrying some of
-them join, behind every exact one. Double quotes keep a phrase together in both passes.
-
-An identifier written inside a question reaches its declaration without being quoted:
-`where does encode_path get its escape set` ranks `encode_path` through the identifier
-matching, while the prose around it ranks through the full-text index.
-
-The index ranks at most 1,000 units for one request. When more units match, the answer
-carries a `lexical_ranking_truncated` warning naming that bound, and hits past it never reach
-a page: `paths` selects among the ranked units, so only a narrower `query` brings the rest
-inside the bound.
-
-The read has its own bound of 1,000, applied to the candidates it ranks and again to the hits
-it orders and pages: a read that reached it warns `results_truncated`.
-
-A symbol whose only match sits in its documentation and its source, not in its name, still
-returns as a `symbol` hit. `matched_by` names every field that carried a term, so this one
-is tagged `["documentation", "content"]`: the attached doc comment carried both words, and
-the declaration's own source carries that comment. A hit tagged `["ranked"]` is one the
-vector ranking placed, where no indexed field carries the query's literal bytes at all.
-
-**Request:**
-
-```json
-{ "query": "literal minted" }
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/crates/rift-core/src/identity.rs/encode_path",
-      "language": "rust",
-      "name": "encode_path",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["documentation", "content"],
-  "range": { "start": 1496, "end": 1925 },
-  "line": 43,
-  "path": "crates/rift-core/src/identity.rs"
-}
-```
-
-<VersionBadge version="v0.0.25" />
-
-Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
-language entry or [`[search.text].include`](/docs/developer/configuration#search) selects it. A hit on one
-of those files returns as a `file` hit, tagged `matched_by: ["content"]` the same way:
-
-**Request:**
-
-```json
-{ "query": "install checksum", "target": "file" }
-```
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "file",
-    "size": 3546
-  },
-  "matched_by": ["content"],
-  "range": { "start": 820, "end": 920 },
-  "line": 35,
-  "path": "README.md"
-}
-```
-
-A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
-returns the same way, because the selection reads the whole project-relative path. A file hit
-carries `languages` only where a syntax provider claims the path; the full-text index also
-reaches a file no provider claims, as this one does.
-
-The hit above carries no `source`: a request pays that lookup only when `include` names it.
-`include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
-the hit's symbol or file, `path`, `range`, and `line` alone, as both hits above do.
-
-A hit's `score` follows the same rule: absent unless `include` names it. `include: ["score"]`
-attaches the fused ranking value that ordered the page, comparable only within this one
-answer.
-
-### Traversal [#search-traversal]
-
-<VersionBadge version="v0.0.29" languages={["Rust"]} />
-
-`traversal` walks the references a configured
-[language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
-from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
-the optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference#SymbolId)
-values, the same identity a `get_symbol` or `search` hit already carries.
-
-`traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
-reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
-carries both entries.
-
-`direction` takes `incoming`, its default and its one value: the engine answers which
-declarations reference the seed, and no lane resolves what a declaration reaches outward. Two
-shapes cover most questions:
-
-- **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
-- **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
-
-Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
-the path length - and `traversal_path`, the [`GraphHop`](/docs/developer/protocol/reference#GraphHop) list
-from `seed` to the hit. Every `GraphHop` carries the
-[`Relationship`](/docs/developer/protocol/reference#Relationship) it followed and the direction it
-followed it in; `seed` itself is never a hit.
-
-For a Python workspace with the embedded engine configured, this request asks which declarations
-reference `serve` in `service.py`:
-
-**Request:**
+Before changing a declaration, the agent can ask which other declarations reference it.
+`traversal` starts from a symbol identity returned by `search` or `get_symbol` and follows
+incoming references:
 
 ```json
 {
   "traversal": {
-    "seed": "rift://symbol/python/service.py/serve",
+    "seed": "rift://symbol/rust/src/config.rs/load_config",
     "direction": "incoming",
     "facets": ["references"],
     "depth": 1
@@ -434,408 +189,170 @@ reference `serve` in `service.py`:
 }
 ```
 
-Each caller's `traversal_path` carries a relationship from the caller to `serve`, with
-`facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
+At `depth: 1`, the result contains declarations that reference `load_config`. At `depth: 2`,
+Rift also follows references to those declarations, helping the agent inspect the effect of a change.
+Use the returned symbol identity for `seed`, since names alone do not identify a declaration.
 
-`facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference#RelationshipFacet)
-values; an empty or omitted list follows every facet a lane populates, which is `references`
-today. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+Traversal works on current local code and needs a configured
+[language engine](/docs/developer/configuration#languages-and-lsp) that resolves references.
+The [traversal reference](/docs/developer/protocol/mcp#search-traversal) describes result paths,
+coverage warnings, and unsupported requests.
 
-A `traversal` names the declaration its walk starts at, so a request carrying no `seed`
-refuses `invalid_request` naming the field.
+</Accordion>
+<Accordion title="Language-engine references" id="search-engine-references">
 
-A walk whose seed no engine answers for refuses `capability_unavailable` naming
-`relationship traversal (no language engine serves the seed)`: nothing this workspace holds
-resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
-no facet a lane populates draws the same refusal. An engine session serves the current tree, so
-`traversal` combines with neither `rev` nor `change`, and refuses `capability_unavailable` for
-each. A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine
-answers for with no callers returns an empty result set, since an isolated declaration is a
-legitimate answer.
+During traversal, the configured language engine resolves reference locations. Rift finds the
+smallest indexed declaration containing each location, so the result identifies the caller.
+These references belong to this read and do not become indexed relationships in the map.
 
-A walk the server stops at its node bound attaches a `traversal_truncated` entry to
-`warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
-and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
+See [language-engine references](/docs/developer/protocol/mcp#search-engine-references) for
+validation, retries, and failure behavior.
 
-A walk asking for coverage no lane populates attaches a `relationship_coverage_missing` entry
-to `warnings`. Its `facets` names the requested facets no lane populates, such as `implements`
-beside the `references` the engine lane resolves. An empty answer carrying it means the walk
-could not run; an empty answer without it means the walk ran and the seed has no neighbor
-under the request.
+</Accordion>
+<Accordion title="Changes between revisions" id="search-change">
 
-### Language-engine references [#search-engine-references]
-
-<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
-
-A current-tree symbol traversal consults the configured
-[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` contains
-`references` or is empty. The engine's answer is what the walk follows, under the same
-traversal depth and result bounds.
-
-The server maps each reference location to the smallest indexed declaration containing it.
-Locations outside the workspace or without an indexed declaration contribute no hit. When no
-engine is configured, or the engine lacks reference support, the walk refuses
-`capability_unavailable`. A configured engine that fails to start returns its failure through
-[`ErrorData`](/docs/developer/protocol/reference#ErrorData).
-
-The server captures source and configuration before and after the engine request. If either
-changes, the server captures the current publication, refreshes the search ranking, and repeats
-the reference request, with at most three attempts. The publication wait, the search ranking,
-reference resolution, and these retries share one `[server] readiness_timeout` deadline, taken
-once where the request enters. Exhausted attempts or an expired deadline return
-`temporarily_unavailable` with `retry: "same_request"`.
-
-A stale publication uses indexed relationships and carries `stale_index`. Each engine request
-also uses the configured engine retry and restart bounds.
-
-### Change [#search-change]
-
-<VersionBadge
-  version="v0.0.36"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-`change` answers the declarations two committed revisions hold differently. `base` names the
-revision compared from and `head` the revision compared to, each a branch, tag, or commit id
-spelled the way git spells it; an omitted `head` is `HEAD`. Both sides name a commit, so
-uncommitted working-tree bytes take part in no comparison.
-
-The server lists the paths the two revisions hold differently, reads and parses those paths
-alone on each side, and matches declarations within one path by the provider's qualified name
-and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
-bytes differ is classified the way a [symbol timeline](#revision-reads) classifies two adjacent
-revisions, into `signature_changed`, `body_changed`, or `decorators_changed`. A declaration only
-`head` holds is `introduced`, and one only `base` holds is `removed`.
-
-A deletion and an addition in two different paths whose declarations match one to one - same
-qualified name, same kind, same bytes - are one declaration that `moved`. Anything ambiguous
-stays an addition beside a removal: two same-named declarations removed against one added leave
-three hits, because no evidence says which removal the addition answers.
-
-Each hit is tagged `matched_by: ["change"]` and carries a
-[`SymbolChange`](/docs/developer/protocol/reference#SymbolChange) as `change`, naming the `kind`
-above and the `base_path` and `head_path` the declaration lives at on each side. The hit's
-`symbol`, `path`, `range`, `line`, and `source` read the head revision:
-
-**Request:**
+When reviewing a branch, the agent can search for declarations that differ between committed
+revisions. This request compares `main` with `HEAD`:
 
 ```json
-{ "change": { "base": "main", "head": "HEAD" }, "include": ["source"] }
+{ "change": { "base": "main", "head": "HEAD" }, "target": "symbol" }
 ```
 
-**Search hit:**
+Each result describes what changed and identifies the declaration on each side of the comparison.
+The comparison uses committed code, so it does not include uncommitted edits. `change` selects
+the result set on its own; see the [change reference](/docs/developer/protocol/mcp#search-change)
+for classifications and argument constraints.
+
+</Accordion>
+</Accordions>
+
+## Symbols [#tool-get_symbol]
+
+Once search has found a relevant name, `get_symbol` reads the declaration, its signature,
+and its source.
+
+To read `load_config` from the example project, the agent calls `get_symbol`:
+
+<SymbolExample />
+
+The result gives the agent the function's definition, location, and symbol identity.
+If several declarations match, the agent can inspect their paths and qualified names
+and select the one relevant to its task.
+
+Use `include` to choose which additional information comes with each symbol. Options can be combined:
+
+| Include | Adds |
+| --- | --- |
+| `source` | Source code, with a node identity for project declarations |
+| `documentation` | Collected documentation referring to the declaration |
+| `history` | The declaration's version-control timeline |
+
+If omitted, `include` defaults to `["source"]`. An explicit list replaces that default;
+`include: []` returns the symbol and its location without these additions.
+
+<span id="get_symbol-scope" />
+
+The same `scope` values used by search apply here. Use `global` or `all` to retrieve a dependency
+declaration; package results identify their origin and do not carry local node addresses or history.
+See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for optional fields and matching behavior.
+
+## Nodes [#tool-nodes]
+
+After reading a declaration, the agent may need to change only its name, body, or one expression.
+`nodes` identifies the syntax around a position in a local file, giving the agent source ranges
+for a precise edit target.
+
+<Callout type="info">
+
+The position is a UTF-8 byte offset, rather than a line or character number.
+
+</Callout>
+
+In the sample `src/config.rs`, byte `338` lies inside the `parse_config(&text)` call:
 
 ```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/config.rs/load_config",
-      "language": "rust",
-      "name": "load_config",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["change"],
-  "change": {
-    "kind": "signature_changed",
-    "base_path": "src/config.rs",
-    "head_path": "src/config.rs"
-  },
-  "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path, strict: bool) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-  "range": { "start": 0, "end": 207 },
-  "line": 1,
-  "path": "src/config.rs"
-}
+{ "path": "src/config.rs", "position": 338 }
 ```
 
-A removed declaration is the exception: the head revision no longer holds it, so its hit keeps
-its base-side identity, path, range, and source, and its `change` carries `base_path` alone:
+The response lists enclosing nodes from outermost to innermost, with source excerpts and byte ranges:
 
-**Search hit:**
+| Node in this example | What the agent can inspect |
+| --- | --- |
+| File | The surrounding source |
+| `load_config` function | The complete declaration |
+| Function body | The implementation inside the braces |
+| `parse_config(&text)` call | The expression to change |
+| `parse_config` identifier | The name within that expression |
+
+The agent chooses the range it needs and applies the change with its own editing tools.
+After the file changes, it should read again before using its ranges for another edit.
+See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
+
+## Edits and index updates [#edit-and-index-updates]
+
+As the agents edit the codebase, rift watches the project files and updates the local index
+when they change, so the next read can use the new code.
+
+`search` and `get_symbol` can also reach the global index for dependency declarations and
+documentation. Those reads use the project's package context; edits to project source update
+the local index. See [Index](/docs/developer/architecture#index) for local updates and
+[package scope](/docs/developer/protocol/mcp#get_symbol-scope) for dependency reads.
+
+## Reading results [#reads]
+
+As the agent moves between these tools, it can keep responses small with `limit` and request
+another page using `page_index` on `search` and `get_symbol`. The returned `pagination` tells
+it which page was served and how many pages are available.
+
+Warnings explain when an answer is incomplete or a capability could not contribute.
+For example, `stale_index` reports an index behind the captured project state or a rebuild failure;
+`results_truncated` means a narrower query or path selection can bring results within the bound.
+The [read reference](/docs/developer/protocol/mcp#reads) describes each warning.
+
+<Accordions>
+<Accordion title="Earlier revisions" id="revision-reads">
+
+The agent can read older project code by adding `rev` to `search`, `get_symbol`, or `nodes`.
+For example, this reads the function from `main` without changing the working tree:
 
 ```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/legacy.rs/load_legacy_config",
-      "language": "rust",
-      "name": "load_legacy_config",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["change"],
-  "change": { "kind": "removed", "base_path": "src/legacy.rs" },
-  "source": "pub fn load_legacy_config() {}",
-  "range": { "start": 0, "end": 30 },
-  "line": 1,
-  "path": "src/legacy.rs"
-}
+{ "name": "load_config", "rev": "main" }
 ```
 
-A comparison ranks nothing, so no hit carries a `score` even when `include` names one. Ordering
-is deterministic for identical inputs: `relevance` has no score to rank by here and orders
-changed declarations by path, then by name, while `path` and `identity` order as they do in
-every other search answer. `paths` narrows which changed paths are compared, through the same
-glob engine every other selector uses. `target: "file"` never carries a change hit, since the
-comparison reaches declarations alone.
+Revision reads use committed source from a branch, tag, or commit and require a Git repository.
+See [revision-addressed reads](/docs/developer/protocol/mcp#revision-reads) for configuration
+and argument constraints.
 
-A comparison the server stops at its changed-path bound attaches a `change_truncated` entry to
-`warnings` naming that bound: declarations in the changed paths past it are absent from the
-answer, and `paths` narrows a further comparison onto them. The result set keeps its own bound
-and its `results_truncated` warning. A changed file either revision cannot read - bytes past the
-per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
-contributes no declaration, and the changed paths beside it still answer.
+</Accordion>
+<Accordion title="Errors" id="errors">
 
-The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
-revisions, and beside `query` with `invalid_request`, since the two select different result
-sets. A `traversal` beside it refuses `capability_unavailable`, since a language engine serves
-the current tree and a comparison names two committed revisions. A `scope` past `local`
-refuses with `invalid_request`, because package facts are served for the current tree alone.
-[`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
-[revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
-with no git repository refuses `capability_unavailable`, and a revision neither side resolves
-refuses `resource_not_found`.
+A failed request carries a `retry` directive that distinguishes retrying the same request from
+changing its arguments or fixing local configuration. See the
+[error reference](/docs/developer/protocol/mcp#errors) for those directives and limit details.
 
-### Package scope [#search-scope]
-
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
-
-`scope` selects what `query` runs over, with the three values
-[`get_symbol`](#get_symbol-scope) takes. `local`, the default, runs the lanes above: the
-indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
-`traversal`. `global` runs none of them and answers from the public declarations of the
-workspace's dependency packages, ranked the way the project index ranks a name. `all` runs
-both and orders the two sides together under `order`: by score under `relevance`; under
-`path`, every project path first, then the package hits in unit order.
-
-A package hit is a `symbol` hit tagged `matched_by: ["name"]`, addressed by `unit` in place
-of `path` - the [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) of the package file -
-with `range` and `line` inside that unit, and `source` when `include` names it. A package
-contributes declarations alone, so `target: "file"` answers nothing from it.
-
-<VersionBadge version="v0.0.43" />
-
-The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
-package facts are served for the current tree alone, and refuses `traversal` together with
-`global` the same way, since a walk runs over the project alone; `all` still walks the
-project graph. The package warnings under [Reads](#reads) ride a `search` answer whose
-`scope` reaches packages, as they ride a `get_symbol` answer.
-
-The resolvers read at most 256 manifests per workspace, taken in path order, so a `global` or
-`all` search over a workspace reaches packages those manifests declare. The package branch uses
-the same lazy REST request and local fallback as [`get_symbol`](#get_symbol-scope).
-
-This search reaches the `helper` crate the `get_symbol` lookup above reaches:
-
-**Request:**
-
-```json
-{ "query": "helper_beacon", "scope": "global" }
-```
-
-**Response:**
-
-```json
-{
-  "results": [
-    {
-      "hit": {
-        "target": "symbol",
-        "symbol": {
-          "id": "rift://symbol/rust/cargo/helper@0.1.0/src/lib.rs/helper_beacon",
-          "language": "rust",
-          "name": "helper_beacon",
-          "kind": "function",
-          "facets": ["value", "callable", "public"],
-          "visibility": "pub",
-          "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
-          "origin": {
-            "location": "dependency",
-            "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
-            "source_kind": "authored"
-          }
-        }
-      },
-      "matched_by": ["name"],
-      "range": { "start": 0, "end": 25 },
-      "line": 1,
-      "unit": "rift://source/cargo/helper@0.1.0/src/lib.rs"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 },
-  "warnings": [
-    {
-      "code": "global_api_unavailable",
-      "failure_class": "connection",
-      "fallback_indexed": 1,
-      "fallback_unresolved": 0
-    }
-  ]
-}
-```
-
-<McpTool name="nodes" />
-
-A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
-`capability_unavailable`, naming the extension, or stating that the path carries none.
+</Accordion>
+</Accordions>
 
 ## Resources
 
-### Server logs [#resource-logs]
+When a result needs more context, the agent can read the local configuration or diagnostics
+through MCP resources:
 
-<VersionBadge version="v0.0.22" />
+<Cards>
+<Card id="resource-workspace" title="Workspace" href="/docs/developer/protocol/mcp#resource-workspace" icon={<GearIcon />}>
 
-`rift://logs` reads the server's own diagnostics back, newest first. Events admitted by the
-`[logs] capture` filter enter a bounded queue and one task writes them to the workspace database,
-so an agent that met a refusal can ask what the server was doing without an operator reading its
-terminal. When the queue fills, the task drops later events and records the dropped count:
+`rift://workspace` shows accepted configuration and the source catalog, including which files
+and languages Rift serves.
 
-| Resource | Content |
-| --- | --- |
-| `rift://logs` | every recorded diagnostic, newest first |
-| `rift://logs/level/{level}` | one severity: `trace`, `debug`, `info`, `warn`, or `error` |
-| `rift://logs/component/{component}` | one component's records, as its spans label them |
+</Card>
+<Card id="resource-logs" title="Server logs" href="/docs/developer/protocol/mcp#resource-logs" icon={<FileTextIcon />}>
 
-The answer is a JSON object carrying `records` and `record_count`. Each record names its
-`identity` (the store's own ascending number), `recorded_at_ms`, `level`, `target`,
-`component`, `operation`, `message`, and the remaining `fields` as an object. A span that
-closed carries the fields it recorded beside `elapsed_ms`, which is how long the work it
-wrapped took.
+`rift://logs` returns recorded diagnostics, newest first, including when the index is not ready.
 
-The read never waits on workspace readiness. A request that refuses because the index will not
-settle is exactly the request whose reason these records hold, so the log read answers while
-every workspace read is still refusing. A store that could not be opened answers with an empty
-set and an `unavailable` reason rather than a refusal.
+</Card>
+<Card title="MCP reference" href="/docs/developer/protocol/mcp" icon={<BookOpenIcon />}>
 
-`[logs] page_records` bounds one read; `retention_records` bounds the store. Both are
-[workspace configuration](/docs/developer/configuration#logs).
+Complete tool examples, resource fields, limits, warnings, and failure behavior.
 
-### Workspace [#resource-workspace]
-
-<VersionBadge version="v0.0.25" />
-
-`rift://workspace` reads accepted configuration together with one captured source catalog page.
-The answer carries:
-
-- `configuration_revision` - an eight-character digest of the accepted `rift.toml` bytes
-- `languages` - effective identities in order, with enabled state, include and exclude patterns,
-  syntax availability, and selected LSP process state
-- `source` - captured project paths, content digests, and matched language identities
-- `pagination` - the zero-based page and total page count
-
-The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
-holds at most 1000 source units; language summaries repeat so every page can be read
-alone. A page past the end returns an empty `source` list with the true page count.
-
-### Map [#resource-map]
-
-<VersionBadge version="v0.0.29" />
-
-`rift://map` reads a workspace orientation snapshot: a starting picture for an agent new to the
-codebase, computed once when the index publishes and served from cache after that, so a read
-costs a lookup. The answer carries:
-
-- `revision` - an eight-character [`Digest`](/docs/developer/protocol/reference#Digest) of the indexed
-  tree the map was computed from
-- `languages` - per-language file and symbol counts, sorted by language spelling
-- `modules` - the directory tree indexed files sit under, each entry's file and symbol counts
-  inclusive of its descendants, folded three directories deep
-- `hubs` - the most-referenced symbols, ranked by reference count descending
-- `entry_points` - symbols where execution starts
-- `docs` - markdown files, in path order
-- `module_relationships` - the modules a resolved reference reaches between, ranked by that
-  count descending
-- `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
-  `name`, then selector order
-- `pagination` - always page zero of one, the whole map on one page
-
-<VersionBadge version="v0.0.29" languages={["Rust"]} />
-
-`entry_points` lists symbols carrying the `entrypoint`
-[`SymbolFacet`](/docs/developer/protocol/reference#SymbolFacet) - a file-scope `fn main`, not one
-nested in a module, an `impl` block, or another function. It stays empty for a workspace with no
-such facts.
-
-`hubs` ranks [`SymbolId`](/docs/developer/protocol/reference#SymbolId)s by how often the index
-holds a resolved reference to them, and `module_relationships` folds both ends of every such
-reference to the module `modules` lists them under, drops a pair whose two ends fold to one
-module, and counts what is left. `module_relationships` carries at most 100 entries, ordered
-by `references` descending, then `from`, then `to`, so a workspace past that bound keeps the
-strongest pairs and two reads of one tree agree. Both read the index alone: the language
-engine resolves a reference for one read and publishes none, so both lists stay empty until a
-provider publishes resolved references into the index.
-
-<VersionBadge version="v0.0.32" languages={["Rust", "Python", "TypeScript"]} />
-
-`packages` lists the [dependency context](/docs/developer/architecture#dependency-context): what the
-Cargo, uv, npm, and Bun resolvers read from `Cargo.toml` and `Cargo.lock`, `pyproject.toml` and
-`uv.lock`, `package.json` and `package-lock.json`, and `package.json` and `bun.lock`. The pass
-reads those files and nothing else, so it runs no toolchain. Each entry is a
-[`PackageContextEntry`](/docs/developer/protocol/reference#PackageContextEntry) carrying the exact
-`version` a lockfile pins or the `requirement` a manifest declares, never both, and the
-`availability` a global package index could answer under. The list follows those files: one
-rewritten while the server runs is read again on the next publication.
-
-A resolver reads at most 256 manifests per workspace, taken in path order, so `packages` over a
-workspace holding more lists what the manifests it read declare.
-
-**Request:** `rift://map`
-
-**Response:**
-
-```json
-{
-  "revision": "3f9a1c2e",
-  "languages": [
-    { "language": "rust", "files": 191, "symbols": 3204 }
-  ],
-  "modules": [
-    {
-      "path": "crates",
-      "files": 191,
-      "symbols": 3204,
-      "children": [
-        {
-          "path": "crates/rift-server",
-          "files": 16,
-          "symbols": 418
-        }
-      ]
-    }
-  ],
-  "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
-  "docs": ["README.md"],
-  "packages": [
-    {
-      "manager": "cargo",
-      "name": "tokio",
-      "version": "1.53.1",
-      "availability": "canonical"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 }
-}
-```
-
-## Errors
-
-[`ErrorData`](/docs/developer/protocol/reference#ErrorData) reports request and infrastructure failures
-such as invalid input, a crossed limit, or a storage failure.
-
-Every one carries a `retry` directive, which is the field to branch on - it rides each error
-instance rather than the code, because the same `storage_failure` can be transient once and
-permanent the next time:
-
-- `never` - the same bytes will fail the same way
-- `same_request` - it was transient: an index still filling, a tree with a filesystem
-  write in flight
-- `operator_action` - the workspace requires a local state or configuration change before retry
-
-A `limit_exceeded` also carries which limit and by how much, so a request can be resized without
-parsing the message meant for a human.
+</Card>
+</Cards>

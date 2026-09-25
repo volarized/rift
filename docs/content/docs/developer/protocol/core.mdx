@@ -74,7 +74,7 @@ covered under the `types` family.
 
 A read result carries the answer, `pagination`, and `warnings`. A condition the caller must
 weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
-[Reads](/docs/mcp#reads) section on the MCP page states the paging and warning
+[Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
 contract.
 
 [`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin) keeps source location separate from
@@ -98,4 +98,3 @@ language includes a module path in its qualified name; the timeline still record
 
 The walk is bounded by the configured history depth, and the timeline rides a
 [`get_symbol`](/docs/mcp#tool-get_symbol) hit when the request asks for history.
-
