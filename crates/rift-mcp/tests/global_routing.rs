@@ -377,17 +377,20 @@ async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() ->
     Ok(())
 }
 
+/// How long the fixture holds a resolution. A server that ignored the one-second
+/// request deadline could answer only after it, and one that honors the deadline answers
+/// well before it, however slow the machine running the test.
+const RESOLUTION_DELAY: Duration = Duration::from_secs(10);
+
 #[tokio::test]
 async fn request_deadline_bounds_global_resolution() -> TestResult {
-    let fixture = GlobalFixture::start_with_resolution_delay(
-        SymbolFixture::Valid,
-        Some(Duration::from_secs(4)),
-    )
-    .await?;
+    let fixture =
+        GlobalFixture::start_with_resolution_delay(SymbolFixture::Valid, Some(RESOLUTION_DELAY))
+            .await?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"5s\"\nconnect_timeout = \"100ms\"\n\n\
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
          [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n",
         fixture.endpoint
     );
@@ -408,7 +411,11 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     .await?;
     let started = tokio::time::Instant::now();
     let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
-    assert!(started.elapsed() < Duration::from_secs(3));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < RESOLUTION_DELAY,
+        "the request deadline must end the resolution wait: elapsed={elapsed:?}"
+    );
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
