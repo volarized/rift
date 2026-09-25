@@ -479,8 +479,6 @@ jobs:
           R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_READ_SECRET_ACCESS_KEY }}
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
-          SCCACHE_LOG: sccache::compiler::compiler=debug
-          SCCACHE_ERROR_LOG: ${{ runner.temp }}/sccache.log
         run: uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev rift-dev build-cache
       # The ci profile's default filter keeps the live and corpus suites out.
       # Ignored tests run too, except the `_probe` tests, which exist only as
@@ -506,12 +504,6 @@ jobs:
       - name: Report the build cache
         if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
         run: sccache --show-stats
-      - uses: actions/upload-artifact@v6.0.0
-        if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
-        with:
-          name: sccache-log-${{ matrix.target }}
-          path: ${{ runner.temp }}/sccache.log
-          retention-days: 3
 
   # The corpus profile compiles the whole workspace optimized. The corpus jobs
   # run an instrumented archive and the artifact job serves the plain CLI, and
