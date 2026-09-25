@@ -107,8 +107,8 @@ Python developer tooling lives in the locked `rift-dev` package under `dev/`:
 | `just integration-test` | Live language engines, models, corpus repositories, and served binary checks |
 
 Unit tests, live language-engine suites, and the corpus, artifact, and agent checks run on pull
-requests and pushes to `main`, and every release target runs the unit suite natively, Windows its
-process and update tests alone. Each target
+requests and pushes to `main`, and every release target runs the unit suite natively, Windows
+without the nine server and proxy tests issue #388 tracks. Each target
 builds once, and every check that can share a build runs from it: CI reuses compiled test archives
 and keeps compiled crates in an R2 build cache.
 See [Testing](docs/content/docs/developer/testing.mdx) for prerequisites and commands.

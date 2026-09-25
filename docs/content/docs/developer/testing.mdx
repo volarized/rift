@@ -8,16 +8,18 @@ Unit tests, live language-engine and embedding-model suites, and the corpus, art
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
 pinned Next.js, Bun, and FastAPI repositories. Each release target other than x86-64 Linux builds
 every workspace target once and runs the unit suite from that build, so every test runs on the OS
-it targets. On Windows the `ci` profile in `.config/nextest.toml` selects the process exit, server
-election, and update publisher tests: a Unix runner cannot exercise a Windows Job object or a
-replace-while-running publication. x86-64 Linux runs the unit
+it targets. On Windows the `ci` profile in `.config/nextest.toml` leaves out nine server and proxy
+tests: a detached server there inherits the output pipes of the `rift` process that started it, so a
+test that reads that process's output to its end waits for the server to exit
+([issue #388](https://github.com/volarized/rift/issues/388)). x86-64 Linux runs the unit
 suite from one instrumented archive, and the corpus checks there reuse one optimized archive
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
 
 CI compiles through [sccache](https://github.com/mozilla/sccache), which keeps compiled crates in
 the `rift-oss-build-cache` R2 bucket, so a job compiles only the crates whose inputs changed since
-a cached build.
+a cached build. On Windows the native jobs link with `/Brepro`: without it, every proc-macro build
+carries a new timestamp, and each crate that uses the macro misses the cache.
 `rift-dev build-cache` starts it; a run without the bucket's secrets, such as a pull request from
 a fork, compiles everything.
 
