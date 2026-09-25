@@ -7,7 +7,9 @@ title: Protocol
 Rift publishes one generated contract through these definitions:
 
 - [Core model](/docs/developer/protocol/core) - source discovery, identities, and provider facts shared by protocol surfaces
-- [MCP](/docs/mcp) - the tools and resources an agent calls
+- [MCP reference](/docs/developer/protocol/mcp) - tool arguments, resource responses, and failure behavior
+
+For an introduction through an agent's workflow, start with the [MCP guide](/docs/mcp).
 
 The Rust models in `crates/rift-protocol` are the source of truth. The served tool surface is
 exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
