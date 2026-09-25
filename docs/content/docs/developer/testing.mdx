@@ -19,7 +19,9 @@ and fails unless each one succeeded, and `main` accepts a pull request only once
 CI compiles through [sccache](https://github.com/mozilla/sccache), which keeps compiled crates in
 the `rift-oss-build-cache` R2 bucket, so a job compiles only the crates whose inputs changed since
 a cached build. On Windows the native jobs link with `/Brepro`: without it, every proc-macro build
-carries a new timestamp, and each crate that uses the macro misses the cache.
+carries a new timestamp, and each crate that uses the macro misses the cache. The release workflow
+starts the same build cache and restores the Cargo registry `main` saved, so a tag recompiles only
+what changed since an earlier tag.
 `rift-dev build-cache` starts it; a run without the bucket's secrets, such as a pull request from
 a fork, compiles everything.
 
