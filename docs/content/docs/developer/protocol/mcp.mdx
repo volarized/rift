@@ -531,10 +531,10 @@ declarations `serve` calls:
 
 `handle`'s `traversal_path` carries a relationship from `serve` to `handle`, with
 `facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. The local
-index holds no declaration of `len`, so its hit carries the identity the global index holds for
-it, the same identity a `get_symbol` hit with `scope: "global"` carries. Its `unit` names the
-stub it is declared in, in place of `path`, and it carries no `range` or `line`: the local index
-holds none of its bytes.
+index holds no declaration of `len`, so its hit carries the identity and the `kind` the global
+index holds for it, the same a `get_symbol` hit with `scope: "global"` carries. Its `unit` names
+the stub it is declared in, in place of `path`, and it carries no `range` or `line`: the local
+index holds none of its bytes.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference)
 values; an empty or omitted list follows every facet a lane populates, which is `references` on
