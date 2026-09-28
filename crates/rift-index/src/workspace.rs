@@ -47,6 +47,7 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::capture::{CapturedPath, LastCapture, capture_path};
 use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::documentation::NotebookFiles;
@@ -2776,20 +2777,39 @@ fn compiled_gitignore(path: &Path) -> Result<Gitignore, WorkspaceIndexError> {
 
 /// Hashes one already-discovered source and text path set without parsing syntax. Both
 /// classes enforce [`WorkspaceIndexLimits::file_bytes_max`] before counting accepted bytes
-/// against `workspace_bytes_max`, matching the catalog read the index build applies.
+/// against `workspace_bytes_max`, matching the catalog read the index build applies. A
+/// path whose stat matches `last` keeps its recorded digests without a read, and the
+/// returned [`LastCapture`] records this capture's paths for the next one.
 fn capture_paths(
     root: &Path,
     paths: &DiscoveredPaths,
     limits: WorkspaceIndexLimits,
-) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+    last: &LastCapture,
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let mut workspace_bytes = 0_usize;
+    let mut next = LastCapture::under(limits, paths.source.len() + paths.text.len());
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
-    let source = capture_path_class(&mut workspace_bytes, root, &source, limits)?;
-    let text = capture_path_class(&mut workspace_bytes, root, &paths.text, limits)?;
-    Ok(WorkspaceDigests::classified(
+    let mut capture = PathCapture {
+        workspace_bytes: &mut workspace_bytes,
+        root,
+        limits,
+        last,
+        next: &mut next,
+    };
+    let source = capture.path_class(&source)?;
+    let text = capture.path_class(&paths.text)?;
+    tracing::debug!(
+        component = "index",
+        operation = "fingerprint.bytes",
+        bytes = workspace_bytes,
+        source = source.len(),
+        text = text.len(),
+    );
+    let digests = WorkspaceDigests::classified(
         source,
         text.into_iter().map(|(path, state, _)| (path, state)),
-    ))
+    );
+    Ok((digests, next))
 }
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
@@ -2813,10 +2833,14 @@ pub fn capture_digests(
         visibility,
         &TextFileInclusion::default(),
         &LanguageFileSelections::default(),
+        &LastCapture::default(),
     )
+    .map(|(digests, _)| digests)
 }
 
-/// Reads one effective language and text selection's digests below `root`.
+/// Reads one effective language and text selection's digests below `root`, reusing the
+/// digests `last` recorded for every path whose stat did not move. The returned
+/// [`LastCapture`] records this capture's paths for the next one.
 ///
 /// # Errors
 ///
@@ -2828,75 +2852,73 @@ pub fn capture_digests_with_languages(
     visibility: &SourceVisibility,
     text_inclusion: &TextFileInclusion,
     languages: &LanguageFileSelections,
-) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+    last: &LastCapture,
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let root = canonical_root(root)?;
-    let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
-    let classified = discover(&root, limits, visibility, &language)?;
-    capture_paths(&root, &classified, limits)
+    let language = rift_core::traced!(
+        component = "index",
+        operation = "fingerprint.language_policy",
+        { WorkspaceLanguagePolicy::build(&root, languages, text_inclusion) }
+    )?;
+    let classified =
+        rift_core::traced!(component = "index", operation = "fingerprint.discover", {
+            discover(&root, limits, visibility, &language)
+        })?;
+    let source = classified.source.len();
+    let text = classified.text.len();
+    rift_core::traced!(
+        component = "index",
+        operation = "fingerprint.read",
+        source = source,
+        text = text,
+        { capture_paths(&root, &classified, limits, last) }
+    )
 }
 
-/// Reads one path class into captured file states: each kept file's project path, its
-/// file-state digest, and its content digest, in walk order.
-///
-/// Files are read and hashed across the rayon pool, and no file's bytes outlive its own
-/// digest, so the capture holds one file per worker. The kept lengths are then summed in
-/// walk order: the `workspace_bytes_max` refusal names the path a sequential read would
-/// name, and an earlier path's failure wins over a later one's.
-fn capture_path_class(
-    workspace_bytes: &mut usize,
-    root: &Path,
-    paths: &[PathBuf],
+/// One request-time capture's running state: the bytes kept so far, and the record the
+/// next capture reuses.
+struct PathCapture<'capture> {
+    workspace_bytes: &'capture mut usize,
+    root: &'capture Path,
     limits: WorkspaceIndexLimits,
-) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
-    let read: Vec<Result<Option<CapturedFile>, WorkspaceIndexError>> = paths
-        .par_iter()
-        .map(|path| CapturedFile::read(path, limits))
-        .collect();
-    let mut captured = Vec::with_capacity(paths.len());
-    for (path, file) in paths.iter().zip(read) {
-        let Some(file) = file? else {
-            continue;
-        };
-        count_workspace_bytes(workspace_bytes, file.length, path, limits)?;
-        captured.push((project_path_below(root, path)?, file.state, file.content));
-    }
-    Ok(captured)
+    last: &'capture LastCapture,
+    next: &'capture mut LastCapture,
 }
 
-/// One file's captured digests, and the byte length it counts against the workspace.
-struct CapturedFile {
-    length: usize,
-    state: FileDigest,
-    content: FileDigest,
-}
-
-impl CapturedFile {
-    /// Reads and hashes the file at `path`, or answers nothing for a file the index leaves
-    /// out: past `file_bytes_max`, holding a NUL byte, or not UTF-8.
-    fn read(
-        path: &Path,
-        limits: WorkspaceIndexLimits,
-    ) -> Result<Option<Self>, WorkspaceIndexError> {
-        let handle = fs::File::open(path).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
-        let metadata = handle.metadata().map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
-        let bytes = read_file_bytes(handle, path, limits)?;
-        if bytes.len() > limits.file_bytes_max()
-            || bytes.contains(&0)
-            || std::str::from_utf8(&bytes).is_err()
-        {
-            return Ok(None);
+impl PathCapture<'_> {
+    /// Reads one path class into captured file states: each kept file's project path, its
+    /// file-state digest, and its content digest, in walk order. Each path is recorded in
+    /// `next`, with its stat and what capturing it found.
+    ///
+    /// A path whose stat matches `last` keeps its recorded digests. Every other file is
+    /// read and hashed across the rayon pool, and no file's bytes outlive its own digest,
+    /// so the capture holds one file per worker. The kept lengths, reused ones included,
+    /// are then summed in walk order: the `workspace_bytes_max` refusal names the path a
+    /// sequential read would name, and an earlier path's failure wins over a later one's.
+    fn path_class(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+        let (limits, last) = (self.limits, self.last);
+        let read: Vec<Result<(CapturedPath, bool), WorkspaceIndexError>> = paths
+            .par_iter()
+            .map(|path| capture_path(path, limits, last))
+            .collect();
+        let mut captured = Vec::with_capacity(paths.len());
+        for (path, capture) in paths.iter().zip(read) {
+            let (capture, was_read) = capture?;
+            self.next.record(path, capture, was_read);
+            let Some(file) = capture.file() else {
+                continue;
+            };
+            count_workspace_bytes(self.workspace_bytes, file.length, path, limits)?;
+            captured.push((
+                project_path_below(self.root, path)?,
+                file.state,
+                file.content,
+            ));
         }
-        let (content, state) =
-            FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
-        Ok(Some(Self {
-            length: bytes.len(),
-            state,
-            content,
-        }))
+        Ok(captured)
     }
 }
 
@@ -3331,20 +3353,20 @@ fn catalog_file(
 }
 
 #[cfg(unix)]
-fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
+pub(crate) fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
 /// Reads at most one byte beyond the file bound, so callers can classify an oversized
 /// file without reading its remaining bytes. Capture, catalog, and syntax reads share it.
-fn read_file_bytes(
+pub(crate) fn read_file_bytes(
     reader: impl std::io::Read,
     path: &Path,
     limits: WorkspaceIndexLimits,
@@ -5680,6 +5702,47 @@ mod tests {
         );
     }
 
+    /// Captures `paths` below `root` with nothing recorded to reuse.
+    fn captured_paths(
+        root: &Path,
+        paths: &DiscoveredPaths,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+        capture_paths(root, paths, limits, &LastCapture::default()).map(|(digests, _)| digests)
+    }
+
+    #[test]
+    fn test_capture_paths_counts_reused_lengths_against_the_workspace_bound() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let limits = WorkspaceIndexLimits::new(5, 8, 10, 4, 5).expect("limits");
+        let first = root.join("first.rs");
+        let oversized = root.join("oversized.rs");
+        fs::write(&first, b"123456").expect("first source");
+        fs::write(&oversized, b"123456789").expect("oversized source");
+        let both = source_only(vec![first.clone(), oversized.clone()]);
+        let (digests, last) =
+            capture_paths(&root, &both, limits, &LastCapture::default()).expect("first fits");
+        let alone =
+            captured_paths(&root, &source_only(vec![first.clone()]), limits).expect("first alone");
+        assert_eq!(digests.fingerprint(), alone.fingerprint());
+        let (_, next) = capture_paths(&root, &both, limits, &last).expect("nothing moved");
+        assert_eq!(
+            next.read_paths(),
+            0,
+            "the left-out file stays left out without a read"
+        );
+        let second = root.join("second.rs");
+        fs::write(&second, b"123456").expect("second source");
+        let all = source_only(vec![first, oversized, second]);
+        let error = capture_paths(&root, &all, limits, &next).expect_err("workspace bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge,
+            "a reused length still counts against workspace_bytes_max"
+        );
+    }
+
     #[test]
     fn test_capture_paths_preserves_bound_and_path_failures() {
         let directory = tempfile::tempdir().expect("workspace");
@@ -5688,7 +5751,7 @@ mod tests {
 
         let missing = root.join("missing.rs");
         let error =
-            capture_paths(&root, &source_only(vec![missing]), limits).expect_err("missing source");
+            captured_paths(&root, &source_only(vec![missing]), limits).expect_err("missing source");
         assert_eq!(
             error.fault().violation(),
             WorkspaceIndexViolation::Filesystem
@@ -5696,7 +5759,7 @@ mod tests {
 
         let oversized = root.join("oversized.rs");
         fs::write(&oversized, b"123456789").expect("oversized source");
-        let digests = capture_paths(&root, &source_only(vec![oversized]), limits)
+        let digests = captured_paths(&root, &source_only(vec![oversized]), limits)
             .expect("oversized source is omitted");
         assert!(digests.is_empty());
 
@@ -5704,7 +5767,7 @@ mod tests {
         let second = root.join("second.rs");
         fs::write(&first, b"123456").expect("first source");
         fs::write(&second, b"123456").expect("second source");
-        let error = capture_paths(&root, &source_only(vec![first, second]), limits)
+        let error = captured_paths(&root, &source_only(vec![first, second]), limits)
             .expect_err("workspace bound");
         assert_eq!(
             error.fault().violation(),
@@ -5713,7 +5776,7 @@ mod tests {
 
         let outside = tempfile::NamedTempFile::new().expect("outside source");
         fs::write(outside.path(), b"fn x(){}").expect("outside bytes");
-        let error = capture_paths(
+        let error = captured_paths(
             &root,
             &source_only(vec![outside.path().to_path_buf()]),
             limits,
@@ -5729,7 +5792,7 @@ mod tests {
         // index over the same tree.
         let invalid = root.join("invalid.rs");
         fs::write(&invalid, [0xff]).expect("invalid source");
-        let digests = capture_paths(&root, &source_only(vec![invalid]), limits)
+        let digests = captured_paths(&root, &source_only(vec![invalid]), limits)
             .expect("invalid UTF-8 is omitted rather than failing the capture");
         assert!(digests.is_empty(), "the invalid file contributes no digest");
     }
@@ -5746,7 +5809,7 @@ mod tests {
             source: Vec::new(),
             text: vec![big_text],
         };
-        let digests = capture_paths(&root, &paths, limits)
+        let digests = captured_paths(&root, &paths, limits)
             .expect("a text file over file_bytes_max is omitted");
         assert!(digests.is_empty());
 
@@ -5758,7 +5821,7 @@ mod tests {
             text: vec![over_workspace],
         };
         let digests =
-            capture_paths(&root, &paths, tight).expect("the per-file bound applies first");
+            captured_paths(&root, &paths, tight).expect("the per-file bound applies first");
         assert!(digests.is_empty());
     }
 
@@ -5773,7 +5836,7 @@ mod tests {
             source: Vec::new(),
             text: vec![invalid],
         };
-        let digests = capture_paths(&root, &paths, limits)
+        let digests = captured_paths(&root, &paths, limits)
             .expect("invalid UTF-8 text is omitted rather than failing the capture");
         assert!(
             digests.is_empty(),
@@ -7533,6 +7596,160 @@ mod tests {
         );
     }
 
+    /// Captures `root` under the default policies, reusing what `last` recorded.
+    fn captured_after(root: &Path, last: &LastCapture) -> (WorkspaceDigests, LastCapture) {
+        capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            last,
+        )
+        .expect("the capture must read the tree")
+    }
+
+    /// A two-file workspace, `src/lib.rs` and `notes.txt`, and the modification time
+    /// `src/lib.rs` holds.
+    fn two_file_workspace() -> (tempfile::TempDir, std::time::SystemTime) {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("text");
+        let modified = fs::metadata(root.join("src/lib.rs"))
+            .and_then(|metadata| metadata.modified())
+            .expect("modification time");
+        (directory, modified)
+    }
+
+    /// Rewrites `path` in place, keeping its inode, and sets its modification time.
+    fn rewrite(path: &Path, bytes: &[u8], modified: std::time::SystemTime) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open for rewrite");
+        std::io::Write::write_all(&mut file, bytes).expect("rewrite");
+        file.set_modified(modified).expect("set modification time");
+    }
+
+    #[test]
+    fn test_capture_of_an_unchanged_tree_reads_no_path_again() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (first, last) = captured_after(root, &LastCapture::default());
+        assert_eq!(last.read_paths(), 2, "the first capture reads every path");
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(next.read_paths(), 0, "no stat moved, so no path is read");
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        let (_, again) = captured_after(root, &next);
+        assert_eq!(
+            again.read_paths(),
+            0,
+            "the reused record carries every path on"
+        );
+    }
+
+    #[test]
+    fn test_capture_reads_again_a_path_whose_modification_time_moved() {
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let (first, last) = captured_after(root, &LastCapture::default());
+        rewrite(
+            &root.join("src/lib.rs"),
+            b"pub fn moved() {}\n",
+            modified + std::time::Duration::from_secs(2),
+        );
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(next.read_paths(), 1, "only the edited path is read");
+        assert_ne!(second.fingerprint(), first.fingerprint());
+        let (fresh, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(
+            second.fingerprint(),
+            fresh.fingerprint(),
+            "the reused capture folds to what a full read folds to"
+        );
+    }
+
+    #[test]
+    fn test_capture_reads_again_under_other_limits() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (_, last) = captured_after(root, &LastCapture::default());
+        let limits = WorkspaceIndexLimits {
+            files_max: WorkspaceIndexLimits::default().files_max - 1,
+            ..WorkspaceIndexLimits::default()
+        };
+        let (_, next) = capture_digests_with_languages(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &last,
+        )
+        .expect("the capture must read the tree");
+        assert_eq!(
+            next.read_paths(),
+            2,
+            "a record under other limits is not reused"
+        );
+    }
+
+    /// A same-size rewrite that restores the modification time still moves the status
+    /// change time, so the capture reads the file again and sees the rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_reads_again_a_same_size_rewrite_that_restores_the_modification_time() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let path = root.join("src/lib.rs");
+        let (first, last) = captured_after(root, &LastCapture::default());
+        let recorded = fs::metadata(&path).expect("recorded stat");
+        let changed = |metadata: &fs::Metadata| (metadata.ctime(), metadata.ctime_nsec());
+        // A filesystem whose clock ticks coarser than this test runs stamps the rewrite
+        // with the recorded status change time, which is the documented same-tick miss;
+        // the rewrite repeats until that clock moves, so the case under test is the
+        // restored modification time alone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            rewrite(&path, b"pub fn keep() {}\n", modified);
+            let current = fs::metadata(&path).expect("rewritten stat");
+            if changed(&current) != changed(&recorded) {
+                assert_eq!(
+                    current.len(),
+                    recorded.len(),
+                    "the rewrite keeps the length"
+                );
+                assert_eq!(current.ino(), recorded.ino(), "the rewrite keeps the inode");
+                assert_eq!(
+                    current.modified().expect("modification time"),
+                    modified,
+                    "the rewrite restores the modification time"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the status change time never moved: recorded={:?}",
+                changed(&recorded)
+            );
+            std::thread::yield_now();
+        }
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(
+            next.read_paths(),
+            1,
+            "the moved status change time reads it"
+        );
+        assert_ne!(second.fingerprint(), first.fingerprint());
+        let (fresh, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(second.fingerprint(), fresh.fingerprint());
+    }
+
     #[test]
     fn test_a_capture_folds_the_tree_revision_the_build_stamps() {
         let directory = tempfile::tempdir().expect("temporary workspace");
@@ -7550,8 +7767,10 @@ mod tests {
                 &SourceVisibility::default(),
                 &inclusion,
                 &LanguageFileSelections::default(),
+                &LastCapture::default(),
             )
             .expect("the capture must read the tree")
+            .0
         };
         let captured = capture(root);
         assert_eq!(

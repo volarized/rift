@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
+    LastCapture, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
     capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
@@ -1270,6 +1270,9 @@ pub struct RiftMcp {
     /// writes records holds its own.
     logs: Option<Arc<LogStore>>,
     engines: Arc<EngineHold>,
+    /// The last request-time capture's stats and digests: the next capture reads only the
+    /// paths whose stat moved since.
+    last_capture: Arc<std::sync::Mutex<Arc<LastCapture>>>,
     /// The capture a test forces in place of reading the tree, so every retry arm of the
     /// bounded reconciliation loop is reached without racing filesystem events.
     #[cfg(test)]
@@ -1463,6 +1466,7 @@ impl RiftMcp {
             lexical,
             logs,
             engines,
+            last_capture: Arc::default(),
             #[cfg(test)]
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
@@ -2439,7 +2443,9 @@ impl RiftMcp {
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
             let tree_matches =
-                digests.fingerprint() == current.fingerprint && configuration_matches;
+                rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+                    digests.fingerprint() == current.fingerprint
+                }) && configuration_matches;
             if tree_matches {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
@@ -2513,7 +2519,9 @@ impl RiftMcp {
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
-    /// `current`'s accepted policy, on the worker pool.
+    /// `current`'s accepted policy, on the worker pool. A file whose stat did not move since
+    /// the last capture keeps that capture's digest without a read; [`LastCapture`] names
+    /// the one rewrite that reuse misses.
     async fn capture_tree(
         &self,
         current: &PublishedWorkspace,
@@ -2527,17 +2535,32 @@ impl RiftMcp {
         let visibility = current.configuration.source_visibility();
         let text_inclusion = current.configuration.text_inclusion();
         let languages = current.configuration.language_file_selections();
+        let last_capture = Arc::clone(&self.last_capture);
         self.blocking
             .run("workspace fingerprint", move || {
-                let digests = capture_digests_with_languages(
+                let last = Arc::clone(
+                    &last_capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                let (digests, next) = capture_digests_with_languages(
                     &root,
                     limits,
                     &visibility,
                     &text_inclusion,
                     &languages,
+                    &last,
                 )
                 .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
-                Ok((digests, configuration_fingerprint(&root)))
+                *last_capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                let configuration = rift_core::traced!(
+                    component = "index",
+                    operation = "fingerprint.configuration",
+                    { configuration_fingerprint(&root) }
+                );
+                Ok((digests, configuration))
             })
             .instrument(tracing::debug_span!(
                 "index.reconcile",
@@ -4670,12 +4693,13 @@ mod tests {
         let visibility = current.configuration.source_visibility();
         let text_inclusion = current.configuration.text_inclusion();
         let languages = current.configuration.language_file_selections();
-        let digests = super::capture_digests_with_languages(
+        let (digests, _) = super::capture_digests_with_languages(
             root,
             limits,
             &visibility,
             &text_inclusion,
             &languages,
+            &super::LastCapture::default(),
         )
         .map_err(|error| super::ReadError::from(ReadFault::Index(error)))?;
         Ok((digests, super::configuration_fingerprint(root)))

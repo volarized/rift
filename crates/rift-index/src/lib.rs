@@ -1,5 +1,6 @@
 //! In-memory indexing and retrieval.
 
+mod capture;
 mod change_set;
 mod chunk;
 mod database;
@@ -15,6 +16,7 @@ mod revision;
 mod vector;
 mod workspace;
 
+pub use capture::LastCapture;
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
