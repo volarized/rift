@@ -14,9 +14,9 @@ use opentelemetry_sdk::Resource;
 #[cfg(feature = "otlp")]
 use opentelemetry_sdk::runtime;
 #[cfg(feature = "otlp")]
-use opentelemetry_sdk::trace::SdkTracerProvider;
-#[cfg(feature = "otlp")]
 use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor;
+#[cfg(feature = "otlp")]
+use opentelemetry_sdk::trace::{BatchConfig, SdkTracerProvider};
 
 use tracing_subscriber::Layer;
 #[cfg(feature = "otlp")]
@@ -94,26 +94,53 @@ where
             return (None, Export { provider: None });
         }
     };
-    let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
-    let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
-    let provider = SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_span_processor(processor)
-        .build();
-    let tracer = provider.tracer(SERVICE_NAME);
+    let provider = tracer_provider(exporter, BatchConfig::default());
     let filter = std::env::var(RIFT_OTLP_FILTER_VAR)
         .ok()
         .and_then(|value| tracing_subscriber::EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(DEFAULT_OTLP_FILTER));
-    let layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_filter(filter);
     (
-        Some(layer),
+        Some(export_layer(&provider, filter)),
         Export {
             provider: Some(provider),
         },
     )
+}
+
+/// The tracer provider that batches every ended span into `exporter` under `batch`.
+///
+/// Must be called inside a Tokio runtime: the batch processor spawns its export task
+/// there.
+#[cfg(feature = "otlp")]
+fn tracer_provider<E>(exporter: E, batch: BatchConfig) -> SdkTracerProvider
+where
+    E: opentelemetry_sdk::trace::SpanExporter + 'static,
+{
+    let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
+        .with_batch_config(batch)
+        .build();
+    let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+    SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_span_processor(processor)
+        .build()
+}
+
+/// The layer that hands every span `filter` enables to `provider`.
+///
+/// `filter` is reevaluated at every span, so a span the export filter enables reaches
+/// `provider` whatever pass another layer's filter ran last on that thread.
+#[cfg(feature = "otlp")]
+fn export_layer<S>(
+    provider: &SdkTracerProvider,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl Layer<S> + Send + Sync + use<S>
+where
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+{
+    tracing_opentelemetry::layer()
+        .with_tracer(provider.tracer(SERVICE_NAME))
+        .with_filter(crate::reevaluated(filter))
 }
 
 /// Always `None`: no exporter exists to install without the `otlp` feature.
@@ -123,4 +150,88 @@ where
     S: tracing::Subscriber,
 {
     (None::<tracing_subscriber::layer::Identity>, Export {})
+}
+
+#[cfg(all(test, feature = "otlp"))]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::trace::{BatchConfig, SpanData, SpanExporter};
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{EnvFilter, Layer as _};
+
+    use super::{export_layer, tracer_provider};
+
+    /// Spans each test ends; enough that one lost span shows as a count mismatch.
+    const SPANS: usize = 32;
+
+    /// Every span name one exporter received, in export order.
+    #[derive(Clone, Debug, Default)]
+    struct RecordingExporter {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingExporter {
+        fn count(&self, name: &str) -> usize {
+            self.names
+                .lock()
+                .expect("the exporter's names are not poisoned")
+                .iter()
+                .filter(|exported| exported.as_str() == name)
+                .count()
+        }
+    }
+
+    impl SpanExporter for RecordingExporter {
+        fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            self.names
+                .lock()
+                .expect("the exporter's names are not poisoned")
+                .extend(batch.into_iter().map(|span| span.name.into_owned()));
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a test runtime builds")
+    }
+
+    /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
+    /// statement. A stderr filter with a bare `warn` default, such as `RUST_LOG=warn,rift=info`,
+    /// enables that probe while the export filter refuses it, which is what a search request
+    /// meets on the thread its store query ran on.
+    #[test]
+    fn every_closed_span_is_exported_after_a_probe_the_export_filter_refuses() {
+        let runtime = runtime();
+        let _entered = runtime.enter();
+        let exporter = RecordingExporter::default();
+        let provider = tracer_provider(exporter.clone(), BatchConfig::default());
+        let stderr = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(EnvFilter::new("warn,rift=info"));
+        let export = export_layer(&provider, EnvFilter::new("rift=info"));
+        let subscriber = tracing_subscriber::registry().with(stderr).with(export);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..SPANS {
+                let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
+                rift_core::traced!(component = "search", operation = "search.request", {});
+            }
+        });
+        provider
+            .shutdown()
+            .expect("the provider flushes on shutdown");
+        assert_eq!(
+            exporter.count("search.request"),
+            SPANS,
+            "every closed span must reach the exporter"
+        );
+    }
 }

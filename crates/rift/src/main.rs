@@ -19,8 +19,10 @@ use std::process::ExitCode;
 #[cfg(test)]
 use clap::{Command, CommandFactory};
 use clap::{Parser, Subcommand};
+use tracing::subscriber::Interest;
+use tracing_subscriber::filter::{DynFilterFn, FilterExt as _, LevelFilter};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::layer::{Filter, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
@@ -181,7 +183,7 @@ fn initialize_tracing(
             let (sink, drain) = rift_mcp::log_capture();
             let filter = EnvFilter::try_new(capture)
                 .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER));
-            (Some(sink.with_filter(filter)), Some(drain))
+            (Some(sink.with_filter(reevaluated(filter))), Some(drain))
         }
         None => (None, None),
     };
@@ -195,15 +197,35 @@ fn initialize_tracing(
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
                 .with_writer(writer)
-                .with_filter(
+                .with_filter(reevaluated(
                     EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
-                ),
+                )),
         )
         .with(sink)
         .with(otlp_layer)
         .init();
     (drain, otlp_export)
+}
+
+/// Wraps a per-layer filter so the subscriber asks it at every span and event.
+///
+/// `tracing-subscriber` hands each per-layer filter's answer to the registry through one
+/// thread-local state that only an `enabled` pass writes, and a callsite whose interest is
+/// cached as `always` opens its span without such a pass. `tracing::event_enabled!` runs a
+/// pass and dispatches nothing - `toasty` asks it about a `toasty::query` warning before
+/// every statement - so without this wrapper the next such span on that thread inherits the
+/// probe's answers, and each layer whose filter refused the probe loses the span: the log
+/// store does not record it, and the OTLP export does not export it.
+///
+/// The `DynFilterFn` beside `filter` enables everything and answers `sometimes` for every
+/// callsite `filter` does not refuse, so no callsite's interest is cached as `always`. Its
+/// `TRACE` hint leaves `filter`'s own level hint in force.
+fn reevaluated<S>(filter: impl Filter<S>) -> impl Filter<S> {
+    let every_time = DynFilterFn::new(|_, _| true)
+        .with_callsite_filter(|_| Interest::sometimes())
+        .with_max_level_hint(LevelFilter::TRACE);
+    filter.and(every_time)
 }
 
 #[derive(Debug)]
@@ -330,9 +352,13 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::sync::{Arc, Mutex};
 
     use super::{Cli, CliCommand, CliError, cli_command};
     use clap::Parser;
+    use tracing::span::{Attributes, Id};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+    use tracing_subscriber::{EnvFilter, Layer};
 
     #[test]
     fn empty_invocation_remains_valid() {
@@ -739,5 +765,60 @@ mod tests {
             Cli::try_parse_from(["rift", "steer", "--session-id", "abc"]).is_err(),
             "steer reads the hook call from stdin, not flags"
         );
+    }
+
+    /// Spans the filter test opens; enough that one lost span shows as a count mismatch.
+    const OPENED_SPANS: usize = 32;
+
+    /// Every span name one layer saw open, in order.
+    #[derive(Clone, Default)]
+    struct OpenedSpans {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl OpenedSpans {
+        fn count(&self, name: &str) -> usize {
+            self.names
+                .lock()
+                .expect("the opened span names are not poisoned")
+                .iter()
+                .filter(|opened| **opened == name)
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for OpenedSpans {
+        fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
+            self.names
+                .lock()
+                .expect("the opened span names are not poisoned")
+                .push(attributes.metadata().name());
+        }
+    }
+
+    /// `toasty` asks `tracing::event_enabled!` about a `toasty::query` warning before every
+    /// statement. A stderr filter with a bare `warn` default, such as `RUST_LOG=warn,rift=info`,
+    /// enables that probe while the log store's capture filter refuses it, and the capture
+    /// must still see every span that follows on the thread.
+    #[test]
+    fn a_reevaluated_filter_sees_every_span_after_a_probe_it_refuses() {
+        let capture = OpenedSpans::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                OpenedSpans::default()
+                    .with_filter(super::reevaluated(EnvFilter::new("warn,rift=info"))),
+            )
+            .with(
+                capture
+                    .clone()
+                    .with_filter(super::reevaluated(EnvFilter::new("rift=info"))),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..OPENED_SPANS {
+                let _ = tracing::event_enabled!(target: "toasty::query", tracing::Level::WARN);
+                rift_core::traced!(component = "search", operation = "search.request", {});
+            }
+        });
+        assert_eq!(capture.count("search.request"), OPENED_SPANS);
     }
 }
