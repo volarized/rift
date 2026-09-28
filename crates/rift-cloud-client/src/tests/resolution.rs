@@ -232,7 +232,7 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
     let past_the_bound = [
         Value::Array(vec![unknown; DEPENDENCY_ENTRIES_MAX + 1]),
         json!([{"code": "unknown", "detail": ""}]),
-        json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_BYTES_MAX + 1)}]),
+        json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_CHARS_MAX + 1)}]),
     ];
     for warnings in past_the_bound {
         let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
@@ -241,41 +241,46 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
             Err(ClientError::InvalidResponseField { field: "warnings" })
         );
     }
-    let at_the_bound = json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_BYTES_MAX)}]);
+    let at_the_bound = json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_CHARS_MAX)}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(at_the_bound)));
     assert_eq!(validate_resolution_response(&request, &response), Ok(()));
 }
 
 /// A `requirement_unsatisfied` detail for an entry at every package field's bound fills the
-/// warning detail bound exactly, and the resolution naming it is accepted.
+/// warning detail bound exactly, and the resolution naming it is accepted. The bounds count
+/// characters, as the contract's `maxLength` does, so a name in a multi-byte script at its
+/// bound passes the request check too, at twice the bytes.
 #[test]
 fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
     let requirement = PackageContextEntry {
         availability: PackageAvailability::Canonical,
-        manager: "m".repeat(128),
-        name: "n".repeat(IDENTIFIER_BYTES_MAX),
-        requirement: Some("r".repeat(IDENTIFIER_BYTES_MAX)),
+        manager: "m".repeat(PACKAGE_MANAGER_CHARS_MAX),
+        name: "\u{e9}".repeat(PACKAGE_NAME_CHARS_MAX),
+        requirement: Some("r".repeat(PACKAGE_VERSION_CHARS_MAX)),
         version: None,
     };
     let package = PackageIdentity {
         manager: requirement.manager.clone(),
         name: requirement.name.clone(),
-        version: "v".repeat(IDENTIFIER_BYTES_MAX),
+        version: "v".repeat(PACKAGE_VERSION_CHARS_MAX),
     };
     let detail = format!(
         "{}/{} {}{ANSWERED_BY}{}",
         requirement.manager,
         requirement.name,
-        "r".repeat(IDENTIFIER_BYTES_MAX),
+        "r".repeat(PACKAGE_VERSION_CHARS_MAX),
         package.version
     );
-    assert_eq!(detail.len(), WARNING_DETAIL_BYTES_MAX);
+    assert_eq!(detail.chars().count(), WARNING_DETAIL_CHARS_MAX);
+    assert!(detail.len() > WARNING_DETAIL_CHARS_MAX, "the name is multi-byte");
     let resolved = json!([{"entry": entry_json(&requirement), "package": package}]);
     let warnings = json!([{"code": "requirement_unsatisfied", "detail": detail}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
     let request = PackageResolutionRequest {
         entries: vec![requirement.clone()],
     };
+    assert_eq!(validate_resolution_request(&request), Ok(()));
+    assert_eq!(validate_packages(std::slice::from_ref(&package)), Ok(()));
     assert_eq!(validate_resolution_response(&request, &response), Ok(()));
     assert_eq!(
         response.substitutions(),
@@ -284,4 +289,76 @@ fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
             served: package,
         }]
     );
+}
+
+/// The manager, name, and version of one package, at their character bounds.
+struct PackageFields {
+    manager: String,
+    name: String,
+    version: String,
+}
+
+impl PackageFields {
+    fn at_bound() -> Self {
+        Self {
+            manager: "m".repeat(PACKAGE_MANAGER_CHARS_MAX),
+            name: "\u{e9}".repeat(PACKAGE_NAME_CHARS_MAX),
+            version: "v".repeat(PACKAGE_VERSION_CHARS_MAX),
+        }
+    }
+
+    fn entry(&self) -> PackageContextEntry {
+        PackageContextEntry {
+            availability: PackageAvailability::Canonical,
+            manager: self.manager.clone(),
+            name: self.name.clone(),
+            requirement: None,
+            version: Some(self.version.clone()),
+        }
+    }
+
+    fn identity(&self) -> PackageIdentity {
+        PackageIdentity {
+            manager: self.manager.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+}
+
+/// One character past a package field's bound is refused before transport, however few
+/// bytes it takes: the bounds count characters.
+#[test]
+fn test_package_fields_past_their_character_bound_are_refused() {
+    let at_bound = PackageFields::at_bound();
+    let request = PackageResolutionRequest {
+        entries: vec![at_bound.entry()],
+    };
+    assert_eq!(validate_resolution_request(&request), Ok(()));
+    assert_eq!(validate_packages(&[at_bound.identity()]), Ok(()));
+
+    let past: [(&str, &str, fn(&mut PackageFields)); 3] = [
+        ("manager", "package_manager", |fields| fields.manager.push('m')),
+        ("name", "package_name", |fields| fields.name.push('\u{e9}')),
+        ("selector", "package_version", |fields| fields.version.push('v')),
+    ];
+    for (entry_field, package_field, lengthen) in past {
+        let mut fields = PackageFields::at_bound();
+        lengthen(&mut fields);
+        let request = PackageResolutionRequest {
+            entries: vec![fields.entry()],
+        };
+        assert_eq!(
+            validate_resolution_request(&request),
+            Err(ClientError::InvalidRequest { field: entry_field }),
+            "{entry_field}"
+        );
+        assert_eq!(
+            validate_packages(&[fields.identity()]),
+            Err(ClientError::InvalidRequest {
+                field: package_field
+            }),
+            "{package_field}"
+        );
+    }
 }

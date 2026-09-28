@@ -908,11 +908,11 @@ pub struct ProjectPath(
 /// publication.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
-/// Most UTF-8 bytes the `detail` of one global API warning carries: the longest
+/// Most characters the `detail` of one global API warning carries: the longest
 /// `requirement_unsatisfied` detail the global API's package fields admit,
-/// `<manager>/<name> <requirement> answered by <version>`, at 128 bytes of manager and
-/// 4,096 bytes each of name, requirement, and version.
-pub const GLOBAL_WARNING_DETAIL_BYTES_MAX: usize = 12_431;
+/// `<manager>/<name> <requirement> answered by <version>`, at 128 characters of manager and
+/// 4,096 characters each of name, requirement, and version.
+pub const GLOBAL_WARNING_DETAIL_CHARS_MAX: usize = 12_431;
 
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
 /// in project-path order; when more files are left out, one more warning follows them and
@@ -2037,7 +2037,7 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_BYTES_MAX, GetSymbolParams,
+        Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
         GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
         PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
         RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
@@ -2087,7 +2087,7 @@ mod tests {
             .expect("the warning union holds a global_page_warning arm");
         assert_eq!(
             arm["properties"]["detail"]["maxLength"],
-            json!(GLOBAL_WARNING_DETAIL_BYTES_MAX)
+            json!(GLOBAL_WARNING_DETAIL_CHARS_MAX)
         );
     }
 

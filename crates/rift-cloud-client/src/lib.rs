@@ -82,6 +82,16 @@ pub const ATTEMPTS_MIN: u32 = 1;
 pub const ATTEMPTS_MAX: u32 = 5;
 /// Most entries one dependency context carries.
 pub const DEPENDENCY_ENTRIES_MAX: usize = 20_000;
+/// Most characters one package manager name carries, the contract's `maxLength`.
+pub const PACKAGE_MANAGER_CHARS_MAX: usize = 128;
+/// Most characters one package name carries, the contract's `maxLength`.
+pub const PACKAGE_NAME_CHARS_MAX: usize = 4_096;
+/// Most characters one package version, or one version requirement, carries: the contract's
+/// `maxLength`.
+pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
+/// Most characters one capability name, package manager name, or revision label in the
+/// capabilities and page metadata carries.
+const LABEL_CHARS_MAX: usize = 128;
 /// Most UTF-8 bytes one query carries.
 pub const QUERY_BYTES_MAX: usize = 4_096;
 /// Most terms one query carries.
@@ -106,9 +116,9 @@ pub const PAGE_LIMIT_MIN: i64 = 1;
 pub const PAGE_LIMIT_MAX: i64 = 1_000;
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
-/// Most UTF-8 bytes one warning's `detail` carries, on a page or a resolution: room for the
+/// Most characters one warning's `detail` carries, on a page or a resolution: room for the
 /// longest `requirement_unsatisfied` detail the package fields admit.
-pub const WARNING_DETAIL_BYTES_MAX: usize = rift_protocol::read::GLOBAL_WARNING_DETAIL_BYTES_MAX;
+pub const WARNING_DETAIL_CHARS_MAX: usize = rift_protocol::read::GLOBAL_WARNING_DETAIL_CHARS_MAX;
 /// What a `requirement_unsatisfied` detail writes between the requirement and the version
 /// that answers it.
 pub(crate) const ANSWERED_BY: &str = " answered by ";
@@ -1157,7 +1167,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         || value
             .supported_package_managers
             .iter()
-            .any(|manager| manager.is_empty() || manager.len() > 128)
+            .any(|manager| !within_characters(manager, LABEL_CHARS_MAX))
     {
         return Err(ClientError::InvalidResponseField {
             field: "supported_package_managers",
@@ -1169,7 +1179,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         || value
             .supported_features
             .iter()
-            .any(|feature| feature.is_empty() || feature.len() > 128)
+            .any(|feature| !within_characters(feature, LABEL_CHARS_MAX))
         || required_features.iter().any(|required| {
             !value
                 .supported_features
@@ -1181,10 +1191,8 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
             field: "supported_features",
         });
     }
-    if value.analyzer_revision.is_empty()
-        || value.analyzer_revision.len() > 128
-        || value.corpus_revision.is_empty()
-        || value.corpus_revision.len() > 128
+    if !within_characters(&value.analyzer_revision, LABEL_CHARS_MAX)
+        || !within_characters(&value.corpus_revision, LABEL_CHARS_MAX)
     {
         return Err(ClientError::InvalidResponseField { field: "revision" });
     }
@@ -1360,8 +1368,8 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
                 field: "availability",
             });
         }
-        bounded_nonempty(&entry.manager, 128, "manager")?;
-        bounded_nonempty(&entry.name, IDENTIFIER_BYTES_MAX, "name")?;
+        bounded_nonempty_characters(&entry.manager, PACKAGE_MANAGER_CHARS_MAX, "manager")?;
+        bounded_nonempty_characters(&entry.name, PACKAGE_NAME_CHARS_MAX, "name")?;
         if entry.version.is_some() == entry.requirement.is_some() {
             return Err(ClientError::InvalidRequest {
                 field: "version_or_requirement",
@@ -1369,12 +1377,9 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
         }
         if entry
             .version
-            .as_ref()
-            .is_some_and(|value| value.len() > IDENTIFIER_BYTES_MAX)
-            || entry
-                .requirement
-                .as_ref()
-                .is_some_and(|value| value.len() > IDENTIFIER_BYTES_MAX)
+            .iter()
+            .chain(&entry.requirement)
+            .any(|selector| selector.chars().count() > PACKAGE_VERSION_CHARS_MAX)
         {
             return Err(ClientError::InvalidRequest { field: "selector" });
         }
@@ -1486,13 +1491,14 @@ fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<
     Ok(())
 }
 
-/// Whether every warning's `detail`, when present, holds 1 to `WARNING_DETAIL_BYTES_MAX` bytes.
+/// Whether every warning's `detail`, when present, holds 1 to `WARNING_DETAIL_CHARS_MAX`
+/// characters.
 fn warning_details_within_bound(warnings: &[Warning]) -> bool {
     warnings.iter().all(|warning| {
         warning
             .detail
             .as_ref()
-            .is_none_or(|detail| !detail.is_empty() && detail.len() <= WARNING_DETAIL_BYTES_MAX)
+            .is_none_or(|detail| within_characters(detail, WARNING_DETAIL_CHARS_MAX))
     })
 }
 
@@ -1634,10 +1640,12 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     validate_packages(&request.packages)
 }
 
+/// Checks one package identity against the contract's bounds, which count characters: a
+/// package name the resolution answered in any script reaches the read that names it.
 fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
-    bounded_nonempty(&package.manager, 128, "package_manager")?;
-    bounded_nonempty(&package.name, IDENTIFIER_BYTES_MAX, "package_name")?;
-    bounded_nonempty(&package.version, IDENTIFIER_BYTES_MAX, "package_version")
+    bounded_nonempty_characters(&package.manager, PACKAGE_MANAGER_CHARS_MAX, "package_manager")?;
+    bounded_nonempty_characters(&package.name, PACKAGE_NAME_CHARS_MAX, "package_name")?;
+    bounded_nonempty_characters(&package.version, PACKAGE_VERSION_CHARS_MAX, "package_version")
 }
 
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
@@ -1883,8 +1891,7 @@ impl PageMetadata<'_> {
                 field: "publication_format",
             });
         }
-        if self.analyzer_revision.is_empty()
-            || self.analyzer_revision.len() > 128
+        if !within_characters(self.analyzer_revision, LABEL_CHARS_MAX)
             || self.corpus_revision != capabilities.corpus_revision
         {
             return Err(ClientError::InvalidResponseField { field: "revision" });
@@ -2123,6 +2130,25 @@ fn bounded_nonempty(value: &str, max: usize, field: &'static str) -> Result<(), 
         return Err(ClientError::InvalidRequest { field });
     }
     Ok(())
+}
+
+/// Refuses `value` naming `field` unless it holds 1 to `max` characters, the unit a
+/// contract `maxLength` counts.
+fn bounded_nonempty_characters(
+    value: &str,
+    max: usize,
+    field: &'static str,
+) -> Result<(), ClientError> {
+    if within_characters(value, max) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidRequest { field })
+    }
+}
+
+/// Whether `value` holds 1 to `max` characters.
+fn within_characters(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= max
 }
 
 fn package_key(package: &PackageIdentity) -> (String, String, String) {

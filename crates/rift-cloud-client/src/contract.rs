@@ -366,6 +366,9 @@ fn validate_request(spec: &Spec, endpoint: Endpoint, operation: &Operation) -> R
 }
 
 fn validate_bounds(spec: &Spec) -> Result<(), String> {
+    // Before the pins below, so a package field raised past the detail bound names the
+    // detail it no longer fits.
+    validate_warning_detail_bound(spec)?;
     let page_items_max =
         usize::try_from(crate::PAGE_LIMIT_MAX).map_err(|error| error.to_string())?;
     let expected_max_items = [
@@ -412,7 +415,26 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
         ("PackagePatternRequest", "pattern", SEARCH_PATTERN_CHARS_MAX),
-        ("Warning", "detail", crate::WARNING_DETAIL_BYTES_MAX),
+        ("Warning", "detail", crate::WARNING_DETAIL_CHARS_MAX),
+        ("PackageIdentity", "manager", crate::PACKAGE_MANAGER_CHARS_MAX),
+        ("PackageIdentity", "name", crate::PACKAGE_NAME_CHARS_MAX),
+        ("PackageIdentity", "version", crate::PACKAGE_VERSION_CHARS_MAX),
+        (
+            "PackageContextEntry",
+            "manager",
+            crate::PACKAGE_MANAGER_CHARS_MAX,
+        ),
+        ("PackageContextEntry", "name", crate::PACKAGE_NAME_CHARS_MAX),
+        (
+            "PackageContextEntry",
+            "version",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
+        (
+            "PackageContextEntry",
+            "requirement",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
     ];
     for (component, property, value) in expected_max_lengths {
         let schema = property_schema(spec, component, property)?;
@@ -448,8 +470,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
         )?;
     }
-    validate_pattern_page_bound(spec)?;
-    validate_warning_detail_bound(spec)
+    validate_pattern_page_bound(spec)
 }
 
 /// Pins the warning `detail` bound to the longest `requirement_unsatisfied` detail the
