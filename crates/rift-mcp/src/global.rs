@@ -605,12 +605,7 @@ pub(crate) fn merge_search(
         })
         .collect::<Vec<_>>();
     order_search_hits(&mut ordered, params.order);
-    let limit = usize::try_from(
-        params
-            .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
-    )
-    .unwrap_or(usize::MAX);
+    let limit = search_page_limit(params);
     let (results, pagination) = page_window(ordered, params.page_index, limit);
     Ok(SearchResult {
         results,
@@ -645,12 +640,7 @@ pub(crate) fn merge_patterns(
         }
     }
     order_search_hits(&mut hits, params.order);
-    let limit = usize::try_from(
-        params
-            .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
-    )
-    .unwrap_or(usize::MAX);
+    let limit = search_page_limit(params);
     let (results, pagination) = page_window(hits, params.page_index, limit);
     let mut warnings = local.warnings;
     warnings.extend(remote.warnings);
@@ -659,6 +649,14 @@ pub(crate) fn merge_patterns(
         pagination,
         warnings,
     }
+}
+
+/// The page size a search asks for: its `limit`, or the default page size when it names none.
+fn search_page_limit(params: &SearchParams) -> usize {
+    let limit = params
+        .limit
+        .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64);
+    usize::try_from(limit).unwrap_or(usize::MAX)
 }
 
 /// One page of the project's own symbol hits, for a read whose remote lane failed: the
@@ -679,12 +677,7 @@ pub(crate) fn local_symbol_page(
 /// One page of the project's own search hits, for a read whose remote lane failed: the
 /// hits keep the order the snapshot answered them in under `params.order`.
 pub(crate) fn local_search_page(params: &SearchParams, local: SearchResult) -> SearchResult {
-    let limit = usize::try_from(
-        params
-            .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
-    )
-    .unwrap_or(usize::MAX);
+    let limit = search_page_limit(params);
     let (results, pagination) = page_window(local.results, params.page_index, limit);
     SearchResult {
         results,
