@@ -50,7 +50,7 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalSearchCandidates, GlobalState, local_search_page, local_symbol_page,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, local_search_page, local_symbol_page,
     merge_search, merge_symbols, package_search, package_symbols,
 };
 use crate::parameters::Parameters;
@@ -1652,40 +1652,16 @@ impl RiftMcp {
             .read_context(params.scope, params.rev.as_ref(), &params.packages)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
-        let mut route = match tokio::time::timeout_at(
-            deadline.at(),
-            Box::pin(self.global.route(&configuration, &context)),
-        )
-        .await
-        {
-            Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(&context),
-        };
-        let mut remote_warnings = Vec::new();
-        let remote = match (&route.client, route.remote_packages.is_empty()) {
-            (Some(client), false) => {
-                match tokio::time::timeout_at(
-                    deadline.at(),
-                    Box::pin(package_symbols(client, &params, &route.remote_packages)),
-                )
-                .await
-                {
-                    Ok(Ok(remote)) => {
-                        remote_warnings = remote.warnings;
-                        remote.items
-                    }
-                    Ok(Err(error)) => {
-                        route.discard_remote(&error);
-                        Vec::new()
-                    }
-                    Err(_) => {
-                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
-                        Vec::new()
-                    }
-                }
-            }
-            _ => Vec::new(),
-        };
+        let requested = &params;
+        let (mut route, remote) = self
+            .global_read(deadline, &configuration, &context, |client, packages| async move {
+                package_symbols(&client, requested, &packages).await
+            })
+            .await;
+        let GlobalSymbolCandidates {
+            items: remote,
+            warnings: mut remote_warnings,
+        } = remote;
         let mut collected = params.clone();
         collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
         collected.page_index = 0;
@@ -1899,8 +1875,17 @@ impl RiftMcp {
             .read_context(params.scope, params.rev.as_ref(), &params.packages)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
+        let requested = &params;
+        let parsed = &parsed;
         let (mut route, mut remote) = self
-            .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
+            .global_read(
+                deadline,
+                &configuration,
+                &context,
+                |client, packages| async move {
+                    package_search(&client, requested, parsed, &packages).await
+                },
+            )
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
         let mut collected = params.clone();
@@ -1925,15 +1910,27 @@ impl RiftMcp {
         Ok(Json(answer))
     }
 
-    /// Resolves and reads the remote branch inside one MCP request deadline.
-    async fn global_search_candidates(
+    /// Resolves the package context and runs `read` over the packages the global API
+    /// serves, both inside one MCP request deadline.
+    ///
+    /// A route the global API did not answer, a route serving no package, a failed read,
+    /// and a spent deadline all answer `T::default()`: the read answers project hits alone,
+    /// and the route carries the typed warning naming why.
+    async fn global_read<T, Read, Answer>(
         &self,
         deadline: RequestDeadline,
         configuration: &rift_protocol::configuration::GlobalConfiguration,
         context: &Arc<rift_dependency::DependencyContext>,
-        params: &SearchParams,
-        parsed: &ParsedQuery,
-    ) -> (GlobalRoute, GlobalSearchCandidates) {
+        read: Read,
+    ) -> (GlobalRoute, T)
+    where
+        T: Default,
+        Read: FnOnce(
+            rift_cloud_client::GlobalClient,
+            Vec<rift_cloud_client::PackageIdentity>,
+        ) -> Answer,
+        Answer: std::future::Future<Output = Result<T, rift_cloud_client::ClientError>>,
+    {
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
             Box::pin(self.global.route(configuration, context)),
@@ -1943,33 +1940,23 @@ impl RiftMcp {
             Ok(route) => route,
             Err(_) => self.global.deadline_exceeded(context),
         };
-        let remote = match (&route.client, route.remote_packages.is_empty()) {
-            (Some(client), false) => {
-                match tokio::time::timeout_at(
-                    deadline.at(),
-                    Box::pin(package_search(
-                        client,
-                        params,
-                        parsed,
-                        &route.remote_packages,
-                    )),
-                )
-                .await
-                {
-                    Ok(Ok(remote)) => remote,
-                    Ok(Err(error)) => {
-                        route.discard_remote(&error);
-                        GlobalSearchCandidates::default()
-                    }
-                    Err(_) => {
-                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
-                        GlobalSearchCandidates::default()
-                    }
-                }
-            }
-            _ => GlobalSearchCandidates::default(),
+        let (Some(client), false) = (route.client.clone(), route.remote_packages.is_empty()) else {
+            return (route, T::default());
         };
-        (route, remote)
+        let packages = route.remote_packages.clone();
+        let answer =
+            match tokio::time::timeout_at(deadline.at(), Box::pin(read(client, packages))).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => {
+                    route.discard_remote(&error);
+                    T::default()
+                }
+                Err(_) => {
+                    route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                    T::default()
+                }
+            };
+        (route, answer)
     }
 
     /// Executes one search against the published snapshot `resolved` captured.
