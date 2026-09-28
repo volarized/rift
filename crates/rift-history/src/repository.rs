@@ -137,8 +137,8 @@ impl ResolvedRevision {
 /// path and the blob that holds its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeFile {
-    path: String,
-    blob: gix::ObjectId,
+    pub(crate) path: String,
+    pub(crate) blob: gix::ObjectId,
 }
 
 impl TreeFile {
@@ -223,8 +223,8 @@ impl PathHistory {
 /// comparison listed all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedFiles {
-    paths: Vec<String>,
-    truncated: bool,
+    pub(crate) paths: Vec<String>,
+    pub(crate) truncated: bool,
 }
 
 impl ChangedFiles {
@@ -249,11 +249,11 @@ impl ChangedFiles {
 /// then serve only entries inside the workspace, re-relativized to it.
 #[derive(Debug)]
 pub struct Repository {
-    inner: gix::Repository,
+    pub(crate) inner: gix::Repository,
     root: PathBuf,
     /// The workspace root's forward-slash path inside the repository's
     /// working tree; empty when the workspace is that root.
-    prefix: String,
+    pub(crate) prefix: String,
 }
 
 impl Repository {
@@ -457,7 +457,10 @@ impl Repository {
     }
 
     /// The tree one resolved revision's commit points at.
-    fn commit_tree(&self, revision: &ResolvedRevision) -> Result<gix::Tree<'_>, HistoryError> {
+    pub(crate) fn commit_tree(
+        &self,
+        revision: &ResolvedRevision,
+    ) -> Result<gix::Tree<'_>, HistoryError> {
         self.inner
             .find_commit(revision.commit)
             .map_err(|error| storage("read commit", &error))?
@@ -563,7 +566,7 @@ impl Repository {
 /// The bytes of `filepath` below the workspace prefix, or `None` for a path
 /// outside the workspace. An empty prefix - the workspace at the repository
 /// root - keeps every path.
-fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if prefix.is_empty() {
         return Some(filepath);
     }
@@ -792,7 +795,7 @@ fn object_kind(repository: &gix::Repository, id: gix::ObjectId) -> String {
         .map_or_else(|_| "unknown".to_owned(), |header| header.kind().to_string())
 }
 
-fn storage(operation: &'static str, error: &dyn std::fmt::Display) -> HistoryError {
+pub(crate) fn storage(operation: &'static str, error: &dyn std::fmt::Display) -> HistoryError {
     Error::new(HistoryFault::Storage {
         operation,
         detail: error.to_string(),

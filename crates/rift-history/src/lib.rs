@@ -11,6 +11,7 @@ mod contribution;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixture;
 mod repository;
+mod working;
 
 pub use contribution::{
     HistoryContributionAdapter, HistoryContributionError, HistoryContributionViolation,
@@ -19,3 +20,4 @@ pub use repository::{
     ChangedFiles, HistoryError, HistoryFault, PathHistory, PathRevision, REVISION_TREE_ENTRIES_MAX,
     Repository, ResolvedRevision, TreeFile,
 };
+pub use working::{WorkingForm, WorkingForms};
