@@ -82,7 +82,8 @@ refusal alone doesn't say why.
 
 A skill changes what an agent reaches for; habit still wins the first time it needs to search.
 Claude Code agents call `Grep` and `Glob` from training, even in a workspace `rift mcp` already
-indexes. `rift steer` catches that first call and redirects it.
+indexes, and a session whose tool set lists neither runs `grep`, `rg`, or `find` through `Bash`.
+`rift steer` catches that first call and redirects it.
 
 `rift install claude` writes a `PreToolUse` hook alongside the skill:
 
@@ -97,28 +98,53 @@ indexes. `rift steer` catches that first call and redirects it.
             "type": "command"
           }
         ],
-        "matcher": "Grep|Glob"
+        "matcher": "Grep|Glob|Bash"
       }
     ]
   }
 }
 ```
 
-Claude Code runs `rift steer` before the first `Grep` or `Glob` call in a session and pipes it
-the tool call as JSON on stdin. In a workspace Rift has indexed and version control tracks, that
-first call is denied: the reason names the [`search`](/docs/mcp#tool-search) call that
-answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for a known name,
+Claude Code runs `rift steer` before every `Grep`, `Glob`, and `Bash` call and pipes it the tool
+call as JSON on stdin. In a workspace Rift has indexed and version control tracks, the first
+search call of a session is denied: the reason names the [`search`](/docs/mcp#tool-search) call
+that answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for a known name,
 and [`rift://map`](/docs/mcp#resource-map) for orientation.
 
-The same `Grep` or `Glob` call passes if the agent retries it, and every later call in that
-session passes without a prompt. `rift steer` marks the session with a file under
-`.rift/steer/`, so it denies at most once per session.
+<VersionBadge version="v0.0.46" />
+
+The suggested call carries the agent's own search:
+
+- a `Grep` call becomes a [`pattern`](/docs/mcp#search-pattern) search with the same regex. Its
+  `path`, `glob`, and `type` become `paths.include`, `-i` a `(?i)` prefix, and `head_limit` and
+  `offset` the page
+- a `Glob` call becomes a `pattern` search for `\A`, which matches once at the start of every
+  file, with `target: "file"`: the answer lists the indexed files its pattern selects
+- a `Bash` call running one plain `grep`, `rg`, or `find` command is read as the `Grep` or
+  `Glob` call it equals. grep's basic and extended syntax is translated into the regex syntax
+  `pattern` reads, so `grep -rn "cfg(test)" src/` from the workspace root suggests:
+
+```json
+{ "pattern": "cfg\\(test\\)", "paths": { "include": ["src/**"] } }
+```
+
+A call with a part `search` has no form for passes without a deny: context lines, `multiline`,
+`output_mode: "count"`, a pipeline or a list of commands, or a flag the steer does not map.
+
+The same call passes if the agent retries it, and every later call in that session passes
+without a prompt. `rift steer` marks the session with a file under `.rift/steer/`, so it denies
+at most once per session.
 
 Every other case passes without a prompt too: a workspace with no index yet, one with no version
 control, and a session that already saw its one redirect.
 
 Set `RIFT_STEER=0` in the environment Claude Code runs in to disable the hook entirely; every
 call then passes.
+
+On a workspace installed while the hook ran under `Grep|Glob` alone, `rift install claude`
+rewrites the steering hook's matcher to `Grep|Glob|Bash` and reports that it wrote the hook. A
+steering hook sharing its group with other hooks moves to a group of its own, so none of them
+starts running on `Bash`.
 
 `rift install claude --remove` strips the hook entry from `.claude/settings.json`, leaving every
 other entry in the file untouched.
