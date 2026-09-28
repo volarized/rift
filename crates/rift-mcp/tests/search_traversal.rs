@@ -1,12 +1,18 @@
 //! Drives `search`'s `traversal` block through a live rmcp client over a fixture workspace:
 //! a callers walk, an indirect-caller walk, a path query, a hit reached both lexically and
-//! by the walk, and the refusals a walk with no edge source draws.
+//! by the walk, outgoing walks through call hierarchy, the refusals a walk with no edge
+//! source draws, the warnings a walk carries when an engine could not answer in full, and
+//! the changed files a publication hands the engines.
 //!
-//! A configured language engine resolves the references the walk follows, so every fixture
-//! here selects the embedded `ty` engine over a Python workspace: no external process, and
-//! the same lane a real read uses.
+//! A configured language engine resolves the references and calls the walk follows. Most
+//! fixtures select the embedded `ty` engine over a Python workspace: no external process,
+//! and the same lane a real read uses. Fake `sh` engines script the answers a real engine
+//! gives while it loads or after an edit, and one suite drives rust-analyzer itself under
+//! `RIFT_ENGINE_LIVE`.
 
 mod hermetic_search;
+#[path = "../../rift-lsp/tests/live_engine_gate.rs"]
+mod live_engine_gate;
 // `served_relative_workspace` and its `relative_spelling` helper are part of
 // `workspace_client`'s shared surface; this binary serves its root the plain way.
 #[allow(dead_code)]
@@ -325,6 +331,929 @@ async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> Te
     .await?;
 
     assert_eq!(code, json!("capability_unavailable"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `sh` engine that answers `initialize`, announces work it never ends, and
+/// answers every later request with no location, so the session reads analyzing on
+/// every attempt. Each start appends one line to the file its first argument names.
+#[cfg(unix)]
+const ANALYZING_ENGINE: &str = r#"echo start >> "$1"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"id":'*) frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+/// An incoming walk whose engine still reads analyzing when its wait is
+/// spent answers with `engine_analysis_unavailable` and keeps the session, as an outgoing
+/// walk does: the second walk meets the same engine process instead of starting a
+/// replacement.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_past_the_readiness_timeout_warns_and_keeps_the_engine() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let starts = engine.path().join("starts.log");
+    std::fs::write(&script, ANALYZING_ENGINE)?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        starts.display()
+    );
+    let (_directory, client, _server_task) = served_workspace(
+        &[(
+            "lib.rs",
+            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+        )],
+        Some(configuration),
+    )
+    .await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    let started_lines = || std::fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
+    let mut starts_after = Vec::new();
+    for _walk in 0..2 {
+        let started = std::time::Instant::now();
+        let structured = call_retrying_acceptance(
+            &client,
+            tool_request(
+                "search",
+                &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+            ),
+        )
+        .await?;
+        let elapsed = started.elapsed();
+        eprintln!("incoming walk: elapsed={elapsed:?} answer={structured}");
+        assert!(results(&structured).is_empty(), "{structured}");
+        let warning = &structured["warnings"][0];
+        assert_eq!(
+            warning["code"],
+            json!("engine_analysis_unavailable"),
+            "{structured}"
+        );
+        assert!(
+            warning["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("readiness_timeout")),
+            "{structured}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        starts_after.push(started_lines());
+    }
+    eprintln!("incoming: engine starts after each walk={starts_after:?}");
+    assert_eq!(
+        starts_after,
+        [1, 1],
+        "both walks meet the one engine process"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A fake engine that registers one `**/*.rs` file watcher once initialized and appends
+/// every `workspace/didChangeWatchedFiles` body it receives to the log named by `$1`. It
+/// answers every request with an empty list.
+const WATCHING_ENGINE: &str = r#"log="$1"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
+    *'"method":"initialized"'*)
+      frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}' ;;
+    *'"method":"workspace/didChangeWatchedFiles"'*)
+      printf '%s\n' "$body" >> "$log" ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+/// A publication's changed files reach the live engine session as one classified
+/// `workspace/didChangeWatchedFiles` batch before the next walk asks it anything. The
+/// edit touches files no walk opens: one modified, one created, one deleted.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let notified = engine.path().join("notified.log");
+    std::fs::write(&script, WATCHING_ENGINE)?;
+    let configuration = format!(
+        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n\
+         retry = {{ attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }}\n",
+        script.display(),
+        notified.display()
+    );
+    let (directory, client, _server_task) = served_workspace(
+        &[
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+            ("other.rs", "pub fn other_marker() {}\n"),
+            ("gone.rs", "pub fn gone_marker() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let walk = || {
+        call_retrying_acceptance(
+            &client,
+            tool_request(
+                "search",
+                &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+            ),
+        )
+    };
+    walk().await?;
+    assert!(!notified.exists(), "a new session is told nothing");
+
+    std::fs::write(
+        directory.path().join("other.rs"),
+        "pub fn other_marker() {}\n\npub fn other_marker_two() {}\n",
+    )?;
+    std::fs::write(
+        directory.path().join("added.rs"),
+        "pub fn added_marker() {}\n",
+    )?;
+    std::fs::remove_file(directory.path().join("gone.rs"))?;
+    let edited = std::time::Instant::now();
+    for (name, present) in [
+        ("other_marker_two", true),
+        ("added_marker", true),
+        ("gone_marker", false),
+    ] {
+        published_holds(&client, name, present).await?;
+    }
+    let published = edited.elapsed();
+    walk().await?;
+    let fed = edited.elapsed();
+
+    let text = std::fs::read_to_string(&notified)?;
+    let mut changes: Vec<(String, u64)> = Vec::new();
+    for line in text.lines() {
+        let body: Value = serde_json::from_str(line)?;
+        for change in body["params"]["changes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let uri = change["uri"].as_str().unwrap_or_default();
+            let name = uri.rsplit('/').next().unwrap_or_default().to_owned();
+            changes.push((name, change["type"].as_u64().unwrap_or_default()));
+        }
+    }
+    eprintln!(
+        "feed: published after {published:?}, walk answered after {fed:?}, \
+         batches={} changes={changes:?}",
+        text.lines().count()
+    );
+    changes.sort();
+    assert_eq!(
+        changes,
+        vec![
+            ("added.rs".to_owned(), 1),
+            ("gone.rs".to_owned(), 3),
+            ("other.rs".to_owned(), 2),
+        ],
+        "created, deleted, and changed reach the engine once each: {text}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The rift-lsp live Rust fixture, served with rust-analyzer 1.98 through rustup.
+const LIVE_RUST_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        include_str!("../../rift-lsp/tests/fixtures/rust/Cargo.toml"),
+    ),
+    (
+        "lib.rs",
+        include_str!("../../rift-lsp/tests/fixtures/rust/lib.rs"),
+    ),
+    (
+        "hub.rs",
+        include_str!("../../rift-lsp/tests/fixtures/rust/hub.rs"),
+    ),
+    (
+        "walk.rs",
+        include_str!("../../rift-lsp/tests/fixtures/rust/walk.rs"),
+    ),
+    (
+        "caller.rs",
+        include_str!("../../rift-lsp/tests/fixtures/rust/caller.rs"),
+    ),
+];
+
+const LIVE_RUST_ENGINE: &str =
+    "[languages.rust.lsp]\ncommand = [\"rustup\", \"run\", \"1.98\", \"rust-analyzer\"]\n";
+
+/// Walks from `seed` in `direction` until the reached names equal `expected`, at most
+/// [`LIVE_WALK_ATTEMPTS_MAX`] times, printing each answer with its wall time. Returns
+/// the attempt that matched and its answer.
+async fn live_walk(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    label: &str,
+    seed: &str,
+    direction: &str,
+    expected: &[&str],
+) -> TestResult<(usize, Value)> {
+    for attempt in 1..=LIVE_WALK_ATTEMPTS_MAX {
+        let started = std::time::Instant::now();
+        let structured = call_retrying_acceptance(
+            client,
+            tool_request(
+                "search",
+                &json!({"traversal": {"seed": seed, "direction": direction}}),
+            ),
+        )
+        .await?;
+        let reached = symbol_names(&structured);
+        eprintln!(
+            "live {label} attempt {attempt}: elapsed={:?} reached={reached:?} warnings={}",
+            started.elapsed(),
+            structured["warnings"]
+        );
+        if reached == expected {
+            return Ok((attempt, structured));
+        }
+    }
+    Err(format!("{label} never answered {expected:?}").into())
+}
+
+/// Walks one live answer may take while rust-analyzer loads the fixture.
+const LIVE_WALK_ATTEMPTS_MAX: usize = 10;
+
+/// The first walk on a cold rust-analyzer answers the callee on its first request, since
+/// the walk waits out the load instead of taking the empty prepare rust-analyzer answers
+/// while loading. rust-analyzer runs in client watcher mode, so it learns of a file no read
+/// opens only through the server's feed. `beacon` becomes `beacon2` in hub.rs, below a
+/// new `helper`, and caller.rs gains `again`. The outgoing walk from `larger` opens only
+/// walk.rs, and the incoming read of `beacon2` opens only hub.rs.
+#[tokio::test]
+async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestResult {
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let (directory, client, _server_task) =
+        served_workspace(LIVE_RUST_FILES, Some(LIVE_RUST_ENGINE.to_owned())).await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    let larger = "rift://symbol/rust/walk.rs/larger";
+    let (cold, answer) =
+        live_walk(&client, "outgoing before", larger, "outgoing", &["beacon"]).await?;
+    assert_eq!(
+        cold, 1,
+        "the first walk waits out rust-analyzer's load instead of taking the empty prepare \
+         it answers while loading as final"
+    );
+    let dropped = answer["warnings"]
+        .as_array()
+        .and_then(|warnings| {
+            warnings
+                .iter()
+                .find(|warning| warning["code"] == json!("callees_dropped"))
+        })
+        .ok_or("the walk counts the callees it dropped")?;
+    assert_eq!(
+        dropped["callees"],
+        json!(2),
+        "`max` and `len` sit in the standard library: {answer}"
+    );
+    live_walk(
+        &client,
+        "incoming before",
+        "rift://symbol/rust/hub.rs/beacon",
+        "incoming",
+        &["larger", "total"],
+    )
+    .await?;
+    eprintln!("live: warm after {:?}", started.elapsed());
+
+    std::fs::write(
+        directory.path().join("hub.rs"),
+        "pub fn helper() -> i32 {\n    0\n}\n\npub fn beacon2(value: i32) -> i32 {\n    value\n}\n",
+    )?;
+    std::fs::write(
+        directory.path().join("walk.rs"),
+        include_str!("../../rift-lsp/tests/fixtures/rust/walk.rs").replace("beacon", "beacon2"),
+    )?;
+    std::fs::write(
+        directory.path().join("caller.rs"),
+        "use crate::hub::beacon2;\n\npub fn total() -> i32 {\n    beacon2(2)\n}\n\n\
+         pub fn again() -> i32 {\n    beacon2(3)\n}\n",
+    )?;
+    let edited = std::time::Instant::now();
+    for (name, present) in [("beacon2", true), ("again", true), ("beacon", false)] {
+        published_holds(&client, name, present).await?;
+    }
+    eprintln!("live: published after {:?}", edited.elapsed());
+    let (outgoing, _) =
+        live_walk(&client, "outgoing after", larger, "outgoing", &["beacon2"]).await?;
+    eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
+    let (incoming, _) = live_walk(
+        &client,
+        "incoming after",
+        "rift://symbol/rust/hub.rs/beacon2",
+        "incoming",
+        &["again", "larger", "total"],
+    )
+    .await?;
+    eprintln!("live: incoming fresh after {:?}", edited.elapsed());
+    assert_eq!(
+        (outgoing, incoming),
+        (1, 1),
+        "both answer the edit on the first walk"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Waits until the current publication holds `name` as a symbol, or no longer does.
+async fn published_holds(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    present: bool,
+) -> TestResult {
+    for _attempt in 0..PUBLICATION_ATTEMPTS_MAX {
+        let structured =
+            call_retrying_acceptance(client, tool_request("search", &json!({"query": name})))
+                .await?;
+        if symbol_names(&structured).iter().any(|held| held == name) == present {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(format!("the publication never settled on {name} present={present}").into())
+}
+
+/// Searches one edit may take before its publication is current: 10 s at 50 ms apart.
+const PUBLICATION_ATTEMPTS_MAX: usize = 200;
+
+/// The embedded `ty` engine under the default retry table and `settle_delay`: it declares
+/// itself ready at its start, so a walk takes its first answer.
+const OUTGOING_ENGINE: &str = "[languages.python.lsp]\nembedded = \"ty\"\n";
+
+const ROOT: &str = "rift://symbol/python/graph.py/root";
+
+/// [`CALL_GRAPH_FILES`] plus a module that calls into the standard library and holds a
+/// class whose body makes a call.
+const OUTGOING_FILES: &[(&str, &str)] = &[
+    CALL_GRAPH_FILES[0],
+    (
+        "extra.py",
+        "from graph import leaf\n\nLIMIT = 3\n\n\
+         def counted() -> int:\n    return len([leaf()]) + LIMIT\n\n\
+         class Holder:\n    size = counted()\n\n    def grow(self) -> int:\n        return root_call()\n\n\
+         def root_call() -> int:\n    return 1\n",
+    ),
+];
+
+#[tokio::test]
+async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> TestResult {
+    let (_directory, client, _server_task) =
+        served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
+
+    let started = std::time::Instant::now();
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({ "traversal": { "seed": ROOT, "direction": "outgoing" } }),
+        ),
+    )
+    .await?;
+    eprintln!("outgoing depth 1: {:?}", started.elapsed());
+
+    assert_eq!(
+        symbol_names(&structured),
+        ["branch_a", "branch_b"],
+        "{structured}"
+    );
+    for hit in results(&structured) {
+        assert_eq!(hit["distance"], json!(1), "{hit}");
+        let hop = &hit["traversal_path"][0];
+        assert_eq!(hop["direction"], json!("outgoing"), "{hit}");
+        assert_eq!(hop["relationship"]["from"], json!(ROOT), "{hit}");
+        assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{hit}");
+    }
+    assert!(structured["warnings"].is_null(), "{structured}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees() -> TestResult {
+    let (_directory, client, _server_task) =
+        served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
+
+    let started = std::time::Instant::now();
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({ "traversal": { "seed": ROOT, "direction": "outgoing", "depth": 2 } }),
+        ),
+    )
+    .await?;
+    eprintln!("outgoing depth 2: {:?}", started.elapsed());
+
+    assert_eq!(
+        symbol_names(&structured),
+        ["branch_a", "branch_b", "leaf"],
+        "{structured}"
+    );
+    let leaf = results(&structured)
+        .into_iter()
+        .find(|hit| hit["hit"]["symbol"]["name"] == json!("leaf"))
+        .ok_or("leaf must be a hit")?;
+    assert_eq!(leaf["distance"], json!(2), "{leaf}");
+    assert_eq!(
+        leaf["traversal_path"][1]["relationship"]["to"],
+        json!(LEAF),
+        "{leaf}"
+    );
+
+    let only_leaf = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": { "seed": ROOT, "direction": "outgoing", "depth": 2, "to": LEAF }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&only_leaf), ["leaf"], "{only_leaf}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// `query` and an outgoing walk merge as an incoming walk does, and facets filter on
+/// `calls`: `references` has no outgoing lane, so asking for it alone refuses and beside
+/// `calls` it warns.
+#[tokio::test]
+async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> TestResult {
+    let (_directory, client, _server_task) =
+        served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
+
+    let merged = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "query": "branch_a",
+                "target": "symbol",
+                "traversal": { "seed": ROOT, "direction": "outgoing", "facets": ["calls"] }
+            }),
+        ),
+    )
+    .await?;
+    let hit = results(&merged)
+        .into_iter()
+        .find(|hit| hit["hit"]["symbol"]["name"] == json!("branch_a"))
+        .ok_or("branch_a must be a hit")?;
+    let matched_by = hit["matched_by"].as_array().ok_or("matched_by")?;
+    assert!(matched_by.contains(&json!("name")), "{hit}");
+    assert!(matched_by.contains(&json!("relationship")), "{hit}");
+    assert!(merged["warnings"].is_null(), "{merged}");
+
+    let warned = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": ROOT, "direction": "outgoing", "facets": ["references", "calls"]
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&warned), ["branch_a", "branch_b"], "{warned}");
+    assert_eq!(
+        warned["warnings"][0]["code"],
+        json!("relationship_coverage_missing")
+    );
+    assert_eq!(warned["warnings"][0]["facets"], json!(["references"]));
+
+    let code = refusal_code(
+        &client,
+        &json!({"traversal": {"seed": ROOT, "direction": "outgoing", "facets": ["references"]}}),
+    )
+    .await?;
+    assert_eq!(code, json!("capability_unavailable"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A standard library callee (`len`, answered in ty's vendored `builtins.pyi`) has no
+/// declaration in the tree, so its edge drops, the answer counts it in `callees_dropped`,
+/// and the project callee stays; a class seed answers the calls in its own body alone
+/// (`counted`, not `root_call` inside `grow`).
+#[tokio::test]
+async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_class_body()
+-> TestResult {
+    let (_directory, client, _server_task) =
+        served_workspace(OUTGOING_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
+
+    let counted = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    let warnings = counted["warnings"]
+        .as_array()
+        .ok_or("a dropped callee warns")?;
+    assert_eq!(warnings.len(), 1, "{counted}");
+    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
+    assert_eq!(warnings[0]["callees"], json!(1), "{counted}");
+
+    let holder = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/python/extra.py/Holder", "direction": "outgoing"
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&holder), ["counted"], "{holder}");
+    assert!(
+        holder["warnings"].is_null(),
+        "every callee the class body names is in the project: {holder}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `sh` engine serving references and call hierarchy that begins and ends its work at
+/// start, so the session reads it ready once quiet, and answers every request `null`: a
+/// prepare that gives no item.
+#[cfg(unix)]
+const READY_UNPREPARED_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"id":'*) frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// Once the engine reads ready, an empty prepare at the seed refuses, naming the seed's
+/// kind; the incoming walk's other refusals stay: a walk beside `change` refuses.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_refuses() -> TestResult
+{
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    std::fs::write(&script, READY_UNPREPARED_ENGINE)?;
+    let configuration = format!(
+        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
+        script.display()
+    );
+    let (_directory, client, _server_task) = served_workspace(
+        &[("lib.rs", "pub struct Beacon;\n\npub fn caller() {}\n")],
+        Some(configuration),
+    )
+    .await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "Beacon"}))).await?;
+
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({
+                "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
+            }),
+        ))
+        .await
+        .expect_err("the ready engine prepares no call hierarchy item at a struct");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+    eprintln!("refusal: message={:?} data={:?}", error.message, error.data);
+    let data = error.data.clone().unwrap_or_default();
+    assert_eq!(data["code"], json!("capability_unavailable"), "{error:?}");
+    assert!(error.message.contains("of kind `struct`"), "{error:?}");
+
+    let code = refusal_code(
+        &client,
+        &json!({
+            "change": {"base": "baseline"},
+            "traversal": {"seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing"}
+        }),
+    )
+    .await?;
+    assert_eq!(code, json!("capability_unavailable"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `sh` engine serving references and call hierarchy over `lib.rs`, whose `caller`
+/// calls `beacon`. It prepares `caller` at any position, names `beacon` at line
+/// `CALLEE_LINE` as the one callee, and answers references with `beacon`'s own occurrence
+/// on line 0 beside a call at line `CALLER_LINE`. `PROGRESS` runs once `initialize` is
+/// answered.
+#[cfg(unix)]
+const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
+      PROGRESS ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"caller\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":4,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":2,\"character\":7},\"end\":{\"line\":2,\"character\":13}}}]}" ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"beacon\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":CALLEE_LINE,\"character\":0},\"end\":{\"line\":CALLEE_LINE,\"character\":18}},\"selectionRange\":{\"start\":{\"line\":CALLEE_LINE,\"character\":7},\"end\":{\"line\":CALLEE_LINE,\"character\":13}}},\"fromRanges\":[]}]}" ;;
+    *'"method":"textDocument/references"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}},{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":CALLER_LINE,\"character\":4},\"end\":{\"line\":CALLER_LINE,\"character\":10}}}]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// The `PROGRESS` step of an engine that begins and ends its work at start, so the session
+/// reads it ready once quiet.
+#[cfg(unix)]
+const ANNOUNCED_WORK: &str = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'"#;
+
+/// The `lib.rs` [`SCRIPTED_CALLS_ENGINE`] answers about: `beacon` on line 0, and
+/// `caller` on lines 2 to 4, calling it on line 3.
+const SCRIPTED_CALLS_FILES: &[(&str, &str)] = &[(
+    "lib.rs",
+    "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+)];
+
+/// The lines a [`SCRIPTED_CALLS_ENGINE`] names: the callee's on an outgoing answer, and
+/// the call's on an incoming one.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct ScriptedLines {
+    callee: u32,
+    caller: u32,
+}
+
+/// The lines `lib.rs` holds `beacon` and its call in.
+#[cfg(unix)]
+const SERVED_LINES: ScriptedLines = ScriptedLines {
+    callee: 0,
+    caller: 3,
+};
+
+/// A line past the end of `lib.rs`, which no served byte holds.
+#[cfg(unix)]
+const UNSERVED_LINES: ScriptedLines = ScriptedLines {
+    callee: 50,
+    caller: 50,
+};
+
+/// Serves [`SCRIPTED_CALLS_FILES`] under a [`SCRIPTED_CALLS_ENGINE`] that runs `progress`
+/// at start and names `lines`.
+#[cfg(unix)]
+async fn scripted_calls_workspace(
+    progress: &str,
+    lines: ScriptedLines,
+) -> TestResult<(tempfile::TempDir, workspace_client::ServedWorkspace)> {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    std::fs::write(
+        &script,
+        SCRIPTED_CALLS_ENGINE
+            .replace("PROGRESS", progress)
+            .replace("CALLEE_LINE", &lines.callee.to_string())
+            .replace("CALLER_LINE", &lines.caller.to_string()),
+    )?;
+    let configuration = format!(
+        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
+        script.display()
+    );
+    let served = served_workspace(SCRIPTED_CALLS_FILES, Some(configuration)).await?;
+    call_retrying_acceptance(
+        &served.1,
+        tool_request("search", &json!({"query": "caller"})),
+    )
+    .await?;
+    Ok((engine, served))
+}
+
+/// An engine that announces no work reads unconfirmed, so a walk in either direction takes
+/// its answer once the session read it quiet past `settle_delay`, and the answer names the
+/// engine in `engine_readiness_unconfirmed`.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_unconfirmed()
+-> TestResult {
+    let (_engine, (_directory, client, _server_task)) =
+        scripted_calls_workspace(":", SERVED_LINES).await?;
+    for (seed, direction, reached) in [
+        ("rift://symbol/rust/lib.rs/caller", "outgoing", "beacon"),
+        ("rift://symbol/rust/lib.rs/beacon", "incoming", "caller"),
+    ] {
+        let structured = call_retrying_acceptance(
+            &client,
+            tool_request(
+                "search",
+                &json!({"traversal": {"seed": seed, "direction": direction}}),
+            ),
+        )
+        .await?;
+        assert_eq!(symbol_names(&structured), [reached], "{structured}");
+        let warnings = structured["warnings"]
+            .as_array()
+            .ok_or("an unconfirmed engine warns")?;
+        assert_eq!(warnings.len(), 1, "{structured}");
+        assert_eq!(
+            warnings[0]["code"],
+            json!("engine_readiness_unconfirmed"),
+            "{structured}"
+        );
+        assert_eq!(warnings[0]["processes"], json!(["rust"]), "{structured}");
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// An engine answer naming a line the served `lib.rs` does not hold drops the engine's
+/// contribution with `engine_analysis_unavailable`, in either direction. The indexed store
+/// holds no edge, and the walk still answers with the warning instead of refusing.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directions() -> TestResult
+{
+    let (_engine, (_directory, client, _server_task)) =
+        scripted_calls_workspace(ANNOUNCED_WORK, UNSERVED_LINES).await?;
+    for (seed, direction) in [
+        ("rift://symbol/rust/lib.rs/caller", "outgoing"),
+        ("rift://symbol/rust/lib.rs/beacon", "incoming"),
+    ] {
+        let structured = call_retrying_acceptance(
+            &client,
+            tool_request(
+                "search",
+                &json!({"traversal": {"seed": seed, "direction": direction}}),
+            ),
+        )
+        .await?;
+        assert!(results(&structured).is_empty(), "{structured}");
+        let warnings = structured["warnings"]
+            .as_array()
+            .ok_or("the dropped contribution warns")?;
+        assert_eq!(warnings.len(), 1, "{structured}");
+        assert_eq!(
+            warnings[0]["code"],
+            json!("engine_analysis_unavailable"),
+            "{structured}"
+        );
+        assert_eq!(warnings[0]["language"], json!("rust"), "{structured}");
+        assert!(
+            warnings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("line_out_of_range")),
+            "the engine answered, about a line the served bytes do not hold: {structured}"
+        );
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `sh` engine serving references and call hierarchy that announces work it never
+/// ends; each start appends one line to the file its first argument names.
+#[cfg(unix)]
+const ANALYZING_CALL_HIERARCHY_ENGINE: &str = r#"echo start >> "$1"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"id":'*) frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+/// An outgoing walk whose engine still reads analyzing when its wait is spent
+/// answers with `engine_analysis_unavailable` and keeps the session: the second walk
+/// meets the same engine process instead of starting a replacement.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_the_engine()
+-> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let starts = engine.path().join("starts.log");
+    std::fs::write(&script, ANALYZING_CALL_HIERARCHY_ENGINE)?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        starts.display()
+    );
+    let (_directory, client, _server_task) = served_workspace(
+        &[(
+            "lib.rs",
+            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+        )],
+        Some(configuration),
+    )
+    .await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "caller"}))).await?;
+    let started_lines = || std::fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
+    let mut starts_after = Vec::new();
+    for _walk in 0..2 {
+        let started = std::time::Instant::now();
+        let structured = call_retrying_acceptance(
+            &client,
+            tool_request(
+                "search",
+                &json!({"traversal": {
+                    "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing"
+                }}),
+            ),
+        )
+        .await?;
+        let elapsed = started.elapsed();
+        eprintln!("outgoing walk: elapsed={elapsed:?} answer={structured}");
+        assert!(results(&structured).is_empty(), "{structured}");
+        let warning = &structured["warnings"][0];
+        assert_eq!(
+            warning["code"],
+            json!("engine_analysis_unavailable"),
+            "{structured}"
+        );
+        assert!(
+            warning["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("readiness_timeout")),
+            "{structured}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        starts_after.push(started_lines());
+    }
+    assert_eq!(
+        starts_after,
+        [1, 1],
+        "both walks meet the one engine process"
+    );
 
     client.cancel().await?;
     Ok(())
