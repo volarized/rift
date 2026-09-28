@@ -484,12 +484,9 @@ pub(crate) fn extract_markdown_facts(
             .iter()
             .any(|error| ranges_overlap(block.range, *error))
     });
-    links.retain(|link| blocks.iter().any(|block| block.range == link.block_range));
-    reference_candidates.retain(|candidate| {
-        blocks
-            .iter()
-            .any(|block| block.range == candidate.block_range)
-    });
+    let block_ranges: HashSet<ByteRange> = blocks.iter().map(|block| block.range).collect();
+    links.retain(|link| block_ranges.contains(&link.block_range));
+    reference_candidates.retain(|candidate| block_ranges.contains(&candidate.block_range));
     blocks.sort_by_key(|block| (block.range.start, block.range.end, block.structure as u8));
     links.sort_by_key(|link| (link.range.start, link.range.end, link.kind as u8));
     reference_candidates.sort_by_key(|candidate| (candidate.range.start, candidate.range.end));
@@ -528,10 +525,16 @@ fn extract_block_facts(
     let mut heading_for_node = HashMap::new();
     let mut blocks = Vec::new();
     let mut node_blocks = HashMap::with_capacity(block_nodes.len());
+    let heading_symbols = heading_symbols_by_start(syntax);
     // `bounded_tree_nodes` already checked this tree's node and depth limits.
-    let mut stack = vec![(trees.block.root_node(), None::<usize>, None::<ByteRange>)];
+    let mut stack = vec![(
+        trees.block.root_node(),
+        None::<Node<'_>>,
+        None::<usize>,
+        None::<ByteRange>,
+    )];
     let mut cursor = trees.block.walk();
-    while let Some((node, inherited_heading, inherited_block)) = stack.pop() {
+    while let Some((node, parent, inherited_heading, inherited_block)) = stack.pop() {
         let mut child_heading = inherited_heading;
         if node.kind_id() == kinds.section {
             if let Some(declared) = declaring_heading(node, kinds.atx_heading, kinds.setext_heading)
@@ -539,7 +542,7 @@ fn extract_block_facts(
                     declared,
                     inherited_heading,
                     source.text,
-                    syntax,
+                    &heading_symbols,
                     &mut headings,
                 )?
             {
@@ -547,9 +550,14 @@ fn extract_block_facts(
                 child_heading = Some(index);
             }
         } else if node.kind_id() == kinds.setext_heading
-            && !declares_its_section(node, kinds.atx_heading, kinds.setext_heading)
-            && let Some(index) =
-                add_heading(node, inherited_heading, source.text, syntax, &mut headings)?
+            && !declares_its_section(node, parent, kinds.atx_heading, kinds.setext_heading)
+            && let Some(index) = add_heading(
+                node,
+                inherited_heading,
+                source.text,
+                &heading_symbols,
+                &mut headings,
+            )?
         {
             heading_for_node.insert(node.id(), index);
         }
@@ -587,7 +595,7 @@ fn extract_block_facts(
         }
 
         extract::push_named_children(&mut stack, &mut cursor, node, |child| {
-            (child, child_heading, current_block)
+            (child, Some(node), child_heading, current_block)
         });
     }
 
@@ -637,14 +645,18 @@ fn extract_authored_facts(
             limits.syntax_nodes_max(),
             limits.syntax_depth_max(),
         )?;
-        for entry in inline_nodes {
+        for (index, entry) in inline_nodes.iter().enumerate() {
             if entry.node.kind_id() == kinds.code_span {
                 let range = code_span_content_range(entry.node, kinds.code_span_delimiter)?;
                 if range.start < range.end {
                     reference_candidates.push(MarkdownReferenceCandidate { block_range, range });
                 }
             }
-            collect_inline_link(entry.node, block_range, source.text, kinds, &mut links)?;
+            let inline = InlineNode {
+                nodes: &inline_nodes,
+                index,
+            };
+            collect_inline_link(inline, block_range, source.text, kinds, &mut links)?;
         }
     }
     collect_block_links(trees.block.root_node(), source.text, kinds, &mut links)?;
@@ -694,6 +706,35 @@ impl ProgressBudget {
 struct BoundedNode<'tree> {
     node: Node<'tree>,
     depth: usize,
+    /// The parent's index among the walk's nodes; `None` for the root.
+    parent: Option<usize>,
+}
+
+/// One node of a bounded walk, with the walk's nodes its ancestors are read from.
+#[derive(Debug, Clone, Copy)]
+struct InlineNode<'walk, 'tree> {
+    nodes: &'walk [BoundedNode<'tree>],
+    index: usize,
+}
+
+impl<'tree> InlineNode<'_, 'tree> {
+    fn node(self) -> Node<'tree> {
+        self.nodes[self.index].node
+    }
+
+    /// The nearest ancestor whose kind is one of `kinds`, stepping through the
+    /// parents the bounded walk recorded.
+    fn nearest_ancestor(self, kinds: &[u16]) -> Option<Node<'tree>> {
+        let mut current = self.nodes[self.index].parent;
+        while let Some(index) = current {
+            let ancestor = self.nodes[index];
+            if kinds.contains(&ancestor.node.kind_id()) {
+                return Some(ancestor.node);
+            }
+            current = ancestor.parent;
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -773,9 +814,9 @@ fn bounded_tree_nodes<'tree>(
     depth_max: usize,
 ) -> Result<Vec<BoundedNode<'tree>>, SyntaxError> {
     let mut result = Vec::new();
-    let mut pending = vec![(root, base_depth)];
+    let mut pending = vec![(root, base_depth, None)];
     let mut cursor = root.walk();
-    while let Some((node, depth)) = pending.pop() {
+    while let Some((node, depth, parent)) = pending.pop() {
         if depth > depth_max {
             return Err(Error::new(SyntaxFault::TooDeep {
                 path: path.clone(),
@@ -788,14 +829,21 @@ fn bounded_tree_nodes<'tree>(
                 syntax_nodes_max: nodes_max,
             }));
         }
-        result.push(BoundedNode { node, depth });
+        let index = result.len();
+        result.push(BoundedNode {
+            node,
+            depth,
+            parent,
+        });
         if result.len() + pending.len() + node.named_child_count() > nodes_max {
             return Err(Error::new(SyntaxFault::TooManyNodes {
                 path: path.clone(),
                 syntax_nodes_max: nodes_max,
             }));
         }
-        extract::push_named_children(&mut pending, &mut cursor, node, |child| (child, depth + 1));
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+            (child, depth + 1, Some(index))
+        });
     }
     Ok(result)
 }
@@ -838,26 +886,43 @@ fn declaring_heading(section: Node<'_>, atx_heading: u16, setext_heading: u16) -
     (first.kind_id() == atx_heading || first.kind_id() == setext_heading).then_some(first)
 }
 
-fn declares_its_section(node: Node<'_>, atx_heading: u16, setext_heading: u16) -> bool {
-    node.parent()
+/// Whether `node` is the heading its parent section declares; the block walk
+/// hands over the parent it already holds.
+fn declares_its_section(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    atx_heading: u16,
+    setext_heading: u16,
+) -> bool {
+    parent
         .and_then(|parent| declaring_heading(parent, atx_heading, setext_heading))
         .is_some_and(|heading| heading.id() == node.id())
+}
+
+/// Each heading symbol's index, by the byte offset it starts at; the first
+/// heading symbol wins where two start at one offset.
+///
+/// Every heading the block walk meets looks its symbol up here, so the
+/// symbols are read once instead of once per heading.
+fn heading_symbols_by_start(syntax: &SyntaxDocument) -> HashMap<u64, usize> {
+    let mut by_start = HashMap::new();
+    for (index, symbol) in syntax.symbols().iter().enumerate() {
+        if symbol.kind == super::HEADING_KIND_WORD {
+            by_start.entry(symbol.range.start).or_insert(index);
+        }
+    }
+    by_start
 }
 
 fn add_heading(
     node: Node<'_>,
     parent: Option<usize>,
     source: &str,
-    syntax: &SyntaxDocument,
+    heading_symbols: &HashMap<u64, usize>,
     headings: &mut Vec<MarkdownHeadingFact>,
 ) -> Result<Option<usize>, SyntaxError> {
     let range = extract::byte_range(node)?;
-    let Some((symbol_index, _)) = syntax
-        .symbols()
-        .iter()
-        .enumerate()
-        .find(|(_, symbol)| symbol.kind == "heading" && symbol.range.start == range.start)
-    else {
+    let Some(&symbol_index) = heading_symbols.get(&range.start) else {
         return Ok(None);
     };
     let level = heading_level(node, source);
@@ -957,15 +1022,16 @@ fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<
 }
 
 fn collect_inline_link(
-    node: Node<'_>,
+    inline: InlineNode<'_, '_>,
     block_range: ByteRange,
     source: &str,
     kinds: &MarkdownFactKinds,
     links: &mut Vec<MarkdownLinkFact>,
 ) -> Result<(), SyntaxError> {
+    let node = inline.node();
     let kind = node.kind_id();
     if kind == kinds.link_destination {
-        let parent_link = nearest_ancestor(node, &[kinds.inline_link, kinds.image]);
+        let parent_link = inline.nearest_ancestor(&[kinds.inline_link, kinds.image]);
         let Some(parent_link) = parent_link else {
             return Ok(());
         };
@@ -1032,17 +1098,6 @@ fn child_node(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
 
 fn child_range(node: Node<'_>, kind: u16) -> Result<Option<ByteRange>, SyntaxError> {
     child_node(node, kind).map(extract::byte_range).transpose()
-}
-
-fn nearest_ancestor<'tree>(node: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if kinds.contains(&parent.kind_id()) {
-            return Some(parent);
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
