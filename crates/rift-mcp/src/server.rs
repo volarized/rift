@@ -1576,7 +1576,9 @@ impl RiftMcp {
     /// version-control revision instead of the current tree. `scope` reaches
     /// past the project tree: `global` answers from the public declarations the
     /// global index holds for the workspace's dependencies alone, `all` from both,
-    /// project hits first. Use `search` when the name is not exactly known.
+    /// project hits first. `packages` names package versions the lookup reads beside the
+    /// workspace's own, such as an upgrade target or a package the project does not use
+    /// yet. Use `search` when the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -1591,9 +1593,10 @@ impl RiftMcp {
     }
 
     /// Routes one current-tree lookup whose `scope` reaches packages: the project hits
-    /// come from the published snapshot, the package hits from the global index. A route
-    /// the global API did not answer, or a remote read that failed, leaves the project
-    /// hits alone with the typed global warning.
+    /// come from the published snapshot, the package hits from the global index, which
+    /// resolves the snapshot's dependency context with the request's `packages` applied.
+    /// A route the global API did not answer, or a remote read that failed, leaves the
+    /// project hits alone with the typed global warning.
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
@@ -1602,7 +1605,11 @@ impl RiftMcp {
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let context = resolved
+            .published
+            .reads
+            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
@@ -1666,8 +1673,10 @@ impl RiftMcp {
     /// `traversal`. `rev` searches a version-control revision instead of the current tree,
     /// and never combines with `traversal` or `change`. `scope` reaches past the project
     /// tree: `global` answers `query` from the public declarations the global index holds
-    /// for the workspace's dependencies alone, `all` from both, ordered together. Use
-    /// `get_symbol` when the declaration name is known.
+    /// for the workspace's dependencies alone, `all` from both, ordered together.
+    /// `packages` names package versions `query` searches beside the workspace's own, such
+    /// as an upgrade target or a package the project does not use yet. Use `get_symbol`
+    /// when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1813,7 +1822,8 @@ impl RiftMcp {
 
     /// Routes one current-tree search: the project hits come from the published snapshot,
     /// and a `query` whose `scope` reaches packages adds the global index's package hits,
-    /// ordered together. A route the global API did not answer, or a remote read that
+    /// ordered together, for the snapshot's dependency context with the request's
+    /// `packages` applied. A route the global API did not answer, or a remote read that
     /// failed, leaves the project hits alone with the typed global warning.
     async fn route_current_tree_search(
         &self,
@@ -1840,7 +1850,11 @@ impl RiftMcp {
             return Ok(answer);
         };
 
-        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let context = resolved
+            .published
+            .reads
+            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let (mut route, mut remote) = self
             .global_search_candidates(deadline, &configuration, &context, &params, &parsed)

@@ -7,7 +7,7 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, LimitEvidence,
-    SourceVisibility, TextFileInclusion, line,
+    SourceVisibility, TextFileInclusion, fault_label, line,
 };
 use rift_dependency::{DependencyContext, StandardLibrary};
 use rift_history::{HistoryError, Repository};
@@ -17,7 +17,9 @@ use rift_index::{
     WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
-use rift_protocol::dependencies::{DependenciesConfiguration, DependencyResolution};
+use rift_protocol::dependencies::{
+    DependenciesConfiguration, DependencyResolution, REQUESTED_PACKAGES_MAX, RequestedPackage,
+};
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams,
@@ -824,6 +826,29 @@ impl ReadService {
         &self.context
     }
 
+    /// The dependency context one current-tree read resolves through the global API:
+    /// this snapshot's own, with the request's `packages` applied through
+    /// [`DependencyContext::with_requested`]. A request naming no package reads the
+    /// snapshot's context as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming `packages` for an argument the read cannot send:
+    /// beside the `local` scope, beside `rev`, past `REQUESTED_PACKAGES_MAX` entries, or
+    /// with an entry outside its advertised lengths.
+    pub fn read_context(
+        &self,
+        scope: SearchScope,
+        rev: Option<&RevisionId>,
+        packages: &[RequestedPackage],
+    ) -> Result<Arc<DependencyContext>, ReadError> {
+        validate_requested_packages(scope, rev.is_some(), packages)?;
+        if packages.is_empty() {
+            return Ok(Arc::clone(&self.context));
+        }
+        Ok(Arc::new(self.context.with_requested(packages)))
+    }
+
     /// The accepted `[dependencies]` table this snapshot was built under.
     #[must_use]
     pub const fn dependency_configuration(&self) -> &DependenciesConfiguration {
@@ -1013,11 +1038,13 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a scope beyond `local` beside `rev`, and for symbol
-    /// history the workspace's version control cannot serve.
+    /// Returns [`ReadError`] for a scope beyond `local` beside `rev`, a `packages`
+    /// argument the read cannot send, and symbol history the workspace's version control
+    /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
+        validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         // The whole ranked match set is collected up to the project index's own
         // `results_max` bound, so `pagination.total_pages` counts the full result set the
@@ -1177,6 +1204,57 @@ const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
 )]
 pub(crate) fn validate_common(_rev: bool) -> Result<(), ReadError> {
     Ok(())
+}
+
+/// Refuses a `packages` argument no read can send: `get_symbol` and `search` share the
+/// rule.
+///
+/// A `local` scope reads the project alone, and a revision read serves no package fact,
+/// so either leaves the argument nothing to change. The list is bounded by
+/// [`REQUESTED_PACKAGES_MAX`], and each entry is classified against the lengths its
+/// schema advertises before it can reach the global API.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming `packages` for the first rule the argument breaks.
+pub(crate) fn validate_requested_packages(
+    scope: SearchScope,
+    rev: bool,
+    packages: &[RequestedPackage],
+) -> Result<(), ReadError> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    if rev {
+        return Err(ReadFault::invalid(
+            "packages",
+            "package facts are served for the current tree alone",
+        ));
+    }
+    if scope == SearchScope::Local {
+        return Err(ReadFault::invalid(
+            "packages",
+            "the local scope reads the project alone",
+        ));
+    }
+    if packages.len() > REQUESTED_PACKAGES_MAX {
+        return Err(ReadFault::invalid(
+            "packages",
+            format!(
+                "{} entries exceed the maximum {REQUESTED_PACKAGES_MAX}",
+                packages.len()
+            ),
+        ));
+    }
+    let entry_violation = packages.iter().enumerate().find_map(|(index, package)| {
+        package
+            .violation()
+            .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
+    });
+    match entry_violation {
+        Some(violation) => Err(ReadFault::invalid("packages", violation)),
+        None => Ok(()),
+    }
 }
 
 /// Cuts one page out of a fully collected result set and states where the page sits.
@@ -1730,8 +1808,9 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DependenciesConfiguration, DependencyResolution, HistoryConfiguration, ReadFault,
-        ReadService, WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
+        Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
+        REQUESTED_PACKAGES_MAX, ReadError, ReadFault, ReadService, RequestedPackage,
+        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id, validate_requested_packages,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -3148,6 +3227,132 @@ pub fn compute() -> i32 {
             );
             assert_eq!(error.descriptor().code(), "invalid_request");
         }
+        Ok(())
+    }
+
+    /// One `get_symbol` request, `arguments` laid over `name: "beacon"`.
+    fn lookup(arguments: serde_json::Value) -> TestResult<GetSymbolParams> {
+        let mut request = json!({"name": "beacon"});
+        for (key, value) in arguments.as_object().ok_or("arguments are an object")? {
+            request[key] = value.clone();
+        }
+        Ok(serde_json::from_value(request)?)
+    }
+
+    fn packages_violation(error: &ReadError) -> Option<&str> {
+        match error.fault() {
+            ReadFault::Invalid {
+                field: "packages",
+                violation,
+            } => Some(violation.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A `local` read consults no package, so `packages` beside it, spelled or omitted,
+    /// refuses naming the field.
+    #[test]
+    fn get_symbol_packages_beside_the_local_scope_refuses_naming_packages() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let packages = json!([{"manager": "cargo", "name": "serde"}]);
+        for request in [
+            json!({"packages": packages}),
+            json!({"packages": packages, "scope": "local"}),
+        ] {
+            let error = service
+                .get_symbol(&lookup(request.clone())?)
+                .expect_err("a local read names no package");
+            assert_eq!(
+                packages_violation(&error),
+                Some("the local scope reads the project alone"),
+                "{request}: {error}"
+            );
+            assert_eq!(error.descriptor().code(), "invalid_request");
+        }
+        Ok(())
+    }
+
+    /// Package facts follow the current tree alone, so `packages` beside `rev` refuses
+    /// naming the field, whatever the scope.
+    #[test]
+    fn get_symbol_packages_beside_rev_refuses_naming_packages() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        for scope in ["local", "global", "all"] {
+            let request = json!({
+                "scope": scope,
+                "rev": "main",
+                "packages": [{"manager": "cargo", "name": "serde", "version": "1.0.228"}]
+            });
+            let error = service
+                .get_symbol(&lookup(request)?)
+                .expect_err("a revision read names no package");
+            assert_eq!(
+                packages_violation(&error),
+                Some("package facts are served for the current tree alone"),
+                "scope {scope}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The argument holds at most `REQUESTED_PACKAGES_MAX` entries, and the first entry
+    /// outside its advertised lengths is named by position and rule.
+    #[test]
+    fn requested_packages_refuse_past_the_bound_and_name_a_malformed_entry() {
+        let package = |name: &str| RequestedPackage {
+            manager: "cargo".to_owned(),
+            name: name.to_owned(),
+            version: None,
+        };
+        let at_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX];
+        assert!(validate_requested_packages(SearchScope::All, false, &at_bound).is_ok());
+        assert!(validate_requested_packages(SearchScope::Local, true, &[]).is_ok());
+
+        let past_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX + 1];
+        let error = validate_requested_packages(SearchScope::Global, false, &past_bound)
+            .expect_err("one entry past the bound refuses");
+        assert_eq!(
+            packages_violation(&error),
+            Some("65 entries exceed the maximum 64")
+        );
+
+        let error = validate_requested_packages(
+            SearchScope::All,
+            false,
+            &[package("serde"), package(""), package("")],
+        )
+        .expect_err("an empty name refuses");
+        assert_eq!(
+            packages_violation(&error),
+            Some("entry 1 breaks name_length")
+        );
+    }
+
+    /// A read naming packages resolves a context of its own, and one naming none reads
+    /// the snapshot's context itself.
+    #[test]
+    fn read_context_applies_the_requested_packages_for_one_read() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let unchanged = service.read_context(SearchScope::Global, None, &[])?;
+        assert!(Arc::ptr_eq(&unchanged, service.dependency_context()));
+
+        let requested = [RequestedPackage {
+            manager: "cargo".to_owned(),
+            name: "serde".to_owned(),
+            version: Some("1.0.228".to_owned()),
+        }];
+        let held = service.dependency_context().entries().to_vec();
+        let mut expected = held.clone();
+        expected.push(requested[0].context_entry());
+        expected.sort();
+        let read = service.read_context(SearchScope::All, None, &requested)?;
+        assert_eq!(read.entries(), expected);
+        assert_eq!(service.dependency_context().entries(), held);
+
+        let error = service
+            .read_context(SearchScope::Local, None, &requested)
+            .expect_err("a local read names no package");
+        assert!(packages_violation(&error).is_some(), "{error}");
         Ok(())
     }
 

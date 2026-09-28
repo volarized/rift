@@ -36,7 +36,8 @@ use crate::engine_read::EngineReferences;
 use crate::read::parse_symbol_address;
 use crate::read::{
     ReadError, ReadFault, ReadService, accepted_limit, excerpt, page, project_path,
-    results_truncation_warning, source_warnings, text_range, validate_common, wire_symbol,
+    results_truncation_warning, source_warnings, text_range, validate_common,
+    validate_requested_packages, wire_symbol,
 };
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
@@ -152,8 +153,8 @@ impl ReadService {
     /// # Errors
     ///
     /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
-    /// a scope beyond `local` beside a revision, `global` beside `traversal`, and a query
-    /// the bounded parser refuses.
+    /// a scope beyond `local` beside a revision, `global` beside `traversal`, a `packages`
+    /// argument the read cannot send, and a query the bounded parser refuses.
     pub fn search(
         &self,
         params: &SearchParams,
@@ -615,6 +616,7 @@ impl SelectedPaths {
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(params.rev.is_some())?;
+    validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
@@ -4460,6 +4462,47 @@ impl Tower {
             super::validate_search(&params).is_ok(),
             "{arguments} must pass the seed rule"
         );
+    }
+
+    /// `packages` reaches the global API alone, so beside the `local` scope and beside
+    /// `rev` the search refuses naming it, and beside a scope reaching packages it passes
+    /// the rule.
+    #[test]
+    fn search_packages_refuse_beside_the_local_scope_and_rev() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let packages = json!([{"manager": "cargo", "name": "serde"}]);
+        for (request, violation) in [
+            (
+                json!({"query": "beacon", "packages": packages}),
+                "the local scope reads the project alone",
+            ),
+            (
+                json!({"query": "beacon", "scope": "all", "rev": "main", "packages": packages}),
+                "package facts are served for the current tree alone",
+            ),
+            (
+                json!({"change": {"base": "main"}, "packages": packages}),
+                "the local scope reads the project alone",
+            ),
+        ] {
+            let params: SearchParams = serde_json::from_value(request.clone())?;
+            let error = service
+                .search(&params, &StoreAnswer::identifier_only())
+                .expect_err("the argument has nothing to change");
+            assert!(
+                matches!(
+                    error.fault(),
+                    ReadFault::Invalid { field: "packages", violation: found } if found == violation
+                ),
+                "{request}: {error}"
+            );
+        }
+        let params: SearchParams = serde_json::from_value(
+            json!({"query": "beacon", "scope": "all", "packages": packages}),
+        )?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert!(!answer.results.is_empty(), "{answer:?}");
+        Ok(())
     }
 
     #[test]

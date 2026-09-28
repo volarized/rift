@@ -11,13 +11,16 @@ walked from the served revision. `rev` serves the lookup from a
 version-control revision instead of the current tree. `scope` reaches
 past the project tree: `global` answers from the public declarations the
 global index holds for the workspace's dependencies alone, `all` from both,
-project hits first. Use `search` when the name is not exactly known.
+project hits first. `packages` names package versions the lookup reads beside the
+workspace's own, such as an upgrade target or a package the project does not use
+yet. Use `search` when the name is not exactly known.
 
 Parameters:
 
 - `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
 - `language` - Narrows the answer to one language.
 - `scope` - Which declarations the lookup searches: the project tree, the dependency packages, or both.
+- `packages` - Packages this lookup reads beside the ones the workspace's manifests and lockfiles name, at most 64.
 - `include` - Optional hit fields to attach: `source`, `history`.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
 - `page_index` - Zero-based page of the result set to serve, sized by `limit`.
@@ -47,8 +50,10 @@ declarations two committed revisions hold differently, in place of `query` and
 `traversal`. `rev` searches a version-control revision instead of the current tree,
 and never combines with `traversal` or `change`. `scope` reaches past the project
 tree: `global` answers `query` from the public declarations the global index holds
-for the workspace's dependencies alone, `all` from both, ordered together. Use
-`get_symbol` when the declaration name is known.
+for the workspace's dependencies alone, `all` from both, ordered together.
+`packages` names package versions `query` searches beside the workspace's own, such
+as an upgrade target or a package the project does not use yet. Use `get_symbol`
+when the declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -61,6 +66,7 @@ Parameters:
 - `order` - Which total order the page comes back in.
 - `query` - Text to match against declaration names, qualified names, signatures, attached documentation, declaration source, and file contents.
 - `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
+- `packages` - Packages `query` searches beside the ones the workspace's manifests and lockfiles name, at most 64.
 - `paths` - Files eligible for the search, selected by project-relative globs.
 - `include` - Extra payload to attach to every hit.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
