@@ -1601,18 +1601,21 @@ pub enum RelationshipFacet {
 }
 
 /// Longest revision spelling the wire accepts, in bytes; the accepted charset is ASCII, so
-/// the schema's `{1,128}` repetition counts the same units.
+/// the schema's `maxLength` counts the same units.
 pub const REVISION_ID_BYTES_MAX: usize = 128;
 
 /// Identity of one revision in the workspace's version-control history, spelled the way the
-/// version-control system spells it. Rift carries it opaquely and never orders two revisions
-/// by comparing their identifiers.
+/// version-control system spells it: a branch, tag, or commit id, optionally followed by
+/// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
+/// the second parent. Rift carries it opaquely and never orders two revisions by comparing
+/// their identifiers.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct RevisionId(
     #[schemars(example = &"main")]
-    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))]
+    #[schemars(length(min = 1, max = 128))]
+    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$"))]
     pub String,
 );
 
@@ -1635,8 +1638,11 @@ pub enum RevisionIdViolation {
     Empty,
     /// The spelling is longer than [`REVISION_ID_BYTES_MAX`] bytes.
     TooLong,
-    /// The spelling carries a byte outside `A-Z a-z 0-9 . _ / -`.
+    /// The spelling carries a byte outside `A-Z a-z 0-9 . _ / - ~ ^`.
     CharsetForbidden,
+    /// An ancestry suffix follows no name, or a `~` or `^` is followed by something other
+    /// than digits or another suffix, as in `~1` or `HEAD~1/src`.
+    AncestryInvalid,
 }
 
 impl RevisionIdViolation {
@@ -1647,6 +1653,7 @@ impl RevisionIdViolation {
             Self::Empty => "empty",
             Self::TooLong => "too_long",
             Self::CharsetForbidden => "charset_forbidden",
+            Self::AncestryInvalid => "ancestry_invalid",
         }
     }
 }
@@ -1654,15 +1661,29 @@ impl RevisionIdViolation {
 /// Classifies one revision spelling against the rules [`RevisionId`]'s schema advertises.
 /// Arms are ordered by precedence: the first matching rule names the violation.
 fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
-    let accepted =
+    let name_byte =
         |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-');
+    let accepted = |byte: &u8| name_byte(byte) || ANCESTRY_MARKERS.contains(byte);
+    let name_end = value
+        .bytes()
+        .position(|byte| ANCESTRY_MARKERS.contains(&byte))
+        .unwrap_or(value.len());
+    let (name, ancestry) = value.as_bytes().split_at(name_end);
+    let ancestry_accepted = ancestry
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || ANCESTRY_MARKERS.contains(byte));
     match value.as_bytes() {
         [] => Some(RevisionIdViolation::Empty),
         bytes if bytes.len() > REVISION_ID_BYTES_MAX => Some(RevisionIdViolation::TooLong),
         bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
+        _ if name.is_empty() || !ancestry_accepted => Some(RevisionIdViolation::AncestryInvalid),
         _ => None,
     }
 }
+
+/// The bytes that open an ancestry suffix on a revision name: `~` walks first parents and
+/// `^` picks a parent, each optionally followed by a count.
+const ANCESTRY_MARKERS: [u8; 2] = *b"~^";
 
 /// Which corpus a read searches. The names identify logical corpora, not storage
 /// locations: `global` reaches dependency package facts wherever the server holds them.
@@ -2374,12 +2395,10 @@ mod tests {
     }
 
     #[test]
-    fn revision_id_schema_pattern_states_the_enforced_length_bound() {
+    fn revision_id_schema_states_the_enforced_length_bound() {
         let schema = serde_json::to_value(schema_for!(RevisionId)).expect("revision id schema");
-        assert_eq!(
-            schema["pattern"],
-            json!(format!("^[A-Za-z0-9._/-]{{1,{REVISION_ID_BYTES_MAX}}}$"))
-        );
+        assert_eq!(schema["maxLength"], json!(REVISION_ID_BYTES_MAX));
+        assert_eq!(schema["minLength"], json!(1));
     }
 
     #[test]
@@ -2390,21 +2409,36 @@ mod tests {
                 "a".repeat(REVISION_ID_BYTES_MAX + 1).leak() as &str,
                 Some(RevisionIdViolation::TooLong),
             ),
-            ("HEAD~1", Some(RevisionIdViolation::CharsetForbidden)),
             (
                 "rev with space",
                 Some(RevisionIdViolation::CharsetForbidden),
             ),
+            ("HEAD@{1}", Some(RevisionIdViolation::CharsetForbidden)),
+            ("~1", Some(RevisionIdViolation::AncestryInvalid)),
+            ("^", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~1/src", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~x", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~1", None),
+            ("HEAD~", None),
+            ("HEAD^", None),
+            ("main^2~3", None),
             ("main", None),
             ("feature/rev-reads", None),
             ("v0.0.6", None),
             ("dd0a482", None),
         ];
+        let schema = serde_json::to_value(schema_for!(RevisionId)).expect("revision schema");
+        let advertised = jsonschema::validator_for(&schema).expect("the schema compiles");
         for (spelling, expected) in cases {
             assert_eq!(
                 RevisionId(spelling.to_owned()).violation(),
                 expected,
                 "spelling {spelling:?}"
+            );
+            assert_eq!(
+                advertised.is_valid(&json!(spelling)),
+                expected.is_none(),
+                "the advertised schema and the classifier agree on {spelling:?}"
             );
         }
     }
@@ -2415,6 +2449,7 @@ mod tests {
             (RevisionIdViolation::Empty, "empty"),
             (RevisionIdViolation::TooLong, "too_long"),
             (RevisionIdViolation::CharsetForbidden, "charset_forbidden"),
+            (RevisionIdViolation::AncestryInvalid, "ancestry_invalid"),
         ] {
             assert_eq!(violation.as_str(), label);
             assert_eq!(

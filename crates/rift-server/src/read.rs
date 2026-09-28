@@ -4218,6 +4218,38 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// An ancestry suffix resolves through git's own revision syntax, and the snapshot
+    /// names the commit it resolved to rather than the spelling it was asked with.
+    #[test]
+    fn revision_read_resolves_an_ancestry_suffix_to_its_commit() -> TestResult {
+        let directory = committed_fixture()?;
+        rift_history::fixture::commit_all(directory.path(), "return seven");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn beacon() -> u8 {\n    8\n}\n",
+        )?;
+        rift_history::fixture::commit_all(directory.path(), "return eight");
+        let first = rift_history::Repository::open(directory.path())?
+            .resolve("main~2")?
+            .commit_id();
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+
+        for spelling in ["HEAD~2", "HEAD^^", "main^1~1"] {
+            let service = revision_service(directory.path(), spelling)?;
+            assert_eq!(
+                service.revision(),
+                Some(&RevisionId(first.clone())),
+                "{spelling}"
+            );
+            let value = serde_json::to_value(service.get_symbol(&params)?)?;
+            assert_eq!(
+                value["hits"][0]["source"], "pub fn beacon() {}",
+                "{spelling}"
+            );
+        }
+        Ok(())
+    }
+
     /// A committed file the syntax provider refuses under its depth bound is left out of
     /// the revision index the way the workspace scan leaves it out, so `get_symbol` at
     /// the revision still answers from the file beside it and names the refused one.
@@ -4354,7 +4386,7 @@ pub fn compute() -> i32 {
     #[test]
     fn revision_read_refuses_a_forbidden_spelling_as_invalid() -> TestResult {
         let directory = committed_fixture()?;
-        let error = revision_service(directory.path(), "HEAD~1")
+        let error = revision_service(directory.path(), "HEAD@{1}")
             .expect_err("a spelling outside the advertised charset must refuse");
         assert_eq!(
             error.to_string(),

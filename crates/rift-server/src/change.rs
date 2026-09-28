@@ -1745,7 +1745,7 @@ mod tests {
         let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
 
         let error = fixture
-            .search(&json!({"change": {"base": "HEAD~1"}}))
+            .search(&json!({"change": {"base": "HEAD@{1}"}}))
             .expect_err("a spelling outside the charset must refuse");
 
         assert_eq!(
@@ -1753,6 +1753,30 @@ mod tests {
             ErrorName::Wire(ErrorCode::InvalidRequest)
         );
         assert!(error.to_string().contains("change.base"), "{error}");
+        Ok(())
+    }
+
+    /// An ancestry suffix on `base` names the same commit the tag does: `HEAD~1` and
+    /// `HEAD^` both reach the baseline one commit below `HEAD`.
+    #[test]
+    fn change_resolves_an_ancestry_suffix_on_the_base() -> TestResult {
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let head = [("src/lib.rs", "pub fn kept() {}\npub fn added() {}\n")];
+        let fixture = Fixture::revisions(&base, &head, &[])?;
+        let expected = sorted_changes(&fixture.baseline_to_head()?);
+
+        for base in ["HEAD~1", "HEAD^", "HEAD~"] {
+            let answer = fixture.search(&json!({"change": {"base": base}}))?;
+            assert_eq!(sorted_changes(&answer), expected, "base {base}");
+        }
+        assert_eq!(
+            expected,
+            [row("added", "introduced", None, Some("src/lib.rs"))]
+        );
+        let error = fixture
+            .search(&json!({"change": {"base": "HEAD~1/src"}}))
+            .expect_err("a suffix past the digits must refuse");
+        assert!(error.to_string().contains("ancestry_invalid"), "{error}");
         Ok(())
     }
 
