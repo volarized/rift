@@ -77,6 +77,7 @@ pub struct WorkspaceIndexLimits {
     directory_depth_max: usize,
     results_max: usize,
     syntax: SyntaxLimits,
+    large_files: LargeFileStrategy,
 }
 
 impl WorkspaceIndexLimits {
@@ -104,6 +105,7 @@ impl WorkspaceIndexLimits {
             directory_depth_max,
             results_max,
             syntax: SyntaxLimits::default(),
+            large_files: LargeFileStrategy::default(),
         }
         .validated()
     }
@@ -185,15 +187,12 @@ impl WorkspaceIndexLimits {
         self.workspace_bytes_max
     }
 
-    /// Parses every source under `syntax`; the per-file byte bound follows its source bound,
-    /// so the walk admits every file a provider accepts.
+    /// Parses every source under `syntax`; the per-file byte bound follows its source bound
+    /// under the large-file strategy these bounds carry, as [`Self::with_large_files`]
+    /// states.
     #[must_use]
     pub const fn with_syntax(self, syntax: SyntaxLimits) -> Self {
-        Self {
-            file_bytes_max: syntax.source_bytes_max(),
-            syntax,
-            ..self
-        }
+        Self { syntax, ..self }.with_large_files(self.large_files)
     }
 
     /// Parses every source under a `[providers.syntax]` table's bounds, as
@@ -218,10 +217,11 @@ impl WorkspaceIndexLimits {
         self.syntax
     }
 
-    /// The per-file byte bound `[search.text] large_files` sets, applied last: under
-    /// `split` a file is held as text up to the workspace byte bound whatever its size, and
-    /// one past the syntax source bound is held unparsed; under `skip` a file past the
-    /// syntax source bound is left out, as the provider cannot parse it.
+    /// The per-file byte bound `[search.text] large_files` sets: under `split`, the default,
+    /// a file is held as text up to the workspace byte bound whatever its size, and one past
+    /// the syntax source bound is held unparsed; under `skip` a file past the syntax source
+    /// bound is left out, as the provider cannot parse it. [`Self::with_syntax`] keeps the
+    /// strategy and derives the bound again from the new source bound.
     #[must_use]
     pub const fn with_large_files(self, strategy: LargeFileStrategy) -> Self {
         let parsed = self.syntax.source_bytes_max();
@@ -233,12 +233,15 @@ impl WorkspaceIndexLimits {
         };
         Self {
             file_bytes_max,
+            large_files: strategy,
             ..self
         }
     }
 }
 
 impl Default for WorkspaceIndexLimits {
+    /// The served defaults: `[source]` and `[providers.syntax]` at their defaults, and the
+    /// per-file byte bound the default `[search.text] large_files`, `split`, sets.
     fn default() -> Self {
         Self {
             files_max: WORKSPACE_FILES_MAX_DEFAULT,
@@ -248,7 +251,9 @@ impl Default for WorkspaceIndexLimits {
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
             syntax: SyntaxLimits::default(),
+            large_files: LargeFileStrategy::default(),
         }
+        .with_large_files(LargeFileStrategy::default())
     }
 }
 
@@ -7520,6 +7525,33 @@ mod tests {
         assert_eq!(
             large.fault().violation(),
             WorkspaceIndexViolation::FileTooLarge
+        );
+    }
+
+    #[test]
+    fn test_default_limits_hold_large_files_as_the_served_default_does() {
+        let limits = WorkspaceIndexLimits::default();
+        let served = TextFileInclusion::default().large_files();
+        assert_eq!(served, LargeFileStrategy::Split);
+        assert_eq!(limits, limits.with_large_files(served));
+        assert_eq!(
+            limits.file_bytes_max(),
+            limits.workspace_bytes_max(),
+            "split holds a file as text up to the workspace byte bound"
+        );
+        let syntax = SyntaxLimits::new(4_096, 250_000, 512).expect("syntax bounds");
+        assert_eq!(
+            limits.with_syntax(syntax).file_bytes_max(),
+            limits.workspace_bytes_max(),
+            "a new source bound keeps the strategy the bounds carry"
+        );
+        let skipped = limits
+            .with_large_files(LargeFileStrategy::Skip)
+            .with_syntax(syntax);
+        assert_eq!(
+            skipped.file_bytes_max(),
+            4_096,
+            "skip follows the source bound"
         );
     }
 
