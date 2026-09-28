@@ -2884,7 +2884,6 @@ pub enum PackageSearchHitContributingField {
     QualifiedName,
     Documentation,
     Signature,
-    DeclarationSource,
     Unknown,
 }
 impl core::fmt::Display for PackageSearchHitContributingField {
@@ -2894,7 +2893,6 @@ impl core::fmt::Display for PackageSearchHitContributingField {
             Self::QualifiedName => write!(f, "qualified_name"),
             Self::Documentation => write!(f, "documentation"),
             Self::Signature => write!(f, "signature"),
-            Self::DeclarationSource => write!(f, "declaration_source"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -2910,9 +2908,6 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
             "qualified_name" => Ok(PackageSearchHitContributingField::QualifiedName),
             "documentation" => Ok(PackageSearchHitContributingField::Documentation),
             "signature" => Ok(PackageSearchHitContributingField::Signature),
-            "declaration_source" => {
-                Ok(PackageSearchHitContributingField::DeclarationSource)
-            }
             "unknown" => Ok(PackageSearchHitContributingField::Unknown),
             _ => Ok(PackageSearchHitContributingField::Unknown),
         }

@@ -591,9 +591,6 @@ fn matched_fields(
             PackageSearchHitContributingField::Signature => {
                 rift_protocol::read::MatchedField::Signature
             }
-            PackageSearchHitContributingField::DeclarationSource => {
-                rift_protocol::read::MatchedField::Content
-            }
             PackageSearchHitContributingField::Unknown => rift_protocol::read::MatchedField::Ranked,
         };
         if !fields.contains(&field) {
@@ -1146,7 +1143,7 @@ mod tests {
             line: 3,
             contributing_fields: vec![
                 PackageSearchHitContributingField::QualifiedName,
-                PackageSearchHitContributingField::DeclarationSource,
+                PackageSearchHitContributingField::Signature,
             ],
             match_class: crate::generated::IdentifierMatchClass::NameExact,
             source: Some("pub fn helper_beacon() {}".to_owned()),

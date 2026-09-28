@@ -654,8 +654,7 @@ fn capabilities_json() -> String {
             "name",
             "qualified_name",
             "documentation",
-            "signature",
-            "declaration_source"
+            "signature"
         ],
         "bounds": {
             "request_body_bytes_max": REQUEST_BODY_BYTES_MAX,
@@ -1905,6 +1904,28 @@ async fn test_fixture_rejects_invalid_capabilities() {
     let (_server, client) = operation_client(OperationFixture::MissingRequiredField).await;
     assert_eq!(
         client.get_capabilities().await,
+        Err(ClientError::InvalidResponseField {
+            field: "required_search_fields"
+        })
+    );
+}
+
+/// The search fields are an exact set: a service whose `required_search_fields` still name
+/// `declaration_source` ranks over a field the client no longer merges, and is refused.
+#[test]
+fn test_capabilities_still_searching_declaration_source_are_refused() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+    let current: Capabilities =
+        serde_json::from_value(value.clone()).expect("current capabilities");
+    assert_eq!(validate_capabilities(&current), Ok(()));
+    value["required_search_fields"]
+        .as_array_mut()
+        .expect("required_search_fields is an array")
+        .push(serde_json::json!("declaration_source"));
+    let previous: Capabilities = serde_json::from_value(value).expect("previous capabilities");
+    assert_eq!(
+        validate_capabilities(&previous),
         Err(ClientError::InvalidResponseField {
             field: "required_search_fields"
         })

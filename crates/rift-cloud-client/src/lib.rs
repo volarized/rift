@@ -1219,13 +1219,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
     if !bounds_ok {
         return Err(ClientError::InvalidResponseField { field: "bounds" });
     }
-    let known_fields = [
-        "name",
-        "qualified_name",
-        "documentation",
-        "signature",
-        "declaration_source",
-    ];
+    let known_fields = ["name", "qualified_name", "documentation", "signature"];
     if value.required_search_fields.len() != known_fields.len()
         || known_fields.iter().any(|required| {
             !value

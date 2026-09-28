@@ -186,7 +186,7 @@ fn capabilities() -> Value {
         "corpus_revision": "corpus-v1",
         "documentation_revision": "0123abcd",
         "required_search_fields": [
-            "name", "qualified_name", "documentation", "signature", "declaration_source"
+            "name", "qualified_name", "documentation", "signature"
         ],
         "bounds": {
             "request_body_bytes_max": 4_194_304,
