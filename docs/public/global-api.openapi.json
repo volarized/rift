@@ -2260,7 +2260,7 @@
         "type": "object"
       },
       "IdentifierMatchClass": {
-        "description": "Match class established for one declaration identifier.",
+        "description": "Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.",
         "type": "string",
         "enum": [
           "qualified_exact",

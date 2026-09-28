@@ -52,6 +52,7 @@ enum OperationFixture {
     InvalidSource,
     InvalidSourceIdentity,
     InvalidMatchClass,
+    UnknownMatchClass,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -395,6 +396,11 @@ fn operation_search_response(
         | OperationFixture::InvalidSource
         | OperationFixture::InvalidSourceIdentity
         | OperationFixture::InvalidMatchClass => invalid_search_page(mode),
+        OperationFixture::UnknownMatchClass => {
+            let mut page = search_page_json("demo", None, "analyzer-v1", "first");
+            page["items"][0]["match_class"] = serde_json::json!("unknown");
+            page
+        }
         OperationFixture::TightSourceBound => {
             let mut page = search_page_json("demo", None, "analyzer-v1", "first");
             page["items"][0]["source"] = serde_json::json!("too large");
@@ -1748,6 +1754,49 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
             Err(ClientError::InvalidResponseField { field })
         );
     }
+}
+
+/// A hit found by its text or its vector reports `unknown`, and the page reaches the caller when
+/// the hit matches none of the requested identifiers; `unknown` on a hit spelling a requested
+/// identifier contradicts it (#389).
+#[tokio::test]
+async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifier() {
+    for identifiers in [Vec::new(), vec!["absent".to_owned()]] {
+        let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
+        let mut request = search_request();
+        request.identifiers = identifiers;
+        let page = client
+            .search_packages(&request, 20, None)
+            .await
+            .expect("an unknown hit matching no identifier is valid");
+        assert_eq!(page.items.len(), 1);
+    }
+
+    let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
+    assert_eq!(
+        client.search_packages(&search_request(), 20, None).await,
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
+}
+
+#[test]
+fn test_symbol_lookup_refuses_unknown_match_class() {
+    let hit: PackageSymbol = serde_json::from_value(serde_json::json!({
+        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
+        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "line": 1, "match_class": "unknown"
+    }))
+    .expect("symbol hit fixture");
+    let mut request = symbol_request();
+    request.name = "absent".to_owned();
+    assert_eq!(
+        validate_symbol_match_class(&request, &hit, "demo"),
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
 }
 
 #[tokio::test]

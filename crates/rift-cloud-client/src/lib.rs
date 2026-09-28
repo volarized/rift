@@ -1875,13 +1875,19 @@ fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String
     Ok(qualified_name.into_owned())
 }
 
+/// Checks a search hit's class against the request's identifiers. A hit reporting `unknown`,
+/// found by its text or its vector, matches none of them; a hit claiming an identifier class
+/// carries the best class `rift_ranking::match_class` gives it.
 fn validate_search_match_class(
     request: &PackageSearchRequest,
     hit: &PackageSearchHit,
     qualified_name: &str,
 ) -> Result<(), ClientError> {
-    let actual = ranking_match_class(&hit.match_class)?;
-    if request.identifiers.is_empty() {
+    let claimed = match hit.match_class {
+        IdentifierMatchClass::Unknown => None,
+        ref class => Some(ranking_match_class(class)?),
+    };
+    if claimed.is_some() && request.identifiers.is_empty() {
         return Ok(());
     }
     let name = hit.symbol.name.to_lowercase();
@@ -1893,7 +1899,7 @@ fn validate_search_match_class(
             rift_ranking::match_class(&candidate.to_lowercase(), &name, &qualified_name)
         })
         .min();
-    if expected != Some(actual) {
+    if expected != claimed {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",
         });

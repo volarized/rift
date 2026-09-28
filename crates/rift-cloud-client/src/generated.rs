@@ -987,7 +987,7 @@ pub struct PackageSearchRequest {
     /// Which package results may be returned. Omitted, symbol.
     pub target: Option<PackageSearchRequestTarget>,
 }
-/// Match class established for one declaration identifier.
+/// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum IdentifierMatchClass {
     #[default]
@@ -1048,7 +1048,7 @@ pub struct PackageSearchHit {
     pub line: i64,
     /// Fields that contributed to ranking.
     pub contributing_fields: Vec<PackageSearchHitContributingField>,
-    /// Match class established for one declaration identifier.
+    /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
@@ -1123,7 +1123,7 @@ pub struct PackageSymbol {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// Match class established for one declaration identifier.
+    /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
