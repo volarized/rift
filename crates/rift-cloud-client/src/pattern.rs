@@ -101,7 +101,9 @@ pub(crate) fn validate_pattern_request_for_capabilities(
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
     if !supports_feature(capabilities, PATTERN_FEATURE) {
-        return Err(ClientError::InvalidRequest { field: "pattern" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: PATTERN_FEATURE,
+        });
     }
     validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
 }

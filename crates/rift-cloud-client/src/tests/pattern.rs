@@ -134,7 +134,9 @@ async fn test_fixture_pattern_search_requires_the_advertised_capability() {
         client
             .search_package_patterns(&pattern_request(), 20, None)
             .await,
-        Err(ClientError::InvalidRequest { field: "pattern" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "patterns"
+        })
     );
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),

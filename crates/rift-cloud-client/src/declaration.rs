@@ -114,7 +114,9 @@ pub(crate) fn validate_declaration_request_for_capabilities(
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
     if !supports_feature(capabilities, DECLARATION_FEATURE) {
-        return Err(ClientError::InvalidRequest { field: "positions" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: DECLARATION_FEATURE,
+        });
     }
     let packages = request
         .positions

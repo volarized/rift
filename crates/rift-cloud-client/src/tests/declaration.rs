@@ -88,7 +88,9 @@ async fn test_fixture_declarations_require_the_advertised_capability() {
         client
             .find_package_declarations(&declaration_request())
             .await,
-        Err(ClientError::InvalidRequest { field: "positions" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "declarations"
+        })
     );
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),

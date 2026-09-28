@@ -833,6 +833,12 @@ fn test_client_errors_use_bounded_messages() {
             "global response violates contract: query",
         ),
         (
+            ClientError::FeatureUnavailable {
+                feature: "patterns",
+            },
+            "global API does not advertise feature: patterns",
+        ),
+        (
             ClientError::Http {
                 meta: Box::new(meta),
                 problem: None,
@@ -948,7 +954,9 @@ fn test_documentation_request_requires_advertised_capability() {
     request.target = Some(PackageSearchRequestTarget::Documentation);
     assert_eq!(
         validate_search_request_for_capabilities(&request, 20, None, &capabilities),
-        Err(ClientError::InvalidRequest { field: "target" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "documentation_search"
+        })
     );
 
     capabilities
@@ -962,7 +970,9 @@ fn test_documentation_request_requires_advertised_capability() {
     symbol.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
     assert_eq!(
         validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities),
-        Err(ClientError::InvalidRequest { field: "include" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "symbol_documentation"
+        })
     );
     capabilities
         .supported_features

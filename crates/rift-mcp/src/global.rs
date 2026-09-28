@@ -51,7 +51,8 @@ struct ClientSlot {
 
 /// What the global API resolved for one read: the packages it serves, the context
 /// entries it holds no release for, the entries a release other than the requested one
-/// answers, and the service state the read met.
+/// answers, the service state the read met, and the feature its capabilities did not
+/// advertise for the read.
 ///
 /// A read whose route answers no client carries project hits alone, with the typed
 /// global warning naming why.
@@ -63,6 +64,7 @@ pub(crate) struct GlobalRoute {
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
     substituted: Vec<SubstitutedEntry>,
     pub(crate) state: RouteState,
+    unadvertised_feature: Option<&'static str>,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 }
 
@@ -808,9 +810,17 @@ fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagi
 impl GlobalRoute {
     /// Discards a remote lane that failed after the resolution: the read answers project
     /// hits alone, with the typed global warning naming the failure.
+    ///
+    /// A lane the global API's capabilities do not advertise is no failure of the
+    /// service: the resolution's own warnings stand, and the read warns
+    /// `capability_unavailable` naming the feature.
     pub(crate) fn discard_remote(&mut self, error: &ClientError) {
         self.client = None;
         self.remote_packages.clear();
+        if let ClientError::FeatureUnavailable { feature } = error {
+            self.unadvertised_feature = Some(feature);
+            return;
+        }
         self.missing_exact.clear();
         self.missing_requirements.clear();
         self.substituted.clear();
@@ -819,12 +829,13 @@ impl GlobalRoute {
     }
 
     /// The warnings a read whose `scope` reaches packages carries: the typed global
-    /// warning when the global API did not answer, then at most `DEPENDENCY_WARNINGS_MAX`
-    /// package and dependency-context warnings together. Those name each degraded
-    /// resolver in resolver order, each context entry no public registry serves with the
-    /// missing capability its kind names, each entry the global publication holds no
-    /// release for, and each entry a release other than the requested one answers, in that
-    /// order.
+    /// warning when the global API did not answer, or `capability_unavailable` when its
+    /// capabilities do not advertise the feature the read needs, then at most
+    /// `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings together. Those
+    /// name each degraded resolver in resolver order, each context entry no public registry
+    /// serves with the missing capability its kind names, each entry the global publication
+    /// holds no release for, and each entry a release other than the requested one answers,
+    /// in that order.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let degraded = self.context.degradations().iter().map(|degradation| {
             ReadWarning::PackageContextDegraded {
@@ -860,6 +871,7 @@ impl GlobalRoute {
                 });
         self.state_warning()
             .into_iter()
+            .chain(self.unadvertised_feature.map(unadvertised_feature_warning))
             .chain(
                 degraded
                     .chain(unavailable)
@@ -903,6 +915,7 @@ impl GlobalRoute {
             missing_requirements: Vec::new(),
             substituted: Vec::new(),
             state,
+            unadvertised_feature: None,
             observation,
         }
     }
@@ -924,6 +937,18 @@ impl GlobalRoute {
         if transitioned {
             log_service_transition(self.state);
         }
+    }
+}
+
+/// The warning a read carries when the global API's capabilities do not advertise
+/// `feature`, which the read needs for its package facts.
+fn unadvertised_feature_warning(feature: &'static str) -> ReadWarning {
+    ReadWarning::GlobalPageWarning {
+        warning_code: GlobalPageWarningCode::CapabilityUnavailable,
+        detail: Some(format!(
+            "the global API does not advertise the `{feature}` feature, so no package \
+             answers this read"
+        )),
     }
 }
 
@@ -1054,6 +1079,7 @@ fn resolved_route(
         missing_requirements,
         substituted,
         state: RouteState::Available,
+        unadvertised_feature: None,
         observation,
     }
 }
@@ -1116,6 +1142,7 @@ fn failure_state(error: &ClientError) -> RouteState {
         ClientError::Http { .. } => (FailureKind::Api, GlobalFailureClass::NonSuccessResponse),
         ClientError::Config(_) => (FailureKind::Api, GlobalFailureClass::InvalidResponse),
         ClientError::RequestBodyTooLarge { .. }
+        | ClientError::FeatureUnavailable { .. }
         | ClientError::InvalidMediaType { .. }
         | ClientError::InvalidResponse { .. }
         | ClientError::Decode { .. }
@@ -1178,6 +1205,15 @@ mod tests {
             super::RouteState::Unavailable {
                 kind: FailureKind::Api,
                 class: GlobalFailureClass::Authentication,
+            }
+        );
+        assert_eq!(
+            failure_state(&ClientError::FeatureUnavailable {
+                feature: "patterns"
+            }),
+            super::RouteState::Unavailable {
+                kind: FailureKind::Response,
+                class: GlobalFailureClass::InvalidResponse,
             }
         );
     }
@@ -1761,6 +1797,58 @@ mod tests {
 
         route.discard_remote(&ClientError::Connection);
         assert_eq!(warning_codes(&route), ["global_api_unavailable"]);
+    }
+
+    /// A remote lane the capabilities do not advertise drops the lane alone: the read warns
+    /// `capability_unavailable` naming the feature, the resolution's own warnings stand, and
+    /// the route reads no package.
+    #[test]
+    fn an_unadvertised_feature_keeps_the_resolution_warnings() {
+        use rift_protocol::read::ReadWarning;
+
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let resolution: rift_cloud_client::PackageResolutionResponse =
+            serde_json::from_value(serde_json::json!({
+                "available_exact": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "resolved_requirements": [],
+                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_requirements": []
+            }))
+            .expect("resolution fixture");
+        let mut route = super::resolved_route(
+            &Arc::new(DependencyContext::default()),
+            client,
+            resolution,
+            Arc::new(Mutex::new(None)),
+        );
+
+        route.discard_remote(&ClientError::FeatureUnavailable {
+            feature: "patterns",
+        });
+
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
+        assert_eq!(route.state, RouteState::Available);
+        assert_eq!(
+            warning_codes(&route),
+            ["global_page_warning", "package_absent"]
+        );
+        assert_eq!(
+            route.warnings()[0],
+            ReadWarning::GlobalPageWarning {
+                warning_code: rift_protocol::read::GlobalPageWarningCode::CapabilityUnavailable,
+                detail: Some(
+                    "the global API does not advertise the `patterns` feature, so no package \
+                     answers this read"
+                        .to_owned()
+                ),
+            }
+        );
     }
 
     /// A package declaration holding two matches answers once, at its first, and `target`

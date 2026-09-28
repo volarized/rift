@@ -92,6 +92,10 @@ pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
 /// Most characters one capability name, package manager name, or revision label in the
 /// capabilities and page metadata carries.
 const LABEL_CHARS_MAX: usize = 128;
+/// The capability feature a server advertises when search answers documentation blocks.
+const DOCUMENTATION_SEARCH_FEATURE: &str = "documentation_search";
+/// The capability feature a server advertises when symbol reads attach documentation.
+const SYMBOL_DOCUMENTATION_FEATURE: &str = "symbol_documentation";
 /// Most UTF-8 bytes one query carries.
 pub const QUERY_BYTES_MAX: usize = 4_096;
 /// Most terms one query carries.
@@ -315,6 +319,12 @@ pub enum ClientError {
         /// Stable field name.
         field: &'static str,
     },
+    /// The capabilities do not advertise the feature the operation needs, so the client
+    /// sent no request for it.
+    FeatureUnavailable {
+        /// The feature as the capabilities spell it, such as `patterns`.
+        feature: &'static str,
+    },
     /// Endpoint returned a non-success response.
     Http {
         /// Bounded status and headers.
@@ -355,6 +365,9 @@ impl fmt::Display for ClientError {
             Self::InvalidRequest { field } => write!(f, "global request violates bound: {field}"),
             Self::InvalidResponseField { field } => {
                 write!(f, "global response violates contract: {field}")
+            }
+            Self::FeatureUnavailable { feature } => {
+                write!(f, "global API does not advertise feature: {feature}")
             }
             Self::Http { meta, .. } => write!(f, "global endpoint returned HTTP {}", meta.status),
         }
@@ -1196,8 +1209,8 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
     {
         return Err(ClientError::InvalidResponseField { field: "revision" });
     }
-    let documentation_supported = supports_feature(value, "documentation_search")
-        || supports_feature(value, "symbol_documentation");
+    let documentation_supported = supports_feature(value, DOCUMENTATION_SEARCH_FEATURE)
+        || supports_feature(value, SYMBOL_DOCUMENTATION_FEATURE);
     if documentation_supported
         != value
             .documentation_revision
@@ -1289,9 +1302,11 @@ fn validate_search_request_for_capabilities(
     if matches!(
         target,
         PackageSearchRequestTarget::Documentation | PackageSearchRequestTarget::All
-    ) && !supports_feature(capabilities, "documentation_search")
+    ) && !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
     {
-        return Err(ClientError::InvalidRequest { field: "target" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: DOCUMENTATION_SEARCH_FEATURE,
+        });
     }
     let bounds = &capabilities.bounds;
     if request.query.len() > smaller_bound(bounds.query_bytes_max, QUERY_BYTES_MAX) {
@@ -1326,9 +1341,11 @@ fn validate_symbol_request_for_capabilities(
         .include
         .as_ref()
         .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation))
-        && !supports_feature(capabilities, "symbol_documentation")
+        && !supports_feature(capabilities, SYMBOL_DOCUMENTATION_FEATURE)
     {
-        return Err(ClientError::InvalidRequest { field: "include" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: SYMBOL_DOCUMENTATION_FEATURE,
+        });
     }
     if request.name.len() > smaller_bound(capabilities.bounds.query_bytes_max, QUERY_BYTES_MAX) {
         return Err(ClientError::InvalidRequest { field: "name" });
@@ -1748,7 +1765,7 @@ fn validate_search_page(
                 documentation_bytes += hit.source.as_ref().map_or(0, String::len);
                 validate_documentation_bytes(documentation_bytes)?;
                 if !documentation_requested
-                    || !supports_feature(capabilities, "documentation_search")
+                    || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
                     || !packages.contains(&package_key(&hit.package))
                     || page.documentation_revision.as_deref()
                         != Some(hit.documentation.documentation_revision.as_str())

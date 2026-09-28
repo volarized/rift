@@ -1172,10 +1172,15 @@ pub enum ReadWarning {
     },
     /// The global package page carried a bounded condition while its items remained valid.
     /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
+    /// `capability_unavailable` also names a feature the global API's capabilities do not
+    /// advertise, such as `patterns` for a `pattern` search, and the answer then carries the
+    /// project hits alone.
     GlobalPageWarning {
-        /// Stable condition code returned by the global package service.
+        /// Stable condition code returned by the global package service, or
+        /// `capability_unavailable` for a feature its capabilities do not advertise.
         warning_code: GlobalPageWarningCode,
-        /// Optional bounded explanation returned by the global package service.
+        /// Optional bounded explanation returned by the global package service, or the
+        /// feature its capabilities do not advertise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(length(max = 12_431))]
         detail: Option<String>,
