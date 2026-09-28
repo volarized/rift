@@ -456,18 +456,19 @@ pub struct SearchParams {
     /// each hit is tagged `content` and carries no score, and `relevance` orders the hits
     /// by path, then offset. With a `scope` past `local`, the global index matches the
     /// pattern over the dependency packages' source too, and those hits carry `unit` in
-    /// place of `path`. The server refuses `pattern` beside `query`, `traversal`, `change`, and
-    /// `rev`, and with `target: "documentation"`, and it refuses a pattern whose compiled
-    /// size, candidate rows, or verified bytes pass the `[search]` bounds, naming the bound.
+    /// place of `path`. The server refuses `pattern` beside `query`, `traversal`,
+    /// `change`, and `rev`, and with `target: "documentation"`, and it refuses a pattern
+    /// whose compiled size, candidate rows, or verified bytes pass the `[search]` bounds,
+    /// naming the bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = SEARCH_PATTERN_CHARS_MAX))]
     pub pattern: Option<String>,
     /// Which sources `query` and `pattern` search: the project tree, the dependency
     /// packages, or both. Omitted, `local`. A package contributes symbol hits alone to
     /// `query`, and file and symbol hits to `pattern`. The server refuses a scope beyond
-    /// `local` together with `rev`, since
-    /// package facts are served for the current tree alone, and `global` together with
-    /// `traversal`, since a walk runs over the project alone.
+    /// `local` together with `rev`, since package facts are served for the current tree
+    /// alone, and `global` together with `traversal`, since a walk runs over the project
+    /// alone.
     #[serde(default)]
     pub scope: SearchScope,
     /// Packages `query` and `pattern` search beside the ones the workspace's manifests and
