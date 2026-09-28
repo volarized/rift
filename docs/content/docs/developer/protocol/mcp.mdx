@@ -947,9 +947,10 @@ Package-scope answers can also carry these package warnings:
   standard library probe answered nothing, so the dependency context can miss packages or name a
   standard library by its static reading. `resolver` names which, by manager name - `cargo`,
   `uv`, `npm`, or `bun` - or by standard library entry - `stdlib/rust`, `stdlib/node`, or
-  `stdlib/python` - and `reason` says what it could not read. When the request's `packages` push
-  the context past 20,000 entries, the most one read sends, the entries sorted last leave and
-  `resolver` names their package manager, such as `pypi`.
+  `stdlib/python` - and `reason` says what it could not read. When the context passes the
+  entries one read sends - 20,000, or fewer when the global API advertises a smaller
+  `dependency_entries_max` - the entries sorted last leave while the request's `packages` stay,
+  and `resolver` names their package manager, such as `pypi`.
 
 <VersionBadge version="v0.0.46" />
 
