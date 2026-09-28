@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    LastCapture, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
-    capture_digests_with_languages,
+    ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests,
+    WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -44,7 +44,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -1493,6 +1493,7 @@ impl RiftMcp {
         let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
+        validation.feed_engines(Arc::clone(&engines));
         let server = Self {
             root: root.clone(),
             identity,
@@ -3030,10 +3031,13 @@ impl ServerHandler for RiftMcp {
 /// long-lived services, so the hold compares the published tables against
 /// the pool it keeps: unchanged tables reuse the running sessions, and
 /// changed tables swap in a fresh pool and shut the replaced one down.
+///
+/// The lock is a std one, held for a compare or a swap and never across an await, so a
+/// publication can hand the held pool its changed files from the blocking pool.
 #[derive(Debug)]
 pub(crate) struct EngineHold {
     root: PathBuf,
-    pool: AsyncMutex<Arc<EnginePool>>,
+    pool: std::sync::Mutex<Arc<EnginePool>>,
 }
 
 impl EngineHold {
@@ -3046,7 +3050,43 @@ impl EngineHold {
         let pool = Arc::new(EnginePool::new(&root, definitions, bindings));
         Self {
             root,
-            pool: AsyncMutex::new(pool),
+            pool: std::sync::Mutex::new(pool),
+        }
+    }
+
+    /// The held pool.
+    fn held(&self) -> std::sync::MutexGuard<'_, Arc<EnginePool>> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hands the held pool the files one publication changed against the one it
+    /// replaced, when the pool runs an engine.
+    ///
+    /// An incremental rebuild's own `change_set` already names those files, so it is
+    /// handed on as it stands. A full rebuild names none, so both publications'
+    /// digests are compared, O(files), and only while an engine is running: a pool
+    /// with none has no session to tell.
+    pub(crate) fn owe_publication(
+        &self,
+        previous: &PublishedWorkspace,
+        publishing: &PublishedWorkspace,
+        change_set: &ChangeSet,
+    ) {
+        if Arc::ptr_eq(&previous.reads, &publishing.reads) {
+            return;
+        }
+        let pool = Arc::clone(&self.held());
+        if !pool.runs_an_engine() {
+            return;
+        }
+        match change_set {
+            ChangeSet::Incremental(changes) => pool.owe_changed_paths(changes),
+            ChangeSet::Full => pool.owe_changed_paths(&PathChanges::between(
+                &previous.reads.workspace_digests(),
+                &publishing.reads.workspace_digests(),
+            )),
         }
     }
 
@@ -3069,13 +3109,18 @@ impl EngineHold {
         definitions: BTreeMap<LspProcessKey, LspConfiguration>,
         bindings: BTreeMap<String, LspProcessKey>,
     ) -> Arc<EnginePool> {
-        let mut held = self.pool.lock().await;
-        if held.built_from(&definitions, &bindings) {
-            return Arc::clone(&held);
-        }
-        let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
-        let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
-        drop(held);
+        // The std guard lives in a block rather than ending at a `drop`: the compiler
+        // counts a dropped `MutexGuard` as live across the await below, which would make
+        // this future, and every tool future awaiting it, not `Send`.
+        let (rebuilt, replaced) = {
+            let mut held = self.held();
+            if held.built_from(&definitions, &bindings) {
+                return Arc::clone(&held);
+            }
+            let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
+            let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
+            (rebuilt, replaced)
+        };
         replaced.shutdown_replaced_by(&rebuilt).await;
         rebuilt
     }
@@ -3083,7 +3128,7 @@ impl EngineHold {
     /// Ends the held pool's running engines; the pool stays usable and a
     /// later request respawns what it needs.
     pub(crate) async fn shutdown(&self) {
-        let held = Arc::clone(&*self.pool.lock().await);
+        let held = Arc::clone(&*self.held());
         held.shutdown().await;
     }
 }
@@ -3230,6 +3275,110 @@ mod tests {
         );
         let (definitions, bindings) = lsp_runtime_configuration("pyright");
         assert!(replaced.built_from(&definitions, &bindings));
+        hold.shutdown().await;
+        Ok(())
+    }
+
+    /// A fake engine that registers one `**/*.rs` file watcher once initialized and
+    /// appends every `workspace/didChangeWatchedFiles` body it receives to the log named
+    /// by `$1`. It answers every request with an empty list.
+    #[cfg(unix)]
+    const WATCHING_ENGINE: &str = r#"log="$1"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
+    *'"method":"initialized"'*)
+      frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}' ;;
+    *'"method":"workspace/didChangeWatchedFiles"'*)
+      printf '%s\n' "$body" >> "$log" ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+    /// An incremental rebuild's own change set reaches the engine as it stands,
+    /// and a full rebuild's changes come from comparing both publications' digests.
+    /// The incremental set names `carried.rs`, which neither publication holds, so
+    /// only the carried set can name it; the full rebuild names `lib.rs`, which the
+    /// two publications hold with different bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owe_publication_hands_on_an_incremental_change_set_and_compares_a_full_one()
+    -> TestResult {
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        let notified = engine.path().join("notified.log");
+        fs::write(&script, WATCHING_ENGINE)?;
+        let directory = tempfile::tempdir()?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let before = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
+        let after = stable_candidate(directory.path(), 1)?;
+
+        let key = LspProcessKey::named("rust");
+        let configuration: LspConfiguration = serde_json::from_value(json!({
+            "command": ["sh", script.display().to_string(), notified.display().to_string()],
+        }))?;
+        let hold = super::EngineHold::new(
+            directory.path().to_path_buf(),
+            std::collections::BTreeMap::from([(key.clone(), configuration)]),
+            std::collections::BTreeMap::from([("rust".to_owned(), key.clone())]),
+        );
+        let pool = Arc::clone(&hold.held());
+        let slot = pool.engine_by_key(&key).ok_or("the slot")?;
+        let exchange = || {
+            slot.request(|session| {
+                Box::pin(async move {
+                    session
+                        .read_output(
+                            tokio::time::Instant::now() + Duration::from_millis(200),
+                            |_session| false,
+                        )
+                        .await
+                })
+            })
+        };
+        exchange().await?;
+        assert!(
+            pool.runs_an_engine(),
+            "the first exchange started the engine"
+        );
+
+        let carried = rift_index::PathChanges::resolve(
+            [(
+                rift_core::ProjectPath::new("carried.rs")?,
+                Some(rift_core::FileDigest::of(b"carried")),
+            )],
+            |_path| None,
+        );
+        hold.owe_publication(
+            &before,
+            &after,
+            &rift_index::ChangeSet::Incremental(carried),
+        );
+        exchange().await?;
+        hold.owe_publication(&before, &after, &rift_index::ChangeSet::Full);
+        exchange().await?;
+
+        let text = fs::read_to_string(&notified)?;
+        let batches: Vec<&str> = text.lines().collect();
+        assert_eq!(batches.len(), 2, "{text}");
+        assert!(
+            batches[0].contains("carried.rs") && !batches[0].contains("lib.rs"),
+            "the incremental rebuild's own change set, not a comparison: {text}"
+        );
+        assert!(
+            batches[1].contains("lib.rs") && !batches[1].contains("carried.rs"),
+            "the full rebuild compares both publications' digests: {text}"
+        );
         hold.shutdown().await;
         Ok(())
     }

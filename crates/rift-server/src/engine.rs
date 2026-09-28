@@ -34,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rift_core::{Error, ErrorCode, ErrorName};
+use lsp_types::FileChangeType;
+use rift_core::{Error, ErrorCode, ErrorName, ProjectPath};
+use rift_index::{PathChange, PathChanges};
 use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
 use rift_protocol::configuration::{CommandInput, EmbeddedEngine, LspConfiguration};
 use rift_protocol::read::Language;
@@ -49,6 +51,10 @@ use rift_lsp::session::EngineReadiness;
 /// One step of an engine exchange: a future borrowing the session it runs on.
 pub(crate) type SessionFuture<'session, T> =
     std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
+
+/// How many distinct changed paths one slot holds for its live session before it
+/// replaces the session instead: a replacement reads every file from disk at its start.
+const OWED_CHANGES_MAX: usize = 16_384;
 
 fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
     Box::pin(async { Ok(()) })
@@ -150,6 +156,7 @@ impl EnginePool {
                         configuration,
                         workspace_root: workspace_root.to_path_buf(),
                         state: Mutex::new(SlotState::default()),
+                        owed: std::sync::Mutex::new(OwedChanges::default()),
                         reported_state,
                     })
                 });
@@ -191,6 +198,33 @@ impl EnginePool {
     #[must_use]
     pub fn engine_by_key(&self, key: &LspProcessKey) -> Option<&EngineSlot> {
         self.engines.get(key).map(Arc::as_ref)
+    }
+
+    /// Whether any slot reports an engine it started and has not stopped.
+    #[must_use]
+    pub fn runs_an_engine(&self) -> bool {
+        self.engines.values().any(|slot| {
+            !matches!(
+                *slot.reported_state.borrow(),
+                LspState::Stopped | LspState::Failed
+            )
+        })
+    }
+
+    /// Records one publication's changed files for every slot, without waiting.
+    ///
+    /// Each slot sends what it holds as one `workspace/didChangeWatchedFiles` batch
+    /// to its live session before that session's next exchange, so a request that
+    /// reads the publication naming these changes asks an engine that was told of
+    /// them. A slot with no live session drops them when it starts one, since a
+    /// new session reads every file from disk.
+    pub fn owe_changed_paths(&self, changes: &PathChanges) {
+        if changes.is_empty() {
+            return;
+        }
+        for slot in self.engines.values() {
+            slot.owe(changes);
+        }
     }
 
     /// Current state of one accepted process definition.
@@ -247,7 +281,65 @@ pub struct EngineSlot {
     configuration: LspConfiguration,
     workspace_root: PathBuf,
     state: Mutex<SlotState>,
+    /// Changed files the live session was not told of yet. A std lock, taken
+    /// only for a push or a take and never across an await, so a publication
+    /// records changes without waiting for a request that holds `state`.
+    owed: std::sync::Mutex<OwedChanges>,
     reported_state: watch::Sender<LspState>,
+}
+
+/// Changed files one slot owes its live session, one classification per path.
+///
+/// A later change to the same path replaces the earlier one. Past
+/// [`OWED_CHANGES_MAX`] paths the slot stops recording and replaces the
+/// session at its next request instead.
+#[derive(Debug, Default)]
+struct OwedChanges {
+    paths: BTreeMap<ProjectPath, FileChangeType>,
+    overflowed: bool,
+}
+
+impl OwedChanges {
+    /// Records `changes`, or marks the bound spent.
+    fn record(&mut self, changes: &PathChanges) {
+        if self.overflowed {
+            return;
+        }
+        for (path, change) in changes.iter() {
+            if self.paths.len() >= OWED_CHANGES_MAX && !self.paths.contains_key(path) {
+                self.paths.clear();
+                self.overflowed = true;
+                return;
+            }
+            self.paths.insert(path.clone(), watched_change(change));
+        }
+    }
+
+    /// Sends the held changes to `session` as one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the session ended, a path cannot form a
+    /// document URI, or the connection broke.
+    async fn send(self, session: &mut EngineSession) -> Result<(), EngineError> {
+        if self.paths.is_empty() {
+            return Ok(());
+        }
+        let changes: Vec<(ProjectPath, FileChangeType)> = self.paths.into_iter().collect();
+        session
+            .notify_changed_paths(&changes)
+            .await
+            .map(|_matched| ())
+    }
+}
+
+/// The watched-file event one index classification names.
+fn watched_change(change: PathChange) -> FileChangeType {
+    match change {
+        PathChange::Added => FileChangeType::CREATED,
+        PathChange::Modified => FileChangeType::CHANGED,
+        PathChange::Removed => FileChangeType::DELETED,
+    }
 }
 
 /// Everything one slot's lock guards: the running engine and the restarts
@@ -528,6 +620,52 @@ fn restart_may_help(error: &EngineError) -> bool {
 }
 
 impl EngineSlot {
+    /// Records `changes` for the live session's next exchange.
+    fn owe(&self, changes: &PathChanges) {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(changes);
+    }
+
+    /// Takes every change recorded so far.
+    fn take_owed(&self) -> OwedChanges {
+        std::mem::take(
+            &mut *self
+                .owed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Sends `owed` to the live `session` before its next exchange.
+    ///
+    /// A failure that leaves the session running is logged and the exchange goes
+    /// on: the engine then answers from its older view of those files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the session ended while sending.
+    async fn tell(
+        &self,
+        session: &mut EngineSession,
+        owed: OwedChanges,
+    ) -> Result<(), EngineError> {
+        match owed.send(session).await {
+            Err(error) if session.is_ended() => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    component = "engine",
+                    engine = self.name(),
+                    %error,
+                    "changed files did not reach the language engine"
+                );
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// Ends the running session under the slot's lock and reports the slot stopped.
     async fn end_session(self: Arc<Self>) {
         let mut held = self.state.lock().await;
@@ -886,12 +1024,23 @@ impl EngineSlot {
         let mut session_generation = 0_u64;
         loop {
             let state = &mut *guarded.state;
+            let owed = self.take_owed();
             let session = match state.session.take() {
-                Some(running) if !running.is_ended() => state.session.insert(running),
+                Some(running) if !running.is_ended() && !owed.overflowed => {
+                    let running = state.session.insert(running);
+                    if let Err(error) = self.tell(running, owed).await {
+                        reported = Some(error);
+                        continue;
+                    }
+                    running
+                }
                 dead => {
                     if let Some(dead) = dead {
                         self.reap(dead).await;
                     }
+                    // A replacement opens nothing on its own, so `begin` runs on it
+                    // again, even when the session it replaces was still live.
+                    exchange_started = false;
                     let started = self
                         .start_within_budget(&mut state.restarts, reported.take())
                         .await?;
@@ -1169,17 +1318,31 @@ impl EngineSlot {
         }
     }
 
-    /// Reaps one ended engine and keeps its captured standard error
-    /// visible in the log.
-    async fn reap(&self, dead: EngineSession) {
-        let stderr = dead.shutdown().await;
+    /// Reaps one session the slot replaces, and keeps an ended engine's
+    /// captured standard error visible in the log.
+    ///
+    /// A live session reaches here only when more files changed between two
+    /// requests than [`OWED_CHANGES_MAX`] allows telling it of: its replacement
+    /// reads every file from disk.
+    async fn reap(&self, replaced: EngineSession) {
+        let ended = replaced.is_ended();
+        let stderr = replaced.shutdown().await;
         let engine = self.name();
-        tracing::warn!(
-            component = "engine",
-            engine,
-            stderr = %stderr.text,
-            "language engine ended and was reaped"
-        );
+        if ended {
+            tracing::warn!(
+                component = "engine",
+                engine,
+                stderr = %stderr.text,
+                "language engine ended and was reaped"
+            );
+        } else {
+            tracing::info!(
+                component = "engine",
+                engine,
+                owed_changes_max = OWED_CHANGES_MAX,
+                "more files changed between two requests than the language engine is told of, so its session was replaced"
+            );
+        }
     }
 }
 
@@ -2136,6 +2299,266 @@ done
         pool.shutdown().await;
     }
 
+    /// A fake engine that announces one begin and end once initialized, then
+    /// no progress again, appends every `workspace/didChangeWatchedFiles` body
+    /// to `notified.log` and one line per start to `starts.log`, and answers
+    /// every request with no location. With
+    /// `watching`, it registers one `**/*.rs` file watcher, as rust-analyzer
+    /// does; without, it registers none, as typescript-language-server does.
+    #[cfg(unix)]
+    fn fed_slot(directory: &Path, watching: bool) -> EnginePool {
+        const SCRIPT: &str = r#"printf 'start\n' >> "$2"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
+    *'"method":"initialized"'*)
+      REGISTER
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"workspace/didChangeWatchedFiles"'*)
+      printf '%s\n' "$body" >> "$1" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+        const REGISTER: &str = r#"frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}'"#;
+        let script = directory.join("engine.sh");
+        std::fs::write(
+            &script,
+            SCRIPT.replace("REGISTER", if watching { REGISTER } else { ":" }),
+        )
+        .expect("engine script");
+        let mut configuration = table("sh");
+        configuration.command = Some(CommandInput::ProgramAndArguments(vec![
+            "sh".to_owned(),
+            script.display().to_string(),
+            directory.join("notified.log").display().to_string(),
+            directory.join("starts.log").display().to_string(),
+        ]));
+        configuration.initialization_options = None;
+        let key = LspProcessKey::named("rust");
+        EnginePool::new(
+            directory,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
+    /// One incoming read against `slot` under the default retry table: the
+    /// answer's unconfirmed record, the attempts it took, and its time.
+    #[cfg(unix)]
+    async fn fed_read(slot: &EngineSlot) -> (bool, u64, Duration) {
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let (_answer, unconfirmed) = slot
+            .request_settled(
+                open_lib,
+                counted_references(&attempts),
+                finish_immediately,
+                |_count| (true, false),
+                |_count| None,
+                started + Duration::from_secs(30),
+            )
+            .await
+            .expect("the read answers");
+        (
+            unconfirmed,
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            started.elapsed(),
+        )
+    }
+
+    /// One modified file no read opens, as a publication hands it on.
+    fn edited_other() -> PathChanges {
+        PathChanges::resolve(
+            [(
+                ProjectPath::new("other.rs").expect("path"),
+                Some(rift_core::FileDigest::of(b"edited")),
+            )],
+            |_path| Some(rift_core::FileDigest::of(b"held")),
+        )
+    }
+
+    /// After a feed resets readiness, an engine that announces no progress
+    /// reads unconfirmed, and the incoming read takes its repeated full report
+    /// once the session is quiet past the 500 ms `settle_delay`, with the
+    /// unconfirmed record, instead of spending the 9.75 s retry table.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_incoming_read_after_a_feed_settles_once_quiet_past_the_settle_delay() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = fed_slot(directory.path(), true);
+        let slot = pool
+            .engine_by_key(&LspProcessKey::named("rust"))
+            .expect("slot");
+        let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
+        eprintln!("before the feed: attempts={attempts} elapsed={elapsed:?}");
+        assert!(!unconfirmed, "the engine read ready before the feed");
+
+        pool.owe_changed_paths(&edited_other());
+        let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
+        eprintln!(
+            "after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        );
+        let notified = std::fs::read_to_string(directory.path().join("notified.log"))
+            .expect("the engine was told");
+        assert!(notified.contains("other.rs"), "{notified}");
+        assert!(unconfirmed, "the read records the engine unconfirmed");
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_500),
+            "{elapsed:?}"
+        );
+        assert!(attempts <= 4, "{attempts}");
+        pool.shutdown().await;
+    }
+
+    /// An engine that registered no watcher is told nothing of a feed, so its
+    /// readiness stands: the next incoming read settles ready on its first attempt,
+    /// with no unconfirmed record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_engine_with_no_watcher_keeps_its_readiness_after_a_feed() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = fed_slot(directory.path(), false);
+        let slot = pool
+            .engine_by_key(&LspProcessKey::named("rust"))
+            .expect("slot");
+        let (unconfirmed, _attempts, _elapsed) = fed_read(slot).await;
+        assert!(!unconfirmed, "the engine read ready before the feed");
+
+        pool.owe_changed_paths(&edited_other());
+        let (unconfirmed, attempts, elapsed) = fed_read(slot).await;
+        eprintln!(
+            "unwatched after the feed: attempts={attempts} elapsed={elapsed:?} unconfirmed={unconfirmed}"
+        );
+        assert!(
+            !directory.path().join("notified.log").exists(),
+            "no registered watcher matched, so nothing was sent"
+        );
+        assert!(!unconfirmed);
+        assert_eq!(attempts, 1, "the engine still reads ready");
+        pool.shutdown().await;
+    }
+
+    /// An incoming report that never settles - a ready engine answering no reference
+    /// beyond the seed's own - keeps the walk waiting until its deadline, and the spent
+    /// wait answers [`EngineFault::Analyzing`] with the session kept, as a wait spent on
+    /// an engine still analyzing does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_incoming_report_that_never_settles_ends_at_the_spent_wait_with_the_session_kept() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = fed_slot(directory.path(), false);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let spent = slot
+            .request_settled(
+                open_lib,
+                counted_references(&attempts),
+                finish_immediately,
+                |_count| (true, true),
+                |_count| None,
+                started + Duration::from_secs(1),
+            )
+            .await
+            .expect_err("an empty report from a ready engine never settles inside a second");
+        assert!(
+            matches!(spent.fault(), EngineFault::Analyzing { attempts } if *attempts >= 2),
+            "{:?}",
+            spent.fault()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            slot.state.lock().await.session.is_some(),
+            "the session survives the spent wait"
+        );
+        assert_ne!(pool.state_for_key(&key), Some(LspState::Failed));
+        pool.shutdown().await;
+    }
+
+    /// More changed paths than `OWED_CHANGES_MAX`, recorded while a request
+    /// waits between two attempts, tell the live session nothing: the slot
+    /// replaces it at the next attempt, which claims one restart, and `begin`
+    /// opens the document again on the replacement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slot_past_the_owed_changes_bound_replaces_its_live_session() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = fed_slot(directory.path(), true);
+        let slot = pool
+            .engine_by_key(&LspProcessKey::named("rust"))
+            .expect("slot");
+        fed_read(slot).await;
+
+        let begins = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_begins = Arc::clone(&begins);
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let first_ask = Arc::clone(&asked);
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut references = counted_references(&attempts);
+        let held = rift_core::FileDigest::of(b"held");
+        let beyond_the_bound = PathChanges::resolve(
+            (0..=OWED_CHANGES_MAX).map(|index| {
+                let path = ProjectPath::new(format!("f{index}.rs")).expect("path");
+                (path, Some(held))
+            }),
+            |_path| None,
+        );
+        let request = slot.request_settled(
+            move |session: &mut EngineSession| {
+                counted_begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open_lib(session)
+            },
+            move |session: &mut EngineSession| {
+                first_ask.notify_one();
+                references(session)
+            },
+            finish_immediately,
+            |_count| (false, false),
+            |_count| None,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let owe = async {
+            asked.notified().await;
+            pool.owe_changed_paths(&beyond_the_bound);
+        };
+        let (spent, ()) = tokio::join!(request, owe);
+        let spent = spent.expect_err("a partial report never settles");
+        assert!(
+            matches!(spent.fault(), EngineFault::Analyzing { .. }),
+            "{:?}",
+            spent.fault()
+        );
+        assert!(
+            !directory.path().join("notified.log").exists(),
+            "past the bound the live session is told nothing"
+        );
+        let starts = std::fs::read_to_string(directory.path().join("starts.log"))
+            .expect("the engine records its starts");
+        assert_eq!(starts.lines().count(), 2, "the slot replaced its session");
+        assert_eq!(
+            begins.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the replacement opened the document again"
+        );
+        pool.shutdown().await;
+    }
+
     /// One embedded walk from `root` in `directory`'s `graph.py`, opened as
     /// it stands on disk: the answer, the attempts it took, and its time.
     async fn walk_from_root(
@@ -2266,6 +2689,62 @@ done
         assert!(elapsed < settle_delay, "{elapsed:?}");
         assert_eq!(pool.state_for_key(&key), Some(LspState::Ready));
         pool.shutdown().await;
+    }
+
+    /// The index's three classifications reach the engine as created, changed and
+    /// deleted; a later change to one path replaces the earlier one; past
+    /// `OWED_CHANGES_MAX` paths the slot stops recording and marks the bound spent.
+    #[test]
+    fn owed_changes_classify_merge_and_mark_the_bound_spent() {
+        let path = |name: &str| ProjectPath::new(name).expect("path");
+        let held = rift_core::FileDigest::of(b"held");
+        let first = PathChanges::resolve(
+            [
+                (path("added.rs"), Some(rift_core::FileDigest::of(b"new"))),
+                (
+                    path("changed.rs"),
+                    Some(rift_core::FileDigest::of(b"edited")),
+                ),
+                (path("removed.rs"), None),
+            ],
+            |observed| (observed.as_str() != "added.rs").then_some(held),
+        );
+        let mut owed = OwedChanges::default();
+        owed.record(&first);
+        let recorded = |owed: &OwedChanges| {
+            owed.paths
+                .iter()
+                .map(|(path, change)| (path.as_str().to_owned(), *change))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            recorded(&owed),
+            [
+                ("added.rs".to_owned(), FileChangeType::CREATED),
+                ("changed.rs".to_owned(), FileChangeType::CHANGED),
+                ("removed.rs".to_owned(), FileChangeType::DELETED),
+            ]
+        );
+        owed.record(&PathChanges::resolve([(path("added.rs"), None)], |_| {
+            Some(held)
+        }));
+        assert_eq!(
+            owed.paths.get(&path("added.rs")),
+            Some(&FileChangeType::DELETED),
+            "the later change replaces the earlier one"
+        );
+
+        let many = PathChanges::resolve(
+            (0..=OWED_CHANGES_MAX).map(|index| (path(&format!("f{index}.rs")), Some(held))),
+            |_| None,
+        );
+        let mut owed = OwedChanges::default();
+        owed.record(&many);
+        assert!(
+            owed.overflowed && owed.paths.is_empty(),
+            "{:?}",
+            owed.paths.len()
+        );
     }
 
     #[test]
