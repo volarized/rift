@@ -1747,6 +1747,25 @@ mod tests {
         }
     }
 
+    /// The walk the wire document gate runs finds an optional property that accepts
+    /// `null`, in either spelling, and passes a required one.
+    #[test]
+    fn the_optional_null_walk_finds_both_null_spellings_and_skips_required_ones() {
+        let document = json!({
+            "properties": {
+                "rev": {"anyOf": [{"$ref": "#/$defs/RevisionId"}, {"type": "null"}]},
+                "limit": {"type": ["integer", "null"]},
+                "cursor": {"type": ["string", "null"]},
+                "name": {"type": "string"}
+            },
+            "required": ["cursor"]
+        });
+        let mut found = Vec::new();
+        optional_null_properties(&document, "", &mut found);
+        found.sort();
+        assert_eq!(found, ["/limit", "/rev"]);
+    }
+
     /// The package index document is a wire document: every optional field is omitted
     /// when absent, so no property it does not require advertises `null`.
     #[test]
@@ -2511,5 +2530,31 @@ mod tests {
         dotted.sort();
         dotted.dedup();
         assert_eq!(dotted.len(), listed, "every key appears once");
+    }
+
+    /// A table whose members the caller names declares each named member's keys; a table
+    /// with fixed members, or a table the schema lacks, declares none.
+    #[test]
+    fn test_declared_named_keys_answer_only_a_table_whose_members_the_caller_names() {
+        let schema = super::configuration_schema();
+        let dotted = |table: &str| -> Vec<String> {
+            super::declared_named_keys(&schema, table, &["python"])
+                .iter()
+                .map(|key| key.path().join("."))
+                .collect()
+        };
+        let languages = dotted("languages");
+        assert!(
+            languages.contains(&"languages.python.enabled".to_owned()),
+            "{languages:?}"
+        );
+        assert!(
+            languages
+                .iter()
+                .all(|key| key.starts_with("languages.python.")),
+            "{languages:?}"
+        );
+        assert_eq!(dotted("server"), Vec::<String>::new());
+        assert_eq!(dotted("absent"), Vec::<String>::new());
     }
 }
