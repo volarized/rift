@@ -7,7 +7,7 @@ use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use crate::{
     Capabilities, ClientError, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
     PackagePatternRequest, PageMetadata, SOURCE_BYTES_MAX, SearchPackagePatternsRequestQuery,
-    active_response_body_bytes_max, advertised_page_limit, bounded_nonempty, contract,
+    active_response_body_bytes_max, advertised_page_limit, bounded_nonempty_characters, contract,
     includes_source, package_key, package_source_path, response, serialize_body, smaller_bound,
     supports_feature, validate_body_for_capabilities, validate_hit_common, validate_packages,
     validate_page, validate_read_bounds,
@@ -83,7 +83,7 @@ impl GlobalClient {
 }
 
 pub(crate) fn validate_pattern_request(request: &PackagePatternRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.pattern, SEARCH_PATTERN_CHARS_MAX, "pattern")?;
+    bounded_nonempty_characters(&request.pattern, SEARCH_PATTERN_CHARS_MAX, "pattern")?;
     if request
         .include
         .as_ref()

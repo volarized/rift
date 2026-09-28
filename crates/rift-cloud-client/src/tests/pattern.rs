@@ -175,6 +175,22 @@ async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
     );
 }
 
+/// The contract's `maxLength` counts characters, so a pattern of that many two-byte
+/// characters is accepted although it holds twice as many bytes, and one more refuses.
+#[test]
+fn test_the_pattern_bound_counts_characters_as_the_contract_does() {
+    let mut request = pattern_request();
+    request.pattern = "\u{e9}".repeat(SEARCH_PATTERN_CHARS_MAX);
+    assert_eq!(request.pattern.len(), 2 * SEARCH_PATTERN_CHARS_MAX);
+    assert_eq!(validate_pattern_request(&request), Ok(()));
+
+    request.pattern.push('\u{e9}');
+    assert_eq!(
+        validate_pattern_request(&request),
+        Err(ClientError::InvalidRequest { field: "pattern" })
+    );
+}
+
 #[test]
 fn test_pattern_requests_refuse_bounds_before_transport() {
     assert_eq!(validate_pattern_request(&pattern_request()), Ok(()));

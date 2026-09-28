@@ -9,6 +9,7 @@ use rift_cloud_client::{
     Capabilities, PackageDeclarationResponse, PackagePatternPage, PackageResolutionResponse,
     PackageSearchCandidate, PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
 };
+use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Map, Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -247,6 +248,21 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     document["components"]["schemas"]["PackageContextEntry"]["properties"]["requirement"]["maxLength"] =
         json!(8192);
     assert_invalid(&document, "Warning/properties/detail/maxLength")?;
+    Ok(())
+}
+
+/// The contract bounds a package `pattern` by the search pattern bound the local server
+/// enforces, and both count characters.
+#[test]
+fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
+    let document = contract()?;
+    let request = &document["components"]["schemas"]["PackagePatternRequest"];
+    let max_length = &request["properties"]["pattern"]["maxLength"];
+    assert_eq!(
+        max_length.as_u64(),
+        Some(u64::try_from(SEARCH_PATTERN_CHARS_MAX)?),
+        "{max_length}"
+    );
     Ok(())
 }
 
