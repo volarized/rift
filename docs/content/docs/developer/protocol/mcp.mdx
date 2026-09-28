@@ -949,8 +949,9 @@ Package-scope answers can also carry these package warnings:
   `uv`, `npm`, or `bun` - or by standard library entry - `stdlib/rust`, `stdlib/node`, or
   `stdlib/python` - and `reason` says what it could not read. When the context passes the
   entries one read sends - 20,000, or fewer when the global API advertises a smaller
-  `dependency_entries_max` - the entries sorted last leave while the request's `packages` stay,
-  and `resolver` names their package manager, such as `pypi`.
+  `dependency_entries_max` - the entries sorted last leave, and `resolver` names their package
+  manager, such as `pypi`. The request's `packages` leave only after every other entry has, the
+  ones sorted last first, and `reason` then counts the requested packages not reported.
 
 <VersionBadge version="v0.0.46" />
 
