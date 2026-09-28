@@ -5439,8 +5439,11 @@ mod tests {
         Ok((server, double))
     }
 
+    /// One hit of a pattern answer as its path and byte range.
+    type PatternHit = (Option<String>, Option<(u64, u64)>);
+
     /// Each hit of a pattern answer as its path and byte range.
-    fn pattern_hits(answer: &SearchResult) -> Vec<(Option<String>, Option<(u64, u64)>)> {
+    fn pattern_hits(answer: &SearchResult) -> Vec<PatternHit> {
         answer
             .results
             .iter()

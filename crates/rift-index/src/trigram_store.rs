@@ -271,12 +271,12 @@ fn grouped(
         .collect()
 }
 
+/// File rows as one read answers them: each row's file and the bytes of the file it holds.
+type FileRows = Vec<(ProjectPath, Range<u64>)>;
+
 /// The rows one bounded read answered, or `None` when it answered the row past
 /// `rows_max`: every row of the read's shape is a file and the bytes of the file it holds.
-fn within_rows(
-    rows: &[Value],
-    rows_max: u32,
-) -> Result<Option<Vec<(ProjectPath, Range<u64>)>>, LexicalIndexError> {
+fn within_rows(rows: &[Value], rows_max: u32) -> Result<Option<FileRows>, LexicalIndexError> {
     if rows.len() > bound_as_usize(rows_max) {
         return Ok(None);
     }
@@ -301,7 +301,7 @@ async fn trigram_rows(
     executor: &mut dyn Executor,
     expression: &str,
     rows_max: u32,
-) -> Result<Option<Vec<(ProjectPath, Range<u64>)>>, LexicalIndexError> {
+) -> Result<Option<FileRows>, LexicalIndexError> {
     let rows = toasty::sql::query(
         "SELECT lexical_documents.path, lexical_documents.byte_offset, \
          lexical_documents.byte_length \
@@ -325,7 +325,7 @@ async fn trigram_rows(
 async fn pending_rows(
     executor: &mut dyn Executor,
     rows_max: u32,
-) -> Result<Option<Vec<(ProjectPath, Range<u64>)>>, LexicalIndexError> {
+) -> Result<Option<FileRows>, LexicalIndexError> {
     let rows = toasty::sql::query(
         "SELECT lexical_documents.path, lexical_documents.byte_offset, \
          lexical_documents.byte_length \
@@ -599,13 +599,14 @@ mod tests {
     #[test]
     fn test_rows_group_by_file_and_a_whole_file_row_wins() {
         let path = |value: &str| ProjectPath::new(value).expect("fixture path must be valid");
+        let span = |start: u64, end: u64| start..end;
         let candidates = grouped([
-            (path("b.txt"), Some(40..60)),
-            (path("a.txt"), Some(10..20)),
-            (path("b.txt"), Some(0..40)),
-            (path("c.txt"), Some(0..5)),
+            (path("b.txt"), Some(span(40, 60))),
+            (path("a.txt"), Some(span(10, 20))),
+            (path("b.txt"), Some(span(0, 40))),
+            (path("c.txt"), Some(span(0, 5))),
             (path("c.txt"), None),
-            (path("c.txt"), Some(5..9)),
+            (path("c.txt"), Some(span(5, 9))),
             (path("d.txt"), None),
         ]);
         let shape: Vec<(&str, Vec<std::ops::Range<u64>>)> = candidates
@@ -615,8 +616,8 @@ mod tests {
         assert_eq!(
             shape,
             [
-                ("a.txt", vec![10..20]),
-                ("b.txt", vec![0..40, 40..60]),
+                ("a.txt", vec![span(10, 20)]),
+                ("b.txt", vec![span(0, 40), span(40, 60)]),
                 ("c.txt", Vec::new()),
                 ("d.txt", Vec::new()),
             ]
