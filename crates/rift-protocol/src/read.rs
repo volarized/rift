@@ -62,7 +62,7 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 pub use crate::search::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, GraphHop, HopDirection, MatchedField, PathPattern,
     PathPatternViolation, PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT,
-    SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_BYTES_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
+    SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
     SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
     SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
     SearchResult, SearchTraversal, SymbolChange, TraversalDirection,

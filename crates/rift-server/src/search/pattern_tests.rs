@@ -8,7 +8,7 @@ use rift_protocol::configuration::{
     ByteSize, HistoryConfiguration, LargeFileStrategy, SearchConfiguration,
 };
 use rift_protocol::read::{
-    MatchedField, ReadWarning, SEARCH_PATTERN_BYTES_MAX, SearchHitTarget, SearchParams,
+    MatchedField, ReadWarning, SEARCH_PATTERN_CHARS_MAX, SearchHitTarget, SearchParams,
     SearchResult,
 };
 use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits};
@@ -365,7 +365,7 @@ fn refusal(service: &ReadService, request: Value) -> TestResult<String> {
 #[test]
 fn refusals_name_the_field_and_the_bound() -> TestResult {
     let (_directory, service) = fixture()?;
-    let too_long = "a".repeat(SEARCH_PATTERN_BYTES_MAX + 1);
+    let too_long = "a".repeat(SEARCH_PATTERN_CHARS_MAX + 1);
     let cases = [
         (json!({"pattern": "useState("}), "unclosed group"),
         (json!({"pattern": too_long}), "exceeds the maximum 1024"),
@@ -411,11 +411,11 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
 /// character refuses naming the count.
 #[test]
 fn the_pattern_bound_counts_characters_as_the_schema_does() -> TestResult {
-    let at_bound = "\u{e9}".repeat(SEARCH_PATTERN_BYTES_MAX);
-    assert_eq!(at_bound.len(), 2 * SEARCH_PATTERN_BYTES_MAX);
+    let at_bound = "\u{e9}".repeat(SEARCH_PATTERN_CHARS_MAX);
+    assert_eq!(at_bound.len(), 2 * SEARCH_PATTERN_CHARS_MAX);
     let request = params(json!({ "pattern": at_bound }))?;
     assert!(accepted_pattern(&request, PatternBounds::default())?.is_some());
-    let past_bound = params(json!({ "pattern": "\u{e9}".repeat(SEARCH_PATTERN_BYTES_MAX + 1) }))?;
+    let past_bound = params(json!({ "pattern": "\u{e9}".repeat(SEARCH_PATTERN_CHARS_MAX + 1) }))?;
     let error = accepted_pattern(&past_bound, PatternBounds::default())
         .expect_err("one character past the bound refuses");
     assert!(
