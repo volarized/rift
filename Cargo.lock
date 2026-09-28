@@ -4487,6 +4487,7 @@ version = "0.0.45"
 dependencies = [
  "ignore",
  "rayon",
+ "regex-syntax",
  "rift-analysis",
  "rift-core",
  "rift-history",
@@ -4583,6 +4584,9 @@ name = "rift-ranking"
 version = "0.0.45"
 dependencies = [
  "data-encoding",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
  "rift-core",
  "serde",
  "sha2",

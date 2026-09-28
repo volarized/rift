@@ -66,6 +66,20 @@ percent-encoding = "2.3.1"
 rayon = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 regex = "1.12.3"
+# The feature set `regex` 1.13.1 already enables on `regex-automata`, so the matcher the
+# pattern search builds from a rewritten `Hir` compiles nothing the graph lacks.
+regex-automata = { version = "0.4.18", default-features = false, features = [
+    "dfa-onepass",
+    "hybrid",
+    "meta",
+    "nfa-backtrack",
+    "perf-inline",
+    "perf-literal",
+    "std",
+    "syntax",
+    "unicode",
+] }
+regex-syntax = "0.8.11"
 rig-core = { version = "=0.42.0", default-features = false }
 rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
