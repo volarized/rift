@@ -37,6 +37,12 @@ pub(crate) const DECLARATIONS: [&str; 2] = ["helper_beacon", "beacon"];
 /// it with that release and a `requirement_unsatisfied` warning.
 pub(crate) const UNSATISFIED_REQUIREMENT: &str = ">=2";
 
+/// The `page_limit_max` the fixture's capabilities advertise unless a test sets another.
+pub(crate) const PAGE_LIMIT_ADVERTISED: u64 = 200;
+
+/// The cursor a search page stopped at the response body bound names.
+pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
+
 /// Largest request body the fixture reads.
 const REQUEST_BODY_BYTES_MAX: usize = 4_194_304;
 
@@ -64,24 +70,48 @@ pub(crate) enum Hold {
     Read(Duration),
 }
 
+/// How the fixture answers, beyond the collection it holds.
+#[derive(Clone, Copy)]
+pub(crate) struct FixtureOptions {
+    /// What the symbol and search endpoints answer.
+    pub(crate) symbol: SymbolFixture,
+    /// The answer the fixture holds before it sends it, and for how long.
+    pub(crate) hold: Option<Hold>,
+    /// The `page_limit_max` the capabilities advertise.
+    pub(crate) page_limit_max: u64,
+    /// Whether the precise search page stops at the response body bound: it answers its
+    /// declarations with a `result_truncated` warning and [`BODY_BOUND_CURSOR`].
+    pub(crate) stopped_at_body_bound: bool,
+}
+
+impl Default for FixtureOptions {
+    fn default() -> Self {
+        Self {
+            symbol: SymbolFixture::Valid,
+            hold: None,
+            page_limit_max: PAGE_LIMIT_ADVERTISED,
+            stopped_at_body_bound: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FixtureState {
-    symbol: SymbolFixture,
-    hold: Option<Hold>,
+    options: FixtureOptions,
     requests: Arc<Mutex<Vec<ObservedRequest>>>,
 }
 
 impl FixtureState {
     /// Waits out the resolution hold, when the fixture holds resolutions.
     async fn hold_resolution(&self) {
-        if let Some(Hold::Resolution(delay)) = self.hold {
+        if let Some(Hold::Resolution(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
         }
     }
 
     /// Waits out the read hold, when the fixture holds symbol and search pages.
     async fn hold_read(&self) {
-        if let Some(Hold::Read(delay)) = self.hold {
+        if let Some(Hold::Read(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
         }
     }
@@ -94,20 +124,32 @@ pub(crate) struct ObservedRequest {
 }
 
 impl GlobalFixture {
-    pub(crate) async fn start(symbol_fixture: SymbolFixture) -> Result<Self, std::io::Error> {
-        Self::start_holding(symbol_fixture, None).await
+    pub(crate) async fn start(symbol: SymbolFixture) -> Result<Self, std::io::Error> {
+        Self::start_with(FixtureOptions {
+            symbol,
+            ..FixtureOptions::default()
+        })
+        .await
     }
 
     /// Starts the fixture, holding the answers `hold` names before it sends them.
     pub(crate) async fn start_holding(
-        symbol_fixture: SymbolFixture,
+        symbol: SymbolFixture,
         hold: Option<Hold>,
     ) -> Result<Self, std::io::Error> {
+        Self::start_with(FixtureOptions {
+            symbol,
+            hold,
+            ..FixtureOptions::default()
+        })
+        .await
+    }
+
+    pub(crate) async fn start_with(options: FixtureOptions) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let state = FixtureState {
-            symbol: symbol_fixture,
-            hold,
+            options,
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
@@ -156,8 +198,9 @@ async fn global_handler(
         body: body.clone(),
     });
     let body = body.unwrap_or(Value::Null);
+    let options = state.options;
     if path.ends_with("/capabilities") {
-        return json_response(&capabilities());
+        return json_response(&capabilities(options.page_limit_max));
     }
     if path.ends_with("/resolutions") {
         state.hold_resolution().await;
@@ -165,11 +208,12 @@ async fn global_handler(
     }
     if path.ends_with("/search") {
         state.hold_read().await;
-        return json_response(&search_page(state.symbol, &body));
+        let page = search_page(options.symbol, &body, options.stopped_at_body_bound);
+        return json_response(&page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        return json_response(&symbols(state.symbol, &body));
+        return json_response(&symbols(options.symbol, &body));
     }
     StatusCode::NOT_FOUND.into_response()
 }
@@ -183,7 +227,7 @@ fn json_response(value: &Value) -> Response {
         .into_response()
 }
 
-fn capabilities() -> Value {
+fn capabilities(page_limit_max: u64) -> Value {
     json!({
         "supported_package_managers": ["cargo"],
         "supported_features": ["resolutions", "search", "symbols", "documentation_search", "symbol_documentation"],
@@ -205,7 +249,7 @@ fn capabilities() -> Value {
             "identifier_bytes_max": 4096,
             "packages_max": 20000,
             "page_limit_min": 1,
-            "page_limit_max": 200,
+            "page_limit_max": page_limit_max,
             "page_limit_default": 20,
             "cursor_bytes_max": 4096,
             "candidate_pool_max": 1000,
@@ -266,11 +310,11 @@ fn resolution(requested: &Value) -> Value {
     body
 }
 
-/// One page of `items` and `warnings`, with the revision fields every page carries.
+/// One page of `items` and `warnings`, with the revision fields every page carries and no
+/// cursor.
 fn page(items: &[Value], warnings: &Value) -> Value {
     json!({
         "items": items,
-        "next_cursor": null,
         "warnings": warnings,
         "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
@@ -302,8 +346,9 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
 /// its identifiers matches, at the best class any of them reaches, with a `query_narrowed`
-/// page warning; the broad phase answers no further declaration.
-fn search_page(fixture: SymbolFixture, request: &Value) -> Value {
+/// page warning; the broad phase answers no further declaration. A page stopped at the
+/// response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
+fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: bool) -> Value {
     if request["phase"] != "precise" {
         return page(&[], &json!([]));
     }
@@ -325,13 +370,20 @@ fn search_page(fixture: SymbolFixture, request: &Value) -> Value {
             hit
         })
         .collect();
-    page(
-        &items,
-        &json!([{
-            "code": "query_narrowed",
-            "detail": "query exceeded the active term bound"
-        }]),
-    )
+    let narrowed = json!({
+        "code": "query_narrowed",
+        "detail": "query exceeded the active term bound"
+    });
+    if !stopped_at_body_bound {
+        return page(&items, &json!([narrowed]));
+    }
+    let truncated = json!({
+        "code": "result_truncated",
+        "detail": "the page stopped at response_body_bytes_max"
+    });
+    let mut stopped = page(&items, &json!([narrowed, truncated]));
+    stopped["next_cursor"] = json!(BODY_BOUND_CURSOR);
+    stopped
 }
 
 /// Each collected declaration one of the lowercase `candidates` matches, at the best

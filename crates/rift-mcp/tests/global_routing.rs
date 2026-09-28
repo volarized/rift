@@ -12,7 +12,10 @@ mod workspace_client;
 
 use std::{fs, time::Duration};
 
-use global_api::{COLLECTED_UNIT, GlobalFixture, Hold, SymbolFixture, UNSATISFIED_REQUIREMENT};
+use global_api::{
+    BODY_BOUND_CURSOR, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold, SymbolFixture,
+    UNSATISFIED_REQUIREMENT,
+};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -494,6 +497,123 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
         assert!(!rendered.contains("local_beacon"));
         assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The search requests `fixture` received, in order.
+async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.contains("/v1/search?"))
+        .collect()
+}
+
+/// A search asks each phase for one page at the smaller of the client's bound and the
+/// advertised `page_limit_max`: 200 against a service advertising 200, 1,000 against one
+/// advertising 1,000, and one request per phase either way.
+#[tokio::test]
+async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResult {
+    for (advertised, limit) in [(200, "limit=200"), (1_000, "limit=1000")] {
+        let fixture = GlobalFixture::start_with(FixtureOptions {
+            page_limit_max: advertised,
+            ..FixtureOptions::default()
+        })
+        .await?;
+        let configuration = format!(
+            "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+             request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+            fixture.endpoint
+        );
+        let workspace = served_dependent_workspace(Some(&configuration)).await?;
+        let (directory, client, server_task) = workspace.served;
+        let answer = call_tool(
+            &client,
+            "search",
+            json!({"query":"helper_beacon demo","scope":"global"}),
+        )
+        .await?;
+        assert!(
+            answer["results"]
+                .as_array()
+                .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+            "{answer:#}"
+        );
+        let searches = search_requests(&fixture).await;
+        assert_eq!(searches.len(), 2, "{searches:#?}");
+        for request in &searches {
+            assert!(
+                request.uri.ends_with(limit),
+                "{advertised}: {}",
+                request.uri
+            );
+        }
+        drop(directory);
+        client.cancel().await?;
+        server_task.await?;
+    }
+    Ok(())
+}
+
+/// A search page the service stopped at its response body bound answers what fit, with the
+/// page's `result_truncated` as a `global_page_warning`, and its cursor is not followed: the
+/// search stays at one request per phase.
+#[tokio::test]
+async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        stopped_at_body_bound: true,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query":"helper_beacon demo","scope":"global","include":["source"]}),
+    )
+    .await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let truncated: Vec<&Value> = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| {
+            warning["code"] == "global_page_warning"
+                && warning["warning_code"] == "result_truncated"
+        })
+        .collect();
+    assert_eq!(
+        truncated,
+        [&json!({
+            "code": "global_page_warning",
+            "warning_code": "result_truncated",
+            "detail": "the page stopped at response_body_bytes_max"
+        })],
+        "{answer:#}"
+    );
+    let searches = search_requests(&fixture).await;
+    assert_eq!(searches.len(), 2, "{searches:#?}");
+    assert!(
+        searches
+            .iter()
+            .all(|request| !request.uri.contains(BODY_BOUND_CURSOR)),
+        "the stopped page's cursor is never followed: {searches:#?}"
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
