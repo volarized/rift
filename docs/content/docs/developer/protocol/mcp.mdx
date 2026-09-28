@@ -599,6 +599,8 @@ A callee outside the project maps to the package whose files hold it, at an exac
   Cargo registry folder, or its import folder in the Python environment, at the version the
   lockfile pins
 - the Rust standard library below `rustc --print sysroot`, at the toolchain's version
+- a crate the Rust standard library vendors, such as `library/vendor/hashbrown-0.17.1/` below
+  the sysroot, as that Cargo package at the version the standard library's `Cargo.lock` pins
 - the TypeScript built-ins in the `lib.*.d.ts` files of the `typescript` package the engine
   runs, at that package's version
 - Python's standard library, in the typeshed stubs the embedded engine ships, at the release the
