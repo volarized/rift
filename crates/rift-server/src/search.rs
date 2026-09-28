@@ -360,7 +360,7 @@ impl ReadService {
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(self.documentation_warnings(target));
-        warnings.extend(references.analysis_unavailable().cloned());
+        warnings.extend(references.warnings());
         warnings
     }
 

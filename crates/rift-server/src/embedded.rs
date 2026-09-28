@@ -8,9 +8,11 @@
 //! references and diagnostics need no embedded-specific path.
 //!
 //! The served surface is the subset the server itself asks engines for:
-//! `initialize`, document open and close, `textDocument/references`, and the
-//! `textDocument/diagnostic` pull. Ranges cross the wire in UTF-8 positions,
-//! the encoding the answer advertises.
+//! `initialize`, document open and close, `textDocument/references`, call
+//! hierarchy (`textDocument/prepareCallHierarchy` and
+//! `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
+//! Ranges cross the wire in UTF-8 positions, the encoding the answer
+//! advertises.
 //!
 //! ty analyzes the tree on disk: the database is rooted at the workspace,
 //! discovery stays inside it (`discover_without_uv` only when the tree
@@ -59,6 +61,11 @@ const CONTENT_MODIFIED: i64 = -32801;
 /// serving ty over the duplex transport. Dropping the session's transport
 /// ends the task the way a spawned engine's exit does.
 ///
+/// ty answers each request on demand against the tree's database and
+/// announces no work-done progress, so the session is declared ready at its
+/// start ([`EngineSession::declare_ready`]) instead of reading unconfirmed
+/// until a `settle_delay` passes, and stays ready across a file change.
+///
 /// # Errors
 ///
 /// Returns [`EngineError`] when the handshake refuses, exactly as a
@@ -75,7 +82,11 @@ pub(crate) async fn started_session(
     let (client, server) = tokio::io::duplex(DUPLEX_BYTES);
     let root = workspace_root.to_path_buf();
     tokio::spawn(serve(server, root));
-    EngineSession::start_over_transport(launch, workspace_root, client, tokio::io::empty()).await
+    let mut session =
+        EngineSession::start_over_transport(launch, workspace_root, client, tokio::io::empty())
+            .await?;
+    session.declare_ready();
+    Ok(session)
 }
 
 /// Serves the LSP loop over one transport until the peer closes it or
@@ -203,11 +214,27 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
         ("shutdown", Some(id)) => Handled::Reply(reply(&id, &Value::Null)),
 
         ("textDocument/references", Some(id)) => {
-            answered(&id, root, documents, &params, references)
+            answered(&id, root, documents, &params, DOCUMENT_URI, references)
         }
-        ("textDocument/diagnostic", Some(id)) => {
-            answered(&id, root, documents, &params, pulled_diagnostics)
+        ("textDocument/prepareCallHierarchy", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            prepared_call_hierarchy,
+        ),
+        ("callHierarchy/outgoingCalls", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, outgoing_calls)
         }
+        ("textDocument/diagnostic", Some(id)) => answered(
+            &id,
+            root,
+            documents,
+            &params,
+            DOCUMENT_URI,
+            pulled_diagnostics,
+        ),
         (_, Some(id)) => Handled::Reply(error_reply(
             &id,
             METHOD_NOT_FOUND,
@@ -216,16 +243,25 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
     }
 }
 
+/// Where a document request names its document.
+const DOCUMENT_URI: &str = "/textDocument/uri";
+/// Where a call hierarchy request names the file of the item it re-sends.
+const ITEM_URI: &str = "/item/uri";
+
 /// Runs one answer against the tree's database and wraps it as a reply.
+///
+/// `uri_pointer` names the document whose sent text the answer converts
+/// positions against.
 fn answered(
     id: &Value,
     root: &Path,
     documents: &DocumentStore,
     params: &Value,
+    uri_pointer: &str,
     answer: fn(&mut ProjectDatabase, &Exchange<'_>, &Value) -> Result<Value, AnswerRefusal>,
 ) -> Handled {
     let sent = params
-        .pointer("/textDocument/uri")
+        .pointer(uri_pointer)
         .and_then(Value::as_str)
         .and_then(|uri| documents.lock().ok()?.get(uri).cloned());
     let outcome = with_database(root, |db, canonical| {
@@ -256,14 +292,15 @@ fn error_reply(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The capabilities this engine advertises: UTF-8 positions, prepare and
-/// references and the diagnostic pull. No file-operation
-/// capability is declared, so moves warn instead of asking.
+/// The capabilities this engine advertises: UTF-8 positions, references,
+/// call hierarchy, and the diagnostic pull. No file-operation capability is
+/// declared, so moves warn instead of asking.
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
             "positionEncoding": "utf-8",
             "referencesProvider": true,
+            "callHierarchyProvider": true,
             "diagnosticProvider": {
                 "interFileDependencies": true,
                 "workspaceDiagnostics": false,
@@ -501,6 +538,120 @@ fn target_location(
     Ok(Some((uri, range)))
 }
 
+/// Answers `textDocument/prepareCallHierarchy`: one item per callable
+/// definition at the position, and `null` off a function, method, or class.
+fn prepared_call_hierarchy(
+    database: &mut ProjectDatabase,
+    exchange: &Exchange<'_>,
+    params: &Value,
+) -> Result<Value, AnswerRefusal> {
+    let file = file_at(
+        database,
+        params.pointer(DOCUMENT_URI).unwrap_or(&Value::Null),
+    )?;
+    database.project().open_file(database, file);
+    let program_file = database.program_file(file);
+    let text = source_text(database, file);
+    let text = exchange.conversion_text(text.as_str());
+    let offset = offset_at(text, params.pointer("/position").unwrap_or(&Value::Null))?;
+    let items = ty_ide::prepare_call_hierarchy(database, program_file, offset).unwrap_or_default();
+    let mut prepared = Vec::with_capacity(items.len());
+    for item in &items {
+        if let Some(item) = hierarchy_item(database, exchange, item)? {
+            prepared.push(item);
+        }
+    }
+    Ok(if prepared.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(prepared)
+    })
+}
+
+/// Answers `callHierarchy/outgoingCalls` for an item this engine prepared.
+///
+/// The item is found again from its URI and the start of its selection
+/// range, the key `ty_ide::outgoing_calls` reads. Each call's `fromRanges`
+/// sit in the item's own file.
+fn outgoing_calls(
+    database: &mut ProjectDatabase,
+    exchange: &Exchange<'_>,
+    params: &Value,
+) -> Result<Value, AnswerRefusal> {
+    let file = file_at(database, params.pointer(ITEM_URI).unwrap_or(&Value::Null))?;
+    database.project().open_file(database, file);
+    let program_file = database.program_file(file);
+    let text = source_text(database, file);
+    let offset = offset_at(
+        exchange.conversion_text(text.as_str()),
+        params
+            .pointer("/item/selectionRange/start")
+            .unwrap_or(&Value::Null),
+    )?;
+    let mut calls = Vec::new();
+    for call in ty_ide::outgoing_calls(database, program_file, offset) {
+        let Some(to) = hierarchy_item(database, exchange, &call.to)? else {
+            continue;
+        };
+        let from_ranges = call
+            .from_ranges
+            .iter()
+            .map(|range| range_at(text.as_str(), *range))
+            .collect::<Result<Vec<_>, _>>()?;
+        calls.push(json!({ "to": to, "fromRanges": from_ranges }));
+    }
+    Ok(Value::Array(calls))
+}
+
+/// One `ty_ide` call hierarchy item in its LSP spelling; `None` for a file
+/// that is neither on the filesystem nor a vendored stub.
+///
+/// A vendored typeshed stub keeps its `vendored://stdlib/<path>` spelling as
+/// the URI, so the server can name the standard library module it belongs to.
+fn hierarchy_item(
+    database: &ProjectDatabase,
+    exchange: &Exchange<'_>,
+    item: &ty_ide::CallHierarchyItem,
+) -> Result<Option<Value>, AnswerRefusal> {
+    let text = source_text(database, item.file);
+    let (uri, range) = match item.file.path(database).as_vendored_path() {
+        Some(vendored) => (
+            vendored.to_string(),
+            range_at(text.as_str(), item.full_range)?,
+        ),
+        None => match target_location(database, exchange, item.file, item.full_range)? {
+            Some(location) => location,
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(json!({
+        "name": item.name.as_str(),
+        "kind": symbol_kind(item.kind),
+        "detail": item.detail,
+        "uri": uri,
+        "range": range,
+        "selectionRange": range_at(text.as_str(), item.selection_range)?,
+    })))
+}
+
+/// The LSP symbol kind for a `ty_ide` one, as `ty_server` maps it.
+fn symbol_kind(kind: ty_ide::SymbolKind) -> lsp_types::SymbolKind {
+    match kind {
+        ty_ide::SymbolKind::Module | ty_ide::SymbolKind::Import => lsp_types::SymbolKind::MODULE,
+        ty_ide::SymbolKind::Class => lsp_types::SymbolKind::CLASS,
+        ty_ide::SymbolKind::Method => lsp_types::SymbolKind::METHOD,
+        ty_ide::SymbolKind::Function => lsp_types::SymbolKind::FUNCTION,
+        ty_ide::SymbolKind::Variable | ty_ide::SymbolKind::Parameter => {
+            lsp_types::SymbolKind::VARIABLE
+        }
+        ty_ide::SymbolKind::Constant => lsp_types::SymbolKind::CONSTANT,
+        ty_ide::SymbolKind::Property => lsp_types::SymbolKind::PROPERTY,
+        ty_ide::SymbolKind::Field => lsp_types::SymbolKind::FIELD,
+        ty_ide::SymbolKind::Constructor => lsp_types::SymbolKind::CONSTRUCTOR,
+        ty_ide::SymbolKind::TypeParameter => lsp_types::SymbolKind::TYPE_PARAMETER,
+    }
+}
+
 /// Answers the `textDocument/diagnostic` pull with one full report.
 fn pulled_diagnostics(
     database: &mut ProjectDatabase,
@@ -591,6 +742,7 @@ mod tests {
         let capabilities = initialize_result();
         assert_eq!(capabilities["capabilities"]["positionEncoding"], "utf-8");
         assert_eq!(capabilities["capabilities"]["referencesProvider"], true);
+        assert_eq!(capabilities["capabilities"]["callHierarchyProvider"], true);
         assert!(capabilities["capabilities"]["diagnosticProvider"].is_object());
         assert!(
             capabilities["capabilities"].get("workspace").is_none(),
@@ -735,6 +887,85 @@ mod tests {
             serde_json::json!([]),
             "a position resolving no symbol answers the empty list"
         );
+    }
+
+    /// Prepare anchors a function and answers `null` off one; outgoing calls
+    /// name a callee in the tree by its file URI and a builtin by its
+    /// vendored typeshed path, each with the call site in the seed's file.
+    #[test]
+    fn test_call_hierarchy_prepares_a_function_and_names_its_callees() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(
+            directory.path().join("a.py"),
+            "def helper():\n    return 1\n",
+        )
+        .expect("fixture a");
+        std::fs::write(
+            directory.path().join("b.py"),
+            "from a import helper\n\ndef total():\n    return helper() + len([])\n",
+        )
+        .expect("fixture b");
+        let uri = uri_of(&directory.path().join("b.py"));
+        let prepare = |position: Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "textDocument/prepareCallHierarchy",
+                "params": { "textDocument": { "uri": uri }, "position": position },
+            })
+        };
+        let Handled::Reply(prepared) = handle_message(
+            &prepare(serde_json::json!({ "line": 2, "character": 4 })),
+            directory.path(),
+            &empty_documents(),
+        ) else {
+            panic!("prepare must reply");
+        };
+        let item = prepared["result"][0].clone();
+        assert_eq!(item["name"], "total", "{prepared:#}");
+        assert_eq!(
+            item["kind"],
+            serde_json::json!(lsp_types::SymbolKind::FUNCTION)
+        );
+        assert_eq!(item["uri"], serde_json::json!(uri));
+
+        let outgoing = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "callHierarchy/outgoingCalls",
+            "params": { "item": item },
+        });
+        let Handled::Reply(reply) = handle_message(&outgoing, directory.path(), &empty_documents())
+        else {
+            panic!("outgoing calls must reply");
+        };
+        let calls = reply["result"].as_array().expect("a call list");
+        let helper = calls
+            .iter()
+            .find(|call| call["to"]["name"] == "helper")
+            .unwrap_or_else(|| panic!("helper is a callee: {reply:#}"));
+        assert_eq!(
+            helper["to"]["uri"],
+            serde_json::json!(uri_of(&directory.path().join("a.py")))
+        );
+        assert_eq!(
+            helper["fromRanges"][0]["start"],
+            serde_json::json!({ "line": 3, "character": 11 })
+        );
+        assert!(
+            calls.iter().any(|call| call["to"]["name"] == "len"
+                && call["to"]["uri"] == "vendored://stdlib/builtins.pyi"),
+            "a builtin keeps its vendored stub path: {reply:#}"
+        );
+
+        let Handled::Reply(off_function) = handle_message(
+            &prepare(serde_json::json!({ "line": 1, "character": 0 })),
+            directory.path(),
+            &empty_documents(),
+        ) else {
+            panic!("prepare must reply");
+        };
+        assert_eq!(off_function["result"], Value::Null);
     }
 
     /// The serve loop over a raw transport: initialize answers a framed

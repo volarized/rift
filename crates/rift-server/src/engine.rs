@@ -38,7 +38,7 @@ use rift_core::{Error, ErrorCode, ErrorName};
 use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
 use rift_protocol::configuration::{CommandInput, EmbeddedEngine, LspConfiguration};
 use rift_protocol::read::Language;
-use rift_protocol::retry::RestartPolicy;
+use rift_protocol::retry::{RETRY_ATTEMPTS_MAX, RestartPolicy, RetryPolicy};
 use rift_protocol::workspace::LspState;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
@@ -46,7 +46,9 @@ use tokio::time::Instant;
 
 use rift_lsp::session::EngineReadiness;
 
-type SessionFuture<'session, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
+/// One step of an engine exchange: a future borrowing the session it runs on.
+pub(crate) type SessionFuture<'session, T> =
+    std::pin::Pin<Box<dyn Future<Output = T> + Send + 'session>>;
 
 fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
     Box::pin(async { Ok(()) })
@@ -318,6 +320,10 @@ impl RestartBudget {
 enum Settlement {
     /// Report can be returned.
     Ready,
+    /// The engine announced no work since the last change and stayed quiet
+    /// past `settle_delay`, and the full report repeated: the read takes it
+    /// and records the engine unconfirmed, as a walk does.
+    Unconfirmed,
     /// Report must be requested again.
     Retry,
 }
@@ -351,20 +357,108 @@ struct DiagnosticEvidence {
     shape: ReportShape,
     repeated: bool,
     final_attempt: bool,
+    /// The session read engine output at least `settle_delay` after the last
+    /// change ([`EngineSession::walk_is_quiet`]).
+    quiet: bool,
 }
 
 /// Decides whether one diagnostic report is ready to return.
+///
+/// An unconfirmed engine's repeated full report is taken once the session is
+/// quiet past `settle_delay`: after a file change it was told of,
+/// rust-analyzer announces no progress, so the first incoming read after
+/// each edit would otherwise spend the whole retry table.
 fn diagnostic_settlement(readiness: EngineReadiness, evidence: DiagnosticEvidence) -> Settlement {
     if evidence.shape == ReportShape::Partial || readiness == EngineReadiness::Analyzing {
         return Settlement::Retry;
     }
-    if (readiness == EngineReadiness::Ready && evidence.shape == ReportShape::FullNonempty)
+    if readiness == EngineReadiness::Unconfirmed && evidence.repeated && evidence.quiet {
+        Settlement::Unconfirmed
+    } else if (readiness == EngineReadiness::Ready && evidence.shape == ReportShape::FullNonempty)
         || (evidence.repeated && evidence.final_attempt)
     {
         Settlement::Ready
     } else {
         Settlement::Retry
     }
+}
+
+/// What one outgoing calls answer decides for a walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutgoingSettlement {
+    /// The engine read ready; its answer is final.
+    Ready,
+    /// The engine announced no work since the last change and stayed quiet
+    /// past `settle_delay`; the walk trusts its answer and warns.
+    Unconfirmed,
+    /// The answer is provisional; ask again.
+    Retry,
+}
+
+/// Decides whether one outgoing calls answer is final for a walk.
+///
+/// An outgoing answer has no evidence of its own, unlike an incoming one
+/// that holds the declaration's own occurrence: rust-analyzer answers an
+/// empty prepare or `content modified` while it loads, never a partial
+/// callee list, so readiness alone decides. Once the engine reads ready, an
+/// empty prepare and an empty callee list are both final: the first refuses
+/// the seed, the second is a walk with no callee. Whether prepare gave
+/// an item does not change the verdict; [`EngineSlot::request_outgoing`]
+/// reads it after.
+fn outgoing_settlement(readiness: EngineReadiness, quiet: bool) -> OutgoingSettlement {
+    match readiness {
+        EngineReadiness::Ready => OutgoingSettlement::Ready,
+        EngineReadiness::Unconfirmed if quiet => OutgoingSettlement::Unconfirmed,
+        EngineReadiness::Unconfirmed | EngineReadiness::Analyzing => OutgoingSettlement::Retry,
+    }
+}
+
+/// Whether a walk's wait between two attempts can end: the next attempt's
+/// answer would be final.
+fn walk_settled(session: &EngineSession) -> bool {
+    outgoing_settlement(session.walk_readiness(), session.walk_is_quiet())
+        != OutgoingSettlement::Retry
+}
+
+/// What one outgoing calls exchange settled on.
+#[derive(Debug, Eq, PartialEq)]
+pub enum OutgoingAnswer<T> {
+    /// The engine read ready and prepared an item; the answer is final.
+    Ready(T),
+    /// The engine announced no work since the last change and stayed quiet
+    /// past `settle_delay`: the walk takes the answer and warns.
+    Unconfirmed(T),
+    /// The engine read ready and prepared no call hierarchy item at the
+    /// seed, so the walk refuses the seed and names its kind.
+    Unprepared,
+    /// The readiness wait was spent before the engine read ready. The
+    /// session stays live, so a later walk continues from its load.
+    Unsettled {
+        /// Attempts the walk made before the wait was spent.
+        attempts: u64,
+    },
+}
+
+/// The wait before a walk's next attempt, absent once the wait would pass
+/// `deadline` or [`RETRY_ATTEMPTS_MAX`] attempts were made.
+///
+/// The retry table's waits apply as they do to every request, and hold at
+/// `delay_limit` once its attempt bound is spent: a walk waits under
+/// `[server] readiness_timeout`, not under `retry.attempts`, since a
+/// loading engine's readiness, not its answer, is what the walk waits for.
+fn walk_wait(
+    retry: &RetryPolicy,
+    attempt: u64,
+    now: Instant,
+    deadline: Instant,
+) -> Option<Duration> {
+    if attempt >= RETRY_ATTEMPTS_MAX {
+        return None;
+    }
+    let wait = retry
+        .delay_after(attempt)
+        .unwrap_or_else(|| Duration::from_millis(retry.delay_limit.milliseconds()));
+    (now + wait < deadline).then_some(wait)
 }
 
 /// One condition the slot absorbs: the engine may answer the same request
@@ -388,6 +482,22 @@ enum Transient<T> {
     AnsweredNothing(T),
     /// A full diagnostic report has not yet repeated without progress.
     Unready,
+}
+
+impl<T> Transient<T> {
+    /// Whether the condition can mean the engine is still loading, so a walk
+    /// keeps waiting for it past the retry table's attempt bound.
+    ///
+    /// A refusal whose code does not invite the same request again is the
+    /// engine's verdict on the request, which no wait changes: it ends a
+    /// walk at the retry table's bound, as it ends every other request.
+    fn is_loading(&self) -> bool {
+        match self {
+            Self::Analyzing | Self::Unready => true,
+            Self::Refused(refusal) => refusal.fault().is_retryable_refusal(),
+            Self::AnsweredNothing(_) => false,
+        }
+    }
 }
 
 /// What the retry loop does with one answer.
@@ -499,6 +609,8 @@ impl EngineSlot {
             begin_immediately,
             operation,
             finish_immediately,
+            None,
+            |_session| false,
             |session, _session_generation, answer, _final_attempt| {
                 if session.is_analyzing() {
                     Answer::Retry(Transient::Analyzing)
@@ -541,6 +653,8 @@ impl EngineSlot {
             begin,
             operation,
             finish,
+            None,
+            |_session| false,
             |session, _session_generation, answer, _final_attempt| {
                 if session.is_analyzing() {
                     Answer::Retry(Transient::Analyzing)
@@ -561,6 +675,21 @@ impl EngineSlot {
     /// Retries repeat only `operation`. `finish` runs once before a live
     /// session returns or exhausts its retry table. A replacement session
     /// receives its own begin call.
+    ///
+    /// The exchange is an incoming walk's, and waits as an outgoing one does
+    /// ([`EngineSlot::request_outgoing`]): past the retry table's attempt
+    /// bound, up to `deadline`, so a spent wait ends inside the loop with
+    /// [`EngineFault::Analyzing`] and the session kept. A wait that
+    /// follows an attempt the engine answered while analyzing ends once the
+    /// session no longer reads analyzing, and one that follows an unconfirmed
+    /// attempt read before the quiet ends once the session reads quiet.
+    ///
+    /// An unconfirmed engine's repeated full report is taken once the session
+    /// is quiet past `settle_delay`, and the answer comes back with `true`, so
+    /// the read records the engine unconfirmed. An unconfirmed session
+    /// has seen no progress transition since the change, so the walk's quiet
+    /// ([`EngineSession::walk_is_quiet`]) is the quiet of every token,
+    /// flycheck included.
     ///
     /// `answer_version` reads the document version one answer names, when it
     /// names one at all - `textDocument/publishDiagnostics` carries an
@@ -594,42 +723,139 @@ impl EngineSlot {
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         mut report_state: impl FnMut(&T) -> (bool, bool),
         mut answer_version: impl FnMut(&T) -> Option<i32>,
-    ) -> Result<T, EngineError> {
+        deadline: Instant,
+    ) -> Result<(T, bool), EngineError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let mut previous = None;
-        self.request_deciding(
-            begin,
-            operation,
-            finish,
-            |session, session_generation, answer, final_attempt| {
-                let stale = answer_version(&answer)
-                    .is_some_and(|version| version != session.document_version());
-                if stale {
-                    return Answer::Retry(Transient::Unready);
-                }
-                let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
-                    *prior_generation == session_generation && prior == &answer
-                });
-                let (full, empty) = report_state(&answer);
-                if diagnostic_settlement(
-                    session.readiness(),
-                    DiagnosticEvidence {
-                        shape: ReportShape::from_report(full, empty),
-                        repeated,
-                        final_attempt,
-                    },
-                ) == Settlement::Ready
-                {
-                    Answer::Ready(answer)
-                } else {
-                    previous = Some((session_generation, answer));
-                    Answer::Retry(Transient::Unready)
-                }
-            },
+        let mut settled = Settlement::Retry;
+        let analyzing = AtomicBool::new(false);
+        let awaiting_quiet = AtomicBool::new(false);
+        let answer = self
+            .request_deciding(
+                begin,
+                operation,
+                finish,
+                Some(deadline),
+                |session| {
+                    (analyzing.load(Ordering::Relaxed) && !session.is_analyzing())
+                        || (awaiting_quiet.load(Ordering::Relaxed)
+                            && session.readiness() == EngineReadiness::Unconfirmed
+                            && session.walk_is_quiet())
+                },
+                |session, session_generation, answer, final_attempt| {
+                    analyzing.store(session.is_analyzing(), Ordering::Relaxed);
+                    let quiet = session.walk_is_quiet();
+                    awaiting_quiet.store(
+                        session.readiness() == EngineReadiness::Unconfirmed && !quiet,
+                        Ordering::Relaxed,
+                    );
+                    let stale = answer_version(&answer)
+                        .is_some_and(|version| version != session.document_version());
+                    if stale {
+                        return Answer::Retry(Transient::Unready);
+                    }
+                    let repeated = previous.as_ref().is_some_and(|(prior_generation, prior)| {
+                        *prior_generation == session_generation && prior == &answer
+                    });
+                    let (full, empty) = report_state(&answer);
+                    settled = diagnostic_settlement(
+                        session.readiness(),
+                        DiagnosticEvidence {
+                            shape: ReportShape::from_report(full, empty),
+                            repeated,
+                            final_attempt,
+                            quiet,
+                        },
+                    );
+                    if settled == Settlement::Retry {
+                        previous = Some((session_generation, answer));
+                        Answer::Retry(Transient::Unready)
+                    } else {
+                        Answer::Ready(answer)
+                    }
+                },
+            )
+            .await?;
+        Ok((answer, settled == Settlement::Unconfirmed))
+    }
+
+    /// Runs one outgoing calls exchange until the engine reads ready for a
+    /// walk, or `deadline` passes.
+    ///
+    /// `operation` answers `None` when prepare gave no item at the seed and
+    /// the callees otherwise. Readiness is the walk's
+    /// ([`EngineSession::walk_readiness`]): rust-analyzer's `cargo check`
+    /// does not hold a walk back. The waits between attempts follow the
+    /// retry table and continue past its attempt bound up to `deadline`, so a
+    /// spent wait ends inside the loop: `finish` runs, the session stays
+    /// live, and the answer is [`OutgoingAnswer::Unsettled`] instead of a
+    /// dropped request that discards the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns operation failure, exhausted refusal, start failure, or ended
+    /// session.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future can skip `finish`, so its session is discarded. The next
+    /// request starts a replacement within the configured restart budget.
+    pub async fn request_outgoing<T>(
+        &self,
+        begin: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
         )
-        .await
+            -> SessionFuture<'session, Result<Option<T>, EngineError>>,
+        finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+        deadline: Instant,
+    ) -> Result<OutgoingAnswer<T>, EngineError> {
+        let mut settled = OutgoingSettlement::Retry;
+        let answer = self
+            .request_deciding(
+                begin,
+                operation,
+                finish,
+                Some(deadline),
+                walk_settled,
+                |session, _session_generation, answer, _final_attempt| {
+                    settled =
+                        outgoing_settlement(session.walk_readiness(), session.walk_is_quiet());
+                    match settled {
+                        OutgoingSettlement::Retry => Answer::Retry(Transient::Analyzing),
+                        OutgoingSettlement::Ready | OutgoingSettlement::Unconfirmed => {
+                            Answer::Ready(answer)
+                        }
+                    }
+                },
+            )
+            .await;
+        match answer {
+            Ok(None) => Ok(OutgoingAnswer::Unprepared),
+            Ok(Some(callees)) if settled == OutgoingSettlement::Unconfirmed => {
+                Ok(OutgoingAnswer::Unconfirmed(callees))
+            }
+            Ok(Some(callees)) => Ok(OutgoingAnswer::Ready(callees)),
+            Err(error) => match error.fault() {
+                EngineFault::Analyzing { attempts } => Ok(OutgoingAnswer::Unsettled {
+                    attempts: *attempts,
+                }),
+                _ => Err(error),
+            },
+        }
     }
 
     /// Shared bounded request loop.
+    ///
+    /// Without `deadline`, the retry table's attempt bound ends the loop; with
+    /// it, [`walk_wait`] does while the absorbed condition can mean the engine
+    /// is still loading ([`Transient::is_loading`]), and the retry table's
+    /// bound or `deadline`, whichever comes first, does otherwise. The wait
+    /// between two attempts reads engine output
+    /// ([`EngineSession::read_output`]), so progress is stamped when it
+    /// arrives; the wait also ends once `wake` holds.
     ///
     /// A canceled request discards its session before releasing the slot lock. A later
     /// request spends the configured restart budget to start without open documents.
@@ -643,6 +869,8 @@ impl EngineSlot {
         )
             -> SessionFuture<'session, Result<T, EngineError>>,
         mut finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
+        deadline: Option<Instant>,
+        wake: impl Fn(&EngineSession) -> bool,
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
     ) -> Result<T, EngineError> {
         let retry = self.configuration.retry;
@@ -713,20 +941,53 @@ impl EngineSlot {
                     return Err(error);
                 }
             };
-            let Some(wait) = retry.delay_after(attempt) else {
+            let wait = match deadline {
+                Some(deadline) if absorbed.is_loading() => {
+                    walk_wait(&retry, attempt, Instant::now(), deadline)
+                }
+                Some(deadline) => retry
+                    .delay_after(attempt)
+                    .filter(|wait| Instant::now() + *wait < deadline),
+                None => retry.delay_after(attempt),
+            };
+            let Some(wait) = wait else {
                 finish(session).await;
                 guarded.finished = true;
-                return self.exhausted(absorbed, retry.attempts);
+                return self.exhausted(absorbed, attempt, deadline.is_some());
             };
-            tokio::time::sleep(wait).await;
+            let waited = session.read_output(Instant::now() + wait, &wake).await;
+            if let Err(error) = waited {
+                exchange_started = false;
+                reported = Some(error);
+            }
             attempt += 1;
         }
     }
 
     /// What one absorbed condition surfaces once attempt bound is spent.
-    fn exhausted<T>(&self, absorbed: Transient<T>, attempts: u64) -> Result<T, EngineError> {
+    ///
+    /// A walk's wait spent on a retryable refusal surfaces as
+    /// [`EngineFault::Analyzing`], as a wait spent on analyzing answers does:
+    /// rust-analyzer answers `-32801` content modified while it loads, and an
+    /// empty prepare at the same moment means the same load.
+    fn exhausted<T>(
+        &self,
+        absorbed: Transient<T>,
+        attempts: u64,
+        walk: bool,
+    ) -> Result<T, EngineError> {
         let engine = self.name();
         match absorbed {
+            Transient::Refused(refusal) if walk && refusal.fault().is_retryable_refusal() => {
+                tracing::warn!(
+                    component = "engine",
+                    engine,
+                    attempts,
+                    refusal = %refusal,
+                    "language engine refused with a retryable code when the walk's wait was spent"
+                );
+                Err(Error::new(EngineFault::Analyzing { attempts }))
+            }
             Transient::Analyzing | Transient::Unready => {
                 tracing::warn!(
                     component = "engine",
@@ -1474,12 +1735,549 @@ mod tests {
     }
 
     #[test]
+    fn outgoing_settlement_trusts_ready_and_a_quiet_unconfirmed_engine_alone() {
+        use EngineReadiness::{Analyzing, Ready, Unconfirmed};
+        for (readiness, quiet, expected) in [
+            (Analyzing, false, OutgoingSettlement::Retry),
+            (Analyzing, true, OutgoingSettlement::Retry),
+            (Unconfirmed, false, OutgoingSettlement::Retry),
+            (Unconfirmed, true, OutgoingSettlement::Unconfirmed),
+            (Ready, false, OutgoingSettlement::Ready),
+            (Ready, true, OutgoingSettlement::Ready),
+        ] {
+            assert_eq!(
+                outgoing_settlement(readiness, quiet),
+                expected,
+                "{readiness:?} quiet={quiet}"
+            );
+        }
+    }
+
+    /// The default retry table spends 8 attempts over 9.75 s of waits; a walk
+    /// under the 30 s `readiness_timeout` keeps asking at `delay_limit` and
+    /// makes 18 attempts, the last at 29.75 s.
+    #[test]
+    fn walk_wait_follows_the_retry_table_up_to_the_deadline() {
+        let retry = RetryPolicy::default();
+        let schedule = |next: &dyn Fn(u64, Duration) -> Option<Duration>| {
+            let (mut attempt, mut elapsed) = (1_u64, Duration::ZERO);
+            while let Some(wait) = next(attempt, elapsed) {
+                elapsed += wait;
+                attempt += 1;
+            }
+            (attempt, elapsed)
+        };
+        assert_eq!(
+            schedule(&|attempt, _| retry.delay_after(attempt)),
+            (8, Duration::from_millis(9_750))
+        );
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        assert_eq!(
+            schedule(&|attempt, elapsed| walk_wait(&retry, attempt, start + elapsed, deadline)),
+            (18, Duration::from_millis(29_750))
+        );
+        let never = start + Duration::from_hours(24);
+        assert_eq!(
+            schedule(&|attempt, elapsed| walk_wait(&retry, attempt, start + elapsed, never)).0,
+            RETRY_ATTEMPTS_MAX,
+            "the attempt bound still holds a far deadline"
+        );
+    }
+
+    /// A `sh` engine that answers `initialize` and then announces work, answers
+    /// each request with no location once it is sent, and ends its work at the
+    /// first request `analyzing_secs` or more whole seconds after its start:
+    /// the `$/progress` end and that request's answer arrive in one read, as
+    /// they would from an engine whose end landed between two requests.
+    #[cfg(unix)]
+    fn analyzing_engine(directory: &Path, analyzing_secs: u64) -> LspConfiguration {
+        const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+start=$(date +%s)
+ended=0
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"id":'*)
+      if [ "$ended" -eq 0 ] && [ $(( $(date +%s) - start )) -ge ANALYZING_SECS ]; then
+        frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
+        ended=1
+      fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+        let script = directory.join("engine.sh");
+        std::fs::write(
+            &script,
+            SCRIPT.replace("ANALYZING_SECS", &analyzing_secs.to_string()),
+        )
+        .expect("engine script");
+        let mut configuration = table("sh");
+        configuration.command = Some(CommandInput::ProgramAndArguments(vec![
+            "sh".to_owned(),
+            script.display().to_string(),
+        ]));
+        configuration.initialization_options = None;
+        configuration
+    }
+
+    #[cfg(unix)]
+    fn analyzing_slot(directory: &Path, analyzing_secs: u64) -> EnginePool {
+        let key = LspProcessKey::named("rust");
+        EnginePool::new(
+            directory,
+            BTreeMap::from([(key.clone(), analyzing_engine(directory, analyzing_secs))]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
+    /// One references request against the analyzing engine, counted.
+    #[cfg(unix)]
+    fn counted_references(
+        attempts: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> impl for<'session> FnMut(
+        &'session mut EngineSession,
+    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+        let attempts = Arc::clone(attempts);
+        move |session: &mut EngineSession| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let path = rift_core::ProjectPath::new("lib.rs").expect("path");
+                let position = lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                };
+                session
+                    .references(&path, position)
+                    .await
+                    .map(|locations| Some(locations.len()))
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_lib(session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
+        Box::pin(async move {
+            session
+                .open(
+                    &rift_core::ProjectPath::new("lib.rs").expect("path"),
+                    "rust",
+                    "fn beacon() {}\n".to_owned(),
+                )
+                .await
+        })
+    }
+
+    /// An exchange that is no walk ends at the retry table's 8th attempt,
+    /// 9.75 s of waits in, while the engine reads analyzing until 13 s: an
+    /// engine whose load passes 9.75 s answers such a request with
+    /// [`EngineFault::Analyzing`], well inside the 30 s `readiness_timeout`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_analyzing_engine_spends_the_retry_table_before_the_readiness_timeout() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = analyzing_slot(directory.path(), 13);
+        let slot = pool
+            .engine_by_key(&LspProcessKey::named("rust"))
+            .expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let failure = slot
+            .request_exchange(open_lib, counted_references(&attempts), finish_immediately)
+            .await
+            .expect_err("the engine never reads ready inside the retry table");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "exchange: attempts={attempts:?} elapsed={elapsed:?} fault={:?}",
+            failure.fault()
+        );
+        assert!(matches!(
+            failure.fault(),
+            EngineFault::Analyzing { attempts: 8 }
+        ));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert!(elapsed >= Duration::from_millis(9_750) && elapsed < Duration::from_secs(13));
+        pool.shutdown().await;
+    }
+
+    /// A walk waits under the deadline, past the retry table's attempt
+    /// bound, and reads ready one `settle_delay` after the attempt
+    /// that read the engine's end: this engine sends its end with an answer,
+    /// about 13.75 s in at attempt 10, and the wait that follows reads the
+    /// engine quiet 0.5 s later and ends there, so attempt 11 settles. The
+    /// engine's whole-second clock can end its work one attempt early.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_walk_waits_under_the_deadline_until_the_engine_reads_ready() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = analyzing_slot(directory.path(), 13);
+        let slot = pool
+            .engine_by_key(&LspProcessKey::named("rust"))
+            .expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let answer = slot
+            .request_outgoing(
+                open_lib,
+                counted_references(&attempts),
+                finish_immediately,
+                started + Duration::from_secs(30),
+            )
+            .await
+            .expect("the walk settles");
+        let elapsed = started.elapsed();
+        eprintln!("walk: attempts={attempts:?} elapsed={elapsed:?} answer={answer:?}");
+        assert_eq!(answer, OutgoingAnswer::Ready(0));
+        assert!((10..=11).contains(&attempts.load(std::sync::atomic::Ordering::SeqCst)));
+        assert!(elapsed > Duration::from_secs(13) && elapsed < Duration::from_secs(20));
+        pool.shutdown().await;
+    }
+
+    /// A wait spent before the engine reads ready answers `Unsettled` and
+    /// keeps the session, where a request dropped at its deadline discards it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spent_walk_wait_answers_unsettled_and_keeps_the_session() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = analyzing_slot(directory.path(), 50);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let answer = slot
+            .request_outgoing(
+                open_lib,
+                counted_references(&attempts),
+                finish_immediately,
+                started + Duration::from_secs(1),
+            )
+            .await
+            .expect("a spent wait is an answer, not a failure");
+        eprintln!(
+            "spent walk: attempts={attempts:?} elapsed={:?} answer={answer:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(answer, OutgoingAnswer::Unsettled { attempts } if (2..=3).contains(&attempts)),
+            "the engine's start shares the first 250 ms: {answer:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            slot.state.lock().await.session.is_some(),
+            "the session survives the spent wait"
+        );
+        assert_eq!(pool.state_for_key(&key), Some(LspState::Analyzing));
+        pool.shutdown().await;
+    }
+
+    /// A `sh` engine serving references and call hierarchy that refuses every
+    /// later request with JSON-RPC error `code`, as rust-analyzer answers
+    /// `-32801` content modified while it loads.
+    #[cfg(unix)]
+    fn refusing_slot(directory: &Path, code: i64) -> EnginePool {
+        const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}" ;;
+    *'"method":"shutdown"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+    *'"id":'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":REFUSAL_CODE,\"message\":\"refused\"}}" ;;
+  esac
+done
+"#;
+        let script = directory.join("engine.sh");
+        std::fs::write(&script, SCRIPT.replace("REFUSAL_CODE", &code.to_string()))
+            .expect("engine script");
+        let mut configuration = table("sh");
+        configuration.command = Some(CommandInput::ProgramAndArguments(vec![
+            "sh".to_owned(),
+            script.display().to_string(),
+            directory.join("notified.log").display().to_string(),
+        ]));
+        configuration.initialization_options = None;
+        let key = LspProcessKey::named("rust");
+        EnginePool::new(
+            directory,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
+    /// One call hierarchy prepare at `lib.rs`'s `beacon`, counted: the item
+    /// count, `None` for an empty prepare.
+    #[cfg(unix)]
+    fn counted_prepare(
+        attempts: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> impl for<'session> FnMut(
+        &'session mut EngineSession,
+    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+        let attempts = Arc::clone(attempts);
+        move |session: &mut EngineSession| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let path = rift_core::ProjectPath::new("lib.rs").expect("path");
+                let position = lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                };
+                let items = session.prepare_call_hierarchy(&path, position).await?;
+                Ok((!items.is_empty()).then_some(items.len()))
+            })
+        }
+    }
+
+    /// A retryable refusal as the last condition when a walk's wait is
+    /// spent answers like analyzing: an outgoing walk answers `Unsettled`
+    /// and an incoming one [`EngineFault::Analyzing`], both with the session
+    /// kept. A refusal that is the engine's verdict on the request stays the
+    /// walk's error, inside the walk's deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retryable_refusal_at_a_spent_walk_wait_answers_unsettled() {
+        const CONTENT_MODIFIED: i64 = -32_801;
+        const INVALID_REQUEST: i64 = -32_600;
+        let key = LspProcessKey::named("rust");
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = refusing_slot(directory.path(), CONTENT_MODIFIED);
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Instant::now();
+        let answer = slot
+            .request_outgoing(
+                open_lib,
+                counted_prepare(&attempts),
+                finish_immediately,
+                started + Duration::from_secs(1),
+            )
+            .await
+            .expect("a retryable refusal at the spent wait is an answer");
+        eprintln!(
+            "retryable refusal: elapsed={:?} answer={answer:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(answer, OutgoingAnswer::Unsettled { attempts } if (2..=3).contains(&attempts)),
+            "{answer:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            match answer {
+                OutgoingAnswer::Unsettled { attempts } => attempts,
+                _ => unreachable!("matched above"),
+            }
+        );
+        assert!(
+            slot.state.lock().await.session.is_some(),
+            "the session survives the spent wait"
+        );
+
+        let incoming = slot
+            .request_settled(
+                open_lib,
+                counted_references(&attempts),
+                finish_immediately,
+                |_count| (true, false),
+                |_count| None,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the incoming walk reports the spent wait");
+        assert!(
+            matches!(incoming.fault(), EngineFault::Analyzing { .. }),
+            "{:?}",
+            incoming.fault()
+        );
+        assert!(slot.state.lock().await.session.is_some());
+        pool.shutdown().await;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = refusing_slot(directory.path(), INVALID_REQUEST);
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let started = Instant::now();
+        let refused = slot
+            .request_outgoing(
+                open_lib,
+                counted_prepare(&attempts),
+                finish_immediately,
+                started + Duration::from_secs(1),
+            )
+            .await
+            .expect_err("the engine's verdict on the request stays the walk's error");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                refused.fault(),
+                EngineFault::Refused {
+                    code: INVALID_REQUEST,
+                    ..
+                }
+            ),
+            "{:?}",
+            refused.fault()
+        );
+        pool.shutdown().await;
+    }
+
+    /// One embedded walk from `root` in `directory`'s `graph.py`, opened as
+    /// it stands on disk: the answer, the attempts it took, and its time.
+    async fn walk_from_root(
+        slot: &EngineSlot,
+        directory: &Path,
+    ) -> (OutgoingAnswer<usize>, u64, Duration) {
+        let source = std::fs::read_to_string(directory.join("graph.py")).expect("source reads");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&attempts);
+        let started = Instant::now();
+        let answer = slot
+            .request_outgoing(
+                move |session: &mut EngineSession| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        let path = rift_core::ProjectPath::new("graph.py").expect("path");
+                        session.open(&path, "python", source).await
+                    })
+                },
+                move |session: &mut EngineSession| {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        let path = rift_core::ProjectPath::new("graph.py").expect("path");
+                        let position = lsp_types::Position {
+                            line: 3,
+                            character: 4,
+                        };
+                        let items = session.prepare_call_hierarchy(&path, position).await?;
+                        let Some(item) = items.into_iter().next() else {
+                            return Ok(None);
+                        };
+                        Ok(Some(session.outgoing_calls(item).await?.len()))
+                    })
+                },
+                finish_immediately,
+                started + Duration::from_secs(30),
+            )
+            .await
+            .expect("the walk settles");
+        (
+            answer,
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            started.elapsed(),
+        )
+    }
+
+    /// A pool serving the embedded engine for Python over `directory`, and
+    /// the key of its one slot.
+    fn embedded_pool(directory: &Path) -> (EnginePool, LspProcessKey, Duration) {
+        let mut configuration = table("ty");
+        configuration.command = None;
+        configuration.embedded = Some(EmbeddedEngine::Ty);
+        configuration.initialization_options = None;
+        let settle_delay = Duration::from_millis(configuration.settle_delay.milliseconds());
+        let key = LspProcessKey::named("python");
+        let pool = EnginePool::new(
+            directory,
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("python".to_owned(), key.clone())]),
+        );
+        (pool, key, settle_delay)
+    }
+
+    /// The embedded engine declares itself ready at its start, so its
+    /// first walk answers `Ready` on the first attempt instead of reading
+    /// unconfirmed until the 500 ms `settle_delay` passes.
+    #[tokio::test]
+    async fn the_embedded_engine_walks_ready_on_its_first_attempt() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let source = "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    return leaf()\n";
+        std::fs::write(directory.path().join("graph.py"), source).expect("source");
+        let (pool, key, settle_delay) = embedded_pool(directory.path());
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let (answer, attempts, elapsed) = walk_from_root(slot, directory.path()).await;
+        eprintln!("embedded first walk: elapsed={elapsed:?} answer={answer:?}");
+        assert_eq!(answer, OutgoingAnswer::Ready(1), "root calls leaf");
+        assert_eq!(attempts, 1);
+        assert!(elapsed < settle_delay, "{elapsed:?}");
+        assert_eq!(pool.state_for_key(&key), Some(LspState::Ready));
+        pool.shutdown().await;
+    }
+
+    /// The embedded engine's ready declaration survives a file change,
+    /// since it answers from its database at request time. A walk right after
+    /// an edit answers `Ready` with the edit's callees on its first attempt,
+    /// not `Unconfirmed` after the 500 ms `settle_delay`.
+    #[tokio::test]
+    async fn the_embedded_engine_walks_ready_on_its_first_attempt_after_a_change() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let graph = directory.path().join("graph.py");
+        std::fs::write(
+            &graph,
+            "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    return leaf()\n",
+        )
+        .expect("source");
+        let (pool, key, settle_delay) = embedded_pool(directory.path());
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let (before, _, _) = walk_from_root(slot, directory.path()).await;
+        assert_eq!(before, OutgoingAnswer::Ready(1), "root calls leaf");
+
+        std::fs::write(
+            &graph,
+            "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    return leaf() + twig()\n\ndef twig() -> int:\n    return 2\n",
+        )
+        .expect("edit");
+        let readiness = slot
+            .request(|session: &mut EngineSession| {
+                Box::pin(async move {
+                    let path = rift_core::ProjectPath::new("graph.py").expect("path");
+                    session
+                        .notify_changed_paths(&[(path, lsp_types::FileChangeType::CHANGED)])
+                        .await?;
+                    Ok((session.readiness(), session.walk_readiness()))
+                })
+            })
+            .await
+            .expect("the change reaches the session");
+        assert_eq!(
+            readiness,
+            (EngineReadiness::Ready, EngineReadiness::Ready),
+            "the declaration survives the change"
+        );
+
+        let (after, attempts, elapsed) = walk_from_root(slot, directory.path()).await;
+        eprintln!("embedded walk after an edit: elapsed={elapsed:?} answer={after:?}");
+        assert_eq!(after, OutgoingAnswer::Ready(2), "root calls leaf and twig");
+        assert_eq!(attempts, 1);
+        assert!(elapsed < settle_delay, "{elapsed:?}");
+        assert_eq!(pool.state_for_key(&key), Some(LspState::Ready));
+        pool.shutdown().await;
+    }
+
+    #[test]
     fn diagnostic_settlement_covers_progress_and_stable_full_reports() {
+        use EngineReadiness::{Analyzing, Ready, Unconfirmed};
+        // (name, readiness, full, empty, repeated, final attempt, quiet, expected)
         let rows = [
             (
                 "stale nonempty",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1487,26 +2285,29 @@ mod tests {
             ),
             (
                 "stale empty",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 true,
                 true,
                 false,
                 true,
+                false,
                 Settlement::Retry,
             ),
             (
                 "progress start",
-                EngineReadiness::Analyzing,
+                Analyzing,
                 true,
                 false,
+                true,
                 true,
                 true,
                 Settlement::Retry,
             ),
             (
                 "progress end",
-                EngineReadiness::Ready,
+                Ready,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1514,51 +2315,143 @@ mod tests {
             ),
             (
                 "progress end empty",
-                EngineReadiness::Ready,
+                Ready,
                 true,
                 true,
                 false,
                 false,
+                true,
                 Settlement::Retry,
             ),
             (
                 "oscillating",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 true,
                 false,
                 false,
                 true,
+                false,
                 Settlement::Retry,
             ),
             (
                 "stable before bound",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 true,
                 false,
                 true,
+                false,
                 false,
                 Settlement::Retry,
             ),
             (
                 "stable at bound",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 true,
                 false,
                 true,
                 true,
+                false,
                 Settlement::Ready,
             ),
             (
                 "partial",
-                EngineReadiness::Unconfirmed,
+                Unconfirmed,
                 false,
                 false,
+                true,
                 true,
                 true,
                 Settlement::Retry,
             ),
         ];
-        for (name, readiness, full, empty, repeated, final_attempt, expected) in rows {
+        assert_settlements(&rows);
+    }
+
+    /// An unconfirmed engine's repeated full report settles once quiet past
+    /// `settle_delay`, empty or not, and a ready engine's rules are unchanged.
+    #[test]
+    fn diagnostic_settlement_takes_a_quiet_unconfirmed_repeated_report() {
+        use EngineReadiness::{Ready, Unconfirmed};
+        let rows = [
+            (
+                "quiet once",
+                Unconfirmed,
+                true,
+                false,
+                false,
+                false,
+                true,
+                Settlement::Retry,
+            ),
+            (
+                "quiet repeated",
+                Unconfirmed,
+                true,
+                false,
+                true,
+                false,
+                true,
+                Settlement::Unconfirmed,
+            ),
+            (
+                "quiet repeated empty",
+                Unconfirmed,
+                true,
+                true,
+                true,
+                false,
+                true,
+                Settlement::Unconfirmed,
+            ),
+            (
+                "quiet repeated at bound",
+                Unconfirmed,
+                true,
+                false,
+                true,
+                true,
+                true,
+                Settlement::Unconfirmed,
+            ),
+            (
+                "quiet partial",
+                Unconfirmed,
+                false,
+                false,
+                true,
+                false,
+                true,
+                Settlement::Retry,
+            ),
+            (
+                "ready quiet repeated empty",
+                Ready,
+                true,
+                true,
+                true,
+                false,
+                true,
+                Settlement::Retry,
+            ),
+        ];
+        assert_settlements(&rows);
+    }
+
+    /// One settlement row: name, readiness, full, empty, repeated, final attempt,
+    /// quiet, and the expected verdict.
+    type SettlementRow = (
+        &'static str,
+        EngineReadiness,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        Settlement,
+    );
+
+    fn assert_settlements(rows: &[SettlementRow]) {
+        for &(name, readiness, full, empty, repeated, final_attempt, quiet, expected) in rows {
             assert_eq!(
                 diagnostic_settlement(
                     readiness,
@@ -1566,6 +2459,7 @@ mod tests {
                         shape: ReportShape::from_report(full, empty),
                         repeated,
                         final_attempt,
+                        quiet,
                     },
                 ),
                 expected,

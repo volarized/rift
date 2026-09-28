@@ -1067,6 +1067,11 @@ fn ranking_of(
     }
 }
 
+/// A walk stops waiting for engine readiness this share of the request budget before
+/// the request's deadline, a tenth, so the answer and its warning still fit inside the
+/// budget and the request timeout never drops the engine session.
+const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
+
 /// The instant every wait inside one request must end by.
 ///
 /// `[server] readiness_timeout` bounds one request, not each wait that request makes. A
@@ -2053,7 +2058,7 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ErrorData> {
         for attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
-            if let Some(references) = self.engine_references(&resolved, params).await? {
+            if let Some(references) = self.engine_references(&resolved, params, deadline).await? {
                 return Ok((resolved, ranking, references));
             }
             if attempt + 1 < INDEX_CAPTURE_ATTEMPTS_MAX {
@@ -2074,14 +2079,21 @@ impl RiftMcp {
     ///
     /// `None` asks the caller to capture a fresh publication after source or configuration
     /// movement. A stale publication uses its index and keeps its existing stale warning.
+    ///
+    /// A walk, in either direction, stops waiting for engine readiness a tenth of the
+    /// budget before `deadline`, so a spent wait answers with its warning and keeps the
+    /// engine session instead of reaching the request's own timeout, which drops the
+    /// session.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,
         params: &SearchParams,
+        deadline: RequestDeadline,
     ) -> Result<Option<EngineReferences>, ErrorData> {
         if params.traversal.is_none() || resolved.stale.is_some() {
             return Ok(Some(EngineReferences::default()));
         }
+        let walk_deadline = deadline.at() - deadline.budget() / WALK_BUDGET_RESERVE_DIVISOR;
         let engines = self.engine_pool_for(&resolved.published).await;
         if !uses_engine_references(&resolved.published.reads, &engines, params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
@@ -2095,6 +2107,7 @@ impl RiftMcp {
             &resolved.published.reads,
             &engines,
             params,
+            walk_deadline,
         ))
         .await
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
@@ -4475,7 +4488,11 @@ mod tests {
         let resolved = super::ResolvedWorkspace::current(Arc::clone(&published));
         assert!(
             server
-                .engine_references(&resolved, &params)
+                .engine_references(
+                    &resolved,
+                    &params,
+                    RequestDeadline::starting(Duration::from_secs(30))
+                )
                 .await?
                 .is_none(),
             "moved source asks for a fresh publication, not an empty engine answer"
@@ -4489,7 +4506,11 @@ mod tests {
             let indexed = serde_json::from_value(request)?;
             assert!(
                 server
-                    .engine_references(&resolved, &indexed)
+                    .engine_references(
+                        &resolved,
+                        &indexed,
+                        RequestDeadline::starting(Duration::from_secs(30))
+                    )
                     .await?
                     .is_some(),
                 "an indexed traversal must not recapture source for unused engine references"
@@ -4515,7 +4536,11 @@ mod tests {
         let resolved = super::ResolvedWorkspace::current(published);
         assert!(
             server
-                .engine_references(&resolved, &params)
+                .engine_references(
+                    &resolved,
+                    &params,
+                    RequestDeadline::starting(Duration::from_secs(30))
+                )
                 .await?
                 .is_some(),
             "no selected engine leaves the indexed read unchanged"
@@ -4554,7 +4579,11 @@ mod tests {
         )?;
         assert!(
             server
-                .engine_references(&resolved, &params)
+                .engine_references(
+                    &resolved,
+                    &params,
+                    RequestDeadline::starting(Duration::from_secs(30))
+                )
                 .await?
                 .is_none(),
             "the captured publication predates the new caller"
