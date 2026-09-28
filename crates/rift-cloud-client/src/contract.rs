@@ -410,7 +410,38 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             u64::try_from(value).map_err(|error| error.to_string())?,
         )?;
     }
+    validate_max_lengths(spec)?;
 
+    let limit = parameter_schema(spec, "Limit")?;
+    expect_bound("Limit/schema/default", limit.default, json!(100))?;
+    expect_bound(
+        "Limit/schema/maximum",
+        limit.maximum,
+        serde_json::Number::from(crate::PAGE_LIMIT_MAX),
+    )?;
+    for property in ["page_limit_min", "page_limit_max", "page_limit_default"] {
+        let schema = property_schema(spec, "CapabilityBounds", property)?;
+        expect_bound(
+            &format!("CapabilityBounds/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::PAGE_LIMIT_MAX),
+        )?;
+    }
+    let cursor = parameter_schema(spec, "Cursor")?;
+    expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
+    for property in ["line", "character"] {
+        let schema = property_schema(spec, "PackagePosition", property)?;
+        expect_bound(
+            &format!("PackagePosition/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
+        )?;
+    }
+    validate_pattern_page_bound(spec)
+}
+
+/// Pins each string bound the client enforces to the contract's `maxLength` for it.
+fn validate_max_lengths(spec: &Spec) -> Result<(), String> {
     let expected_max_lengths = [
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
@@ -452,33 +483,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             u64::try_from(value).map_err(|error| error.to_string())?,
         )?;
     }
-
-    let limit = parameter_schema(spec, "Limit")?;
-    expect_bound("Limit/schema/default", limit.default, json!(100))?;
-    expect_bound(
-        "Limit/schema/maximum",
-        limit.maximum,
-        serde_json::Number::from(crate::PAGE_LIMIT_MAX),
-    )?;
-    for property in ["page_limit_min", "page_limit_max", "page_limit_default"] {
-        let schema = property_schema(spec, "CapabilityBounds", property)?;
-        expect_bound(
-            &format!("CapabilityBounds/properties/{property}/maximum"),
-            schema.maximum,
-            serde_json::Number::from(crate::PAGE_LIMIT_MAX),
-        )?;
-    }
-    let cursor = parameter_schema(spec, "Cursor")?;
-    expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
-    for property in ["line", "character"] {
-        let schema = property_schema(spec, "PackagePosition", property)?;
-        expect_bound(
-            &format!("PackagePosition/properties/{property}/maximum"),
-            schema.maximum,
-            serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
-        )?;
-    }
-    validate_pattern_page_bound(spec)
+    Ok(())
 }
 
 /// Pins the warning `detail` bound to the longest `requirement_unsatisfied` detail the
