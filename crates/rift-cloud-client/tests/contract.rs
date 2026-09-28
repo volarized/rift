@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::{
     Capabilities, PackageDeclarationResponse, PackagePatternPage, PackageResolutionResponse,
-    PackageSearchPage, PackageSymbolPage,
+    PackageSearchCandidate, PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
 };
 use serde_json::{Map, Value, json};
 
@@ -266,10 +266,16 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
             serde_json::from_value::<PackageResolutionResponse>(value)?;
         }
         "#/components/schemas/PackageSearchPage" => {
-            serde_json::from_value::<PackageSearchPage>(value)?;
+            let page = serde_json::from_value::<PackageSearchPage>(value)?;
+            for item in page.items {
+                PackageSearchCandidate::try_from(item)?;
+            }
         }
         "#/components/schemas/PackageSymbolPage" => {
-            serde_json::from_value::<PackageSymbolPage>(value)?;
+            let page = serde_json::from_value::<PackageSymbolPage>(value)?;
+            for item in page.items {
+                PackageSymbolCandidate::try_from(item)?;
+            }
         }
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;

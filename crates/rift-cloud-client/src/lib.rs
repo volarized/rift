@@ -1964,7 +1964,7 @@ fn validate_hit_common(
     {
         return Err(ClientError::InvalidResponseField { field: "origin" });
     }
-    validate_symbol_identity(symbol, &source_path)
+    validate_symbol_identity(symbol, package, &source_path)
 }
 
 /// The package-relative path of `unit`, a file of `package`: its key after `name@version/`,
@@ -1986,7 +1986,18 @@ fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, 
         .ok_or(invalid)
 }
 
-fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String, ClientError> {
+/// Checks that a package hit's symbol identity is one its unit mints, and returns its qualified
+/// name.
+///
+/// Package analysis mints a package declaration's identity over its unit's resolver and key,
+/// `<manager>/<name>@<version>/<path>`, as `rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve`
+/// for `rift://source/cargo/beacon@1.0.0/src/lib.rs`. The spelling over the package-relative
+/// path alone, `rift://symbol/rust/src/lib.rs/serve`, is accepted as well.
+fn validate_symbol_identity(
+    symbol: &Symbol,
+    package: &PackageIdentity,
+    source_path: &str,
+) -> Result<String, ClientError> {
     let id = symbol
         .id
         .as_deref()
@@ -2027,9 +2038,14 @@ fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String
         .map_err(|_| ClientError::InvalidResponseField {
             field: "symbol_identity",
         })?;
-    if qualified_name.is_empty()
-        || rift_core::symbol_identity(language, source_path, &qualified_name) != id
-    {
+    let unit_path = format!(
+        "{}/{}@{}/{source_path}",
+        package.manager, package.name, package.version
+    );
+    let minted = [unit_path.as_str(), source_path]
+        .into_iter()
+        .any(|path| rift_core::symbol_identity(language, path, &qualified_name) == id);
+    if qualified_name.is_empty() || !minted {
         return Err(ClientError::InvalidResponseField {
             field: "symbol_identity",
         });

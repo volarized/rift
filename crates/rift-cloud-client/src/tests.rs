@@ -573,7 +573,7 @@ fn package_json(name: &str) -> serde_json::Value {
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "id":format!("rift://symbol/rust/src/{suffix}.rs/demo"),
+        "id":format!("rift://symbol/rust/cargo/{package}@1.0.0/src/{suffix}.rs/demo"),
         "kind":"function",
         "language":"rust",
         "name":"demo",
@@ -1841,6 +1841,54 @@ fn test_symbol_lookup_refuses_unknown_match_class() {
         Err(ClientError::InvalidResponseField {
             field: "match_class"
         })
+    );
+}
+
+/// Package analysis mints a package declaration's identity over its unit's resolver and key, so
+/// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
+/// `rift://source/cargo/demo@1.0.0/src/first.rs`; the package-relative spelling is accepted too.
+#[test]
+fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
+    let hit = |id: &str| {
+        let mut value = search_hit_json("demo", "first");
+        value["symbol"]["id"] = serde_json::json!(id);
+        serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
+    };
+    let accepted = [
+        rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/first.rs", "demo"),
+        rift_core::symbol_identity("rust", "src/first.rs", "demo"),
+    ];
+    for id in accepted {
+        let candidate = PackageSearchCandidate::try_from(&hit(&id));
+        assert!(candidate.is_ok(), "{id}: {candidate:?}");
+    }
+    let refused = [
+        "rift://symbol/rust/cargo/demo@2.0.0/src/first.rs/demo",
+        "rift://symbol/rust/npm/demo@1.0.0/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo@1.0.0/src/second.rs/demo",
+        "rift://symbol/rust/cargo/demo@1.0.0/demo",
+    ];
+    for id in refused {
+        assert_eq!(
+            PackageSearchCandidate::try_from(&hit(id)).err(),
+            Some(ClientError::InvalidResponseField {
+                field: "symbol_identity"
+            }),
+            "{id}"
+        );
+    }
+
+    let symbol: PackageSymbol = serde_json::from_value(serde_json::json!({
+        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
+        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "line": 1, "match_class": "qualified_exact"
+    }))
+    .expect("symbol hit fixture");
+    let candidate = PackageSymbolCandidate::try_from(&symbol)
+        .unwrap_or_else(|error| panic!("package symbol identity: {error:?}"));
+    assert_eq!(
+        candidate.symbol_identity.0,
+        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo"
     );
 }
 

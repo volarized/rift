@@ -629,7 +629,7 @@
                             "version": "1.0.219"
                           },
                           "symbol": {
-                            "id": "rift://symbol/rust/rift-server/ReadService",
+                            "id": "rift://symbol/rust/cargo/serde@1.0.219/src/de.rs/ReadService",
                             "language": "rust",
                             "name": "ReadService",
                             "kind": "struct",
@@ -643,7 +643,7 @@
                               "source_kind": "authored"
                             }
                           },
-                          "unit": "rift://source/cargo/serde-1.0.219/src/de.rs",
+                          "unit": "rift://source/cargo/serde@1.0.219/src/de.rs",
                           "range": {
                             "start": 0,
                             "end": 10
@@ -680,7 +680,7 @@
                               "source": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/serde-1.0.219/README.md"
+                                  "unit": "rift://source/cargo/serde@1.0.219/README.md"
                                 }
                               },
                               "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -695,7 +695,7 @@
                               "identity": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/serde-1.0.219/README.md"
+                                  "unit": "rift://source/cargo/serde@1.0.219/README.md"
                                 }
                               },
                               "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -953,7 +953,7 @@
                             "version": "1.0.219"
                           },
                           "symbol": {
-                            "id": "rift://symbol/rust/rift-server/ReadService",
+                            "id": "rift://symbol/rust/cargo/serde@1.0.219/src/de.rs/ReadService",
                             "language": "rust",
                             "name": "ReadService",
                             "kind": "struct",
@@ -967,7 +967,7 @@
                               "source_kind": "authored"
                             }
                           },
-                          "unit": "rift://source/cargo/serde-1.0.219/src/de.rs",
+                          "unit": "rift://source/cargo/serde@1.0.219/src/de.rs",
                           "range": {
                             "start": 0,
                             "end": 10
@@ -1214,7 +1214,7 @@
                           "line": 3,
                           "declaration": {
                             "symbol": {
-                              "id": "rift://symbol/rust/src/lib.rs/serve",
+                              "id": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve",
                               "language": "rust",
                               "name": "serve",
                               "kind": "function",
@@ -1477,7 +1477,7 @@
                             "line": 3,
                             "character": 4
                           },
-                          "declaration": "rift://symbol/rust/src/lib.rs/serve"
+                          "declaration": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve"
                         },
                         {
                           "position": {

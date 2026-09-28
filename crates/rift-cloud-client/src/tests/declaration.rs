@@ -5,7 +5,7 @@ use crate::declaration::{
 };
 use serde_json::{Value, json};
 
-const DECLARATION: &str = "rift://symbol/rust/src/first.rs/demo";
+const DECLARATION: &str = "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo";
 
 /// One edit to a submitted position, beside the field the client names when it refuses it.
 type PositionEdit = (fn(&mut PackagePosition), &'static str);
