@@ -106,8 +106,12 @@ pub const PAGE_LIMIT_MIN: i64 = 1;
 pub const PAGE_LIMIT_MAX: i64 = 1_000;
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
-/// Most UTF-8 bytes one warning's `detail` carries.
-pub const WARNING_DETAIL_BYTES_MAX: usize = 1_024;
+/// Most UTF-8 bytes one warning's `detail` carries, on a page or a resolution: room for the
+/// longest `requirement_unsatisfied` detail the package fields admit.
+pub const WARNING_DETAIL_BYTES_MAX: usize = rift_protocol::read::GLOBAL_WARNING_DETAIL_BYTES_MAX;
+/// What a `requirement_unsatisfied` detail writes between the requirement and the version
+/// that answers it.
+pub(crate) const ANSWERED_BY: &str = " answered by ";
 /// Most UTF-8 bytes one source payload carries.
 pub const SOURCE_BYTES_MAX: usize = 1024 * 1024;
 /// Most candidates one page assembly retains.
@@ -1512,7 +1516,7 @@ impl ResolvedRequirement {
     fn unsatisfied_detail(&self) -> Option<String> {
         let requirement = self.entry.requirement.as_ref()?;
         Some(format!(
-            "{}/{} {requirement} answered by {}",
+            "{}/{} {requirement}{ANSWERED_BY}{}",
             self.entry.manager, self.entry.name, self.package.version
         ))
     }

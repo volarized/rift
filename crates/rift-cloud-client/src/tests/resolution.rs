@@ -245,3 +245,43 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
     let response = decoded(resolution(&resolved, &json!([]), Some(at_the_bound)));
     assert_eq!(validate_resolution_response(&request, &response), Ok(()));
 }
+
+/// A `requirement_unsatisfied` detail for an entry at every package field's bound fills the
+/// warning detail bound exactly, and the resolution naming it is accepted.
+#[test]
+fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
+    let requirement = PackageContextEntry {
+        availability: PackageAvailability::Canonical,
+        manager: "m".repeat(128),
+        name: "n".repeat(IDENTIFIER_BYTES_MAX),
+        requirement: Some("r".repeat(IDENTIFIER_BYTES_MAX)),
+        version: None,
+    };
+    let package = PackageIdentity {
+        manager: requirement.manager.clone(),
+        name: requirement.name.clone(),
+        version: "v".repeat(IDENTIFIER_BYTES_MAX),
+    };
+    let detail = format!(
+        "{}/{} {}{ANSWERED_BY}{}",
+        requirement.manager,
+        requirement.name,
+        "r".repeat(IDENTIFIER_BYTES_MAX),
+        package.version
+    );
+    assert_eq!(detail.len(), WARNING_DETAIL_BYTES_MAX);
+    let resolved = json!([{"entry": entry_json(&requirement), "package": package}]);
+    let warnings = json!([{"code": "requirement_unsatisfied", "detail": detail}]);
+    let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
+    let request = PackageResolutionRequest {
+        entries: vec![requirement.clone()],
+    };
+    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
+    assert_eq!(
+        response.substitutions(),
+        [Substitution {
+            requested: requirement,
+            served: package,
+        }]
+    );
+}

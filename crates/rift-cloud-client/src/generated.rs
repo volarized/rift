@@ -872,7 +872,7 @@ pub struct QueryTerm {
 pub struct Warning {
     /// Stable warning code.
     pub code: WarningCode,
-    /// Bounded explanation for the warning.
+    /// Bounded explanation for the warning. The bound holds the longest `requirement_unsatisfied` detail the package fields admit: a 128-byte manager, and a 4,096-byte name, requirement, and version.
     pub detail: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]

@@ -908,6 +908,12 @@ pub struct ProjectPath(
 /// publication.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
+/// Most UTF-8 bytes the `detail` of one global API warning carries: the longest
+/// `requirement_unsatisfied` detail the global API's package fields admit,
+/// `<manager>/<name> <requirement> answered by <version>`, at 128 bytes of manager and
+/// 4,096 bytes each of name, requirement, and version.
+pub const GLOBAL_WARNING_DETAIL_BYTES_MAX: usize = 12_431;
+
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
 /// in project-path order; when more files are left out, one more warning follows them and
 /// counts the rest.
@@ -1171,7 +1177,7 @@ pub enum ReadWarning {
         warning_code: GlobalPageWarningCode,
         /// Optional bounded explanation returned by the global package service.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(max = 1024))]
+        #[schemars(length(max = 12_431))]
         detail: Option<String>,
     },
     /// The global publication holds no release of an exact package the dependency
@@ -2031,8 +2037,8 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, FileId, GetSymbolParams, GlobalFailureClass, GlobalPageWarningCode,
-        IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
+        Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_BYTES_MAX, GetSymbolParams,
+        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
         PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
         RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
         SymbolId,
@@ -2065,6 +2071,23 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// A `global_page_warning` carries the global API's `detail` as it arrived, so its
+    /// advertised `maxLength` is the bound the client accepts a detail under.
+    #[test]
+    fn global_page_warning_schema_detail_length_equals_the_global_bound() {
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let arm = schema["oneOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|arm| arm["properties"]["code"]["const"] == "global_page_warning")
+            .expect("the warning union holds a global_page_warning arm");
+        assert_eq!(
+            arm["properties"]["detail"]["maxLength"],
+            json!(GLOBAL_WARNING_DETAIL_BYTES_MAX)
         );
     }
 

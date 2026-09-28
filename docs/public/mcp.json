@@ -1936,7 +1936,7 @@
                   },
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {
@@ -4383,7 +4383,7 @@
                   },
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {
@@ -7096,7 +7096,7 @@
                   },
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {

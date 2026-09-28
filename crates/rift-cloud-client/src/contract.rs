@@ -446,7 +446,30 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
         )?;
     }
-    validate_pattern_page_bound(spec)
+    validate_pattern_page_bound(spec)?;
+    validate_warning_detail_bound(spec)
+}
+
+/// Pins the warning `detail` bound to the longest `requirement_unsatisfied` detail the
+/// contract's own package fields admit: `<manager>/<name> <requirement> answered by
+/// <version>`, each part at its `maxLength`.
+fn validate_warning_detail_bound(spec: &Spec) -> Result<(), String> {
+    let parts = [
+        ("PackageContextEntry", "manager"),
+        ("PackageContextEntry", "name"),
+        ("PackageContextEntry", "requirement"),
+        ("PackageIdentity", "version"),
+    ];
+    let mut longest = u64::try_from("/".len() + " ".len() + crate::ANSWERED_BY.len())
+        .map_err(|error| error.to_string())?;
+    for (component, property) in parts {
+        let bound = property_schema(spec, component, property)?
+            .max_length
+            .ok_or_else(|| format!("{component}/properties/{property}/maxLength is missing"))?;
+        longest = longest.saturating_add(bound);
+    }
+    let detail = property_schema(spec, "Warning", "detail")?;
+    expect_bound("Warning/properties/detail/maxLength", detail.max_length, longest)
 }
 
 /// Pins the files bound the pattern operation states to the one the client enforces.

@@ -2401,10 +2401,10 @@
             ]
           },
           "detail": {
-            "description": "Bounded explanation for the warning.",
+            "description": "Bounded explanation for the warning. The bound holds the longest `requirement_unsatisfied` detail the package fields admit: a 128-byte manager, and a 4,096-byte name, requirement, and version.",
             "type": "string",
             "minLength": 1,
-            "maxLength": 1024
+            "maxLength": 12431
           }
         },
         "required": [
