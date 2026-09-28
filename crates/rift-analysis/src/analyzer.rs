@@ -20,6 +20,7 @@ use crate::documentation::{
 };
 use crate::input::ExactPackageInput;
 use crate::revision::analyzer_revision;
+use crate::selection::documentation_format;
 use crate::semantic::{PlacedDocument, WorkspaceSemantics};
 use crate::source::{FileDigest, IndexedFile};
 use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -1403,20 +1404,6 @@ fn source_language(extension: &str, package_language: &Language) -> Language {
     }
 }
 
-/// Returns the documentation format selected by a supported package source extension.
-#[must_use]
-pub fn documentation_format(file_name: &str) -> Option<DocumentationSourceFormat> {
-    let extension = Path::new(file_name).extension()?.to_str()?;
-    match extension {
-        "md" | "markdown" => Some(DocumentationSourceFormat::Markdown),
-        "mdx" => Some(DocumentationSourceFormat::Mdx),
-        "rst" => Some(DocumentationSourceFormat::RestructuredText),
-        "txt" => Some(DocumentationSourceFormat::Text),
-        "ipynb" => Some(DocumentationSourceFormat::Notebook),
-        _ => None,
-    }
-}
-
 /// The placement of one package file: its unit, identity path, and origin.
 fn placement_of(
     package: &PackageIdentity,
@@ -1430,14 +1417,15 @@ fn placement_of(
     Ok(DocumentPlacement::new(origin.clone(), unit, identity_path))
 }
 
-/// The languages the package index reads an API from, and each one's rules.
+/// The languages package analysis reads an API from, and each one's rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageLanguage {
     /// Rust declarations use `pub`; items of a public trait also count.
     Rust,
     /// Python names without a leading underscore count.
     Python,
-    /// TypeScript declarations exclude private and protected members.
+    /// TypeScript declarations exclude private and protected members. A TypeScript package
+    /// ships its JavaScript builds beside its declaration files.
     TypeScript,
 }
 
@@ -1461,22 +1449,16 @@ impl PackageLanguage {
         }
     }
 
-    /// Whether one file name is a source candidate for this package language.
-    #[must_use]
-    pub fn is_candidate(self, file_name: &str) -> bool {
-        let path = std::path::Path::new(file_name);
-        let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    /// The shipped languages whose files a package in this language holds as source.
+    pub(crate) const fn source_languages(self) -> &'static [ShippedLanguage] {
         match self {
-            Self::Rust => extension.is_some_and(|value| value.eq_ignore_ascii_case("rs")),
-            Self::Python => extension.is_some_and(|value| {
-                value.eq_ignore_ascii_case("py") || value.eq_ignore_ascii_case("pyi")
-            }),
-            Self::TypeScript => {
-                extension.is_some_and(|value| value.eq_ignore_ascii_case("ts"))
-                    && path.file_stem().is_some_and(|stem| {
-                        stem.to_string_lossy().to_ascii_lowercase().ends_with(".d")
-                    })
-            }
+            Self::Rust => &[ShippedLanguage::Rust],
+            Self::Python => &[ShippedLanguage::Python],
+            Self::TypeScript => &[
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
         }
     }
 

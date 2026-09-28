@@ -13,6 +13,8 @@ mod input;
 mod relationship;
 mod revision;
 #[cfg(feature = "collector")]
+mod selection;
+#[cfg(feature = "collector")]
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
@@ -20,8 +22,7 @@ mod source;
 #[cfg(feature = "collector")]
 pub use analyzer::{
     AnalyzedFile, PackageAnalysis, PackageAnalysisError, PackageAnalysisFault,
-    PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, documentation_format,
-    public_qualified_names,
+    PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 #[cfg(feature = "collector")]
@@ -38,6 +39,12 @@ pub use relationship::{
 };
 pub use revision::{
     ManifestError, analyzer_manifest_path, analyzer_revision, render_analyzer_manifest,
+};
+#[cfg(feature = "collector")]
+pub use selection::{
+    BUILD_OUTPUT_FOLDERS, CONTEXT7_FILE, Context7, Context7Error, Context7Fault, Context7Violation,
+    DOCUMENTATION_EXCLUDED_FILES, DOCUMENTATION_EXCLUDED_FOLDERS, DocumentationSelection,
+    PackageFileSelection, SelectedFiles, documentation_format,
 };
 #[cfg(feature = "collector")]
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemanticError, WorkspaceSemantics};

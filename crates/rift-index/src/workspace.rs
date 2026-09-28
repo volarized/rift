@@ -54,7 +54,9 @@ use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePoli
 use crate::lexical::LimitBreach;
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemanticError, WorkspaceSemantics};
-use rift_analysis::{ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError};
+use rift_analysis::{
+    DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError,
+};
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -473,6 +475,14 @@ pub(crate) fn index_error_over_limit(
         source: None,
         limit: Some(Box::new(LimitBreach::from_counts(field, observed, maximum))),
     })
+}
+
+/// The documentation selection the `[documentation]` table `inclusion` carries compiles
+/// to, under the same `[source]` glob semantics every other index pattern matches with.
+fn documentation_selection(
+    inclusion: &TextFileInclusion,
+) -> Result<DocumentationSelection, WorkspaceIndexError> {
+    DocumentationSelection::new(inclusion.documentation()).map_err(IndexFailure::index_error)
 }
 
 /// A refusal from a layer below the index, classified as the index failure it reports.
@@ -1452,6 +1462,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
@@ -1523,6 +1534,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(&self.text_inclusion)?,
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             Some((&self.documentation, &self.notebooks)),
         )?;
@@ -1613,6 +1625,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(&text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             None,
         )?;
@@ -3881,6 +3894,86 @@ mod tests {
         )
         .expect("fixture workspace must capture");
         assert_eq!(index.fingerprint(), &captured);
+    }
+
+    /// The documentation sources one index collected, by project path.
+    fn documentation_paths(index: &WorkspaceIndex) -> Vec<String> {
+        index
+            .documentation()
+            .index()
+            .sources
+            .iter()
+            .filter_map(|source| match &source.identity.source {
+                DocumentationSourceIdentity::Project { path } => Some(path.0.clone()),
+                DocumentationSourceIdentity::Package { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The index collects a workspace's documentation through the one documentation
+    /// selection package analysis uses, and the `[documentation]` table the text
+    /// inclusion carries overrides its defaults on every build path.
+    #[test]
+    fn test_documentation_follows_the_selection_the_text_inclusion_carries() {
+        use rift_protocol::documentation::DocumentationConfiguration;
+        use rift_protocol::read::PathPattern;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path();
+        fs::create_dir_all(root.join("docs/archive")).expect("fixture directory");
+        fs::write(root.join("README.md"), "# Beacon\n").expect("fixture readme");
+        fs::write(root.join("CHANGELOG.md"), "# Changes\n").expect("fixture change log");
+        fs::write(root.join("docs/guide.md"), "# Guide\n").expect("fixture guide");
+        fs::write(root.join("docs/archive/v1.md"), "# Version one\n").expect("fixture page");
+
+        let index = indexed(root, &TextFileInclusion::default());
+        assert_eq!(documentation_paths(&index), ["README.md", "docs/guide.md"]);
+
+        let overridden =
+            TextFileInclusion::default().with_documentation(DocumentationConfiguration {
+                enabled: true,
+                exclude: vec![PathPattern("README.md".to_owned())],
+                force_include: vec![PathPattern("CHANGELOG.md".to_owned())],
+            });
+        let index = indexed(root, &overridden);
+        assert_eq!(
+            documentation_paths(&index),
+            ["CHANGELOG.md", "docs/guide.md"]
+        );
+
+        fs::write(root.join("docs/guide.md"), "# Guide\n\nEdited.\n").expect("edited guide");
+        let changes = resolved(&index, root, &["docs/guide.md"]);
+        let next = index.rebuilt(&changes).expect("the rebuild must land");
+        assert_eq!(
+            documentation_paths(&next),
+            ["CHANGELOG.md", "docs/guide.md"],
+            "a rebuild keeps the table the index was built under"
+        );
+    }
+
+    #[test]
+    fn test_a_documentation_pattern_that_is_no_glob_refuses_the_build() {
+        use rift_protocol::documentation::DocumentationConfiguration;
+        use rift_protocol::read::PathPattern;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("README.md"), "# Beacon\n").expect("fixture readme");
+        let inclusion =
+            TextFileInclusion::default().with_documentation(DocumentationConfiguration {
+                exclude: vec![PathPattern("docs/[guide".to_owned())],
+                ..DocumentationConfiguration::default()
+            });
+        let error = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &inclusion,
+        )
+        .expect_err("an unclosed character class refuses the build");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
     }
 
     #[test]
