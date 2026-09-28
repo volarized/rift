@@ -12,7 +12,7 @@ mod workspace_client;
 
 use std::{fs, time::Duration};
 
-use global_api::{COLLECTED_UNIT, GlobalFixture, SymbolFixture};
+use global_api::{COLLECTED_UNIT, GlobalFixture, Hold, SymbolFixture};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -144,9 +144,8 @@ const RESOLUTION_DELAY: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn request_deadline_bounds_global_resolution() -> TestResult {
-    let fixture =
-        GlobalFixture::start_with_resolution_delay(SymbolFixture::Valid, Some(RESOLUTION_DELAY))
-            .await?;
+    let hold = Some(Hold::Resolution(RESOLUTION_DELAY));
+    let fixture = GlobalFixture::start_holding(SymbolFixture::Valid, hold).await?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
@@ -183,6 +182,67 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
         .ok_or_else(|| format!("missing deadline warning: {answer:#}"))?;
     assert_eq!(warning["failure_class"], "timeout");
     assert_eq!(fixture.requests().await.len(), 2);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// How long the fixture holds a symbol or search page: past the one-second request
+/// deadline, however slow the machine running the test.
+const READ_DELAY: Duration = Duration::from_secs(10);
+
+/// A package read the request deadline cuts short discards the remote lane: `get_symbol`
+/// and `search` each answer the project hits alone, with the timeout warning, well before
+/// the held page would have arrived.
+#[tokio::test]
+async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
+    let hold = Some(Hold::Read(READ_DELAY));
+    let fixture = GlobalFixture::start_holding(SymbolFixture::Valid, hold).await?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let reads = [
+        (
+            "get_symbol",
+            "hits",
+            json!({"name": "beacon", "scope": "all"}),
+        ),
+        (
+            "search",
+            "results",
+            json!({"query": "beacon", "scope": "all"}),
+        ),
+    ];
+    for (tool, member, args) in reads {
+        let started = tokio::time::Instant::now();
+        let answer = call_tool(&client, tool, args).await?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < READ_DELAY,
+            "{tool}: the request deadline must end the read wait: elapsed={elapsed:?}"
+        );
+        let warning = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|warning| warning["code"] == "global_api_unavailable")
+            .ok_or_else(|| format!("{tool}: missing deadline warning: {answer:#}"))?;
+        assert_eq!(warning["failure_class"], "timeout", "{tool}");
+        let hits = answer[member]
+            .as_array()
+            .ok_or("the answer lists its hits")?;
+        assert!(!hits.is_empty(), "{tool}: {answer:#}");
+        assert!(
+            hits.iter().all(|hit| hit["path"] == "src/lib.rs"),
+            "{tool}: every hit is a project hit: {answer:#}"
+        );
+    }
+    drop(directory);
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -405,8 +465,9 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
 }
 
 /// A remote page that fails validation discards the remote lane: `beacon` is declared in
-/// the project and in the collected package, and the answer carries the project hits
-/// alone, with the typed warning naming the failure and no package counts.
+/// the project and in the collected package, and the `get_symbol` and `search` answers
+/// carry the project hits alone, with the typed warning naming the failure and no package
+/// counts.
 #[tokio::test]
 async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
@@ -438,6 +499,28 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     assert!(
         hits.iter().all(|hit| hit["path"] == "src/lib.rs"),
         "every hit is a project hit: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+
+    // The client answers every request as unavailable for `failure_ttl` after a failed
+    // one, so the search runs against a server of its own to meet the invalid page.
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let answer = call_tool(&client, "search", json!({"query":"beacon","scope":"all"})).await?;
+    let warning = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == "global_response_invalid")
+        .ok_or_else(|| format!("missing invalid-response warning: {answer:#}"))?;
+    assert_eq!(warning["failure_class"], "invalid_response");
+    let results = answer["results"].as_array().ok_or("results are an array")?;
+    assert!(!results.is_empty(), "{answer:#}");
+    assert!(
+        results.iter().all(|hit| hit["path"] == "src/lib.rs"),
+        "every search hit is a project hit: {answer:#}"
     );
     drop(directory);
     client.cancel().await?;

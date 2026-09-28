@@ -40,7 +40,7 @@ pub(crate) struct GlobalFixture {
     task: JoinHandle<()>,
 }
 
-/// What the symbol endpoint answers.
+/// What the symbol and search endpoints answer.
 #[derive(Clone, Copy)]
 pub(crate) enum SymbolFixture {
     /// Hits whose symbol identities name the unit they sit in.
@@ -49,11 +49,36 @@ pub(crate) enum SymbolFixture {
     InvalidIdentity,
 }
 
+/// An answer the fixture holds before it sends it, and for how long.
+#[derive(Clone, Copy)]
+pub(crate) enum Hold {
+    /// The resolution endpoint's answer.
+    Resolution(Duration),
+    /// The symbol and search endpoints' answers.
+    Read(Duration),
+}
+
 #[derive(Clone)]
 struct FixtureState {
     symbol: SymbolFixture,
-    resolution_delay: Option<Duration>,
+    hold: Option<Hold>,
     requests: Arc<Mutex<Vec<ObservedRequest>>>,
+}
+
+impl FixtureState {
+    /// Waits out the resolution hold, when the fixture holds resolutions.
+    async fn hold_resolution(&self) {
+        if let Some(Hold::Resolution(delay)) = self.hold {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Waits out the read hold, when the fixture holds symbol and search pages.
+    async fn hold_read(&self) {
+        if let Some(Hold::Read(delay)) = self.hold {
+            tokio::time::sleep(delay).await;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -64,18 +89,19 @@ pub(crate) struct ObservedRequest {
 
 impl GlobalFixture {
     pub(crate) async fn start(symbol_fixture: SymbolFixture) -> Result<Self, std::io::Error> {
-        Self::start_with_resolution_delay(symbol_fixture, None).await
+        Self::start_holding(symbol_fixture, None).await
     }
 
-    pub(crate) async fn start_with_resolution_delay(
+    /// Starts the fixture, holding the answers `hold` names before it sends them.
+    pub(crate) async fn start_holding(
         symbol_fixture: SymbolFixture,
-        resolution_delay: Option<Duration>,
+        hold: Option<Hold>,
     ) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let state = FixtureState {
             symbol: symbol_fixture,
-            resolution_delay,
+            hold,
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
@@ -128,15 +154,15 @@ async fn global_handler(
         return json_response(&capabilities());
     }
     if path.ends_with("/resolutions") {
-        if let Some(delay) = state.resolution_delay {
-            tokio::time::sleep(delay).await;
-        }
+        state.hold_resolution().await;
         return json_response(&resolution(&body));
     }
     if path.ends_with("/search") {
-        return json_response(&search_page(&body));
+        state.hold_read().await;
+        return json_response(&search_page(state.symbol, &body));
     }
     if path.ends_with("/symbols") {
+        state.hold_read().await;
         return json_response(&symbols(state.symbol, &body));
     }
     StatusCode::NOT_FOUND.into_response()
@@ -254,7 +280,7 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 /// The search page for `request`: in the precise phase, each collected declaration one of
 /// its identifiers matches, at the best class any of them reaches, with a `query_narrowed`
 /// page warning; the broad phase answers no further declaration.
-fn search_page(request: &Value) -> Value {
+fn search_page(fixture: SymbolFixture, request: &Value) -> Value {
     if request["phase"] != "precise" {
         return page(&[], &json!([]));
     }
@@ -269,7 +295,7 @@ fn search_page(request: &Value) -> Value {
     let items: Vec<Value> = matched_declarations(&identifiers)
         .map(|(declaration, class)| {
             let (match_class, field) = class_wire(class);
-            let mut hit = collected_hit(SymbolFixture::Valid, declaration, with_source);
+            let mut hit = collected_hit(fixture, declaration, with_source);
             hit["target"] = json!("symbol");
             hit["match_class"] = json!(match_class);
             hit["contributing_fields"] = json!([field]);
