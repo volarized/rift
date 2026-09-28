@@ -1352,6 +1352,101 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     Ok(())
 }
 
+/// A global API advertising a smaller `dependency_entries_max` than the client's own bound
+/// still answers a read: the resolution request holds that many entries, the requested
+/// package among them, and the context entries sorted last leave with a
+/// `package_context_degraded` warning naming their package manager.
+#[tokio::test]
+async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> TestResult {
+    use std::fmt::Write as _;
+
+    let advertised = 3;
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        dependency_entries_max: advertised,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let mut lockfile =
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+    for index in 0..5 {
+        write!(
+            lockfile,
+            "\n[[package]]\nname = \"pkg-{index:05}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        )?;
+    }
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let sent = resolution_entries(&fixture).await;
+    assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
+    assert_eq!(sent[0].len(), usize::try_from(advertised)?, "{sent:#?}");
+    assert_eq!(demo_entries(&sent[0]).len(), 1, "{sent:#?}");
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] == "package_context_degraded" && warning["resolver"] == "cargo"
+        })
+        .collect();
+    assert_eq!(
+        degraded,
+        [&json!({
+            "code": "package_context_degraded",
+            "resolver": "cargo",
+            "reason": format!(
+                "3 of 5 packages were not reported: at most {advertised} are carried per \
+                 read, the requested packages first"
+            )
+        })],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// A workspace whose lockfile fills the dependency context to its bound still answers a
 /// read naming one more package: the requested package goes out, the context entry sorted
 /// last leaves with a `package_context_degraded` warning naming its package manager, and

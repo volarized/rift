@@ -41,6 +41,10 @@ pub(crate) const UNSATISFIED_REQUIREMENT: &str = ">=2";
 /// The `page_limit_max` the fixture's capabilities advertise unless a test sets another.
 pub(crate) const PAGE_LIMIT_ADVERTISED: u64 = 200;
 
+/// The `dependency_entries_max` the fixture's capabilities advertise unless a test sets
+/// another: the client's own bound.
+const DEPENDENCY_ENTRIES_ADVERTISED: u64 = 20_000;
+
 /// The cursor a search page stopped at the response body bound names.
 pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 
@@ -87,6 +91,8 @@ pub(crate) struct FixtureOptions {
     pub(crate) hold: Option<Hold>,
     /// The `page_limit_max` the capabilities advertise.
     pub(crate) page_limit_max: u64,
+    /// The `dependency_entries_max` the capabilities advertise.
+    pub(crate) dependency_entries_max: u64,
     /// Whether the precise search page stops at the response body bound: it answers its
     /// declarations with a `result_truncated` warning and [`BODY_BOUND_CURSOR`].
     pub(crate) stopped_at_body_bound: bool,
@@ -101,6 +107,7 @@ impl Default for FixtureOptions {
             symbol: SymbolFixture::Valid,
             hold: None,
             page_limit_max: PAGE_LIMIT_ADVERTISED,
+            dependency_entries_max: DEPENDENCY_ENTRIES_ADVERTISED,
             stopped_at_body_bound: false,
             withheld_features: &[],
         }
@@ -212,10 +219,7 @@ async fn global_handler(
     let body = body.unwrap_or(Value::Null);
     let options = state.options;
     if path.ends_with("/capabilities") {
-        return json_response(&capabilities(
-            options.page_limit_max,
-            options.withheld_features,
-        ));
+        return json_response(&capabilities(&options));
     }
     if path.ends_with("/resolutions") {
         state.hold_resolution().await;
@@ -248,8 +252,10 @@ fn json_response(value: &Value) -> Response {
         .into_response()
 }
 
-/// The capabilities the fixture advertises, every feature it serves but `withheld`.
-fn capabilities(page_limit_max: u64, withheld: &[&str]) -> Value {
+/// The capabilities the fixture advertises under `options`, every feature it serves but
+/// the withheld ones.
+fn capabilities(options: &FixtureOptions) -> Value {
+    let withheld = options.withheld_features;
     let features: Vec<&str> = [
         "resolutions",
         "search",
@@ -274,7 +280,7 @@ fn capabilities(page_limit_max: u64, withheld: &[&str]) -> Value {
         "bounds": {
             "request_body_bytes_max": 4_194_304,
             "response_body_bytes_max": 33_554_432,
-            "dependency_entries_max": 20000,
+            "dependency_entries_max": options.dependency_entries_max,
             "query_bytes_max": 4096,
             "query_terms_max": 32,
             "query_term_bytes_max": 256,
@@ -282,7 +288,7 @@ fn capabilities(page_limit_max: u64, withheld: &[&str]) -> Value {
             "identifier_bytes_max": 4096,
             "packages_max": 20000,
             "page_limit_min": 1,
-            "page_limit_max": page_limit_max,
+            "page_limit_max": options.page_limit_max,
             "page_limit_default": 20,
             "cursor_bytes_max": 4096,
             "candidate_pool_max": 1000,

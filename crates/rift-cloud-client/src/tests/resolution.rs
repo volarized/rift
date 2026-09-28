@@ -375,3 +375,31 @@ fn test_package_fields_past_their_character_bound_are_refused() {
         );
     }
 }
+
+/// A resolution request carries at most the smaller of the advertised
+/// `dependency_entries_max` and the compiled bound, and the client refuses a longer one
+/// naming `entries`.
+#[test]
+fn test_resolution_entries_stop_at_the_smaller_advertised_bound() {
+    let mut capabilities: Capabilities =
+        serde_json::from_str(&capabilities_json()).expect("capabilities");
+    assert_eq!(
+        capabilities.dependency_entries_max(),
+        DEPENDENCY_ENTRIES_MAX
+    );
+
+    capabilities.bounds.dependency_entries_max = 2;
+    assert_eq!(capabilities.dependency_entries_max(), 2);
+    let mut request = PackageResolutionRequest {
+        entries: vec![exact_entry("1.0.0"), exact_entry("1.0.1")],
+    };
+    assert_eq!(
+        validate_resolution_request_for_capabilities(&request, &capabilities),
+        Ok(())
+    );
+    request.entries.push(exact_entry("1.0.2"));
+    assert_eq!(
+        validate_resolution_request_for_capabilities(&request, &capabilities),
+        Err(ClientError::InvalidRequest { field: "entries" })
+    );
+}
