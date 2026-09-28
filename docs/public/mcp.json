@@ -1628,7 +1628,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift://logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -1641,7 +1641,7 @@
                   },
                   "unit": {
                     "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
+                    "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
@@ -1905,7 +1905,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
                     "const": "change_truncated",
@@ -2720,7 +2720,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -4168,7 +4168,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift://logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -4181,7 +4181,7 @@
                   },
                   "unit": {
                     "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
+                    "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
@@ -4445,7 +4445,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
                     "const": "change_truncated",
@@ -4878,7 +4878,7 @@
             "type": "string"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -5037,9 +5037,41 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations two committed revisions hold\ndifferently, in place of `query` and `traversal`. `rev` searches a version-control\nrevision instead of the current tree, and never combines with `pattern`, `traversal`,\nor `change`. `scope` reaches past the project tree: `global` answers `query` from the\npublic declarations the global index holds for the workspace's dependencies alone and\n`pattern` from their source, `all` from both, ordered together. `packages` names\npackage versions `query` and `pattern` search beside the workspace's own, such as an\nupgrade target or a package the project does not use yet. Use `get_symbol` when the\ndeclaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations a committed revision and another\nrevision, or the working tree, hold differently, in place of `query` and `traversal`.\n`rev` searches a version-control revision instead of the current tree, and never\ncombines with `pattern`, `traversal`, or `change`. `scope` reaches past the project\ntree: `global` answers `query` from the public declarations the global index holds for\nthe workspace's dependencies alone and `pattern` from their source, `all` from both,\nordered together. `packages` names package versions `query` and `pattern` search beside\nthe workspace's own, such as an upgrade target or a package the project does not use\nyet. `target: \"commit\"` matches `query` alone against the messages of the commits the\nhistory store holds. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
+          "ChangeHead": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RevisionId",
+                "description": "A branch, tag, or commit id as the workspace's version control spells it."
+              },
+              {
+                "$ref": "#/$defs/ChangeTree",
+                "description": "The working tree as the current index serves it: staged and unstaged edits, files\ngit does not track, and deleted files."
+              }
+            ],
+            "description": "The side a comparison compares to: a committed revision, or the working tree with its\nuncommitted edits."
+          },
+          "ChangeTree": {
+            "description": "A comparison side that names a tree rather than a revision, spelled\n`{\"kind\": \"working_tree\"}`: no revision spelling can collide with it.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "The working tree, uncommitted edits included.",
+                "properties": {
+                  "kind": {
+                    "const": "working_tree",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "PathPattern": {
             "description": "Project-relative glob using *, ?, **, and character classes. Forward-slash separated on\nevery platform, whatever separator the host OS uses natively.",
             "examples": [
@@ -5309,11 +5341,17 @@
           },
           "SearchChange": {
             "additionalProperties": false,
-            "description": "Two committed revisions to compare. The answer is the declarations the two revisions\nhold differently: `base` is the revision compared from, `head` the revision compared\nto. Both sides name a commit; uncommitted working-tree bytes take part in no\ncomparison.",
+            "description": "Two sides to compare. The answer is the declarations the two sides hold differently:\n`base` is the committed revision compared from, `head` the revision or the working tree\ncompared to.",
             "examples": [
               {
                 "base": "main",
                 "head": "HEAD"
+              },
+              {
+                "base": "HEAD",
+                "head": {
+                  "kind": "working_tree"
+                }
               }
             ],
             "properties": {
@@ -5322,9 +5360,9 @@
                 "description": "The revision compared from - a branch, tag, or commit id as the workspace's version\ncontrol spells it."
               },
               "head": {
-                "$ref": "#/$defs/RevisionId",
+                "$ref": "#/$defs/ChangeHead",
                 "default": "HEAD",
-                "description": "The revision compared to, spelled the same way. Omitted, `HEAD`."
+                "description": "The side compared to: a revision spelled the same way, or the working tree.\nOmitted, `HEAD`."
               }
             },
             "required": [
@@ -5367,7 +5405,12 @@
               },
               {
                 "const": "all",
-                "description": "Any entity kind may match.",
+                "description": "Any declaration, tree entry, or documentation block may match.",
+                "type": "string"
+              },
+              {
+                "const": "commit",
+                "description": "Only commits the history store holds may match, by their message.",
                 "type": "string"
               }
             ]
@@ -5436,7 +5479,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -5601,12 +5644,17 @@
             },
             "limit": 25,
             "target": "symbol"
+          },
+          {
+            "limit": 10,
+            "query": "change path bound",
+            "target": "commit"
           }
         ],
         "properties": {
           "change": {
             "$ref": "#/$defs/SearchChange",
-            "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`, since no lane resolves references for a\ncommitted revision; and beside a `scope` past `local`."
+            "description": "A committed revision compared against another revision or the working tree,\nstanding alone. Every declaration the two sides hold differently becomes a hit\ntagged `change`, carrying a `change` block that names what differs and where the\ndeclaration lives on each side. `target: \"file\"` never carries a change hit, since\nthe comparison reaches declarations alone, and `relevance` orders the hits by path,\nthen name. `paths` narrows which changed paths are compared. The server refuses\n`change` beside `rev`, since `change` names its own revisions; beside `query`, since\nthe two select different result sets; beside `traversal`, which no comparison\nserves; and beside a `scope` past `local`."
           },
           "include": {
             "description": "Extra payload to attach to every hit. Every entry costs response bytes per hit, so\nthe caller requests only what it will read.",
@@ -5653,7 +5701,7 @@
             "type": "string"
           },
           "query": {
-            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, and file contents. A declaration whose body alone holds the terms\nanswers through its file's contents, tagged `content`, when that file ranks among\nthe first 20 files. Matching is case-insensitive and identifier-aware: the query and\nthe indexed names split on case, acronym, and separator boundaries, so `loadConfig`\nfinds `load_config`. Double quotes keep a phrase together, and an identifier written\ninside a question reaches its declaration without being quoted. A query naming\nseveral terms is answered by the declarations carrying all of them before the ones\ncarrying some. Scoring is server-defined and comparable within one answer.",
+            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, and file contents. A declaration whose body alone holds the terms\nanswers through its file's contents, tagged `content`, when that file ranks among\nthe first 20 files. Matching is case-insensitive and identifier-aware: the query and\nthe indexed names split on case, acronym, and separator boundaries, so `loadConfig`\nfinds `load_config`. Double quotes keep a phrase together, and an identifier written\ninside a question reaches its declaration without being quoted. A query naming\nseveral terms is answered by the declarations carrying all of them before the ones\ncarrying some. Scoring is server-defined and comparable within one answer. With\n`target: \"commit\"`, the text matches commit messages instead.",
             "type": "string"
           },
           "rev": {
@@ -5668,7 +5716,7 @@
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
             "default": "all",
-            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match."
+            "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, `all`: declarations, tree entries, and documentation\nblocks. `commit` matches `query` against the messages of the commits the history\nstore holds - under `[providers.history] strategy = \"selective\"`, the selected\nreleases alone - and answers the commits carrying every term before the ones\ncarrying some, each group newest first, whatever `order` names. While the store\nfills, a commit it has not analyzed yet answers nothing. The server refuses `commit`\nbeside `pattern`, `traversal`, `change`, `rev`, `packages`, and `paths`, and with a\n`scope` past `local`, since each of them selects declarations, text, or another\ntree, and the global index holds no project history."
           },
           "traversal": {
             "$ref": "#/$defs/SearchTraversal",
@@ -5681,6 +5729,75 @@
       "name": "search",
       "output_schema": {
         "$defs": {
+          "CommitAuthor": {
+            "additionalProperties": false,
+            "description": "The author one revision records, as committed: no `.mailmap` rewrites the name or the\naddress.",
+            "properties": {
+              "email": {
+                "description": "The author's email address.",
+                "type": "string"
+              },
+              "name": {
+                "description": "The author's name.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "email"
+            ],
+            "type": "object"
+          },
+          "CommitHit": {
+            "additionalProperties": false,
+            "description": "One commit whose message matched a commit search, as the history store holds it.",
+            "properties": {
+              "author": {
+                "$ref": "#/$defs/CommitAuthor",
+                "description": "Who authored the commit, as the version control records it."
+              },
+              "message": {
+                "description": "The commit message, cut at `COMMIT_MESSAGE_BYTES_MAX` bytes on a character boundary.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "message_truncated": {
+                "description": "Whether the message ran past `COMMIT_MESSAGE_BYTES_MAX` bytes, so `message` holds\nits first bytes alone.",
+                "type": "boolean"
+              },
+              "paths": {
+                "description": "The paths the commit changed against the commit it was compared with, in path order,\nat most `COMMIT_PATHS_MAX`. A path `[source]` leaves out of the index, or a lockfile\n`[search.text] excluded_lockfiles` names, is not listed.",
+                "items": {
+                  "$ref": "#/$defs/ProjectPath"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "paths_truncated": {
+                "description": "Whether the commit changed more paths than `paths` lists.",
+                "type": "boolean"
+              },
+              "revision": {
+                "$ref": "#/$defs/RevisionId",
+                "description": "The commit id, as the workspace's version control spells it."
+              },
+              "timestamp": {
+                "description": "When the commit was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
+                "maxLength": 64,
+                "type": "string"
+              }
+            },
+            "required": [
+              "revision",
+              "message",
+              "message_truncated",
+              "author",
+              "timestamp",
+              "paths",
+              "paths_truncated"
+            ],
+            "type": "object"
+          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -6417,7 +6534,7 @@
               },
               {
                 "const": "change",
-                "description": "A comparison of two committed revisions found the declaration changed.",
+                "description": "A comparison `change` named found the declaration changed.",
                 "type": "string"
               }
             ]
@@ -6977,7 +7094,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift://logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
                 "properties": {
                   "code": {
                     "const": "source_unavailable",
@@ -6990,7 +7107,7 @@
                   },
                   "unit": {
                     "$ref": "#/$defs/FileId",
-                    "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
+                    "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
                 "required": [
@@ -7254,7 +7371,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two revisions that differ in fewer files.",
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
                     "const": "change_truncated",
@@ -7717,6 +7834,14 @@
               }
             ]
           },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "examples": [
+              "main"
+            ],
+            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "type": "string"
+          },
           "SearchHit": {
             "additionalProperties": false,
             "allOf": [
@@ -7769,11 +7894,11 @@
                 }
               }
             ],
-            "description": "One search hit. Its file, node, or symbol payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+            "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
             "properties": {
               "change": {
                 "$ref": "#/$defs/SymbolChange",
-                "description": "How the declaration differs between the two revisions `change` named, present when\nthe comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`,\nand `source` read the head revision, except for a removed declaration, which keeps\nits base-side identity, path, range, and source - the head revision no longer holds\nit. A change hit carries no `score`, since a comparison ranks nothing."
+                "description": "How the declaration differs between the two sides `change` named, present when the\ncomparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`, and\n`source` read the head side, except for a removed declaration, which keeps its\nbase-side identity, path, range, and source - the head side no longer holds it. A\nchange hit carries no `score`, since a comparison ranks nothing."
               },
               "distance": {
                 "description": "Number of edges in `traversal_path`. It is present exactly when `traversal_path` is\npresent and equals its length.",
@@ -7784,7 +7909,7 @@
               },
               "hit": {
                 "$ref": "#/$defs/SearchHitTarget",
-                "description": "What was found. A symbol, a node, or a file - whichever `target` allowed."
+                "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
               },
               "line": {
                 "description": "The 1-based source line where the hit begins, or absent with `range`.",
@@ -7828,7 +7953,7 @@
               },
               "unit": {
                 "$ref": "#/$defs/SourceUnitId",
-                "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit carries exactly one of `path` and `unit`."
+                "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit in a file carries exactly one of `path` and\n`unit`; a commit hit carries neither."
               }
             },
             "required": [
@@ -7923,6 +8048,25 @@
                 "required": [
                   "target",
                   "size"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A commit hit: one commit the history store holds, matched by its message.",
+                "properties": {
+                  "commit": {
+                    "$ref": "#/$defs/CommitHit",
+                    "description": "The commit that matched."
+                  },
+                  "target": {
+                    "const": "commit",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "target",
+                  "commit"
                 ],
                 "type": "object"
               }
@@ -8345,7 +8489,7 @@
             ]
           },
           "SymbolId": {
-            "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
             "examples": [
               "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
             ],
@@ -8682,6 +8826,34 @@
                   "start": 121
                 },
                 "source": "    let config = load_config(&arguments.path)?;"
+              }
+            ]
+          },
+          {
+            "pagination": {
+              "page_index": 0,
+              "total_pages": 1
+            },
+            "results": [
+              {
+                "hit": {
+                  "commit": {
+                    "author": {
+                      "email": "alice@example.com",
+                      "name": "Alice"
+                    },
+                    "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
+                    "message_truncated": false,
+                    "paths": [
+                      "crates/rift-protocol/src/search.rs",
+                      "crates/rift-server/src/change.rs"
+                    ],
+                    "paths_truncated": false,
+                    "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
+                    "timestamp": "2026-09-22T14:03:11+02:00"
+                  },
+                  "target": "commit"
+                }
               }
             ]
           }
