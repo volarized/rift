@@ -1,22 +1,31 @@
 //! Symbol timelines: version-control history read through the syntax tier.
 //!
-//! One request's composition walks each hit path's first-parent history,
-//! parses the committed blobs with the path's syntax provider, and
+//! A workspace whose server keeps a history store answers a timeline from
+//! it: the store holds, per analyzed commit, the declarations whose shape
+//! changed and the files moved without a byte changed, and the timeline
+//! follows the commits it holds from the served revision. With no store
+//! attached, one request's composition walks each hit path's first-parent
+//! history, parses the committed blobs with the path's syntax provider, and
 //! classifies each adjacent pair of parsed states into a wire
-//! [`SymbolVersionKind`]. The caller runs the composition on its blocking
-//! lane; the classifier itself is sans-I/O.
+//! [`SymbolVersionKind`]. The caller runs either on its blocking lane; the
+//! classifier itself is sans-I/O.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::sync::Arc;
 
 use rift_core::ProjectPath;
 use rift_history::{
     HistoryFault, PathHistory, PathRevision, Repository, ResolvedRevision, TreeFile,
 };
+use rift_history_store::{StoreReader, StoreReads, StoredCommit};
 use rift_index::SymbolMatch;
-use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration};
-use rift_protocol::read::{RevisionId, SymbolHistory, SymbolVersion, SymbolVersionKind};
+use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration, HistoryStrategy};
+use rift_protocol::read::{
+    CommitAuthor, ProjectPath as WireProjectPath, RevisionId, SymbolHistory, SymbolId,
+    SymbolVersion, SymbolVersionKind,
+};
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
 
 use crate::read::{ReadError, ReadFault, project_path, symbol_id};
@@ -34,36 +43,78 @@ struct ParsedRevision {
     document: SyntaxDocument,
 }
 
-/// Per-request timeline composition over one served revision: one
-/// repository handle, one walk per distinct hit path, one parse per
-/// distinct committed blob.
+/// The history store a symbol-history read answers from, and the signal
+/// that asks the history task to fill when the store lags a read.
+#[derive(Clone)]
+pub struct StoredHistory {
+    reader: StoreReader,
+    strategy: HistoryStrategy,
+    lagging: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl StoredHistory {
+    /// The store `reader` opens, filled under `strategy`. A read that meets
+    /// a served revision the store does not hold yet calls `lagging` once
+    /// and answers from what the store holds.
+    #[must_use]
+    pub fn new(
+        reader: StoreReader,
+        strategy: HistoryStrategy,
+        lagging: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            reader,
+            strategy,
+            lagging,
+        }
+    }
+}
+
+impl std::fmt::Debug for StoredHistory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredHistory")
+            .field("reader", &self.reader)
+            .field("strategy", &self.strategy)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-request timeline composition over one served revision.
 #[derive(Debug)]
 pub(crate) struct SymbolTimelines {
     _span: tracing::Span,
-    repository: Repository,
-    start: ResolvedRevision,
-    revisions_max: usize,
-    syntax: SyntaxLimits,
-    walks: HashMap<String, PathHistory>,
-    parses: HashMap<ParseKey, Option<ParsedRevision>>,
+    source: TimelineSource,
+}
+
+/// Where one request's timelines come from.
+#[derive(Debug)]
+enum TimelineSource {
+    /// The history store the server fills.
+    Store(StoredTimelines),
+    /// A walk of git per request, when no store is attached.
+    Walk(Box<WalkedTimelines>),
 }
 
 impl SymbolTimelines {
     /// Opens the workspace repository and resolves where timelines start:
     /// the served commit for a revision read, `HEAD` for a current-tree
     /// read. The walk budget is the configured history depth under the
-    /// protocol's hard bound.
+    /// protocol's hard bound. With `store` attached, the timelines read it;
+    /// otherwise each walks git.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`]: `unsupported` when `[providers.history]` is
-    /// disabled, and the version-control fault when the workspace has no
-    /// repository or its head does not resolve.
+    /// disabled, the version-control fault when the workspace has no
+    /// repository or its head does not resolve, and the store fault when the
+    /// attached store cannot be read.
     pub(crate) fn open(
         root: &Path,
         revision: Option<&RevisionId>,
         history: &HistoryConfiguration,
         syntax: SyntaxLimits,
+        store: Option<&StoredHistory>,
     ) -> Result<Self, ReadError> {
         if !history.enabled {
             return Err(ReadFault::unsupported(
@@ -90,26 +141,193 @@ impl SymbolTimelines {
             phase = "start",
             "symbol history started"
         );
+        let source = match store {
+            Some(stored) => TimelineSource::Store(StoredTimelines::open(
+                stored,
+                &start,
+                revision.is_some(),
+                revisions_max,
+            )?),
+            None => TimelineSource::Walk(Box::new(WalkedTimelines {
+                repository,
+                start,
+                revisions_max,
+                syntax,
+                walks: HashMap::new(),
+                parses: HashMap::new(),
+            })),
+        };
         Ok(Self {
             _span: span,
-            repository,
-            start,
-            revisions_max,
-            syntax,
-            walks: HashMap::new(),
-            parses: HashMap::new(),
+            source,
         })
     }
 
-    /// Composes one hit's timeline: the path's touching commits newest
-    /// first, each parsed through `provider` and classified against its
-    /// adjacent older state.
+    /// Composes one hit's timeline, newest first.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the repository cannot be read. A blob the
-    /// tier cannot analyze contributes no version instead of failing.
+    /// Returns [`ReadError`] when the repository or the store cannot be
+    /// read. A blob the tier cannot analyze contributes no version instead of
+    /// failing.
     pub(crate) fn timeline(
+        &mut self,
+        provider: &dyn SyntaxProvider,
+        matched: SymbolMatch<'_>,
+    ) -> Result<SymbolHistory, ReadError> {
+        match &mut self.source {
+            TimelineSource::Store(stored) => stored.timeline(matched),
+            TimelineSource::Walk(walked) => walked.timeline(provider, matched),
+        }
+    }
+}
+
+/// Timelines read from the history store: one read connection, and the
+/// held commit they start at.
+#[derive(Debug)]
+struct StoredTimelines {
+    reads: StoreReads,
+    start: Option<String>,
+    revisions_max: usize,
+}
+
+impl StoredTimelines {
+    /// Opens one read connection and settles where the timelines start.
+    ///
+    /// Under `everything` they start at the served commit. Under `selective`
+    /// a current-tree read starts at the newest release the store holds and
+    /// a revision read at the served commit when it is a held release. A
+    /// start the store does not hold answers no version, and a current-tree
+    /// read that meets one asks the history task to fill.
+    fn open(
+        stored: &StoredHistory,
+        served: &ResolvedRevision,
+        revision_read: bool,
+        revisions_max: usize,
+    ) -> Result<Self, ReadError> {
+        let reads = stored.reader.connect().map_err(ReadFault::history_store)?;
+        let start = match (stored.strategy, revision_read) {
+            (HistoryStrategy::Selective, false) => {
+                reads.chain_head().map_err(ReadFault::history_store)?
+            }
+            _ => Some(served.commit_id()),
+        };
+        let held = match &start {
+            Some(start) => reads
+                .commit(start)
+                .map_err(ReadFault::history_store)?
+                .is_some(),
+            None => false,
+        };
+        if !held && !revision_read {
+            (stored.lagging)();
+        }
+        Ok(Self {
+            reads,
+            start,
+            revisions_max,
+        })
+    }
+
+    /// One declaration's timeline through the held commits, newest first.
+    ///
+    /// Each held commit contributes the change the store recorded for the
+    /// declaration at the path it lived at then. A file the commit moved
+    /// without changing a byte, or a declaration it moved unchanged into
+    /// another file, contributes a `moved` version, and the timeline goes on
+    /// at the path it came from. The timeline is
+    /// complete once it passes a commit compared with nothing; it is not
+    /// when it meets a commit the store does not hold, a boundary, or the
+    /// `max_revisions` bound first.
+    fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, ReadError> {
+        let symbol = symbol_id(matched.file, matched.symbol);
+        let qualified_name = matched.symbol.qualified_name.as_str();
+        let mut path = matched.file.path().as_str().to_owned();
+        let mut versions = Vec::new();
+        let mut next = self.start.clone();
+        let mut complete = false;
+        for _ in 0..self.revisions_max {
+            let Some(id) = next else {
+                complete = true;
+                break;
+            };
+            let Some(commit) = self.reads.commit(&id).map_err(ReadFault::history_store)? else {
+                break;
+            };
+            if let Some(kind) = self
+                .reads
+                .declaration_change(&commit, &path, qualified_name)
+                .map_err(ReadFault::history_store)?
+            {
+                versions.push(stored_version(&commit, &path, kind));
+                if kind == SymbolVersionKind::Moved
+                    && let Some(old_path) = self
+                        .reads
+                        .moved_from(&commit, &path, qualified_name)
+                        .map_err(ReadFault::history_store)?
+                {
+                    path = old_path;
+                }
+            }
+            if let Some(old_path) = self
+                .reads
+                .renamed_from(&commit, &path)
+                .map_err(ReadFault::history_store)?
+            {
+                versions.push(stored_version(&commit, &path, SymbolVersionKind::Moved));
+                path = old_path;
+            }
+            if commit.boundary {
+                break;
+            }
+            next = commit.base;
+        }
+        Ok(timeline_answer(symbol, versions, complete))
+    }
+}
+
+/// One version a held commit contributes.
+fn stored_version(commit: &StoredCommit, path: &str, kind: SymbolVersionKind) -> SymbolVersion {
+    SymbolVersion {
+        revision: RevisionId(commit.id.clone()),
+        path: WireProjectPath(path.to_owned()),
+        kind,
+        timestamp: commit.committed_at.clone(),
+        summary: commit.summary().map(str::to_owned),
+        author: commit.author.clone(),
+    }
+}
+
+/// The wire timeline one composition answers.
+const fn timeline_answer(
+    symbol: SymbolId,
+    versions: Vec<SymbolVersion>,
+    complete: bool,
+) -> SymbolHistory {
+    SymbolHistory {
+        symbol,
+        versions,
+        complete,
+    }
+}
+
+/// Timelines walked through git per request: one repository handle, one
+/// walk per distinct hit path, one parse per distinct committed blob.
+#[derive(Debug)]
+struct WalkedTimelines {
+    repository: Repository,
+    start: ResolvedRevision,
+    revisions_max: usize,
+    syntax: SyntaxLimits,
+    walks: HashMap<String, PathHistory>,
+    parses: HashMap<ParseKey, Option<ParsedRevision>>,
+}
+
+impl WalkedTimelines {
+    /// Composes one hit's timeline: the path's touching commits newest
+    /// first, each parsed through `provider` and classified against its
+    /// adjacent older state.
+    fn timeline(
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
@@ -122,7 +340,6 @@ impl SymbolTimelines {
             syntax,
             walks,
             parses,
-            ..
         } = self;
         let history = match walks.entry(path.as_str().to_owned()) {
             Entry::Occupied(walked) => walked.into_mut(),
@@ -165,13 +382,17 @@ impl SymbolTimelines {
                 kind,
                 timestamp: revision.timestamp().to_owned(),
                 summary: revision.summary().map(str::to_owned),
+                author: CommitAuthor {
+                    name: revision.author_name().to_owned(),
+                    email: revision.author_email().to_owned(),
+                },
             });
         }
-        Ok(SymbolHistory {
-            symbol: symbol_id(matched.file, matched.symbol),
+        Ok(timeline_answer(
+            symbol_id(matched.file, matched.symbol),
             versions,
             complete,
-        })
+        ))
     }
 }
 
@@ -609,6 +830,7 @@ mod tests {
             None,
             &HistoryConfiguration::default(),
             SyntaxLimits::default(),
+            None,
         )
         .map_err(|error| error.to_string())?;
         for name in ["beacon_one", "beacon_two"] {
@@ -625,11 +847,10 @@ mod tests {
                 "{name} grew after its introduction"
             );
         }
-        assert_eq!(
-            timelines.walks.len(),
-            1,
-            "two hits on one path share one walk"
-        );
+        let TimelineSource::Walk(walked) = &timelines.source else {
+            panic!("no store is attached, so the timelines walk git");
+        };
+        assert_eq!(walked.walks.len(), 1, "two hits on one path share one walk");
         assert_eq!(
             provider.analyzed(),
             2,
@@ -643,11 +864,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp dir");
         let disabled = HistoryConfiguration {
             enabled: false,
-            max_revisions: 500,
+            ..HistoryConfiguration::default()
         };
-        let error =
-            SymbolTimelines::open(directory.path(), None, &disabled, SyntaxLimits::default())
-                .expect_err("a disabled provider must refuse before any repository access");
+        let error = SymbolTimelines::open(
+            directory.path(),
+            None,
+            &disabled,
+            SyntaxLimits::default(),
+            None,
+        )
+        .expect_err("a disabled provider must refuse before any repository access");
         assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
     }
 
@@ -660,6 +886,7 @@ mod tests {
             None,
             &HistoryConfiguration::default(),
             SyntaxLimits::default(),
+            None,
         )
         .expect_err("a repository without commits resolves no HEAD");
         assert!(matches!(error.fault(), ReadFault::History(_)));
@@ -672,8 +899,9 @@ mod tests {
         service: &ReadService,
         history: &HistoryConfiguration,
     ) -> TestResult<SymbolHistory> {
-        let mut timelines = SymbolTimelines::open(root, None, history, SyntaxLimits::default())
-            .map_err(|error| error.to_string())?;
+        let mut timelines =
+            SymbolTimelines::open(root, None, history, SyntaxLimits::default(), None)
+                .map_err(|error| error.to_string())?;
         let matches = service
             .index()
             .symbols("beacon_one", 5)
@@ -700,8 +928,8 @@ mod tests {
     fn timeline_cut_by_the_revision_bound_is_incomplete() -> TestResult {
         let (directory, service) = shared_path_fixture()?;
         let bounded = HistoryConfiguration {
-            enabled: true,
             max_revisions: 1,
+            ..HistoryConfiguration::default()
         };
         let timeline = beacon_timeline(directory.path(), &service, &bounded)?;
         assert!(
@@ -732,6 +960,286 @@ mod tests {
             timeline.versions.is_empty(),
             "nothing older than the boundary is provable, so no version is classified"
         );
+        Ok(())
+    }
+
+    /// A history store at `store_folder`, filled with every commit `history`
+    /// selects in the workspace at `root`.
+    fn filled_store(
+        root: &Path,
+        store_folder: &Path,
+        history: &HistoryConfiguration,
+    ) -> TestResult<rift_history_store::HistoryStore> {
+        let store = rift_history_store::HistoryStore::open(
+            &rift_history_store::StoreLocation::new(store_folder, "aa"),
+        )?;
+        let mut filler = store.filler()?.ok_or("no other filler runs")?;
+        let analysis = crate::HistoryAnalysis::open(
+            root,
+            history,
+            (
+                &SourceVisibility::default(),
+                &rift_core::TextFileInclusion::default(),
+                &rift_core::LanguageFileSelections::default(),
+            ),
+            SyntaxLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let held = filler.held()?;
+        let plan = analysis.plan(&held).map_err(|error| error.to_string())?;
+        let mut records = Vec::new();
+        for pending in plan.pending() {
+            let analyzed = analysis
+                .analyze(pending, &|| false)
+                .map_err(|error| error.to_string())?
+                .ok_or("nothing cancels the analysis")?;
+            records.push(analyzed.into_record());
+        }
+        filler.write_batch(&records)?;
+        filler.trim(plan.keep())?;
+        Ok(store)
+    }
+
+    /// The store handle a read attaches, counting how often a read found the
+    /// store lagging.
+    fn stored(
+        store: &rift_history_store::HistoryStore,
+        strategy: HistoryStrategy,
+    ) -> (StoredHistory, Arc<AtomicUsize>) {
+        let lagged = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lagged);
+        let stored = StoredHistory::new(
+            store.reader(),
+            strategy,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (stored, lagged)
+    }
+
+    /// One timeline of `name` from `service`'s index, composed from `stored`.
+    fn stored_timeline(
+        root: &Path,
+        service: &ReadService,
+        history: &HistoryConfiguration,
+        stored: &StoredHistory,
+        name: &str,
+    ) -> TestResult<SymbolHistory> {
+        let mut timelines =
+            SymbolTimelines::open(root, None, history, SyntaxLimits::default(), Some(stored))
+                .map_err(|error| error.to_string())?;
+        let matches = service
+            .index()
+            .symbols(name, 5)
+            .map_err(|error| error.to_string())?;
+        let timeline = timelines
+            .timeline(&RustSyntaxProvider::default(), matches[0])
+            .map_err(|error| error.to_string())?;
+        Ok(timeline)
+    }
+
+    #[test]
+    fn a_stored_timeline_answers_what_a_walk_answers() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(directory.path(), folder.path(), &history)?;
+        let (stored, lagged) = stored(&store, HistoryStrategy::Everything);
+
+        let from_store =
+            stored_timeline(directory.path(), &service, &history, &stored, "beacon_one")?;
+        let walked = beacon_timeline(directory.path(), &service, &history)?;
+
+        assert_eq!(from_store, walked);
+        assert!(from_store.complete);
+        assert_eq!(from_store.versions.len(), 2);
+        assert_eq!(from_store.versions[0].author.name, "Rift Fixture");
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_timeline_lags_until_the_store_holds_the_served_commit() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let empty = rift_history_store::HistoryStore::open(
+            &rift_history_store::StoreLocation::new(folder.path(), "aa"),
+        )?;
+        let (stored_empty, lagged) = stored(&empty, HistoryStrategy::Everything);
+
+        let lagging = stored_timeline(
+            directory.path(),
+            &service,
+            &history,
+            &stored_empty,
+            "beacon_one",
+        )?;
+
+        assert!(!lagging.complete, "the store holds nothing yet");
+        assert!(lagging.versions.is_empty());
+        assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
+        drop(stored_empty);
+        drop(empty);
+
+        let store = filled_store(directory.path(), folder.path(), &history)?;
+        let (stored_filled, lagged) = stored(&store, HistoryStrategy::Everything);
+        let caught_up = stored_timeline(
+            directory.path(),
+            &service,
+            &history,
+            &stored_filled,
+            "beacon_one",
+        )?;
+        assert!(caught_up.complete, "the store holds the whole history now");
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_timeline_past_the_window_is_incomplete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration {
+            max_revisions: 1,
+            ..HistoryConfiguration::default()
+        };
+        let store = filled_store(directory.path(), folder.path(), &history)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+
+        let timeline =
+            stored_timeline(directory.path(), &service, &history, &stored, "beacon_one")?;
+
+        assert!(!timeline.complete);
+        let kinds: Vec<SymbolVersionKind> = timeline
+            .versions
+            .iter()
+            .map(|version| version.kind)
+            .collect();
+        assert_eq!(kinds, [SymbolVersionKind::BodyChanged]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_timeline_follows_a_file_moved_without_a_byte_changed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        rift_history::fixture::init(root);
+        fs::write(root.join("before.rs"), "pub fn travelled() {}\n")?;
+        rift_history::fixture::commit_all(root, "introduce travelled");
+        fs::write(
+            root.join("before.rs"),
+            "pub fn travelled() { let _grown = 1; }\n",
+        )?;
+        rift_history::fixture::commit_all(root, "grow travelled");
+        rift_history::fixture::git(root, &["mv", "before.rs", "after.rs"]);
+        rift_history::fixture::commit_all(root, "move travelled");
+        let service = ReadService::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(root, folder.path(), &history)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "travelled")?;
+
+        let versions: Vec<(SymbolVersionKind, &str)> = timeline
+            .versions
+            .iter()
+            .map(|version| (version.kind, version.path.0.as_str()))
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                (SymbolVersionKind::Moved, "after.rs"),
+                (SymbolVersionKind::BodyChanged, "before.rs"),
+                (SymbolVersionKind::Introduced, "before.rs"),
+            ]
+        );
+        assert!(timeline.complete);
+        Ok(())
+    }
+
+    #[test]
+    fn a_selective_timeline_lists_the_releases_that_changed_the_declaration() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let root = directory.path();
+        rift_history::fixture::git(root, &["tag", "v1.0.0", "HEAD~1"]);
+        rift_history::fixture::git(root, &["tag", "v2.0.0", "HEAD"]);
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration {
+            strategy: HistoryStrategy::Selective,
+            releases: vec!["v*".to_owned()],
+            ..HistoryConfiguration::default()
+        };
+        let store = filled_store(root, folder.path(), &history)?;
+        let (stored, lagged) = stored(&store, HistoryStrategy::Selective);
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "beacon_one")?;
+
+        let kinds: Vec<SymbolVersionKind> = timeline
+            .versions
+            .iter()
+            .map(|version| version.kind)
+            .collect();
+        assert_eq!(kinds, [SymbolVersionKind::BodyChanged]);
+        assert!(
+            !timeline.complete,
+            "the oldest selected release is compared with nothing"
+        );
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_timeline_follows_a_declaration_moved_into_another_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        rift_history::fixture::init(root);
+        fs::write(
+            root.join("from.rs"),
+            "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n",
+        )?;
+        rift_history::fixture::commit_all(root, "introduce travelled");
+        fs::remove_file(root.join("from.rs"))?;
+        fs::write(
+            root.join("to.rs"),
+            "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n",
+        )?;
+        rift_history::fixture::commit_all(root, "move travelled");
+        let service = ReadService::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(root, folder.path(), &history)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "travelled")?;
+
+        let versions: Vec<(SymbolVersionKind, &str)> = timeline
+            .versions
+            .iter()
+            .map(|version| (version.kind, version.path.0.as_str()))
+            .collect();
+        assert_eq!(
+            versions,
+            [
+                (SymbolVersionKind::Moved, "to.rs"),
+                (SymbolVersionKind::Introduced, "from.rs"),
+            ]
+        );
+        assert!(timeline.complete);
         Ok(())
     }
 }

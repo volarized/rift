@@ -202,6 +202,25 @@
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
+          "CommitAuthor": {
+            "additionalProperties": false,
+            "description": "The author one revision records, as committed: no `.mailmap` rewrites the name or the\naddress.",
+            "properties": {
+              "email": {
+                "description": "The author's email address.",
+                "type": "string"
+              },
+              "name": {
+                "description": "The author's name.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "email"
+            ],
+            "type": "object"
+          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -2675,10 +2694,10 @@
           },
           "SymbolHistory": {
             "additionalProperties": false,
-            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The walk follows first parents from the served revision along the declaration's\ncurrent path only, bounded by the configured history depth and by a shallow clone's\nboundary.",
+            "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The timeline follows first parents from the served revision, or the selected\nreleases in version order, through the revisions the history store holds, and follows\nthe declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary.",
             "properties": {
               "complete": {
-                "description": "Whether the walk reached the repository's first commit. `false` when the\n`max_revisions` bound or a shallow clone's boundary ended the walk first, so\nrevisions older than the listed ones may have touched the symbol.",
+                "description": "Whether the timeline reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so revisions older than the listed ones may have touched the symbol.",
                 "type": "boolean"
               },
               "symbol": {
@@ -2735,6 +2754,10 @@
             "additionalProperties": false,
             "description": "One revision that touched a symbol. The history provider parses the declaration at each\nfirst-parent revision that changed its file and classifies adjacent states; a revision\nwhose source cannot be parsed contributes no version.",
             "properties": {
+              "author": {
+                "$ref": "#/$defs/CommitAuthor",
+                "description": "Who authored the revision, as the version control records it."
+              },
               "kind": {
                 "$ref": "#/$defs/SymbolVersionKind",
                 "description": "How the revision changed the symbol."
@@ -2753,7 +2776,7 @@
                 "type": "string"
               },
               "timestamp": {
-                "description": "When the revision was recorded, as RFC 3339 date-time.",
+                "description": "When the revision was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
                 "maxLength": 64,
                 "type": "string"
               }
@@ -2762,7 +2785,8 @@
               "revision",
               "path",
               "kind",
-              "timestamp"
+              "timestamp",
+              "author"
             ],
             "type": "object"
           },
@@ -2972,6 +2996,10 @@
                   "symbol": "rift://symbol/rust/src/config.rs/load_config",
                   "versions": [
                     {
+                      "author": {
+                        "email": "alice@example.com",
+                        "name": "Alice"
+                      },
                       "kind": "signature_changed",
                       "path": "src/config.rs",
                       "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
@@ -2979,6 +3007,10 @@
                       "timestamp": "2026-08-21T14:03:22+00:00"
                     },
                     {
+                      "author": {
+                        "email": "alice@example.com",
+                        "name": "Alice"
+                      },
                       "kind": "introduced",
                       "path": "src/config.rs",
                       "revision": "8259026556ceae156a29adb53178c842ca32c4a2",

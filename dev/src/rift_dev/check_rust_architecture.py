@@ -71,6 +71,7 @@ EXPECTED_EDGES = {
     "rift-server -> rift-core",
     "rift-server -> rift-dependency",
     "rift-server -> rift-history",
+    "rift-server -> rift-history-store",
     "rift-server -> rift-index",
     "rift-server -> rift-lsp",
     "rift-server -> rift-protocol",

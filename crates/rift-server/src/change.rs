@@ -96,7 +96,7 @@ struct ComparedRevisions<'current> {
 /// revision, or the published current index for the working tree.
 enum HeadIndex<'current> {
     /// The index over the changed paths of the committed head revision.
-    Revision(WorkspaceIndex),
+    Revision(Box<WorkspaceIndex>),
     /// The published current index, which serves the working tree.
     WorkingTree(&'current WorkspaceIndex),
 }
@@ -206,7 +206,7 @@ impl<'current> ComparedRevisions<'current> {
         let head_index = index_side(&head)?;
         Ok(Self {
             base: base_index,
-            head: HeadIndex::Revision(head_index),
+            head: HeadIndex::Revision(Box::new(head_index)),
             paths: project_paths(changed.paths()),
             truncated: changed.is_truncated(),
             unconverted: BTreeMap::new(),
@@ -291,7 +291,7 @@ impl<'current> ComparedRevisions<'current> {
     const fn head(&self) -> &WorkspaceIndex {
         match &self.head {
             HeadIndex::Revision(index) => index,
-            HeadIndex::WorkingTree(index) => *index,
+            HeadIndex::WorkingTree(index) => index,
         }
     }
 

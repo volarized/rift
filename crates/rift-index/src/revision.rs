@@ -30,6 +30,11 @@ use rift_analysis::PathMatcher;
 #[derive(Debug)]
 pub(crate) struct RevisionFiles;
 
+/// Reads one committed file's bytes under the per-file byte bound it is handed; `None`
+/// leaves the file out.
+type CommittedBytes<'read> =
+    dyn FnMut(&TreeFile, usize) -> Result<Option<Vec<u8>>, HistoryError> + 'read;
+
 impl WorkspaceIndex {
     /// Builds read index over one committed tree.
     ///
@@ -139,7 +144,7 @@ impl WorkspaceIndex {
             &rift_core::LanguageFileSelections,
         ),
         selection: &dyn Fn(&str) -> bool,
-        read: &mut dyn FnMut(&TreeFile, usize) -> Result<Option<Vec<u8>>, HistoryError>,
+        read: &mut CommittedBytes<'_>,
     ) -> Result<Self, WorkspaceIndexError> {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;

@@ -517,14 +517,22 @@ fn default_get_symbol_params_page_index() -> u64 {
                             "path": "src/config.rs",
                             "kind": "signature_changed",
                             "timestamp": "2026-08-21T14:03:22+00:00",
-                            "summary": "Return ConfigError from load_config"
+                            "summary": "Return ConfigError from load_config",
+                            "author": {
+                                "name": "Alice",
+                                "email": "alice@example.com"
+                            }
                         },
                         {
                             "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
                             "path": "src/config.rs",
                             "kind": "introduced",
                             "timestamp": "2026-08-17T09:41:05+00:00",
-                            "summary": "Add workspace configuration loading"
+                            "summary": "Add workspace configuration loading",
+                            "author": {
+                                "name": "Alice",
+                                "email": "alice@example.com"
+                            }
                         }
                     ],
                     "complete": true
@@ -1991,9 +1999,10 @@ pub enum SymbolFacet {
 }
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The walk follows first parents from the served revision along the declaration's
-/// current path only, bounded by the configured history depth and by a shallow clone's
-/// boundary.
+/// first. The timeline follows first parents from the served revision, or the selected
+/// releases in version order, through the revisions the history store holds, and follows
+/// the declaration's file across a rename that kept its bytes. It is bounded by
+/// `[providers.history] max_revisions` and by a shallow clone's boundary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
@@ -2001,9 +2010,10 @@ pub struct SymbolHistory {
     pub symbol: SymbolId,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
-    /// Whether the walk reached the repository's first commit. `false` when the
-    /// `max_revisions` bound or a shallow clone's boundary ended the walk first, so
-    /// revisions older than the listed ones may have touched the symbol.
+    /// Whether the timeline reached the repository's first commit. `false` when the
+    /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
+    /// ended it first, or while the history store has not yet analyzed the served
+    /// revision, so revisions older than the listed ones may have touched the symbol.
     pub complete: bool,
 }
 
@@ -2078,13 +2088,27 @@ pub struct SymbolVersion {
     pub path: ProjectPath,
     /// How the revision changed the symbol.
     pub kind: SymbolVersionKind,
-    /// When the revision was recorded, as RFC 3339 date-time.
+    /// When the revision was committed, as RFC 3339 date-time carrying the recorded offset:
+    /// the committer time, not the author time.
     #[schemars(length(max = 64))]
     pub timestamp: String,
     /// The revision's own first summary line, where the version control records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub summary: Option<String>,
+    /// Who authored the revision, as the version control records it.
+    pub author: CommitAuthor,
+}
+
+/// The author one revision records, as committed: no `.mailmap` rewrites the name or the
+/// address.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitAuthor {
+    /// The author's name.
+    pub name: String,
+    /// The author's email address.
+    pub email: String,
 }
 
 /// What the revision did to the symbol.

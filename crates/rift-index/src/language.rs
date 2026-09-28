@@ -225,6 +225,22 @@ impl WorkspaceLanguagePolicy {
         Ok(first)
     }
 
+    /// The syntax provider that parses `path`: the shipped provider of the one
+    /// enabled language entry claiming it, or `None` when no such entry does.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when two language entries match `path`.
+    pub fn syntax_provider_for(
+        &self,
+        path: &Path,
+    ) -> Result<Option<&'static dyn SyntaxProvider>, WorkspaceIndexError> {
+        Ok(self
+            .language_for_path(path)?
+            .filter(|language| language.enabled)
+            .and_then(EffectiveLanguage::syntax_provider))
+    }
+
     /// Which lane one visible path joins.
     ///
     /// An enabled entry with a shipped provider makes the path source. Every
@@ -240,11 +256,7 @@ impl WorkspaceLanguagePolicy {
         path: &Path,
     ) -> Result<Option<ClassifiedPath>, WorkspaceIndexError> {
         let path = self.absolute(path);
-        if let Some(provider) = self
-            .language_for_path(&path)?
-            .filter(|language| language.enabled)
-            .and_then(EffectiveLanguage::syntax_provider)
-        {
+        if let Some(provider) = self.syntax_provider_for(&path)? {
             return Ok(Some(ClassifiedPath::Source(provider)));
         }
         if is_workspace_document(path.extension().and_then(|extension| extension.to_str())) {
