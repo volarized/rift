@@ -272,7 +272,10 @@ fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
         package.version
     );
     assert_eq!(detail.chars().count(), WARNING_DETAIL_CHARS_MAX);
-    assert!(detail.len() > WARNING_DETAIL_CHARS_MAX, "the name is multi-byte");
+    assert!(
+        detail.len() > WARNING_DETAIL_CHARS_MAX,
+        "the name is multi-byte"
+    );
     let resolved = json!([{"entry": entry_json(&requirement), "package": package}]);
     let warnings = json!([{"code": "requirement_unsatisfied", "detail": detail}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
@@ -338,9 +341,13 @@ fn test_package_fields_past_their_character_bound_are_refused() {
     assert_eq!(validate_packages(&[at_bound.identity()]), Ok(()));
 
     let past: [(&str, &str, fn(&mut PackageFields)); 3] = [
-        ("manager", "package_manager", |fields| fields.manager.push('m')),
+        ("manager", "package_manager", |fields| {
+            fields.manager.push('m')
+        }),
         ("name", "package_name", |fields| fields.name.push('\u{e9}')),
-        ("selector", "package_version", |fields| fields.version.push('v')),
+        ("selector", "package_version", |fields| {
+            fields.version.push('v')
+        }),
     ];
     for (entry_field, package_field, lengthen) in past {
         let mut fields = PackageFields::at_bound();

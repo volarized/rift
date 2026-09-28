@@ -1636,10 +1636,18 @@ mod tests {
             Arc::new(Mutex::new(None)),
         );
 
-        assert_eq!(route.remote_packages.len(), 3, "every answering release is read");
+        assert_eq!(
+            route.remote_packages.len(),
+            3,
+            "every answering release is read"
+        );
         assert_eq!(
             warning_codes(&route),
-            ["package_absent", "package_substituted", "package_substituted"]
+            [
+                "package_absent",
+                "package_substituted",
+                "package_substituted"
+            ]
         );
         let package = |manager: &str, name: &str, version: &str| PackageIdentity {
             manager: manager.to_owned(),

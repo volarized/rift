@@ -2049,10 +2049,10 @@ mod tests {
 
     use super::{
         Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
-        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
-        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
-        SymbolId,
+        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
+        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
+        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
+        RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;

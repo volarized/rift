@@ -416,9 +416,17 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
         ("PackagePatternRequest", "pattern", SEARCH_PATTERN_CHARS_MAX),
         ("Warning", "detail", crate::WARNING_DETAIL_CHARS_MAX),
-        ("PackageIdentity", "manager", crate::PACKAGE_MANAGER_CHARS_MAX),
+        (
+            "PackageIdentity",
+            "manager",
+            crate::PACKAGE_MANAGER_CHARS_MAX,
+        ),
         ("PackageIdentity", "name", crate::PACKAGE_NAME_CHARS_MAX),
-        ("PackageIdentity", "version", crate::PACKAGE_VERSION_CHARS_MAX),
+        (
+            "PackageIdentity",
+            "version",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
         (
             "PackageContextEntry",
             "manager",
@@ -492,7 +500,11 @@ fn validate_warning_detail_bound(spec: &Spec) -> Result<(), String> {
         longest = longest.saturating_add(bound);
     }
     let detail = property_schema(spec, "Warning", "detail")?;
-    expect_bound("Warning/properties/detail/maxLength", detail.max_length, longest)
+    expect_bound(
+        "Warning/properties/detail/maxLength",
+        detail.max_length,
+        longest,
+    )
 }
 
 /// Pins the files bound the pattern operation states to the one the client enforces.

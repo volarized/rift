@@ -1643,9 +1643,17 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
 /// Checks one package identity against the contract's bounds, which count characters: a
 /// package name the resolution answered in any script reaches the read that names it.
 fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
-    bounded_nonempty_characters(&package.manager, PACKAGE_MANAGER_CHARS_MAX, "package_manager")?;
+    bounded_nonempty_characters(
+        &package.manager,
+        PACKAGE_MANAGER_CHARS_MAX,
+        "package_manager",
+    )?;
     bounded_nonempty_characters(&package.name, PACKAGE_NAME_CHARS_MAX, "package_name")?;
-    bounded_nonempty_characters(&package.version, PACKAGE_VERSION_CHARS_MAX, "package_version")
+    bounded_nonempty_characters(
+        &package.version,
+        PACKAGE_VERSION_CHARS_MAX,
+        "package_version",
+    )
 }
 
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {

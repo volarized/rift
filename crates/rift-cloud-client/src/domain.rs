@@ -912,7 +912,8 @@ mod tests {
     }
 
     fn symbol(package: &PackageIdentity) -> Symbol {
-        let id = rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon");
+        let id =
+            rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon");
         Symbol {
             id: Some(id),
             language: "rust".to_owned(),

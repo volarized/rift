@@ -196,15 +196,14 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "PackageIdentity")?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["Warning"]["properties"]["detail"]["maxLength"] =
-        json!(1024);
+    document["components"]["schemas"]["Warning"]["properties"]["detail"]["maxLength"] = json!(1024);
     assert_invalid(&document, "Warning/properties/detail/maxLength")?;
 
     // A longer requirement makes a longer `requirement_unsatisfied` detail than the warning
     // bound holds.
     let mut document = contract()?;
-    document["components"]["schemas"]["PackageContextEntry"]["properties"]["requirement"]
-        ["maxLength"] = json!(8192);
+    document["components"]["schemas"]["PackageContextEntry"]["properties"]["requirement"]["maxLength"] =
+        json!(8192);
     assert_invalid(&document, "Warning/properties/detail/maxLength")?;
     Ok(())
 }
