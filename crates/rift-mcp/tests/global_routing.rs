@@ -1522,3 +1522,53 @@ async fn a_body_matched_package_declaration_answers_as_a_content_match() -> Test
     server_task.await?;
     Ok(())
 }
+
+/// `packages` beside a package-scoped `pattern` matches the pattern over the requested
+/// release: a workspace depending on nothing names `demo` for one search, and the pattern
+/// request carries it and answers its matches.
+#[tokio::test]
+async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({
+            "pattern": r"fn helper_\w+",
+            "scope": "global",
+            "target": "all",
+            "include": ["source"],
+            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        }),
+    )
+    .await?;
+    assert_eq!(
+        answer["results"],
+        helper_beacon_pattern_hits(),
+        "{answer:#}"
+    );
+
+    let bodies: Vec<Value> = pattern_requests(&fixture)
+        .await
+        .into_iter()
+        .filter_map(|request| request.body)
+        .collect();
+    assert_eq!(
+        bodies,
+        [json!({
+            "pattern": r"fn helper_\w+",
+            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+            "include": ["source"]
+        })]
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

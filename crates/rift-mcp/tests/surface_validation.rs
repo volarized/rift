@@ -167,8 +167,9 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
 /// `packages` requests: one replacing the version of the fixture's path dependency
 /// `helper`, which then answers `package_absent` in place of `package_unavailable`, one
 /// adding `extra`, a package the context lacks, which answers
-/// `package_requirement_absent`, and one replacing the collected `demo` by the requirement
-/// `>=0`, which the fixture global API resolves to its collected release.
+/// `package_requirement_absent`, one replacing the collected `demo` by the requirement
+/// `>=0`, which the fixture global API resolves to its collected release, and a `pattern`
+/// matched over that release beside the project.
 fn package_argument_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -192,6 +193,14 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "query": "beacon",
                 "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "demo" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "pattern": "helper_beacon",
+                "scope": "all",
                 "packages": [{ "manager": "cargo", "name": "demo" }]
             }),
         ),
