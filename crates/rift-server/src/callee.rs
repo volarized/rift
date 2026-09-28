@@ -414,26 +414,29 @@ impl PackageCallee {
     }
 
     /// The symbol a walk's hit for this callee carries, once the global API named its
-    /// declaration `id` in `package`: the name and kind are the engine's, and the origin
-    /// the package's. `None` for an id naming no language, or a kind the protocol does
-    /// not define.
+    /// declaration `id` in `package`: the name and kind are the engine's. The origin is
+    /// the one package analysis gives the package's declarations: `stdlib` for a standard
+    /// library, the Rust one included although its callees reach it through an install
+    /// folder, and `dependency` naming the package otherwise. `None` for an id naming no
+    /// language, or a kind the protocol does not define.
     pub(crate) fn symbol(&self, id: &SymbolId, package: &PackageIdentity) -> Option<Symbol> {
         let parsed = rift_core::parse_symbol_identity(&id.0).ok()?;
         let language = Language::from_identity_segment(parsed.language_segment()).ok()?;
         let word = SYMBOL_KIND_WORDS
             .iter()
             .find_map(|(kind, word)| (*kind == self.kind).then_some(*word))?;
-        let origin = match self.package {
-            CalleePackage::Installed(_) => SymbolOrigin {
-                location: Some(SourceLocationKind::Dependency),
-                package: Some(package.clone()),
-                source_kind: SourceKind::Authored,
-            },
-            CalleePackage::StandardLibrary(_) => SymbolOrigin {
+        let origin = if package.manager == STANDARD_LIBRARY_MANAGER {
+            SymbolOrigin {
                 location: Some(SourceLocationKind::Stdlib),
                 package: None,
                 source_kind: SourceKind::Authored,
-            },
+            }
+        } else {
+            SymbolOrigin {
+                location: Some(SourceLocationKind::Dependency),
+                package: Some(package.clone()),
+                source_kind: SourceKind::Authored,
+            }
         };
         Some(Symbol {
             id: Some(id.clone()),
@@ -872,6 +875,32 @@ mod tests {
         assert!(
             held.symbol(&SymbolId("not an identity".into()), &greeting)
                 .is_none()
+        );
+        Ok(())
+    }
+
+    /// A Rust standard library callee reaches the sysroot's folder as an installed
+    /// package, and its hit carries the origin package analysis gives the standard library:
+    /// `stdlib`, naming no package.
+    #[test]
+    fn a_standard_library_callee_below_the_sysroot_carries_the_stdlib_origin() -> TestResult {
+        let rust = identity("stdlib", "rust", "1.98.1");
+        let held = callee(
+            CalleePackage::Installed(rust.clone()),
+            "std/src/fs.rs",
+            SymbolKind::FUNCTION,
+        );
+        let id =
+            SymbolId("rift://symbol/rust/stdlib/rust@1.98.1/std/src/fs.rs/read_to_string".into());
+        let wire = serde_json::to_value(held.symbol(&id, &rust).ok_or("the id names a language")?)?;
+        assert_eq!(
+            wire["origin"],
+            serde_json::json!({"location": "stdlib", "source_kind": "authored"})
+        );
+        assert_eq!(wire["language"], "rust");
+        assert_eq!(
+            held.unit(&rust).map(|unit| unit.0),
+            Some("rift://source/stdlib/rust@1.98.1/std/src/fs.rs".to_owned())
         );
         Ok(())
     }
