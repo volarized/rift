@@ -2,7 +2,9 @@
 
 pub use rift_core::FileDigest;
 use rift_core::ProjectPath;
-use rift_syntax::SyntaxDocument;
+use rift_syntax::{SyntaxDocument, SyntaxSymbol};
+
+use crate::EnclosingDefinitions;
 
 /// One immutable file enriched with syntax facts.
 ///
@@ -14,6 +16,8 @@ pub struct IndexedFile {
     digest: FileDigest,
     executable: bool,
     syntax: SyntaxDocument,
+    /// Each declaration's complete span, keyed by its position in `syntax`'s symbols.
+    declarations: EnclosingDefinitions<usize>,
 }
 
 impl IndexedFile {
@@ -26,12 +30,20 @@ impl IndexedFile {
         executable: bool,
         syntax: SyntaxDocument,
     ) -> Self {
+        let declarations = EnclosingDefinitions::new(
+            syntax
+                .symbols()
+                .iter()
+                .enumerate()
+                .map(|(position, symbol)| (symbol.range.start, symbol.range.end, position)),
+        );
         Self {
             path,
             source,
             digest,
             executable,
             syntax,
+            declarations,
         }
     }
 
@@ -68,5 +80,17 @@ impl IndexedFile {
     #[must_use]
     pub const fn syntax(&self) -> &SyntaxDocument {
         &self.syntax
+    }
+
+    /// The smallest declaration whose complete span, attached documentation and
+    /// attributes included, contains `start..end`, or `None` outside every declaration.
+    ///
+    /// The spans are sorted once when the file is indexed, so one lookup costs the
+    /// nesting depth at `start` rather than the file's declaration count.
+    #[must_use]
+    pub fn enclosing_symbol(&self, start: u64, end: u64) -> Option<&SyntaxSymbol> {
+        self.declarations
+            .resolve(start, end)
+            .and_then(|position| self.syntax.symbols().get(*position))
     }
 }

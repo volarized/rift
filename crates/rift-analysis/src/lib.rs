@@ -6,6 +6,7 @@ mod analyzer;
 pub mod archive;
 mod chunk;
 pub mod documentation;
+mod enclosing;
 #[cfg(feature = "collector")]
 mod glob;
 mod input;
@@ -25,6 +26,7 @@ pub use analyzer::{
     PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, StubForm, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
+pub use enclosing::EnclosingDefinitions;
 #[cfg(feature = "collector")]
 pub use glob::{
     ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
