@@ -1447,6 +1447,114 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     Ok(())
 }
 
+/// A global API advertising fewer entries than a read requests still answers it: every
+/// lockfile entry leaves first, then the requested entries sorted last, and
+/// `package_context_degraded` names the bound and the requested packages not reported. The
+/// read answers the requested package that stayed, and no global warning says the global
+/// API failed.
+#[tokio::test]
+async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entries() -> TestResult
+{
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        dependency_entries_max: 1,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let registry = "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let lockfile = format!(
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
+         [[package]]\nname = \"pkg-00000\"\nversion = \"1.0.0\"\n{registry}\n\
+         [[package]]\nname = \"pkg-00001\"\nversion = \"1.0.0\"\n{registry}"
+    );
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [
+            {"manager": "cargo", "name": "zlib", "version": "1.3.1"},
+            {"manager": "cargo", "name": "demo", "version": "1.0.0"}
+        ]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let sent = resolution_entries(&fixture).await;
+    assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
+    assert_eq!(
+        sent[0],
+        [json!({
+            "availability": "canonical",
+            "manager": "cargo",
+            "name": "demo",
+            "version": "1.0.0"
+        })],
+        "{sent:#?}"
+    );
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] == "package_context_degraded" && warning["resolver"] == "cargo"
+        })
+        .collect();
+    assert_eq!(
+        degraded,
+        [
+            &json!({
+                "code": "package_context_degraded",
+                "resolver": "cargo",
+                "reason": "2 of 2 packages were not reported: at most 1 are carried per read, \
+                           the requested packages first"
+            }),
+            &json!({
+                "code": "package_context_degraded",
+                "resolver": "cargo",
+                "reason": "1 of 2 requested packages were not reported: at most 1 are carried \
+                           per read, and every other package left first"
+            })
+        ],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// A workspace whose lockfile fills the dependency context to its bound still answers a
 /// read naming one more package: the requested package goes out, the context entry sorted
 /// last leaves with a `package_context_degraded` warning naming its package manager, and
