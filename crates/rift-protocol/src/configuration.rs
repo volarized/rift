@@ -1022,9 +1022,10 @@ impl ExecutionConfiguration {
 
 /// The `[search]` table. `ranking` weighs the ranking inputs against each
 /// other, `lexical` and `vector` bound the two indexed rankings, `text`
-/// bounds the lexical chunks derived from visible text files, and
+/// bounds the lexical chunks derived from visible text files,
 /// `pool_slots` and `busy_timeout` bound the shared `SQLite` connections
-/// behind search and logs.
+/// behind search and logs, and the `pattern_` keys bound one regex
+/// `pattern` search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -1047,6 +1048,22 @@ pub struct SearchConfiguration {
     /// another process before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
+    /// Most bytes the matcher one search `pattern` compiles to may take, 64kb to
+    /// 64mb. A pattern whose matcher compiles past it is refused naming this key.
+    pub pattern_compiled_size: ByteSize,
+    /// Most rows of the trigram index one `pattern` search reads to select the
+    /// files it verifies, 100 to 1000000, counted once per chunk of a large file.
+    /// A search whose selection passes it is refused naming this key.
+    #[schemars(range(min = 100, max = 1_000_000))]
+    pub pattern_candidate_rows: u64,
+    /// Most file text one `pattern` search verifies, 1mb to 64gb. A search that
+    /// would verify more is refused naming this key.
+    pub pattern_verified_size: ByteSize,
+    /// Most matches one file contributes to a `pattern` search, 1 to 100000. A
+    /// file past it is cut there, and the answer warns
+    /// `pattern_matches_truncated`.
+    #[schemars(range(min = 1, max = 100_000))]
+    pub pattern_matches_per_file: u64,
 }
 
 impl Default for SearchConfiguration {
@@ -1058,6 +1075,10 @@ impl Default for SearchConfiguration {
             vector: VectorSearchConfiguration::default(),
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
+            pattern_compiled_size: ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_DEFAULT),
+            pattern_candidate_rows: SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT,
+            pattern_verified_size: ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT),
+            pattern_matches_per_file: SEARCH_PATTERN_MATCHES_PER_FILE_DEFAULT,
         }
     }
 }
@@ -1086,6 +1107,30 @@ impl SearchConfiguration {
                         SEARCH_BUSY_TIMEOUT_MS_MIN,
                         SEARCH_BUSY_TIMEOUT_MS_MAX,
                     ),
+                    (
+                        "search.pattern_compiled_size",
+                        self.pattern_compiled_size.bytes(),
+                        SEARCH_PATTERN_COMPILED_BYTES_MIN,
+                        SEARCH_PATTERN_COMPILED_BYTES_MAX,
+                    ),
+                    (
+                        "search.pattern_candidate_rows",
+                        self.pattern_candidate_rows,
+                        SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                        SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+                    ),
+                    (
+                        "search.pattern_verified_size",
+                        self.pattern_verified_size.bytes(),
+                        SEARCH_PATTERN_VERIFIED_BYTES_MIN,
+                        SEARCH_PATTERN_VERIFIED_BYTES_MAX,
+                    ),
+                    (
+                        "search.pattern_matches_per_file",
+                        self.pattern_matches_per_file,
+                        SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                        SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+                    ),
                 ])
             })
     }
@@ -1103,6 +1148,33 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+/// Bytes `search.pattern_compiled_size` may hold, at least: room for a pattern of a few
+/// Unicode word classes, the largest the text-search evaluation compiled at 51,116 bytes.
+pub const SEARCH_PATTERN_COMPILED_BYTES_MIN: u64 = 64 << 10;
+/// Bytes `search.pattern_compiled_size` may hold, at most.
+pub const SEARCH_PATTERN_COMPILED_BYTES_MAX: u64 = 64 << 20;
+/// Bytes `search.pattern_compiled_size` holds when the key is absent: a tenth of the
+/// `regex` crate's own 10 MiB default.
+const SEARCH_PATTERN_COMPILED_BYTES_DEFAULT: u64 = 1 << 20;
+/// Rows `search.pattern_candidate_rows` may hold, at least.
+pub const SEARCH_PATTERN_CANDIDATE_ROWS_MIN: u64 = 100;
+/// Rows `search.pattern_candidate_rows` may hold, at most.
+pub const SEARCH_PATTERN_CANDIDATE_ROWS_MAX: u64 = 1_000_000;
+/// Rows `search.pattern_candidate_rows` holds when the key is absent.
+const SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT: u64 = 10_000;
+/// Bytes `search.pattern_verified_size` may hold, at least.
+pub const SEARCH_PATTERN_VERIFIED_BYTES_MIN: u64 = 1 << 20;
+/// Bytes `search.pattern_verified_size` may hold, at most: the most text `[source]
+/// workspace_size` lets a workspace hold.
+pub const SEARCH_PATTERN_VERIFIED_BYTES_MAX: u64 = crate::source::SOURCE_WORKSPACE_BYTES_MAX;
+/// Bytes `search.pattern_verified_size` holds when the key is absent.
+const SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT: u64 = 128 << 20;
+/// Matches `search.pattern_matches_per_file` may hold, at least.
+pub const SEARCH_PATTERN_MATCHES_PER_FILE_MIN: u64 = 1;
+/// Matches `search.pattern_matches_per_file` may hold, at most.
+pub const SEARCH_PATTERN_MATCHES_PER_FILE_MAX: u64 = 100_000;
+/// Matches `search.pattern_matches_per_file` holds when the key is absent.
+const SEARCH_PATTERN_MATCHES_PER_FILE_DEFAULT: u64 = 1_000;
 
 /// `search.ranking.fusion_k` accepted, at least.
 pub const SEARCH_FUSION_K_MIN: u64 = 1;
@@ -4577,6 +4649,128 @@ mod tests {
             configuration.search.lexical.transaction_size = ByteSize::from_bytes(bytes);
             assert_eq!(configuration.validate(), Ok(()));
         }
+    }
+
+    /// Sets one `[search]` pattern key to a value in its base unit.
+    type PatternSetter = fn(&mut SearchConfiguration, u64);
+
+    #[test]
+    fn test_search_pattern_bounds_refuse_past_their_ranges_naming_the_key() {
+        let cases: [(&str, PatternSetter, [u64; 2]); 4] = [
+            (
+                "search.pattern_compiled_size",
+                |search, value| search.pattern_compiled_size = ByteSize::from_bytes(value),
+                [
+                    SEARCH_PATTERN_COMPILED_BYTES_MIN,
+                    SEARCH_PATTERN_COMPILED_BYTES_MAX,
+                ],
+            ),
+            (
+                "search.pattern_candidate_rows",
+                |search, value| search.pattern_candidate_rows = value,
+                [
+                    SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                    SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+                ],
+            ),
+            (
+                "search.pattern_verified_size",
+                |search, value| search.pattern_verified_size = ByteSize::from_bytes(value),
+                [
+                    SEARCH_PATTERN_VERIFIED_BYTES_MIN,
+                    SEARCH_PATTERN_VERIFIED_BYTES_MAX,
+                ],
+            ),
+            (
+                "search.pattern_matches_per_file",
+                |search, value| search.pattern_matches_per_file = value,
+                [
+                    SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                    SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+                ],
+            ),
+        ];
+        for (field, set, [min, max]) in cases {
+            for accepted in [min, max] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, accepted);
+                assert_eq!(configuration.validate(), Ok(()), "{field} {accepted}");
+            }
+            for refused in [min - 1, max + 1] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, refused);
+                assert!(
+                    matches!(
+                        configuration.validate(),
+                        Err(ConfigurationViolation::LimitOutOfRange { field: named, .. })
+                            if named == field
+                    ),
+                    "{field} {refused} must be refused naming the key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_pattern_bounds_default_and_advertise_their_ranges() {
+        let search = SearchConfiguration::default();
+        assert_eq!(search.pattern_compiled_size, ByteSize::from_bytes(1 << 20));
+        assert_eq!(search.pattern_candidate_rows, 10_000);
+        assert_eq!(
+            search.pattern_verified_size,
+            ByteSize::from_bytes(128 << 20)
+        );
+        assert_eq!(search.pattern_matches_per_file, 1_000);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["SearchConfiguration"]["properties"];
+        assert_eq!(
+            table["pattern_compiled_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MAX),
+            })
+        );
+        assert_eq!(
+            table["pattern_verified_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MAX),
+            })
+        );
+        for (key, min, max) in [
+            (
+                "pattern_candidate_rows",
+                SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+            ),
+            (
+                "pattern_matches_per_file",
+                SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+            ),
+        ] {
+            assert_eq!(table[key]["minimum"], json!(min), "{key}");
+            assert_eq!(table[key]["maximum"], json!(max), "{key}");
+        }
+        let written = json!({ "search": {
+            "pattern_compiled_size": "2mb",
+            "pattern_candidate_rows": 500,
+            "pattern_verified_size": "1gb",
+            "pattern_matches_per_file": 20,
+        } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the pattern keys deserialize");
+        assert_eq!(
+            configuration.search.pattern_compiled_size,
+            ByteSize::from_bytes(2 << 20)
+        );
+        assert_eq!(configuration.search.pattern_candidate_rows, 500);
+        assert_eq!(
+            configuration.search.pattern_verified_size,
+            ByteSize::from_bytes(1 << 30)
+        );
+        assert_eq!(configuration.search.pattern_matches_per_file, 20);
     }
 
     #[test]

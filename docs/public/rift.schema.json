@@ -900,7 +900,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files, and\n`pool_slots` and `busy_timeout` bound the shared `SQLite` connections\nbehind search and logs.",
+      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files,\n`pool_slots` and `busy_timeout` bound the shared `SQLite` connections\nbehind search and logs, and the `pattern_` keys bound one regex\n`pattern` search.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -920,6 +920,40 @@
             "units_max": 1000000
           },
           "description": "How many units the lexical index holds."
+        },
+        "pattern_candidate_rows": {
+          "default": 10000,
+          "description": "Most rows of the trigram index one `pattern` search reads to select the\nfiles it verifies, 100 to 1000000, counted once per chunk of a large file.\nA search whose selection passes it is refused naming this key.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "pattern_compiled_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Most bytes the matcher one search `pattern` compiles to may take, 64kb to\n64mb. A pattern whose matcher compiles past it is refused naming this key.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "64kb"
+          }
+        },
+        "pattern_matches_per_file": {
+          "default": 1000,
+          "description": "Most matches one file contributes to a `pattern` search, 1 to 100000. A\nfile past it is cut there, and the answer warns\n`pattern_matches_truncated`.",
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pattern_verified_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "128mb",
+          "description": "Most file text one `pattern` search verifies, 1mb to 64gb. A search that\nwould verify more is refused naming this key.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1mb"
+          }
         },
         "pool_slots": {
           "default": 4,
@@ -1360,6 +1394,10 @@
           "transaction_units": 5000,
           "units_max": 1000000
         },
+        "pattern_candidate_rows": 10000,
+        "pattern_compiled_size": "1mb",
+        "pattern_matches_per_file": 1000,
+        "pattern_verified_size": "128mb",
         "pool_slots": 4,
         "ranking": {
           "fusion_k": 60,

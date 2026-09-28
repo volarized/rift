@@ -62,10 +62,10 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 pub use crate::search::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, GraphHop, HopDirection, MatchedField, PathPattern,
     PathPatternViolation, PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT,
-    SEARCH_CHANGE_PATHS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
-    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchTraversal, SymbolChange, TraversalDirection,
+    SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_BYTES_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
+    SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
+    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchTraversal, SymbolChange, TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -1002,6 +1002,17 @@ pub enum ReadWarning {
         /// The bound the read stopped at: the server's limit on both the candidates one
         /// read ranks and the hits it returns.
         results_max: u64,
+    },
+    /// A file held more matches of `pattern` than `matches_per_file`, so its later matches
+    /// are missing from this answer while every other file answers in full. `files` names
+    /// the cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow
+    /// `pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.
+    PatternMatchesTruncated {
+        /// Matches one file contributes at most: the server's bound on one file's matches.
+        matches_per_file: u64,
+        /// The files cut at the bound.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
     },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
@@ -1983,7 +1994,8 @@ mod tests {
         Digest, Duration, FileId, GetSymbolParams, GlobalFailureClass, GlobalPageWarningCode,
         IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
         PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
-        RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
+        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
+        SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2581,6 +2593,36 @@ mod tests {
     }
 
     #[test]
+    fn the_pattern_matches_truncation_warning_round_trips_and_bounds_its_files() {
+        let warning = ReadWarning::PatternMatchesTruncated {
+            matches_per_file: 1_000,
+            files: vec![FileId("rift://file/src%2Fmany.rs".to_owned())],
+        };
+        let wire = json!({
+            "code": "pattern_matches_truncated",
+            "matches_per_file": 1_000,
+            "files": ["rift://file/src%2Fmany.rs"],
+        });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let arm = schema["oneOf"]
+            .as_array()
+            .and_then(|arms| {
+                arms.iter().find(|arm| {
+                    arm["properties"]["code"]["const"] == json!("pattern_matches_truncated")
+                })
+            })
+            .expect("the schema advertises the match-bound warning");
+        assert_eq!(
+            arm["properties"]["files"]["maxItems"],
+            json!(SOURCE_WARNINGS_MAX),
+            "the advertised bound is the one the server cuts at"
+        );
+    }
+
+    #[test]
     fn the_results_truncation_warning_round_trips_under_its_code_tag() {
         let warning = ReadWarning::ResultsTruncated { results_max: 1_000 };
         let wire = json!({ "code": "results_truncated", "results_max": 1_000 });
@@ -2605,6 +2647,7 @@ mod tests {
             "query_narrowed",
             "lexical_ranking_truncated",
             "results_truncated",
+            "pattern_matches_truncated",
             "source_unavailable",
             "symbol_disagreement",
             "global_access_disabled",

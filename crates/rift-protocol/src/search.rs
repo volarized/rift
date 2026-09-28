@@ -268,6 +268,10 @@ pub enum SearchHitTarget {
     },
 }
 
+/// Most bytes one search `pattern` may hold; the server refuses a longer one naming the
+/// field.
+pub const SEARCH_PATTERN_BYTES_MAX: usize = 1_024;
+
 /// The field path the server names when a comparison's base revision spelling breaks the
 /// contract [`RevisionId`] advertises.
 pub const CHANGE_BASE_FIELD: &str = "change.base";
@@ -340,8 +344,8 @@ pub enum SearchInclude {
 }
 
 /// Criteria for one search. The caller supplies a lexical `query`, a relationship
-/// `traversal`, or both, or a `change` comparing two committed revisions; `paths` narrows
-/// the files eligible for any of them.
+/// `traversal`, or both, a regex `pattern`, or a `change` comparing two committed
+/// revisions; `paths` narrows the files eligible for any of them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::require_search_selector)]
@@ -390,6 +394,19 @@ pub enum SearchInclude {
         "limit": 10
     },
     {
+        "target": "file",
+        "pattern": "fn\\s+load_\\w+\\(",
+        "paths": {
+            "include": [
+                "src/**"
+            ]
+        },
+        "include": [
+            "source"
+        ],
+        "limit": 25
+    },
+    {
         "target": "symbol",
         "query": "spawn_blocking",
         "scope": "all",
@@ -429,6 +446,20 @@ pub struct SearchParams {
     /// server-defined and comparable within one answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    /// A regex matched against the text of every indexed file, in the syntax of the Rust
+    /// `regex` crate that ripgrep reads. Matching runs line by line: `^` and `$` match at
+    /// line boundaries, a `\r` before a line feed belongs to its line, and no class matches
+    /// a line feed, so only a literal `\n` crosses a line; `(?i)` makes the match
+    /// case-insensitive. Every match becomes one file hit whose `range` is the match's
+    /// bytes, and every declaration holding a match one symbol hit at its first match;
+    /// each hit is tagged `content` and carries no score, and `relevance` orders the hits
+    /// by path, then offset. The server refuses `pattern` beside `query`, `traversal`,
+    /// `change`, and `rev`, with a `scope` past `local`, and with `target:
+    /// "documentation"`, and it refuses a pattern whose compiled size, candidate rows, or
+    /// verified bytes pass the `[search]` bounds, naming the bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = SEARCH_PATTERN_BYTES_MAX))]
+    pub pattern: Option<String>,
     /// Which declarations `query` searches: the project tree, the public declarations of
     /// the dependency packages, or both. Omitted, `local`. A package contributes symbol
     /// hits alone. The server refuses a scope beyond `local` together with `rev`, since
@@ -722,9 +753,9 @@ pub enum TraversalDirection {
 mod tests {
     use super::{
         PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern, PathPatternViolation,
-        SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-        SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
-        SearchParams, SearchScope, SearchTraversal, TraversalDirection,
+        SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_PATTERN_BYTES_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
+        SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
+        SearchChange, SearchHit, SearchParams, SearchScope, SearchTraversal, TraversalDirection,
     };
     use serde_json::json;
 
@@ -901,9 +932,9 @@ mod tests {
     }
 
     /// The schema states the same rule the server enforces: a request selects its
-    /// result set with `query`, `traversal`, or `change`.
+    /// result set with `query`, `pattern`, `traversal`, or `change`.
     #[test]
-    fn search_params_schema_states_the_three_result_set_selectors() {
+    fn search_params_schema_states_the_four_result_set_selectors() {
         let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
         let selector = schema["allOf"]
             .as_array()
@@ -915,7 +946,25 @@ mod tests {
             .iter()
             .filter_map(|clause| clause["required"][0].as_str())
             .collect();
-        assert_eq!(required, ["query", "traversal", "change"], "{schema:#}");
+        assert_eq!(
+            required,
+            ["query", "pattern", "traversal", "change"],
+            "{schema:#}"
+        );
+    }
+
+    /// The schema's `maxLength` on `pattern` and the server's refusal both read
+    /// `SEARCH_PATTERN_BYTES_MAX`; this pins the advertised bound to that constant.
+    #[test]
+    fn search_params_schema_pattern_length_equals_the_enforced_constant() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+        let pattern = &schema["properties"]["pattern"];
+        assert_eq!(pattern["maxLength"], json!(SEARCH_PATTERN_BYTES_MAX));
+        assert_eq!(pattern["minLength"], json!(1));
+        let request: SearchParams =
+            serde_json::from_value(json!({ "pattern": "TODO|FIXME" })).expect("a pattern parses");
+        assert_eq!(request.pattern.as_deref(), Some("TODO|FIXME"));
+        assert_eq!(request.query, None);
     }
 
     /// The schema states the same rule the server enforces: a walk names `seed` when it
