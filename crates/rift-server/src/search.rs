@@ -3363,6 +3363,20 @@ impl Tower {
         Ok(())
     }
 
+    /// The check an engine-backed search runs before any engine starts refuses an invalid
+    /// `force_include` glob the way the search itself does.
+    #[test]
+    fn engine_search_validation_refuses_an_invalid_force_include_glob() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let request = json!({"query": "Beacon", "paths": {"force_include": ["["]}});
+        let params: SearchParams = serde_json::from_value(request)?;
+        let error = service
+            .validate_engine_search(&params)
+            .expect_err("an invalid force_include glob must refuse");
+        assert!(matches!(error.fault(), ReadFault::Index(_)), "{error}");
+        Ok(())
+    }
+
     /// One committed source file, then uncommitted drift, so a revision
     /// search and a working-tree search answer differently.
     fn committed_fixture() -> TestResult<(TempDir, ReadService)> {
