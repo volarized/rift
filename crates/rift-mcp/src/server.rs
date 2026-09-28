@@ -2131,7 +2131,10 @@ impl RiftMcp {
     /// which files are read: a pattern the read path refuses, one with no prefilter, a
     /// store that could not open, and a store that does not hold the captured tree all
     /// leave the read path to verify every held file, and the answer is complete either
-    /// way. Nothing waits for a lexical commit in flight, and nothing is warned.
+    /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
+    /// batches: the rows the trigram index lacks ride the selection, and the read path
+    /// verifies them, or answers from the rows the index holds and warns
+    /// `pattern_index_preparing`.
     async fn pattern_ranking(
         &self,
         params: &SearchParams,
@@ -5357,16 +5360,7 @@ mod tests {
 
         double.release_one();
         search_after_population(&server, "beacon").await?;
-        let published = current_publication(&server).await;
-        let budget = server.readiness_timeout().await;
-        let ranking = server
-            .ranking(&params, &published, RequestDeadline::starting(budget))
-            .await?
-            .ok_or("a pattern always ranks")?;
-        let candidates = ranking
-            .answer
-            .pattern_candidates()
-            .ok_or("the trigram index answered the prefilter")?;
+        let candidates = trigram_candidates_after_population(&server, &params).await?;
         assert_eq!(
             candidates.candidates().len(),
             1,
@@ -5374,6 +5368,213 @@ mod tests {
         );
         let after = server.search(Parameters(params)).await?.0;
         assert_eq!(located(&after), expected);
+        Ok(())
+    }
+
+    /// Polls `params`' trigram selection until the lexical lane's trigram batches have
+    /// indexed every row the store holds.
+    async fn trigram_candidates_after_population(
+        server: &RiftMcp,
+        params: &SearchParams,
+    ) -> TestResult<rift_index::PatternCandidates> {
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            let published = current_publication(server).await;
+            let budget = server.readiness_timeout().await;
+            let ranking = server
+                .ranking(params, &published, RequestDeadline::starting(budget))
+                .await?
+                .ok_or("a pattern always ranks")?;
+            let candidates = ranking
+                .answer
+                .pattern_candidates()
+                .ok_or("the store answered the prefilter")?;
+            if candidates.unindexed().is_none() {
+                return Ok(candidates.clone());
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+        }
+        Err("the lexical lane never caught the trigram index up".into())
+    }
+
+    /// Notes past a candidate bound of 100 rows, each a text file of one row.
+    const TRIGRAM_FIXTURE_NOTES: usize = 150;
+
+    /// A server over `lib.rs` and [`TRIGRAM_FIXTURE_NOTES`] text notes whose lexical lane
+    /// runs over a [`StoreDouble`] holding every trigram batch after the first write, with
+    /// `configuration` in `rift.toml`. Returns once that write has landed.
+    async fn server_with_trigrams_held(
+        root: &std::path::Path,
+        configuration: &str,
+    ) -> TestResult<(RiftMcp, Arc<StoreDouble>)> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        for note in 0..TRIGRAM_FIXTURE_NOTES {
+            fs::write(
+                root.join(format!("note_{note:03}.txt")),
+                format!("harbor note {note}\n"),
+            )?;
+        }
+        super::hermetic_workspace(root, configuration)?;
+        let double = StoreDouble::new();
+        double.hold_trigrams_after_writes(1);
+        let gate = Arc::clone(&double);
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(root)?,
+            WorkspaceIndexLimits::default(),
+            None,
+            move |index, blocking, cancellation, executable_digest| {
+                gate.attach(index);
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    executable_digest,
+                )
+            },
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        Ok((server, double))
+    }
+
+    /// Each hit of a pattern answer as its path and byte range.
+    fn pattern_hits(answer: &SearchResult) -> Vec<(Option<String>, Option<(u64, u64)>)> {
+        answer
+            .results
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.as_ref().map(|path| path.0.clone()),
+                    hit.range.as_ref().map(|range| (range.start, range.end)),
+                )
+            })
+            .collect()
+    }
+
+    /// The answer a scan of every file `server`'s publication holds gives `params`.
+    async fn scanned(server: &RiftMcp, params: &SearchParams) -> TestResult<SearchResult> {
+        let published = current_publication(server).await;
+        Ok(published
+            .reads
+            .search(params, &StoreAnswer::identifier_only())?)
+    }
+
+    /// Rows the trigram index lacks are verified beside the ones it selects while they fit
+    /// the `[search]` bounds, so a search right after a write, with every trigram batch
+    /// held, answers at once and in full, warning nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_verifies_the_rows_the_trigram_index_lacks_while_they_fit()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double) = server_with_trigrams_held(directory.path(), "").await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
+        let answer =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params.clone())))
+                .await
+                .map_err(|_| "a pattern search never waits for the trigram index")??
+                .0;
+        assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
+        assert_eq!(pattern_hits(&answer).len(), 10, "notes 10 to 19");
+        assert_eq!(
+            pattern_hits(&answer),
+            pattern_hits(&scanned(&server, &params).await?)
+        );
+
+        let published = current_publication(&server).await;
+        let budget = server.readiness_timeout().await;
+        let ranking = server
+            .ranking(&params, &published, RequestDeadline::starting(budget))
+            .await?
+            .ok_or("a pattern always ranks")?;
+        let unindexed = ranking
+            .answer
+            .pattern_candidates()
+            .and_then(rift_index::PatternCandidates::unindexed)
+            .ok_or("every batch after the write is held, so rows still lack trigrams")?;
+        assert_eq!(unindexed.prepared(), 0);
+        assert!(
+            unindexed.completed().is_some(),
+            "the lacking rows fit the default bounds"
+        );
+        Ok(())
+    }
+
+    /// Past `pattern_candidate_rows`, a search while every trigram batch is held answers at
+    /// once from the rows the index holds, and carries `pattern_index_preparing` counting
+    /// them; the answer validates against the served `search` output schema. Once the
+    /// batches land, the warning goes and the answer equals a scan of every held file.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_past_the_bounds_warns_until_the_trigram_index_catches_up()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) =
+            server_with_trigrams_held(directory.path(), "[search]\npattern_candidate_rows = 100\n")
+                .await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
+        let held =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params.clone())))
+                .await
+                .map_err(|_| "a pattern search never waits for the trigram index")??
+                .0;
+        let preparing: Vec<(u64, u64)> = held
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::PatternIndexPreparing {
+                    prepared, total, ..
+                } => Some((*prepared, *total)),
+                _ => None,
+            })
+            .collect();
+        let [(prepared, total)] = preparing.as_slice() else {
+            return Err(format!("one preparation warning: {:?}", held.warnings).into());
+        };
+        assert_eq!(*prepared, 0, "the held batches indexed no row");
+        assert!(*total > 100, "every note and lib.rs store a row: {total}");
+        assert!(
+            held.results.is_empty(),
+            "the index holds no row to verify: {:?}",
+            held.results
+        );
+        let tools = RiftMcp::tool_router().list_all();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search")
+            .ok_or("search is served")?;
+        let schema = serde_json::Value::Object(
+            search
+                .output_schema
+                .as_deref()
+                .ok_or("search declares an output schema")?
+                .clone(),
+        );
+        let validator = jsonschema::validator_for(&schema)?;
+        let instance = serde_json::to_value(&held)?;
+        let failures: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|failure| failure.to_string())
+            .collect();
+        assert!(failures.is_empty(), "{failures:#?}\n{instance:#}");
+
+        double.release_trigrams();
+        let mut settled = server.search(Parameters(params.clone())).await?.0;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if settled.warnings.is_empty() {
+                break;
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+            settled = server.search(Parameters(params.clone())).await?.0;
+        }
+        assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
+        assert_eq!(pattern_hits(&settled).len(), 10, "notes 10 to 19");
+        assert_eq!(
+            pattern_hits(&settled),
+            pattern_hits(&scanned(&server, &params).await?)
+        );
         Ok(())
     }
 
