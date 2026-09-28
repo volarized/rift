@@ -429,11 +429,10 @@ fn walk_unsettled_warning(language: Language, attempts: u64) -> ReadWarning {
 fn callees_dropped_warning(callees: u64) -> ReadWarning {
     ReadWarning::CalleesDropped {
         callees,
-        detail: format!(
-            "the language engine named {callees} callees in standard library or package \
-             files, which the local index does not analyze, so the walk carries no edge to \
-             them and does not continue past them"
-        ),
+        detail: "the language engine named callees in standard library or package files, \
+                 which the local index does not analyze, so the walk carries no edge to them \
+                 and does not continue past them"
+            .to_owned(),
     }
 }
 

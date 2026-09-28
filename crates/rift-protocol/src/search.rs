@@ -389,6 +389,17 @@ pub enum SearchInclude {
     },
     {
         "target": "symbol",
+        "traversal": {
+            "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees",
+            "direction": "outgoing",
+            "facets": [
+                "calls"
+            ]
+        },
+        "limit": 25
+    },
+    {
+        "target": "symbol",
         "query": "spawn_blocking",
         "scope": "global",
         "limit": 10
@@ -715,7 +726,8 @@ pub struct SearchTraversal {
     /// The declaration the walk starts at. The seed itself is never a hit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<SymbolId>,
-    /// Which edges the walk follows from each visited symbol. Omitted, `incoming`.
+    /// Which edges the walk follows from each visited symbol: `incoming` reaches the
+    /// declarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`.
     #[serde(default = "default_search_traversal_direction")]
     pub direction: TraversalDirection,
     /// Portable relationship facets eligible for the walk. Omitted or empty, every facet is
@@ -742,17 +754,20 @@ fn default_search_traversal_depth() -> u64 {
     SEARCH_TRAVERSAL_DEPTH_DEFAULT
 }
 
-/// Which edge direction a search traversal walks from each visited symbol.
+/// Which edge direction a search traversal walks from each visited symbol. A language
+/// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
+/// `outgoing`.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TraversalDirection {
-    /// Walks edges arriving at each visited symbol.
+    /// Walks edges arriving at each visited symbol: the references a language engine
+    /// resolves to it, each hop carrying the `references` facet.
     #[default]
     Incoming,
     /// Walks edges leaving each visited symbol: the calls a language engine's call
-    /// hierarchy names for it.
+    /// hierarchy names for it, each hop carrying the `calls` facet.
     Outgoing,
 }
 

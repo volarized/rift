@@ -1699,18 +1699,19 @@ impl RiftMcp {
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol. `pattern` matches a regex
-    /// against the text of every indexed file, line by line as ripgrep reads it, and answers
-    /// each match and each declaration holding one, in place of `query` and `traversal`.
-    /// `change` answers the declarations two committed revisions hold differently, in place
-    /// of `query` and `traversal`. `rev` searches a version-control revision instead of the
-    /// current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
-    /// reaches past the project tree: `global` answers `query` from the public declarations
-    /// the global index holds for the workspace's dependencies alone and `pattern` from their
-    /// source, `all` from both, ordered together. `packages` names package versions `query`
-    /// and `pattern` search beside the workspace's own, such as an upgrade target or a
-    /// package the project does not use yet. Use `get_symbol` when the declaration name is
-    /// known.
+    /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
+    /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
+    /// regex against the text of every indexed file, line by line as ripgrep reads it, and
+    /// answers each match and each declaration holding one, in place of `query` and
+    /// `traversal`. `change` answers the declarations two committed revisions hold
+    /// differently, in place of `query` and `traversal`. `rev` searches a version-control
+    /// revision instead of the current tree, and never combines with `pattern`, `traversal`,
+    /// or `change`. `scope` reaches past the project tree: `global` answers `query` from the
+    /// public declarations the global index holds for the workspace's dependencies alone and
+    /// `pattern` from their source, `all` from both, ordered together. `packages` names
+    /// package versions `query` and `pattern` search beside the workspace's own, such as an
+    /// upgrade target or a package the project does not use yet. Use `get_symbol` when the
+    /// declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
