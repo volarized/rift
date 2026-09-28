@@ -130,6 +130,20 @@ file, then waits until the published index counter matches its observation. That
 read the tree, so a read that finds the index behind names the files that moved rather than
 asking for a whole rebuild.
 
+<VersionBadge version="v0.0.46" />
+
+The capture records each file's stat beside its digests: the length and modification time, and
+on unix the status change time, inode, and mode. The next capture reads and hashes only the files
+whose stat moved and keeps the recorded digests of the rest, so a read over an unchanged tree
+reads no file. The record holds the last capture's paths alone and is reused only under the same
+index limits.
+
+Restoring a modification time (`touch -r`, `cp -p`, `rsync -t`) moves the status change time,
+so such a rewrite is read again. One miss stays: a rewrite to bytes of the same length inside
+the same timestamp tick keeps its old digest until the file's stat moves again. APFS and ext4
+stamp nanoseconds, which makes that tick too short to matter; the 1 s or 2 s ticks of HFS+, FAT,
+and some network mounts widen it.
+
 A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
 it answers from the published index and carries `stale_index`, whose `detail` names the counter
 the failed rebuild answered for, the counter the tree is at, and the failure's causes. The next observation retries the rebuild.
@@ -206,7 +220,10 @@ transaction: the ones already committed recorded their files' digests with their
 start's comparison writes only the files the stopped write did not reach.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
-snapshots. `search.busy_timeout` bounds a lock wait caused by another process.
+snapshots. `search.busy_timeout` bounds a lock wait caused by another process. Every checkout
+sets its pragmas again, `mmap_size` among them, from
+[`[search.lexical]`](/docs/developer/configuration#search) `mmap_size`, so a pooled connection
+reads the store file through the memory map that key sets.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.
