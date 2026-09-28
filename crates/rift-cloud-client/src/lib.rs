@@ -2090,10 +2090,7 @@ fn validate_search_match_class(
     hit: &PackageSearchHit,
     qualified_name: &str,
 ) -> Result<(), ClientError> {
-    let claimed = match hit.match_class {
-        IdentifierMatchClass::Unknown => None,
-        ref class => Some(ranking_match_class(class)?),
-    };
+    let claimed = search_match_class(&hit.match_class)?;
     if claimed.is_some() && request.identifiers.is_empty() {
         return Ok(());
     }
@@ -2131,6 +2128,18 @@ fn validate_symbol_match_class(
         });
     }
     Ok(())
+}
+
+/// The identifier match class one search hit claims: `None` for `unknown`, which a hit
+/// matching none of the requested identifiers reports, such as a declaration matched by
+/// its body alone.
+fn search_match_class(
+    value: &IdentifierMatchClass,
+) -> Result<Option<rift_ranking::IdentifierMatchClass>, ClientError> {
+    match value {
+        IdentifierMatchClass::Unknown => Ok(None),
+        class => ranking_match_class(class).map(Some),
+    }
 }
 
 fn ranking_match_class(

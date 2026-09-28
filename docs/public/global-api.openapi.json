@@ -2801,7 +2801,7 @@
             "maximum": 9007199254740991
           },
           "contributing_fields": {
-            "description": "Fields that contributed to ranking.",
+            "description": "Fields that contributed to ranking. `file_content` names a match inside the declaration, which the file's text holds.",
             "items": {
               "type": "string",
               "enum": [
@@ -2809,6 +2809,7 @@
                 "qualified_name",
                 "documentation",
                 "signature",
+                "file_content",
                 "unknown"
               ]
             },

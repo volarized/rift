@@ -1061,7 +1061,7 @@ pub struct PackageSearchHit {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// Fields that contributed to ranking.
+    /// Fields that contributed to ranking. `file_content` names a match inside the declaration, which the file's text holds.
     pub contributing_fields: Vec<PackageSearchHitContributingField>,
     /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
@@ -2909,6 +2909,7 @@ pub enum PackageSearchHitContributingField {
     QualifiedName,
     Documentation,
     Signature,
+    FileContent,
     Unknown,
 }
 impl core::fmt::Display for PackageSearchHitContributingField {
@@ -2918,6 +2919,7 @@ impl core::fmt::Display for PackageSearchHitContributingField {
             Self::QualifiedName => write!(f, "qualified_name"),
             Self::Documentation => write!(f, "documentation"),
             Self::Signature => write!(f, "signature"),
+            Self::FileContent => write!(f, "file_content"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -2933,6 +2935,7 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
             "qualified_name" => Ok(PackageSearchHitContributingField::QualifiedName),
             "documentation" => Ok(PackageSearchHitContributingField::Documentation),
             "signature" => Ok(PackageSearchHitContributingField::Signature),
+            "file_content" => Ok(PackageSearchHitContributingField::FileContent),
             "unknown" => Ok(PackageSearchHitContributingField::Unknown),
             _ => Ok(PackageSearchHitContributingField::Unknown),
         }

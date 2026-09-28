@@ -21,7 +21,8 @@ pub struct PackageSearchCandidate {
     pub identity: rift_ranking::DocumentIdentity,
     /// Search hit carrying declaration.
     pub hit: rift_protocol::read::SearchHit,
-    /// Identifier match class established by global index.
+    /// Identifier match class established by global index. Absent for a documentation
+    /// block, and for a declaration matching none of the requested identifiers.
     pub match_class: Option<rift_ranking::IdentifierMatchClass>,
 }
 
@@ -156,7 +157,7 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
         let symbol = convert_symbol(&value.symbol)?;
         let identity = rift_ranking::DocumentIdentity::for_unit(&unit, &qualified_name)
             .map_err(|_| invalid("symbol_identity"))?;
-        let match_class = crate::ranking_match_class(&value.match_class)?;
+        let match_class = crate::search_match_class(&value.match_class)?;
         let hit = rift_protocol::read::SearchHit {
             hit: rift_protocol::read::SearchHitTarget::Symbol {
                 symbol: Box::new(symbol),
@@ -176,7 +177,7 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
             package,
             identity,
             hit,
-            match_class: Some(match_class),
+            match_class,
         })
     }
 }
@@ -673,6 +674,9 @@ fn matched_fields(
             }
             PackageSearchHitContributingField::Signature => {
                 rift_protocol::read::MatchedField::Signature
+            }
+            PackageSearchHitContributingField::FileContent => {
+                rift_protocol::read::MatchedField::Content
             }
             PackageSearchHitContributingField::Unknown => rift_protocol::read::MatchedField::Ranked,
         };
@@ -1249,6 +1253,30 @@ mod tests {
             candidate.hit.hit,
             rift_protocol::read::SearchHitTarget::Symbol { .. }
         ));
+    }
+
+    /// A declaration matched inside its body reports `file_content` and the `unknown`
+    /// match class: it answers as a content match claiming no identifier class.
+    #[test]
+    fn search_candidate_maps_a_body_match_to_content() {
+        let package = package();
+        let hit = PackageSearchHit {
+            package: package.clone(),
+            symbol: symbol(&package),
+            unit: unit(),
+            range: TextRange { start: 8, end: 24 },
+            line: 3,
+            contributing_fields: vec![PackageSearchHitContributingField::FileContent],
+            match_class: crate::generated::IdentifierMatchClass::Unknown,
+            source: None,
+            additional_properties: HashMap::new(),
+        };
+        let candidate = PackageSearchCandidate::try_from(hit).expect("valid body match");
+        assert_eq!(
+            candidate.hit.matched_by,
+            [rift_protocol::read::MatchedField::Content]
+        );
+        assert_eq!(candidate.match_class, None);
     }
 
     #[test]
