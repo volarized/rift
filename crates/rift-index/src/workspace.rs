@@ -50,11 +50,11 @@ use sha2::{Digest as _, Sha256};
 use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::documentation::NotebookFiles;
-use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::LimitBreach;
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemanticError, WorkspaceSemantics};
+use rift_analysis::{ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError};
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -475,6 +475,20 @@ pub(crate) fn index_error_over_limit(
     })
 }
 
+/// A refusal from a layer below the index, classified as the index failure it reports.
+pub trait IndexFailure {
+    /// This refusal as the [`WorkspaceIndexError`] a build or a read reports, the
+    /// refusal kept as its cause.
+    fn index_error(self) -> WorkspaceIndexError;
+}
+
+impl IndexFailure for SourcePatternError {
+    /// A `[source]` or `paths` glob that does not compile: `source_pattern_invalid`.
+    fn index_error(self) -> WorkspaceIndexError {
+        index_error_caused_by(WorkspaceIndexViolation::SourcePatternInvalid, None, self)
+    }
+}
+
 pub(crate) fn index_error_caused_by(
     violation: WorkspaceIndexViolation,
     path: Option<&Path>,
@@ -739,7 +753,8 @@ impl WorkspaceSourcePolicy {
             visibility.include(),
             visibility.exclude(),
             visibility.force_include(),
-        )?;
+        )
+        .map_err(IndexFailure::index_error)?;
         let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
@@ -2091,7 +2106,8 @@ impl WorkspaceIndex {
         if force_include.is_empty() {
             return Ok(Vec::new());
         }
-        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let matcher = PathMatcher::build(&self.root, force_include, &[])
+            .map_err(IndexFailure::index_error)?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
         let walker = source_walk(
@@ -2155,7 +2171,8 @@ impl WorkspaceIndex {
         if force_include.is_empty() {
             return Ok(Vec::new());
         }
-        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let matcher = PathMatcher::build(&self.root, force_include, &[])
+            .map_err(IndexFailure::index_error)?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
         let mut match_count = 0_usize;
@@ -2574,7 +2591,8 @@ fn discover(
         visibility.include(),
         visibility.exclude(),
         visibility.force_include(),
-    )?;
+    )
+    .map_err(IndexFailure::index_error)?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {

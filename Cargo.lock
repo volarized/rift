@@ -4389,6 +4389,7 @@ name = "rift-analysis"
 version = "0.0.45"
 dependencies = [
  "flate2",
+ "ignore",
  "percent-encoding",
  "rayon",
  "rift-core",

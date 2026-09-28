@@ -15,8 +15,8 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
 use rift_index::{
-    IndexedFile, LexicalChange, PathChanges, PathMatcher, SymbolMatch, TextSourceFile,
-    WorkspaceIndex,
+    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, SymbolMatch,
+    TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
@@ -308,7 +308,7 @@ impl ReadService {
                 &pattern_strings(&selector.force_include),
                 &[],
             )
-            .map_err(ReadFault::index)?;
+            .map_err(|error| ReadFault::index(error.index_error()))?;
         }
         Ok(())
     }
@@ -753,7 +753,7 @@ pub(crate) fn path_matcher(
         &pattern_strings(&selector.exclude),
     )
     .map(Some)
-    .map_err(ReadFault::index)
+    .map_err(|error| ReadFault::index(error.index_error()))
 }
 
 fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {

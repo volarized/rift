@@ -12,11 +12,12 @@ workspace = true
 
 [features]
 default = ["collector"]
-collector = ["dep:rift-provider", "dep:rift-syntax", "dep:strum", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
+collector = ["dep:ignore", "dep:rift-provider", "dep:rift-syntax", "dep:strum", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
 archive = ["dep:flate2", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
 [dependencies]
+ignore = { workspace = true, optional = true }
 rift-core.workspace = true
 rift-protocol.workspace = true
 rift-provider = { workspace = true, optional = true }

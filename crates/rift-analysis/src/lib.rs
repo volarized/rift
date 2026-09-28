@@ -6,6 +6,8 @@ mod analyzer;
 pub mod archive;
 mod chunk;
 pub mod documentation;
+#[cfg(feature = "collector")]
+mod glob;
 mod input;
 #[cfg(feature = "collector")]
 mod relationship;
@@ -22,6 +24,10 @@ pub use analyzer::{
     public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
+#[cfg(feature = "collector")]
+pub use glob::{
+    ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
+};
 pub use input::{
     ExactPackageInput, ExactPackageLimits, PackageInputError, PackageInputFault,
     PackageInputViolation, PackageSource,

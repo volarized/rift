@@ -5,7 +5,6 @@ mod chunk;
 mod database;
 mod documentation;
 mod documentation_store;
-mod glob;
 mod language;
 mod lexical;
 mod log;
@@ -18,7 +17,6 @@ mod workspace;
 
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
-pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
@@ -39,12 +37,16 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::documentation::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
+pub use rift_analysis::{
+    ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
+};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,
-    WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
-    WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests, capture_digests_with_languages,
-    declaration_identity, source_line_matches, symbol_matches, text_line_matches,
+    IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
+    WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
+    capture_digests_with_languages, declaration_identity, source_line_matches, symbol_matches,
+    text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

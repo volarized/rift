@@ -16,13 +16,14 @@ use rift_protocol::source::SOURCE_FILES_FIELD;
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
 
-use crate::glob::PathMatcher;
 use crate::language::ClassifiedPath;
+use crate::workspace::IndexFailure;
 use crate::workspace::{
     IndexContents, ReadIndex, RustFacts, WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexLimits,
     WorkspaceIndexViolation, component, composition_error, index_error_at, index_error_caused_by,
     index_error_over_limit,
 };
+use rift_analysis::PathMatcher;
 
 #[derive(Debug)]
 pub(crate) struct RevisionFiles;
@@ -221,7 +222,8 @@ impl RevisionPaths {
                 visibility.include(),
                 visibility.exclude(),
                 visibility.force_include(),
-            )?,
+            )
+            .map_err(IndexFailure::index_error)?,
         })
     }
 

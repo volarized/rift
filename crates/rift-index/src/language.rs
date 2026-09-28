@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use rift_core::{LanguageFileSelection, LanguageFileSelections, TextFileInclusion};
 use rift_syntax::{SyntaxProvider, registry};
 
-use crate::PathMatcher;
+use crate::workspace::IndexFailure;
 use crate::workspace::{WorkspaceIndexError, WorkspaceIndexViolation, index_error_caused_by};
+use rift_analysis::PathMatcher;
 
 /// One accepted language entry with expanded path patterns.
 #[derive(Debug)]
@@ -154,7 +155,8 @@ impl WorkspaceLanguagePolicy {
         languages.sort_by(|left, right| left.identity.cmp(&right.identity));
         let text = (!text.include().is_empty())
             .then(|| PathMatcher::build(root, text.include(), &[]))
-            .transpose()?;
+            .transpose()
+            .map_err(IndexFailure::index_error)?;
         Ok(Self {
             root: root.to_path_buf(),
             languages,
@@ -173,7 +175,8 @@ impl WorkspaceLanguagePolicy {
     ) -> Result<EffectiveLanguage, WorkspaceIndexError> {
         let matcher = (!include.is_empty())
             .then(|| PathMatcher::build(root, &include, &exclude))
-            .transpose()?;
+            .transpose()
+            .map_err(IndexFailure::index_error)?;
         Ok(EffectiveLanguage {
             identity,
             enabled,
