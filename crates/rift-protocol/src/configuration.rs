@@ -2117,10 +2117,25 @@ pub const EXCLUDED_LOCKFILES_DEFAULT: [&str; 12] = [
 /// name the common filesystems accept.
 pub const LOCKFILE_NAME_BYTES_MAX: usize = 255;
 
+/// What the text index does with a file whose text runs past `[search.text] max_chunk`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeFileStrategy {
+    /// The file's text is indexed as whole-line chunks of at most `max_chunk` bytes, and a
+    /// file past `[providers.syntax] max_file` is held as text the syntax provider does
+    /// not parse, up to `[source] workspace_size`.
+    #[default]
+    Split,
+    /// The file leaves the text index: no search reads its text, and a file past
+    /// `[providers.syntax] max_file` leaves the index entirely.
+    Skip,
+}
+
 /// The `[search.text]` table. `include` selects which visible paths join the
 /// text index once every language entry has had its claim, `max_chunk`
-/// bounds the lexical units derived from them, and `excluded_lockfiles`
-/// names the lockfiles the index leaves out of search.
+/// bounds the lexical units derived from them, `large_files` decides what
+/// happens to a file past `max_chunk`, and `excluded_lockfiles` names the
+/// lockfiles the index leaves out of search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
@@ -2129,9 +2144,15 @@ pub struct TextSearchConfiguration {
     /// The default `["**"]` selects every unclaimed visible path; an empty list selects none.
     #[schemars(length(max = 64))]
     pub include: Vec<PathPattern>,
-    /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
-    /// several chunks of at most this size.
+    /// Bytes one lexical chunk may hold, 1kb to 16mb. A larger file is indexed as
+    /// several chunks of at most this size, or left out of the text index, as
+    /// `large_files` decides.
     pub max_chunk: ByteSize,
+    /// What the text index does with a file past `max_chunk`: `split` indexes it in
+    /// chunks and holds a file past `[providers.syntax] max_file` as unparsed text;
+    /// `skip` leaves it out of the text index, and every search answer whose `paths`
+    /// reach one counts it in a `large_file_skipped` warning. Omitted, `split`.
+    pub large_files: LargeFileStrategy,
     /// File names of the lockfiles the index leaves out of search, matched against
     /// each visible file's final path segment. Such a file answers no search and no
     /// symbol lookup, while `rift://map` still reads its pinned versions and
@@ -2146,6 +2167,7 @@ impl Default for TextSearchConfiguration {
         Self {
             include: vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())],
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
+            large_files: LargeFileStrategy::default(),
             excluded_lockfiles: EXCLUDED_LOCKFILES_DEFAULT
                 .iter()
                 .map(|name| (*name).to_owned())
@@ -4774,6 +4796,34 @@ mod tests {
     }
 
     #[test]
+    fn test_search_text_large_files_defaults_to_split_and_reads_skip() {
+        assert_eq!(
+            TextSearchConfiguration::default().large_files,
+            LargeFileStrategy::Split
+        );
+        let written = json!({ "search": { "text": { "large_files": "skip" } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the strategy deserializes");
+        assert_eq!(
+            configuration.search.text.large_files,
+            LargeFileStrategy::Skip
+        );
+        let refused = serde_json::from_value::<WorkspaceConfiguration>(
+            json!({ "search": { "text": { "large_files": "drop" } } }),
+        );
+        assert!(
+            refused.is_err(),
+            "an unknown strategy is refused: {refused:?}"
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        assert_eq!(
+            schema["$defs"]["TextSearchConfiguration"]["properties"]["large_files"]["default"],
+            json!("split")
+        );
+    }
+
+    #[test]
     fn test_search_lexical_mmap_size_refuses_past_the_bundled_cap() {
         let mut configuration = WorkspaceConfiguration::default();
         configuration.search.lexical.mmap_size = ByteSize::from_bytes(2_147_418_113);
@@ -4847,9 +4897,10 @@ mod tests {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let properties = &schema["$defs"]["TextSearchConfiguration"]["properties"];
-        assert_eq!(properties.as_object().expect("properties").len(), 3);
+        assert_eq!(properties.as_object().expect("properties").len(), 4);
         assert!(properties.get("include").is_some());
         assert!(properties.get("max_chunk").is_some());
+        assert!(properties.get("large_files").is_some());
         assert_eq!(
             properties["excluded_lockfiles"]["maxItems"],
             json!(CONFIGURATION_PATTERNS_MAX),

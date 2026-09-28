@@ -1029,6 +1029,30 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// Text files past `[search.text] max_chunk` are left out of the text index under the
+    /// key `large_files = "skip"`, so no hit answers from their text; `skipped` counts the
+    /// ones the request's `paths` reach. A declaration such a file holds still answers.
+    /// Setting `large_files` to `split` indexes them in chunks.
+    LargeFileSkipped {
+        /// The files past `max_chunk` the request's `paths` reach.
+        skipped: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// Files past `[providers.syntax] max_file` are held as text the syntax provider does
+    /// not parse: their text answers `search`, and none of their declarations were
+    /// extracted, so no symbol hit and no `get_symbol` answer comes from them. `files`
+    /// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising
+    /// `max_file` parses them.
+    LargeFileUnparsed {
+        /// The files held as text alone.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// A lockfile the request's `paths.include` selects is left out of search, so no hit
     /// answers from it; `rift://map` still carries the versions it pins. Naming the file
     /// in `paths.force_include` searches it for one request, and removing its name from
@@ -2623,6 +2647,35 @@ mod tests {
     }
 
     #[test]
+    fn the_large_file_warnings_round_trip_under_their_code_tags() {
+        let cases = [
+            (
+                ReadWarning::LargeFileSkipped {
+                    skipped: 2,
+                    detail: "2 selected files are past max_chunk".to_owned(),
+                },
+                json!({
+                    "code": "large_file_skipped",
+                    "skipped": 2,
+                    "detail": "2 selected files are past max_chunk",
+                }),
+            ),
+            (
+                ReadWarning::LargeFileUnparsed {
+                    files: vec![FileId("rift://file/big.js".to_owned())],
+                    detail: "big.js is past max_file".to_owned(),
+                },
+                json!({
+                    "code": "large_file_unparsed",
+                    "files": ["rift://file/big.js"],
+                    "detail": "big.js is past max_file",
+                }),
+            ),
+        ];
+        assert_round_trips(cases);
+    }
+
+    #[test]
     fn the_results_truncation_warning_round_trips_under_its_code_tag() {
         let warning = ReadWarning::ResultsTruncated { results_max: 1_000 };
         let wire = json!({ "code": "results_truncated", "results_max": 1_000 });
@@ -2649,6 +2702,8 @@ mod tests {
             "results_truncated",
             "pattern_matches_truncated",
             "source_unavailable",
+            "large_file_skipped",
+            "large_file_unparsed",
             "symbol_disagreement",
             "global_access_disabled",
             "global_api_unavailable",

@@ -564,6 +564,21 @@
       ],
       "description": "How one exact language selects an LSP process."
     },
+    "LargeFileStrategy": {
+      "description": "What the text index does with a file whose text runs past `[search.text] max_chunk`.",
+      "oneOf": [
+        {
+          "const": "split",
+          "description": "The file's text is indexed as whole-line chunks of at most `max_chunk` bytes, and a\nfile past `[providers.syntax] max_file` is held as text the syntax provider does\nnot parse, up to `[source] workspace_size`.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "The file leaves the text index: no search reads its text, and a file past\n`[providers.syntax] max_file` leaves the index entirely.",
+          "type": "string"
+        }
+      ]
+    },
     "LexicalSearchConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.lexical]` table: how many units the lexical index holds, how many one\ntransaction writes, and how much of the store file a connection memory-maps.",
@@ -993,6 +1008,7 @@
             "include": [
               "**"
             ],
+            "large_files": "split",
             "max_chunk": "1mb"
           },
           "description": "Chunking policy for visible text files in lexical search."
@@ -1192,7 +1208,7 @@
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, `max_chunk`\nbounds the lexical units derived from them, and `excluded_lockfiles`\nnames the lockfiles the index leaves out of search.",
+      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, `max_chunk`\nbounds the lexical units derived from them, `large_files` decides what\nhappens to a file past `max_chunk`, and `excluded_lockfiles` names the\nlockfiles the index leaves out of search.",
       "properties": {
         "excluded_lockfiles": {
           "default": [
@@ -1227,10 +1243,15 @@
           "maxItems": 64,
           "type": "array"
         },
+        "large_files": {
+          "$ref": "#/$defs/LargeFileStrategy",
+          "default": "split",
+          "description": "What the text index does with a file past `max_chunk`: `split` indexes it in\nchunks and holds a file past `[providers.syntax] max_file` as unparsed text;\n`skip` leaves it out of the text index, and every search answer whose `paths`\nreach one counts it in a `large_file_skipped` warning. Omitted, `split`."
+        },
         "max_chunk": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
-          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as\nseveral chunks of at most this size.",
+          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. A larger file is indexed as\nseveral chunks of at most this size, or left out of the text index, as\n`large_files` decides.",
           "rift:range": {
             "max": "16mb",
             "min": "1kb"
@@ -1423,6 +1444,7 @@
           "include": [
             "**"
           ],
+          "large_files": "split",
           "max_chunk": "1mb"
         },
         "vector": {
