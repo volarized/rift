@@ -250,6 +250,20 @@ mod tests {
         );
     }
 
+    /// A whole export of a computed value, such as a call's result or a
+    /// number, names no declaration, so it marks none.
+    #[test]
+    fn test_a_whole_export_of_a_computed_value_marks_nothing() {
+        let document = analyze("function create() {}\nexport default create();\n");
+        assert_eq!(public_facts(&document), [("create", false)]);
+
+        let document = analyze("function create() {}\nmodule.exports = create();\n");
+        assert_eq!(public_facts(&document), [("create", false)]);
+
+        let document = analyze("const answer = 1;\nexport default 42;\n");
+        assert_eq!(public_facts(&document), [("answer", false)]);
+    }
+
     /// A re-export names another module's declarations, so a local
     /// declaration of the same name stays unmarked.
     #[test]
