@@ -1571,6 +1571,43 @@ fn package_request() -> PackageIdentity {
     }
 }
 
+/// The contract's `maxLength` for `query`, a query term's `text`, and a symbol `name` counts
+/// characters, so each field holding that many two-byte characters is accepted although it
+/// holds twice as many bytes, and one character more refuses naming the field.
+#[test]
+fn test_query_term_and_name_bounds_count_characters() {
+    let at_bound = |max: usize| "\u{e9}".repeat(max);
+    let past_bound = |max: usize| "\u{e9}".repeat(max + 1);
+    assert_eq!(at_bound(QUERY_BYTES_MAX).len(), 2 * QUERY_BYTES_MAX);
+
+    let mut search = search_request();
+    search.query = at_bound(QUERY_BYTES_MAX);
+    assert_eq!(validate_search_request(&search), Ok(()));
+    search.query = past_bound(QUERY_BYTES_MAX);
+    assert_eq!(
+        validate_search_request(&search),
+        Err(ClientError::InvalidRequest { field: "query" })
+    );
+
+    let mut search = search_request();
+    search.terms[0].text = at_bound(QUERY_TERM_BYTES_MAX);
+    assert_eq!(validate_search_request(&search), Ok(()));
+    search.terms[0].text = past_bound(QUERY_TERM_BYTES_MAX);
+    assert_eq!(
+        validate_search_request(&search),
+        Err(ClientError::InvalidRequest { field: "term" })
+    );
+
+    let mut symbol = symbol_request();
+    symbol.name = at_bound(QUERY_BYTES_MAX);
+    assert_eq!(validate_symbol_request(&symbol), Ok(()));
+    symbol.name = past_bound(QUERY_BYTES_MAX);
+    assert_eq!(
+        validate_symbol_request(&symbol),
+        Err(ClientError::InvalidRequest { field: "name" })
+    );
+}
+
 fn search_request() -> PackageSearchRequest {
     PackageSearchRequest {
         query: "demo".to_owned(),

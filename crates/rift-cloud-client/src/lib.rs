@@ -96,11 +96,15 @@ const LABEL_CHARS_MAX: usize = 128;
 const DOCUMENTATION_SEARCH_FEATURE: &str = "documentation_search";
 /// The capability feature a server advertises when symbol reads attach documentation.
 const SYMBOL_DOCUMENTATION_FEATURE: &str = "symbol_documentation";
-/// Most UTF-8 bytes one query carries.
+/// Most characters one query or symbol `name` carries, the unit the contract's `maxLength`
+/// counts for both, and the ceiling of the advertised `query_bytes_max`, which counts UTF-8
+/// bytes.
 pub const QUERY_BYTES_MAX: usize = 4_096;
 /// Most terms one query carries.
 pub const QUERY_TERMS_MAX: usize = 32;
-/// Most UTF-8 bytes one query term carries.
+/// Most characters one query term carries, the unit the contract's `maxLength` counts for
+/// `text`, and the ceiling of the advertised `query_term_bytes_max`, which counts UTF-8
+/// bytes.
 pub const QUERY_TERM_BYTES_MAX: usize = 256;
 /// Most identifiers one query carries.
 pub const IDENTIFIERS_MAX: usize = 16;
@@ -1600,12 +1604,12 @@ impl PackageResolutionResponse {
 }
 
 fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.query, QUERY_BYTES_MAX, "query")?;
+    bounded_nonempty_characters(&request.query, QUERY_BYTES_MAX, "query")?;
     if request.terms.is_empty() || request.terms.len() > QUERY_TERMS_MAX {
         return Err(ClientError::InvalidRequest { field: "terms" });
     }
     for term in &request.terms {
-        bounded_nonempty(&term.text, QUERY_TERM_BYTES_MAX, "term")?;
+        bounded_nonempty_characters(&term.text, QUERY_TERM_BYTES_MAX, "term")?;
         if term.phrase && term.prefix {
             return Err(ClientError::InvalidRequest {
                 field: "phrase_prefix",
@@ -1651,7 +1655,7 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientE
 }
 
 fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.name, QUERY_BYTES_MAX, "name")?;
+    bounded_nonempty_characters(&request.name, QUERY_BYTES_MAX, "name")?;
     if request
         .include
         .as_ref()
@@ -2161,13 +2165,6 @@ fn ranking_match_class(
             field: "match_class",
         }),
     }
-}
-
-fn bounded_nonempty(value: &str, max: usize, field: &'static str) -> Result<(), ClientError> {
-    if value.is_empty() || value.len() > max {
-        return Err(ClientError::InvalidRequest { field });
-    }
-    Ok(())
 }
 
 /// Refuses `value` naming `field` unless it holds 1 to `max` characters, the unit a
