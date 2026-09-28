@@ -1491,6 +1491,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
         json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
         "{greet}"
     );
+    assert_eq!(greet["hit"]["symbol"]["kind"], json!("function"), "{greet}");
     assert_eq!(
         greet["hit"]["symbol"]["origin"],
         json!({
