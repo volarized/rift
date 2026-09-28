@@ -278,7 +278,7 @@ fn test_declaration_responses_account_for_every_position() {
 }
 
 #[test]
-fn test_declaration_responses_carry_a_kind_exactly_beside_a_declaration() {
+fn test_declaration_responses_carry_a_well_formed_kind_exactly_beside_a_declaration() {
     let request = declaration_request();
     let cases = [
         json!({"results": [
@@ -288,6 +288,10 @@ fn test_declaration_responses_carry_a_kind_exactly_beside_a_declaration() {
         json!({"results": [
             {"position": position_json(3), "declaration": DECLARATION, "kind": KIND},
             {"position": position_json(0), "kind": KIND}
+        ]}),
+        json!({"results": [
+            {"position": position_json(3), "declaration": DECLARATION, "kind": "9function"},
+            {"position": position_json(0)}
         ]}),
     ];
     for response in cases {
