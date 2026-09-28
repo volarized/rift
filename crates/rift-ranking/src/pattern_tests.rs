@@ -479,10 +479,10 @@ fn never_drops_a_match(seed: u64, patterns: usize, texts_per_pattern: usize) -> 
     outcome
 }
 
-/// The plan never drops a match: for every generated text the matcher matches, the rows
-/// the index holds meet the formula the plan built. The generator covers alternations,
-/// small classes, case classes FTS5 folds and ones it does not, repetitions, look-around,
-/// and literal newlines.
+/// The query plan never drops a match: for every generated text the matcher matches, the
+/// rows the index holds meet the formula the query plan built. The generator covers
+/// alternations, small classes, case classes FTS5 folds and ones it does not, repetitions,
+/// look-around, and literal newlines.
 #[test]
 fn the_formula_never_drops_a_matching_text() {
     let outcome = never_drops_a_match(0x5EED_0001, 4_000, 8);
