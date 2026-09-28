@@ -1053,11 +1053,16 @@ pub struct SearchConfiguration {
     pub pattern_compiled_size: ByteSize,
     /// Most rows of the trigram index one `pattern` search reads to select the
     /// files it verifies, 100 to 1000000, counted once per chunk of a large file.
-    /// A search whose selection passes it is refused naming this key.
+    /// A search whose selection passes it is refused naming this key. Rows the
+    /// trigram index does not hold yet are verified within what the selection
+    /// leaves of it; past that, the search answers from the rows the index holds
+    /// and warns `pattern_index_preparing`.
     #[schemars(range(min = 100, max = 1_000_000))]
     pub pattern_candidate_rows: u64,
     /// Most file text one `pattern` search verifies, 1mb to 64gb. A search that
-    /// would verify more is refused naming this key.
+    /// would verify more is refused naming this key. Rows the trigram index does
+    /// not hold yet are left out rather than verified past it, and the answer
+    /// warns `pattern_index_preparing`.
     pub pattern_verified_size: ByteSize,
     /// Most matches one file contributes to a `pattern` search, 1 to 100000. A
     /// file past it is cut there, and the answer warns
@@ -1284,7 +1289,9 @@ pub struct LexicalSearchConfiguration {
     /// Most units one lexical transaction writes, 100 to 1000000. A write
     /// larger than this commits in several transactions, and the tree it
     /// answers for is stamped by the last. One file's units always share a
-    /// transaction, so a file holding more units takes one of its own.
+    /// transaction, so a file holding more units takes one of its own. The
+    /// trigram index `pattern` search reads is filled after each write in
+    /// transactions of at most this many rows.
     #[schemars(range(min = 100, max = 1_000_000))]
     pub transaction_units: u64,
     /// Most content one lexical transaction writes, 1mb to 1gb, counted and

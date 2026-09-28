@@ -60,7 +60,11 @@ fn service_over(root: &std::path::Path) -> TestResult<ReadService> {
     )?)
 }
 
-async fn published_store(directory: &TempDir, service: &ReadService) -> TestResult<SearchIndex> {
+/// Trigram batches one fixture store takes at most before its index holds every row.
+const TRIGRAM_BATCHES_MAX: usize = 64;
+
+/// A store holding `service`'s tree, its trigram index behind the rows the write stored.
+async fn written_store(directory: &TempDir, service: &ReadService) -> TestResult<SearchIndex> {
     let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
         .disable_vector()
         .build();
@@ -68,6 +72,23 @@ async fn published_store(directory: &TempDir, service: &ReadService) -> TestResu
     store
         .replace_lexical(&service.index_documents(), service.tree_revision())
         .await?;
+    Ok(store)
+}
+
+/// Runs trigram batches until `store`'s trigram index holds every row the store does.
+async fn catch_up_trigrams(store: &SearchIndex) -> TestResult {
+    for _batch in 0..TRIGRAM_BATCHES_MAX {
+        if store.index_trigrams().await?.pending() == 0 {
+            return Ok(());
+        }
+    }
+    Err("the trigram index never caught up with the fixture store".into())
+}
+
+/// A store holding `service`'s tree with its trigram index caught up.
+async fn published_store(directory: &TempDir, service: &ReadService) -> TestResult<SearchIndex> {
+    let store = written_store(directory, service).await?;
+    catch_up_trigrams(&store).await?;
     Ok(store)
 }
 
@@ -500,6 +521,73 @@ async fn a_selection_past_the_candidate_rows_refuses_naming_the_bound() -> TestR
         message.contains("more than 2 candidate rows, the [search] pattern_candidate_rows bound"),
         "{message}"
     );
+    Ok(())
+}
+
+/// The one `pattern_index_preparing` warning an answer carries, as its two counts.
+fn preparing(result: &SearchResult) -> Option<(u64, u64)> {
+    let mut found = result.warnings.iter().filter_map(|warning| match warning {
+        ReadWarning::PatternIndexPreparing {
+            prepared, total, ..
+        } => Some((*prepared, *total)),
+        _ => None,
+    });
+    let first = found.next();
+    assert!(found.next().is_none(), "one warning at most: {result:?}");
+    first
+}
+
+/// Before the trigram index takes the rows a write stored, a search verifies them beside
+/// the rows the index selects while both fit the `[search]` bounds, and answers exactly
+/// what a scan of every held file answers. Past `pattern_candidate_rows` or
+/// `pattern_verified_size`, it answers from the rows the index holds and warns
+/// `pattern_index_preparing`, counting them; once the index catches up, the answer is the
+/// scan's again and carries no warning.
+#[tokio::test]
+async fn rows_the_trigram_index_lacks_are_verified_within_the_bounds_and_warned_past_them()
+-> TestResult {
+    let (directory, service) = fixture()?;
+    let store = written_store(&directory, &service).await?;
+    let request = params(json!({"pattern": "NEEDLE|TODO", "target": "file"}))?;
+    let scanned = service.search(&request, &StoreAnswer::identifier_only())?;
+    assert!(!scanned.results.is_empty(), "the fixture holds matches");
+
+    let complete = store_answer(&store, &service, &request, PatternBounds::default()).await?;
+    let unindexed = complete
+        .pattern_candidates()
+        .and_then(rift_index::PatternCandidates::unindexed)
+        .ok_or("the write left every file row for the trigram index")?;
+    assert_eq!(unindexed.prepared(), 0);
+    let total = unindexed.total();
+    assert!(total > 4, "the long file splits into several rows: {total}");
+    let result = service.search(&request, &complete)?;
+    assert_eq!(located(&result), located(&scanned));
+    assert_eq!(preparing(&result), None, "the lacking rows were verified");
+
+    for bounds in [
+        bounds_with(|search| search.pattern_candidate_rows = 1),
+        bounds_with(|search| search.pattern_verified_size = ByteSize::from_bytes(64)),
+    ] {
+        let answer = store_answer(&store, &service, &request, bounds).await?;
+        let result = service.search(&request, &answer)?;
+        assert_eq!(preparing(&result), Some((0, total)), "{bounds:?}");
+        assert!(
+            result.results.is_empty(),
+            "the index holds no row, so nothing is verified: {result:?}"
+        );
+    }
+
+    catch_up_trigrams(&store).await?;
+    let caught_up = store_answer(&store, &service, &request, PatternBounds::default()).await?;
+    assert_eq!(
+        caught_up
+            .pattern_candidates()
+            .and_then(rift_index::PatternCandidates::unindexed),
+        None
+    );
+    let result = service.search(&request, &caught_up)?;
+    assert_eq!(located(&result), located(&scanned));
+    assert_eq!(preparing(&result), None);
     Ok(())
 }
 

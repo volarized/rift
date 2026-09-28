@@ -1014,6 +1014,22 @@ pub enum ReadWarning {
         #[schemars(length(max = 8))]
         files: Vec<FileId>,
     },
+    /// The trigram index `pattern` selects its files through lacks rows of stored file
+    /// text, and verifying those rows beside the selected ones would pass the `[search]`
+    /// key `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the
+    /// rows the index holds and a match in the other rows is missing from it. The server
+    /// indexes those rows in the background after each write; `prepared` and `total` state
+    /// how far it has got. Resend the request once the index has caught up.
+    PatternIndexPreparing {
+        /// Rows of stored file text the trigram index holds: one per file, or one per
+        /// chunk of a file split under `[search.text]`.
+        prepared: u64,
+        /// Rows of stored file text the store holds.
+        total: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
     /// directly still refuses `content_unavailable`. Every other file in the workspace
@@ -2647,6 +2663,24 @@ mod tests {
     }
 
     #[test]
+    fn the_pattern_index_preparation_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::PatternIndexPreparing {
+            prepared: 12_000,
+            total: 17_500,
+            detail: "12000 of 17500 rows of file text are in the trigram index".to_owned(),
+        };
+        let wire = json!({
+            "code": "pattern_index_preparing",
+            "prepared": 12_000,
+            "total": 17_500,
+            "detail": "12000 of 17500 rows of file text are in the trigram index",
+        });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
     fn the_large_file_warnings_round_trip_under_their_code_tags() {
         let cases = [
             (
@@ -2701,6 +2735,7 @@ mod tests {
             "lexical_ranking_truncated",
             "results_truncated",
             "pattern_matches_truncated",
+            "pattern_index_preparing",
             "source_unavailable",
             "large_file_skipped",
             "large_file_unparsed",

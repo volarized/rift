@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use rift_core::ProjectPath;
 use rift_core::line::{line_of, line_starts, without_ending};
-use rift_index::{PatternCandidates, SymbolMatch, TextSourceFile, WorkspaceIndex};
+use rift_index::{
+    PatternCandidate, PatternCandidates, SymbolMatch, TextSourceFile, UnindexedRows, WorkspaceIndex,
+};
 use rift_protocol::configuration::SearchConfiguration;
 use rift_protocol::read::{
     MatchedField, ReadWarning, ResultOrder, SEARCH_PATTERN_CHARS_MAX, SOURCE_WARNINGS_MAX,
@@ -385,6 +387,10 @@ impl ReadService {
     /// answer, verifies every held file whole under the same bounds. The hits carry no
     /// score, so `relevance` keeps them in path order, then by offset, a declaration at
     /// its first match.
+    ///
+    /// Rows the trigram index lacks are verified beside the ones it selected while both
+    /// fit the `[search]` bounds, so the answer stays complete; past them the answer
+    /// covers the rows the index holds and warns `pattern_index_preparing`.
     pub(super) fn search_pattern(
         &self,
         params: &SearchParams,
@@ -394,7 +400,8 @@ impl ReadService {
         let bounds = store.pattern_bounds();
         let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
         let selected = self.selected_paths(params.paths.as_ref())?;
-        let candidates = self.pattern_candidates(pattern, store.pattern_candidates(), &selected)?;
+        let (candidates, preparing) =
+            self.pattern_candidates(pattern, store.pattern_candidates(), &selected, bounds)?;
         let results_max = self.index().results_max();
         let mut verification =
             Verification::new(params.target, HitPayloads::requested(params), bounds);
@@ -408,6 +415,7 @@ impl ReadService {
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(matches_truncation_warning(&verification.cut, bounds));
+        warnings.extend(preparing);
         if params.order != ResultOrder::Relevance {
             order_hits(&mut results, params.order);
         }
@@ -423,23 +431,58 @@ impl ReadService {
         })
     }
 
-    /// The files to verify, in path order: the store's selection when the pattern has a
-    /// prefilter and the store answered, every searched file otherwise, screened by the
-    /// request's `paths`, and every `paths.force_include` file whole.
+    /// The files to verify, in path order, and the warning the answer carries when rows
+    /// the trigram index lacks were left out.
+    ///
+    /// The store's selection stands when the pattern has a prefilter and the store
+    /// answered, merged with the rows the index lacks when the store listed them and the
+    /// merged set fits `pattern_verified_size`; every searched file otherwise. Each set is
+    /// screened by the request's `paths`, and every `paths.force_include` file joins whole.
     fn pattern_candidates<'a>(
         &'a self,
         pattern: &Pattern,
         selection: Option<&'a PatternCandidates>,
         selected: &'a SelectedPaths,
-    ) -> Result<Vec<Candidate<'a>>, ReadError> {
+        bounds: PatternBounds,
+    ) -> Result<(Vec<Candidate<'a>>, Option<ReadWarning>), ReadError> {
         let index = self.index();
-        let chosen = match (pattern.prefilter(), selection) {
-            (Some(_), Some(selection)) => self.selected_candidates(selection)?,
-            _ => index
+        let Some(selection) = selection.filter(|_| pattern.prefilter().is_some()) else {
+            let every = index
                 .searched_text_files()
                 .map(|file| Candidate::whole(index, file))
-                .collect(),
+                .collect();
+            return Ok((self.screened(every, selected), None));
         };
+        if let Some(rows_max) = selection.truncated_at() {
+            return Err(ReadFault::invalid(
+                "pattern",
+                format!(
+                    "more than {rows_max} candidate rows, the [search] pattern_candidate_rows \
+                     bound; narrow `pattern` or `paths`"
+                ),
+            ));
+        }
+        let held = self.screened(self.selected_candidates(selection.candidates()), selected);
+        let Some(unindexed) = selection.unindexed() else {
+            return Ok((held, None));
+        };
+        if let Some(completed) = unindexed.completed() {
+            let complete = self.screened(self.selected_candidates(completed), selected);
+            if planned_bytes(&complete) <= bounds.verified_bytes_max {
+                return Ok((complete, None));
+            }
+        }
+        Ok((held, Some(pattern_index_preparing(unindexed))))
+    }
+
+    /// `chosen`, screened by the request's `paths`, with every `paths.force_include` file
+    /// whole, in path order. A file named twice is verified as its later entry names it.
+    fn screened<'a>(
+        &'a self,
+        chosen: Vec<Candidate<'a>>,
+        selected: &'a SelectedPaths,
+    ) -> Vec<Candidate<'a>> {
+        let index = self.index();
         let mut files: BTreeMap<&'a ProjectPath, Candidate<'a>> = chosen
             .into_iter()
             .filter(|candidate| includes(selected.matcher.as_ref(), index.root(), candidate.path()))
@@ -452,27 +495,15 @@ impl ReadService {
                     .map(|file| (file.path(), Candidate::whole(extra, file))),
             );
         }
-        Ok(files.into_values().collect())
+        files.into_values().collect()
     }
 
-    /// The store's selection, refused when it stopped at the candidate bound, and every
-    /// file the trigram index cannot rule out, whole: its whole-file candidates follow the
-    /// selected rows, so a file both name is verified whole.
-    fn selected_candidates<'a>(
-        &'a self,
-        selection: &'a PatternCandidates,
-    ) -> Result<Vec<Candidate<'a>>, ReadError> {
-        if let Some(rows_max) = selection.truncated_at() {
-            return Err(ReadFault::invalid(
-                "pattern",
-                format!(
-                    "more than {rows_max} candidate rows, the [search] pattern_candidate_rows \
-                     bound; narrow `pattern` or `paths`"
-                ),
-            ));
-        }
+    /// `rows` as the files to verify, and every file the trigram index cannot rule out,
+    /// whole: its whole-file candidates follow the selected rows, so a file both name is
+    /// verified whole.
+    fn selected_candidates<'a>(&'a self, rows: &'a [PatternCandidate]) -> Vec<Candidate<'a>> {
         let index = self.index();
-        let rows = selection.candidates().iter().filter_map(|chosen| {
+        let rows = rows.iter().filter_map(|chosen| {
             let file = index.text_file(chosen.path())?;
             let spans = chosen.spans().iter().map(text_span).collect();
             Some(Candidate {
@@ -484,6 +515,31 @@ impl ReadService {
         let whole = index
             .whole_file_candidates()
             .map(|file| Candidate::whole(index, file));
-        Ok(rows.chain(whole).collect())
+        rows.chain(whole).collect()
+    }
+}
+
+/// The bytes of text verifying every one of `candidates` reads.
+fn planned_bytes(candidates: &[Candidate<'_>]) -> u64 {
+    let bytes: usize = candidates
+        .iter()
+        .flat_map(Candidate::spans)
+        .map(|span| span.len())
+        .sum();
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+/// The warning an answer carries when it covers the rows the trigram index holds alone.
+fn pattern_index_preparing(unindexed: &UnindexedRows) -> ReadWarning {
+    let prepared = unindexed.prepared();
+    let total = unindexed.total();
+    ReadWarning::PatternIndexPreparing {
+        prepared,
+        total,
+        detail: format!(
+            "{prepared} of {total} rows of file text are in the trigram index, so a match in \
+             the other rows is missing from this answer; resend the request once the trigram \
+             index has caught up"
+        ),
     }
 }
