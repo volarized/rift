@@ -3412,8 +3412,8 @@ pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexEr
 
 /// The class one declaration's names reach against a lowercase query.
 ///
-/// The classing itself lives in `rift-ranking`, so a package index, an
-/// in-memory fixture, and this index all order a declaration the same way.
+/// The classing itself lives in `rift-ranking`, so a package index and this
+/// index order a declaration the same way.
 fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClass> {
     match_class(
         query,

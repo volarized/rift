@@ -39,9 +39,9 @@ pub const DOCUMENTATION_BYTES_MAX: usize = 16_384;
 /// mixes languages whose identifiers stem badly, and the retrieval gate has no
 /// measurement supporting the change yet.
 ///
-/// Diacritic folding is off as well, so the in-memory adapter can tokenize the
-/// same text the same way without carrying a Unicode folding table of its own.
-/// A reader that folded on one side and not the other would rank the same
+/// Diacritic folding is off as well, so [`tokenize`](crate::tokenize) splits
+/// the same text the same way without carrying a Unicode folding table of its
+/// own. A reader that folded on one side and not the other would rank the same
 /// publication two ways.
 pub const CORPUS_TOKENIZER: &str = "unicode61 remove_diacritics 0";
 
@@ -449,15 +449,6 @@ impl DocumentFields {
         slot.as_deref()
     }
 
-    /// The fields this document filled.
-    #[must_use]
-    pub fn filled(&self) -> FieldSet {
-        SearchableField::ALL
-            .into_iter()
-            .filter(|field| self.get(*field).is_some())
-            .collect()
-    }
-
     /// The digest of the fields this document filled, in declared column
     /// order.
     ///
@@ -834,8 +825,11 @@ mod tests {
     #[test]
     fn test_an_empty_field_value_leaves_the_field_absent() {
         let fields = DocumentFields::empty().with(SearchableField::Signature, "");
-        assert_eq!(fields.get(SearchableField::Signature), None);
-        assert!(fields.filled().is_empty());
+        assert!(
+            SearchableField::ALL
+                .into_iter()
+                .all(|field| fields.get(field).is_none())
+        );
     }
 
     #[test]
@@ -857,7 +851,6 @@ mod tests {
         for field in SearchableField::ALL {
             assert_eq!(fields.get(field), Some(field.column()));
         }
-        assert_eq!(fields.filled(), FieldSet::all());
     }
 
     #[test]

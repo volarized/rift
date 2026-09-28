@@ -4586,7 +4586,6 @@ dependencies = [
  "rift-core",
  "serde",
  "sha2",
- "tokio",
 ]
 
 [[package]]

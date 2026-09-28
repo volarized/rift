@@ -1584,10 +1584,10 @@ impl<'a> StoredUnits<'a> {
 /// `SQLite` FTS5-backed lexical search index.
 ///
 /// [`IndexDocument`] is the one shape every Rift index publishes, so a
-/// project row, a package row, and an in-memory fixture carry the same fields
-/// and the same identity spelling. This store holds project documents: a
-/// document addressed by a source unit belongs to a package index, and the
-/// write path refuses it rather than filing a unit URI in the path column.
+/// project row and a package row carry the same fields and the same identity
+/// spelling. This store holds project documents: a document addressed by a
+/// source unit belongs to a package index, and the write path refuses it
+/// rather than filing a unit URI in the path column.
 #[derive(Debug)]
 pub struct LexicalSearchIndex {
     database: Arc<WorkspaceDatabase>,

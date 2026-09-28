@@ -239,8 +239,8 @@ The database tables:
   comparable only within one search. The same statement asks `bm25` once per column with every
   other weight zeroed, which is how an answer states that a term landed in documentation rather
   than in a name. The tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what
-  lets an in-memory adapter tokenize the same text the same way without carrying a folding
-  table of its own.
+  lets Rift split the same text the same way outside SQLite without carrying a folding table
+  of its own.
 - `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
 
