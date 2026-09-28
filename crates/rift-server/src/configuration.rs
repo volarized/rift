@@ -117,6 +117,63 @@ mod tests {
         assert!(configuration.source.respect_gitignore);
     }
 
+    /// Every `rift.toml` the repository keeps, by its path from the repository root.
+    const REPOSITORY_CONFIGURATIONS: [(&str, &str); 2] = [
+        ("docs/rift.toml", include_str!("../../../docs/rift.toml")),
+        ("rift.toml", include_str!("../../../rift.toml")),
+    ];
+
+    /// A server started in any directory of this repository that holds a `rift.toml` reads
+    /// it under the model this module validates against, so each one accepts cleanly.
+    #[test]
+    fn test_every_repository_rift_toml_accepts_cleanly() {
+        for (path, raw) in REPOSITORY_CONFIGURATIONS {
+            if let Err(error) = accept(raw) {
+                panic!("{path} must accept cleanly: {error}");
+            }
+        }
+    }
+
+    /// [`REPOSITORY_CONFIGURATIONS`] names every `rift.toml` below the repository root that
+    /// `.gitignore` keeps, so a file added anywhere in the tree joins the acceptance check.
+    #[test]
+    fn test_the_repository_configurations_name_every_rift_toml_in_the_tree() {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo sets CARGO_MANIFEST_DIR for every test it runs");
+        let root = std::path::Path::new(&manifest).join("../..");
+        let mut walk = ignore::WalkBuilder::new(&root);
+        walk.standard_filters(false)
+            .git_ignore(true)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(|entry| entry.file_name() != ".git");
+        let mut found: Vec<String> = walk
+            .build()
+            .map(|entry| entry.expect("the repository tree must be readable"))
+            .filter(|entry| entry.file_name() == WORKSPACE_CONFIGURATION_FILE)
+            .map(|entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .expect("the walk stays below its root");
+                relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        found.sort();
+        let listed: Vec<&str> = REPOSITORY_CONFIGURATIONS
+            .iter()
+            .map(|(path, _)| *path)
+            .collect();
+        assert_eq!(
+            found, listed,
+            "every rift.toml in the tree must be listed in REPOSITORY_CONFIGURATIONS"
+        );
+    }
+
     #[test]
     fn test_documented_example_file_is_accepted() {
         let directory = tempfile::tempdir().expect("tempdir");

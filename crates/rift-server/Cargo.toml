@@ -48,6 +48,7 @@ serde_json.workspace = true
 serde_path_to_error.workspace = true
 
 [dev-dependencies]
+ignore.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 schemars.workspace = true
 serde_json.workspace = true

@@ -4631,6 +4631,7 @@ dependencies = [
 name = "rift-server"
 version = "0.0.45"
 dependencies = [
+ "ignore",
  "lsp-types",
  "percent-encoding",
  "rayon",
