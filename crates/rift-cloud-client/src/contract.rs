@@ -409,6 +409,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
         ("PackagePatternRequest", "pattern", crate::PATTERN_BYTES_MAX),
+        ("Warning", "detail", crate::WARNING_DETAIL_BYTES_MAX),
     ];
     for (component, property, value) in expected_max_lengths {
         let schema = property_schema(spec, component, property)?;

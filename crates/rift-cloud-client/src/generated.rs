@@ -951,24 +951,8 @@ pub struct PackageResolutionResponse {
     pub missing_exact: Vec<PackageIdentity>,
     /// Requirements absent from the global index.
     pub missing_requirements: Vec<PackageContextEntry>,
-    /// Conditions the caller must account for, each naming one entry of `resolved_requirements` beside the package that answers it. Absent when none applies.
-    pub warnings: Option<Vec<ResolutionWarning>>,
-    /// Additional properties not defined in the schema.
-    #[serde(flatten)]
-    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
-}
-/// One condition an answered entry carries.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-pub struct ResolutionWarning {
-    /// Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.
-    pub code: ResolutionWarningCode,
-    /// One package the workspace depends on, as its manifests and lockfiles state it.
-    ///
-    /// Entries order by manager, then name, then the selector they state: a declared
-    /// requirement before an exact version.
-    pub entry: PackageContextEntry,
-    /// One package as its package manager identifies it.
-    pub package: PackageIdentity,
+    /// Conditions the caller must account for, absent when none applies. A `requirement_unsatisfied` warning names a requirement of `resolved_requirements` whose package lies outside the range the requirement states, since no collected release satisfies it; its `detail` reads `<manager>/<name> <requirement> answered by <version>`, as in `npm/typescript ~5.7.2 answered by 5.9.3`.
+    pub warnings: Option<Vec<Warning>>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -2788,6 +2772,7 @@ pub enum WarningCode {
     PublicationChanged,
     CapabilityUnavailable,
     ResultTruncated,
+    RequirementUnsatisfied,
     Unknown,
 }
 impl core::fmt::Display for WarningCode {
@@ -2798,6 +2783,7 @@ impl core::fmt::Display for WarningCode {
             Self::PublicationChanged => write!(f, "publication_changed"),
             Self::CapabilityUnavailable => write!(f, "capability_unavailable"),
             Self::ResultTruncated => write!(f, "result_truncated"),
+            Self::RequirementUnsatisfied => write!(f, "requirement_unsatisfied"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -2814,38 +2800,9 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
             "publication_changed" => Ok(WarningCode::PublicationChanged),
             "capability_unavailable" => Ok(WarningCode::CapabilityUnavailable),
             "result_truncated" => Ok(WarningCode::ResultTruncated),
+            "requirement_unsatisfied" => Ok(WarningCode::RequirementUnsatisfied),
             "unknown" => Ok(WarningCode::Unknown),
             _ => Ok(WarningCode::Unknown),
-        }
-    }
-}
-/// Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
-pub enum ResolutionWarningCode {
-    #[default]
-    RequirementUnsatisfied,
-    Unknown,
-}
-impl core::fmt::Display for ResolutionWarningCode {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::RequirementUnsatisfied => write!(f, "requirement_unsatisfied"),
-            Self::Unknown => write!(f, "unknown"),
-        }
-    }
-}
-impl<'de> serde::Deserialize<'de> for ResolutionWarningCode {
-    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.to_ascii_lowercase().as_str() {
-            "requirement_unsatisfied" => {
-                Ok(ResolutionWarningCode::RequirementUnsatisfied)
-            }
-            "unknown" => Ok(ResolutionWarningCode::Unknown),
-            _ => Ok(ResolutionWarningCode::Unknown),
         }
     }
 }

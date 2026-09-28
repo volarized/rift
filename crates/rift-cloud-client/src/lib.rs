@@ -60,13 +60,12 @@ pub use generated::{
     PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage,
     PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
     PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
-    ProblemDetails, PublicationFormat, QueryTerm, ResolutionWarning, ResolutionWarningCode,
-    ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
-    SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse,
-    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, Signature,
-    SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
-    Warning, WarningCode,
+    ProblemDetails, PublicationFormat, QueryTerm, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
+    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
@@ -107,6 +106,8 @@ pub const PAGE_LIMIT_MIN: i64 = 1;
 pub const PAGE_LIMIT_MAX: i64 = 1_000;
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
+/// Most UTF-8 bytes one warning's `detail` carries.
+pub const WARNING_DETAIL_BYTES_MAX: usize = 1_024;
 /// Most UTF-8 bytes one source payload carries.
 pub const SOURCE_BYTES_MAX: usize = 1024 * 1024;
 /// Most candidates one page assembly retains.
@@ -1458,31 +1459,43 @@ fn validate_resolution_response(
     validate_resolution_warnings(response)
 }
 
-/// Checks that every `requirement_unsatisfied` warning names a requirement entry of
-/// `resolved_requirements`, beside the package that answers it, at most once.
+/// Checks the resolution's warnings: bounded like page warnings, and each
+/// `requirement_unsatisfied` naming, through its `detail`, one requirement of
+/// `resolved_requirements` beside the version that answers it, at most once.
 fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<(), ClientError> {
     let warnings = response.warnings.as_deref().unwrap_or_default();
-    if warnings.len() > DEPENDENCY_ENTRIES_MAX {
+    if warnings.len() > DEPENDENCY_ENTRIES_MAX || !warning_details_within_bound(warnings) {
         return Err(ClientError::InvalidResponseField { field: "warnings" });
     }
-    let mut named = HashSet::new();
+    let named: HashSet<String> = response
+        .resolved_requirements
+        .iter()
+        .filter_map(ResolvedRequirement::unsatisfied_detail)
+        .collect();
+    let mut seen = HashSet::new();
     for warning in warnings {
-        if warning.code != ResolutionWarningCode::RequirementUnsatisfied {
+        if warning.code != WarningCode::RequirementUnsatisfied {
             continue;
         }
-        let is_requirement = warning.entry.version.is_none() && warning.entry.requirement.is_some();
-        let answered = response
-            .resolved_requirements
-            .iter()
-            .any(|resolved| resolved.entry == warning.entry && resolved.package == warning.package);
-        let first = named.insert(context_key(&warning.entry));
-        if !(is_requirement && answered && first) {
+        let detail = warning.detail.as_deref();
+        let names_a_requirement = detail.is_some_and(|detail| named.contains(detail));
+        if !names_a_requirement || !seen.insert(detail) {
             return Err(ClientError::InvalidResponseField {
                 field: "resolution_warning",
             });
         }
     }
     Ok(())
+}
+
+/// Whether every warning's `detail`, when present, holds 1 to `WARNING_DETAIL_BYTES_MAX` bytes.
+fn warning_details_within_bound(warnings: &[Warning]) -> bool {
+    warnings.iter().all(|warning| {
+        warning
+            .detail
+            .as_ref()
+            .is_none_or(|detail| !detail.is_empty() && detail.len() <= WARNING_DETAIL_BYTES_MAX)
+    })
 }
 
 impl ResolvedRequirement {
@@ -1499,6 +1512,16 @@ impl ResolvedRequirement {
         };
         names_the_package && selector_holds
     }
+
+    /// The `detail` a `requirement_unsatisfied` warning carries for this requirement:
+    /// `<manager>/<name> <requirement> answered by <version>`. `None` for an exact entry.
+    fn unsatisfied_detail(&self) -> Option<String> {
+        let requirement = self.entry.requirement.as_ref()?;
+        Some(format!(
+            "{}/{} {requirement} answered by {}",
+            self.entry.manager, self.entry.name, self.package.version
+        ))
+    }
 }
 
 /// One entry the global index answers from a release other than the one it names.
@@ -1512,8 +1535,8 @@ pub struct Substitution {
 
 impl PackageResolutionResponse {
     /// The substitutions this resolution names, in `resolved_requirements` order: each exact
-    /// entry answered at another version, and each requirement a `requirement_unsatisfied`
-    /// warning names.
+    /// entry answered at another version, and each requirement whose served version a
+    /// `requirement_unsatisfied` warning names in its `detail`.
     ///
     /// The resolution names an exact substitution by answering the exact entry in
     /// `resolved_requirements` beside the served package. An `available_exact` package at a
@@ -1521,7 +1544,14 @@ impl PackageResolutionResponse {
     /// whole resolution as `resolution_accounting`.
     #[must_use]
     pub fn substitutions(&self) -> Vec<Substitution> {
-        let warnings = self.warnings.as_deref().unwrap_or_default();
+        let unsatisfied: HashSet<&str> = self
+            .warnings
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|warning| warning.code == WarningCode::RequirementUnsatisfied)
+            .filter_map(|warning| warning.detail.as_deref())
+            .collect();
         self.resolved_requirements
             .iter()
             .filter(|resolved| {
@@ -1530,10 +1560,9 @@ impl PackageResolutionResponse {
                     .version
                     .as_ref()
                     .is_some_and(|requested| requested != &resolved.package.version);
-                let outside_its_range = warnings.iter().any(|warning| {
-                    warning.code == ResolutionWarningCode::RequirementUnsatisfied
-                        && warning.entry == resolved.entry
-                });
+                let outside_its_range = resolved
+                    .unsatisfied_detail()
+                    .is_some_and(|detail| unsatisfied.contains(detail.as_str()));
                 exact_elsewhere || outside_its_range
             })
             .map(|resolved| Substitution {
@@ -1883,12 +1912,7 @@ impl PageMetadata<'_> {
             return Err(ClientError::InvalidResponseField { field: "cursor" });
         }
         if self.warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
-            || self.warnings.iter().any(|warning| {
-                warning
-                    .detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.is_empty() || detail.len() > 1024)
-            })
+            || !warning_details_within_bound(self.warnings)
         {
             return Err(ClientError::InvalidResponseField { field: "warnings" });
         }

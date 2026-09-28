@@ -35,8 +35,9 @@ fn entry_json(entry: &PackageContextEntry) -> Value {
     serde_json::to_value(entry).expect("context entry JSON")
 }
 
-fn warning_json(entry: &PackageContextEntry, version: &str) -> Value {
-    json!({"code": "requirement_unsatisfied", "entry": entry_json(entry), "package": served(version)})
+/// A `requirement_unsatisfied` warning whose `detail` names `selector` answered by `version`.
+fn warning_json(selector: &str, version: &str) -> Value {
+    json!({"code": "requirement_unsatisfied", "detail": format!("cargo/demo {selector} answered by {version}")})
 }
 
 fn resolution(resolved: &Value, available: &Value, warnings: Option<Value>) -> Value {
@@ -68,7 +69,7 @@ pub(super) fn substitution_response(mode: &OperationFixture) -> Option<Value> {
         }
         OperationFixture::RequirementOutsideRange => {
             let requirement = requirement_entry();
-            let warnings = json!([warning_json(&requirement, "5.9.3")]);
+            let warnings = json!([warning_json(RANGE, "5.9.3")]);
             resolution(&resolved(&requirement, "5.9.3"), &json!([]), Some(warnings))
         }
         _ => return None,
@@ -180,16 +181,14 @@ fn test_resolution_refuses_a_warning_naming_no_answered_requirement() {
     let cases = [
         (
             "another served version",
-            json!([warning_json(&requirement, "5.9.2")]),
+            json!([warning_json(RANGE, "5.9.2")]),
         ),
-        ("an exact entry", json!([warning_json(&exact, "1.0.2")])),
+        ("an exact entry", json!([warning_json("1.0.3", "1.0.2")])),
         (
             "the same requirement twice",
-            json!([
-                warning_json(&requirement, "5.9.3"),
-                warning_json(&requirement, "5.9.3")
-            ]),
+            json!([warning_json(RANGE, "5.9.3"), warning_json(RANGE, "5.9.3")]),
         ),
+        ("no detail", json!([{"code": "requirement_unsatisfied"}])),
     ];
     for (case, warnings) in cases {
         let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
@@ -202,8 +201,7 @@ fn test_resolution_refuses_a_warning_naming_no_answered_requirement() {
         );
     }
 
-    let future =
-        json!([{"code": "future_code", "entry": entry_json(&exact), "package": served("0.0.1")}]);
+    let future = json!([{"code": "future_code", "detail": "cargo/demo 1.0.3 answered by 1.0.2"}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(future)));
     assert_eq!(validate_resolution_response(&request, &response), Ok(()));
     assert_eq!(
@@ -211,7 +209,7 @@ fn test_resolution_refuses_a_warning_naming_no_answered_requirement() {
             .warnings
             .as_deref()
             .map(|warnings| &warnings[0].code),
-        Some(&ResolutionWarningCode::Unknown)
+        Some(&WarningCode::Unknown)
     );
     assert_eq!(
         response.substitutions(),
@@ -230,12 +228,20 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
         entries: vec![requirement.clone()],
     };
     let resolved = json!([{"entry": entry_json(&requirement), "package": served("5.9.3")}]);
-    let unknown =
-        json!({"code": "unknown", "entry": entry_json(&requirement), "package": served("5.9.3")});
-    let warnings = Value::Array(vec![unknown; DEPENDENCY_ENTRIES_MAX + 1]);
-    let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
-    assert_eq!(
-        validate_resolution_response(&request, &response),
-        Err(ClientError::InvalidResponseField { field: "warnings" })
-    );
+    let unknown = json!({"code": "unknown"});
+    let past_the_bound = [
+        Value::Array(vec![unknown; DEPENDENCY_ENTRIES_MAX + 1]),
+        json!([{"code": "unknown", "detail": ""}]),
+        json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_BYTES_MAX + 1)}]),
+    ];
+    for warnings in past_the_bound {
+        let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
+        assert_eq!(
+            validate_resolution_response(&request, &response),
+            Err(ClientError::InvalidResponseField { field: "warnings" })
+        );
+    }
+    let at_the_bound = json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_BYTES_MAX)}]);
+    let response = decoded(resolution(&resolved, &json!([]), Some(at_the_bound)));
+    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
 }

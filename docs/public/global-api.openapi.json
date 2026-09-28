@@ -370,17 +370,7 @@
                       "warnings": [
                         {
                           "code": "requirement_unsatisfied",
-                          "entry": {
-                            "manager": "npm",
-                            "name": "typescript",
-                            "availability": "canonical",
-                            "requirement": "~5.7.2"
-                          },
-                          "package": {
-                            "manager": "npm",
-                            "name": "typescript",
-                            "version": "5.9.3"
-                          }
+                          "detail": "npm/typescript ~5.7.2 answered by 5.9.3"
                         }
                       ]
                     }
@@ -2473,6 +2463,7 @@
               "publication_changed",
               "capability_unavailable",
               "result_truncated",
+              "requirement_unsatisfied",
               "unknown"
             ]
           },
@@ -2749,9 +2740,9 @@
             "maxItems": 20000
           },
           "warnings": {
-            "description": "Conditions the caller must account for, each naming one entry of `resolved_requirements` beside the package that answers it. Absent when none applies.",
+            "description": "Conditions the caller must account for, absent when none applies. A `requirement_unsatisfied` warning names a requirement of `resolved_requirements` whose package lies outside the range the requirement states, since no collected release satisfies it; its `detail` reads `<manager>/<name> <requirement> answered by <version>`, as in `npm/typescript ~5.7.2 answered by 5.9.3`.",
             "items": {
-              "$ref": "#/components/schemas/ResolutionWarning"
+              "$ref": "#/components/schemas/Warning"
             },
             "type": "array",
             "maxItems": 20000
@@ -2762,34 +2753,6 @@
           "resolved_requirements",
           "missing_exact",
           "missing_requirements"
-        ],
-        "type": "object"
-      },
-      "ResolutionWarning": {
-        "additionalProperties": true,
-        "description": "One condition an answered entry carries.",
-        "properties": {
-          "code": {
-            "description": "Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "enum": [
-              "requirement_unsatisfied",
-              "unknown"
-            ]
-          },
-          "entry": {
-            "$ref": "#/components/schemas/PackageContextEntry"
-          },
-          "package": {
-            "$ref": "#/components/schemas/PackageIdentity"
-          }
-        },
-        "required": [
-          "code",
-          "entry",
-          "package"
         ],
         "type": "object"
       },

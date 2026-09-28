@@ -289,7 +289,9 @@ fn extend_page_warnings(target: &mut Vec<ReadWarning>, warnings: Vec<Warning>) {
                 WarningCode::PublicationChanged => GlobalPageWarningCode::PublicationChanged,
                 WarningCode::CapabilityUnavailable => GlobalPageWarningCode::CapabilityUnavailable,
                 WarningCode::ResultTruncated => GlobalPageWarningCode::ResultTruncated,
-                WarningCode::Unknown => GlobalPageWarningCode::Unknown,
+                WarningCode::RequirementUnsatisfied | WarningCode::Unknown => {
+                    GlobalPageWarningCode::Unknown
+                }
             },
             detail: warning.detail,
         };
