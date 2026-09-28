@@ -1540,8 +1540,8 @@ enum ExportRule {
     Language(PackageLanguage),
     /// A JavaScript module exports what an ES `export` wraps: a declaration the provider
     /// marks `Public`, and a member of a class so marked other than an ES private
-    /// element. A CommonJS `module.exports` or `exports.name` assignment wraps no
-    /// declaration, so it marks none.
+    /// element. A `module.exports` or `exports.name` assignment wraps no declaration, so
+    /// it marks none.
     JavaScriptModule,
 }
 
@@ -1975,9 +1975,9 @@ mod tests {
         }
     }
 
-    /// The JavaScript provider declares nothing for a CommonJS `exports.name = function`
+    /// The JavaScript provider declares nothing for an `exports.name = function`
     /// assignment, and marks no declaration `Public` for `module.exports = { .. }`, so a
-    /// CommonJS module keeps its declarations and exports none of them.
+    /// module exporting through them keeps its declarations and exports none of them.
     #[test]
     fn test_a_commonjs_module_exports_no_declaration() {
         let source = "function helper() {}\n\
