@@ -1,22 +1,24 @@
 //! Maps one qualifying call to the `search` arguments answering the same question.
 //!
 //! A `Grep` call, and the `grep` or `rg` command [`super::bash`] reads as one, maps to a
-//! `search` call carrying `pattern`; a `Glob` call, and a `find` command, map to
-//! `paths.include` globs. A call holding a field `search` has no form for maps to nothing, so
-//! the steer lets it through without a deny. Sans-I/O: every path arrives classified as a
-//! [`GrepPath`], which the shell probes.
-
-use std::borrow::Cow;
+//! `search` call carrying `pattern`. A `Glob` call, and a `find` command, list files by
+//! name, so they map to a `search` call whose `pattern` matches once in every file, over the
+//! `paths.include` globs selecting the same names. A call holding a field `search` has no
+//! form for maps to nothing, so the steer lets it through without a deny. Sans-I/O: every
+//! path arrives classified as a [`GrepPath`], which the shell probes.
 
 use ignore::types::TypesBuilder;
 use rift_protocol::read::{PAGE_LIMIT_MAX, PathPattern, SearchParamsTarget};
 use serde::Serialize;
 use serde_json::Value;
 
-/// UTF-8 bytes of the caller's own pattern a deny reason carries. A longer `Grep` pattern
-/// passes without a deny, since a truncated regex is another regex; a longer `Glob` pattern
-/// is truncated so the reason stays bounded.
+/// UTF-8 bytes of the caller's own regex a deny reason carries. A longer `Grep` pattern
+/// passes without a deny, since a truncated regex is another regex.
 pub(super) const DENY_PATTERN_BYTES_MAX: usize = 256;
+
+/// The `pattern` a file listing searches with. `\A` matches once, at the start of each
+/// file's text, so the answer holds one file hit per file its `paths` select.
+const EVERY_FILE_PATTERN: &str = r"\A";
 
 /// Bytes of one serialized `search` suggestion. A call whose arguments run longer passes
 /// without a deny, so the deny reason stays bounded whatever the call names.
@@ -101,6 +103,32 @@ impl GrepRequest {
             head_limit: None,
             offset: None,
         }
+    }
+
+    /// A request listing each file `globs` select once, as a `Glob` call or a `find DIRECTORY
+    /// -name NAME` command asks: [`EVERY_FILE_PATTERN`], answered as file hits.
+    pub(super) fn files(globs: Vec<String>) -> Self {
+        Self {
+            globs,
+            files_only: true,
+            ..Self::lines(EVERY_FILE_PATTERN.to_owned())
+        }
+    }
+
+    /// Reads one `Glob` call's input, the `pattern` and `path` fields Claude Code 2.1.280's
+    /// `Glob` schema declares; `path` is resolved by the caller. The pattern is one
+    /// `rg --glob` value, which reads it with the `.gitignore` rules `paths.include` reads.
+    /// `None` for a pattern that is not a string, or a field steer does not know.
+    pub(super) fn from_glob_input(input: &Value) -> Option<Self> {
+        let fields = input.as_object()?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "pattern" | "path"))
+        {
+            return None;
+        }
+        let pattern = fields.get("pattern")?.as_str()?;
+        Some(Self::files(vec![pattern.to_owned()]))
     }
 
     /// Reads one `Grep` call's input, the fields Claude Code 2.1.280's `Grep` schema
@@ -254,28 +282,6 @@ struct SuggestedPaths {
     include: Vec<PathPattern>,
 }
 
-/// The `paths.include` list one `Glob` pattern maps to, serialized so a quote or backslash
-/// stays valid JSON. `None` for a pattern `paths.include` refuses.
-pub(super) fn glob_suggestion(pattern: &str) -> Option<String> {
-    let include = [PathPattern(truncate_pattern(pattern).into_owned())];
-    if include[0].violation().is_some() {
-        return None;
-    }
-    serde_json::to_string(&include).ok()
-}
-
-/// The `paths.include` list one `find DIRECTORY -name NAME` maps to: `NAME` in every
-/// directory below `DIRECTORY`. `None` for a start path that is not a directory in the
-/// workspace.
-pub(super) fn find_suggestion(directory: &GrepPath, name: &str) -> Option<String> {
-    let pattern = match directory {
-        GrepPath::Root => format!("**/{name}"),
-        GrepPath::Directory(directory) => format!("{directory}/**/{name}"),
-        GrepPath::File(_) | GrepPath::Unmapped => return None,
-    };
-    glob_suggestion(&pattern)
-}
-
 /// Splits one `Grep` `glob` as Claude Code 2.1.280 does before passing each piece to
 /// `rg --glob`: on whitespace, then on commas, except that a piece holding both `{` and `}`
 /// stays whole.
@@ -325,27 +331,14 @@ fn count(value: &Value) -> Option<u64> {
     }
 }
 
-/// Truncates `pattern` at a UTF-8 char boundary within [`DENY_PATTERN_BYTES_MAX`] bytes,
-/// so a caller-supplied glob cannot grow the deny reason without bound.
-fn truncate_pattern(pattern: &str) -> Cow<'_, str> {
-    if pattern.len() <= DENY_PATTERN_BYTES_MAX {
-        return Cow::Borrowed(pattern);
-    }
-    let mut end = DENY_PATTERN_BYTES_MAX;
-    while end > 0 && !pattern.is_char_boundary(end) {
-        end -= 1;
-    }
-    Cow::Owned(format!("{}...", &pattern[..end]))
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use rift_protocol::read::SearchParams;
     use serde_json::{Value, json};
 
     use super::{
-        DENY_PATTERN_BYTES_MAX, GrepPath, GrepRequest, INCLUDE_GLOBS_MAX, SUGGESTION_BYTES_MAX,
-        find_suggestion, glob_suggestion, grep_globs, truncate_pattern,
+        DENY_PATTERN_BYTES_MAX, EVERY_FILE_PATTERN, GrepPath, GrepRequest, INCLUDE_GLOBS_MAX,
+        SUGGESTION_BYTES_MAX, grep_globs,
     };
 
     /// Proves one suggestion is a `search` call the server takes: it deserializes into
@@ -620,36 +613,73 @@ pub(super) mod tests {
         assert_eq!(past_bound.suggestion(&[GrepPath::Root]), None);
     }
 
-    #[test]
-    fn a_glob_serializes_as_one_include_entry() {
-        assert_eq!(
-            glob_suggestion("**/*.rs").as_deref(),
-            Some(r#"["**/*.rs"]"#)
-        );
-        assert_eq!(
-            glob_suggestion(r#"**/say"hi".rs"#).as_deref(),
-            Some(r#"["**/say\"hi\".rs"]"#)
-        );
-        assert_eq!(glob_suggestion("/etc/**"), None);
-        assert_eq!(glob_suggestion(""), None);
+    /// The `search` arguments one `Glob` input maps to at `path`, proven a served call, or
+    /// `None` when the call passes.
+    fn listed(input: &Value, path: &GrepPath) -> Option<Value> {
+        let request = GrepRequest::from_glob_input(input)?;
+        let suggestion = request.suggestion(std::slice::from_ref(path))?;
+        Some(served_search_call(&suggestion))
+    }
+
+    /// The listing call selecting `include`, as a `Glob` call or a `find` command maps.
+    fn listing(include: &[&str]) -> Value {
+        json!({"pattern": EVERY_FILE_PATTERN, "paths": {"include": include}, "target": "file"})
     }
 
     #[test]
-    fn a_find_name_maps_below_its_start_directory() {
+    fn a_glob_maps_to_a_listing_of_the_files_it_selects() {
+        let rust = json!({"pattern": "**/*.rs"});
+        assert_eq!(listed(&rust, &GrepPath::Root), Some(listing(&["**/*.rs"])));
+        let quoted = json!({"pattern": r#"**/say"hi".rs"#});
         assert_eq!(
-            find_suggestion(&GrepPath::Root, "*.rs").as_deref(),
-            Some(r#"["**/*.rs"]"#)
+            listed(&quoted, &GrepPath::Root),
+            Some(listing(&[r#"**/say"hi".rs"#]))
         );
+        let below = json!({"pattern": "*.rs", "path": "src"});
         assert_eq!(
-            find_suggestion(&GrepPath::Directory("src".to_owned()), "*.rs").as_deref(),
-            Some(r#"["src/**/*.rs"]"#)
+            listed(&below, &GrepPath::Directory("src".to_owned())),
+            Some(listing(&["src/**/*.rs"]))
         );
+    }
+
+    #[test]
+    fn a_glob_no_include_list_states_passes() {
+        let cases = [
+            (json!({"pattern": "/etc/**"}), GrepPath::Root),
+            (json!({"pattern": ""}), GrepPath::Root),
+            (json!({"pattern": 7}), GrepPath::Root),
+            (json!({"path": "src"}), GrepPath::Root),
+            (json!({"pattern": "*.rs", "limit": 10}), GrepPath::Root),
+            (
+                json!({"pattern": "lib/*.rs"}),
+                GrepPath::Directory("src".to_owned()),
+            ),
+            (
+                json!({"pattern": "*.rs"}),
+                GrepPath::File("src/lib.rs".to_owned()),
+            ),
+            (json!({"pattern": "*.rs"}), GrepPath::Unmapped),
+        ];
+        for (input, path) in cases {
+            assert_eq!(listed(&input, &path), None, "{input} at {path:?}");
+        }
+    }
+
+    #[test]
+    fn a_find_name_lists_the_files_below_its_start_directory() {
+        let find = |directory: &GrepPath, name: &str| {
+            GrepRequest::files(vec![name.to_owned()])
+                .suggestion(std::slice::from_ref(directory))
+                .map(|suggestion| served_search_call(&suggestion))
+        };
+        assert_eq!(find(&GrepPath::Root, "*.rs"), Some(listing(&["*.rs"])));
         assert_eq!(
-            find_suggestion(&GrepPath::File("src/lib.rs".to_owned()), "*.rs"),
-            None
+            find(&GrepPath::Directory("src".to_owned()), "*.rs"),
+            Some(listing(&["src/**/*.rs"]))
         );
-        assert_eq!(find_suggestion(&GrepPath::Unmapped, "*.rs"), None);
-        assert_eq!(find_suggestion(&GrepPath::Root, r"a\b"), None);
+        assert_eq!(find(&GrepPath::File("src/lib.rs".to_owned()), "*.rs"), None);
+        assert_eq!(find(&GrepPath::Unmapped, "*.rs"), None);
+        assert_eq!(find(&GrepPath::Root, r"a\b"), None);
     }
 
     #[test]
@@ -658,31 +688,5 @@ pub(super) mod tests {
         assert!(GrepPath::Directory("src".to_owned()).is_directory());
         assert!(!GrepPath::File("src/lib.rs".to_owned()).is_directory());
         assert!(!GrepPath::Unmapped.is_directory());
-    }
-
-    #[test]
-    fn truncate_pattern_keeps_short_patterns_verbatim() {
-        assert_eq!(truncate_pattern("short"), "short");
-    }
-
-    #[test]
-    fn truncate_pattern_cuts_long_patterns_at_a_char_boundary() {
-        let long = "é".repeat(200);
-        let truncated = truncate_pattern(&long);
-        assert!(truncated.ends_with("..."));
-        assert!(truncated.len() <= DENY_PATTERN_BYTES_MAX + "...".len());
-        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
-    }
-
-    #[test]
-    fn truncate_pattern_backs_off_when_the_cut_lands_mid_character() {
-        // "€" is 3 bytes; DENY_PATTERN_BYTES_MAX (256) is not a multiple of 3,
-        // so the naive cut at byte 256 lands mid-character and must back off
-        // to the nearest char boundary at byte 255.
-        let long = "€".repeat(100);
-        let truncated = truncate_pattern(&long);
-        assert!(truncated.ends_with("..."));
-        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
-        assert_eq!(truncated.len(), 255 + "...".len());
     }
 }

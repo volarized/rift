@@ -70,8 +70,8 @@ fn tool_payload(
     .to_string()
 }
 
-/// The `search` arguments a deny reason suggests, parsed from the text
-/// between `tool: ` and ` finds`.
+/// The `search` arguments a deny reason suggests: the one JSON object
+/// following `tool: `.
 fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
     let decision = decision(output)?;
     assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -79,11 +79,14 @@ fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
         .as_str()
         .ok_or("a deny carries a reason")?;
     let call = reason
-        .split("tool: ")
-        .nth(1)
-        .and_then(|rest| rest.split(" finds").next())
+        .split_once("tool: ")
+        .and_then(|(_, rest)| {
+            serde_json::Deserializer::from_str(rest)
+                .into_iter::<serde_json::Value>()
+                .next()
+        })
         .ok_or_else(|| format!("the reason names no call: {reason}"))?;
-    Ok(serde_json::from_str(call)?)
+    Ok(call?)
 }
 
 fn indexed_workspace(root: &Path) -> TestResult {
@@ -284,6 +287,29 @@ fn a_bash_grep_from_a_subdirectory_denies_with_its_search_call() -> TestResult {
             .join("steer")
             .join("session-bash")
             .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_glob_call_from_a_subdirectory_denies_with_the_listing_call() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let source = root.join("src");
+    fs::create_dir(&source)?;
+    let input = serde_json::json!({"pattern": "*.rs"});
+    let payload = tool_payload("Glob", &input, "session-glob", &source);
+
+    let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        suggested_call(&output)?,
+        serde_json::json!({
+            "pattern": r"\A",
+            "paths": {"include": ["src/**/*.rs"]},
+            "target": "file"
+        })
     );
     Ok(())
 }

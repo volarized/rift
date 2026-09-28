@@ -27,14 +27,14 @@ use bash::{BashSearch, bash_search};
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use suggestion::{GrepPath, GrepRequest, find_suggestion, glob_suggestion};
+use suggestion::{GrepPath, GrepRequest};
 
 /// Bytes of one hook payload steer reads from stdin; a payload past this
 /// bound answers allow rather than growing an unbounded buffer.
 const HOOK_STDIN_BYTES_MAX: u64 = 1_048_576;
 
-/// The path a `Grep` call without `path`, and a recursive `grep`, `rg`, or
-/// `find` naming none, searches: the hook's working directory.
+/// The path a `Grep` or `Glob` call without `path`, and a recursive `grep`, `rg`,
+/// or `find` naming none, searches: the hook's working directory.
 const CURRENT_DIRECTORY: &str = ".";
 
 /// Highest ASCII bytes in a session id steer accepts, matching the marker
@@ -168,6 +168,14 @@ impl HookCall {
             .and_then(Value::as_str)
     }
 
+    /// The path a `Grep` or `Glob` call searches: its `path`, or the hook's working
+    /// directory when the call names none.
+    fn searched_path(&self) -> &str {
+        self.input_text("path")
+            .filter(|path| !path.is_empty())
+            .unwrap_or(CURRENT_DIRECTORY)
+    }
+
     /// This call's session id, validated against the marker filename form.
     /// `None` for a missing or invalid id, so no path is ever built from an
     /// unvalidated one.
@@ -223,14 +231,10 @@ impl QualifyingTool {
     /// call names against the workspace root.
     fn suggestion(&self, call: &HookCall, resolve: &dyn Fn(&str) -> GrepPath) -> Option<String> {
         match self {
-            Self::Grep => {
-                let path = call
-                    .input_text("path")
-                    .filter(|path| !path.is_empty())
-                    .unwrap_or(CURRENT_DIRECTORY);
-                GrepRequest::from_input(call.tool_input.as_ref()?)?.suggestion(&[resolve(path)])
-            }
-            Self::Glob => glob_suggestion(call.input_text("pattern")?),
+            Self::Grep => GrepRequest::from_input(call.tool_input.as_ref()?)?
+                .suggestion(&[resolve(call.searched_path())]),
+            Self::Glob => GrepRequest::from_glob_input(call.tool_input.as_ref()?)?
+                .suggestion(&[resolve(call.searched_path())]),
             Self::Bash(BashSearch::Grep {
                 request,
                 paths,
@@ -242,7 +246,7 @@ impl QualifyingTool {
                 (!refused).then(|| request.suggestion(&paths))?
             }
             Self::Bash(BashSearch::Find { directory, name }) => {
-                find_suggestion(&resolve(directory), name)
+                GrepRequest::files(vec![name.clone()]).suggestion(&[resolve(directory)])
             }
         }
     }
@@ -319,7 +323,7 @@ fn deny_reason(tool: &QualifyingTool, suggestion: &str) -> String {
     let clause = if tool.searches_text() {
         format!("{suggestion} finds declarations and text,")
     } else {
-        format!("search with paths.include {suggestion} finds files by path,")
+        format!("{suggestion} lists the indexed files by path,")
     };
     let name = tool.name();
     format!(
@@ -541,14 +545,11 @@ mod tests {
     }
 
     /// The suggestion one hook call maps to, its paths classified by
-    /// `resolve`, proven a served `search` call when it is a text search.
-    fn suggested(call: &HookCall, resolve: &dyn Fn(&str) -> GrepPath) -> Option<String> {
+    /// `resolve`, proven a served `search` call.
+    fn suggested(call: &HookCall, resolve: &dyn Fn(&str) -> GrepPath) -> Option<Value> {
         let tool = call.qualifying_tool()?;
         let suggestion = tool.suggestion(call, resolve)?;
-        if tool.searches_text() {
-            served_search_call(&suggestion);
-        }
-        Some(suggestion)
+        Some(served_search_call(&suggestion))
     }
 
     /// Classifies paths the way a workspace holding `src/` and
@@ -722,13 +723,13 @@ mod tests {
             GrepPath::Directory("crates".to_owned())
         };
         assert_eq!(
-            suggested(&call, &resolve).as_deref(),
-            Some(r#"{"pattern":"fn","paths":{"include":["crates/**"]}}"#)
+            suggested(&call, &resolve),
+            Some(json!({"pattern": "fn", "paths": {"include": ["crates/**"]}}))
         );
         let call = hook_call("Grep", &json!({"pattern": "fn", "path": "src"}));
         assert_eq!(
-            suggested(&call, &resolve).as_deref(),
-            Some(r#"{"pattern":"fn","paths":{"include":["crates/**"]},"target":"file"}"#)
+            suggested(&call, &resolve),
+            Some(json!({"pattern": "fn", "paths": {"include": ["crates/**"]}, "target": "file"}))
         );
         let call = hook_call("Grep", &json!({"pattern": "fn", "path": ""}));
         assert!(suggested(&call, &resolve).is_some());
@@ -738,18 +739,23 @@ mod tests {
     }
 
     #[test]
-    fn a_glob_call_and_a_find_command_select_files_by_path() {
+    fn a_glob_call_and_a_find_command_list_the_files_they_select() {
+        let listing = |include: &str| json!({"pattern": r"\A", "paths": {"include": [include]}, "target": "file"});
         let glob = hook_call("Glob", &json!({"pattern": "**/*.rs"}));
+        assert_eq!(suggested(&glob, &fixture_path), Some(listing("**/*.rs")));
+        let below = hook_call("Glob", &json!({"pattern": "*.rs", "path": "src"}));
         assert_eq!(
-            suggested(&glob, &fixture_path).as_deref(),
-            Some(r#"["**/*.rs"]"#)
+            suggested(&below, &fixture_path),
+            Some(listing("src/**/*.rs"))
         );
         let absolute = hook_call("Glob", &json!({"pattern": "/etc/*.conf"}));
         assert_eq!(suggested(&absolute, &fixture_path), None);
+        let outside = hook_call("Glob", &json!({"pattern": "*.conf", "path": "/etc"}));
+        assert_eq!(suggested(&outside, &fixture_path), None);
         let find = hook_call("Bash", &json!({"command": "find src -name '*.rs'"}));
         assert_eq!(
-            suggested(&find, &fixture_path).as_deref(),
-            Some(r#"["src/**/*.rs"]"#)
+            suggested(&find, &fixture_path),
+            Some(listing("src/**/*.rs"))
         );
         let outside = hook_call("Bash", &json!({"command": "find /etc -name '*.conf'"}));
         assert_eq!(suggested(&outside, &fixture_path), None);
@@ -790,12 +796,7 @@ mod tests {
         ];
         for (command, expected) in cases {
             let call = hook_call("Bash", &json!({"command": command}));
-            let suggestion = suggested(&call, &fixture_path);
-            let arguments = suggestion
-                .map(|suggestion| serde_json::from_str::<Value>(&suggestion))
-                .transpose()
-                .expect("a suggestion is JSON");
-            assert_eq!(arguments, expected, "{command}");
+            assert_eq!(suggested(&call, &fixture_path), expected, "{command}");
         }
     }
 
@@ -809,7 +810,8 @@ mod tests {
             );
         }
         let grep_reason = deny_reason(&QualifyingTool::Grep, r#"{"pattern":"TODO"}"#);
-        let glob_reason = deny_reason(&QualifyingTool::Glob, r#"["**/*.rs"]"#);
+        let listing = r#"{"pattern":"\\A","paths":{"include":["**/*.rs"]},"target":"file"}"#;
+        let glob_reason = deny_reason(&QualifyingTool::Glob, listing);
         for reason in [&grep_reason, &glob_reason] {
             assert!(reason.contains("search"), "{reason}");
             assert!(reason.contains("get_symbol"), "{reason}");
@@ -820,7 +822,7 @@ mod tests {
             "{grep_reason}"
         );
         assert!(
-            glob_reason.contains(r#"paths.include ["**/*.rs"]"#),
+            glob_reason.contains(&format!("tool: {listing} lists the indexed files")),
             "{glob_reason}"
         );
     }

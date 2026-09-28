@@ -584,6 +584,28 @@ async fn notebooks_split_lines_and_force_included_files_are_verified_whole() -> 
     Ok(())
 }
 
+/// `\A` matches once, at the start of a file's text, so a `target: "file"` search lists
+/// each file the `paths` select once, a parsed file and a chunked one alike: the listing a
+/// `Glob` call steers to.
+#[tokio::test]
+async fn a_start_of_text_pattern_lists_each_selected_file_once() -> TestResult {
+    let (directory, service) = fixture()?;
+    let listing = |include: &[&str]| json!({"pattern": r"\A", "paths": {"include": include}, "target": "file"});
+    let notes = searched(&directory, &service, listing(&["notes/**"])).await?;
+    let start = |path: &str| (path.to_owned(), 1, 0, 0);
+    assert_eq!(
+        located(&notes),
+        [
+            start("notes/crlf.txt"),
+            start("notes/grusse.txt"),
+            start("notes/long.txt")
+        ]
+    );
+    let rust = searched(&directory, &service, listing(&["*.rs"])).await?;
+    assert_eq!(located(&rust), [start("src/lib.rs")]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn paths_narrow_the_verified_files() -> TestResult {
     let (directory, service) = fixture()?;
