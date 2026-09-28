@@ -10,6 +10,8 @@
 //! gives while it loads or after an edit, and one suite drives rust-analyzer itself under
 //! `RIFT_ENGINE_LIVE`.
 
+#[cfg(unix)]
+mod fake_engine;
 mod hermetic_search;
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
@@ -923,39 +925,13 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
     Ok(())
 }
 
-/// A `sh` engine serving references and call hierarchy that begins and ends its work at
-/// start, so the session reads it ready once quiet, and answers every request `null`: a
-/// prepare that gives no item.
-#[cfg(unix)]
-const READY_UNPREPARED_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
-while IFS= read -r header; do
-  IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
-  body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  case "$body" in
-    *'"method":"initialize"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
-      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
-      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
-    *'"id":'*) frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
-  esac
-done
-"#;
-
 /// Once the engine reads ready, an empty prepare at the seed refuses, naming the seed's
 /// kind; the incoming walk's other refusals stay: a walk beside `change` refuses.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_refuses() -> TestResult
 {
-    let engine = tempfile::tempdir()?;
-    let script = engine.path().join("engine.sh");
-    std::fs::write(&script, READY_UNPREPARED_ENGINE)?;
-    let configuration = format!(
-        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
-        script.display()
-    );
+    let (_engine, configuration) = fake_engine::rust_engine(fake_engine::READY_UNPREPARED_ENGINE)?;
     let (_directory, client, _server_task) = served_workspace(
         &[("lib.rs", "pub struct Beacon;\n\npub fn caller() {}\n")],
         Some(configuration),
@@ -994,101 +970,18 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
     Ok(())
 }
 
-/// A `sh` engine serving references and call hierarchy over `lib.rs`, whose `caller`
-/// calls `beacon`. It prepares `caller` at any position, names `beacon` at line
-/// `CALLEE_LINE` as the one callee, and answers references with `beacon`'s own occurrence
-/// on line 0 beside a call at line `CALLER_LINE`. `PROGRESS` runs once `initialize` is
-/// answered.
-#[cfg(unix)]
-const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
-while IFS= read -r header; do
-  IFS= read -r blank
-  length=$(printf '%s' "$header" | tr -dc 0-9)
-  body=$(dd bs=1 count="$length" 2>/dev/null)
-  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
-  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
-  case "$body" in
-    *'"method":"initialize"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}"
-      PROGRESS ;;
-    *'"method":"textDocument/prepareCallHierarchy"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"caller\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":4,\"character\":1}},\"selectionRange\":{\"start\":{\"line\":2,\"character\":7},\"end\":{\"line\":2,\"character\":13}}}]}" ;;
-    *'"method":"callHierarchy/outgoingCalls"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"beacon\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":CALLEE_LINE,\"character\":0},\"end\":{\"line\":CALLEE_LINE,\"character\":18}},\"selectionRange\":{\"start\":{\"line\":CALLEE_LINE,\"character\":7},\"end\":{\"line\":CALLEE_LINE,\"character\":13}}},\"fromRanges\":[]}]}" ;;
-    *'"method":"textDocument/references"'*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}},{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":CALLER_LINE,\"character\":4},\"end\":{\"line\":CALLER_LINE,\"character\":10}}}]}" ;;
-    *'"method":"exit"'*)
-      exit 0 ;;
-    *'"id":'[0-9]*)
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
-  esac
-done
-"#;
-
 /// The `PROGRESS` step of an engine that begins and ends its work at start, so the session
 /// reads it ready once quiet.
 #[cfg(unix)]
 const ANNOUNCED_WORK: &str = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'"#;
 
-/// The `lib.rs` [`SCRIPTED_CALLS_ENGINE`] answers about: `beacon` on line 0, and
-/// `caller` on lines 2 to 4, calling it on line 3.
-const SCRIPTED_CALLS_FILES: &[(&str, &str)] = &[(
-    "lib.rs",
-    "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-)];
-
-/// The lines a [`SCRIPTED_CALLS_ENGINE`] names: the callee's on an outgoing answer, and
-/// the call's on an incoming one.
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-struct ScriptedLines {
-    callee: u32,
-    caller: u32,
-}
-
-/// The lines `lib.rs` holds `beacon` and its call in.
-#[cfg(unix)]
-const SERVED_LINES: ScriptedLines = ScriptedLines {
-    callee: 0,
-    caller: 3,
-};
-
 /// A line past the end of `lib.rs`, which no served byte holds.
 #[cfg(unix)]
-const UNSERVED_LINES: ScriptedLines = ScriptedLines {
+const UNSERVED_LINES: fake_engine::ScriptedLines = fake_engine::ScriptedLines {
     callee: 50,
     caller: 50,
 };
-
-/// Serves [`SCRIPTED_CALLS_FILES`] under a [`SCRIPTED_CALLS_ENGINE`] that runs `progress`
-/// at start and names `lines`.
-#[cfg(unix)]
-async fn scripted_calls_workspace(
-    progress: &str,
-    lines: ScriptedLines,
-) -> TestResult<(tempfile::TempDir, workspace_client::ServedWorkspace)> {
-    let engine = tempfile::tempdir()?;
-    let script = engine.path().join("engine.sh");
-    std::fs::write(
-        &script,
-        SCRIPTED_CALLS_ENGINE
-            .replace("PROGRESS", progress)
-            .replace("CALLEE_LINE", &lines.callee.to_string())
-            .replace("CALLER_LINE", &lines.caller.to_string()),
-    )?;
-    let configuration = format!(
-        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
-        script.display()
-    );
-    let served = served_workspace(SCRIPTED_CALLS_FILES, Some(configuration)).await?;
-    call_retrying_acceptance(
-        &served.1,
-        tool_request("search", &json!({"query": "caller"})),
-    )
-    .await?;
-    Ok((engine, served))
-}
 
 /// An engine that announces no work reads unconfirmed, so a walk in either direction takes
 /// its answer once the session read it quiet past `settle_delay`, and the answer names the
@@ -1097,8 +990,11 @@ async fn scripted_calls_workspace(
 #[tokio::test]
 async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_unconfirmed()
 -> TestResult {
-    let (_engine, (_directory, client, _server_task)) =
-        scripted_calls_workspace(":", SERVED_LINES).await?;
+    let (_engine, (_directory, client, _server_task)) = fake_engine::scripted_calls_workspace(
+        fake_engine::UNANNOUNCED_WORK,
+        fake_engine::SERVED_LINES,
+    )
+    .await?;
     for (seed, direction, reached) in [
         ("rift://symbol/rust/lib.rs/caller", "outgoing", "beacon"),
         ("rift://symbol/rust/lib.rs/beacon", "incoming", "caller"),
@@ -1136,7 +1032,7 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
 async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directions() -> TestResult
 {
     let (_engine, (_directory, client, _server_task)) =
-        scripted_calls_workspace(ANNOUNCED_WORK, UNSERVED_LINES).await?;
+        fake_engine::scripted_calls_workspace(ANNOUNCED_WORK, UNSERVED_LINES).await?;
     for (seed, direction) in [
         ("rift://symbol/rust/lib.rs/caller", "outgoing"),
         ("rift://symbol/rust/lib.rs/beacon", "incoming"),
