@@ -623,6 +623,11 @@ The pattern's query plan derives the trigrams any match must contain - `load_con
 the rows holding them. The pattern's matcher then verifies those rows over the text the
 published index holds, line by line as ripgrep reads it.
 
+The trigram index is filled in the background after the rows it covers are written, so no search
+waits for it. A row it doesn't hold yet is verified beside the rows it selects, and when those rows
+pass the search's bounds, the answer covers the rows the index holds and warns
+[`pattern_index_preparing`](/docs/developer/protocol/mcp#search-pattern).
+
 The plan never rules out a row that could hold a match: a class too large to expand, a
 repetition that can match nothing, and a literal shorter than three characters each require
 nothing. A pattern that requires nothing, such as `[0-9a-f]{40}`, verifies every file its

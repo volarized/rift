@@ -289,6 +289,12 @@ each one with the pattern, so the answer equals a scan of every indexed file. A 
 literals hold no run of three characters, such as `[0-9a-f]{40}`, verifies every file `paths`
 selects.
 
+The server fills the trigram index in the background after each write to the stored text, and no
+search waits for it. Until the index catches up, the server verifies the rows it lacks beside the
+rows it selects, while both fit the `pattern_candidate_rows` and `pattern_verified_size` bounds
+below. Past either, the answer covers the rows the index holds and carries a
+`pattern_index_preparing` warning.
+
 With `target: "file"`, every match is one hit: `range` holds the match's bytes, `line` its line,
 and `source`, when `include` names it, the matched line. With `target: "symbol"`, every
 declaration holding a match is one hit at its first match, and `range` holds the declaration's
@@ -857,6 +863,10 @@ Text search answers can carry these warnings:
 - `pattern_matches_truncated` - a file held more matches of `pattern` than the `[search]` key
   `pattern_matches_per_file`, so its later matches are missing while every other file answers in
   full. `files` names the cut files, at most eight, in project-path order.
+- `pattern_index_preparing` - the trigram index lacks rows of stored file text, and verifying them
+  beside the selected rows would pass `pattern_candidate_rows` or `pattern_verified_size`, so a
+  match in those rows is missing from the answer. `prepared` counts the rows the index holds and
+  `total` the rows the store holds; the warning stops once the index has caught up.
 - `large_file_skipped` - under `[search.text] large_files = "skip"`, files past `max_chunk` are
   left out of the text index; `skipped` counts the ones the request's `paths` reach. A
   declaration such a file holds still answers.

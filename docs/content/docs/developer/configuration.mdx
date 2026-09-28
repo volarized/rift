@@ -643,6 +643,10 @@ pattern_matches_per_file = 1000
 A search that would pass one of the first three refuses naming the key. A file past
 `pattern_matches_per_file` is cut there, and the answer warns `pattern_matches_truncated`.
 
+While the trigram index catches up after a write, the rows it lacks are verified within what the
+selection leaves of `pattern_candidate_rows` and `pattern_verified_size`. Past either, the search
+answers from the rows the index holds and warns `pattern_index_preparing` rather than refusing.
+
 <VersionBadge
   version="v0.0.16"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
@@ -787,7 +791,8 @@ transaction of a lexical write. A write past either commits in several transacti
 last one stamps the tree it answers for. One file's units always share a transaction, so a
 file holding more takes one of its own. The bounds are what a server asked to stop waits on:
 it aborts the transaction running, and the next start writes what that transaction did not
-reach.
+reach. The trigram index behind regex search is filled after each write in transactions under
+the same two bounds.
 
 One unit holds at most 16mb of content, the largest chunk `max_chunk` accepts, so every chunk
 the configuration derives fits. A declaration's unit carries its names, signature, and

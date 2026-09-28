@@ -142,6 +142,11 @@ each declaration holding a match instead. Matching runs line by line, and a `(?i
 case-insensitive. Rift reads only the files a trigram index says can match, then checks them
 with the pattern, so the answer holds every match the files carry.
 
+Rift fills the trigram index in the background once the project's text is stored, so a search
+right after startup or an edit doesn't wait for it. Files the index doesn't hold yet are checked
+too, and when they're too many for one search, the answer covers the files the index holds and
+carries a `pattern_index_preparing` warning until the index catches up.
+
 `pattern` doesn't combine with `query`, `traversal`, `change`, or `rev`, and it searches project
 code alone. The [pattern reference](/docs/developer/protocol/mcp#search-pattern) describes the
 bounds a search runs under and the warning a file with too many matches carries.

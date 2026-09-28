@@ -208,7 +208,7 @@ lane runs the writes it was handed in publication order, one at a time. The lane
 behind the running one, and a write handed while one waits merges into it: the union of the files
 both named, derived from the newer publication, leaves the store exactly as running both would. A
 burst of changes therefore costs one write per lane turn. One process-wide write turn serializes
-index commits, vector batches, and log batches, and each transaction starts with
+index commits, trigram batches, vector batches, and log batches, and each transaction starts with
 `BEGIN IMMEDIATE`.
 
 A write commits in transactions of at most
@@ -218,6 +218,11 @@ but the last stamps no tree, so a reader meets no publication rather than a mix 
 the last names the tree the write answers for. A server that stops during a write aborts one
 transaction: the ones already committed recorded their files' digests with their rows, so the next
 start's comparison writes only the files the stopped write did not reach.
+
+Between writes, the lane fills the trigram index behind regex search. Each batch indexes the
+oldest rows the index lacks, under the same `transaction_units` and `transaction_size` bounds, and
+a write handed meanwhile runs before the next batch. A search never waits for a batch: it reads
+the rows the index lacks beside the index.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process. Every checkout
@@ -267,8 +272,13 @@ The database tables:
   tokenized `trigram` with `detail=none`: it records which rows hold each run of three
   characters, case-folded, and no positions, which is all a regex prefilter reads. Declaration
   rows carry no text and stay out of it, and `columnsize=0` keeps FTS5's `integrity-check` from
-  counting them as missing. The statements that keep `lexical_documents_fts` in step keep this
-  index too, inside the same transaction.
+  counting them as missing. The lane's trigram batches fill it, and a write that removes a path
+  deletes the entries of the path's rows the index holds alone: a `'delete'` naming a row the
+  index never took leaves it failing `integrity-check`.
+- `lexical_trigram_pending` - the `id` of every file row the trigram index doesn't hold yet. A
+  write files its new file rows here in the transaction that stores them, a trigram batch takes
+  them off as it indexes them, and a regex search reads it beside the trigram index, so a row
+  stored since the last batch still reaches the answer.
 - `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
 
