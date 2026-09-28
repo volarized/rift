@@ -1,10 +1,14 @@
-//! Analyzer revision from the checked source manifest.
+//! Analyzer revision from the checked source manifest, and the renderer that writes it.
+
+mod manifest;
 
 use std::sync::OnceLock;
 
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_protocol::read::Digest;
 use sha2::{Digest as _, Sha256};
+
+pub use manifest::{ManifestError, analyzer_manifest_path, render_analyzer_manifest};
 
 const ANALYZER_MANIFEST: &str = include_str!("analyzer-manifest.json");
 

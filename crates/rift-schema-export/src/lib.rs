@@ -41,7 +41,7 @@ pub enum ExportError {
     /// The analyzer manifest could not be rendered from the repository tree.
     AnalyzerManifest {
         /// Renderer failure.
-        source: rift_index::ManifestError,
+        source: rift_analysis::ManifestError,
     },
     /// The published global contract is invalid.
     GlobalContract {
@@ -269,9 +269,9 @@ fn validate_global_contract(request: &ExportRequest) -> Result<(), ExportError> 
 
 fn run_analyzer_manifest(request: &ExportRequest) -> Result<(), ExportError> {
     let root = request.output_dir.as_path();
-    let document = rift_index::render_analyzer_manifest(root)
+    let document = rift_analysis::render_analyzer_manifest(root)
         .map_err(|source| ExportError::AnalyzerManifest { source })?;
-    let path = root.join(rift_index::analyzer_manifest_path());
+    let path = root.join(rift_analysis::analyzer_manifest_path());
     if request.check {
         return check_document(&path, &document);
     }

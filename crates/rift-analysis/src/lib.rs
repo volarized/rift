@@ -30,7 +30,9 @@ pub use input::{
 pub use relationship::{
     RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
 };
-pub use revision::analyzer_revision;
+pub use revision::{
+    ManifestError, analyzer_manifest_path, analyzer_revision, render_analyzer_manifest,
+};
 #[cfg(feature = "collector")]
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemanticError, WorkspaceSemantics};
 #[cfg(feature = "collector")]
