@@ -15,7 +15,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lsp_types::{Position, SymbolKind, Uri};
+use lsp_types::{Position, Uri};
 use rift_core::{PackageIdentity, ProjectPath, SymbolId as CoreSymbolId};
 use rift_dependency::{
     DependencyContext, InstallFolder, InstallLocation, STANDARD_LIBRARY_MANAGER, StandardLibrary,
@@ -53,38 +53,6 @@ const NODE_MODULES_DIRECTORY_NAME: &str = "node_modules";
 
 /// The manifest naming an npm package's version.
 const PACKAGE_MANIFEST_FILE_NAME: &str = "package.json";
-
-/// The words the Language Server Protocol names its symbol kinds by, in `SymbolKind`
-/// order, so a package callee's hit states the kind its engine named. `language` rides
-/// beside the kind, as it does for every symbol, so the word carries no language prefix.
-const SYMBOL_KIND_WORDS: [(SymbolKind, &str); 26] = [
-    (SymbolKind::FILE, "file"),
-    (SymbolKind::MODULE, "module"),
-    (SymbolKind::NAMESPACE, "namespace"),
-    (SymbolKind::PACKAGE, "package"),
-    (SymbolKind::CLASS, "class"),
-    (SymbolKind::METHOD, "method"),
-    (SymbolKind::PROPERTY, "property"),
-    (SymbolKind::FIELD, "field"),
-    (SymbolKind::CONSTRUCTOR, "constructor"),
-    (SymbolKind::ENUM, "enum"),
-    (SymbolKind::INTERFACE, "interface"),
-    (SymbolKind::FUNCTION, "function"),
-    (SymbolKind::VARIABLE, "variable"),
-    (SymbolKind::CONSTANT, "constant"),
-    (SymbolKind::STRING, "string"),
-    (SymbolKind::NUMBER, "number"),
-    (SymbolKind::BOOLEAN, "boolean"),
-    (SymbolKind::ARRAY, "array"),
-    (SymbolKind::OBJECT, "object"),
-    (SymbolKind::KEY, "key"),
-    (SymbolKind::NULL, "null"),
-    (SymbolKind::ENUM_MEMBER, "enum_member"),
-    (SymbolKind::STRUCT, "struct"),
-    (SymbolKind::EVENT, "event"),
-    (SymbolKind::OPERATOR, "operator"),
-    (SymbolKind::TYPE_PARAMETER, "type_parameter"),
-];
 
 /// The installed packages an outgoing walk addresses a callee's file through.
 ///
@@ -380,7 +348,18 @@ pub struct PackageCallee {
     position: Position,
     encoding: PositionEncoding,
     name: String,
-    kind: SymbolKind,
+}
+
+/// The declaration the global API named at one package callee's position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalleeDeclaration {
+    /// The declaration's identity, the one `get_symbol` reads under `scope: "global"`.
+    pub id: SymbolId,
+    /// What the declaration is in its provider's vocabulary, as package analysis stored
+    /// it, such as `function`.
+    pub kind: ExactKind,
+    /// The exact package holding the declaration.
+    pub package: PackageIdentity,
 }
 
 impl PackageCallee {
@@ -414,17 +393,15 @@ impl PackageCallee {
     }
 
     /// The symbol a walk's hit for this callee carries, once the global API named its
-    /// declaration `id` in `package`: the name and kind are the engine's. The origin is
-    /// the one package analysis gives the package's declarations: `stdlib` for a standard
-    /// library, the Rust one included although its callees reach it through an install
-    /// folder, and `dependency` naming the package otherwise. `None` for an id naming no
-    /// language, or a kind the protocol does not define.
-    pub(crate) fn symbol(&self, id: &SymbolId, package: &PackageIdentity) -> Option<Symbol> {
+    /// `declaration`: the name is the engine's, and the kind the one package analysis
+    /// stored, as every other hit carries its provider's kind. The origin is the one
+    /// package analysis gives the package's declarations: `stdlib` for a standard library,
+    /// the Rust one included although its callees reach it through an install folder, and
+    /// `dependency` naming the package otherwise. `None` for an id naming no language.
+    pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
+        let CalleeDeclaration { id, kind, package } = declaration;
         let parsed = rift_core::parse_symbol_identity(&id.0).ok()?;
         let language = Language::from_identity_segment(parsed.language_segment()).ok()?;
-        let word = SYMBOL_KIND_WORDS
-            .iter()
-            .find_map(|(kind, word)| (*kind == self.kind).then_some(*word))?;
         let origin = if package.manager == STANDARD_LIBRARY_MANAGER {
             SymbolOrigin {
                 location: Some(SourceLocationKind::Stdlib),
@@ -440,7 +417,7 @@ impl PackageCallee {
         };
         Some(Symbol {
             id: Some(id.clone()),
-            kind: ExactKind(word.to_owned()),
+            kind: kind.clone(),
             language,
             name: self.name.clone(),
             facets: Vec::new(),
@@ -469,7 +446,6 @@ impl PackageCallee {
 pub(crate) struct NamedCallee<'call> {
     pub(crate) uri: &'call Uri,
     pub(crate) name: &'call str,
-    pub(crate) kind: SymbolKind,
     pub(crate) position: Position,
     pub(crate) encoding: PositionEncoding,
 }
@@ -505,7 +481,6 @@ pub(crate) fn callee_file(
             position: call.position,
             encoding: call.encoding,
             name: call.name.to_owned(),
-            kind: call.kind,
         })
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
@@ -540,16 +515,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
-    use lsp_types::{Position, SymbolKind, Uri};
+    use lsp_types::{Position, Uri};
     use rift_core::{PackageIdentity, ProjectPath, SymbolId as CoreSymbolId};
     use rift_dependency::{InstallFolder, InstallLocation, StandardLibrary};
     use rift_lsp::capabilities::PositionEncoding;
     use rift_lsp::uri::{EngineAddress, PackageRoot, TreeRoot};
-    use rift_protocol::read::SymbolId;
+    use rift_protocol::read::{ExactKind, SymbolId};
 
     use super::{
-        CalleeFile, CalleePackage, CalleeRoots, NamedCallee, PackageCallee, RootSpellings,
-        callee_file, folder_roots, node_package_root, package_version, registry_sources,
+        CalleeDeclaration, CalleeFile, CalleePackage, CalleeRoots, NamedCallee, PackageCallee,
+        RootSpellings, callee_file, folder_roots, node_package_root, package_version,
+        registry_sources,
     };
     use crate::{EnginePool, LspProcessKey};
 
@@ -797,7 +773,7 @@ mod tests {
         Ok(())
     }
 
-    fn callee(package: CalleePackage, path: &str, kind: SymbolKind) -> PackageCallee {
+    fn callee(package: CalleePackage, path: &str) -> PackageCallee {
         PackageCallee {
             caller: CoreSymbolId::new("rift://symbol/python/app.py/hello").expect("caller id"),
             package,
@@ -808,27 +784,34 @@ mod tests {
             },
             encoding: PositionEncoding::Utf16,
             name: "greet".to_owned(),
-            kind,
+        }
+    }
+
+    fn declaration(id: &str, kind: &str, package: &PackageIdentity) -> CalleeDeclaration {
+        CalleeDeclaration {
+            id: SymbolId(id.to_owned()),
+            kind: ExactKind(kind.to_owned()),
+            package: package.clone(),
         }
     }
 
     #[test]
-    fn a_named_callee_carries_the_engines_name_and_kind_and_its_packages_origin() -> TestResult {
+    fn a_named_callee_carries_the_engines_name_the_stored_kind_and_its_packages_origin()
+    -> TestResult {
         let greeting = identity("pypi", "greeting", "1.0.0");
         let held = callee(
             CalleePackage::Installed(greeting.clone()),
             "greeting/core.py",
-            SymbolKind::FUNCTION,
         );
-        let id = SymbolId("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet".into());
+        let id = "rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet";
         let symbol = held
-            .symbol(&id, &greeting)
+            .symbol(&declaration(id, "function", &greeting))
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(&symbol)?;
         assert_eq!(
             wire,
             serde_json::json!({
-                "id": id.0,
+                "id": id,
                 "language": "python",
                 "name": "greet",
                 "kind": "function",
@@ -848,14 +831,13 @@ mod tests {
         let stub = callee(
             CalleePackage::StandardLibrary(StandardLibrary::Python),
             "builtins.pyi",
-            SymbolKind::METHOD,
         );
-        let len = SymbolId("rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len".into());
+        let len = "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len";
         let symbol = stub
-            .symbol(&len, &python)
+            .symbol(&declaration(len, "class", &python))
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(&symbol)?;
-        assert_eq!(wire["kind"], "method");
+        assert_eq!(wire["kind"], "class", "the stored kind, whatever it is");
         assert_eq!(
             wire["origin"],
             serde_json::json!({"location": "stdlib", "source_kind": "authored"})
@@ -863,17 +845,8 @@ mod tests {
         assert_eq!(stub.package().manager(), "stdlib");
         assert_eq!(stub.package().name(), "python");
 
-        let unknown = callee(
-            CalleePackage::Installed(greeting.clone()),
-            "greeting/core.py",
-            serde_json::from_value(serde_json::json!(99))?,
-        );
         assert!(
-            unknown.symbol(&id, &greeting).is_none(),
-            "a kind the protocol does not define names no symbol"
-        );
-        assert!(
-            held.symbol(&SymbolId("not an identity".into()), &greeting)
+            held.symbol(&declaration("not an identity", "function", &greeting))
                 .is_none()
         );
         Ok(())
@@ -885,14 +858,12 @@ mod tests {
     #[test]
     fn a_standard_library_callee_below_the_sysroot_carries_the_stdlib_origin() -> TestResult {
         let rust = identity("stdlib", "rust", "1.98.1");
-        let held = callee(
-            CalleePackage::Installed(rust.clone()),
-            "std/src/fs.rs",
-            SymbolKind::FUNCTION,
-        );
-        let id =
-            SymbolId("rift://symbol/rust/stdlib/rust@1.98.1/std/src/fs.rs/read_to_string".into());
-        let wire = serde_json::to_value(held.symbol(&id, &rust).ok_or("the id names a language")?)?;
+        let held = callee(CalleePackage::Installed(rust.clone()), "std/src/fs.rs");
+        let id = "rift://symbol/rust/stdlib/rust@1.98.1/std/src/fs.rs/read_to_string";
+        let symbol = held
+            .symbol(&declaration(id, "function", &rust))
+            .ok_or("the id names a language")?;
+        let wire = serde_json::to_value(symbol)?;
         assert_eq!(
             wire["origin"],
             serde_json::json!({"location": "stdlib", "source_kind": "authored"})
@@ -969,7 +940,6 @@ mod tests {
         NamedCallee {
             uri,
             name: "greet",
-            kind: SymbolKind::FUNCTION,
             position: Position {
                 line: 4,
                 character: 8,

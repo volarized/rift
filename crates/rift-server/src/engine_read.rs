@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lsp_types::{CallHierarchyItem, Location, Position, Range, Uri};
-use rift_core::{PackageIdentity, ProjectPath, SymbolId as CoreSymbolId};
+use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_index::{IndexedFile, RelationshipStore};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
@@ -18,7 +18,9 @@ use rift_protocol::read::{
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
 
-use crate::callee::{CalleeFile, CalleeRoots, NamedCallee, PackageCallee, callee_file};
+use crate::callee::{
+    CalleeDeclaration, CalleeFile, CalleeRoots, NamedCallee, PackageCallee, callee_file,
+};
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
 use crate::read::{ReadError, ReadFault, ReadService, symbol_id};
 use crate::traversal::{
@@ -120,22 +122,22 @@ impl EngineReferences {
         &self.package_callees
     }
 
-    /// Ends each waiting callee's edge at the declaration `named` answers for it, with
-    /// the exact package that holds it, and counts the callees `named` answers nothing
-    /// for as dropped.
+    /// Ends each waiting callee's edge at the declaration `named` answers for it, with its
+    /// kind and the exact package that holds it, and counts the callees `named` answers
+    /// nothing for as dropped.
     ///
     /// A caller keeps one edge per callee declaration, whatever the number of calls the
     /// engine named for it. The walk does not continue from a package declaration: the
     /// local index holds no declaration of it to ask an engine about.
     pub fn name_package_callees(
         &mut self,
-        mut named: impl FnMut(&PackageCallee) -> Option<(SymbolId, PackageIdentity)>,
+        mut named: impl FnMut(&PackageCallee) -> Option<CalleeDeclaration>,
     ) {
         for callee in std::mem::take(&mut self.package_callees) {
-            let declaration = named(&callee).and_then(|(id, package)| {
+            let declaration = named(&callee).and_then(|declaration| {
                 Some(PackageDeclaration {
-                    symbol: callee.symbol(&id, &package)?,
-                    unit: callee.unit(&package)?,
+                    symbol: callee.symbol(&declaration)?,
+                    unit: callee.unit(&declaration.package)?,
                 })
             });
             let Some(declaration) = declaration else {
@@ -825,7 +827,6 @@ fn map_callees(
         let call = NamedCallee {
             uri: &item.uri,
             name: &item.name,
-            kind: item.kind,
             position: item.selection_range.start,
             encoding: report.encoding,
         };
@@ -1218,14 +1219,14 @@ mod tests {
     use rift_lsp::capabilities::PositionEncoding;
     use rift_lsp::uri::TreeRoot;
     use rift_protocol::configuration::{HistoryConfiguration, LspConfiguration};
-    use rift_protocol::read::{GetSymbolParams, SearchParams, SymbolId};
+    use rift_protocol::read::{ExactKind, GetSymbolParams, SearchParams, SymbolId};
     use serde_json::json;
 
     use super::{
         CalleeReport, EngineReferences, ReferenceReport, declaration_name_offset, map_callees,
         map_references, resolve_engine_references,
     };
-    use crate::callee::CalleeRoots;
+    use crate::callee::{CalleeDeclaration, CalleeRoots};
     use crate::search::StoreAnswer;
     use crate::{EnginePool, LspProcessKey, ReadService};
 
@@ -1417,7 +1418,6 @@ mod tests {
         let call = crate::callee::NamedCallee {
             uri: &uri,
             name,
-            kind: lsp_types::SymbolKind::FUNCTION,
             position: Position {
                 line: 1,
                 character: 4,
@@ -1451,7 +1451,11 @@ mod tests {
         };
         assert_eq!(references.package_callees().len(), 3);
         references.name_package_callees(|callee| {
-            (callee.path().as_str() == "builtins.pyi").then(|| (len.clone(), python.clone()))
+            (callee.path().as_str() == "builtins.pyi").then(|| CalleeDeclaration {
+                id: len.clone(),
+                kind: ExactKind("function".to_owned()),
+                package: python.clone(),
+            })
         });
         let edges: Vec<&SymbolId> = references
             .outgoing(&caller)
@@ -1469,6 +1473,7 @@ mod tests {
             "rift://source/stdlib/python@3.12.9/builtins.pyi"
         );
         assert_eq!(declaration.symbol.name, "len");
+        assert_eq!(declaration.symbol.kind.0, "function", "the stored kind");
 
         references.package_callees = vec![held_stub("json/__init__.pyi", "loads")?];
         references.drop_package_callees();

@@ -14,7 +14,7 @@ mod read;
 mod search;
 mod traversal;
 
-pub use callee::{CalleePackage, CalleeRoots, PackageCallee};
+pub use callee::{CalleeDeclaration, CalleePackage, CalleeRoots, PackageCallee};
 pub use change::search_change;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,

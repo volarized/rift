@@ -20,7 +20,7 @@ use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
-    DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
+    DEPENDENCY_WARNINGS_MAX, ExactKind, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
     ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
     SearchParamsTarget, SearchResult, SearchScope, SymbolId,
@@ -29,7 +29,9 @@ use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
-use rift_server::{CalleePackage, PackageCallee, PositionEncoding, ReadError, ReadService};
+use rift_server::{
+    CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadError, ReadService,
+};
 use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
@@ -304,9 +306,10 @@ pub(crate) async fn package_symbols(
 /// The declarations the global API named at one walk's package callee positions.
 #[derive(Debug, Default)]
 pub(crate) struct CalleeDeclarations {
-    /// The declaration answered at each position asked, by the position's encoding and
-    /// key.
-    named: HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), SymbolId>,
+    /// The declaration answered at each position asked, with its kind, by the position's
+    /// encoding and key.
+    named:
+        HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
     /// The releases the resolution served, which name a standard library's version.
     served: Vec<WirePackageIdentity>,
 }
@@ -321,17 +324,18 @@ struct CalleePosition {
 }
 
 impl CalleeDeclarations {
-    /// The declaration the global API named at `callee`'s position, with the exact
-    /// package holding it; `None` for a position it answered no declaration at, or one
-    /// left unasked.
-    pub(crate) fn declaration(
-        &self,
-        callee: &PackageCallee,
-    ) -> Option<(SymbolId, PackageIdentity)> {
+    /// The declaration the global API named at `callee`'s position, with its kind and the
+    /// exact package holding it; `None` for a position it answered no declaration at, or
+    /// one left unasked.
+    pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
         let package = callee_package(callee, &self.served)?;
         let key = (wire_encoding(callee), callee_position(callee, &package)?);
-        let declaration = self.named.get(&key)?;
-        Some((declaration.clone(), protocol_package_identity(package)))
+        let (id, kind) = self.named.get(&key)?;
+        Some(CalleeDeclaration {
+            id: id.clone(),
+            kind: kind.clone(),
+            package: protocol_package_identity(package),
+        })
     }
 }
 
@@ -359,7 +363,7 @@ pub(crate) async fn callee_declarations(
         let answer = client.find_package_declarations(&request).await?;
         let encoding = request.position_encoding;
         for result in answer.results {
-            let Some(declaration) = result.declaration else {
+            let (Some(declaration), Some(kind)) = (result.declaration, result.kind) else {
                 continue;
             };
             let position = result.position;
@@ -373,7 +377,10 @@ pub(crate) async fn callee_declarations(
                 line: position.line,
                 character: position.character,
             };
-            named.insert((encoding.clone(), key), SymbolId(declaration));
+            named.insert(
+                (encoding.clone(), key),
+                (SymbolId(declaration), ExactKind(kind)),
+            );
         }
     }
     Ok(CalleeDeclarations {
