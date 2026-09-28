@@ -229,7 +229,15 @@ fn a_comparison_over_lfs_paths_starts_no_driver_and_stores_nothing() {
     let repository = Repository::open(root).expect("repository");
     let head = repository.resolve("HEAD").expect("head");
     let files = repository
-        .tree_files(&head, &|path| path.ends_with(".bin"), 16)
+        .tree_files(
+            &head,
+            &|path| {
+                Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension == "bin")
+            },
+            16,
+        )
         .expect("files");
     let mut forms = repository.working_forms().expect("working forms");
     for file in &files {

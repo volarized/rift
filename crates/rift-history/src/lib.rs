@@ -7,12 +7,14 @@
 //! one path, so a read can be answered from any revision without touching
 //! the working tree.
 
+mod commits;
 mod contribution;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixture;
 mod repository;
 mod working;
 
+pub use commits::{ChangedBlob, ChangedBlobs, CommitFacts, TaggedCommit, WindowCommit};
 pub use contribution::{
     HistoryContributionAdapter, HistoryContributionError, HistoryContributionViolation,
 };
