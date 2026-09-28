@@ -590,3 +590,175 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     server_task.await?;
     Ok(())
 }
+
+/// A served Rust workspace with no dependency of its own, under `configuration`.
+async fn served_probe_workspace(configuration: String) -> TestResult<ServedWorkspace> {
+    served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await
+}
+
+/// The entries of every resolution request the fixture received, in arrival order.
+async fn resolution_entries(fixture: &GlobalFixture) -> Vec<Vec<Value>> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.ends_with("/v1/resolutions"))
+        .filter_map(|request| request.body)
+        .map(|body| body["entries"].as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+/// The entries of `entries` naming the `demo` package.
+fn demo_entries(entries: &[Value]) -> Vec<&Value> {
+    entries
+        .iter()
+        .filter(|entry| entry["name"] == "demo")
+        .collect()
+}
+
+/// A `packages` entry naming a package the context holds replaces its version for that
+/// read alone: the context pins `demo` at a release the collection lacks, and the lookup
+/// naming the collected release sends that version in its place and answers from it.
+#[tokio::test]
+async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
+         [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let pinned = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    assert_eq!(pinned["hits"], json!([]), "{pinned:#}");
+    assert!(
+        pinned["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning["code"] == "package_absent" && warning["package"]["version"] == "0.9.0"
+            })
+        }),
+        "{pinned:#}"
+    );
+
+    let replaced = get_symbol(
+        &client,
+        json!({
+            "name": "helper_beacon",
+            "scope": "global",
+            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        }),
+    )
+    .await?;
+    let units: Vec<&Value> = replaced["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| &hit["unit"])
+        .collect();
+    assert_eq!(units, [&json!(COLLECTED_UNIT)], "{replaced:#}");
+    assert!(
+        !replaced.to_string().contains("package_absent"),
+        "the replaced release is not asked for: {replaced:#}"
+    );
+
+    let resolutions = resolution_entries(&fixture).await;
+    assert_eq!(resolutions.len(), 2, "{resolutions:#?}");
+    assert_eq!(
+        demo_entries(&resolutions[0]),
+        [&json!({"manager":"cargo","name":"demo","version":"0.9.0","availability":"canonical"})]
+    );
+    assert_eq!(
+        demo_entries(&resolutions[1]),
+        [&json!({"manager":"cargo","name":"demo","version":"1.0.0","availability":"canonical"})],
+        "the read sends the requested version in place of the pinned one"
+    );
+    assert!(
+        resolutions[1]
+            .iter()
+            .any(|entry| entry["manager"] == "stdlib" && entry["name"] == "rust"),
+        "the entries the request names nothing about stand: {resolutions:#?}"
+    );
+
+    let again = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    assert_eq!(
+        again["hits"],
+        json!([]),
+        "the next read resolves the workspace's own version: {again:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A `packages` entry naming a package the context lacks adds it for that search, and an
+/// entry without a version goes out as the requirement `>=0`, which the collection
+/// resolves to its release.
+#[tokio::test]
+async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({
+            "query": "helper_beacon",
+            "scope": "all",
+            "packages": [{"manager": "cargo", "name": "demo"}]
+        }),
+    )
+    .await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+
+    let resolutions = resolution_entries(&fixture).await;
+    assert_eq!(resolutions.len(), 1, "{resolutions:#?}");
+    assert_eq!(
+        demo_entries(&resolutions[0]),
+        [&json!({"manager":"cargo","name":"demo","requirement":">=0","availability":"canonical"})]
+    );
+    let searches: Vec<Value> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.contains("/v1/search?"))
+        .filter_map(|request| request.body)
+        .collect();
+    assert!(!searches.is_empty());
+    for body in searches {
+        assert_eq!(
+            body["packages"],
+            json!([{"manager":"cargo","name":"demo","version":"1.0.0"}]),
+            "the search reads the release the requirement resolved to"
+        );
+    }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

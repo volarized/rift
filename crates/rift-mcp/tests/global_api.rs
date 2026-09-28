@@ -184,30 +184,34 @@ fn capabilities() -> Value {
 }
 
 /// The resolution of `requested`: the collected release is available, every other exact
-/// entry is missing, and every requirement is missing, so each entry the request carries,
+/// entry is missing, a requirement naming the collected package resolves to its one
+/// release, and every other requirement is missing, so each entry the request carries,
 /// the standard library entries included, is accounted for once.
 fn resolution(requested: &Value) -> Value {
-    let (mut available, mut missing_exact, mut missing_requirements) =
-        (Vec::new(), Vec::new(), Vec::new());
+    let (mut available, mut resolved, mut missing_exact, mut missing_requirements) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let collected = json!({"manager": COLLECTED.0, "name": COLLECTED.1, "version": COLLECTED.2});
     for entry in requested["entries"].as_array().into_iter().flatten() {
         let identity = (
             entry["manager"].as_str().unwrap_or_default(),
             entry["name"].as_str().unwrap_or_default(),
             entry["version"].as_str().unwrap_or_default(),
         );
+        let names_collected = (identity.0, identity.1) == (COLLECTED.0, COLLECTED.1);
         match (&entry["version"], &entry["requirement"]) {
-            (Value::String(_), _) if identity == COLLECTED => available.push(json!({
-                "manager": identity.0, "name": identity.1, "version": identity.2
-            })),
+            (Value::String(_), _) if identity == COLLECTED => available.push(collected.clone()),
             (Value::String(_), _) => missing_exact.push(json!({
                 "manager": identity.0, "name": identity.1, "version": identity.2
+            })),
+            _ if names_collected => resolved.push(json!({
+                "entry": entry, "package": collected
             })),
             _ => missing_requirements.push(entry.clone()),
         }
     }
     json!({
         "available_exact": available,
-        "resolved_requirements": [],
+        "resolved_requirements": resolved,
         "missing_exact": missing_exact,
         "missing_requirements": missing_requirements
     })

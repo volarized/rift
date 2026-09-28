@@ -95,6 +95,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
     ];
     requests.extend(dependency_scope_search_corpus());
+    requests.extend(package_argument_corpus());
     requests.extend(revision_read_corpus());
     requests.extend(change_search_corpus());
     requests.extend(lexical_search_corpus());
@@ -122,6 +123,40 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
                 "query": "beacon",
                 "scope": "global",
                 "target": "file"
+            }),
+        ),
+    ]
+}
+
+/// `packages` requests: one replacing the version of the fixture's path dependency
+/// `helper`, which then answers `package_absent` in place of `package_unavailable`, one
+/// adding `extra`, a package the context lacks, which answers
+/// `package_requirement_absent`, and one replacing the collected `demo` by the requirement
+/// `>=0`, which the fixture global API resolves to its collected release.
+fn package_argument_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "get_symbol",
+            json!({
+                "name": "helper_beacon",
+                "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "helper", "version": "0.1.0" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "helper_beacon",
+                "scope": "all",
+                "packages": [{ "manager": "cargo", "name": "extra" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "beacon",
+                "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "demo" }]
             }),
         ),
     ]
@@ -568,6 +603,8 @@ struct CorpusArms {
     dependency_units: usize,
     search_dependency_units: usize,
     unavailable_entries: usize,
+    replaced_entries: usize,
+    added_entries: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
 }
@@ -584,6 +621,16 @@ impl CorpusArms {
             .flatten()
             .filter(|warning| warning["code"] == "package_unavailable")
             .count();
+        for warning in structured["warnings"].as_array().into_iter().flatten() {
+            if warning["code"] == "package_absent" && warning["package"]["name"] == "helper" {
+                self.replaced_entries += 1;
+            }
+            if warning["code"] == "package_requirement_absent"
+                && warning["entry"]["name"] == "extra"
+            {
+                self.added_entries += 1;
+            }
+        }
         for identity in node_identities(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
@@ -617,6 +664,14 @@ impl CorpusArms {
             self.unavailable_entries > 0,
             "the corpus must prove a package_unavailable warning naming the fixture's \
              path dependency"
+        );
+        assert!(
+            self.replaced_entries > 0 && self.added_entries > 0,
+            "the corpus must prove a `packages` entry replacing the path dependency's \
+             version and one adding a package the context lacks: replaced_entries={}, \
+             added_entries={}",
+            self.replaced_entries,
+            self.added_entries
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
@@ -863,6 +918,63 @@ async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResul
         Some(&json!("capability_unavailable")),
         "{error:?}"
     );
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// `packages` beside the `local` scope and beside `rev` are schema-valid, runtime-refused
+/// requests on both reads: a project read consults no package, and package facts follow
+/// the current tree alone, so the server refuses `invalid_request` naming `packages`.
+/// A refusal carries no structured content, so the corpus above cannot hold them.
+#[tokio::test]
+async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let requests = [
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "packages": packages }),
+        ),
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "scope": "all", "rev": "main", "packages": packages }),
+        ),
+        (
+            "search",
+            json!({ "query": "helper_beacon", "scope": "local", "packages": packages }),
+        ),
+        (
+            "search",
+            json!({ "query": "helper_beacon", "scope": "global", "rev": "main", "packages": packages }),
+        ),
+    ];
+    for (name, request) in requests {
+        let (input_validator, _) = validators
+            .get(name)
+            .ok_or_else(|| format!("{name} is advertised"))?;
+        assert_validates(input_validator, &request, &format!("{name} request"));
+        let error = client
+            .call_tool(tools_call_request(name, &request)?)
+            .await
+            .expect_err("the argument has nothing to change on this read");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{request}: {wire:#}"
+        );
+        assert!(
+            error.message.contains("field packages"),
+            "the refusal names the field: {request}: {}",
+            error.message
+        );
+    }
 
     client.cancel().await?;
     server_task.await?;
