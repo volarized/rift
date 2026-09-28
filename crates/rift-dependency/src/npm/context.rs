@@ -536,7 +536,7 @@ mod tests {
             .collect()
     }
 
-    /// The root `package.json` of the npm 11.5.1 probe workspace: one member, one
+    /// The root `package.json` of a workspace npm 11.5.1 installs: one member, one
     /// directory inside the root, one outside it, and one tarball outside it.
     const WORKSPACE_MANIFEST: &str = r#"{"name":"probe","private":true,"workspaces":["packages/*"],
  "dependencies":{"api":"*","local":"file:libs/local","outside":"file:../outside","tarred":"file:../tarred-2.0.0.tgz"}}
@@ -842,12 +842,12 @@ mod tests {
         );
     }
 
-    /// The npm 11.5.1 probe workspace: the `workspaces` table form, a `./` glob, and a
-    /// negated member (`w5-npm-probe-workspaces-object.layout.txt`).
+    /// The root `package.json` of a workspace npm 11.5.1 installs: the `workspaces` table
+    /// form, a `./` glob, and a negated member.
     const TABLE_WORKSPACE_MANIFEST: &str = r#"{"name":"probe","private":true,"workspaces":{"packages":["./packages/*","!packages/legacy"]},"dependencies":{"api":"*"}}"#;
 
-    /// `npm install --package-lock-only --offline` over [`TABLE_WORKSPACE_MANIFEST`]:
-    /// `legacy` and `examples/demo` are no members (`w5-npm-probe-workspaces-object.package-lock.json`).
+    /// The lockfile npm 11.5.1 writes for `npm install --package-lock-only --offline` over
+    /// [`TABLE_WORKSPACE_MANIFEST`]: `legacy` and `examples/demo` are no members.
     const TABLE_WORKSPACE_LOCKFILE: &str = r#"{
   "name": "probe",
   "lockfileVersion": 3,
@@ -866,7 +866,7 @@ mod tests {
 }
 "#;
 
-    /// The probe workspace's files below `ROOT`, the root manifest given.
+    /// The table-form workspace's files below `ROOT`, the root manifest given.
     fn table_workspace(root_manifest: &str) -> RecordedInspector {
         RecordedInspector::default()
             .with_file(format!("{ROOT}/package.json"), root_manifest)
