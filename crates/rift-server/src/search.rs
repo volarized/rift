@@ -174,8 +174,10 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
-        references.validate_revision(self)?;
-        validate_search(params)?;
+        rift_core::traced!(component = "search", operation = "search.validate", {
+            references.validate_revision(self)?;
+            validate_search(params)
+        })?;
         if params.change.is_some() {
             // One snapshot holds one tree; a comparison needs two, and reaches its own
             // through `search_change`.
@@ -272,6 +274,12 @@ impl ReadService {
         target: SearchParamsTarget,
         references: &EngineReferences,
     ) -> Vec<ReadWarning> {
+        let _span = tracing::info_span!(
+            "search.initial_warnings",
+            component = "search",
+            operation = "search.initial_warnings"
+        )
+        .entered();
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(self.documentation_warnings(target));
@@ -341,6 +349,12 @@ impl ReadService {
     /// Returns [`ReadError`] for an invalid glob, or a `force_include` matching more
     /// files than `FORCE_INCLUDE_FILES_MAX`.
     fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, ReadError> {
+        let _span = tracing::info_span!(
+            "search.selected_paths",
+            component = "search",
+            operation = "search.selected_paths"
+        )
+        .entered();
         let index = self.index();
         let matcher = path_matcher(index.root(), selector)?;
         let force_include = match selector {
@@ -379,6 +393,12 @@ impl ReadService {
         (query, store): (&ParsedQuery, &StoreAnswer),
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, ReadError> {
+        let _span = tracing::info_span!(
+            "search.query_hits",
+            component = "search",
+            operation = "search.query_hits"
+        )
+        .entered();
         let index = self.index();
         let root = index.root();
         let matcher = selected.matcher.as_ref();
@@ -420,7 +440,7 @@ impl ReadService {
             { identifier_input(index, matcher, root, query, sources, fetch_limit) }
         )?];
         inputs.extend(store.precise().iter().cloned());
-        let screened = screen.projected(&inputs, query)?;
+        let screened = screen.projected(&inputs, query, QueryPhase::Precise)?;
         let mut ranked = rift_core::traced!(
             component = "search",
             operation = "search.fusion",
@@ -430,7 +450,7 @@ impl ReadService {
         // The widened inputs join only when the precise phase came up short: a full pool
         // leaves no slot a broad match could take.
         if ranked.len() < fetch_limit {
-            let screened = screen.projected(store.broad(), query)?;
+            let screened = screen.projected(store.broad(), query, QueryPhase::Broad)?;
             let broad = rift_core::traced!(
                 component = "search",
                 operation = "search.fusion",
@@ -837,12 +857,28 @@ impl CandidateScreen<'_> {
         &self,
         inputs: &[RankingInput],
         query: &ParsedQuery,
+        phase: QueryPhase,
     ) -> Result<Vec<RankingInput>, ReadError> {
-        let screened = self.screened(inputs);
-        match self.documentation {
-            Some(documentation) => documentation.project(&screened, self.target, query),
-            None => Ok(screened),
-        }
+        let _span = tracing::info_span!(
+            "search.projected",
+            component = "search",
+            operation = "search.projected",
+            phase = phase.label()
+        )
+        .entered();
+        let screened = rift_core::traced!(component = "search", operation = "search.screened", {
+            self.screened(inputs)
+        });
+        rift_core::traced!(
+            component = "search",
+            operation = "search.documentation_project",
+            {
+                match self.documentation {
+                    Some(documentation) => documentation.project(&screened, self.target, query),
+                    None => Ok(screened),
+                }
+            }
+        )
     }
     /// `inputs` with every identity this request's filters exclude removed, each input
     /// keeping the order it answered in. An input screened down to nothing no longer
@@ -1184,6 +1220,12 @@ fn populate_symbol_lines(
     index: &WorkspaceIndex,
     force_include: Option<&WorkspaceIndex>,
 ) -> Result<(), ReadError> {
+    let _span = tracing::info_span!(
+        "search.symbol_lines",
+        component = "search",
+        operation = "search.symbol_lines"
+    )
+    .entered();
     for hit in results {
         if hit.line.is_some() || !matches!(hit.hit, SearchHitTarget::Symbol { .. }) {
             continue;
@@ -1366,6 +1408,12 @@ fn order_and_bound_hits(
     order: ResultOrder,
     results_max: usize,
 ) -> Option<usize> {
+    let _span = tracing::info_span!(
+        "search.order",
+        component = "search",
+        operation = "search.order"
+    )
+    .entered();
     order_hits(results, order);
     bound_hits(results, results_max)
 }

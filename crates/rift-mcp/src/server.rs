@@ -141,17 +141,37 @@ impl BlockingExecutor {
     where
         Output: Send + 'static,
     {
+        // Both spans wrap every blocking operation, so they sit at debug: an info filter
+        // would print two closing lines per request and per build.
         let acquire = Arc::clone(&self.operations).acquire_owned();
-        let permit = tokio::time::timeout(Duration::from_millis(self.queue_timeout_ms), acquire)
+        let queue_timeout_ms = self.queue_timeout_ms;
+        let permit = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire)
+            .instrument(tracing::debug_span!(
+                "worker.queue",
+                component = "worker",
+                operation = "worker.queue"
+            ))
             .await
-            .map_err(|_| ReadFault::capacity_timeout(operation, self.queue_timeout_ms))?
+            .map_err(|_| ReadFault::capacity_timeout(operation, queue_timeout_ms))?
             .map_err(|error| ReadFault::task(operation, error.to_string()))?;
-        tokio::task::spawn_blocking(move || {
-            let result = work();
-            // Explicit success-path release; unwinding also drops the owned permit.
-            drop(permit);
-            result
-        })
+        async move {
+            // The blocking thread has no ambient span, so the work's own spans attach to
+            // the current one explicitly rather than opening a disconnected trace.
+            let parent = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                let _entered = parent.enter();
+                let result = work();
+                // Explicit success-path release; unwinding also drops the owned permit.
+                drop(permit);
+                result
+            })
+            .await
+        }
+        .instrument(tracing::debug_span!(
+            "worker.run",
+            component = "worker",
+            operation = "worker.run"
+        ))
         .await
         .map_err(|error| ReadFault::task(operation, error.to_string()))?
     }
@@ -2177,7 +2197,13 @@ impl RiftMcp {
         query: &ParsedQuery,
         deadline: RequestDeadline,
     ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
-        let searched = self.read_store(index, tree_revision, query).await?;
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 1_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
         let Some(lane) = self.lexical.as_ref() else {
             return Ok((searched, LexicalCommitState::Settled));
         };
@@ -2186,8 +2212,18 @@ impl RiftMcp {
         if matched || commit_state != LexicalCommitState::Committing {
             return Ok((searched, commit_state));
         }
-        let commit_state = commit_landed(lane, tree_revision, deadline).await;
-        let searched = self.read_store(index, tree_revision, query).await?;
+        let commit_state =
+            rift_core::traced_async!(component = "search", operation = "search.commit_landed", {
+                commit_landed(lane, tree_revision, deadline).await
+            })
+            .await;
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 2_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
         Ok((searched, commit_state))
     }
 

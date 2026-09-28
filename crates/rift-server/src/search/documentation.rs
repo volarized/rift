@@ -197,6 +197,12 @@ pub(super) fn populate_sources(
     index: &WorkspaceIndex,
     resolution: Resolution<'_>,
 ) -> Vec<ReadWarning> {
+    let _span = tracing::info_span!(
+        "search.sources",
+        component = "search",
+        operation = "search.sources"
+    )
+    .entered();
     let mut remaining = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
     let mut warnings = Vec::new();
     for hit in results {

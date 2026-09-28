@@ -19,6 +19,7 @@ use toasty::stmt::{Type, Value};
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
+use tracing::Instrument as _;
 
 use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
@@ -187,7 +188,18 @@ impl WorkspaceDatabase {
         &self,
         access: ConnectionAccess,
     ) -> Result<Connection, LexicalIndexError> {
-        let mut connection = self.database.connection().await.map_err(storage_error)?;
+        // Every store operation checks a connection out, so the span sits at debug: an info
+        // filter would print one closing line per checkout.
+        let mut connection = self
+            .database
+            .connection()
+            .instrument(tracing::debug_span!(
+                "database.checkout",
+                component = "database",
+                operation = "database.checkout"
+            ))
+            .await
+            .map_err(storage_error)?;
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }

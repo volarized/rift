@@ -1270,6 +1270,23 @@ fn isolated_weights(field: SearchableField) -> String {
         .join(", ")
 }
 
+/// Runs the ranked full-text statement for one rendered `MATCH` expression and decodes
+/// every row it answers, at most `probe_limit`.
+async fn ranked_rows(
+    transaction: &mut dyn Executor,
+    expression: String,
+    probe_limit: i64,
+) -> Result<Vec<LexicalMatch>, LexicalIndexError> {
+    let rows = toasty::sql::query(lexical_search_sql())
+        .bind(expression)
+        .bind(probe_limit)
+        .column_types(lexical_search_column_types())
+        .exec(transaction)
+        .await
+        .map_err(storage_error)?;
+    rows.iter().map(decode_lexical_match).collect()
+}
+
 /// Builds the joined ranking query.
 ///
 /// Equal ranks order by identity, because `SQLite` would otherwise return them
@@ -1916,33 +1933,45 @@ impl LexicalSearchIndex {
         // One row past the bound tells whether the store holds a match the bound cuts.
         let probe_limit = i64::from(bound) + 1;
 
-        let mut connection = self.database.connection().await?;
-        let mut transaction = connection.transaction().await.map_err(storage_error)?;
-        let stored = stored_stamp(&mut transaction).await?;
-        if let Some(scoped) = stamp_scope(stored, tree_revision) {
-            return Ok(scoped);
-        }
-        let Some(expression) = expression else {
-            return Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
-                Vec::new(),
-                bound,
-            )));
-        };
-        let rows = toasty::sql::query(lexical_search_sql())
-            .bind(expression)
-            .bind(probe_limit)
-            .column_types(lexical_search_column_types())
-            .exec(&mut transaction)
-            .await
-            .map_err(storage_error)?;
-
-        let matches = rows
-            .iter()
-            .map(decode_lexical_match)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
-            matches, bound,
-        )))
+        rift_core::traced_async!(
+            component = "lexical",
+            operation = "lexical.search",
+            phase = phase.label(),
+            {
+                let mut connection = rift_core::traced_async!(
+                    component = "lexical",
+                    operation = "lexical.connection",
+                    { self.database.connection().await }
+                )
+                .await?;
+                let mut transaction = connection.transaction().await.map_err(storage_error)?;
+                let stamp_reader = &mut transaction;
+                let stored =
+                    rift_core::traced_async!(component = "lexical", operation = "lexical.stamp", {
+                        stored_stamp(stamp_reader).await
+                    })
+                    .await?;
+                if let Some(scoped) = stamp_scope(stored, tree_revision) {
+                    return Ok(scoped);
+                }
+                let Some(expression) = expression else {
+                    return Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
+                        Vec::new(),
+                        bound,
+                    )));
+                };
+                let query_reader = &mut transaction;
+                let matches =
+                    rift_core::traced_async!(component = "lexical", operation = "lexical.query", {
+                        ranked_rows(query_reader, expression, probe_limit).await
+                    })
+                    .await?;
+                Ok(RevisionScoped::Matched(LexicalRanking::from_probe(
+                    matches, bound,
+                )))
+            }
+        )
+        .await
     }
 
     /// Runs the full-text ranking as one fusion input, best first.
