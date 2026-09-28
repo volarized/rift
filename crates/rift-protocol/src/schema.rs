@@ -78,6 +78,8 @@ mod keyword {
     pub(super) const DESCRIPTION: &str = "description";
 
     pub(super) const MAX_PROPERTIES: &str = "maxProperties";
+    pub(super) const MIN_ITEMS: &str = "minItems";
+    pub(super) const MAX_ITEMS: &str = "maxItems";
 
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
@@ -917,6 +919,55 @@ pub fn declare_syntax_ranges(schema: &mut Schema) {
         range(
             &ByteSize::from_bytes(1),
             &ByteSize::from_bytes(SYNTAX_FILE_BYTES_MAX),
+        ),
+    );
+}
+
+/// A [`HistoryConfiguration`](crate::configuration::HistoryConfiguration) states its
+/// `ByteSize` bounds as `rift:range` on the key, and the release rule the server
+/// enforces at load: `selective` names at least one release, and no other strategy names
+/// any.
+pub fn declare_history_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, HISTORY_BATCH_BYTES_MAX, HISTORY_BATCH_BYTES_MIN, HistoryConfiguration,
+        HistoryStrategy,
+    };
+    annotate_property(
+        schema,
+        property!(HistoryConfiguration, batch_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(HISTORY_BATCH_BYTES_MIN),
+            &ByteSize::from_bytes(HISTORY_BATCH_BYTES_MAX),
+        ),
+    );
+    let strategy = property!(HistoryConfiguration, strategy);
+    let releases = property!(HistoryConfiguration, releases);
+    let selective = merged(vec![
+        requires(&[strategy]),
+        properties(vec![(strategy, constant(&HistoryStrategy::Selective))]),
+    ]);
+    append(
+        schema,
+        described(
+            "providers.history.strategy selective names at least one release",
+            when(
+                selective.clone(),
+                merged(vec![
+                    requires(&[releases]),
+                    properties(vec![(releases, json!({ keyword::MIN_ITEMS: 1 }))]),
+                ]),
+            ),
+        ),
+    );
+    append(
+        schema,
+        described(
+            "providers.history.releases belongs to strategy selective alone",
+            otherwise(
+                selective,
+                properties(vec![(releases, json!({ keyword::MAX_ITEMS: 0 }))]),
+            ),
         ),
     );
 }
