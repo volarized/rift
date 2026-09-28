@@ -133,7 +133,8 @@ pub(crate) fn validate_declaration_request_for_capabilities(
 }
 
 /// Checks that the answer names every submitted position exactly once, each beside the
-/// identity of a declaration in the position's package or none.
+/// identity of a declaration in the position's package and that declaration's kind, or
+/// beside neither.
 pub(crate) fn validate_declaration_response(
     request: &PackageDeclarationRequest,
     response: &PackageDeclarationResponse,
@@ -155,6 +156,9 @@ pub(crate) fn validate_declaration_response(
             return Err(ClientError::InvalidResponseField {
                 field: "declaration",
             });
+        }
+        if result.declaration.is_some() != result.kind.is_some() {
+            return Err(ClientError::InvalidResponseField { field: "kind" });
         }
     }
     if seen.len() != expected.len() {

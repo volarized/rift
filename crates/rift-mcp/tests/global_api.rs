@@ -75,6 +75,8 @@ pub(crate) struct NamedPosition {
     pub(crate) line: Option<i64>,
     /// The declaration's qualified name.
     pub(crate) qualified_name: &'static str,
+    /// The declaration's kind, as the Python provider names it.
+    pub(crate) kind: &'static str,
 }
 
 /// The declarations a Python collection names at package positions. Every other position
@@ -85,12 +87,14 @@ pub(crate) const NAMED_POSITIONS: [NamedPosition; 2] = [
         path: "builtins.pyi",
         line: None,
         qualified_name: "len",
+        kind: "function",
     },
     NamedPosition {
         package: GREETING,
         path: "greeting/core.py",
         line: Some(0),
         qualified_name: "greet",
+        kind: "function",
     },
 ];
 
@@ -414,7 +418,8 @@ fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
 }
 
 /// The declaration answer for `request`: each position [`NAMED_POSITIONS`] lists names its
-/// declaration, by the identity package analysis mints; every other position names none.
+/// declaration, by the identity package analysis mints, and its kind; every other position
+/// names neither.
 fn declarations(request: &Value) -> Value {
     let results: Vec<Value> = request["positions"]
         .as_array()
@@ -435,7 +440,8 @@ fn declarations(request: &Value) -> Value {
                         "position": position,
                         "declaration": format!(
                             "rift://symbol/python/{manager}/{name}@{version}/{path}/{qualified}"
-                        )
+                        ),
+                        "kind": named.kind
                     })
                 }
                 None => json!({"position": position}),

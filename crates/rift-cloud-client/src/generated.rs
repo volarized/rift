@@ -1316,6 +1316,8 @@ pub struct PackageDeclarationResult {
     /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
     /// change the identity when the language includes module path in that qualified name.
     pub declaration: Option<String>,
+    /// A provider-local kind preserving the construct name used by that language implementation.
+    pub kind: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,

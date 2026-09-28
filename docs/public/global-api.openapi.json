@@ -1476,7 +1476,8 @@
                             "line": 3,
                             "character": 4
                           },
-                          "declaration": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve"
+                          "declaration": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve",
+                          "kind": "function"
                         },
                         {
                           "position": {
@@ -3266,6 +3267,10 @@
           },
           "declaration": {
             "$ref": "#/components/schemas/SymbolId"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ExactKind",
+            "description": "What the declaration is in the provider's vocabulary, such as `trait`, `function`, or `table`, as its `Symbol` carries it. Present exactly when `declaration` is."
           }
         },
         "required": [
