@@ -1201,6 +1201,7 @@ fn is_repository_word(word: &str) -> bool {
 /// transaction writes, and how much of the store file a connection memory-maps.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_lexical_ranges)]
 pub struct LexicalSearchConfiguration {
     /// Most units the lexical index holds: one per indexed file, text chunk,
     /// and declaration, 1000 to 50000000. A workspace past it refuses its
@@ -4472,6 +4473,20 @@ mod tests {
             configuration.search.lexical.mmap_size = ByteSize::from_bytes(bytes);
             assert_eq!(configuration.validate(), Ok(()), "mmap_size {bytes}");
         }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["LexicalSearchConfiguration"]["properties"];
+        assert_eq!(
+            table["mmap_size"]["rift:range"],
+            json!({ "min": ByteSize::from_bytes(0), "max": ByteSize::from_bytes(LEXICAL_MMAP_BYTES_MAX) })
+        );
+        assert_eq!(
+            table["transaction_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MIN),
+                "max": ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MAX),
+            })
+        );
         let written = json!({ "search": { "lexical": { "mmap_size": "256mb" } } });
         let configuration: WorkspaceConfiguration =
             serde_json::from_value(written).expect("the memory map size deserializes");

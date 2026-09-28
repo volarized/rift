@@ -1046,6 +1046,35 @@ pub fn declare_text_ranges(schema: &mut Schema) {
     );
 }
 
+/// A [`LexicalSearchConfiguration`](crate::configuration::LexicalSearchConfiguration)
+/// states each `ByteSize` bound as `rift:range` on its key: schema validation alone cannot
+/// compare `"1gb"` against a ceiling, so the server enforces the bounds at load and the
+/// schema carries them for readers.
+pub fn declare_lexical_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, LEXICAL_MMAP_BYTES_MAX, LEXICAL_TRANSACTION_BYTES_MAX,
+        LEXICAL_TRANSACTION_BYTES_MIN, LexicalSearchConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(LexicalSearchConfiguration, transaction_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MIN),
+            &ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(LexicalSearchConfiguration, mmap_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(0),
+            &ByteSize::from_bytes(LEXICAL_MMAP_BYTES_MAX),
+        ),
+    );
+}
+
 /// A [`SourceConfiguration`](crate::source::SourceConfiguration) states its `ByteSize`
 /// bound as `rift:range` on the key: schema validation alone cannot compare `"512mb"`
 /// against a ceiling, so the server enforces the bound at load and the schema carries it
