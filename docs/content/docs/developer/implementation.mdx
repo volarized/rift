@@ -122,8 +122,8 @@ those files, sharing every other file with the previous index. A watch failure, 
 rebuild walks the tree and reads and digests every visible file under the ignore files as they
 stand now, and parses only the files whose bytes the previous index did not already parse. A
 written `rift.toml` reads and parses the whole workspace when `[source]`, a language file
-selection, `[search.text]` inclusion or chunk bound, `[dependencies]`, or `[providers.syntax]`
-changed. Every other accepted configuration change reuses the published tree.
+selection, `[search.text]` inclusion or chunk bound, `[documentation]`, `[dependencies]`, or
+`[providers.syntax]` changed. Every other accepted configuration change reuses the published tree.
 
 Before each current-tree read, the server captures an exact digest of every included workspace
 file, then waits until the published index counter matches its observation. That capture already
@@ -280,13 +280,12 @@ The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the ser
 `rift-ranking` states the retrieval decisions every index makes: the document shape and its
 searchable fields, the corpus revision that says what those fields mean, bounded query
 construction with its precise and broad renderers, identifier splitting and match classing, and
-weighted reciprocal rank fusion over ordered identities. It also carries an index that holds its
-documents in memory and ranks them by the same BM25 weights, which is the peer a test compares
-the stored corpus against.
+weighted reciprocal rank fusion over ordered identities. It also carries the corpus tokenizer's
+split, so text read outside `SQLite` splits into the terms the store indexes.
 
 Nothing in it opens a database, loads a model, or resolves a project path. The architecture
 check refuses `SQLite`, candle, tokenizers, `reqwest`, `rig-core`, and Toasty in that crate's
-dependency closure, and an example builds the whole surface the way an external adapter would.
+dependency closure.
 A `PostgreSQL` or REST adapter therefore consumes the same decisions and the same ordered
 identities rather than copying the algorithms; resolving an identity to a declaration needs the
 store that published it, and deciding which identities win does not.
@@ -409,22 +408,84 @@ The registry itself assembles from one shipped definition list in `rift-syntax`:
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
 
+## Dependency context
+
+<VersionBadge version="v0.0.46" />
+
+`rift-dependency` holds the resolvers and the standard library pass. The resolvers read through a
+reader that offers a file read and a directory listing, so a resolver cannot start a process.
+
+Besides entries, the context records where each pinned package is installed on this machine: a
+Cargo package's `<name>-<version>` folder minted from the lockfile, an npm package's
+`node_modules/<name>` folder, nested copies included, the import folders a Python distribution's
+`.dist-info/RECORD` lists, and the Rust standard library below `rustc --print sysroot`. Those
+folders never reach the global API.
+
+The standard library pass runs `rustup --version`, `rustc --version`, `rustc --print sysroot`,
+and `node --version` through the server's bounded command runner, under
+[`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"` alone. Every
+probe runs with `RUSTUP_AUTO_INSTALL=0` and `MISE_AUTO_INSTALL=0` laid over its environment and
+`RUSTUP_TOOLCHAIN` removed from it. A rustup proxy or a mise shim installs the toolchain a pin
+names when it runs in that pin's folder, and `RUSTUP_TOOLCHAIN` beats the project's toolchain
+file.
+
+rustup honors `RUSTUP_AUTO_INSTALL` from 1.28.1, so `rustup --version` runs first from the
+filesystem root, where no toolchain file applies. Below 1.28.1, or when its first line names no
+version, `rustc` does not run and the entry keeps its static reading; the output decides, because
+`rustup --version` exits 0 whether or not it reached the active toolchain. Where no `rustup`
+starts, as beside a distribution's `rustc`, `rustc --version` runs directly.
+
 ## Package analysis
 
 <VersionBadge version="v0.0.39" />
 
-One package's source reaches the index through the package analyzer in `rift-analysis`, which
+One package's source reaches the global index through package analysis in `rift-analysis`, which
 holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
 providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
 the declarations, and renders one `PackagePublication`. That publication is the logical package
-index. The local package index consumes it, and a later global ingestion consumes the same
-shape, so one extraction serves both.
+index global ingestion consumes. The local server runs no package analysis; its package facts
+come from the global index.
+
+<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
+
+File selection decides which files of a package the analysis reads, from package-relative paths
+alone. It keeps:
+
+- the source files the package language's definitions claim: `.rs` for Rust, `.py` and `.pyi` for
+  Python, and every JavaScript and TypeScript extension for a TypeScript package, whose builds
+  ship `.js`, `.mjs`, and `.cjs` beside their declaration files
+- the documentation files the workspace's own documentation selection keeps, narrowed by a
+  package's `context7.json`
+
+It skips `node_modules`, `__pycache__`, `target`, and `.git`, and the files a caller's
+[`[source]`](/docs/developer/configuration#source) `exclude` patterns match, through the matcher
+the workspace's `[source]` table uses. Tests, examples, and benchmarks stay, since they show how a
+package is used.
+
+The stub and module join pairs a stub with the module it declares: `mod.pyi` with `mod.py`,
+`index.d.ts` with `index.js`, `.d.mts` with `.mjs`, and `.d.cts` with `.cjs`. A `.d.ts` beside no
+`.js` pairs with its `.mjs`, then its `.cjs`, so an ESM build claims a stub before a bundled one.
+Each name both files declare answers one symbol, addressed at the module: its source, range, and
+documentation come from the module, and its signatures and types from the stub, with the stub's
+overload forms gathered into one `signatures` list.
+
+A declaration counts as public by its language's rule:
+
+- Rust - `pub` declarations, and the items of a `pub` trait and the variants of a `pub` enum
+- Python - names without a leading underscore
+- TypeScript - every member but `private` and `protected` ones
+- JavaScript - the declarations an `export` wraps or names, including `module.exports` and
+  `exports.name` assignments, and the members of an exported class other than a `#` private
+  element
+
+In a paired module the stub defines the public set, and a stub declaration with no implementation
+answers from the stub alone.
 
 Two publications are comparable by their own fields. `format_revision` states the shape;
 `analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
 version and checksum and the content digest of every source file that decides what a
-publication holds: the whole `rift-syntax` and `rift-provider` crates, the analyzer, the
-package walk, the lexical and vector passes, and the identity module.
+publication holds: the whole `rift-core`, `rift-analysis`, `rift-provider`, `rift-protocol`,
+`rift-ranking`, and `rift-syntax` crates, and the lexical pass.
 Every record - a source unit, a declaration, a search document - carries a digest over its own
 content, and the whole document renders as
 [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same
