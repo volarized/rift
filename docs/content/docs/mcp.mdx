@@ -263,9 +263,10 @@ follows the calls the declaration makes, and each hop carries the `calls` facet:
 }
 ```
 
-For the example project, the result contains `parse_config`. The standard library's
-`std::fs::read_to_string` has no declaration in the local index, so a `callees_dropped` warning
-counts it in place of a result.
+For the example project, the result contains `parse_config` and the standard library's
+`std::fs::read_to_string`. The local index holds no declaration of the standard library, so the
+global index names it: its hit carries the same identity a `get_symbol` hit with
+`scope: "global"` carries, and the walk does not continue from it.
 
 Traversal works on current local code and needs a configured
 [language engine](/docs/developer/configuration#languages-and-lsp) that resolves references and
@@ -277,8 +278,9 @@ paths, coverage warnings, and unsupported requests.
 
 During traversal, the configured language engine resolves reference locations, or the callees of
 an outgoing walk. Rift finds the smallest indexed declaration containing each location, so the
-result identifies the caller or the callee. These relationships belong to this read and do not
-become indexed relationships in the map.
+result identifies the caller or the callee. A callee in an installed package or a standard library
+is named by the global index. These relationships belong to this read and do not become indexed
+relationships in the map.
 
 See [language-engine references](/docs/developer/protocol/mcp#search-engine-references) for
 validation, retries, and failure behavior.

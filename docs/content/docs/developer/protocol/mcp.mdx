@@ -388,7 +388,8 @@ These shapes cover most questions:
 
 - **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
 - **Callees** - `direction: "outgoing"`: what this symbol relies on, and at `depth: 2` what
-  those declarations rely on in turn.
+  those declarations rely on in turn. A callee in an installed package or a standard library is
+  a hit carrying the global index's identity for it, and the walk stops there.
 - **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
 
 Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
@@ -418,7 +419,9 @@ Each caller's `traversal_path` carries a relationship from the caller to `serve`
 `facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
 
 In the same workspace, `serve` returns `handle(port) + len("serve")`, and `handle` lives in
-`handlers.py`. This request asks which declarations `serve` calls:
+`handlers.py`. `len` is Python's own, declared in the typeshed stubs the embedded engine ships,
+and the global API resolves the workspace's Python to release 3.12.9. This request asks which
+declarations `serve` calls:
 
 **Request:**
 
@@ -483,26 +486,55 @@ In the same workspace, `serve` returns `handle(port) + len("serve")`, and `handl
         }
       ],
       "distance": 1
+    },
+    {
+      "hit": {
+        "target": "symbol",
+        "symbol": {
+          "id": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
+          "language": "python",
+          "name": "len",
+          "kind": "function",
+          "origin": {
+            "location": "stdlib",
+            "source_kind": "authored"
+          }
+        }
+      },
+      "matched_by": [
+        "relationship"
+      ],
+      "unit": "rift://source/stdlib/python@3.12.9/builtins.pyi",
+      "traversal_path": [
+        {
+          "relationship": {
+            "from": "rift://symbol/python/service.py/serve",
+            "kind": "calls",
+            "facets": [
+              "calls"
+            ],
+            "to": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
+            "derivation": "resolution"
+          },
+          "direction": "outgoing"
+        }
+      ],
+      "distance": 1
     }
   ],
   "pagination": {
     "page_index": 0,
     "total_pages": 1
-  },
-  "warnings": [
-    {
-      "code": "callees_dropped",
-      "callees": 1,
-      "detail": "the language engine named callees in standard library or package files, which the local index does not analyze, so the walk carries no edge to them and does not continue past them"
-    }
-  ]
+  }
 }
 ```
 
 `handle`'s `traversal_path` carries a relationship from `serve` to `handle`, with
-`facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. `len` is
-declared in the engine's standard library stubs, which the local index does not hold, so no hit
-answers it and the `callees_dropped` warning counts it.
+`facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. The local
+index holds no declaration of `len`, so its hit carries the identity the global index holds for
+it, the same identity a `get_symbol` hit with `scope: "global"` carries. Its `unit` names the
+stub it is declared in, in place of `path`, and it carries no `range` or `line`: the local index
+holds none of its bytes.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference)
 values; an empty or omitted list follows every facet a lane populates, which is `references` on
@@ -537,10 +569,12 @@ beside the `references` the engine lane resolves. An empty answer carrying it me
 could not run; an empty answer without it means the walk ran and the seed has no neighbor
 under the request.
 
-An outgoing walk attaches a `callees_dropped` entry to `warnings` when the engine names callees no
-declaration of the project holds, such as a standard library function or one in an installed
-package. The walk carries no edge to such a callee and does not continue past it; `callees`
-counts the edges it dropped over every depth.
+An outgoing walk attaches a `callees_dropped` entry to `warnings` when the engine names callees
+no declaration answers for: a file outside the project and every installed package, or a
+position where the global index holds no declaration. With `[global] enabled = false`, or when
+the global API does not answer, every callee in a package or a standard library drops, and the
+answer also carries the global warning naming why, such as `global_access_disabled`. The walk
+carries no edge to a dropped callee; `callees` counts the edges it dropped over every depth.
 
 ### Language-engine references [#search-engine-references]
 
@@ -551,12 +585,28 @@ A current-tree symbol traversal consults the configured
 names the engine facet of its `direction`: `references` for `incoming`, `calls` for `outgoing`.
 The engine's answer is what the walk follows, under the same traversal depth and result bounds.
 
-The server maps each reference location, and each callee's name, to the smallest indexed
-declaration containing it. Locations outside the workspace or without an indexed declaration
-contribute no hit. When no
-engine is configured, or the engine lacks reference support, the walk refuses
-`capability_unavailable`. A configured engine that fails to start returns its failure through
-[`ErrorData`](/docs/developer/protocol/reference).
+The server maps each reference location, and each callee's name in a project file, to the
+smallest indexed declaration containing it. Locations outside the workspace or without an
+indexed declaration contribute no hit. When no engine is configured, or the engine lacks
+reference support, the walk refuses `capability_unavailable`. A configured engine that fails to
+start returns its failure through [`ErrorData`](/docs/developer/protocol/reference).
+
+<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} />
+
+A callee outside the project maps to the package whose files hold it, at an exact version:
+
+- an installed package the workspace's dependencies name, under its `node_modules` folder, its
+  Cargo registry folder, or its import folder in the Python environment, at the version the
+  lockfile pins
+- the Rust standard library below `rustc --print sysroot`, at the toolchain's version
+- the TypeScript built-ins in the `lib.*.d.ts` files of the `typescript` package the engine
+  runs, at that package's version
+- Python's standard library, in the typeshed stubs the embedded engine ships, at the release the
+  global API resolves for the workspace's Python
+
+A package folder inside the workspace, such as `node_modules` or `.venv`, maps as its package.
+The server then asks the global API which declaration holds each such callee's position, in one
+request per walk, and the walk does not continue from a package callee.
 
 The server captures source and configuration before and after the engine request. If either
 changes, the server captures the current publication, refreshes the search ranking, and repeats
