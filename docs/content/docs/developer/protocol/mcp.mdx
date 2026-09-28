@@ -646,7 +646,8 @@ process key in `processes`.
 />
 
 `change` answers the declarations two sides hold differently. `base` names the committed revision
-compared from, a branch, tag, or commit id spelled the way git spells it. `head` names the side
+compared from, spelled the way a [revision read](#revision-reads) spells `rev`, such as `main` or
+`HEAD~1`. `head` names the side
 compared to: a revision spelled the same way, or the working tree, spelled
 `{"kind": "working_tree"}`. An omitted `head` is `HEAD`.
 
@@ -1253,6 +1254,20 @@ currently holds:
 
 ```json
 { "name": "ReadService", "rev": "main" }
+```
+
+<VersionBadge version="v0.0.46" />
+
+A name may carry git's ancestry suffixes: `~N` walks `N` first parents and `^N` picks the `N`th
+parent, each count defaulting to 1, so `HEAD~1` and `HEAD^` name the commit below `HEAD`. The server
+resolves the spelling through git's revision syntax, and a spelling that carries anything else -
+a reflog selector such as `HEAD@{1}`, or a path after a suffix - refuses `invalid_request` naming
+the field. This request reads the declaration one commit back:
+
+**Request:**
+
+```json
+{ "name": "ReadService", "rev": "HEAD~1" }
 ```
 
 A revision search refuses `force_include`: reaching index-excluded files is a walk of the

@@ -483,6 +483,7 @@ For example, this reads the function from `main` without changing the working tr
 { "name": "load_config", "rev": "main" }
 ```
 
+Git's ancestry suffixes work too, so `"rev": "HEAD~1"` reads the commit below `HEAD`.
 Revision reads use committed source from a branch, tag, or commit and require a Git repository.
 See [revision-addressed reads](/docs/developer/protocol/mcp#revision-reads) for configuration
 and argument constraints.
