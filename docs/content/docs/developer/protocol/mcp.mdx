@@ -589,8 +589,8 @@ then the package hits in unit order.
 A package hit is addressed by `unit` in place of `path` - the
 [`SourceUnitId`](/docs/developer/protocol/reference) of the package file - with `range` and
 `line` inside that unit, and `source` when `include` names it. Its `matched_by` names the fields
-the global index matched. A package contributes no file to `query`, so `target: "file"` answers
-nothing from it.
+the global index matched, such as `name` for its name and `content` for a term inside its body.
+A package contributes no file to `query`, so `target: "file"` answers nothing from it.
 
 A `pattern` reaches the package files too. The global index answers each match as a `file` hit
 addressed by `unit`, with the file's `size`, and each declaration holding a match as a `symbol`
@@ -930,7 +930,9 @@ Package-scope answers can also carry these package warnings:
 
 - `global_page_warning` - a valid global page carried a bounded condition. `warning_code`
   identifies it and optional `detail` explains it. `result_truncated` names a page the global API
-  stopped early, and the answer holds what that page held.
+  stopped early, and the answer holds what that page held. `capability_unavailable` names a
+  feature the global API's capabilities do not advertise, such as `patterns` for a `pattern`
+  search, and the answer then holds the project hits alone.
 - `package_absent` - the global publication holds no release of the exact `package` the
   dependency context names, so nothing answers for it.
 - `package_requirement_absent` - the global publication holds no release the declared
@@ -945,7 +947,9 @@ Package-scope answers can also carry these package warnings:
   standard library probe answered nothing, so the dependency context can miss packages or name a
   standard library by its static reading. `resolver` names which, by manager name - `cargo`,
   `uv`, `npm`, or `bun` - or by standard library entry - `stdlib/rust`, `stdlib/node`, or
-  `stdlib/python` - and `reason` says what it could not read.
+  `stdlib/python` - and `reason` says what it could not read. When the request's `packages` push
+  the context past 20,000 entries, the most one read sends, the entries sorted last leave and
+  `resolver` names their package manager, such as `pypi`.
 
 <VersionBadge version="v0.0.46" />
 
