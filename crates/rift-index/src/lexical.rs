@@ -25,13 +25,12 @@
 //! holds the values they were indexed from, and indexes a typed row only after
 //! it is written.
 //!
-//! A second external-content index, `lexical_documents_trigram`, holds every three
-//! characters of the file rows' text under [`rift_ranking::TRIGRAM_TOKENIZER`], so a
-//! regex pattern's prefilter selects the rows that could hold a match. It adds no copy of
-//! the text, and every write keeps it in step with the word index inside the same
-//! transaction.
+//! A second external-content index, `lexical_documents_trigram`, serves regex `pattern`
+//! search. [`crate::trigram_store`] owns its statements: a write files its new file rows
+//! for it, and [`LexicalSearchIndex::index_trigrams`] indexes them later, in bounded
+//! transactions of their own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -59,6 +58,7 @@ use toasty::stmt::{Type, Value};
 
 use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::WorkspaceDatabase;
+use crate::trigram_store::{PatternCandidates, TrigramBatch};
 
 /// Default maximum content bytes accepted for one lexical document: the largest chunk
 /// `[search.text] max_chunk` accepts (16 MiB), so the store takes every row the
@@ -273,6 +273,11 @@ columnsize=0)
 -- #[toasty::breakpoint]
 INSERT INTO lexical_documents_trigram(rowid, file_content) \
 SELECT id, file_content FROM lexical_documents WHERE file_content IS NOT NULL",
+    ),
+    MigrationFile::new(
+        11,
+        "trigram_pending",
+        "CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)",
     ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
@@ -988,11 +993,6 @@ fn searchable_columns() -> String {
     SearchableField::ALL.map(SearchableField::column).join(", ")
 }
 
-/// The rows the trigram index holds: every row that stores text. A symbol row holds none,
-/// and `columnsize=0` is what lets the index skip it: under the default, FTS5's
-/// `integrity-check` counts every content row and reports the table malformed.
-const TRIGRAM_ROWS: &str = "file_content IS NOT NULL";
-
 /// Deletes every unit filed under one path, from both FTS indexes and the typed table
 /// alike, and forgets the digest recorded for the path.
 ///
@@ -1000,8 +1000,10 @@ const TRIGRAM_ROWS: &str = "file_content IS NOT NULL";
 /// still hold the values they were indexed from: the command "must match the values
 /// currently stored in the table" or "the results may be unpredictable"
 /// (<https://www.sqlite.org/fts5.html>). The path index finds the rows, so the work is one
-/// lookup per path and one delete per unit, never a scan of an FTS table. The trigram
-/// index holds the file rows alone, so its `'delete'` names those rows alone.
+/// lookup per path and one delete per unit, never a scan of an FTS table.
+///
+/// The trigram index gives up the path's rows through
+/// [`crate::trigram_store::delete_path`], while the typed rows still hold them as well.
 async fn delete_path_units(
     executor: &mut dyn Executor,
     path: &ProjectPath,
@@ -1015,15 +1017,7 @@ async fn delete_path_units(
     .exec(&mut *executor)
     .await
     .map_err(storage_error)?;
-    toasty::sql::statement(format!(
-        "INSERT INTO lexical_documents_trigram(lexical_documents_trigram, rowid, file_content) \
-         SELECT 'delete', id, file_content FROM lexical_documents \
-         WHERE path = ?1 AND {TRIGRAM_ROWS}"
-    ))
-    .bind(path.as_str().to_owned())
-    .exec(&mut *executor)
-    .await
-    .map_err(storage_error)?;
+    crate::trigram_store::delete_path(&mut *executor, path).await?;
     toasty::sql::statement("DELETE FROM lexical_documents WHERE path = ?1")
         .bind(path.as_str().to_owned())
         .exec(&mut *executor)
@@ -1049,12 +1043,7 @@ async fn delete_every_unit(executor: &mut dyn Executor) -> Result<(), LexicalInd
     .exec(&mut *executor)
     .await
     .map_err(storage_error)?;
-    toasty::sql::statement(
-        "INSERT INTO lexical_documents_trigram(lexical_documents_trigram) VALUES('delete-all')",
-    )
-    .exec(&mut *executor)
-    .await
-    .map_err(storage_error)?;
+    crate::trigram_store::clear(&mut *executor).await?;
     LexicalDocumentRecord::all()
         .delete()
         .exec(&mut *executor)
@@ -1141,7 +1130,7 @@ async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, Lexica
 
 /// How many typed rows hold file text: whole files and the chunks of large ones. A
 /// partial index over those rows alone answers the count without reading a symbol row.
-async fn file_row_count(executor: &mut dyn Executor) -> Result<u64, LexicalIndexError> {
+pub(crate) async fn file_row_count(executor: &mut dyn Executor) -> Result<u64, LexicalIndexError> {
     let counted = single_i64(
         executor,
         "SELECT count(*) FROM lexical_documents WHERE file_content IS NOT NULL",
@@ -1189,7 +1178,7 @@ async fn last_unit_id(executor: &mut dyn Executor) -> Result<i64, LexicalIndexEr
 }
 
 /// Runs one query answering one integer.
-async fn single_i64(
+pub(crate) async fn single_i64(
     executor: &mut dyn Executor,
     sql: &'static str,
     label: &'static str,
@@ -1213,13 +1202,14 @@ async fn single_i64(
 }
 
 /// Writes each document's typed row, then indexes every row this call wrote in one
-/// statement per index.
+/// statement, and files the file rows among them for the trigram index.
 ///
 /// The typed row and the index entry carry the same fields because the index reads them
 /// from the typed row: a column filled in one and absent from the other would rank a
 /// document the reader cannot then describe. Indexing the batch's rows together, selected
 /// by the ids they took above [`last_unit_id`], hands FTS5 one set-based insert rather
-/// than one statement per document. The trigram index takes the file rows among them.
+/// than one statement per document. The file rows wait for the trigram index, which
+/// [`LexicalSearchIndex::index_trigrams`] fills.
 async fn insert_documents(
     executor: &mut dyn Executor,
     documents: &[IndexDocument],
@@ -1237,15 +1227,7 @@ async fn insert_documents(
     .exec(&mut *executor)
     .await
     .map_err(storage_error)?;
-    toasty::sql::statement(format!(
-        "INSERT INTO lexical_documents_trigram(rowid, file_content) \
-         SELECT id, file_content FROM lexical_documents WHERE id > ?1 AND {TRIGRAM_ROWS}"
-    ))
-    .bind(last)
-    .exec(executor)
-    .await
-    .map_err(storage_error)?;
-    Ok(())
+    crate::trigram_store::file_rows_above(executor, last).await
 }
 
 /// Writes one document's typed row.
@@ -1405,7 +1387,7 @@ fn decode_lexical_match(row: &Value) -> Result<LexicalMatch, LexicalIndexError> 
 
 /// The bytes of its file one stored row holds: its offset, and the length of the text
 /// it stores.
-fn stored_file_range(offset: i64, length: i64) -> Result<Range<u64>, LexicalIndexError> {
+pub(crate) fn stored_file_range(offset: i64, length: i64) -> Result<Range<u64>, LexicalIndexError> {
     let start = stored_byte_offset(offset)?;
     let length = stored_byte_offset(length)?;
     Ok(start..start.saturating_add(length))
@@ -1511,166 +1493,6 @@ fn lexical_search_column_types() -> Vec<Type> {
     ];
     types.extend(SearchableField::ALL.map(|_| Type::F64));
     types
-}
-
-/// One file a regex pattern's prefilter selected, and the spans of it to verify.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PatternCandidate {
-    path: ProjectPath,
-    spans: Vec<Range<u64>>,
-}
-
-impl PatternCandidate {
-    /// The file the selected rows belong to.
-    #[must_use]
-    pub const fn path(&self) -> &ProjectPath {
-        &self.path
-    }
-
-    /// The bytes of the file each selected row holds, in file order, or none when the
-    /// whole file is the candidate: a match holding a line feed may cross two rows.
-    #[must_use]
-    pub fn spans(&self) -> &[Range<u64>] {
-        &self.spans
-    }
-}
-
-/// The files one pattern's prefilter selected from the trigram index, or the bound the
-/// selection stopped at.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PatternCandidates {
-    candidates: Vec<PatternCandidate>,
-    truncated_at: Option<u32>,
-}
-
-impl PatternCandidates {
-    /// The selected files, in project-path order.
-    #[must_use]
-    pub fn candidates(&self) -> &[PatternCandidate] {
-        &self.candidates
-    }
-
-    /// The row bound the selection stopped at, when the index held more rows than it let
-    /// the selection read. The candidates are then a prefix of the selection, and a
-    /// caller refuses rather than answer from them.
-    #[must_use]
-    pub const fn truncated_at(&self) -> Option<u32> {
-        self.truncated_at
-    }
-
-    /// The selected rows grouped by file, from rows in any order.
-    fn from_rows(
-        mut rows: Vec<(ProjectPath, Option<Range<u64>>)>,
-        truncated_at: Option<u32>,
-    ) -> Self {
-        rows.sort_by(|(left, left_span), (right, right_span)| {
-            left.cmp(right)
-                .then_with(|| span_start(left_span.as_ref()).cmp(&span_start(right_span.as_ref())))
-        });
-        let mut candidates: Vec<PatternCandidate> = Vec::new();
-        for (path, span) in rows {
-            match candidates.last_mut() {
-                Some(last) if last.path == path => last.spans.extend(span),
-                _ => candidates.push(PatternCandidate {
-                    path,
-                    spans: span.into_iter().collect(),
-                }),
-            }
-        }
-        Self {
-            candidates,
-            truncated_at,
-        }
-    }
-}
-
-fn span_start(span: Option<&Range<u64>>) -> u64 {
-    span.map_or(0, |span| span.start)
-}
-
-/// The trigram rows `expression` selects, at most `rows_max` of them: each row's file and
-/// the bytes of the file it holds. Reads one row past the bound, and answers `None` when
-/// the index held that row. The read carries no order, so the bound cuts before any sort.
-///
-/// Only a row whose text is the slice of its file starting at `byte_offset` answers. A
-/// notebook cell's row holds the cell's source rather than the file's bytes, records no
-/// offset, and never selects its file: a caller verifies a notebook whole.
-async fn trigram_rows(
-    executor: &mut dyn Executor,
-    expression: &str,
-    rows_max: u32,
-) -> Result<Option<Vec<(ProjectPath, Range<u64>)>>, LexicalIndexError> {
-    let rows = toasty::sql::query(
-        "SELECT lexical_documents.path, lexical_documents.byte_offset, \
-         lexical_documents.byte_length \
-         FROM lexical_documents_trigram \
-         JOIN lexical_documents ON lexical_documents.id = lexical_documents_trigram.rowid \
-         WHERE lexical_documents_trigram MATCH ?1 \
-         AND lexical_documents.byte_offset IS NOT NULL LIMIT ?2",
-    )
-    .bind(expression.to_owned())
-    .bind(i64::from(rows_max) + 1)
-    .column_types([Type::String, Type::I64, Type::I64])
-    .exec(executor)
-    .await
-    .map_err(storage_error)?;
-    if rows.len() > bound_as_usize(rows_max) {
-        return Ok(None);
-    }
-    rows.iter()
-        .map(decode_trigram_row)
-        .collect::<Result<_, _>>()
-        .map(Some)
-}
-
-/// One trigram row as its file and the bytes of the file it holds.
-fn decode_trigram_row(row: &Value) -> Result<(ProjectPath, Range<u64>), LexicalIndexError> {
-    let Value::Record(record) = row else {
-        unreachable!("trigram row must be a record: row={row:?}");
-    };
-    let [Value::String(path), Value::I64(offset), Value::I64(length)] = record.as_slice() else {
-        unreachable!("trigram row must match its declared column types: row={row:?}");
-    };
-    let path = ProjectPath::new(path.clone()).map_err(|source| {
-        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
-    })?;
-    Ok((path, stored_file_range(*offset, *length)?))
-}
-
-/// The files `prefilter` selects when its members may sit in different rows of one file:
-/// one `MATCH` per literal, the literals' files combined as the formula combines them.
-/// Every literal's read counts against one `rows_max` budget.
-async fn literal_candidates(
-    executor: &mut dyn Executor,
-    prefilter: &Prefilter,
-    rows_max: u32,
-) -> Result<PatternCandidates, LexicalIndexError> {
-    let mut remaining = rows_max;
-    let mut holding: BTreeMap<&BTreeSet<String>, BTreeSet<ProjectPath>> = BTreeMap::new();
-    for literal in prefilter.literals() {
-        let expression = Prefilter::literal_expression(literal);
-        let Some(rows) = trigram_rows(&mut *executor, &expression, remaining).await? else {
-            return Ok(PatternCandidates {
-                candidates: Vec::new(),
-                truncated_at: Some(rows_max),
-            });
-        };
-        remaining -= u32::try_from(rows.len()).unwrap_or(remaining);
-        holding.insert(literal, rows.into_iter().map(|(path, _)| path).collect());
-    }
-    let files: BTreeSet<&ProjectPath> = holding.values().flatten().collect();
-    let rows = files
-        .into_iter()
-        .filter(|path| {
-            prefilter.accepts_literals(&|literal| {
-                holding
-                    .get(literal)
-                    .is_some_and(|paths| paths.contains(*path))
-            })
-        })
-        .map(|path| (path.clone(), None))
-        .collect();
-    Ok(PatternCandidates::from_rows(rows, None))
 }
 
 /// What one change set does to the lexical index.
@@ -2356,7 +2178,7 @@ impl LexicalSearchIndex {
     }
 
     /// The files a regex pattern's prefilter selects from the trigram index, for the tree
-    /// stamped `tree_revision`, in project-path order.
+    /// stamped `tree_revision`, in project-path order, and the file rows the index lacks.
     ///
     /// A `line_bound` pattern matches inside one line, and a line sits inside one row,
     /// since a chunk packs whole lines: one `MATCH` of the whole formula selects the rows,
@@ -2365,6 +2187,11 @@ impl LexicalSearchIndex {
     /// runs one `MATCH` per literal and combines their files instead, each file a whole
     /// candidate. At most `rows_max` rows are read, counted over every `MATCH` the formula
     /// runs; past it the answer says so and carries no candidate.
+    ///
+    /// The index holds the rows [`Self::index_trigrams`] has reached, so a row a write
+    /// stored since then selects nothing. The answer names those rows in
+    /// [`PatternCandidates::unindexed`], merged into the selection when they fit the rows
+    /// `rows_max` leaves, and counted for the caller to report when they do not.
     ///
     /// # Errors
     ///
@@ -2387,25 +2214,40 @@ impl LexicalSearchIndex {
         if let Some(scoped) = stamp_scope(stored, tree_revision) {
             return Ok(scoped);
         }
-        let row_expression = prefilter.row_expression().filter(|_| line_bound);
-        let candidates = match row_expression {
-            Some(expression) => {
-                match trigram_rows(&mut transaction, &expression, rows_max).await? {
-                    Some(rows) => PatternCandidates::from_rows(
-                        rows.into_iter()
-                            .map(|(path, span)| (path, Some(span)))
-                            .collect(),
-                        None,
-                    ),
-                    None => PatternCandidates {
-                        candidates: Vec::new(),
-                        truncated_at: Some(rows_max),
-                    },
-                }
-            }
-            None => literal_candidates(&mut transaction, prefilter, rows_max).await?,
-        };
-        Ok(RevisionScoped::Matched(candidates))
+        crate::trigram_store::candidates(&mut transaction, prefilter, line_bound, rows_max)
+            .await
+            .map(RevisionScoped::Matched)
+    }
+
+    /// Indexes the oldest file rows the trigram index lacks in one transaction, at most
+    /// [`LexicalIndexLimits::transaction_units_max`] rows and
+    /// [`LexicalIndexLimits::transaction_bytes_max`] bytes of their text, and answers how
+    /// many it still lacks.
+    ///
+    /// The first row always goes, whatever its size, so every call that finds a row lacking
+    /// indexes at least one and repeated calls reach zero. The transaction takes the write
+    /// turn every lexical write takes, and the two bounds are what a write queued behind it
+    /// waits on; readers are never blocked, since they read committed WAL snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] on storage failure; the rows stay lacking.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation before commit leaves the index and the lacking rows as they were.
+    pub async fn index_trigrams(&self) -> Result<TrigramBatch, LexicalIndexError> {
+        let rows_max = self.limits.transaction_units_max();
+        let bytes_max = u64::try_from(self.limits.transaction_bytes_max()).unwrap_or(u64::MAX);
+        rift_core::traced_async!(component = "lexical", operation = "lexical.trigrams", {
+            let mut access = self.database.writing().await?;
+            let mut transaction = access.transaction().await?;
+            let batch =
+                crate::trigram_store::index_batch(&mut transaction, rows_max, bytes_max).await?;
+            transaction.commit().await.map_err(storage_error)?;
+            Ok(batch)
+        })
+        .await
     }
 
     /// Runs the full-text ranking as one fusion input, best first.
@@ -2597,12 +2439,13 @@ mod tests {
     use super::{
         LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault,
         LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch,
-        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, TRIGRAM_ROWS, checked_byte_length,
+        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, checked_byte_length,
         decode_lexical_match, decode_recorded, isolated_weights, lexical_error,
         lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
         project_location, rank_weights, require_pragma_row, searchable_columns,
         validate_lexical_batch,
     };
+    use crate::trigram_store::TRIGRAM_ROWS;
     use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
     use rift_ranking::{
         CORPUS_TOKENIZER, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
@@ -2994,6 +2837,21 @@ mod tests {
         assert!(
             sql.ends_with(&format!("WHERE {TRIGRAM_ROWS}")),
             "the fill selects the rows every write indexes: {sql}"
+        );
+    }
+
+    /// The rows the trigram index lacks are filed by id alone, so a row id is all the
+    /// pending set records and the typed row keeps the only copy of its text.
+    #[test]
+    fn test_the_pending_migration_files_rows_by_id_alone() {
+        let sql = MIGRATION_FILES
+            .iter()
+            .find(|file| file.name() == "trigram_pending")
+            .expect("the pending migration must exist")
+            .sql();
+        assert_eq!(
+            sql,
+            "CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)"
         );
     }
 

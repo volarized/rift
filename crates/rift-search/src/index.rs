@@ -25,7 +25,7 @@ use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
     LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates,
-    RevisionScoped, StoredVector, VectorStore,
+    RevisionScoped, StoredVector, TrigramBatch, VectorStore,
 };
 use rift_ranking::{
     BodyTerms, DocumentIdentity, DocumentLocation, FieldSet, FileRowFrequencies, IndexDocument,
@@ -908,6 +908,20 @@ impl SearchIndex {
             .pattern_candidates(tree_revision, prefilter, line_bound, rows_max)
             .await
             .map_err(store_failed)
+    }
+
+    /// Indexes the oldest file rows the lexical tier's trigram index lacks, in one bounded
+    /// transaction; see [`LexicalSearchIndex::index_trigrams`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation before the commit leaves the index and the lacking rows as they were.
+    pub async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
+        self.lexical.index_trigrams().await.map_err(store_failed)
     }
 
     /// The tree revision the lexical tier is stamped with.

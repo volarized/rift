@@ -135,8 +135,23 @@ async fn untouched_row_ids(
     Ok(ids)
 }
 
-/// FTS5's own check of the word index and the trigram index against the rows they read.
-async fn assert_index_matches_rows(path: &Path) -> TestResult {
+/// Trigram batches one store takes at most before its trigram index holds every row.
+const TRIGRAM_BATCHES_MAX: usize = 64;
+
+/// Runs trigram batches until `store`'s trigram index holds every row the store does.
+async fn catch_up_trigrams(store: &LexicalSearchIndex) -> TestResult {
+    for _batch in 0..TRIGRAM_BATCHES_MAX {
+        if store.index_trigrams().await?.pending() == 0 {
+            return Ok(());
+        }
+    }
+    Err("the trigram index never caught up with the store".into())
+}
+
+/// Catches `store`'s trigram index up with its rows, then runs FTS5's own check of the
+/// word index and the trigram index against the rows they read.
+async fn assert_index_matches_rows(store: &LexicalSearchIndex, path: &Path) -> TestResult {
+    catch_up_trigrams(store).await?;
     let database = probe(path).await?;
     let mut connection = database.connection().await?;
     for index in ["lexical_documents_fts", "lexical_documents_trigram"] {
@@ -195,7 +210,7 @@ impl Kept {
             .apply(&change, &LexicalStamp::published(&revision, "derivation"))
             .await?;
         self.index = next;
-        assert_index_matches_rows(&self.database).await?;
+        assert_index_matches_rows(&self.store, &self.database).await?;
         let kept_after = untouched_row_ids(&self.database, &replaced).await?;
         assert_eq!(
             kept_before, kept_after,
@@ -214,7 +229,7 @@ impl Kept {
         cold_store
             .replace_all(&index_of(&self.root)?.index_documents(), revision)
             .await?;
-        assert_index_matches_rows(&cold_path).await?;
+        assert_index_matches_rows(&cold_store, &cold_path).await?;
         assert_eq!(
             dump(&self.database).await?,
             dump(&cold_path).await?,

@@ -10,7 +10,8 @@ use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_index::{
     DatabasePool, LexicalChange, LexicalIndexLimits, LexicalSearchIndex, LexicalStamp,
-    PatternCandidates, RevisionScoped, WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
+    PatternCandidates, RevisionScoped, TrigramBatch, UnindexedRows, WorkspaceDatabase,
+    WorkspaceIndex, WorkspaceIndexLimits,
 };
 use rift_ranking::{
     DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument, Pattern,
@@ -171,9 +172,24 @@ async fn store(directory: &TempDir) -> TestResult<LexicalSearchIndex> {
     ))
 }
 
-/// FTS5's own check of the trigram index against the rows it reads: every text row's
-/// trigrams, and nothing a removed row held.
-async fn assert_trigram_index_matches_rows(path: &Path) -> TestResult {
+/// Trigram batches one fixture store takes at most before its trigram index holds every
+/// row.
+const TRIGRAM_BATCHES_MAX: usize = 64;
+
+/// Runs trigram batches until `index`'s trigram index holds every row the store does.
+async fn catch_up_trigrams(index: &LexicalSearchIndex) -> TestResult {
+    for _batch in 0..TRIGRAM_BATCHES_MAX {
+        if index.index_trigrams().await?.pending() == 0 {
+            return Ok(());
+        }
+    }
+    Err("the trigram index never caught up with the fixture store".into())
+}
+
+/// Catches `index`'s trigram index up, then runs FTS5's own check of it against the rows
+/// it reads: every text row's trigrams, and nothing a removed row held.
+async fn assert_trigram_index_matches_rows(index: &LexicalSearchIndex, path: &Path) -> TestResult {
+    catch_up_trigrams(index).await?;
     let database = probe(path).await?;
     let mut connection = database.connection().await?;
     toasty::sql::statement(
@@ -192,14 +208,35 @@ fn chunked_tree(files: &[(&str, String)]) -> TestResult<(TempDir, WorkspaceIndex
     for (name, text) in files {
         std::fs::write(tree.path().join(name), text)?;
     }
-    let index = WorkspaceIndex::build_with_languages(
-        tree.path(),
+    let index = indexed_tree(tree.path())?;
+    Ok((tree, index))
+}
+
+/// Indexes the tree at `root` with every file as text, chunked at [`CHUNK_BYTES_MAX`].
+fn indexed_tree(root: &Path) -> TestResult<WorkspaceIndex> {
+    Ok(WorkspaceIndex::build_with_languages(
+        root,
         WorkspaceIndexLimits::default(),
         &SourceVisibility::default(),
         &TextFileInclusion::new(vec!["**".to_owned()], CHUNK_BYTES_MAX),
         &LanguageFileSelections::default(),
-    )?;
-    Ok((tree, index))
+    )?)
+}
+
+/// How many rows of `workspace`'s documents store file text: the rows the trigram index
+/// holds once it has caught up.
+fn file_rows(workspace: &WorkspaceIndex) -> TestResult<u64> {
+    let rows = workspace
+        .index_documents()
+        .iter()
+        .filter(|document| {
+            document
+                .fields()
+                .get(SearchableField::FileContent)
+                .is_some()
+        })
+        .count();
+    Ok(u64::try_from(rows)?)
 }
 
 /// Forty filler lines, then `needle`, then forty more: past the chunk bound, with
@@ -253,7 +290,7 @@ async fn a_line_bound_pattern_selects_the_rows_holding_it_with_their_spans() -> 
     index
         .replace_all(&workspace.index_documents(), "revision-1")
         .await?;
-    assert_trigram_index_matches_rows(&database_path(&directory)).await?;
+    assert_trigram_index_matches_rows(&index, &database_path(&directory)).await?;
 
     let at = u64::try_from(long.find("Beacon").ok_or("the text holds the needle")?)?;
     for pattern in [r"Beacon\s+lantern", "(?i)beacon LANTERN"] {
@@ -287,6 +324,7 @@ async fn a_pattern_crossing_a_line_selects_whole_files_across_chunks() -> TestRe
     index
         .replace_all(&workspace.index_documents(), "revision-1")
         .await?;
+    catch_up_trigrams(&index).await?;
     // Thirty-byte filler lines pack 34 to the first 1024-byte chunk, so line 033 ends it
     // and line 034 opens the next.
     let row_of = |found: &PatternCandidates| {
@@ -321,6 +359,7 @@ async fn the_candidate_bound_counts_rows_and_refuses_a_cut_selection() -> TestRe
     index
         .replace_all(&workspace.index_documents(), "revision-1")
         .await?;
+    catch_up_trigrams(&index).await?;
     let every_row = candidates(&index, "revision-1", "filler line", ROWS_MAX).await?;
     let rows = u32::try_from(every_row.candidates()[0].spans().len())?;
     assert!(rows > 1, "every chunk holds the pattern: {rows}");
@@ -359,6 +398,7 @@ async fn a_formula_past_the_depth_bound_selects_by_literal() -> TestResult {
     index
         .replace_all(&workspace.index_documents(), "revision-1")
         .await?;
+    catch_up_trigrams(&index).await?;
     let mut formula = Prefilter::Literal(trigram_set("beacon"));
     for level in 0..=ROW_EXPRESSION_DEPTH_MAX {
         let sibling = Prefilter::Literal(trigram_set(&format!("absent {level}")));
@@ -396,7 +436,7 @@ async fn a_row_recording_no_offset_selects_no_file() -> TestResult {
         fields,
     )?;
     index.replace_all(&[cell], "revision-1").await?;
-    assert_trigram_index_matches_rows(&database_path(&directory)).await?;
+    assert_trigram_index_matches_rows(&index, &database_path(&directory)).await?;
     let found = candidates(&index, "revision-1", "beacon", ROWS_MAX).await?;
     assert!(found.candidates().is_empty(), "{found:?}");
     Ok(())
@@ -417,7 +457,7 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
     index
         .replace_all(&workspace.index_documents(), "revision-1")
         .await?;
-    assert_trigram_index_matches_rows(&path).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
 
     std::fs::write(tree.path().join("long.txt"), long_text("second lantern"))?;
     std::fs::remove_file(tree.path().join("gone.txt"))?;
@@ -432,14 +472,14 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
     let change = LexicalChange::new(replaced.clone(), rebuilt.index_documents_for(&replaced));
     let stamp = LexicalStamp::published("revision-2", "derivation-a");
     index.apply(&change, &stamp).await?;
-    assert_trigram_index_matches_rows(&path).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
     index
         .apply(
             &change,
             &LexicalStamp::published("revision-3", "derivation-a"),
         )
         .await?;
-    assert_trigram_index_matches_rows(&path).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
 
     let lantern = candidates(&index, "revision-3", "second lantern", ROWS_MAX).await?;
     assert_eq!(lantern.candidates().len(), 1);
@@ -462,7 +502,7 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
     // index carries no revision of its own and is cleared and refilled with the rows.
     assert_eq!(index.recorded_files("derivation-b").await?, None);
     index.clear("derivation-b").await?;
-    assert_trigram_index_matches_rows(&path).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
     assert_eq!(
         index
             .pattern_candidates("revision-3", prefilter, true, ROWS_MAX)
@@ -476,13 +516,188 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
             &LexicalStamp::published("revision-4", "derivation-b"),
         )
         .await?;
-    assert_trigram_index_matches_rows(&path).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
     let found = candidates(&index, "revision-4", "second lantern", ROWS_MAX).await?;
     assert_eq!(
         found.candidates().len(),
         1,
         "the reload refills the trigram index"
     );
+    Ok(())
+}
+
+/// The rows a write stores wait for the trigram index, so a selection finds none of them
+/// and names them instead. Each joins the selection with its span for a line-bound pattern
+/// and as its whole file for one that may cross a line, while they fit the room the
+/// candidate bound leaves past the rows the selection read; past it they are counted and
+/// not listed. Once the index catches up, the selection finds them and names nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_a_write_stores_wait_for_the_trigram_index_and_join_the_selection() -> TestResult {
+    let (tree, workspace) = chunked_tree(&[
+        ("long.txt", long_text("the Beacon lantern sits here")),
+        ("short.txt", "no light at all\n".to_owned()),
+    ])?;
+    let rows = file_rows(&workspace)?;
+    let long_rows = rows - 1;
+    assert!(long_rows > 1, "the long file splits into rows: {rows}");
+    let directory = TempDir::new()?;
+    let index = store(&directory).await?;
+    index
+        .replace_all(&workspace.index_documents(), "revision-1")
+        .await?;
+
+    let found = candidates(&index, "revision-1", r"Beacon\s+lantern", ROWS_MAX).await?;
+    assert!(found.candidates().is_empty(), "the index holds no row yet");
+    let unindexed = found.unindexed().ok_or("every file row waits")?;
+    assert_eq!((unindexed.prepared(), unindexed.total()), (0, rows));
+    let completed = unindexed.completed().ok_or("the rows fit the room")?;
+    let listed: Vec<(&str, usize)> = completed
+        .iter()
+        .map(|candidate| (candidate.path().as_str(), candidate.spans().len()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("long.txt", usize::try_from(long_rows)?), ("short.txt", 1)]
+    );
+
+    let crossing = candidates(&index, "revision-1", r"Beacon\nlantern", ROWS_MAX).await?;
+    let whole = crossing
+        .unindexed()
+        .and_then(UnindexedRows::completed)
+        .ok_or("the rows fit the room")?;
+    assert_eq!(whole.len(), 2);
+    assert!(
+        whole.iter().all(|candidate| candidate.spans().is_empty()),
+        "a pattern crossing a line verifies each lacking file whole: {whole:?}"
+    );
+
+    let exact = candidates(&index, "revision-1", "Beacon", u32::try_from(rows)?).await?;
+    assert!(
+        exact
+            .unindexed()
+            .and_then(UnindexedRows::completed)
+            .is_some(),
+        "a bound equal to the lacking rows lists them"
+    );
+    let short = candidates(&index, "revision-1", "Beacon", u32::try_from(rows - 1)?).await?;
+    let unindexed = short.unindexed().ok_or("the rows still wait")?;
+    assert_eq!(
+        unindexed.completed(),
+        None,
+        "one row past the room lists none"
+    );
+    assert_eq!((unindexed.prepared(), unindexed.total()), (0, rows));
+
+    catch_up_trigrams(&index).await?;
+    let found = candidates(&index, "revision-1", r"Beacon\s+lantern", ROWS_MAX).await?;
+    assert_eq!(found.unindexed(), None);
+    assert_eq!(found.candidates().len(), 1);
+
+    std::fs::write(tree.path().join("short.txt"), "a new light\n")?;
+    let edited = vec![ProjectPath::new("short.txt")?];
+    let change = LexicalChange::new(
+        edited.clone(),
+        indexed_tree(tree.path())?.index_documents_for(&edited),
+    );
+    let stamp = LexicalStamp::published("revision-2", "derivation-a");
+    index.apply(&change, &stamp).await?;
+    let room = u32::try_from(long_rows)?;
+    let fits = candidates(&index, "revision-2", "filler line", room + 1).await?;
+    let unindexed = fits.unindexed().ok_or("the edited row waits")?;
+    assert_eq!((unindexed.prepared(), unindexed.total()), (rows - 1, rows));
+    let paths: Vec<&str> = unindexed
+        .completed()
+        .ok_or("one lacking row fits a room of one")?
+        .iter()
+        .map(|candidate| candidate.path().as_str())
+        .collect();
+    assert_eq!(paths, ["long.txt", "short.txt"]);
+    let full = candidates(&index, "revision-2", "filler line", room).await?;
+    assert_eq!(
+        full.unindexed().and_then(UnindexedRows::completed),
+        None,
+        "a selection that fills the bound leaves no room"
+    );
+    assert_eq!(full.candidates().len(), 1, "the selection itself answers");
+    Ok(())
+}
+
+/// One batch takes the lacking rows in id order up to the transaction bounds: a unit bound
+/// of two indexes two rows a batch, and a byte bound below every row still indexes one
+/// row a batch, so the index always catches up and then matches its rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trigram_batch_stops_at_the_transaction_bounds_and_always_takes_a_row() -> TestResult {
+    let (_tree, workspace) = chunked_tree(&[
+        ("long.txt", long_text("marker line")),
+        ("short.txt", "a light\n".to_owned()),
+    ])?;
+    let rows = file_rows(&workspace)?;
+    for (units, bytes, per_batch) in [(2, usize::MAX, 2), (usize::MAX, 1, 1)] {
+        let directory = TempDir::new()?;
+        let path = database_path(&directory);
+        let index = LexicalSearchIndex::attached(
+            WorkspaceDatabase::open(&path, pool()).await?,
+            LexicalIndexLimits::default().with_transaction_bounds(units, bytes),
+        );
+        index
+            .replace_all(&workspace.index_documents(), "revision-1")
+            .await?;
+        let mut pending = rows;
+        while pending > 0 {
+            let batch = index.index_trigrams().await?;
+            let expected = per_batch.min(pending);
+            assert_eq!(
+                (batch.indexed(), batch.pending()),
+                (expected, pending - expected),
+                "units {units}, bytes {bytes}"
+            );
+            pending = batch.pending();
+        }
+        assert_eq!(index.index_trigrams().await?, TrigramBatch::default());
+        assert_trigram_index_matches_rows(&index, &path).await?;
+    }
+    Ok(())
+}
+
+/// A path rewritten before the trigram index took its rows takes them off the lacking set,
+/// since the index never held them, and rows the index did take leave it through FTS5's
+/// `'delete'`. Writes landing in either order leave the index matching its rows once it
+/// catches up, and a clear leaves nothing lacking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_rewritten_before_the_trigram_index_took_them_leave_it_valid() -> TestResult {
+    let (tree, workspace) = chunked_tree(&[
+        ("long.txt", long_text("first beacon")),
+        ("gone.txt", "gone beacon\n".to_owned()),
+    ])?;
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let index = store(&directory).await?;
+    index
+        .replace_all(&workspace.index_documents(), "revision-1")
+        .await?;
+
+    std::fs::write(tree.path().join("long.txt"), long_text("second lantern"))?;
+    std::fs::remove_file(tree.path().join("gone.txt"))?;
+    let rebuilt = indexed_tree(tree.path())?;
+    let replaced = vec![ProjectPath::new("long.txt")?, ProjectPath::new("gone.txt")?];
+    let change = LexicalChange::new(replaced.clone(), rebuilt.index_documents_for(&replaced));
+    let derived = |revision: &str| LexicalStamp::published(revision, "derivation-a");
+    index.apply(&change, &derived("revision-2")).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
+    let lantern = candidates(&index, "revision-2", "second lantern", ROWS_MAX).await?;
+    assert_eq!(lantern.candidates().len(), 1);
+    assert_eq!(lantern.unindexed(), None);
+    let beacon = candidates(&index, "revision-2", "beacon", ROWS_MAX).await?;
+    assert!(beacon.candidates().is_empty(), "{beacon:?}");
+
+    index.apply(&change, &derived("revision-3")).await?;
+    index.apply(&change, &derived("revision-4")).await?;
+    assert_trigram_index_matches_rows(&index, &path).await?;
+
+    index.apply(&change, &derived("revision-5")).await?;
+    index.clear("derivation-b").await?;
+    assert_eq!(index.index_trigrams().await?, TrigramBatch::default());
+    assert_trigram_index_matches_rows(&index, &path).await?;
     Ok(())
 }
 

@@ -1490,10 +1490,25 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document
     Ok(())
 }
 
-/// Runs FTS5's own consistency check on the word index and the trigram index, comparing
-/// each with the typed rows it reads: "If the value 1 is inserted into the rank column,
-/// the index is also compared to the content table" (<https://www.sqlite.org/fts5.html>).
-async fn assert_index_matches_rows(path: &Path) -> TestResult {
+/// Trigram batches a fixture store takes at most before its trigram index holds every row.
+const TRIGRAM_BATCHES_MAX: usize = 64;
+
+/// Runs trigram batches until `index`'s trigram index holds every row the store does.
+async fn catch_up_trigrams(index: &LexicalSearchIndex) -> TestResult {
+    for _batch in 0..TRIGRAM_BATCHES_MAX {
+        if index.index_trigrams().await?.pending() == 0 {
+            return Ok(());
+        }
+    }
+    Err("the trigram index never caught up with the fixture store".into())
+}
+
+/// Catches `index`'s trigram index up with its rows, then runs FTS5's own consistency
+/// check on the word index and the trigram index, comparing each with the typed rows it
+/// reads: "If the value 1 is inserted into the rank column, the index is also compared to
+/// the content table" (<https://www.sqlite.org/fts5.html>).
+async fn assert_index_matches_rows(index: &LexicalSearchIndex, path: &Path) -> TestResult {
+    catch_up_trigrams(index).await?;
     let probe = open_concurrent_probe(path).await?;
     let mut connection = probe.connection().await?;
     for index in ["lexical_documents_fts", "lexical_documents_trigram"] {
@@ -1581,7 +1596,7 @@ async fn test_lexical_search_index_recorded_files_answer_what_one_derivation_rec
             .await?
             .is_empty()
     );
-    assert_index_matches_rows(&database_path(&directory)).await
+    assert_index_matches_rows(&index, &database_path(&directory)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1731,7 +1746,7 @@ async fn test_lexical_search_index_clear_empties_rows_records_and_the_publicatio
             .len(),
         1
     );
-    assert_index_matches_rows(&path).await
+    assert_index_matches_rows(&index, &path).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1753,7 +1768,7 @@ async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_ro
         )?,
     ];
     index.replace_all(&chunks, "revision-one").await?;
-    assert_index_matches_rows(&path).await?;
+    assert_index_matches_rows(&index, &path).await?;
 
     let rewritten = LexicalChange::new(
         vec![ProjectPath::new("notes.md")?],
@@ -1765,7 +1780,7 @@ async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_ro
             &LexicalStamp::published("revision-two", "derivation-a"),
         )
         .await?;
-    assert_index_matches_rows(&path).await?;
+    assert_index_matches_rows(&index, &path).await?;
     assert!(
         search_matches(&index, "revision-two", "eta", 8)
             .await?
@@ -1784,7 +1799,7 @@ async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_ro
             &LexicalStamp::published("revision-three", "derivation-a"),
         )
         .await?;
-    assert_index_matches_rows(&path).await?;
+    assert_index_matches_rows(&index, &path).await?;
     assert_eq!(
         search_matches(&index, "revision-three", "iota", 8)
             .await?

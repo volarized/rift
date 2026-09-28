@@ -10,6 +10,7 @@ mod language;
 mod lexical;
 mod log;
 mod semantic;
+mod trigram_store;
 
 mod relationship;
 mod revision;
@@ -22,8 +23,7 @@ pub use database::{DatabasePool, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
-    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalStamp, PatternCandidate,
-    PatternCandidates, PublishedIndex, RevisionScoped,
+    LexicalMatch, LexicalRanking, LexicalSearchIndex, LexicalStamp, PublishedIndex, RevisionScoped,
 };
 pub use log::{
     LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
@@ -43,6 +43,7 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::{
     ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
 };
+pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,
