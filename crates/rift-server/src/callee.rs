@@ -905,6 +905,66 @@ mod tests {
         Ok(())
     }
 
+    /// A crate the standard library vendors has its own root inside the library's root,
+    /// and the longer root answers: the callee is the crate's, at the version its folder
+    /// names. A folder below `vendor` no install folder names stays the library's file.
+    #[test]
+    fn a_vendored_crate_addresses_as_its_cargo_package_ahead_of_the_standard_library() -> TestResult
+    {
+        let spellings = RootSpellings {
+            index_root: Path::new("/ws"),
+            engine_roots: &[],
+        };
+        let library = "/toolchain/lib/rustlib/src/rust/library";
+        let installs = [
+            installed(
+                identity("stdlib", "rust", "1.98.1"),
+                InstallLocation::Path(PathBuf::from(library)),
+            ),
+            installed(
+                identity("cargo", "hashbrown", "0.17.1"),
+                InstallLocation::Path(PathBuf::from(format!("{library}/vendor/hashbrown-0.17.1"))),
+            ),
+        ];
+        let roots = CalleeRoots::from_packages(
+            installs
+                .iter()
+                .flat_map(|folder| folder_roots(folder, &[], spellings))
+                .collect(),
+        );
+        let caller = CoreSymbolId::new("rift://symbol/rust/src/lib.rs/run")?;
+        let trees = [Path::new("/ws")];
+        let classify = |path: &str| -> Result<String, Box<dyn std::error::Error>> {
+            let uri: Uri = format!("file://{library}/{path}").parse()?;
+            Ok(match callee_file(&roots, &trees, &caller, call(&uri))? {
+                CalleeFile::Package(PackageCallee {
+                    package: CalleePackage::Installed(package),
+                    path,
+                    ..
+                }) => format!(
+                    "{}/{}@{} {path}",
+                    package.manager, package.name, package.version
+                ),
+                CalleeFile::Package(_) | CalleeFile::Project(_) | CalleeFile::Unaddressed => {
+                    "not an installed package".to_owned()
+                }
+            })
+        };
+        assert_eq!(
+            classify("vendor/hashbrown-0.17.1/src/raw/mod.rs")?,
+            "cargo/hashbrown@0.17.1 src/raw/mod.rs"
+        );
+        assert_eq!(
+            classify("std/src/fs.rs")?,
+            "stdlib/rust@1.98.1 std/src/fs.rs"
+        );
+        assert_eq!(
+            classify("vendor/stray/src/lib.rs")?,
+            "stdlib/rust@1.98.1 vendor/stray/src/lib.rs"
+        );
+        Ok(())
+    }
+
     fn call(uri: &Uri) -> NamedCallee<'_> {
         NamedCallee {
             uri,
