@@ -207,6 +207,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_operations(&spec).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
     validate_optional_properties_omit_null(&document).map_err(&invalid)?;
+    validate_patterns(&document).map_err(&invalid)?;
     validate_shared_schemas(&document).map_err(&invalid)?;
     Ok(())
 }
@@ -621,6 +622,37 @@ fn validate_optional_properties_omit_null(document: &Value) -> Result<(), String
                 "schema `{name}` accepts `null` on an optional property; the service omits an \
                  absent field, so the property states its value type alone"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a schema `pattern` the `regex` crate cannot compile.
+///
+/// A JSON Schema validator reads a pattern as an ECMA-262 regular expression, and the client
+/// generator compiles it with the `regex` crate, which has no lookaround: a pattern outside
+/// the dialect both read leaves the generated client without the check, and the generator
+/// only prints a warning. The walk skips `examples`, whose values are data.
+fn validate_patterns(document: &Value) -> Result<(), String> {
+    let mut pending = vec![("", document)];
+    while let Some((key, value)) = pending.pop() {
+        match value {
+            Value::String(pattern) if key == "pattern" => {
+                regex::Regex::new(pattern).map_err(|error| {
+                    format!(
+                        "pattern `{pattern}` must compile under the `regex` crate the client \
+                         generator reads it with: {error}"
+                    )
+                })?;
+            }
+            Value::Object(members) => pending.extend(
+                members
+                    .iter()
+                    .filter(|(member, _)| !matches!(member.as_str(), "examples" | "example"))
+                    .map(|(member, value)| (member.as_str(), value)),
+            ),
+            Value::Array(items) => pending.extend(items.iter().map(|item| ("", item))),
+            _ => {}
         }
     }
     Ok(())

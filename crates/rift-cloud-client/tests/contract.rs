@@ -55,6 +55,48 @@ fn committed_contract_is_valid() -> TestResult {
     Ok(())
 }
 
+/// Every schema `pattern` compiles in the two dialects that read it: the ECMA-262 regular
+/// expressions a JSON Schema validator runs, and the `regex` crate the client generator
+/// compiles, which has no lookahead. A lookahead the validator accepts fails the contract.
+#[test]
+fn every_schema_pattern_compiles_for_the_validator_and_the_generator() -> TestResult {
+    let document = contract()?;
+    let mut pending = vec![&document];
+    let mut patterns = Vec::new();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(members) => {
+                if let Some(Value::String(pattern)) = members.get("pattern") {
+                    patterns.push(pattern.clone());
+                }
+                pending.extend(
+                    members
+                        .iter()
+                        .filter(|(member, _)| member.as_str() != "examples")
+                        .map(|(_, value)| value),
+                );
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    let project_path = &document["components"]["schemas"]["ProjectPath"]["pattern"];
+    assert!(
+        patterns.iter().any(|pattern| project_path == pattern),
+        "the project path pattern is among them: {patterns:#?}"
+    );
+    for pattern in &patterns {
+        jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+            .map_err(|error| format!("{pattern}: {error}"))?;
+        regex::Regex::new(pattern).map_err(|error| format!("{pattern}: {error}"))?;
+    }
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["ProjectPath"]["pattern"] = json!(r"^(?!\.rift)[a-z]*$");
+    assert_invalid(&document, "must compile under the `regex` crate")?;
+    Ok(())
+}
+
 #[test]
 fn missing_and_malformed_contracts_keep_their_sources() -> TestResult {
     let directory = tempfile::tempdir()?;

@@ -33,6 +33,57 @@ macro_rules! identity_path_character {
     };
 }
 
+/// A character class of what one project path segment holds - anything but the `/`
+/// separator, a backslash, or a control character - less the characters `$excluded` names.
+macro_rules! project_path_class {
+    ($($excluded:literal)?) => {
+        concat!(r"[^\\\u0000-\u001F\u007F/", $($excluded,)? "]")
+    };
+}
+
+/// One project path segment other than `.` and `..`: a run holding a character other than
+/// `.`, or three dots or more.
+macro_rules! project_path_segment {
+    () => {
+        concat!(
+            r"(?:\.*",
+            project_path_class!("."),
+            project_path_class!(),
+            r"*|\.{3,})"
+        )
+    };
+}
+
+/// The first segment of a project path: one `project_path_segment!` other than `.rift`,
+/// spelled out prefix by prefix, since the regex dialects a JSON Schema pattern must
+/// satisfy share no lookahead.
+macro_rules! project_path_first_segment {
+    () => {
+        concat!(
+            "(?:",
+            project_path_class!("."),
+            project_path_class!(),
+            r"*|\.\.",
+            project_path_class!(),
+            r"+|\.",
+            project_path_class!(".r"),
+            project_path_class!(),
+            r"*|\.r(?:",
+            project_path_class!("i"),
+            project_path_class!(),
+            "*|i(?:",
+            project_path_class!("f"),
+            project_path_class!(),
+            "*|f(?:",
+            project_path_class!("t"),
+            project_path_class!(),
+            "*|t",
+            project_path_class!(),
+            "+)?)?)?)"
+        )
+    };
+}
+
 /// The language segment a `rift://node/` or `rift://symbol/` identity carries before its path:
 /// one word, or two joined by `:`.
 macro_rules! identity_language_segment {
@@ -898,7 +949,13 @@ pub struct ProjectPath(
     #[schemars(example = &"src/lib.rs")]
     #[schemars(length(max = 1000))]
     #[schemars(regex(
-        pattern = r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$"
+        pattern = concat!(
+            "^(?:",
+            project_path_first_segment!(),
+            "(?:/",
+            project_path_segment!(),
+            ")*)?$"
+        )
     ))]
     pub String,
 );
@@ -2358,6 +2415,62 @@ mod tests {
             symbol.origin.location,
             Some(super::SourceLocationKind::Project)
         );
+    }
+
+    /// The `ProjectPath` pattern states the rules `rift_core::ProjectPath` enforces with no
+    /// lookahead, which neither the JSON Schema dialect nor the `regex` crate the global
+    /// API client generator reads it with share: the root, no leading, trailing, or doubled
+    /// separator, no `.` or `..` segment, no backslash or control character, and no `.rift`
+    /// first segment.
+    #[test]
+    fn project_path_pattern_refuses_what_the_path_rules_refuse() {
+        let schema =
+            serde_json::to_value(schema_for!(super::ProjectPath)).expect("project path schema");
+        let pattern = schema["pattern"].as_str().expect("an advertised pattern");
+        assert!(!pattern.contains("(?!"), "no lookahead: {pattern}");
+        let validator = jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+            .expect("the advertised pattern compiles");
+        let accepted = [
+            "",
+            "src/lib.rs",
+            ".github/workflows/ci.yml",
+            ".r",
+            ".ri",
+            ".rif",
+            ".rifts",
+            ".rift.toml",
+            "src/.rift",
+            "...",
+            "..a/b",
+            "a./.b",
+        ];
+        for path in accepted {
+            assert!(
+                validator.is_valid(&json!(path)),
+                "{pattern} must accept {path:?}"
+            );
+        }
+        let refused = [
+            ".rift",
+            ".rift/db",
+            "/src",
+            "src/",
+            "src//lib.rs",
+            ".",
+            "..",
+            "./src",
+            "src/./lib.rs",
+            "src/..",
+            "src\\lib.rs",
+            "src/\u{1}.rs",
+            "src/\u{7f}.rs",
+        ];
+        for path in refused {
+            assert!(
+                !validator.is_valid(&json!(path)),
+                "{pattern} must refuse {path:?}"
+            );
+        }
     }
 
     #[test]
