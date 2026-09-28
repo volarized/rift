@@ -35,8 +35,8 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 use crate::engine_read::EngineReferences;
 use crate::read::parse_symbol_address;
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, excerpt, page, project_path,
-    results_truncation_warning, source_warnings, text_range, validate_common,
+    CURRENT_TREE_ALONE, ReadError, ReadFault, ReadService, accepted_limit, excerpt, page,
+    project_path, results_truncation_warning, source_warnings, text_range, validate_common,
     validate_requested_packages, wire_symbol,
 };
 use crate::traversal::{
@@ -688,10 +688,7 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
         ));
     }
     if params.scope != SearchScope::Local {
-        return Err(ReadFault::invalid(
-            "scope",
-            "package facts are served for the current tree alone",
-        ));
+        return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
     }
     let sides = [
         (CHANGE_BASE_FIELD, &change.base),

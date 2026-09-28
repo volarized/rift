@@ -1118,10 +1118,7 @@ impl ReadService {
             return Ok(());
         }
         if rev.is_some() || self.revision.is_some() {
-            return Err(ReadFault::invalid(
-                "scope",
-                "package facts are served for the current tree alone",
-            ));
+            return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
         }
         Ok(())
     }
@@ -1206,6 +1203,12 @@ pub(crate) fn validate_common(_rev: bool) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Why a read refuses a `scope` past `local`, or a `packages` argument, beside a revision.
+pub(crate) const CURRENT_TREE_ALONE: &str = "package facts are served for the current tree alone";
+
+/// Why a `local` read refuses a `packages` argument.
+const LOCAL_SCOPE_ALONE: &str = "the local scope reads the project alone";
+
 /// Refuses a `packages` argument no read can send: `get_symbol` and `search` share the
 /// rule.
 ///
@@ -1222,38 +1225,32 @@ pub(crate) fn validate_requested_packages(
     rev: bool,
     packages: &[RequestedPackage],
 ) -> Result<(), ReadError> {
-    if packages.is_empty() {
-        return Ok(());
-    }
-    if rev {
-        return Err(ReadFault::invalid(
-            "packages",
-            "package facts are served for the current tree alone",
-        ));
-    }
-    if scope == SearchScope::Local {
-        return Err(ReadFault::invalid(
-            "packages",
-            "the local scope reads the project alone",
-        ));
-    }
-    if packages.len() > REQUESTED_PACKAGES_MAX {
-        return Err(ReadFault::invalid(
-            "packages",
-            format!(
-                "{} entries exceed the maximum {REQUESTED_PACKAGES_MAX}",
-                packages.len()
-            ),
-        ));
-    }
-    let entry_violation = packages.iter().enumerate().find_map(|(index, package)| {
-        package
-            .violation()
-            .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
-    });
-    match entry_violation {
+    match requested_packages_violation(scope, rev, packages) {
         Some(violation) => Err(ReadFault::invalid("packages", violation)),
         None => Ok(()),
+    }
+}
+
+/// The first rule a `packages` argument breaks, in precedence order: the read it rides
+/// on, then the list bound, then each entry in list order.
+fn requested_packages_violation(
+    scope: SearchScope,
+    rev: bool,
+    packages: &[RequestedPackage],
+) -> Option<String> {
+    match packages {
+        [] => None,
+        _ if rev => Some(CURRENT_TREE_ALONE.to_owned()),
+        _ if scope == SearchScope::Local => Some(LOCAL_SCOPE_ALONE.to_owned()),
+        _ if packages.len() > REQUESTED_PACKAGES_MAX => Some(format!(
+            "{} entries exceed the maximum {REQUESTED_PACKAGES_MAX}",
+            packages.len()
+        )),
+        _ => packages.iter().enumerate().find_map(|(index, package)| {
+            package
+                .violation()
+                .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
+        }),
     }
 }
 
@@ -3231,7 +3228,7 @@ pub fn compute() -> i32 {
     }
 
     /// One `get_symbol` request, `arguments` laid over `name: "beacon"`.
-    fn lookup(arguments: serde_json::Value) -> TestResult<GetSymbolParams> {
+    fn lookup(arguments: &serde_json::Value) -> TestResult<GetSymbolParams> {
         let mut request = json!({"name": "beacon"});
         for (key, value) in arguments.as_object().ok_or("arguments are an object")? {
             request[key] = value.clone();
@@ -3260,7 +3257,7 @@ pub fn compute() -> i32 {
             json!({"packages": packages, "scope": "local"}),
         ] {
             let error = service
-                .get_symbol(&lookup(request.clone())?)
+                .get_symbol(&lookup(&request)?)
                 .expect_err("a local read names no package");
             assert_eq!(
                 packages_violation(&error),
@@ -3284,7 +3281,7 @@ pub fn compute() -> i32 {
                 "packages": [{"manager": "cargo", "name": "serde", "version": "1.0.228"}]
             });
             let error = service
-                .get_symbol(&lookup(request)?)
+                .get_symbol(&lookup(&request)?)
                 .expect_err("a revision read names no package");
             assert_eq!(
                 packages_violation(&error),
