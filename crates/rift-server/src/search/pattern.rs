@@ -107,7 +107,8 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
 ///
 /// Returns `invalid_request` naming `pattern` for a pattern beside a field that selects
 /// another result set, tree, or index, for an empty pattern, one past
-/// `SEARCH_PATTERN_BYTES_MAX` bytes, one that does not parse, and one whose matcher passes
+/// `SEARCH_PATTERN_BYTES_MAX` characters, the unit the schema's `maxLength` counts, one
+/// that does not parse, and one whose matcher passes
 /// the `[search]` key `pattern_compiled_size`; and `unsupported` for `target:
 /// "documentation"`, since a documentation block carries no file text.
 pub fn accepted_pattern(
@@ -123,12 +124,12 @@ pub fn accepted_pattern(
     if params.target == SearchParamsTarget::Documentation {
         return Err(ReadFault::unsupported("pattern with target documentation"));
     }
-    match pattern.len() {
+    match pattern.chars().count() {
         0 => return Err(ReadFault::invalid("pattern", "empty")),
-        bytes if bytes > SEARCH_PATTERN_BYTES_MAX => {
+        characters if characters > SEARCH_PATTERN_BYTES_MAX => {
             return Err(ReadFault::invalid(
                 "pattern",
-                format!("{bytes} bytes exceeds the maximum {SEARCH_PATTERN_BYTES_MAX}"),
+                format!("{characters} characters exceeds the maximum {SEARCH_PATTERN_BYTES_MAX}"),
             ));
         }
         _ => {}

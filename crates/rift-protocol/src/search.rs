@@ -268,8 +268,8 @@ pub enum SearchHitTarget {
     },
 }
 
-/// Most bytes one search `pattern` may hold; the server refuses a longer one naming the
-/// field.
+/// Most characters one search `pattern` may hold, the unit the schema's `maxLength`
+/// counts; the server refuses a longer one naming the field.
 pub const SEARCH_PATTERN_BYTES_MAX: usize = 1_024;
 
 /// The field path the server names when a comparison's base revision spelling breaks the

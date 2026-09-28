@@ -406,6 +406,27 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
     Ok(())
 }
 
+/// The schema's `maxLength` counts characters, so a pattern of the bound's count of
+/// two-byte characters is accepted although it holds twice as many bytes, and one more
+/// character refuses naming the count.
+#[test]
+fn the_pattern_bound_counts_characters_as_the_schema_does() -> TestResult {
+    let at_bound = "\u{e9}".repeat(SEARCH_PATTERN_BYTES_MAX);
+    assert_eq!(at_bound.len(), 2 * SEARCH_PATTERN_BYTES_MAX);
+    let request = params(json!({ "pattern": at_bound }))?;
+    assert!(accepted_pattern(&request, PatternBounds::default())?.is_some());
+    let past_bound = params(json!({ "pattern": "\u{e9}".repeat(SEARCH_PATTERN_BYTES_MAX + 1) }))?;
+    let error = accepted_pattern(&past_bound, PatternBounds::default())
+        .expect_err("one character past the bound refuses");
+    assert!(
+        error
+            .to_string()
+            .contains("1025 characters exceeds the maximum 1024"),
+        "{error}"
+    );
+    Ok(())
+}
+
 /// `packages` reaches the global API alone and `pattern` reads the project's trigram index
 /// alone, so no scope answers both. The refusal names the first field the request cannot
 /// answer, in the order every search is validated: `packages` beside the `local` scope or
