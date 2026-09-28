@@ -124,11 +124,57 @@ fn install_creates_a_fresh_settings_json_with_the_steering_hook() -> TestResult 
     let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
     assert_eq!(
         settings["hooks"]["PreToolUse"][0]["matcher"],
-        serde_json::json!("Grep|Glob")
+        serde_json::json!("Grep|Glob|Bash")
     );
     assert_eq!(
         settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
         serde_json::json!("rift steer")
+    );
+    Ok(())
+}
+
+#[test]
+fn install_rewrites_the_matcher_an_earlier_install_wrote() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let claude_directory = root.join(".claude");
+    fs::create_dir_all(&claude_directory)?;
+    let settings_path = claude_directory.join("settings.json");
+    fs::write(
+        &settings_path,
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Grep|Glob",
+                    "hooks": [{"type": "command", "command": "rift steer"}],
+                }],
+            },
+        })
+        .to_string(),
+    )?;
+
+    let installed = rift(root, &["install", "claude"])?;
+    require_success(&installed, "install claude over an earlier install")?;
+    let stdout = String::from_utf8(installed.stdout)?;
+    assert!(
+        stdout.contains("wrote the PreToolUse steering hook"),
+        "{stdout:?}"
+    );
+    let settings: serde_json::Value = serde_json::from_str(&fs::read_to_string(&settings_path)?)?;
+    assert_eq!(
+        settings["hooks"]["PreToolUse"],
+        serde_json::json!([{
+            "matcher": "Grep|Glob|Bash",
+            "hooks": [{"type": "command", "command": "rift steer"}],
+        }])
+    );
+
+    let rerun = rift(root, &["install", "claude"])?;
+    require_success(&rerun, "repeated install claude")?;
+    let stdout = String::from_utf8(rerun.stdout)?;
+    assert!(
+        stdout.contains("the PreToolUse steering hook already runs `rift steer`"),
+        "{stdout:?}"
     );
     Ok(())
 }

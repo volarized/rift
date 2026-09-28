@@ -79,8 +79,9 @@ impl fmt::Display for SkillOutcome {
 /// What a completed hook merge or strip did to `.claude/settings.json`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum HookOutcome {
-    /// `rift install claude` ran: the steering hook is present, `changed`
-    /// says whether this run is what added it.
+    /// `rift install claude` ran: the steering hook is present under
+    /// `HOOK_MATCHER`, `changed` says whether this run added it or rewrote
+    /// the matcher it ran under.
     Merged {
         settings_path: PathBuf,
         changed: bool,
@@ -101,7 +102,7 @@ impl fmt::Display for HookOutcome {
                 changed: true,
             } => write!(
                 formatter,
-                "🪝 added the PreToolUse steering hook to {}",
+                "🪝 wrote the PreToolUse steering hook to {}",
                 settings_path.display()
             ),
             Self::Merged {
@@ -358,8 +359,10 @@ impl fmt::Display for SettingsShape {
 
 impl StdError for SettingsShape {}
 
-/// Matcher string the installed steering hook entry runs under.
-const HOOK_MATCHER: &str = "Grep|Glob";
+/// Matcher string the installed steering hook entry runs under. `Bash`
+/// reaches the `grep`, `rg`, and `find` commands an agent runs when its tool
+/// set lists no `Grep` or `Glob`.
+const HOOK_MATCHER: &str = "Grep|Glob|Bash";
 /// Command the installed steering hook entry runs.
 const HOOK_COMMAND: &str = "rift steer";
 
@@ -388,8 +391,13 @@ fn merge_steer_hook(mut settings: Value, remove: bool) -> Result<(Value, bool), 
     Ok((settings, changed))
 }
 
-/// Adds the steering hook group, unless a `PreToolUse` group already runs a
-/// command starting with [`HOOK_COMMAND`].
+/// Adds the steering hook group, or brings an installed one to
+/// [`HOOK_MATCHER`]. A group already running [`HOOK_COMMAND`] under
+/// [`HOOK_MATCHER`] answers unchanged. A group running it alone under another
+/// matcher, as an earlier install wrote it, has its matcher rewritten in
+/// place. A group running it beside other hooks keeps those hooks under their
+/// own matcher, and the steering hook moves to a group of its own, so no
+/// unrelated hook starts running on another tool.
 fn add_steer_hook(root: &mut Map<String, Value>) -> Result<bool, SettingsShape> {
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let Value::Object(hooks) = hooks else {
@@ -399,9 +407,20 @@ fn add_steer_hook(root: &mut Map<String, Value>) -> Result<bool, SettingsShape> 
     let Value::Array(groups) = pre_tool_use else {
         return Err(SettingsShape::PreToolUseNotArray);
     };
-    if groups.iter().any(group_runs_steer) {
+    let installed = groups
+        .iter()
+        .any(|group| group_runs_steer(group) && group_matches_hook_matcher(group));
+    if installed {
         return Ok(false);
     }
+    if let Some(group) = groups
+        .iter_mut()
+        .find(|group| group_runs_steer_alone(group))
+    {
+        group["matcher"] = json!(HOOK_MATCHER);
+        return Ok(true);
+    }
+    strip_steer_groups(groups);
     groups.push(json!({
         "matcher": HOOK_MATCHER,
         "hooks": [{"type": "command", "command": HOOK_COMMAND}],
@@ -461,6 +480,20 @@ fn group_runs_steer(group: &Value) -> bool {
         .get("hooks")
         .and_then(Value::as_array)
         .is_some_and(|hooks| hooks.iter().any(hook_runs_steer))
+}
+
+/// Whether one `PreToolUse` matcher group's hooks are the steering hook
+/// alone.
+fn group_runs_steer_alone(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| !hooks.is_empty() && hooks.iter().all(hook_runs_steer))
+}
+
+/// Whether one `PreToolUse` matcher group runs under [`HOOK_MATCHER`].
+fn group_matches_hook_matcher(group: &Value) -> bool {
+    group.get("matcher").and_then(Value::as_str) == Some(HOOK_MATCHER)
 }
 
 /// Whether one hook entry's `command` is the steering hook (or a variant of
@@ -531,8 +564,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        HOOK_COMMAND, InstallFault, InstallScope, SettingsShape, SkillOutcome, home_directory,
-        merge_steer_hook, remove_skill, write_skill,
+        HOOK_COMMAND, HOOK_MATCHER, InstallFault, InstallScope, SettingsShape, SkillOutcome,
+        home_directory, merge_steer_hook, remove_skill, write_skill,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -700,12 +733,90 @@ mod tests {
             json!({
                 "hooks": {
                     "PreToolUse": [{
-                        "matcher": "Grep|Glob",
+                        "matcher": "Grep|Glob|Bash",
                         "hooks": [{"type": "command", "command": HOOK_COMMAND}],
                     }],
                 },
             })
         );
+    }
+
+    #[test]
+    fn add_steer_hook_rewrites_the_matcher_an_earlier_install_wrote() {
+        let existing = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]},
+                    {
+                        "matcher": "Grep|Glob",
+                        "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+                    },
+                ],
+            },
+        });
+        let (merged, changed) = merge_steer_hook(existing, false).expect("must merge");
+        assert!(changed);
+        assert_eq!(
+            merged["hooks"]["PreToolUse"],
+            json!([
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]},
+                {
+                    "matcher": HOOK_MATCHER,
+                    "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+                },
+            ])
+        );
+        let (rerun, rerun_changed) = merge_steer_hook(merged.clone(), false).expect("must merge");
+        assert!(!rerun_changed);
+        assert_eq!(rerun, merged);
+    }
+
+    #[test]
+    fn add_steer_hook_moves_a_steering_hook_sharing_its_group() {
+        let existing = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Grep|Glob",
+                    "hooks": [
+                        {"type": "command", "command": "echo also"},
+                        {"type": "command", "command": HOOK_COMMAND},
+                    ],
+                }],
+            },
+        });
+        let (merged, changed) = merge_steer_hook(existing, false).expect("must merge");
+        assert!(changed);
+        assert_eq!(
+            merged["hooks"]["PreToolUse"],
+            json!([
+                {
+                    "matcher": "Grep|Glob",
+                    "hooks": [{"type": "command", "command": "echo also"}],
+                },
+                {
+                    "matcher": HOOK_MATCHER,
+                    "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn add_steer_hook_leaves_a_group_already_under_the_matcher() {
+        let existing = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": HOOK_MATCHER,
+                    "hooks": [
+                        {"type": "command", "command": HOOK_COMMAND},
+                        {"type": "command", "command": "echo also"},
+                    ],
+                }],
+            },
+        });
+        let (merged, changed) = merge_steer_hook(existing.clone(), false).expect("must merge");
+        assert!(!changed);
+        assert_eq!(merged, existing);
     }
 
     #[test]
