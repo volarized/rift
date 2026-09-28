@@ -36,9 +36,7 @@ pub use input::{
     PackageInputViolation, PackageSource,
 };
 #[cfg(feature = "collector")]
-pub use relationship::{
-    RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
-};
+pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
     ManifestError, analyzer_manifest_path, analyzer_revision, render_analyzer_manifest,
 };

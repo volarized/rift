@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = ["collector"]
-collector = ["dep:ignore", "dep:rift-provider", "dep:rift-syntax", "dep:strum", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
+collector = ["dep:ignore", "dep:rift-provider", "dep:rift-syntax", "dep:tree-sitter", "dep:tree-sitter-json", "dep:tree-sitter-rst"]
 archive = ["dep:flate2", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
@@ -26,7 +26,6 @@ rift-syntax = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-strum = { workspace = true, optional = true }
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-json = { workspace = true, optional = true }
 url.workspace = true
