@@ -1018,6 +1018,19 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// A lockfile the request's `paths.include` selects is left out of search, so no hit
+    /// answers from it; `rift://map` still carries the versions it pins. Naming the file
+    /// in `paths.force_include` searches it for one request, and removing its name from
+    /// the `[search.text]` key `excluded_lockfiles` indexes it. One warning names every
+    /// such file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.
+    LockfileExcluded {
+        /// The selected lockfiles search leaves out.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// Contributions selected for one symbol's presentation disagree on at least one
     /// field. The answer carries what normalization selected.
     SymbolDisagreement {
@@ -2352,6 +2365,17 @@ mod tests {
                     "code": "source_unavailable",
                     "unit": "rift://file/src%2Finvalid.rs",
                     "detail": "src/invalid.rs is not UTF-8 and is absent from the index",
+                }),
+            ),
+            (
+                ReadWarning::LockfileExcluded {
+                    files: vec![FileId("rift://file/Cargo.lock".to_owned())],
+                    detail: "Cargo.lock is left out of search".to_owned(),
+                },
+                json!({
+                    "code": "lockfile_excluded",
+                    "files": ["rift://file/Cargo.lock"],
+                    "detail": "Cargo.lock is left out of search",
                 }),
             ),
             (

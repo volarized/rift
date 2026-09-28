@@ -24,9 +24,9 @@ use rift_index::{
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
-    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
-    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
-    SearchTraversal, Symbol, SymbolId,
+    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SOURCE_WARNINGS_MAX, SearchChange,
+    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchScope, SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
@@ -37,12 +37,12 @@ use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
-use crate::read::parse_symbol_address;
 use crate::read::{
     CURRENT_TREE_ALONE, ReadError, ReadFault, ReadService, accepted_limit, excerpt, page,
     project_path, results_truncation_warning, source_warnings, text_range, validate_common,
     validate_requested_packages, wire_symbol,
 };
+use crate::read::{file_id, parse_symbol_address};
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
 };
@@ -381,6 +381,7 @@ impl ReadService {
         .entered();
         let index = self.index();
         let matcher = path_matcher(index.root(), selector)?;
+        let lockfiles = selected_lockfiles(index, selector, matcher.as_ref());
         let force_include = match selector {
             Some(selector) if !selector.force_include.is_empty() => Some(
                 index
@@ -395,6 +396,7 @@ impl ReadService {
         Ok(SelectedPaths {
             matcher,
             force_include,
+            lockfiles,
         })
     }
 
@@ -655,18 +657,67 @@ struct SearchCriteria<'a> {
 struct SelectedPaths {
     matcher: Option<PathMatcher>,
     force_include: Option<WorkspaceIndex>,
+    /// The lockfiles `paths.include` selects that the index leaves out of search.
+    lockfiles: Vec<ProjectPath>,
 }
 
 impl SelectedPaths {
     /// The `source_unavailable` warnings for the `force_include` files the on-demand index
-    /// left out. They describe the request's selection, so the answer carries them whatever
-    /// the query yields and whether or not the pool had room for the selected files.
+    /// left out, and the `lockfile_excluded` warning for the lockfiles `paths.include`
+    /// selects that search leaves out. They describe the request's selection, so the
+    /// answer carries them whatever the query yields and whether or not the pool had room
+    /// for the selected files.
     fn warnings(&self) -> Vec<ReadWarning> {
-        self.force_include
+        let mut warnings = self
+            .force_include
             .as_ref()
             .map(|extra| source_warnings(extra.warnings()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        warnings.extend(lockfile_warning(&self.lockfiles));
+        warnings
     }
+}
+
+/// The lockfiles the index leaves out of search that `selector`'s `include` globs select,
+/// in project-path order, when the request names any `include` glob at all.
+///
+/// An `include` glob holds gitignore semantics, so `Cargo.lock` names every `Cargo.lock`
+/// at any depth: the request's own matcher decides, exactly as it decides every other
+/// path the request selects.
+fn selected_lockfiles(
+    index: &WorkspaceIndex,
+    selector: Option<&PathSelector>,
+    matcher: Option<&PathMatcher>,
+) -> Vec<ProjectPath> {
+    let names_include = selector.is_some_and(|selector| !selector.include.is_empty());
+    if !names_include {
+        return Vec::new();
+    }
+    index
+        .excluded_lockfiles()
+        .filter(|path| includes(matcher, index.root(), path))
+        .cloned()
+        .collect()
+}
+
+/// The one warning naming the selected lockfiles search leaves out, at most
+/// `SOURCE_WARNINGS_MAX` of them, or none when the request selects none.
+fn lockfile_warning(lockfiles: &[ProjectPath]) -> Option<ReadWarning> {
+    if lockfiles.is_empty() {
+        return None;
+    }
+    let files = lockfiles
+        .iter()
+        .take(SOURCE_WARNINGS_MAX)
+        .map(file_id)
+        .collect();
+    let detail = format!(
+        "the index leaves {count} selected lockfiles out of search; rift://map carries the \
+         versions they pin, paths.force_include searches one for one request, and removing \
+         its name from the [search.text] excluded_lockfiles key indexes it",
+        count = lockfiles.len(),
+    );
+    Some(ReadWarning::LockfileExcluded { files, detail })
 }
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {

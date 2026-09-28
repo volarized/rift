@@ -1244,6 +1244,36 @@ impl IndexContents {
         Ok(())
     }
 
+    /// Reads every lockfile search leaves out, in walk order, keeping each one's digests
+    /// alone: the bytes count against `workspace_bytes_max` exactly as a text file's do,
+    /// so a request-time capture of the tree agrees with the index.
+    fn hold_read_lockfiles(
+        &mut self,
+        root: &Path,
+        lockfiles: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        for path in lockfiles {
+            match catalog_file(root, path, limits)? {
+                IndexRead::Included(text_file) => {
+                    let length = text_file.content().len();
+                    count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                    self.hold_lockfile(&text_file);
+                }
+                IndexRead::Skipped(warning) => self.leave_out(warning),
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps one lockfile search leaves out by its digests alone: the index serves nothing
+    /// from it, and the capture and the dependency context still see it move.
+    pub(crate) fn hold_lockfile(&mut self, text_file: &TextSourceFile) {
+        self.left_out
+            .insert(text_file.path().clone(), LeftOutFileState::of(text_file));
+    }
+
     /// Holds one cataloged file no provider claims.
     pub(crate) fn hold_text_file(&mut self, text_file: TextSourceFile) {
         self.text_files
@@ -1451,6 +1481,12 @@ impl WorkspaceIndex {
                 previous,
             )?;
             contents.hold_read_texts(&root, &classified.text, limits, &mut workspace_bytes)?;
+            contents.hold_read_lockfiles(
+                &root,
+                &classified.lockfiles,
+                limits,
+                &mut workspace_bytes,
+            )?;
             built_contents(
                 &root,
                 contents.sorted(),
@@ -1571,7 +1607,9 @@ impl WorkspaceIndex {
         let Some(class) = self.language.classifies(&absolute)? else {
             return Ok(());
         };
+        let lockfile = self.language.excludes_lockfile(&absolute);
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
+            IndexRead::Included(text_file) if lockfile => contents.hold_lockfile(&text_file),
             IndexRead::Included(text_file) => match class {
                 ClassifiedPath::Source(provider) => {
                     contents.hold_source_file(
@@ -1804,6 +1842,15 @@ impl WorkspaceIndex {
             .map(|file| file.digest())
             .or_else(|| self.text_files.get(path).map(|file| file.digest()))
             .or_else(|| self.left_out.get(path).map(|state| state.content))
+    }
+
+    /// The files this index leaves out of search as lockfiles `[search.text]
+    /// excluded_lockfiles` names, in project-path order. Each one's digests stay recorded,
+    /// but no search answers from it.
+    pub fn excluded_lockfiles(&self) -> impl Iterator<Item = &ProjectPath> {
+        self.left_out
+            .keys()
+            .filter(|path| self.language.excludes_lockfile(Path::new(path.as_str())))
     }
 
     /// Whether this index holds at least one file below `directory`, the files it left
@@ -2543,13 +2590,17 @@ fn leave_out_beyond_declaration_bound(
     Ok(())
 }
 
-/// Source and text paths [`discover`] found below one root, each list sorted by path.
+/// Source, text, and lockfile paths [`discover`] found below one root, each list sorted
+/// by path.
 #[derive(Debug, Default)]
 struct DiscoveredPaths {
     /// Each source path with the provider that claimed it, so the caller
     /// never asks the language table the same question twice.
     source: Vec<(PathBuf, &'static dyn SyntaxProvider)>,
     text: Vec<PathBuf>,
+    /// The lockfiles `[search.text].excluded_lockfiles` leaves out of search: read for
+    /// their digests alone, so the workspace still moves when one is edited.
+    lockfiles: Vec<PathBuf>,
 }
 
 impl DiscoveredPaths {
@@ -2565,7 +2616,29 @@ impl DiscoveredPaths {
         path: &Path,
         class: ClassifiedPath,
     ) -> Result<(), WorkspaceIndexError> {
-        let total = self.source.len() + self.text.len();
+        self.within_files_max(files_max, path)?;
+        match class {
+            ClassifiedPath::Source(provider) => self.source.push((path.to_path_buf(), provider)),
+            ClassifiedPath::Text => self.text.push(path.to_path_buf()),
+        }
+        Ok(())
+    }
+
+    /// Records one lockfile search leaves out, against the same `files_max` budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the budget is already spent.
+    fn admit_lockfile(&mut self, files_max: usize, path: &Path) -> Result<(), WorkspaceIndexError> {
+        self.within_files_max(files_max, path)?;
+        self.lockfiles.push(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Refuses one more path once `files_max` paths are recorded, naming the `[source]` key
+    /// that owns the bound and the path that crossed it.
+    fn within_files_max(&self, files_max: usize, path: &Path) -> Result<(), WorkspaceIndexError> {
+        let total = self.source.len() + self.text.len() + self.lockfiles.len();
         if total >= files_max {
             return Err(index_error_over_limit(
                 WorkspaceIndexViolation::TooManyFiles,
@@ -2575,11 +2648,22 @@ impl DiscoveredPaths {
                 files_max,
             ));
         }
-        match class {
-            ClassifiedPath::Source(provider) => self.source.push((path.to_path_buf(), provider)),
-            ClassifiedPath::Text => self.text.push(path.to_path_buf()),
-        }
         Ok(())
+    }
+
+    /// Records one classified path, a lockfile search leaves out among them.
+    fn admit_classified(
+        &mut self,
+        files_max: usize,
+        path: &Path,
+        class: ClassifiedPath,
+        language: &WorkspaceLanguagePolicy,
+    ) -> Result<(), WorkspaceIndexError> {
+        if language.excludes_lockfile(path) {
+            self.admit_lockfile(files_max, path)
+        } else {
+            self.admit(files_max, path, class)
+        }
     }
 }
 
@@ -2620,13 +2704,14 @@ fn discover(
         let Some(class) = language.classifies(path)? else {
             continue;
         };
-        discovered.admit(limits.files_max, path, class)?;
+        discovered.admit_classified(limits.files_max, path, class, language)?;
     }
     discover_forced(root, limits, &matcher, language, &mut discovered)?;
     discovered
         .source
         .sort_by(|left, right| left.0.cmp(&right.0));
     discovered.text.sort();
+    discovered.lockfiles.sort();
     Ok(discovered)
 }
 
@@ -2652,6 +2737,7 @@ fn discover_forced(
         .iter()
         .map(|(path, _)| path.clone())
         .chain(discovered.text.iter().cloned())
+        .chain(discovered.lockfiles.iter().cloned())
         .collect();
     for entry in forced_walk(root, limits.directory_depth_max, reach) {
         let entry = entry.map_err(|error| walk_error(root, error))?;
@@ -2664,7 +2750,7 @@ fn discover_forced(
         let Some(class) = language.classifies(path)? else {
             continue;
         };
-        discovered.admit(limits.files_max, path, class)?;
+        discovered.admit_classified(limits.files_max, path, class, language)?;
     }
     Ok(())
 }
@@ -2787,8 +2873,10 @@ fn capture_paths(
     last: &LastCapture,
 ) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let mut workspace_bytes = 0_usize;
-    let mut next = LastCapture::under(limits, paths.source.len() + paths.text.len());
+    let held = paths.source.len() + paths.text.len() + paths.lockfiles.len();
+    let mut next = LastCapture::under(limits, held);
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
+    let text: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
     let mut capture = PathCapture {
         workspace_bytes: &mut workspace_bytes,
         root,
@@ -2797,7 +2885,7 @@ fn capture_paths(
         next: &mut next,
     };
     let source = capture.path_class(&source)?;
-    let text = capture.path_class(&paths.text)?;
+    let text = capture.path_class(&text)?;
     tracing::debug!(
         component = "index",
         operation = "fingerprint.bytes",
@@ -2865,7 +2953,7 @@ pub fn capture_digests_with_languages(
             discover(&root, limits, visibility, &language)
         })?;
     let source = classified.source.len();
-    let text = classified.text.len();
+    let text = classified.text.len() + classified.lockfiles.len();
     rift_core::traced!(
         component = "index",
         operation = "fingerprint.read",
@@ -5642,6 +5730,7 @@ mod tests {
         DiscoveredPaths {
             source: source.into_iter().map(|path| (path, provider)).collect(),
             text: Vec::new(),
+            lockfiles: Vec::new(),
         }
     }
 
@@ -5796,6 +5885,7 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![big_text],
+            lockfiles: Vec::new(),
         };
         let digests = captured_paths(&root, &paths, limits)
             .expect("a text file over file_bytes_max is omitted");
@@ -5807,6 +5897,7 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![over_workspace],
+            lockfiles: Vec::new(),
         };
         let digests =
             captured_paths(&root, &paths, tight).expect("the per-file bound applies first");
@@ -5823,6 +5914,7 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![invalid],
+            lockfiles: Vec::new(),
         };
         let digests = captured_paths(&root, &paths, limits)
             .expect("invalid UTF-8 text is omitted rather than failing the capture");
@@ -7738,6 +7830,129 @@ mod tests {
         assert_ne!(second.fingerprint(), first.fingerprint());
         let (fresh, _) = captured_after(root, &LastCapture::default());
         assert_eq!(second.fingerprint(), fresh.fingerprint());
+    }
+
+    /// A tree holding lockfiles under the default exclusion list, beside one source file.
+    fn lockfile_workspace() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("web")).expect("fixture directory");
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("Cargo.lock"), "version = 4\n").expect("lockfile");
+        fs::write(root.join("deno.lock"), "{\"version\": \"4\"}\n").expect("lockfile");
+        fs::write(root.join("web/package-lock.json"), "{\"name\": \"web\"}\n").expect("lockfile");
+        directory
+    }
+
+    fn project(path: &str) -> ProjectPath {
+        ProjectPath::new(path).expect("fixture path")
+    }
+
+    /// A lockfile the default list names is parsed by no provider and holds no text row,
+    /// yet its digests stay recorded, so a capture of the tree agrees with the index.
+    #[test]
+    fn test_lockfiles_leave_search_and_keep_their_digests() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        for path in ["Cargo.lock", "deno.lock", "web/package-lock.json"] {
+            let path = project(path);
+            assert!(
+                index.file(&path).is_none(),
+                "{path} is parsed by no provider"
+            );
+            assert!(index.text_file(&path).is_none(), "{path} holds no text row");
+            assert!(index.digest(&path).is_some(), "{path} keeps its digest");
+        }
+        assert_eq!(
+            index
+                .excluded_lockfiles()
+                .map(ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            ["Cargo.lock", "deno.lock", "web/package-lock.json"]
+        );
+        let documents = index.index_documents();
+        assert!(
+            documents
+                .iter()
+                .all(|document| document_path(document).as_str() == "lib.rs"),
+            "only the source file publishes rows"
+        );
+        assert!(
+            index.warnings().is_empty(),
+            "an excluded lockfile warns of nothing"
+        );
+        let (captured, _) = capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        )
+        .expect("the capture reads the tree");
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+    }
+
+    /// `paths.force_include` reaches a lockfile the index leaves out, and parses it when a
+    /// provider claims its extension.
+    #[test]
+    fn test_force_include_reaches_a_parsed_lockfile() {
+        let directory = lockfile_workspace();
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        let forced = index
+            .force_include_index(&["web/package-lock.json".to_owned()], 8)
+            .expect("the force-included lockfile reads");
+        let file = forced
+            .file(&project("web/package-lock.json"))
+            .expect("the JSON provider parses the lockfile");
+        assert!(
+            !file.syntax().symbols().is_empty(),
+            "its keys are declarations"
+        );
+    }
+
+    /// An empty exclusion list indexes every lockfile again.
+    #[test]
+    fn test_an_empty_exclusion_list_indexes_lockfiles() {
+        let directory = lockfile_workspace();
+        let inclusion = TextFileInclusion::default().excluding_lockfiles(Vec::new());
+        let index = indexed(directory.path(), &inclusion);
+        assert!(index.text_file(&project("Cargo.lock")).is_some());
+        assert!(index.file(&project("web/package-lock.json")).is_some());
+        assert_eq!(index.excluded_lockfiles().count(), 0);
+    }
+
+    /// An edit to an excluded lockfile moves the workspace: the rebuild over that one path
+    /// records its new digest and still stores no row for it.
+    #[test]
+    fn test_an_edited_lockfile_moves_the_workspace_and_stays_out_of_search() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        let before = index.digest(&project("Cargo.lock"));
+        fs::write(root.join("Cargo.lock"), "version = 4\n\n[[package]]\n").expect("edit");
+        let (captured, _) = capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        )
+        .expect("the capture reads the tree");
+        let changes = PathChanges::between(&index.digests(), &captured);
+        assert_eq!(
+            changes.paths().map(ProjectPath::as_str).collect::<Vec<_>>(),
+            ["Cargo.lock"]
+        );
+        let rebuilt = index
+            .rebuilt(&changes)
+            .expect("the rebuild reads the lockfile");
+        assert_ne!(rebuilt.digest(&project("Cargo.lock")), before);
+        assert!(rebuilt.text_file(&project("Cargo.lock")).is_none());
+        assert_eq!(captured.fingerprint(), *rebuilt.fingerprint());
+        assert!(rebuilt.index_documents_for(changes.paths()).is_empty());
     }
 
     /// A text file past the chunk bound publishes each chunk at its start in the file, and a

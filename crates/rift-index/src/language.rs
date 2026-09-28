@@ -79,6 +79,7 @@ pub struct WorkspaceLanguagePolicy {
     root: PathBuf,
     languages: Vec<EffectiveLanguage>,
     text: Option<PathMatcher>,
+    excluded_lockfiles: BTreeSet<String>,
 }
 
 impl WorkspaceLanguagePolicy {
@@ -153,6 +154,7 @@ impl WorkspaceLanguagePolicy {
             )?);
         }
         languages.sort_by(|left, right| left.identity.cmp(&right.identity));
+        let text_inclusion = text;
         let text = (!text.include().is_empty())
             .then(|| PathMatcher::build(root, text.include(), &[]))
             .transpose()
@@ -161,6 +163,7 @@ impl WorkspaceLanguagePolicy {
             root: root.to_path_buf(),
             languages,
             text,
+            excluded_lockfiles: text_inclusion_lockfiles(text_inclusion),
         })
     }
 
@@ -254,6 +257,19 @@ impl WorkspaceLanguagePolicy {
             .then_some(ClassifiedPath::Text))
     }
 
+    /// Whether the index leaves `path` out of search as a lockfile: its final path segment
+    /// is a name `[search.text].excluded_lockfiles` lists.
+    ///
+    /// The index still reads such a file and records its digests, so an edit to it moves
+    /// the workspace and the dependency context reads it again, but no syntax provider
+    /// parses it and it stores no row. [`Self::classifies`] still answers for it, so
+    /// `paths.force_include` reaches it for one request.
+    pub(crate) fn excludes_lockfile(&self, path: &Path) -> bool {
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| self.excluded_lockfiles.contains(name))
+    }
+
     fn absolute(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
@@ -261,6 +277,11 @@ impl WorkspaceLanguagePolicy {
             self.root.join(path)
         }
     }
+}
+
+/// The lockfile names one text-file policy leaves out of search, as one lookup set.
+fn text_inclusion_lockfiles(text: &TextFileInclusion) -> BTreeSet<String> {
+    text.excluded_lockfiles().iter().cloned().collect()
 }
 
 /// Whether the extension selects workspace documentation independently of `[search.text]`.

@@ -2024,9 +2024,31 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
+/// The lockfile names `[search.text].excluded_lockfiles` carries when the key is absent:
+/// the lockfiles the dependency context reads beside their manifests, and the other
+/// common package managers' lockfiles.
+pub const EXCLUDED_LOCKFILES_DEFAULT: [&str; 12] = [
+    "Cargo.lock",
+    "uv.lock",
+    "package-lock.json",
+    "bun.lock",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "deno.lock",
+];
+/// Bytes one `[search.text].excluded_lockfiles` name may hold, at most: the longest file
+/// name the common filesystems accept.
+pub const LOCKFILE_NAME_BYTES_MAX: usize = 255;
+
 /// The `[search.text]` table. `include` selects which visible paths join the
-/// text index once every language entry has had its claim, and `max_chunk`
-/// bounds the lexical units derived from them.
+/// text index once every language entry has had its claim, `max_chunk`
+/// bounds the lexical units derived from them, and `excluded_lockfiles`
+/// names the lockfiles the index leaves out of search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
@@ -2038,6 +2060,13 @@ pub struct TextSearchConfiguration {
     /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
     /// several chunks of at most this size.
     pub max_chunk: ByteSize,
+    /// File names of the lockfiles the index leaves out of search, matched against
+    /// each visible file's final path segment. Such a file answers no search and no
+    /// symbol lookup, while `rift://map` still reads its pinned versions and
+    /// `paths.force_include` still reaches it for one request. An empty list
+    /// indexes every lockfile.
+    #[schemars(length(max = 64))]
+    pub excluded_lockfiles: Vec<String>,
 }
 
 impl Default for TextSearchConfiguration {
@@ -2045,6 +2074,10 @@ impl Default for TextSearchConfiguration {
         Self {
             include: vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())],
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
+            excluded_lockfiles: EXCLUDED_LOCKFILES_DEFAULT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
         }
     }
 }
@@ -2065,9 +2098,33 @@ impl TextSearchConfiguration {
                 TEXT_CHUNK_BYTES_MIN,
                 TEXT_CHUNK_BYTES_MAX,
             ),
+            (
+                "search.text.excluded_lockfiles",
+                self.excluded_lockfiles.len() as u64,
+                0,
+                CONFIGURATION_PATTERNS_MAX as u64,
+            ),
         ])
         .or_else(|| path_patterns_violation("search.text.include", &self.include))
+        .or_else(|| {
+            self.excluded_lockfiles
+                .iter()
+                .find(|name| !is_file_name(name))
+                .map(|name| ConfigurationViolation::FileNameInvalid {
+                    field: "search.text.excluded_lockfiles",
+                    name: name.clone(),
+                })
+        })
     }
+}
+
+/// Whether `name` is one file name: nonempty, within [`LOCKFILE_NAME_BYTES_MAX`], neither
+/// `.` nor `..`, and free of path separators and control characters.
+fn is_file_name(name: &str) -> bool {
+    let within_length = !name.is_empty() && name.len() <= LOCKFILE_NAME_BYTES_MAX;
+    let one_segment = !name.contains(['/', '\\']) && !is_dot_path_segment(name);
+    let printable = !name.chars().any(char::is_control);
+    within_length && one_segment && printable
 }
 
 /// One executable command as a program string or a program followed by arguments.
@@ -2475,6 +2532,15 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// A `search.text.excluded_lockfiles` entry is not one file name: it is empty,
+    /// longer than `LOCKFILE_NAME_BYTES_MAX` bytes, `.` or `..`, or carries a path
+    /// separator or a control character.
+    FileNameInvalid {
+        /// The key's path in the file: `search.text.excluded_lockfiles`.
+        field: &'static str,
+        /// The rejected name.
+        name: String,
+    },
     /// A `dependencies.packages` entry names `version` and `requirement` together, or
     /// neither, so it states no single version selector.
     PackageSelectorInvalid {
@@ -2579,6 +2645,9 @@ impl ConfigurationViolation {
             }
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
+            }
+            Self::FileNameInvalid { field, name } => {
+                vec![("field", (*field).to_owned()), ("name", name.clone())]
             }
             Self::PackageSelectorInvalid { field, package } => {
                 vec![("field", (*field).to_owned()), ("package", package.clone())]
@@ -3132,7 +3201,62 @@ mod tests {
             configuration.search.text.include,
             vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())]
         );
+        assert_eq!(
+            configuration.search.text.excluded_lockfiles,
+            EXCLUDED_LOCKFILES_DEFAULT.map(str::to_owned)
+        );
+        assert!(
+            configuration
+                .search
+                .text
+                .excluded_lockfiles
+                .contains(&"deno.lock".to_owned())
+        );
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_excluded_lockfiles_accept_file_names_and_refuse_anything_else() {
+        let written = json!({ "search": { "text": { "excluded_lockfiles": ["yarn.lock"] } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("a lockfile list deserializes");
+        assert_eq!(configuration.search.text.excluded_lockfiles, ["yarn.lock"]);
+        assert_eq!(configuration.validate(), Ok(()));
+        let empty = json!({ "search": { "text": { "excluded_lockfiles": [] } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(empty).expect("an empty list indexes every lockfile");
+        assert_eq!(configuration.validate(), Ok(()));
+
+        let long = "l".repeat(LOCKFILE_NAME_BYTES_MAX + 1);
+        for name in [
+            "",
+            "crates/Cargo.lock",
+            "a\\b.lock",
+            ".",
+            "..",
+            "bad\u{7}.lock",
+            &long,
+        ] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.search.text.excluded_lockfiles = vec![name.to_owned()];
+            assert_eq!(
+                configuration.validate(),
+                Err(ConfigurationViolation::FileNameInvalid {
+                    field: "search.text.excluded_lockfiles",
+                    name: name.to_owned(),
+                }),
+                "{name:?} must be refused"
+            );
+        }
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.excluded_lockfiles = vec!["x.lock".to_owned(); 65];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "search.text.excluded_lockfiles",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4529,9 +4653,14 @@ mod tests {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let properties = &schema["$defs"]["TextSearchConfiguration"]["properties"];
-        assert_eq!(properties.as_object().expect("properties").len(), 2);
+        assert_eq!(properties.as_object().expect("properties").len(), 3);
         assert!(properties.get("include").is_some());
         assert!(properties.get("max_chunk").is_some());
+        assert_eq!(
+            properties["excluded_lockfiles"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX),
+            "the advertised list bound is the one acceptance enforces"
+        );
     }
 
     #[test]
@@ -5462,6 +5591,10 @@ mod tests {
             ConfigurationViolation::PathPatternInvalid {
                 field: "x",
                 pattern: text(),
+            },
+            ConfigurationViolation::FileNameInvalid {
+                field: "x",
+                name: text(),
             },
             ConfigurationViolation::PackageSelectorInvalid {
                 field: "x",

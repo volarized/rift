@@ -144,6 +144,9 @@ impl WorkspaceIndex {
             let Some(class) = language.classifies(&context_path)? else {
                 continue;
             };
+            if language.excludes_lockfile(&context_path) {
+                continue;
+            }
             if contents.held_count() >= limits.files_max() {
                 return Err(index_error_over_limit(
                     WorkspaceIndexViolation::TooManyFiles,

@@ -1,12 +1,12 @@
-//! Body matches through the read path: a store publication of a real tree, ranked for one
-//! query and answered by [`ReadService::search`].
+//! Body matches and excluded lockfiles through the read path: a store publication of a
+//! real tree, ranked for one query and answered by [`ReadService::search`].
 
 use std::{error::Error, fs, path::Path};
 
 use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
 use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
-use rift_protocol::read::{MatchedField, SearchParams, SearchResult};
+use rift_protocol::read::{MatchedField, ReadWarning, SearchParams, SearchResult};
 use rift_ranking::{BodyTerms, ParsedQuery, QueryPhase, RankingInput, RankingWeights};
 use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits};
 use serde_json::{Value, json};
@@ -15,7 +15,8 @@ use super::{ReadService, SearchHitTarget, StoreAnswer};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-/// A workspace holding `files`, indexed with every visible file as text.
+/// A workspace holding `files`, indexed with every visible file as text and the default
+/// lockfile exclusion.
 fn service(root: &Path, files: &[(&str, &str)]) -> TestResult<ReadService> {
     for (path, text) in files {
         let path = root.join(path);
@@ -248,5 +249,111 @@ async fn pages_window_the_list_body_matches_expanded() -> TestResult {
         paged.extend(spelled(&page));
     }
     assert_eq!(paged, spelled(&whole), "three windows of one ordered list");
+    Ok(())
+}
+
+/// A lockfile answers no search; naming it in `paths.include` says why, and
+/// `paths.force_include` reaches a parsed one for the one request.
+#[tokio::test]
+async fn an_excluded_lockfile_answers_no_search_and_its_selection_warns() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let lock = "version = 4\n\n[[package]]\nname = \"quokka\"\n";
+    let service = service(
+        directory.path(),
+        &[
+            ("Cargo.lock", lock),
+            ("web/deno.lock", "{\"quokka\": \"1.0\"}\n"),
+            ("web/package-lock.json", "{\"quokka\": \"1.0\"}\n"),
+            ("src/lib.rs", "pub fn quokka() {}\n"),
+        ],
+    )?;
+    let store = published(directory.path(), &service).await?;
+    let answer = answered(&store, &service, "quokka").await?;
+
+    let plain = search(
+        &service,
+        &answer,
+        json!({"query": "quokka", "target": "file"}),
+    )?;
+    assert_eq!(spelled(&plain), ["src/lib.rs"]);
+    assert!(
+        !plain
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::LockfileExcluded { .. })),
+        "a request selecting no lockfile carries no lockfile warning"
+    );
+
+    let selected = search(
+        &service,
+        &answer,
+        json!({"query": "quokka", "paths": {"include": ["*.lock"]}}),
+    )?;
+    assert!(selected.results.is_empty(), "{:?}", spelled(&selected));
+    let files = selected
+        .warnings
+        .iter()
+        .find_map(|warning| match warning {
+            ReadWarning::LockfileExcluded { files, detail } => {
+                assert!(detail.contains("excluded_lockfiles"), "{detail}");
+                Some(files.iter().map(|file| file.0.as_str()).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .ok_or("selecting lockfiles warns")?;
+    assert_eq!(
+        files,
+        ["rift://file/Cargo.lock", "rift://file/web/deno.lock"]
+    );
+
+    let symbols = search(
+        &service,
+        &answer,
+        json!({"query": "quokka", "target": "symbol"}),
+    )?;
+    assert_eq!(
+        spelled(&symbols),
+        ["src/lib.rs#quokka"],
+        "no lockfile key is a declaration"
+    );
+    let forced = search(
+        &service,
+        &answer,
+        json!({
+            "query": "quokka",
+            "target": "symbol",
+            "paths": {"force_include": ["web/package-lock.json"]}
+        }),
+    )?;
+    assert!(
+        spelled(&forced)
+            .iter()
+            .any(|hit| hit.starts_with("web/package-lock.json#")),
+        "force_include reaches the parsed lockfile's keys: {:?}",
+        spelled(&forced)
+    );
+    Ok(())
+}
+
+/// Emptying the exclusion list indexes every lockfile again.
+#[tokio::test]
+async fn an_empty_exclusion_list_indexes_every_lockfile() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("Cargo.lock"), "name = \"quokka\"\n")?;
+    let service = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default().excluding_lockfiles(Vec::new()),
+        HistoryConfiguration::default(),
+    )?;
+    let store = published(directory.path(), &service).await?;
+    let answer = answered(&store, &service, "quokka").await?;
+    let result = search(
+        &service,
+        &answer,
+        json!({"query": "quokka", "target": "file"}),
+    )?;
+    assert_eq!(spelled(&result), ["Cargo.lock"]);
     Ok(())
 }

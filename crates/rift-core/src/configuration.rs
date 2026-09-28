@@ -13,7 +13,8 @@
 
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
-    ConfigurationViolation, LanguageConfiguration, UnitParseError, WorkspaceConfiguration,
+    ConfigurationViolation, EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, UnitParseError,
+    WorkspaceConfiguration,
 };
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
@@ -179,24 +180,31 @@ impl From<&WorkspaceConfiguration> for LanguageFileSelections {
     }
 }
 
-/// Resolved `[search.text]` path selection and chunk bound, and the `[documentation]`
-/// table deciding which of the text files the index reads it collects as documentation.
+/// Resolved `[search.text]` path selection, chunk bound, and the lockfiles search leaves
+/// out, beside the `[documentation]` table deciding which of the text files the index
+/// reads it collects as documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFileInclusion {
     include: Vec<String>,
     chunk_bytes_max: u64,
     documentation: DocumentationConfiguration,
+    excluded_lockfiles: Vec<String>,
 }
 
 impl TextFileInclusion {
     /// Builds one text-file policy from its patterns and chunk bound, collecting
-    /// documentation under the `[documentation]` defaults.
+    /// documentation under the `[documentation]` defaults and leaving out the lockfiles
+    /// `[search.text].excluded_lockfiles` names when the key is absent.
     #[must_use]
     pub fn new(include: Vec<String>, chunk_bytes_max: u64) -> Self {
         Self {
             include,
             chunk_bytes_max,
             documentation: DocumentationConfiguration::default(),
+            excluded_lockfiles: EXCLUDED_LOCKFILES_DEFAULT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
         }
     }
 
@@ -205,6 +213,19 @@ impl TextFileInclusion {
     pub fn with_documentation(mut self, documentation: DocumentationConfiguration) -> Self {
         self.documentation = documentation;
         self
+    }
+
+    /// The same policy, leaving out of search the lockfiles `names` names instead.
+    #[must_use]
+    pub fn excluding_lockfiles(mut self, names: Vec<String>) -> Self {
+        self.excluded_lockfiles = names;
+        self
+    }
+
+    /// The file names of the lockfiles search leaves out.
+    #[must_use]
+    pub fn excluded_lockfiles(&self) -> &[String] {
+        &self.excluded_lockfiles
     }
 
     /// Patterns selecting plain text when no language claims a path.
@@ -244,6 +265,7 @@ impl From<&WorkspaceConfiguration> for TextFileInclusion {
             text.max_chunk.bytes(),
         )
         .with_documentation(configuration.documentation.clone())
+        .excluding_lockfiles(text.excluded_lockfiles.clone())
     }
 }
 
