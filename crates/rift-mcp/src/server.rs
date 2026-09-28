@@ -1752,7 +1752,8 @@ impl RiftMcp {
     /// the workspace's dependencies alone and `pattern` from their source, `all` from both,
     /// ordered together. `packages` names package versions `query` and `pattern` search beside
     /// the workspace's own, such as an upgrade target or a package the project does not use
-    /// yet. Use `get_symbol` when the declaration name is known.
+    /// yet. `target: "commit"` matches `query` alone against the messages of the commits the
+    /// history store holds. Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1764,6 +1765,9 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        if params.target == rift_protocol::read::SearchParamsTarget::Commit {
+            return self.commit_search(params).await;
+        }
         if let Some(change) = params.change.clone() {
             return self.change_search(params, change).await;
         }
@@ -1779,6 +1783,29 @@ impl RiftMcp {
             reads.search(&params, &StoreAnswer::identifier_only())
         })
         .await
+    }
+
+    /// Answers a commit search from the history store the server opened, behind the
+    /// acceptance gate every request passes. The answer reads no published tree, so it
+    /// carries no `stale_index`.
+    async fn commit_search(&self, params: SearchParams) -> Result<Json<SearchResult>, ErrorData> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        resolved
+            .published
+            .configuration
+            .accepted(wire::ErrorPhase::Read)?;
+        let reads = Arc::clone(&resolved.published.reads);
+        if let Some(history) = &self.history {
+            reads.attach_history_store(history.stored());
+        }
+        self.blocking
+            .run("commit search", move || reads.search_commits(&params))
+            .await
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
     }
 
     /// Compares the committed revision `change` names against another revision or the
@@ -4654,7 +4681,7 @@ done
         let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
         let message = data.message.as_ref();
         assert!(
-            message.contains("field target, accepted all, documentation, file, symbol"),
+            message.contains("field target, accepted all, commit, documentation, file, symbol"),
             "{message}"
         );
         assert!(

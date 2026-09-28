@@ -6,6 +6,7 @@
 mod body;
 #[cfg(test)]
 mod body_tests;
+mod commit;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;
@@ -237,6 +238,9 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
+        if params.target == SearchParamsTarget::Commit {
+            return self.search_commits(params);
+        }
         if let Some(pattern) = self.validated_pattern(params, store, references)? {
             return self.search_pattern(params, &pattern, store);
         }
@@ -812,6 +816,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
+    if let Some(conflict) = commit::commit_conflict(params) {
+        return Err(conflict);
+    }
     if let Some(conflict) = pattern::pattern_conflict(params) {
         return Err(conflict);
     }
@@ -902,15 +909,20 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
 /// The lexical `query` the request carries, if any: refused when the request carries
 /// none of `query`, `pattern`, `traversal`, and `change`, and when the query is empty.
 fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
-    let query = params.query.as_deref();
     let selects = params.pattern.is_some() || params.traversal.is_some() || params.change.is_some();
-    if query.is_none() && !selects {
-        return Err(ReadFault::invalid("query", "missing"));
+    if params.query.is_none() && selects {
+        return Ok(None);
     }
-    if query.is_some_and(str::is_empty) {
-        return Err(ReadFault::invalid("query", "empty"));
+    required_query(params).map(Some)
+}
+
+/// The `query` a request must carry: refused when it is missing or empty.
+fn required_query(params: &SearchParams) -> Result<&str, ReadError> {
+    match params.query.as_deref() {
+        None => Err(ReadFault::invalid("query", "missing")),
+        Some("") => Err(ReadFault::invalid("query", "empty")),
+        Some(query) => Ok(query),
     }
-    Ok(query)
 }
 
 /// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
@@ -1581,14 +1593,15 @@ pub(crate) fn find_symbol_hit_mut<'a>(
         .find(|hit| hit_symbol_id(hit) == Some(&identity))
 }
 
-/// One hit's declaration identity: absent for a node or file hit, and for a symbol hit
-/// whose identity no accepted evidence established.
+/// One hit's declaration identity: absent for a node, file, documentation, or commit
+/// hit, and for a symbol hit whose identity no accepted evidence established.
 pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
         SearchHitTarget::Node { .. }
         | SearchHitTarget::File { .. }
-        | SearchHitTarget::Documentation { .. } => None,
+        | SearchHitTarget::Documentation { .. }
+        | SearchHitTarget::Commit { .. } => None,
     }
 }
 
@@ -1660,6 +1673,7 @@ fn hit_identity(hit: &SearchHit) -> &str {
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => &documentation.block.identity.0,
+        SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
 }
 

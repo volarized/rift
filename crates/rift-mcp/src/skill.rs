@@ -130,6 +130,11 @@ const DECISION_TABLE: &[DecisionRow] = &[
         tools: &["search"],
         note: Some("with a `change` block"),
     },
+    DecisionRow {
+        situation: "The commit that made a change, found by its message, is needed.",
+        tools: &["search"],
+        note: Some("with `target: \"commit\"`"),
+    },
 ];
 
 /// Generates the skill from the served tool listing.
@@ -459,6 +464,20 @@ mod tests {
                 rendered.contains(
                     "| The declarations two revisions, or a revision and the working tree, hold \
                      differently are needed. | `search` (with a `change` block) |"
+                ),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_table_routes_a_commit_message_to_search() {
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            assert!(
+                rendered.contains(
+                    "| The commit that made a change, found by its message, is needed. | \
+                     `search` (with `target: \"commit\"`) |"
                 ),
                 "{rendered}"
             );

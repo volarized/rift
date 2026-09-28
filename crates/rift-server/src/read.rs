@@ -849,6 +849,17 @@ impl ReadService {
         let _attached = self.stored_history.get_or_init(|| store.clone());
     }
 
+    /// The history store the serving layer attached, which symbol-history reads and
+    /// commit searches answer from.
+    pub(crate) fn stored_history(&self) -> Option<&StoredHistory> {
+        self.stored_history.get()
+    }
+
+    /// The accepted `[providers.history]` table this snapshot serves under.
+    pub(crate) const fn history_configuration(&self) -> &HistoryConfiguration {
+        &self.history
+    }
+
     /// The attached history store, for a snapshot built from this one.
     fn carried_history(&self) -> OnceLock<StoredHistory> {
         self.stored_history

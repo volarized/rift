@@ -537,6 +537,30 @@ impl StoreReads {
             .map_err(database_error("read moved declaration"))
     }
 
+    /// The paths `commit` changed against the commit it was compared with, in path
+    /// order, at most `limit` of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` refuses the read.
+    pub fn changed_paths(
+        &self,
+        commit: &StoredCommit,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.connection
+            .prepare_cached(
+                "SELECT path FROM changed_paths WHERE commit_row = ?1 ORDER BY path LIMIT ?2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![commit.row, limit], |row| row.get(0))?
+                    .collect()
+            })
+            .map_err(database_error("read changed paths"))
+    }
+
     /// The held commit no other held commit was compared with, newest first:
     /// the newest release a release chain starts at.
     ///

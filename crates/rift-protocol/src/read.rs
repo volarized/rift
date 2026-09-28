@@ -111,13 +111,13 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 // `search` so this module stays below its size bound; re-exporting them here keeps every
 // existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
-    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, ChangeHead, ChangeTree, GraphHop, HopDirection,
-    MatchedField, PathPattern, PathPatternViolation, PathSelector, ResultOrder,
-    SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_CHARS_MAX,
-    SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
-    SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit, SearchHitTarget, SearchInclude,
-    SearchParams, SearchParamsTarget, SearchResult, SearchTraversal, SymbolChange,
-    TraversalDirection,
+    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, COMMIT_MESSAGE_BYTES_MAX, COMMIT_PATHS_MAX, ChangeHead,
+    ChangeTree, CommitHit, GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation,
+    PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_CHANGE_PATHS_MAX,
+    SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchTraversal, SymbolChange, TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every

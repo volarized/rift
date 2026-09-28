@@ -673,9 +673,12 @@ fn search_request(
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
         },
+        // A commit search is refused past the `local` scope before any global request, so
+        // it never reaches this mapping.
         target: match params.target {
             rift_protocol::read::SearchParamsTarget::Symbol
-            | rift_protocol::read::SearchParamsTarget::File => None,
+            | rift_protocol::read::SearchParamsTarget::File
+            | rift_protocol::read::SearchParamsTarget::Commit => None,
             rift_protocol::read::SearchParamsTarget::Documentation => {
                 Some(PackageSearchRequestTarget::Documentation)
             }
@@ -1026,6 +1029,7 @@ fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ClientError> {
             SearchHitTarget::Documentation { documentation } => {
                 DocumentIdentity::for_documentation_block(&documentation.block.identity.0)
             }
+            SearchHitTarget::Commit { commit } => DocumentIdentity::new(commit.revision.0.clone()),
         };
     identity.map_err(|_| ClientError::InvalidResponseField {
         field: "search_identity",
@@ -1058,6 +1062,7 @@ fn search_hit_key(hit: &SearchHit) -> &str {
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
+        SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
 }
 

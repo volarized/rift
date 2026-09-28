@@ -44,7 +44,9 @@ impl<'store> BodyMatching<'store> {
         let file_rows = match target {
             SearchParamsTarget::Symbol => FileRowAnswer::Dropped,
             SearchParamsTarget::All => FileRowAnswer::Kept,
-            SearchParamsTarget::File | SearchParamsTarget::Documentation => return None,
+            SearchParamsTarget::File
+            | SearchParamsTarget::Documentation
+            | SearchParamsTarget::Commit => return None,
         };
         let frequencies = store.file_rows()?;
         let terms = BodyTerms::of(query);

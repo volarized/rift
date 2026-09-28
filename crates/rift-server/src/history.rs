@@ -68,6 +68,11 @@ impl StoredHistory {
             lagging,
         }
     }
+
+    /// Opens one read connection to the store.
+    pub(crate) fn connect(&self) -> Result<StoreReads, ReadError> {
+        self.reader.connect().map_err(ReadFault::history_store)
+    }
 }
 
 impl std::fmt::Debug for StoredHistory {
@@ -205,7 +210,7 @@ impl StoredTimelines {
         revision_read: bool,
         revisions_max: usize,
     ) -> Result<Self, ReadError> {
-        let reads = stored.reader.connect().map_err(ReadFault::history_store)?;
+        let reads = stored.connect()?;
         let start = match (stored.strategy, revision_read) {
             (HistoryStrategy::Selective, false) => {
                 reads.chain_head().map_err(ReadFault::history_store)?
