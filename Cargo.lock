@@ -4624,6 +4624,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rift-history-store"
+version = "0.0.45"
+dependencies = [
+ "rift-core",
+ "rift-protocol",
+ "rift-ranking",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rift-index"
 version = "0.0.45"
 dependencies = [
@@ -4680,6 +4692,7 @@ dependencies = [
  "rift-core",
  "rift-dependency",
  "rift-history",
+ "rift-history-store",
  "rift-index",
  "rift-protocol",
  "rift-ranking",
@@ -4776,6 +4789,7 @@ dependencies = [
 name = "rift-server"
 version = "0.0.45"
 dependencies = [
+ "globset",
  "ignore",
  "lsp-types",
  "percent-encoding",
@@ -4783,6 +4797,7 @@ dependencies = [
  "rift-core",
  "rift-dependency",
  "rift-history",
+ "rift-history-store",
  "rift-index",
  "rift-lsp",
  "rift-protocol",
@@ -4793,6 +4808,7 @@ dependencies = [
  "ruff_db",
  "ruff_text_size",
  "schemars 1.2.2",
+ "semver",
  "serde_json",
  "serde_path_to_error",
  "sha2",
