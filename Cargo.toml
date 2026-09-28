@@ -35,7 +35,7 @@ data-encoding = "2.6.0"
 getrandom = { version = "0.4.3", features = ["std"] }
 flate2 = "1.1.9"
 fs4 = "1.1.0"
-gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1"] }
+gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1", "status"] }
 globset = { version = "0.4.20", default-features = false }
 http = "1.4"
 ignore = { version = "0.4.23", default-features = false }
