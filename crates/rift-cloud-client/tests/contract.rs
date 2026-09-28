@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::{
-    Capabilities, PackagePatternPage, PackageResolutionResponse, PackageSearchPage,
-    PackageSymbolPage,
+    Capabilities, PackageDeclarationResponse, PackagePatternPage, PackageResolutionResponse,
+    PackageSearchPage, PackageSymbolPage,
 };
 use serde_json::{Map, Value, json};
 
@@ -178,6 +178,19 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "x-rift-page-files-max")?;
 
     let mut document = contract()?;
+    document["components"]["schemas"]["PackageDeclarationRequest"]["properties"]["positions"]["maxItems"] =
+        json!(10000);
+    assert_invalid(
+        &document,
+        "PackageDeclarationRequest/properties/positions/maxItems",
+    )?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackagePosition"]["properties"]["character"]["maximum"] =
+        json!(65535);
+    assert_invalid(&document, "PackagePosition/properties/character/maximum")?;
+
+    let mut document = contract()?;
     document["components"]["schemas"]["PackageIdentity"]["properties"]["name"]["maxLength"] =
         json!(4095);
     assert_invalid(&document, "PackageIdentity")?;
@@ -193,7 +206,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 13,
+        checked, 15,
         "each request and success response carries an example"
     );
     Ok(())
@@ -205,7 +218,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 7,
+        checked, 8,
         "each success response carries a generated response type"
     );
     Ok(())
@@ -261,10 +274,14 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
         }
+        "#/components/schemas/PackageDeclarationResponse" => {
+            serde_json::from_value::<PackageDeclarationResponse>(value)?;
+        }
         "#/components/schemas/PackageResolutionRequest"
         | "#/components/schemas/PackageSearchRequest"
         | "#/components/schemas/PackageSymbolRequest"
-        | "#/components/schemas/PackagePatternRequest" => return Ok(false),
+        | "#/components/schemas/PackagePatternRequest"
+        | "#/components/schemas/PackageDeclarationRequest" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
     Ok(true)

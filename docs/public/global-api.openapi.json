@@ -1410,6 +1410,254 @@
         "x-rift-page-files-max": 500,
         "x-rift-page-text-bytes-max": 8388608
       }
+    },
+    "/v1/declarations": {
+      "post": {
+        "operationId": "findPackageDeclarations",
+        "summary": "Find the declarations holding package positions.",
+        "description": "Names, for each position in a file of an exact package version, the smallest declaration whose range holds it. A position in a type stub, such as a `.pyi` or `.d.ts` file, answers the declaration the stub describes: the module's declaration when the stub pairs with a module file. A position answers no declaration when the global index holds no release at that exact version, no file at that path, or no declaration holding the position. The server **MUST NOT** answer from another version, and **MUST NOT** move a position past its line or the text, or one inside a character, to a neighboring one.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "description": "Positions in package files.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageDeclarationRequest"
+              },
+              "examples": {
+                "valid": {
+                  "summary": "Valid request",
+                  "value": {
+                    "position_encoding": "utf-16",
+                    "positions": [
+                      {
+                        "package": {
+                          "manager": "cargo",
+                          "name": "beacon",
+                          "version": "1.0.0"
+                        },
+                        "path": "src/lib.rs",
+                        "line": 3,
+                        "character": 4
+                      },
+                      {
+                        "package": {
+                          "manager": "cargo",
+                          "name": "beacon",
+                          "version": "1.0.0"
+                        },
+                        "path": "src/lib.rs",
+                        "line": 0,
+                        "character": 2
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One answer per submitted position.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageDeclarationResponse"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "results": [
+                        {
+                          "position": {
+                            "package": {
+                              "manager": "cargo",
+                              "name": "beacon",
+                              "version": "1.0.0"
+                            },
+                            "path": "src/lib.rs",
+                            "line": 3,
+                            "character": 4
+                          },
+                          "declaration": "rift://symbol/rust/src/lib.rs/serve"
+                        },
+                        {
+                          "position": {
+                            "package": {
+                              "manager": "cargo",
+                              "name": "beacon",
+                              "version": "1.0.0"
+                            },
+                            "path": "src/lib.rs",
+                            "line": 0,
+                            "character": 2
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
     }
   },
   "components": {
@@ -3087,6 +3335,102 @@
           "publication_format",
           "analyzer_revision",
           "corpus_revision"
+        ],
+        "type": "object"
+      },
+      "PackageDeclarationRequest": {
+        "additionalProperties": false,
+        "description": "Positions in files of exact package versions, each to name a declaration for.",
+        "properties": {
+          "position_encoding": {
+            "description": "How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.",
+            "type": "string",
+            "enum": [
+              "utf-8",
+              "utf-16"
+            ]
+          },
+          "positions": {
+            "description": "Positions to answer, each at most once.",
+            "items": {
+              "$ref": "#/components/schemas/PackagePosition"
+            },
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000
+          }
+        },
+        "required": [
+          "position_encoding",
+          "positions"
+        ],
+        "type": "object"
+      },
+      "PackagePosition": {
+        "additionalProperties": false,
+        "description": "One position in one file of an exact package version.",
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          },
+          "path": {
+            "description": "Path of the file below the package root, using forward slashes, as in `src/lib.rs`.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "line": {
+            "description": "Zero-based line of the position.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "character": {
+            "description": "Zero-based offset within the line, counted as `position_encoding` states.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          }
+        },
+        "required": [
+          "package",
+          "path",
+          "line",
+          "character"
+        ],
+        "type": "object"
+      },
+      "PackageDeclarationResult": {
+        "additionalProperties": true,
+        "description": "One submitted position and the declaration holding it.",
+        "properties": {
+          "position": {
+            "$ref": "#/components/schemas/PackagePosition"
+          },
+          "declaration": {
+            "$ref": "#/components/schemas/SymbolId"
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "type": "object"
+      },
+      "PackageDeclarationResponse": {
+        "additionalProperties": true,
+        "description": "One result per submitted position. A result without `declaration` names a position no declaration holds.",
+        "properties": {
+          "results": {
+            "description": "Results, one per submitted position.",
+            "items": {
+              "$ref": "#/components/schemas/PackageDeclarationResult"
+            },
+            "type": "array",
+            "maxItems": 1000
+          }
+        },
+        "required": [
+          "results"
         ],
         "type": "object"
       },

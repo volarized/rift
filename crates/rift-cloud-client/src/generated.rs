@@ -1258,6 +1258,72 @@ pub struct PackagePatternPage {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
+/// Positions in files of exact package versions, each to name a declaration for.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDeclarationRequest {
+    /// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
+    pub position_encoding: PackageDeclarationRequestPositionEncoding,
+    /// Positions to answer, each at most once.
+    #[validate(length(min = 1u64, max = 1_000u64), nested)]
+    pub positions: Vec<PackagePosition>,
+}
+/// One position in one file of an exact package version.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePosition {
+    /// One package as its package manager identifies it.
+    #[validate(nested)]
+    pub package: PackageIdentity,
+    /// Path of the file below the package root, using forward slashes, as in `src/lib.rs`.
+    #[validate(length(min = 1u64, max = 1_000u64))]
+    pub path: String,
+    /// Zero-based line of the position.
+    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
+    pub line: i64,
+    /// Zero-based offset within the line, counted as `position_encoding` states.
+    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
+    pub character: i64,
+}
+/// One submitted position and the declaration holding it.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackageDeclarationResult {
+    /// One position in one file of an exact package version.
+    pub position: PackagePosition,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub declaration: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One result per submitted position. A result without `declaration` names a position no declaration holds.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackageDeclarationResponse {
+    /// Results, one per submitted position.
+    pub results: Vec<PackageDeclarationResult>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
 /// RFC 9457 problem details for an application error.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct ProblemDetails {
@@ -2582,6 +2648,137 @@ pub enum SearchPackagePatternsResponse {
     ///default: Unknown response
     Unknown,
 }
+/// Names, for each position in a file of an exact package version, the smallest declaration whose range holds it. A position in a type stub, such as a `.pyi` or `.d.ts` file, answers the declaration the stub describes: the module's declaration when the stub pairs with a module file. A position answers no declaration when the global index holds no release at that exact version, no file at that path, or no declaration holding the position. The server **MUST NOT** answer from another version, and **MUST NOT** move a position past its line or the text, or one inside a character, to a neighboring one.
+#[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
+pub struct FindPackageDeclarationsRequest {
+    /// Positions in package files.
+    #[validate(nested)]
+    pub body: PackageDeclarationRequest,
+}
+impl FindPackageDeclarationsRequest {
+    /// Parse the HTTP response into the response enum.
+    pub async fn parse_response(
+        req: reqwest::Response,
+    ) -> anyhow::Result<FindPackageDeclarationsResponse> {
+        let status = req.status();
+        if status == http::StatusCode::OK {
+            let data = oas3_gen_support::Diagnostics::<
+                PackageDeclarationResponse,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Ok(data));
+        }
+        if status == http::StatusCode::BAD_REQUEST {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::BadRequest(data));
+        }
+        if status == http::StatusCode::UNAUTHORIZED {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Unauthorized(data));
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Forbidden(data));
+        }
+        if status == http::StatusCode::NOT_ACCEPTABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::NotAcceptable(data));
+        }
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::ContentTooLarge(data));
+        }
+        if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::UnsupportedMediaType(data));
+        }
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::TooManyRequests(data));
+        }
+        if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::InternalServerError(data));
+        }
+        if status == http::StatusCode::BAD_GATEWAY {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::BadGateway(data));
+        }
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::ServiceUnavailable(data));
+        }
+        if status == http::StatusCode::GATEWAY_TIMEOUT {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::GatewayTimeout(data));
+        }
+        let _ = req.bytes().await?;
+        return Ok(FindPackageDeclarationsResponse::Unknown);
+    }
+}
+/// Response types for findPackageDeclarations
+#[derive(Debug, Clone)]
+pub enum FindPackageDeclarationsResponse {
+    ///200: One answer per submitted position.
+    Ok(PackageDeclarationResponse),
+    ///400: Request JSON, query parameters, or field relationships are invalid.
+    BadRequest(ProblemDetails),
+    ///401: Authentication is required or credentials are invalid.
+    Unauthorized(ProblemDetails),
+    ///403: Credentials do not permit this operation.
+    Forbidden(ProblemDetails),
+    ///406: The server cannot produce an accepted media type.
+    NotAcceptable(ProblemDetails),
+    ///413: The request body exceeds the request body bound.
+    ContentTooLarge(ProblemDetails),
+    ///415: The request media type is unsupported.
+    UnsupportedMediaType(ProblemDetails),
+    ///429: The request rate limit is exhausted.
+    TooManyRequests(ProblemDetails),
+    ///500: The server encountered an unexpected failure.
+    InternalServerError(ProblemDetails),
+    ///502: The server received an invalid upstream response.
+    BadGateway(ProblemDetails),
+    ///503: The service is temporarily unavailable.
+    ServiceUnavailable(ProblemDetails),
+    ///504: The upstream request timed out.
+    GatewayTimeout(ProblemDetails),
+    ///default: Unknown response
+    Unknown,
+}
 /// Stable warning code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum WarningCode {
@@ -2790,6 +2987,36 @@ impl<'de> serde::Deserialize<'de> for PackageSymbolRequestInclude {
             "source" => Ok(PackageSymbolRequestInclude::Source),
             "documentation" => Ok(PackageSymbolRequestInclude::Documentation),
             _ => Err(serde::de::Error::unknown_variant(&s, &["source", "documentation"])),
+        }
+    }
+}
+/// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum PackageDeclarationRequestPositionEncoding {
+    #[serde(rename = "utf-8")]
+    #[default]
+    Utf8,
+    #[serde(rename = "utf-16")]
+    Utf16,
+}
+impl core::fmt::Display for PackageDeclarationRequestPositionEncoding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Utf8 => write!(f, "utf-8"),
+            Self::Utf16 => write!(f, "utf-16"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PackageDeclarationRequestPositionEncoding {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "utf-8" => Ok(PackageDeclarationRequestPositionEncoding::Utf8),
+            "utf-16" => Ok(PackageDeclarationRequestPositionEncoding::Utf16),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["utf-8", "utf-16"])),
         }
     }
 }

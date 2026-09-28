@@ -1,5 +1,6 @@
 use super::*;
 
+mod declaration;
 mod documentation;
 mod pages;
 mod pattern;
@@ -63,6 +64,7 @@ enum OperationFixture {
     RequirementOutsideRange,
     BodyBoundStop,
     Patterns,
+    Declarations,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -329,6 +331,9 @@ fn operation_response(
     if path.ends_with("/symbols") {
         return operation_symbol_response(mode, query);
     }
+    if path.ends_with("/declarations") {
+        return json_response(&declaration::declaration_response_json(), None);
+    }
     if path.ends_with("/patterns") {
         return json_response(&pattern::pattern_page_json(query_cursor(query)), None);
     }
@@ -363,6 +368,10 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         }
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
+        }
+        OperationFixture::Declarations => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "declarations"]);
         }
         OperationFixture::Patterns => {
             value["supported_features"] =

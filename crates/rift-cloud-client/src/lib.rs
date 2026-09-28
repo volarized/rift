@@ -1,6 +1,7 @@
 //! Bounded client for Rift global package data.
 
 pub mod contract;
+mod declaration;
 mod pattern;
 mod response;
 
@@ -47,24 +48,28 @@ pub use generated::{
     DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
+    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions,
+    FindPackageDeclarationsRequest, FindPackageDeclarationsResponse, GetCapabilitiesRequest,
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
-    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
-    PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
-    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
-    PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
-    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
-    PackageSymbolRequestInclude, Parameter, ProblemDetails, PublicationFormat, QueryTerm,
-    ResolutionWarning, ResolutionWarningCode, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
-    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
-    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
+    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDeclarationRequest,
+    PackageDeclarationRequestPositionEncoding, PackageDeclarationResponse,
+    PackageDeclarationResult, PackageDocumentationHit, PackageDocumentationHitContributingField,
+    PackageIdentity, PackagePatternDeclaration, PackagePatternHit, PackagePatternPage,
+    PackagePatternRequest, PackagePosition, PackageResolutionRequest, PackageResolutionResponse,
+    PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
+    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
+    ProblemDetails, PublicationFormat, QueryTerm, ResolutionWarning, ResolutionWarningCode,
+    ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
+    SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse,
+    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, Signature,
+    SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
+    SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
+    Warning, WarningCode,
 };
 pub mod domain;
+pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
 pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::{PATTERN_BYTES_MAX, PATTERN_PAGE_FILES_MAX};
 

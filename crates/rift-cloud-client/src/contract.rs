@@ -38,12 +38,13 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 5] = [
+const ENDPOINTS: [Endpoint; 6] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
     Endpoint::Patterns,
+    Endpoint::Declarations,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -53,6 +54,7 @@ pub(crate) enum Endpoint {
     Search,
     Symbols,
     Patterns,
+    Declarations,
 }
 
 impl Endpoint {
@@ -63,13 +65,18 @@ impl Endpoint {
             Self::Search => "/v1/search",
             Self::Symbols => "/v1/symbols",
             Self::Patterns => "/v1/patterns",
+            Self::Declarations => "/v1/declarations",
         }
     }
 
     pub(crate) fn method(self) -> Method {
         match self {
             Self::Capabilities => Method::GET,
-            Self::Resolutions | Self::Search | Self::Symbols | Self::Patterns => Method::POST,
+            Self::Resolutions
+            | Self::Search
+            | Self::Symbols
+            | Self::Patterns
+            | Self::Declarations => Method::POST,
         }
     }
 
@@ -80,6 +87,7 @@ impl Endpoint {
             Self::Search => "searchPackages",
             Self::Symbols => "listPackageSymbols",
             Self::Patterns => "searchPackagePatterns",
+            Self::Declarations => "findPackageDeclarations",
         }
     }
 
@@ -371,6 +379,16 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ("PackageSearchPage", "items", page_items_max),
         ("PackageSymbolPage", "items", page_items_max),
         ("PackagePatternPage", "items", page_items_max),
+        (
+            "PackageDeclarationRequest",
+            "positions",
+            crate::DECLARATION_POSITIONS_MAX,
+        ),
+        (
+            "PackageDeclarationResponse",
+            "results",
+            crate::DECLARATION_POSITIONS_MAX,
+        ),
         ("PackageSearchRequest", "terms", PARSED_QUERY_MEMBERS_MAX),
         (
             "PackageSearchRequest",
@@ -418,6 +436,14 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     }
     let cursor = parameter_schema(spec, "Cursor")?;
     expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
+    for property in ["line", "character"] {
+        let schema = property_schema(spec, "PackagePosition", property)?;
+        expect_bound(
+            &format!("PackagePosition/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
+        )?;
+    }
     validate_pattern_page_bound(spec)
 }
 
