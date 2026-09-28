@@ -86,6 +86,9 @@ pub(crate) struct FixtureOptions {
     /// Whether the precise search page stops at the response body bound: it answers its
     /// declarations with a `result_truncated` warning and [`BODY_BOUND_CURSOR`].
     pub(crate) stopped_at_body_bound: bool,
+    /// The features the capabilities leave out of `supported_features`. Without both
+    /// documentation features they carry no `documentation_revision` either.
+    pub(crate) withheld_features: &'static [&'static str],
 }
 
 impl Default for FixtureOptions {
@@ -95,6 +98,7 @@ impl Default for FixtureOptions {
             hold: None,
             page_limit_max: PAGE_LIMIT_ADVERTISED,
             stopped_at_body_bound: false,
+            withheld_features: &[],
         }
     }
 }
@@ -204,7 +208,10 @@ async fn global_handler(
     let body = body.unwrap_or(Value::Null);
     let options = state.options;
     if path.ends_with("/capabilities") {
-        return json_response(&capabilities(options.page_limit_max));
+        return json_response(&capabilities(
+            options.page_limit_max,
+            options.withheld_features,
+        ));
     }
     if path.ends_with("/resolutions") {
         state.hold_resolution().await;
@@ -237,13 +244,22 @@ fn json_response(value: &Value) -> Response {
         .into_response()
 }
 
-fn capabilities(page_limit_max: u64) -> Value {
-    json!({
+/// The capabilities the fixture advertises, every feature it serves but `withheld`.
+fn capabilities(page_limit_max: u64, withheld: &[&str]) -> Value {
+    let features: Vec<&str> = [
+        "resolutions",
+        "search",
+        "symbols",
+        "documentation_search",
+        "symbol_documentation",
+        "patterns",
+    ]
+    .into_iter()
+    .filter(|feature| !withheld.contains(feature))
+    .collect();
+    let mut advertised = json!({
         "supported_package_managers": ["cargo"],
-        "supported_features": [
-            "resolutions", "search", "symbols", "documentation_search", "symbol_documentation",
-            "patterns"
-        ],
+        "supported_features": features,
         "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
@@ -269,7 +285,14 @@ fn capabilities(page_limit_max: u64) -> Value {
             "warnings_max": 32,
             "source_bytes_max": 1_048_576
         }
-    })
+    });
+    let documented = ["documentation_search", "symbol_documentation"]
+        .iter()
+        .any(|feature| !withheld.contains(feature));
+    if !documented && let Some(fields) = advertised.as_object_mut() {
+        fields.remove("documentation_revision");
+    }
+    advertised
 }
 
 fn collected_package() -> Value {

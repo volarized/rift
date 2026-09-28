@@ -1396,3 +1396,88 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
     server_task.await?;
     Ok(())
 }
+
+/// A global API whose capabilities advertise none of `patterns`, `documentation_search`,
+/// and `symbol_documentation` still answers the reads that need them: each carries the
+/// project hits and one `capability_unavailable` warning naming the feature, and the
+/// client asks the service for no read it does not serve.
+#[tokio::test]
+async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailable() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        withheld_features: &["patterns", "documentation_search", "symbol_documentation"],
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+
+    let reads = [
+        (
+            "search",
+            json!({"pattern": "beacon", "scope": "all"}),
+            "results",
+            "patterns",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all"}),
+            "results",
+            "documentation_search",
+        ),
+        (
+            "get_symbol",
+            json!({"name": "beacon", "scope": "all", "include": ["documentation"]}),
+            "hits",
+            "symbol_documentation",
+        ),
+    ];
+    for (tool, request, hits, feature) in reads {
+        let answer = call_tool(&client, tool, request.clone()).await?;
+        let project_hits = answer[hits].as_array().ok_or("hits are an array")?;
+        assert!(!project_hits.is_empty(), "{request}: {answer:#}");
+        assert!(
+            project_hits.iter().all(|hit| hit.get("unit").is_none()),
+            "no package answers: {answer:#}"
+        );
+        let warnings = answer["warnings"]
+            .as_array()
+            .ok_or("warnings are an array")?;
+        let capability: Vec<&Value> = warnings
+            .iter()
+            .filter(|warning| warning["code"] == "global_page_warning")
+            .collect();
+        assert_eq!(
+            capability,
+            [&json!({
+                "code": "global_page_warning",
+                "warning_code": "capability_unavailable",
+                "detail": format!(
+                    "the global API does not advertise the `{feature}` feature, so no \
+                     package answers this read"
+                )
+            })],
+            "{request}: {answer:#}"
+        );
+        assert!(
+            !answer.to_string().contains("global_response_invalid"),
+            "{request}: {answer:#}"
+        );
+    }
+    let reads_asked: Vec<String> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .map(|request| request.uri)
+        .filter(|uri| !uri.ends_with("/v1/capabilities") && !uri.ends_with("/v1/resolutions"))
+        .collect();
+    assert!(reads_asked.is_empty(), "{reads_asked:#?}");
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
