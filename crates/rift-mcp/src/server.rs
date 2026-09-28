@@ -18,7 +18,7 @@ use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
     Digest, GetSymbolParams, GetSymbolResult, Language, NodesParams, NodesResult, Pagination,
-    ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope,
+    ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope, TraversalDirection,
 };
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
@@ -33,8 +33,8 @@ use rift_search::{
     StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault, ReadService,
-    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault,
+    ReadService, StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -50,9 +50,9 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, local_search_page,
-    local_symbol_page, merge_patterns, merge_search, merge_symbols, package_patterns,
-    package_search, package_symbols,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, callee_declarations,
+    local_search_page, local_symbol_page, merge_patterns, merge_search, merge_symbols,
+    package_patterns, package_search, package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1826,7 +1826,7 @@ impl RiftMcp {
             ranking = self.ranking(&params, &resolved.published, deadline).await?;
         }
         let requested = &params;
-        let (resolved, ranking, references) = tokio::time::timeout_at(
+        let (resolved, ranking, mut references) = tokio::time::timeout_at(
             deadline.at(),
             Box::pin(rift_core::traced_async!(
                 component = "search",
@@ -1842,7 +1842,13 @@ impl RiftMcp {
             ReadFault::unavailable("engine references", "request deadline exceeded")
                 .tool_error(wire::ErrorPhase::Read)
         })??;
-        let SearchRanking { answer, warnings } = ranking.unwrap_or_else(|| {
+        let callee_warnings = self
+            .name_package_callees(&resolved, &mut references, deadline)
+            .await;
+        let SearchRanking {
+            answer,
+            mut warnings,
+        } = ranking.unwrap_or_else(|| {
             SearchRanking::unavailable(
                 "the lexical index is stamped for a publication newer than the one this \
                  request captured, and the workspace kept publishing across the bounded \
@@ -1851,6 +1857,7 @@ impl RiftMcp {
                 self.ranking_weights,
             )
         });
+        warnings.extend(callee_warnings);
         self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
             .await
     }
@@ -2105,11 +2112,14 @@ impl RiftMcp {
         if !self.engine_tree_matches(&resolved.published).await? {
             return Ok(None);
         }
+        let roots = self
+            .callee_roots(&resolved.published, &engines, params)
+            .await?;
         let references = Box::pin(resolve_engine_references(
             &resolved.published.reads,
             &engines,
             params,
-            walk_deadline,
+            (walk_deadline, &roots),
         ))
         .await
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
@@ -2118,6 +2128,81 @@ impl RiftMcp {
         } else {
             Ok(None)
         }
+    }
+
+    /// The installed packages an outgoing walk addresses its callees' files through, read
+    /// on the worker pool; no package for an incoming walk, which maps into the tree alone.
+    async fn callee_roots(
+        &self,
+        published: &PublishedWorkspace,
+        engines: &Arc<EnginePool>,
+        params: &SearchParams,
+    ) -> Result<CalleeRoots, ErrorData> {
+        let outgoing = params
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.direction == TraversalDirection::Outgoing);
+        if !outgoing {
+            return Ok(CalleeRoots::default());
+        }
+        let reads = Arc::clone(&published.reads);
+        let engines = Arc::clone(engines);
+        self.blocking
+            .run("callee package roots", move || {
+                Ok(CalleeRoots::read(&reads, &engines))
+            })
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// Names the declaration of each callee an outgoing walk found in a package file, in
+    /// one global API request per position encoding, and returns the warnings the global
+    /// lane carries.
+    ///
+    /// A callee answered no declaration, one left out of a request past its bounds, and
+    /// every callee when `[global] enabled = false` or the global API did not answer, is
+    /// counted in `callees_dropped`; the last two carry the global warning naming why.
+    async fn name_package_callees(
+        &self,
+        resolved: &ResolvedWorkspace,
+        references: &mut EngineReferences,
+        deadline: RequestDeadline,
+    ) -> Vec<ReadWarning> {
+        if references.package_callees().is_empty() {
+            return Vec::new();
+        }
+        let read_context = ReadContext::snapshot(&resolved.published.reads);
+        let configuration = resolved.published.configuration.global_configuration();
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(&configuration, &read_context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(&read_context),
+        };
+        let Some(client) = route.client.clone() else {
+            references.drop_package_callees();
+            return route.service_warnings();
+        };
+        let asked = callee_declarations(
+            &client,
+            references.package_callees(),
+            &route.remote_packages,
+        );
+        match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
+            Ok(Ok(named)) => references.name_package_callees(|callee| named.declaration(callee)),
+            Ok(Err(error)) => {
+                route.discard_remote(&error);
+                references.drop_package_callees();
+            }
+            Err(_) => {
+                route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                references.drop_package_callees();
+            }
+        }
+        route.service_warnings()
     }
 
     /// Whether the captured source and configuration still match the publication.
