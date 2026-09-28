@@ -10,7 +10,7 @@
 use std::sync::OnceLock;
 
 use crate::ByteRange;
-use crate::extract;
+use crate::extract::{self, Visited};
 use crate::failure::SyntaxError;
 use rift_protocol::read::{Documentation, DocumentationFormat};
 use tree_sitter::Node;
@@ -82,42 +82,28 @@ fn attachment_kinds() -> &'static AttachmentKinds {
     KINDS.get_or_init(|| AttachmentKinds::resolve(&super::rust_grammar()))
 }
 
-/// Returns the byte offset where `node`'s whole declaration starts.
-///
-/// Walks previous siblings, extending the start over each that is an
-/// `attribute_item` or an outer doc comment. The first sibling that fails
-/// either test stops the walk, and `node`'s own start is the fallback.
-///
-/// A blank line between an attachable sibling and the declaration detaches
-/// it, matching rustdoc's own attachment rule.
-pub(super) fn declaration_start(node: Node<'_>, text: &str) -> usize {
-    attached_front(node, text).start_byte()
+/// Returns the byte offset where the visited declaration's whole declaration
+/// starts: the front of its attached run, or its own start when nothing
+/// attaches.
+pub(super) fn declaration_start(visited: Visited<'_, '_>, text: &str) -> usize {
+    attached_run(visited, text)
+        .last()
+        .map_or(visited.node().start_byte(), |(front, _)| front.start_byte())
 }
 
 /// Whether one of the declaration's attached outer attributes is `#[<name>]`.
 ///
 /// The attribute's own text between `#[` and `]` is compared whole, so
 /// `#[macro_export]` matches `macro_export` and `#[macro_export(local_inner_macros)]`
-/// does not; the walk is the one [`declaration_start`] uses.
-pub(super) fn has_attached_attribute(node: Node<'_>, text: &str, name: &str) -> bool {
+/// does not; the run is the one [`declaration_start`] extends over.
+pub(super) fn has_attached_attribute(visited: Visited<'_, '_>, text: &str, name: &str) -> bool {
     let kinds = attachment_kinds();
-    let front = attached_front(node, text);
-    let mut cursor = Some(front);
-    while let Some(sibling) = cursor {
-        if sibling.start_byte() >= node.start_byte() {
-            break;
-        }
-        if sibling.kind_id() == kinds.attribute_item
-            && text
-                .get(sibling.byte_range())
-                .and_then(attribute_name)
-                .is_some_and(|attribute| attribute == name)
-        {
-            return true;
-        }
-        cursor = sibling.next_sibling();
-    }
-    false
+    attached_run(visited, text)
+        .into_iter()
+        .any(|(sibling, sibling_text)| {
+            sibling.kind_id() == kinds.attribute_item
+                && attribute_name(sibling_text).is_some_and(|attribute| attribute == name)
+        })
 }
 
 /// The name inside `#[...]`, trimmed; `None` for text that is not an attribute item.
@@ -129,12 +115,24 @@ fn attribute_name(attribute_text: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// The first sibling of the run of attached outer attributes and doc comments
-/// standing before `node`; `node` itself when nothing is attached.
-fn attached_front<'tree>(node: Node<'tree>, text: &str) -> Node<'tree> {
-    let mut front = node;
-    while let Some(previous) = front.prev_sibling() {
-        if !is_attached(previous) {
+/// The attached outer attributes and doc comments standing before the
+/// visited declaration, nearest first, each beside its text; empty when
+/// nothing attaches.
+///
+/// Walks previous siblings, taking each that is an `attribute_item` or an
+/// outer doc comment. The first sibling that fails either test stops the
+/// walk, and a blank line between an attachable sibling and the declaration
+/// detaches it, matching rustdoc's own attachment rule. Each step reads the
+/// previous sibling the shared walk recorded, so the walk costs the run's length.
+fn attached_run<'tree, 'text>(
+    visited: Visited<'_, 'tree>,
+    text: &'text str,
+) -> Vec<(Node<'tree>, &'text str)> {
+    let mut run = Vec::new();
+    let mut front = visited;
+    while let Some(previous) = front.previous_sibling() {
+        let sibling = previous.node();
+        if !is_attached(sibling) {
             break;
         }
         // tree-sitter guarantees every sibling's byte range indexes validly
@@ -142,18 +140,19 @@ fn attached_front<'tree>(node: Node<'tree>, text: &str) -> Node<'tree> {
         // guard a caller contract (text must be that same source), not a
         // reachable parse outcome; no legitimate or malformed source drives
         // `text.get` to fail here.
-        let Some(previous_text) = text.get(previous.byte_range()) else {
+        let Some(sibling_text) = text.get(sibling.byte_range()) else {
             break;
         };
-        let Some(gap) = text.get(previous.end_byte()..front.start_byte()) else {
+        let Some(gap) = text.get(sibling.end_byte()..front.node().start_byte()) else {
             break;
         };
-        if !gap_permits_attachment(previous_text, gap) {
+        if !gap_permits_attachment(sibling_text, gap) {
             break;
         }
+        run.push((sibling, sibling_text));
         front = previous;
     }
-    front
+    run
 }
 
 /// Reports whether `node` is an attribute or an outer doc comment, either
@@ -181,45 +180,25 @@ fn is_doc_comment(node: Node<'_>) -> bool {
         && node.child_by_field_name(OUTER_DOC_MARKER_FIELD).is_some()
 }
 
-/// Doc-comment text attached in front of `node` - the same siblings
-/// [`declaration_start`] extends the span over, filtered to outer doc
+/// Doc-comment text attached in front of the visited declaration - the same
+/// run [`declaration_start`] extends the span over, filtered to outer doc
 /// comments alone, since an attribute contributes no text - stripped of
 /// comment syntax and joined in source order. Empty when nothing attaches.
 pub(super) fn attached_documentation(
-    node: Node<'_>,
+    visited: Visited<'_, '_>,
     text: &str,
 ) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
-    let mut front = node;
     let mut comments: Vec<&str> = Vec::new();
     let mut ranges = Vec::new();
-    while let Some(previous) = front.prev_sibling() {
-        if !is_attached(previous) {
-            break;
+    for (sibling, sibling_text) in attached_run(visited, text).into_iter().rev() {
+        if is_doc_comment(sibling) {
+            comments.push(sibling_text);
+            ranges.push(extract::byte_range(sibling)?);
         }
-        // As in `declaration_start`: tree-sitter guarantees every sibling's byte range
-        // indexes validly into the exact text it was parsed from, so these two `None` arms
-        // guard a caller contract (text must be that same source), not a reachable parse
-        // outcome.
-        let Some(previous_text) = text.get(previous.byte_range()) else {
-            break;
-        };
-        let Some(gap) = text.get(previous.end_byte()..front.start_byte()) else {
-            break;
-        };
-        if !gap_permits_attachment(previous_text, gap) {
-            break;
-        }
-        if is_doc_comment(previous) {
-            comments.push(previous_text);
-            ranges.push(extract::byte_range(previous)?);
-        }
-        front = previous;
     }
     if comments.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    comments.reverse();
-    ranges.reverse();
     let text = comments
         .iter()
         .map(|comment| strip_doc_comment_marker(comment))

@@ -11,7 +11,7 @@ use strum::VariantArray;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault, incompatible_grammar, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
@@ -405,7 +405,12 @@ impl GrammarRules for RustGrammarRules {
             .transpose()
     }
 
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         let Some(kind) =
             RustGrammarNodeKind::from_kind(node.kind()).and_then(RustGrammarNodeKind::symbol_kind)
         else {
@@ -414,12 +419,13 @@ impl GrammarRules for RustGrammarRules {
         let Some(name) = declaration_name(node, text) else {
             return Ok(None);
         };
-        let visibility = declared_visibility(node, kind, text);
+        let visibility = declared_visibility(visited, kind, text);
         let mut facets = declaration_facets(kind, &visibility);
-        if is_entrypoint(node, kind, &name) {
+        if is_entrypoint(visited, kind, &name) {
             facets.push(SymbolFacet::Entrypoint);
         }
-        let (documentation, documentation_ranges) = attachment::attached_documentation(node, text)?;
+        let (documentation, documentation_ranges) =
+            attachment::attached_documentation(visited, text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
@@ -452,8 +458,8 @@ impl GrammarRules for RustGrammarRules {
     /// A declaration's start, extended over its attached outer attributes
     /// and outer doc comments so the whole declaration - not just the item
     /// node - is what the symbol read returns.
-    fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
-        attachment::declaration_start(node, text)
+    fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
+        attachment::declaration_start(visited, text)
     }
 
     fn qualification_separator(&self) -> &'static str {
@@ -500,11 +506,15 @@ const MACRO_EXPORT_ATTRIBUTE: &str = "macro_export";
 
 /// A declaration's visibility: its `visibility_modifier`, or, for a `macro_rules!`
 /// macro that carries no modifier, `pub` when `#[macro_export]` is attached.
-fn declared_visibility(node: Node<'_>, kind: RustSymbolKind, text: &str) -> RustVisibility {
-    let authored = declaration_visibility(node, text);
+fn declared_visibility(
+    visited: Visited<'_, '_>,
+    kind: RustSymbolKind,
+    text: &str,
+) -> RustVisibility {
+    let authored = declaration_visibility(visited.node(), text);
     if kind == RustSymbolKind::Macro
         && authored == RustVisibility::Private
-        && attachment::has_attached_attribute(node, text, MACRO_EXPORT_ATTRIBUTE)
+        && attachment::has_attached_attribute(visited, text, MACRO_EXPORT_ATTRIBUTE)
     {
         return RustVisibility::Public;
     }
@@ -588,11 +598,11 @@ fn rust_enclosure_kinds() -> &'static RustEnclosureKinds {
 /// no ancestor is a `mod_item`, `impl_item`, `trait_item`, or
 /// `function_item`. Bounded by the parsed tree's depth, which
 /// [`SyntaxLimits`] caps during extraction.
-fn is_file_scope(node: Node<'_>) -> bool {
+fn is_file_scope(visited: Visited<'_, '_>) -> bool {
     let kinds = rust_enclosure_kinds();
-    let mut ancestor = node.parent();
+    let mut ancestor = visited.parent();
     while let Some(current) = ancestor {
-        let kind_id = current.kind_id();
+        let kind_id = current.node().kind_id();
         if kind_id == kinds.module
             || kind_id == kinds.implementation
             || kind_id == kinds.trait_definition
@@ -608,8 +618,8 @@ fn is_file_scope(node: Node<'_>) -> bool {
 /// Reports whether `node` is a file-scope `fn main` - the binary
 /// entrypoint - so [`SymbolFacet::Entrypoint`] applies. A `main` nested in
 /// a `mod`, an `impl`, a `trait`, or another `fn` never qualifies.
-fn is_entrypoint(node: Node<'_>, kind: RustSymbolKind, name: &str) -> bool {
-    kind == RustSymbolKind::Function && name == "main" && is_file_scope(node)
+fn is_entrypoint(visited: Visited<'_, '_>, kind: RustSymbolKind, name: &str) -> bool {
+    kind == RustSymbolKind::Function && name == "main" && is_file_scope(visited)
 }
 
 /// The implementation part of one declaration: its grammar `body` or `value`

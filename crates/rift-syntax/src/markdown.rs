@@ -45,7 +45,7 @@ use tree_sitter::Node;
 
 use crate::document::{ByteRange, SyntaxDocument};
 mod facts;
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::SyntaxError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use facts::{
@@ -141,11 +141,11 @@ impl MarkdownRules {
     /// Whether `heading` is the one its parent section declares. A loose
     /// setext heading - one the grammar left mid-section - is not, and
     /// declares from its own node instead.
-    fn declares_its_section(&self, heading: Node<'_>) -> bool {
+    fn declares_its_section(&self, heading: Visited<'_, '_>) -> bool {
         heading
             .parent()
-            .and_then(|parent| self.declaring_heading(parent))
-            .is_some_and(|declaring| declaring.id() == heading.id())
+            .and_then(|parent| self.declaring_heading(parent.node()))
+            .is_some_and(|declaring| declaring.id() == heading.node().id())
     }
 
     /// The heading's name: its content text trimmed of structural markers
@@ -219,11 +219,15 @@ impl MarkdownRules {
 
     /// The declaration of a loose setext heading, spanning only its own
     /// lines: the grammar keeps no content under it, so it has no body.
-    fn loose_setext_declaration(&self, heading: Node<'_>, text: &str) -> Option<Declaration> {
+    fn loose_setext_declaration(
+        &self,
+        heading: Visited<'_, '_>,
+        text: &str,
+    ) -> Option<Declaration> {
         if self.declares_its_section(heading) {
             return None;
         }
-        let name = self.heading_name(heading, text)?;
+        let name = self.heading_name(heading.node(), text)?;
         Some(Declaration {
             name,
             kind: HEADING_KIND_WORD,
@@ -237,12 +241,17 @@ impl MarkdownRules {
 }
 
 impl GrammarRules for MarkdownRules {
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         if node.kind_id() == self.kinds.section {
             return self.section_declaration(node, text);
         }
         if node.kind_id() == self.kinds.setext_heading {
-            return Ok(self.loose_setext_declaration(node, text));
+            return Ok(self.loose_setext_declaration(visited, text));
         }
         Ok(None)
     }
@@ -256,8 +265,8 @@ impl GrammarRules for MarkdownRules {
     }
 
     /// A declaration starts at its own node: nothing attaches in front.
-    fn declaration_start(&self, node: Node<'_>, _text: &str) -> usize {
-        node.start_byte()
+    fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
+        visited.node().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {
