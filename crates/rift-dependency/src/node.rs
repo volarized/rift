@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ignore::overrides::{Override, OverrideBuilder};
-use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
+use rift_protocol::dependencies::{
+    PackageAvailability, PackageContextEntry, PackageSelector, REQUIREMENT_ANY,
+};
 use rift_protocol::read::PackageIdentity;
 use serde::Deserialize;
 
@@ -64,9 +66,6 @@ const WORKSPACE_VERSION_PREFIX: &str = "workspace:";
 /// The version prefix naming a range the package manager's workspace file catalogs,
 /// `pnpm-workspace.yaml` or the root `package.json`, which the pass does not read.
 const CATALOG_VERSION_PREFIX: &str = "catalog:";
-/// The requirement a `catalog:` version goes out as: every stable release admits it, so
-/// the global index answers from its newest collected release.
-const CATALOG_REQUIREMENT: &str = ">=0";
 /// The version prefixes naming a git repository.
 const GIT_VERSION_PREFIXES: [&str; 3] = ["git:", "git+", "github:"];
 /// The file name endings of a packed package. The local index reads no archive, so one
@@ -164,7 +163,7 @@ pub(crate) fn path_availability(
 /// range, tag, or locator is a requirement. A `catalog:` range is the requirement `>=0`.
 pub(crate) fn npm_selector(version: &str) -> PackageSelector {
     if version.starts_with(CATALOG_VERSION_PREFIX) {
-        return PackageSelector::Requirement(CATALOG_REQUIREMENT.to_owned());
+        return PackageSelector::Requirement(REQUIREMENT_ANY.to_owned());
     }
     if is_whole_version(version) {
         PackageSelector::Version(version.to_owned())

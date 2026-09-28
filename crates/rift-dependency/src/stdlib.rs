@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 
 use rift_core::line::{lines_inclusive, without_ending};
-use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
+use rift_protocol::dependencies::{
+    PackageAvailability, PackageContextEntry, PackageSelector, REQUIREMENT_ANY,
+};
 use rift_protocol::read::ProjectPath;
 
 use rift_protocol::read::PackageIdentity;
@@ -24,8 +26,6 @@ use crate::resolver::{
 
 /// The manager every standard library entry names, as local reads minted it.
 pub const STANDARD_LIBRARY_MANAGER: &str = "stdlib";
-/// The requirement every stable release admits under all three version rules.
-const REQUIREMENT_ANY: &str = ">=0";
 /// Bytes one pin file may hold before the pass leaves it unread.
 const PIN_FILE_BYTES_MAX: u64 = 64 << 10;
 /// Bytes one `package.json` or `pyproject.toml` may hold before the pass leaves it unread.
