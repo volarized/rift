@@ -670,8 +670,8 @@ fn validate_traversal_seed(
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
 /// to address, and `query` selects a result set of its own. A `scope` past `local`
-/// follows the rule every revision-addressed read applies, since the package branch
-/// serves the current tree alone. A `traversal` is refused beside a comparison by
+/// follows the rule every revision-addressed read applies, since package facts are
+/// served for the current tree alone. A `traversal` is refused beside a comparison by
 /// [`validate_traversal_seed`], since no lane resolves references for a committed
 /// revision.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {

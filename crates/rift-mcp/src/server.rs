@@ -956,8 +956,8 @@ struct SearchRanking {
 }
 
 impl SearchRanking {
-    /// No store ranking, for the reason `detail` states. The identifier ranking answers,
-    /// and so does any selected package index, under the shares `weights` carries.
+    /// No store ranking, for the reason `detail` states. The identifier ranking answers
+    /// alone, under the shares `weights` carries.
     fn unavailable(detail: &str, weights: RankingWeights) -> Self {
         Self {
             answer: StoreAnswer::without_store(weights),
@@ -2039,9 +2039,8 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
-        // A global scope never consults the project store, and a selected package index
-        // answers the full-text input from its own documents, so the shares stay what the
-        // operator configured.
+        // A global scope never consults the project store: the project answers no hit,
+        // and the package hits come from the global index.
         if params.scope == SearchScope::Global {
             return Ok(Some(SearchRanking::without_store(self.ranking_weights)));
         }
@@ -6415,8 +6414,8 @@ mod tests {
             warnings[0]["detail"],
             json!("the database could not be opened")
         );
-        // A selected package index still answers the full-text input, so an absent
-        // project store must not take that share away from it.
+        // The shares stay what `[search.ranking]` states: fusion normalizes them over
+        // the inputs that answered, so an absent store takes nothing from the rest.
         assert!(
             ranking
                 .answer

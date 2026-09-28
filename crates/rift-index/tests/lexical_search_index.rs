@@ -578,7 +578,7 @@ async fn test_lexical_search_index_replace_all_refuses_a_document_addressed_by_a
         .await?;
 
     // This store holds project documents. A document addressed by a source unit belongs
-    // to a package index, and filing its unit URI in the path column would make the
+    // to the global index, and filing its unit URI in the path column would make the
     // stored row unreadable as a project path.
     let unit = SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")?;
     let fields = DocumentFields::empty().with(SearchableField::Name, "helper");

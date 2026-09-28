@@ -1074,8 +1074,8 @@ mod tests {
         Ok(())
     }
 
-    /// The dependency index serves the current tree alone, so a scope past
-    /// `project` refuses beside a comparison of two committed revisions.
+    /// Package facts are served for the current tree alone, so a scope past
+    /// `local` refuses beside a comparison of two committed revisions.
     #[test]
     fn change_beside_a_scope_past_local_refuses_as_an_invalid_request() -> TestResult {
         let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;

@@ -3412,8 +3412,8 @@ pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexEr
 
 /// The class one declaration's names reach against a lowercase query.
 ///
-/// The classing itself lives in `rift-ranking`, so a package index and this
-/// index order a declaration the same way.
+/// The classing itself lives in `rift-ranking`, so the global API client checks a
+/// package hit's class under the same rule this index orders by.
 fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClass> {
     match_class(
         query,
@@ -3475,11 +3475,8 @@ fn symbol_document(
     )
 }
 
-/// The searchable fields one declaration fills, wherever it was read from.
-///
-/// A package index publishes the same fields for its own declarations; only the identity
-/// and the address differ. Sharing the derivation is what makes the two comparable:
-/// equal bytes produce equal fields and one digest, whichever index published them.
+/// The searchable fields one declaration fills: equal bytes produce equal fields and one
+/// digest.
 #[must_use]
 pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> DocumentFields {
     let source = declaration_source(file, symbol.range);
@@ -3558,8 +3555,7 @@ fn bounded_field(value: &str, bytes_max: usize) -> String {
 /// Percent-encoding can widen a path or a qualified name past the wire's own address
 /// ceiling, so this is reachable from a legal workspace rather than a programmer error.
 /// The file keeps answering `get_symbol` and identifier search; only its place in the
-/// searchable corpus is absent, and the log says which path lost it. A package index
-/// leaves an oversized document out the same way.
+/// searchable corpus is absent, and the log says which path lost it.
 pub(crate) fn document(
     identity: String,
     path: &ProjectPath,

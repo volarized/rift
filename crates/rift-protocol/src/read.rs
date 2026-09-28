@@ -2602,7 +2602,7 @@ mod tests {
         for removed in ["global_index_unavailable", "package_skipped"] {
             assert!(
                 !codes.contains(&json!({ "const": removed, "type": "string" })),
-                "no local package index emits {removed}: {codes:?}"
+                "the global route emits no {removed}: {codes:?}"
             );
         }
     }

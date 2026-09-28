@@ -169,9 +169,9 @@ async fn retired_binding_table_fails_reads_typed() -> TestResult {
     Ok(())
 }
 
-/// The package bounds of the removed local package analysis are no keys of the
-/// `[dependencies]` table any more: a `rift.toml` that still sets one is refused like any
-/// unknown key, and reads fail typed until the operator removes it.
+/// `package_size`, `index_size`, and `package_files` are no keys of the `[dependencies]`
+/// table: a `rift.toml` that sets one is refused like any unknown key, and reads fail
+/// typed until the operator removes it.
 #[tokio::test]
 async fn removed_dependencies_bound_keys_fail_reads_as_unknown_keys() -> TestResult {
     for key in [

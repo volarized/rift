@@ -19,8 +19,8 @@
 //! the share the missing input would have carried.
 //!
 //! Nothing here holds a project path or resolves a symbol. The read path
-//! resolves identities after ranking, which is what lets a package index rank
-//! `SourceUnitId` values through this same code.
+//! resolves identities after ranking, which is what lets the global route order
+//! package hits beside project hits through this same code.
 
 use std::collections::BTreeMap;
 

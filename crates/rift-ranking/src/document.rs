@@ -1,9 +1,10 @@
 //! One searchable document, the fields it may carry, and the corpus revision
 //! that states what those fields mean.
 //!
-//! Project search, local package search, and a later global reader publish the
-//! same shape. A provider that starts emitting signatures fills a field that
-//! was already declared here; it does not introduce a second document type.
+//! Project search publishes this shape, and a package document takes the same
+//! one, addressed by its source unit. A provider that starts emitting signatures
+//! fills a field that was already declared here; it does not introduce a second
+//! document type.
 //!
 //! Absent facts stay absent. Nothing substitutes declaration source into the
 //! signature or documentation field, because a reader that weighs those fields
@@ -366,14 +367,14 @@ impl std::fmt::Display for DocumentIdentity {
 /// Where the document's bytes live.
 ///
 /// A project document is addressed by its project-relative path; a package
-/// document is addressed by the source unit the dependency lane minted for it.
+/// document is addressed by the source unit package analysis minted for it.
 /// Neither spelling reaches the ranked text: a host-absolute root must not
 /// change a rank.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocumentLocation {
     /// A path inside the served project.
     Project(ProjectPath),
-    /// One file of a cataloged package.
+    /// One file of a package.
     Unit(SourceUnitId),
 }
 

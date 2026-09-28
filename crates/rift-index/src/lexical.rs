@@ -521,7 +521,7 @@ pub enum LexicalIndexViolation {
     /// A stored row's kind failed to parse as a known [`DocumentKind`].
     StoredKindInvalid,
     /// A write carried a document addressed by a source unit. This store
-    /// holds project documents; a package document belongs to a package
+    /// holds project documents; a package document belongs to the global
     /// index.
     DocumentLocationUnsupported,
     /// A `replace_all` batch repeated one identity across documents.
