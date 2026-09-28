@@ -354,8 +354,9 @@ When `HEAD` moves, the task analyzes only the commits the store lacks and delete
 outside every worktree's newest `max_revisions` commits.
 
 No request waits for the task. A symbol timeline and a
-[commit search](/docs/mcp#search-commits) answer from what the store holds, and a timeline whose
-served revision the store has not analyzed yet answers `complete: false`.
+[commit search](/docs/mcp#search-commits) answer from what the store holds: a timeline whose
+served revision the store has not analyzed yet answers `complete: false`, and a commit search
+answered before the fill lands carries a `history_store_filling` warning naming how far it has got.
 
 The task follows a declaration across files as it analyzes each commit. A deletion and an
 addition carrying one blob id are a rename, and a declaration an added file holds with the exact

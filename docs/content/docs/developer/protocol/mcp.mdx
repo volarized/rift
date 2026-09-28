@@ -780,8 +780,23 @@ term before the ones carrying some, each group newest first by committer time, w
 names.
 
 Under `[providers.history] strategy = "selective"` the store holds the selected releases alone, so
-a commit search answers those. While the store fills, a commit it has not analyzed yet answers
-nothing.
+a commit search answers those.
+
+While the store fills, a commit it has not analyzed yet answers nothing, and the answer carries a
+`history_store_filling` entry in `warnings`: `analyzed` counts the commits the store holds of the
+`total` its latest fill selects. The same warning appears when the store has not yet analyzed the
+commit `HEAD` names, such as right after a new commit, and the read asks the fill to catch up:
+
+**Warning:**
+
+```json
+{
+  "code": "history_store_filling",
+  "analyzed": 40,
+  "total": 100,
+  "detail": "the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest"
+}
+```
 
 Each hit carries a [`CommitHit`](/docs/developer/protocol/reference) as `commit`: the commit's
 `revision`, its `message`, its `author`, the committer `timestamp`, and the `paths` it changed
@@ -1127,6 +1142,9 @@ The search ranking tiers carry their own warnings:
   tier that searched and found nothing. A read waits for a commit in flight until its
   `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
   budget with everything else the read waits for.
+- `history_store_filling` - a [commit search](#search-commits) answered while the history store
+  lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
+  `total` state how far the fill has got.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.

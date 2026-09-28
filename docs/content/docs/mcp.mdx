@@ -339,8 +339,10 @@ When the agent needs the commit that introduced a change, it can search commit m
 }
 ```
 
-Each hit carries the commit's message, author, time, and the paths it changed. A commit search
-takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
+Each hit carries the commit's message, author, time, and the paths it changed. While the local
+server is still filling its history store, the answer carries a `history_store_filling` warning
+naming how many of the selected commits the store holds, and a later search answers the rest.
+A commit search takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
 for ordering, bounds, and refusals.
 
 </Accordion>
