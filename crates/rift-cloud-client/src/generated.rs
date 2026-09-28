@@ -21,6 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+static REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$").expect("invalid regex"));
 /// One package as its package manager identifies it.
 #[derive(
     Debug,
@@ -60,10 +62,12 @@ pub type SymbolId = String;
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct Symbol {
-    /// The symbol this one belongs to - the class that owns a method, the module that owns
-    /// a function. Ownership is not lexical: a Go method sits beside its type and a Rust
-    /// method inside an `impl` block, both naming the type here; absent at the top level.
-    pub container: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub container: Option<String>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model; absent when `false`.
     #[default(Some(false))]
@@ -80,10 +84,12 @@ pub struct Symbol {
     /// kinds `trait` and `interface` can both carry the `type` facet.
     #[default(Some(Default::default()))]
     pub facets: Option<Vec<SymbolFacet>>,
-    /// Unique identifier of this Symbol across the whole workspace. Absent for an
-    /// unestablished symbol: no accepted evidence, or more than one, established its
-    /// identity.
-    pub id: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub id: Option<String>,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
@@ -120,11 +126,11 @@ pub struct Symbol {
 /// package.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct SymbolOrigin {
-    /// Which of the four places the declaration belongs. Absent exactly when
-    /// `source_kind` is `synthetic`.
+    /// Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package
+    /// ownership is the separate `package` field: a `project` declaration can carry one too,
+    /// and `dependency` always does.
     pub location: Option<SourceLocationKind>,
-    /// The package that owns the declaration: present for `dependency`, and optionally
-    /// for `project`. Absent for `stdlib`, `external`, and a synthetic declaration.
+    /// One package as its package manager identifies it.
     pub package: Option<PackageIdentity>,
     /// How source or a declaration came to exist.
     pub source_kind: SourceKind,
@@ -475,8 +481,9 @@ pub struct Signature {
     /// Declared parameters, in source order. Absent when empty.
     #[default(Some(Default::default()))]
     pub parameters: Option<Vec<Parameter>>,
-    /// The implicit first parameter - `self`, `this`. Absent for a free function, and for
-    /// languages that have no such thing.
+    /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
+    /// may pass it. A receiver is one of these too, held in its own field because it has no
+    /// position in the parameter list.
     pub receiver: Option<Parameter>,
     /// What the call yields, absent when empty. An array because a language may return
     /// several values, and because a declared and an inferred return are separate
@@ -506,8 +513,11 @@ pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
     /// a positional parameter in a function type.
     pub name: Option<String>,
-    /// Where this parameter is written in the source.
-    pub node: Option<NodeId>,
+    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
+    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
+    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
+    /// revision the response names.
+    pub node: Option<String>,
     /// Whether a call may leave it out.
     pub optional: bool,
     /// What it accepts, absent when empty. An array because a declared type and an
@@ -679,9 +689,12 @@ pub struct TypeExpression {
     pub extensions: Option<serde_json::Value>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: String,
-    /// The symbol that declares this type, where one does. Absent for a structural type,
-    /// which has a spelling and nothing to open.
-    pub resolved: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub resolved: Option<String>,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     pub source: String,
 }
@@ -1094,8 +1107,12 @@ pub struct PackageSymbolRequest {
     /// Declaration name to look up.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub name: String,
-    /// Optional language filter.
-    pub language: Option<Language>,
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(
+        length(max = 129u64),
+        regex(path = "REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE")
+    )]
+    pub language: Option<String>,
     /// Optional fields to include.
     #[validate(length(max = 2u64))]
     pub include: Option<Vec<PackageSymbolRequestInclude>>,
@@ -1129,7 +1146,7 @@ pub struct PackageSymbol {
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
-    /// Exact documentation references, when requested.
+    /// Bounded documentation context requested for one exact declaration.
     pub documentation: Option<DocumentationContext>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
@@ -1351,8 +1368,12 @@ pub struct DocumentationBlock {
     pub range: TextRange,
     /// One content owner: a regular source or decoded notebook cell.
     pub source: DocumentationContentIdentity,
-    /// Owning declaration for an attached comment.
-    pub symbol: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub symbol: Option<String>,
 }
 /// The content a documentation block addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
@@ -1401,7 +1422,7 @@ pub struct DocumentationChunk {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationContentIdentity {
-    /// Decoded cell when the parent source is a notebook.
+    /// A selected cell addressed within its parent notebook.
     pub cell: Option<NotebookCell>,
     /// The selected source's canonical address.
     pub source: DocumentationSourceIdentity,
@@ -1609,9 +1630,9 @@ pub struct DocumentationSource {
     pub format: DocumentationSourceFormat,
     /// One content owner: a regular source or decoded notebook cell.
     pub identity: DocumentationContentIdentity,
-    /// Declared source language, when known.
-    pub language: Option<Language>,
-    /// License facts recorded by the source adapter.
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    pub language: Option<String>,
+    /// License metadata supplied by the source adapter.
     pub license: Option<DocumentationLicense>,
     /// Media type supplied by the source adapter.
     pub media_type: String,

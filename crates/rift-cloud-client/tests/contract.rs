@@ -197,6 +197,22 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     Ok(())
 }
 
+/// An optional property accepting `null` fails validation, in a shared schema and in one the
+/// contract alone defines: the service omits an absent field.
+#[test]
+fn an_optional_property_accepting_null_fails_validation() -> TestResult {
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageSearchPage"]["properties"]["next_cursor"]["type"] =
+        json!(["string", "null"]);
+    assert_invalid(&document, "schema `PackageSearchPage` accepts `null`")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["Symbol"]["properties"]["visibility"]["type"] =
+        json!(["string", "null"]);
+    assert_invalid(&document, "schema `Symbol` accepts `null`")?;
+    Ok(())
+}
+
 #[test]
 fn every_contract_example_validates_against_its_schema() -> TestResult {
     let document = contract()?;

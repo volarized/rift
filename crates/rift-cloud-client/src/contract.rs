@@ -204,6 +204,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_security(&spec).map_err(&invalid)?;
     validate_operations(&spec).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
+    validate_optional_properties_omit_null(&document).map_err(&invalid)?;
     validate_shared_schemas(&document).map_err(&invalid)?;
     Ok(())
 }
@@ -530,6 +531,40 @@ where
     Ok(())
 }
 
+/// The component schemas of `document`.
+fn component_schemas(document: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    document
+        .get("components")
+        .and_then(|components| components.get("schemas"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "components/schemas must be an object".to_owned())
+}
+
+/// Refuses a component schema whose optional property accepts `null`.
+///
+/// The service omits an absent optional field, as the MCP surface does, so an optional
+/// property's `null` arm advertises a value no answer carries. The rule is the one
+/// `rift_protocol::schema::strip_optional_null_arms` applies to the served MCP schemas: a
+/// schema that stripping changes still holds such an arm.
+fn validate_optional_properties_omit_null(document: &Value) -> Result<(), String> {
+    for (name, schema) in component_schemas(document)? {
+        let Some(schema) = schema.as_object() else {
+            continue;
+        };
+        let mut stripped = schema.clone();
+        rift_protocol::schema::strip_optional_null_arms(&mut stripped);
+        if &stripped != schema {
+            return Err(format!(
+                "schema `{name}` accepts `null` on an optional property; the service omits an \
+                 absent field, so the property states its value type alone"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compares each shared schema with its Rust model's, in the form the MCP surface serves:
+/// with the `null` arm stripped from every optional property.
 fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let mut settings = SchemaSettings::draft2020_12();
     settings.definitions_path = "/components/schemas".into();
@@ -545,13 +580,12 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.
-    let components = document
-        .get("components")
-        .and_then(|components| components.get("schemas"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| "components/schemas must be an object".to_owned())?;
+    let components = component_schemas(document)?;
     for (name, mut expected) in generator.take_definitions(true) {
         normalize_shared_string_enum(&mut expected);
+        if let Some(schema) = expected.as_object_mut() {
+            rift_protocol::schema::strip_optional_null_arms(schema);
+        }
         let actual = components
             .get(&name)
             .ok_or_else(|| format!("shared schema `{name}` is missing"))?;

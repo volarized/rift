@@ -979,7 +979,6 @@
                       "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
                       "corpus_revision": "2026-09-22",
-                      "next_cursor": null,
                       "documentation_revision": "0123abcd"
                     }
                   }
@@ -1236,7 +1235,6 @@
                           "source": "pub fn serve(port: u16) -> std::io::Result<()> {"
                         }
                       ],
-                      "next_cursor": null,
                       "warnings": [],
                       "publication_format": "rift-package-index-v2",
                       "analyzer_revision": "2026-09-22",
@@ -1730,14 +1728,7 @@
         "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
         "properties": {
           "container": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SymbolId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
           },
           "document_local": {
@@ -1767,14 +1758,7 @@
             "type": "array"
           },
           "id": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SymbolId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/SymbolId",
             "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
           },
           "kind": {
@@ -1824,10 +1808,7 @@
           },
           "visibility": {
             "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           }
         },
         "required": [
@@ -1841,25 +1822,11 @@
         "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
         "properties": {
           "location": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SourceLocationKind"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/SourceLocationKind",
             "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
           },
           "package": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/PackageIdentity"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/PackageIdentity",
             "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
           },
           "source_kind": {
@@ -2085,14 +2052,7 @@
             "type": "array"
           },
           "receiver": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Parameter"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/Parameter",
             "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
           },
           "returns": {
@@ -2131,10 +2091,7 @@
         "properties": {
           "default": {
             "description": "The default value as written in the source. Absent where there is none.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "extensions": {
             "$ref": "#/components/schemas/Extensions",
@@ -2143,20 +2100,10 @@
           },
           "name": {
             "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "node": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/NodeId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/NodeId",
             "description": "Where this parameter is written in the source."
           },
           "optional": {
@@ -2274,14 +2221,7 @@
             "description": "The language the spelling is in, and so which provider produced it."
           },
           "resolved": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SymbolId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
           },
           "source": {
@@ -2374,18 +2314,12 @@
           "requirement": {
             "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
             "maxLength": 4096,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "version": {
             "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
             "maxLength": 4096,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           }
         },
         "required": [
@@ -2642,17 +2576,10 @@
             "$ref": "#/components/schemas/CapabilityBounds"
           },
           "documentation_revision": {
-            "anyOf": [
-              {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 8,
-                "pattern": "^[0-9a-f]{8}$"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 8,
+            "pattern": "^[0-9a-f]{8}$",
             "description": "Documentation revision used for documentation reads."
           }
         },
@@ -2892,10 +2819,7 @@
           },
           "source": {
             "description": "Optional declaration source excerpt.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 1048576
           }
         },
@@ -2924,10 +2848,7 @@
           },
           "next_cursor": {
             "description": "Opaque cursor for the next page.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 4096
           },
           "warnings": {
@@ -2954,17 +2875,10 @@
             "maxLength": 128
           },
           "documentation_revision": {
-            "anyOf": [
-              {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 8,
-                "pattern": "^[0-9a-f]{8}$"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 8,
+            "pattern": "^[0-9a-f]{8}$",
             "description": "Documentation revision used for this page."
           }
         },
@@ -2988,14 +2902,7 @@
             "maxLength": 4096
           },
           "language": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Language"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/Language",
             "description": "Optional language filter."
           },
           "include": {
@@ -3052,21 +2959,11 @@
           },
           "source": {
             "description": "Optional declaration source excerpt.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 1048576
           },
           "documentation": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/DocumentationContext"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/DocumentationContext",
             "description": "Exact documentation references, when requested."
           }
         },
@@ -3094,10 +2991,7 @@
           },
           "next_cursor": {
             "description": "Opaque cursor for the next page.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 4096
           },
           "warnings": {
@@ -3124,17 +3018,10 @@
             "maxLength": 128
           },
           "documentation_revision": {
-            "anyOf": [
-              {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 8,
-                "pattern": "^[0-9a-f]{8}$"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 8,
+            "pattern": "^[0-9a-f]{8}$",
             "description": "Documentation revision used for this page."
           }
         },
@@ -3231,10 +3118,7 @@
           },
           "source": {
             "description": "The line where the match begins, without its line ending, when the request includes `source`.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 1048576
           }
         },
@@ -3260,10 +3144,7 @@
           },
           "next_cursor": {
             "description": "Opaque cursor for the next page.",
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "maxLength": 4096
           },
           "warnings": {
@@ -3421,10 +3302,7 @@
             "maxLength": 4096
           },
           "instance": {
-            "type": [
-              "string",
-              "null"
-            ],
+            "type": "string",
             "format": "uri",
             "maxLength": 2048
           }
@@ -3507,10 +3385,7 @@
           },
           "language": {
             "description": "Authored code language, when supplied by the format.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "line": {
             "description": "One-based line where the block starts.",
@@ -3527,14 +3402,7 @@
             "description": "Source record containing revision, format, origin, and license facts."
           },
           "symbol": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/SymbolId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/SymbolId",
             "description": "Owning declaration for an attached comment."
           }
         },
@@ -3584,14 +3452,7 @@
         "description": "One content owner: a regular source or decoded notebook cell.",
         "properties": {
           "cell": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/NotebookCell"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/NotebookCell",
             "description": "Decoded cell when the parent source is a notebook."
           },
           "source": {
@@ -3691,10 +3552,7 @@
         "properties": {
           "expression": {
             "description": "Declared expression; collection does not infer a license from source text.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "files": {
             "description": "License files whose bytes the adapter verified.",
@@ -3791,10 +3649,7 @@
           "excerpt": {
             "description": "Bytes read from the existing content owner within the response bound.",
             "maxLength": 16384,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "reference": {
             "$ref": "#/components/schemas/DocumentationReference",
@@ -3846,25 +3701,11 @@
             "description": "Canonical address of the bytes block ranges use."
           },
           "language": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Language"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/Language",
             "description": "Declared source language, when known."
           },
           "license": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/DocumentationLicense"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/components/schemas/DocumentationLicense",
             "description": "License facts recorded by the source adapter."
           },
           "media_type": {
