@@ -4,7 +4,9 @@
 //! `rift-cloud-client` reads, and records every request it receives. Its collection holds
 //! one package, [`COLLECTED`], whose `src/lib.rs` declares [`DECLARATIONS`]; a symbol
 //! request answers the declaration it names and a search request the declarations its
-//! identifiers match, so each answer passes the client's own match class validation.
+//! identifiers match, so each answer passes the client's own match class validation. The
+//! collected release also answers, as the nearest release, an exact `demo` entry at another
+//! version and every `demo` requirement.
 
 use std::{sync::Arc, time::Duration};
 
@@ -30,6 +32,10 @@ const COLLECTED_SOURCE: &str = "pub fn helper_beacon() {}\npub fn beacon() {}\n"
 
 /// The declarations [`COLLECTED_SOURCE`] carries, in source order.
 pub(crate) const DECLARATIONS: [&str; 2] = ["helper_beacon", "beacon"];
+
+/// The one `demo` requirement the collected release lies outside: the resolution answers
+/// it with that release and a `requirement_unsatisfied` warning.
+pub(crate) const UNSATISFIED_REQUIREMENT: &str = ">=2";
 
 /// Largest request body the fixture reads.
 const REQUEST_BODY_BYTES_MAX: usize = 4_194_304;
@@ -209,38 +215,55 @@ fn capabilities() -> Value {
     })
 }
 
-/// The resolution of `requested`: the collected release is available, every other exact
-/// entry is missing, a requirement naming the collected package resolves to its one
-/// release, and every other requirement is missing, so each entry the request carries,
+fn collected_package() -> Value {
+    json!({"manager": COLLECTED.0, "name": COLLECTED.1, "version": COLLECTED.2})
+}
+
+/// The resolution of `requested`. The collected release answers an exact `demo` entry at
+/// its own version as available, and one at another version, or a `demo` requirement, as
+/// the nearest release, warning `requirement_unsatisfied` for [`UNSATISFIED_REQUIREMENT`].
+/// Every other exact entry and requirement is missing, so each entry the request carries,
 /// the standard library entries included, is accounted for once.
 fn resolution(requested: &Value) -> Value {
     let (mut available, mut resolved, mut missing_exact, mut missing_requirements) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let collected = json!({"manager": COLLECTED.0, "name": COLLECTED.1, "version": COLLECTED.2});
+    let mut warnings = Vec::new();
     for entry in requested["entries"].as_array().into_iter().flatten() {
-        let identity = (
-            entry["manager"].as_str().unwrap_or_default(),
-            entry["name"].as_str().unwrap_or_default(),
-            entry["version"].as_str().unwrap_or_default(),
-        );
-        let names_collected = (identity.0, identity.1) == (COLLECTED.0, COLLECTED.1);
-        match (&entry["version"], &entry["requirement"]) {
-            (Value::String(_), _) if identity == COLLECTED => available.push(collected.clone()),
-            (Value::String(_), _) => missing_exact.push(json!({
-                "manager": identity.0, "name": identity.1, "version": identity.2
+        let manager = entry["manager"].as_str().unwrap_or_default();
+        let name = entry["name"].as_str().unwrap_or_default();
+        let collected = (manager, name) == (COLLECTED.0, COLLECTED.1);
+        match (&entry["version"], collected) {
+            (Value::String(version), true) if version == COLLECTED.2 => {
+                available.push(collected_package());
+            }
+            (Value::String(version), false) => missing_exact.push(json!({
+                "manager": manager, "name": name, "version": version
             })),
-            _ if names_collected => resolved.push(json!({
-                "entry": entry, "package": collected
-            })),
-            _ => missing_requirements.push(entry.clone()),
+            (_, false) => missing_requirements.push(entry.clone()),
+            (_, true) => {
+                resolved.push(json!({"entry": entry, "package": collected_package()}));
+                if entry["requirement"] == UNSATISFIED_REQUIREMENT {
+                    warnings.push(json!({
+                        "code": "requirement_unsatisfied",
+                        "detail": format!(
+                            "{manager}/{name} {UNSATISFIED_REQUIREMENT} answered by {}",
+                            COLLECTED.2
+                        )
+                    }));
+                }
+            }
         }
     }
-    json!({
+    let mut body = json!({
         "available_exact": available,
         "resolved_requirements": resolved,
         "missing_exact": missing_exact,
         "missing_requirements": missing_requirements
-    })
+    });
+    if !warnings.is_empty() {
+        body["warnings"] = json!(warnings);
+    }
+    body
 }
 
 /// One page of `items` and `warnings`, with the revision fields every page carries.

@@ -12,7 +12,7 @@ mod workspace_client;
 
 use std::{fs, time::Duration};
 
-use global_api::{COLLECTED_UNIT, GlobalFixture, Hold, SymbolFixture};
+use global_api::{COLLECTED_UNIT, GlobalFixture, Hold, SymbolFixture, UNSATISFIED_REQUIREMENT};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -340,6 +340,82 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     drop(directory);
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// The collected `demo` release answers an entry the collection holds no release for, and
+/// the answer names the substitution: an exact version the collection lacks, and a
+/// requirement the collected release lies outside. The package hits still answer.
+#[tokio::test]
+async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
+    let cases = [
+        (
+            "version = \"1.0.3\"".to_owned(),
+            json!({"manager":"cargo","name":"demo","version":"1.0.3","availability":"canonical"}),
+        ),
+        (
+            format!("requirement = \"{UNSATISFIED_REQUIREMENT}\""),
+            json!({
+                "manager":"cargo",
+                "name":"demo",
+                "requirement":UNSATISFIED_REQUIREMENT,
+                "availability":"canonical"
+            }),
+        ),
+    ];
+    for (selector, entry) in cases {
+        let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+        let configuration = format!(
+            "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+             request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
+             [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\n{selector}\n",
+            fixture.endpoint
+        );
+        let (directory, client, server_task) = served_workspace(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                (
+                    "Cargo.lock",
+                    "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub fn local_beacon() {}\n"),
+            ],
+            Some(configuration),
+        )
+        .await?;
+        let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+        assert_eq!(
+            answer["hits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|hit| &hit["unit"])
+                .collect::<Vec<_>>(),
+            [&json!(COLLECTED_UNIT)],
+            "{answer:#}"
+        );
+        let substituted: Vec<&Value> = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["code"] == "package_substituted")
+            .collect();
+        assert_eq!(
+            substituted,
+            [&json!({
+                "code": "package_substituted",
+                "entry": entry,
+                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+            })],
+            "{answer:#}"
+        );
+        drop(directory);
+        client.cancel().await?;
+        server_task.await?;
+    }
     Ok(())
 }
 
@@ -713,9 +789,21 @@ fn demo_entries(entries: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// The versions of the `package_substituted` entries `answer` warns about.
+fn substituted_versions(answer: &Value) -> Vec<&Value> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "package_substituted")
+        .map(|warning| &warning["entry"]["version"])
+        .collect()
+}
+
 /// A `packages` entry naming a package the context holds replaces its version for that
-/// read alone: the context pins `demo` at a release the collection lacks, and the lookup
-/// naming the collected release sends that version in its place and answers from it.
+/// read alone: the context pins `demo` at a release the collection lacks, which answers
+/// from the nearest release with `package_substituted`, and the lookup naming the
+/// collected release sends that version in its place and answers from it exactly.
 #[tokio::test]
 async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
@@ -728,13 +816,9 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
     let pinned = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
-    assert_eq!(pinned["hits"], json!([]), "{pinned:#}");
-    assert!(
-        pinned["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "package_absent" && warning["package"]["version"] == "0.9.0"
-            })
-        }),
+    assert_eq!(
+        substituted_versions(&pinned),
+        [&json!("0.9.0")],
         "{pinned:#}"
     );
 
@@ -755,8 +839,8 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         .collect();
     assert_eq!(units, [&json!(COLLECTED_UNIT)], "{replaced:#}");
     assert!(
-        !replaced.to_string().contains("package_absent"),
-        "the replaced release is not asked for: {replaced:#}"
+        substituted_versions(&replaced).is_empty(),
+        "the requested release answers exactly: {replaced:#}"
     );
 
     let resolutions = resolution_entries(&fixture).await;
@@ -779,8 +863,8 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
 
     let again = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
     assert_eq!(
-        again["hits"],
-        json!([]),
+        substituted_versions(&again),
+        [&json!("0.9.0")],
         "the next read resolves the workspace's own version: {again:#}"
     );
     drop(directory);

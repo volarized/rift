@@ -49,7 +49,8 @@ struct ClientSlot {
 }
 
 /// What the global API resolved for one read: the packages it serves, the context
-/// entries it holds no release for, and the service state the read met.
+/// entries it holds no release for, the entries a release other than the requested one
+/// answers, and the service state the read met.
 ///
 /// A read whose route answers no client carries project hits alone, with the typed
 /// global warning naming why.
@@ -59,8 +60,18 @@ pub(crate) struct GlobalRoute {
     context: Arc<DependencyContext>,
     pub(crate) missing_exact: Vec<PackageIdentity>,
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
+    substituted: Vec<SubstitutedEntry>,
     pub(crate) state: RouteState,
     observation: Arc<StdMutex<Option<ServiceState>>>,
+}
+
+/// One context entry the global index answers from a collected release other than the one
+/// the entry names: an exact version it holds no release of, or a requirement no collected
+/// release satisfies.
+#[derive(Clone, Debug, PartialEq)]
+struct SubstitutedEntry {
+    entry: PackageContextEntry,
+    package: PackageIdentity,
 }
 
 /// The global service state one read met.
@@ -730,6 +741,7 @@ impl GlobalRoute {
         self.remote_packages.clear();
         self.missing_exact.clear();
         self.missing_requirements.clear();
+        self.substituted.clear();
         self.state = failure_state(error);
         self.record_observation();
     }
@@ -738,8 +750,9 @@ impl GlobalRoute {
     /// warning when the global API did not answer, then at most `DEPENDENCY_WARNINGS_MAX`
     /// package and dependency-context warnings together. Those name each degraded
     /// resolver in resolver order, each context entry no public registry serves with the
-    /// missing capability its kind names, and each entry the global publication holds no
-    /// release for, in that order.
+    /// missing capability its kind names, each entry the global publication holds no
+    /// release for, and each entry a release other than the requested one answers, in that
+    /// order.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let degraded = self.context.degradations().iter().map(|degradation| {
             ReadWarning::PackageContextDegraded {
@@ -765,12 +778,21 @@ impl GlobalRoute {
                     .cloned()
                     .map(|entry| ReadWarning::PackageRequirementAbsent { entry }),
             );
+        let substituted =
+            self.substituted
+                .iter()
+                .cloned()
+                .map(|substituted| ReadWarning::PackageSubstituted {
+                    entry: substituted.entry,
+                    package: substituted.package,
+                });
         self.state_warning()
             .into_iter()
             .chain(
                 degraded
                     .chain(unavailable)
                     .chain(absent)
+                    .chain(substituted)
                     .take(DEPENDENCY_WARNINGS_MAX),
             )
             .collect()
@@ -807,6 +829,7 @@ impl GlobalRoute {
             context: Arc::clone(context),
             missing_exact: Vec::new(),
             missing_requirements: Vec::new(),
+            substituted: Vec::new(),
             state,
             observation,
         }
@@ -903,9 +926,8 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     }
 }
 
-/// One missing requirement the resolution named, as a context entry. The client sends
-/// canonical entries alone and refuses a missing requirement that is not one, so the
-/// entry is canonical.
+/// One entry the resolution named, as a context entry. The client sends canonical entries
+/// alone and refuses an answered entry it did not send, so the entry is canonical.
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
@@ -922,6 +944,14 @@ fn resolved_route(
     resolution: rift_cloud_client::PackageResolutionResponse,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 ) -> GlobalRoute {
+    let substituted = resolution
+        .substitutions()
+        .into_iter()
+        .map(|substitution| SubstitutedEntry {
+            entry: protocol_context_entry(substitution.requested),
+            package: protocol_package_identity(substitution.served),
+        })
+        .collect();
     let mut remote_packages = Vec::new();
     for package in resolution.available_exact {
         push_distinct_package(&mut remote_packages, package);
@@ -945,6 +975,7 @@ fn resolved_route(
         context: Arc::clone(context),
         missing_exact,
         missing_requirements,
+        substituted,
         state: RouteState::Available,
         observation,
     }
@@ -1551,6 +1582,100 @@ mod tests {
             Some(reason.as_str()),
             rift_protocol::dependencies::PackageAvailability::Path.unavailable_reason()
         );
+    }
+
+    /// Each substitution the resolution names warns `package_substituted` after the absent
+    /// packages: an exact version answered at another release, and a requirement answered
+    /// outside its range. A requirement answered inside its range warns nothing, and a
+    /// remote lane discarded after the resolution drops the substitutions with it.
+    #[test]
+    fn resolved_substitutions_warn_until_the_remote_lane_is_discarded() {
+        use rift_protocol::dependencies::{
+            PackageAvailability, PackageContextEntry, PackageSelector,
+        };
+        use rift_protocol::read::{PackageIdentity, ReadWarning};
+
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let resolution: rift_cloud_client::PackageResolutionResponse =
+            serde_json::from_value(serde_json::json!({
+                "available_exact": [],
+                "resolved_requirements": [
+                    {
+                        "entry": {"manager": "cargo", "name": "demo", "version": "1.0.3",
+                                  "availability": "canonical"},
+                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.2"}
+                    },
+                    {
+                        "entry": {"manager": "npm", "name": "typescript", "requirement": "~5.7.2",
+                                  "availability": "canonical"},
+                        "package": {"manager": "npm", "name": "typescript", "version": "5.9.3"}
+                    },
+                    {
+                        "entry": {"manager": "npm", "name": "react", "requirement": "^19",
+                                  "availability": "canonical"},
+                        "package": {"manager": "npm", "name": "react", "version": "19.1.0"}
+                    }
+                ],
+                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_requirements": [],
+                "warnings": [{
+                    "code": "requirement_unsatisfied",
+                    "detail": "npm/typescript ~5.7.2 answered by 5.9.3"
+                }]
+            }))
+            .expect("resolution fixture");
+        let mut route = super::resolved_route(
+            &Arc::new(DependencyContext::default()),
+            client,
+            resolution,
+            Arc::new(Mutex::new(None)),
+        );
+
+        assert_eq!(route.remote_packages.len(), 3, "every answering release is read");
+        assert_eq!(
+            warning_codes(&route),
+            ["package_absent", "package_substituted", "package_substituted"]
+        );
+        let package = |manager: &str, name: &str, version: &str| PackageIdentity {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        };
+        let substituted = |entry, served| ReadWarning::PackageSubstituted {
+            entry,
+            package: served,
+        };
+        assert_eq!(
+            route.warnings()[1..],
+            [
+                substituted(
+                    PackageContextEntry::new(
+                        "cargo",
+                        "demo",
+                        PackageSelector::Version("1.0.3".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package("cargo", "demo", "1.0.2"),
+                ),
+                substituted(
+                    PackageContextEntry::new(
+                        "npm",
+                        "typescript",
+                        PackageSelector::Requirement("~5.7.2".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package("npm", "typescript", "5.9.3"),
+                ),
+            ]
+        );
+
+        route.discard_remote(&ClientError::Connection);
+        assert_eq!(warning_codes(&route), ["global_api_unavailable"]);
     }
 
     /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides

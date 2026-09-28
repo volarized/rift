@@ -905,7 +905,7 @@ pub struct ProjectPath(
 
 /// Most package and dependency-context warnings one answer carries together: degraded
 /// resolvers, then entries no public registry serves, then packages absent from the global
-/// publication.
+/// publication, then entries a release other than the requested one answers.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
 
 /// Most characters the `detail` of one global API warning carries: the longest
@@ -1193,6 +1193,17 @@ pub enum ReadWarning {
     PackageRequirementAbsent {
         /// The declared requirement absent from the global publication.
         entry: crate::dependencies::PackageContextEntry,
+    },
+    /// The global publication holds no release at the exact version the dependency context
+    /// names, or none inside the range a declared requirement states, so the collected
+    /// release nearest it answers in its place: the package facts for `entry` come from
+    /// `package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
+    /// ride one answer.
+    PackageSubstituted {
+        /// The dependency context entry, as the workspace's manifests and lockfiles state it.
+        entry: crate::dependencies::PackageContextEntry,
+        /// The collected release that answers for `entry`.
+        package: PackageIdentity,
     },
     /// The dependency context names a package no public registry serves: a path outside
     /// the workspace, a git repository, a private registry, or a URL. No global package
@@ -2556,6 +2567,35 @@ mod tests {
                         "name": "missing-helper",
                         "requirement": "^0.1",
                         "availability": "canonical",
+                    },
+                }),
+            ),
+            (
+                ReadWarning::PackageSubstituted {
+                    entry: PackageContextEntry::new(
+                        "npm",
+                        "typescript",
+                        PackageSelector::Requirement("~5.7.2".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package: PackageIdentity {
+                        manager: "npm".to_owned(),
+                        name: "typescript".to_owned(),
+                        version: "5.9.3".to_owned(),
+                    },
+                },
+                json!({
+                    "code": "package_substituted",
+                    "entry": {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "requirement": "~5.7.2",
+                        "availability": "canonical",
+                    },
+                    "package": {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "version": "5.9.3",
                     },
                 }),
             ),

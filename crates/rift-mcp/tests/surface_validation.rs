@@ -444,6 +444,7 @@ fn assert_dependency_warnings_only(structured: &Value) {
                         | "global_page_warning"
                         | "package_absent"
                         | "package_requirement_absent"
+                        | "package_substituted"
                         | "package_unavailable"
                         | "package_context_degraded"
                 )

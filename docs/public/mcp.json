@@ -1990,6 +1990,30 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
                 "properties": {
                   "code": {
@@ -4432,6 +4456,30 @@
                 "required": [
                   "code",
                   "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
                 ],
                 "type": "object"
               },
@@ -7145,6 +7193,30 @@
                 "required": [
                   "code",
                   "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
                 ],
                 "type": "object"
               },
