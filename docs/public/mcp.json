@@ -1569,6 +1569,35 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A lockfile the request's `paths.include` selects is left out of search, so no hit\nanswers from it; `rift://map` still carries the versions it pins. Naming the file\nin `paths.force_include` searches it for one request, and removing its name from\nthe `[search.text]` key `excluded_lockfiles` indexes it. One warning names every\nsuch file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.",
+                "properties": {
+                  "code": {
+                    "const": "lockfile_excluded",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The selected lockfiles search leaves out.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "files",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
                 "properties": {
                   "code": {
@@ -3861,6 +3890,35 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A lockfile the request's `paths.include` selects is left out of search, so no hit\nanswers from it; `rift://map` still carries the versions it pins. Naming the file\nin `paths.force_include` searches it for one request, and removing its name from\nthe `[search.text]` key `excluded_lockfiles` indexes it. One warning names every\nsuch file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.",
+                "properties": {
+                  "code": {
+                    "const": "lockfile_excluded",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The selected lockfiles search leaves out.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "files",
                   "detail"
                 ],
                 "type": "object"
@@ -6401,6 +6459,35 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A lockfile the request's `paths.include` selects is left out of search, so no hit\nanswers from it; `rift://map` still carries the versions it pins. Naming the file\nin `paths.force_include` searches it for one request, and removing its name from\nthe `[search.text]` key `excluded_lockfiles` indexes it. One warning names every\nsuch file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.",
+                "properties": {
+                  "code": {
+                    "const": "lockfile_excluded",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The selected lockfiles search leaves out.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "files",
                   "detail"
                 ],
                 "type": "object"
