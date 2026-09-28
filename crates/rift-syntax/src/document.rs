@@ -75,9 +75,9 @@ pub struct SyntaxSymbol {
     /// The implementation part: the grammar's body or value field; `None`
     /// for a declaration without one.
     pub body_range: Option<ByteRange>,
-    /// Callable forms this declaration renders as. Empty for a declaration
-    /// the grammar does not mark callable, or one with no attached
-    /// implementation.
+    /// Callable forms this declaration renders as: its header before the
+    /// implementation, or its whole text when it has none. Empty for a
+    /// declaration the grammar does not mark callable.
     pub signatures: Vec<Signature>,
     /// Doc comments the grammar attaches to this declaration, stripped of
     /// comment syntax. Empty when nothing attaches.

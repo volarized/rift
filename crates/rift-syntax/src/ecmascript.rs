@@ -24,8 +24,13 @@
 //!   of the document with every declaration nested under it, and counted.
 //! - A declaration's complete span includes directly attached `JSDoc` comments.
 //!   Decorators remain children of the declared node.
+//! - A `method_signature` or `property_signature` declares a `method` or a
+//!   `property` only inside an interface or class body, qualified by it
+//!   (`Array.map`); the same kinds inside a type literal (`{ size: number }`)
+//!   declare nothing.
 //! - `documentation` remains empty. A `Signature` renders for a callable
-//!   declaration from `body_range` and the `Callable` facet.
+//!   declaration from `body_range` and the `Callable` facet, and a bodyless
+//!   one, an overload or a member signature, renders its own text.
 
 use std::num::NonZeroU16;
 
@@ -71,6 +76,16 @@ const FUNCTION_SIGNATURE_KIND: &str = "function_signature";
 /// Grammar spelling of an `accessibility_modifier` (TypeScript grammars
 /// only).
 const ACCESSIBILITY_MODIFIER_KIND: &str = "accessibility_modifier";
+/// Grammar spelling of a bodyless `method_signature` (TypeScript grammars
+/// only).
+const METHOD_SIGNATURE_KIND: &str = "method_signature";
+/// Grammar spelling of a `property_signature` (TypeScript grammars only).
+const PROPERTY_SIGNATURE_KIND: &str = "property_signature";
+/// Grammar spelling of an interface's `object_type` body (TypeScript
+/// grammars only).
+const INTERFACE_BODY_KIND: &str = "interface_body";
+/// Grammar spelling of a `class_body`.
+const CLASS_BODY_KIND: &str = "class_body";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -80,7 +95,8 @@ pub(crate) enum EcmaScriptSymbolKind {
     Function,
     /// Class.
     Class,
-    /// Method inside a class body.
+    /// Method inside a class body, or a method signature inside an interface
+    /// or class body (TypeScript).
     Method,
     /// Named variable declarator.
     Variable,
@@ -92,6 +108,8 @@ pub(crate) enum EcmaScriptSymbolKind {
     TypeAlias,
     /// Namespace (TypeScript).
     Namespace,
+    /// Property signature inside an interface or class body (TypeScript).
+    Property,
 }
 
 impl EcmaScriptSymbolKind {
@@ -106,6 +124,7 @@ impl EcmaScriptSymbolKind {
             Self::Enum => "enum",
             Self::TypeAlias => "type_alias",
             Self::Namespace => "namespace",
+            Self::Property => "property",
         }
     }
 
@@ -115,7 +134,7 @@ impl EcmaScriptSymbolKind {
             Self::Function | Self::Method => vec![SymbolFacet::Value, SymbolFacet::Callable],
             Self::Class | Self::Interface | Self::Enum => vec![SymbolFacet::Type],
             Self::TypeAlias => vec![SymbolFacet::Type, SymbolFacet::Alias],
-            Self::Variable => vec![SymbolFacet::Value],
+            Self::Variable | Self::Property => vec![SymbolFacet::Value],
             Self::Namespace => vec![SymbolFacet::Namespace],
         }
     }
@@ -131,13 +150,13 @@ impl EcmaScriptSymbolKind {
             | Self::Interface
             | Self::Enum
             | Self::Namespace => EcmaScriptGrammarField::Body,
-            Self::Variable | Self::TypeAlias => EcmaScriptGrammarField::Value,
+            Self::Variable | Self::TypeAlias | Self::Property => EcmaScriptGrammarField::Value,
         }
     }
 
     /// Whether declarations inside this kind's body qualify under its name.
     const fn opens_scope(self) -> bool {
-        matches!(self, Self::Class | Self::Namespace)
+        matches!(self, Self::Class | Self::Namespace | Self::Interface)
     }
 }
 
@@ -166,6 +185,13 @@ pub(crate) struct EcmaScriptKinds {
     /// `Some` on the TypeScript grammars; the JavaScript grammar spells no
     /// accessibility.
     accessibility_modifier: Option<u16>,
+    /// Member signature kinds: declarations only inside an interface or a
+    /// class body, since a type literal spells them too. Empty on the
+    /// JavaScript grammar.
+    member_signatures: Vec<u16>,
+    /// The bodies a member signature declares in: `interface_body` and
+    /// `class_body`. Empty on the JavaScript grammar.
+    member_bodies: Vec<u16>,
     name: NonZeroU16,
     body: NonZeroU16,
     value: NonZeroU16,
@@ -208,6 +234,8 @@ impl EcmaScriptKinds {
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
             accessibility_modifier: None,
+            member_signatures: Vec::new(),
+            member_bodies: Vec::new(),
             name: field_id(language, "name"),
             body: field_id(language, "body"),
             value: field_id(language, "value"),
@@ -246,8 +274,28 @@ impl EcmaScriptKinds {
                 EcmaScriptSymbolKind::Function,
             ),
         ]);
+        let member_signatures = [
+            (METHOD_SIGNATURE_KIND, EcmaScriptSymbolKind::Method),
+            (PROPERTY_SIGNATURE_KIND, EcmaScriptSymbolKind::Property),
+        ]
+        .map(|(kind, symbol)| (kind_id(language, kind), symbol));
+        kinds.declarations.extend(member_signatures);
+        kinds.member_signatures = member_signatures.map(|(kind, _)| kind).to_vec();
+        kinds.member_bodies = vec![
+            kind_id(language, INTERFACE_BODY_KIND),
+            kind_id(language, CLASS_BODY_KIND),
+        ];
         kinds.accessibility_modifier = Some(kind_id(language, ACCESSIBILITY_MODIFIER_KIND));
         kinds
+    }
+
+    /// Whether `node` is a member signature outside an interface or class
+    /// body, such as `{ size: number }` in a type annotation.
+    fn is_type_literal_member(&self, node: Node<'_>) -> bool {
+        self.member_signatures.contains(&node.kind_id())
+            && !node
+                .parent()
+                .is_some_and(|parent| self.member_bodies.contains(&parent.kind_id()))
     }
 
     /// The symbol kind `node` declares; `None` for a kind outside the table.
@@ -366,6 +414,9 @@ impl GrammarRules for EcmaScriptRules {
         let Some(kind) = self.kinds.symbol_kind(node) else {
             return Ok(None);
         };
+        if self.kinds.is_type_literal_member(node) {
+            return Ok(None);
+        }
         let Some(name) = self.declaration_name(node, kind, text) else {
             return Ok(None);
         };
@@ -481,14 +532,16 @@ pub(crate) fn node_facets(kind: &str) -> Vec<NodeFacet> {
         | ENUM_DECLARATION_KIND
         | TYPE_ALIAS_DECLARATION_KIND
         | INTERNAL_MODULE_KIND => vec![NodeFacet::Declaration, NodeFacet::Definition],
-        FUNCTION_SIGNATURE_KIND => vec![NodeFacet::Declaration],
+        FUNCTION_SIGNATURE_KIND | METHOD_SIGNATURE_KIND | PROPERTY_SIGNATURE_KIND => {
+            vec![NodeFacet::Declaration]
+        }
         LEXICAL_DECLARATION_KIND | VARIABLE_DECLARATION_KIND => {
             vec![NodeFacet::Declaration, NodeFacet::Statement]
         }
         EXPORT_STATEMENT_KIND => vec![NodeFacet::Export, NodeFacet::Statement],
         "import_statement" => vec![NodeFacet::Import, NodeFacet::Statement],
         "statement_block" => vec![NodeFacet::Block],
-        "class_body" | "interface_body" | "enum_body" => vec![NodeFacet::Body],
+        CLASS_BODY_KIND | INTERFACE_BODY_KIND | "enum_body" => vec![NodeFacet::Body],
         "required_parameter" | "optional_parameter" => vec![NodeFacet::Parameter],
         "decorator" => vec![NodeFacet::Annotation],
         "comment" | "html_comment" => vec![NodeFacet::Comment],
@@ -533,7 +586,8 @@ mod tests {
             tree_sitter_typescript::LANGUAGE_TSX,
         ] {
             let typescript = EcmaScriptKinds::resolve_typescript(&grammar.into());
-            assert_eq!(typescript.declarations.len(), 10);
+            assert_eq!(typescript.declarations.len(), 12);
+            assert_eq!(typescript.member_signatures.len(), 2);
             assert!(typescript.accessibility_modifier.is_some());
         }
     }
@@ -557,6 +611,7 @@ mod tests {
             (EcmaScriptSymbolKind::Enum, "enum"),
             (EcmaScriptSymbolKind::TypeAlias, "type_alias"),
             (EcmaScriptSymbolKind::Namespace, "namespace"),
+            (EcmaScriptSymbolKind::Property, "property"),
         ];
         for (kind, word) in words {
             assert_eq!(kind.word(), word);
@@ -579,6 +634,8 @@ mod tests {
             TYPE_ALIAS_DECLARATION_KIND,
             INTERNAL_MODULE_KIND,
             FUNCTION_SIGNATURE_KIND,
+            METHOD_SIGNATURE_KIND,
+            PROPERTY_SIGNATURE_KIND,
             LEXICAL_DECLARATION_KIND,
             VARIABLE_DECLARATION_KIND,
         ] {
