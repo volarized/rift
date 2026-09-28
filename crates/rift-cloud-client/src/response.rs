@@ -2,10 +2,11 @@
 
 use crate::{
     Capabilities, ClientError, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackageResolutionResponse,
-    PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
+    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackagePatternPage,
+    PackageResolutionResponse, PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
     ResolvePackageContextRequest, ResolvePackageContextResponse, ResponseMeta,
-    SearchPackagesRequest, SearchPackagesResponse,
+    SearchPackagePatternsRequest, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesResponse,
 };
 
 pub(crate) struct Parsed<T> {
@@ -114,6 +115,31 @@ pub(crate) async fn symbols(
         | ListPackageSymbolsResponse::ServiceUnavailable(problem)
         | ListPackageSymbolsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
         ListPackageSymbolsResponse::Unknown => Err(unknown_http_error(meta)),
+    }
+}
+
+pub(crate) async fn patterns(
+    response: RawResponse,
+) -> Result<Parsed<PackagePatternPage>, ClientError> {
+    let (response, meta) = generated_response(response)?;
+    let status = meta.status;
+    let response = SearchPackagePatternsRequest::parse_response(response)
+        .await
+        .map_err(|_| ClientError::Decode { status })?;
+    match response {
+        SearchPackagePatternsResponse::Ok(value) => Ok(Parsed { value, meta }),
+        SearchPackagePatternsResponse::BadRequest(problem)
+        | SearchPackagePatternsResponse::Unauthorized(problem)
+        | SearchPackagePatternsResponse::Forbidden(problem)
+        | SearchPackagePatternsResponse::NotAcceptable(problem)
+        | SearchPackagePatternsResponse::ContentTooLarge(problem)
+        | SearchPackagePatternsResponse::UnsupportedMediaType(problem)
+        | SearchPackagePatternsResponse::TooManyRequests(problem)
+        | SearchPackagePatternsResponse::InternalServerError(problem)
+        | SearchPackagePatternsResponse::BadGateway(problem)
+        | SearchPackagePatternsResponse::ServiceUnavailable(problem)
+        | SearchPackagePatternsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
+        SearchPackagePatternsResponse::Unknown => Err(unknown_http_error(meta)),
     }
 }
 

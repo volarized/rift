@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::{
-    Capabilities, PackageResolutionResponse, PackageSearchPage, PackageSymbolPage,
+    Capabilities, PackagePatternPage, PackageResolutionResponse, PackageSearchPage,
+    PackageSymbolPage,
 };
 use serde_json::{Map, Value, json};
 
@@ -165,6 +166,18 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "Cursor/schema/maxLength")?;
 
     let mut document = contract()?;
+    document["components"]["schemas"]["PackagePatternRequest"]["properties"]["pattern"]["maxLength"] =
+        json!(4096);
+    assert_invalid(
+        &document,
+        "PackagePatternRequest/properties/pattern/maxLength",
+    )?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/patterns"]["post"]["x-rift-page-files-max"] = json!(2000);
+    assert_invalid(&document, "x-rift-page-files-max")?;
+
+    let mut document = contract()?;
     document["components"]["schemas"]["PackageIdentity"]["properties"]["name"]["maxLength"] =
         json!(4095);
     assert_invalid(&document, "PackageIdentity")?;
@@ -180,7 +193,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 11,
+        checked, 13,
         "each request and success response carries an example"
     );
     Ok(())
@@ -192,7 +205,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 6,
+        checked, 7,
         "each success response carries a generated response type"
     );
     Ok(())
@@ -245,9 +258,13 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         "#/components/schemas/PackageSymbolPage" => {
             serde_json::from_value::<PackageSymbolPage>(value)?;
         }
+        "#/components/schemas/PackagePatternPage" => {
+            serde_json::from_value::<PackagePatternPage>(value)?;
+        }
         "#/components/schemas/PackageResolutionRequest"
         | "#/components/schemas/PackageSearchRequest"
-        | "#/components/schemas/PackageSymbolRequest" => return Ok(false),
+        | "#/components/schemas/PackageSymbolRequest"
+        | "#/components/schemas/PackagePatternRequest" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
     Ok(true)

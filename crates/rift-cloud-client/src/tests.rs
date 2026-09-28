@@ -2,6 +2,7 @@ use super::*;
 
 mod documentation;
 mod pages;
+mod pattern;
 mod resolution;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,6 +62,7 @@ enum OperationFixture {
     SubstitutionAtRequestedVersion,
     RequirementOutsideRange,
     BodyBoundStop,
+    Patterns,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -327,6 +329,9 @@ fn operation_response(
     if path.ends_with("/symbols") {
         return operation_symbol_response(mode, query);
     }
+    if path.ends_with("/patterns") {
+        return json_response(&pattern::pattern_page_json(query_cursor(query)), None);
+    }
     status_response(StatusCode::NOT_FOUND)
 }
 
@@ -358,6 +363,10 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         }
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
+        }
+        OperationFixture::Patterns => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
         }
         _ => {}
     })

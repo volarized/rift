@@ -1,6 +1,7 @@
 //! Bounded client for Rift global package data.
 
 pub mod contract;
+mod pattern;
 mod response;
 
 use std::{
@@ -50,19 +51,22 @@ pub use generated::{
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
     NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
-    PackageDocumentationHitContributingField, PackageIdentity, PackageResolutionRequest,
+    PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
+    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
     PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
     PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
     PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
     PackageSymbolRequestInclude, Parameter, ProblemDetails, PublicationFormat, QueryTerm,
     ResolutionWarning, ResolutionWarningCode, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagesRequest,
+    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
+    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
     SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
     SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
     TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
+pub use pattern::{PATTERN_BYTES_MAX, PATTERN_PAGE_FILES_MAX};
 
 /// Most bytes one encoded request body carries.
 pub const REQUEST_BODY_BYTES_MAX: usize = 4 * 1024 * 1024;
@@ -1076,6 +1080,14 @@ impl GlobalClient {
         })
     }
 
+    /// Hands `result` back, recording an unavailable state first when it failed.
+    async fn observed<T>(&self, result: Result<T, ClientError>) -> Result<T, ClientError> {
+        if result.is_err() {
+            self.record_failure().await;
+        }
+        result
+    }
+
     async fn is_unavailable(&self) -> bool {
         self.inner
             .unavailable_until
@@ -1590,15 +1602,19 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     validate_packages(&request.packages)
 }
 
+fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
+    bounded_nonempty(&package.manager, 128, "package_manager")?;
+    bounded_nonempty(&package.name, IDENTIFIER_BYTES_MAX, "package_name")?;
+    bounded_nonempty(&package.version, IDENTIFIER_BYTES_MAX, "package_version")
+}
+
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
     if packages.len() > PACKAGES_MAX {
         return Err(ClientError::InvalidRequest { field: "packages" });
     }
     let mut seen = HashSet::new();
     for package in packages {
-        bounded_nonempty(&package.manager, 128, "package_manager")?;
-        bounded_nonempty(&package.name, IDENTIFIER_BYTES_MAX, "package_name")?;
-        bounded_nonempty(&package.version, IDENTIFIER_BYTES_MAX, "package_version")?;
+        validate_package_identity(package)?;
         if !seen.insert((
             package.manager.as_str(),
             package.name.as_str(),
@@ -1910,25 +1926,7 @@ fn validate_hit_common(
     {
         return Err(ClientError::InvalidResponseField { field: "source" });
     }
-    let unit = rift_core::SourceUnitId::parse(location.unit).map_err(|_| {
-        ClientError::InvalidResponseField {
-            field: "source_identity",
-        }
-    })?;
-    let package_prefix = format!("{}@{}/", package.name, package.version);
-    let source_path = unit
-        .key()
-        .as_str()
-        .strip_prefix(&package_prefix)
-        .filter(|path| !path.is_empty())
-        .ok_or(ClientError::InvalidResponseField {
-            field: "source_identity",
-        })?;
-    if unit.resolver().as_str() != package.manager {
-        return Err(ClientError::InvalidResponseField {
-            field: "source_identity",
-        });
-    }
+    let source_path = package_source_path(package, location.unit)?;
     let Some(origin) = symbol.origin.as_ref() else {
         return Err(ClientError::InvalidResponseField { field: "origin" });
     };
@@ -1937,7 +1935,26 @@ fn validate_hit_common(
     {
         return Err(ClientError::InvalidResponseField { field: "origin" });
     }
-    validate_symbol_identity(symbol, source_path)
+    validate_symbol_identity(symbol, &source_path)
+}
+
+/// The package-relative path of `unit`, a file of `package`: its key after `name@version/`,
+/// under the package's manager as resolver.
+fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, ClientError> {
+    let invalid = ClientError::InvalidResponseField {
+        field: "source_identity",
+    };
+    let unit = rift_core::SourceUnitId::parse(unit).map_err(|_| invalid.clone())?;
+    if unit.resolver().as_str() != package.manager {
+        return Err(invalid);
+    }
+    let package_prefix = format!("{}@{}/", package.name, package.version);
+    unit.key()
+        .as_str()
+        .strip_prefix(&package_prefix)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .ok_or(invalid)
 }
 
 fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String, ClientError> {

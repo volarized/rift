@@ -1148,6 +1148,268 @@
         "x-rift-request-body-bytes-max": 4194304,
         "x-rift-response-body-bytes-max": 33554432
       }
+    },
+    "/v1/patterns": {
+      "post": {
+        "operationId": "searchPackagePatterns",
+        "summary": "Search package source for a pattern.",
+        "description": "Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "requestBody": {
+          "description": "Pattern and selected package versions.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackagePatternRequest"
+              },
+              "examples": {
+                "valid": {
+                  "summary": "Valid request",
+                  "value": {
+                    "pattern": "fn\\s+serve",
+                    "packages": [
+                      {
+                        "manager": "cargo",
+                        "name": "beacon",
+                        "version": "1.0.0"
+                      }
+                    ],
+                    "include": [
+                      "source"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One page of pattern matches.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackagePatternPage"
+                },
+                "examples": {
+                  "valid": {
+                    "summary": "Valid response",
+                    "value": {
+                      "items": [
+                        {
+                          "package": {
+                            "manager": "cargo",
+                            "name": "beacon",
+                            "version": "1.0.0"
+                          },
+                          "unit": "rift://source/cargo/beacon@1.0.0/src/lib.rs",
+                          "range": {
+                            "start": 24,
+                            "end": 32
+                          },
+                          "line": 3,
+                          "declaration": {
+                            "symbol": {
+                              "id": "rift://symbol/rust/src/lib.rs/serve",
+                              "language": "rust",
+                              "name": "serve",
+                              "kind": "function",
+                              "origin": {
+                                "location": "dependency",
+                                "package": {
+                                  "manager": "cargo",
+                                  "name": "beacon",
+                                  "version": "1.0.0"
+                                },
+                                "source_kind": "authored"
+                              }
+                            },
+                            "range": {
+                              "start": 20,
+                              "end": 87
+                            },
+                            "line": 3
+                          },
+                          "source": "pub fn serve(port: u16) -> std::io::Result<()> {"
+                        }
+                      ],
+                      "next_cursor": null,
+                      "warnings": [],
+                      "publication_format": "rift-package-index-v2",
+                      "analyzer_revision": "2026-09-22",
+                      "corpus_revision": "2026-09-22"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is temporarily unavailable.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432,
+        "x-rift-page-files-max": 500,
+        "x-rift-page-text-bytes-max": 8388608
+      }
     }
   },
   "components": {
@@ -2665,6 +2927,158 @@
               }
             ],
             "description": "Documentation revision used for this page."
+          }
+        },
+        "required": [
+          "items",
+          "warnings",
+          "publication_format",
+          "analyzer_revision",
+          "corpus_revision"
+        ],
+        "type": "object"
+      },
+      "PackagePatternRequest": {
+        "additionalProperties": false,
+        "description": "Regular expression search over the source of selected exact package versions.",
+        "properties": {
+          "pattern": {
+            "description": "Regular expression in the syntax of the Rust `regex` crate. The server matches it line by line: `^` and `$` match at line boundaries, and no character class matches a line feed. The inline flag `(?i)` makes it case-insensitive.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "packages": {
+            "description": "Selected exact package versions.",
+            "items": {
+              "$ref": "#/components/schemas/PackageIdentity"
+            },
+            "type": "array",
+            "maxItems": 20000
+          },
+          "include": {
+            "description": "Optional fields to include.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "source"
+              ]
+            },
+            "type": "array",
+            "maxItems": 1
+          }
+        },
+        "required": [
+          "pattern",
+          "packages"
+        ],
+        "type": "object"
+      },
+      "PackagePatternDeclaration": {
+        "additionalProperties": true,
+        "description": "The smallest declaration whose range holds a match. A match no declaration holds carries none.",
+        "properties": {
+          "symbol": {
+            "$ref": "#/components/schemas/Symbol"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange"
+          },
+          "line": {
+            "description": "One-based source line containing the declaration.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "symbol",
+          "range",
+          "line"
+        ],
+        "type": "object"
+      },
+      "PackagePatternHit": {
+        "additionalProperties": true,
+        "description": "One match of the pattern in one package file.",
+        "properties": {
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId"
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange"
+          },
+          "line": {
+            "description": "One-based source line where the match begins.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "declaration": {
+            "$ref": "#/components/schemas/PackagePatternDeclaration"
+          },
+          "source": {
+            "description": "The line where the match begins, without its line ending, when the request includes `source`.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 1048576
+          }
+        },
+        "required": [
+          "package",
+          "unit",
+          "range",
+          "line"
+        ],
+        "type": "object"
+      },
+      "PackagePatternPage": {
+        "additionalProperties": true,
+        "description": "One page of pattern matches. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would, and the page carries the matches that fit, `next_cursor` at the first match left out, and a `result_truncated` warning.",
+        "properties": {
+          "items": {
+            "description": "Matches in package, file path, and offset order.",
+            "items": {
+              "$ref": "#/components/schemas/PackagePatternHit"
+            },
+            "type": "array",
+            "maxItems": 1000
+          },
+          "next_cursor": {
+            "description": "Opaque cursor for the next page.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 4096
+          },
+          "warnings": {
+            "description": "Warnings attached to this page.",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            },
+            "type": "array",
+            "maxItems": 32
+          },
+          "publication_format": {
+            "$ref": "#/components/schemas/PublicationFormat"
+          },
+          "analyzer_revision": {
+            "description": "Analyzer revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "corpus_revision": {
+            "description": "Corpus revision used for this page.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
           }
         },
         "required": [

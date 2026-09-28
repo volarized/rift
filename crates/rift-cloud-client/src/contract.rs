@@ -38,11 +38,12 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 4] = [
+const ENDPOINTS: [Endpoint; 5] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
+    Endpoint::Patterns,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -51,6 +52,7 @@ pub(crate) enum Endpoint {
     Resolutions,
     Search,
     Symbols,
+    Patterns,
 }
 
 impl Endpoint {
@@ -60,13 +62,14 @@ impl Endpoint {
             Self::Resolutions => "/v1/resolutions",
             Self::Search => "/v1/search",
             Self::Symbols => "/v1/symbols",
+            Self::Patterns => "/v1/patterns",
         }
     }
 
     pub(crate) fn method(self) -> Method {
         match self {
             Self::Capabilities => Method::GET,
-            Self::Resolutions | Self::Search | Self::Symbols => Method::POST,
+            Self::Resolutions | Self::Search | Self::Symbols | Self::Patterns => Method::POST,
         }
     }
 
@@ -76,6 +79,7 @@ impl Endpoint {
             Self::Resolutions => "resolvePackageContext",
             Self::Search => "searchPackages",
             Self::Symbols => "listPackageSymbols",
+            Self::Patterns => "searchPackagePatterns",
         }
     }
 
@@ -366,6 +370,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
         ),
         ("PackageSearchPage", "items", page_items_max),
         ("PackageSymbolPage", "items", page_items_max),
+        ("PackagePatternPage", "items", page_items_max),
         ("PackageSearchRequest", "terms", PARSED_QUERY_MEMBERS_MAX),
         (
             "PackageSearchRequest",
@@ -385,6 +390,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     let expected_max_lengths = [
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
+        ("PackagePatternRequest", "pattern", crate::PATTERN_BYTES_MAX),
     ];
     for (component, property, value) in expected_max_lengths {
         let schema = property_schema(spec, component, property)?;
@@ -412,7 +418,25 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     }
     let cursor = parameter_schema(spec, "Cursor")?;
     expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
-    Ok(())
+    validate_pattern_page_bound(spec)
+}
+
+/// Pins the files bound the pattern operation states to the one the client enforces.
+fn validate_pattern_page_bound(spec: &Spec) -> Result<(), String> {
+    let endpoint = Endpoint::Patterns;
+    let operation = spec
+        .operation(&endpoint.method(), endpoint.path())
+        .ok_or_else(|| format!("{} is missing", endpoint.path()))?;
+    let expected =
+        u64::try_from(crate::PATTERN_PAGE_FILES_MAX).map_err(|error| error.to_string())?;
+    expect_bound(
+        "x-rift-page-files-max",
+        operation
+            .extensions
+            .get("rift-page-files-max")
+            .and_then(Value::as_u64),
+        expected,
+    )
 }
 
 fn property_schema(spec: &Spec, component: &str, property: &str) -> Result<ObjectSchema, String> {

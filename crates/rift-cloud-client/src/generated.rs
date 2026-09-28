@@ -1172,6 +1172,92 @@ pub struct PackageSymbolPage {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
+/// Regular expression search over the source of selected exact package versions.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePatternRequest {
+    /// Regular expression in the syntax of the Rust `regex` crate. The server matches it line by line: `^` and `$` match at line boundaries, and no character class matches a line feed. The inline flag `(?i)` makes it case-insensitive.
+    #[validate(length(min = 1u64, max = 1_024u64))]
+    pub pattern: String,
+    /// Selected exact package versions.
+    #[validate(length(max = 20_000u64), nested)]
+    pub packages: Vec<PackageIdentity>,
+    /// Optional fields to include.
+    #[validate(length(max = 1u64))]
+    pub include: Option<Vec<String>>,
+}
+/// The smallest declaration whose range holds a match. A match no declaration holds carries none.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternDeclaration {
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// and is connected through Relationship.
+    pub symbol: Symbol,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One-based source line containing the declaration.
+    pub line: i64,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One match of the pattern in one package file.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternHit {
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
+    /// Stable identity of one source unit in the source catalog: a resolver identity, then that
+    /// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
+    /// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
+    /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
+    /// where byte-identity is required.
+    pub unit: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One-based source line where the match begins.
+    pub line: i64,
+    /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
+    pub declaration: Option<PackagePatternDeclaration>,
+    /// The line where the match begins, without its line ending, when the request includes `source`.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One page of pattern matches. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would, and the page carries the matches that fit, `next_cursor` at the first match left out, and a `result_truncated` warning.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternPage {
+    /// Matches in package, file path, and offset order.
+    pub items: Vec<PackagePatternHit>,
+    /// Opaque cursor for the next page.
+    pub next_cursor: Option<String>,
+    /// Warnings attached to this page.
+    pub warnings: Vec<Warning>,
+    /// Publication format used by the package index.
+    pub publication_format: PublicationFormat,
+    /// Analyzer revision used for this page.
+    pub analyzer_revision: String,
+    /// Corpus revision used for this page.
+    pub corpus_revision: String,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
 /// RFC 9457 problem details for an application error.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct ProblemDetails {
@@ -2320,6 +2406,157 @@ impl ListPackageSymbolsRequest {
 pub enum ListPackageSymbolsResponse {
     ///200: One package declaration page.
     Ok(PackageSymbolPage),
+    ///400: Request JSON, query parameters, or field relationships are invalid.
+    BadRequest(ProblemDetails),
+    ///401: Authentication is required or credentials are invalid.
+    Unauthorized(ProblemDetails),
+    ///403: Credentials do not permit this operation.
+    Forbidden(ProblemDetails),
+    ///406: The server cannot produce an accepted media type.
+    NotAcceptable(ProblemDetails),
+    ///413: The request body exceeds the request body bound.
+    ContentTooLarge(ProblemDetails),
+    ///415: The request media type is unsupported.
+    UnsupportedMediaType(ProblemDetails),
+    ///429: The request rate limit is exhausted.
+    TooManyRequests(ProblemDetails),
+    ///500: The server encountered an unexpected failure.
+    InternalServerError(ProblemDetails),
+    ///502: The server received an invalid upstream response.
+    BadGateway(ProblemDetails),
+    ///503: The service is temporarily unavailable.
+    ServiceUnavailable(ProblemDetails),
+    ///504: The upstream request timed out.
+    GatewayTimeout(ProblemDetails),
+    ///default: Unknown response
+    Unknown,
+}
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+pub struct SearchPackagePatternsRequestQuery {
+    /// Maximum entries in one page.
+    #[validate(range(min = 1i64, max = 1_000i64))]
+    #[default(Some(100i64))]
+    pub limit: Option<i64>,
+    /// Opaque cursor for the next page.
+    #[validate(length(max = 4_096u64))]
+    pub cursor: Option<String>,
+}
+/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped.
+#[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
+pub struct SearchPackagePatternsRequest {
+    #[validate(nested)]
+    pub query: SearchPackagePatternsRequestQuery,
+    /// Pattern and selected package versions.
+    #[validate(nested)]
+    pub body: PackagePatternRequest,
+}
+impl SearchPackagePatternsRequest {
+    /// Parse the HTTP response into the response enum.
+    pub async fn parse_response(
+        req: reqwest::Response,
+    ) -> anyhow::Result<SearchPackagePatternsResponse> {
+        let status = req.status();
+        if status == http::StatusCode::OK {
+            let data = oas3_gen_support::Diagnostics::<
+                PackagePatternPage,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Ok(data));
+        }
+        if status == http::StatusCode::BAD_REQUEST {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::BadRequest(data));
+        }
+        if status == http::StatusCode::UNAUTHORIZED {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Unauthorized(data));
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Forbidden(data));
+        }
+        if status == http::StatusCode::NOT_ACCEPTABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::NotAcceptable(data));
+        }
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::ContentTooLarge(data));
+        }
+        if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::UnsupportedMediaType(data));
+        }
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::TooManyRequests(data));
+        }
+        if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::InternalServerError(data));
+        }
+        if status == http::StatusCode::BAD_GATEWAY {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::BadGateway(data));
+        }
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::ServiceUnavailable(data));
+        }
+        if status == http::StatusCode::GATEWAY_TIMEOUT {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::GatewayTimeout(data));
+        }
+        let _ = req.bytes().await?;
+        return Ok(SearchPackagePatternsResponse::Unknown);
+    }
+}
+/// Response types for searchPackagePatterns
+#[derive(Debug, Clone)]
+pub enum SearchPackagePatternsResponse {
+    ///200: One page of pattern matches.
+    Ok(PackagePatternPage),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
