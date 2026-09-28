@@ -926,7 +926,7 @@ pub struct PackageResolutionRequest {
     #[validate(length(max = 20_000u64), nested)]
     pub entries: Vec<PackageContextEntry>,
 }
-/// One submitted requirement paired with its resolved package.
+/// One submitted entry paired with the package that answers it: a requirement with the release it resolves to, or an exact version with the nearest collected release.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct ResolvedRequirement {
     /// One package the workspace depends on, as its manifests and lockfiles state it.
@@ -945,12 +945,30 @@ pub struct ResolvedRequirement {
 pub struct PackageResolutionResponse {
     /// Exact packages available in the global index.
     pub available_exact: Vec<PackageIdentity>,
-    /// Requirements resolved to exact packages.
+    /// Requirements resolved to exact packages, and exact versions the global index answers from the nearest collected release.
     pub resolved_requirements: Vec<ResolvedRequirement>,
     /// Exact packages absent from the global index.
     pub missing_exact: Vec<PackageIdentity>,
     /// Requirements absent from the global index.
     pub missing_requirements: Vec<PackageContextEntry>,
+    /// Conditions the caller must account for, each naming one entry of `resolved_requirements` beside the package that answers it. Absent when none applies.
+    pub warnings: Option<Vec<ResolutionWarning>>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One condition an answered entry carries.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct ResolutionWarning {
+    /// Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.
+    pub code: ResolutionWarningCode,
+    /// One package the workspace depends on, as its manifests and lockfiles state it.
+    ///
+    /// Entries order by manager, then name, then the selector they state: a declared
+    /// requirement before an exact version.
+    pub entry: PackageContextEntry,
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1894,7 +1912,7 @@ pub enum GetCapabilitiesResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Classifies canonical exact versions and declared requirements against indexed package versions.
+/// Answers each canonical entry with a collected release of its package. An exact version answers with that release and a requirement with the newest release it admits; when the package holds no such release, the entry answers with the release nearest the version it names, for a requirement the lowest version it admits. An entry whose package holds no collected release answers as missing.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct ResolvePackageContextRequest {
     /// Canonical package context.
@@ -2364,6 +2382,36 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
             "result_truncated" => Ok(WarningCode::ResultTruncated),
             "unknown" => Ok(WarningCode::Unknown),
             _ => Ok(WarningCode::Unknown),
+        }
+    }
+}
+/// Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum ResolutionWarningCode {
+    #[default]
+    RequirementUnsatisfied,
+    Unknown,
+}
+impl core::fmt::Display for ResolutionWarningCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RequirementUnsatisfied => write!(f, "requirement_unsatisfied"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for ResolutionWarningCode {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "requirement_unsatisfied" => {
+                Ok(ResolutionWarningCode::RequirementUnsatisfied)
+            }
+            "unknown" => Ok(ResolutionWarningCode::Unknown),
+            _ => Ok(ResolutionWarningCode::Unknown),
         }
     }
 }

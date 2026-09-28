@@ -237,7 +237,7 @@
       "post": {
         "operationId": "resolvePackageContext",
         "summary": "Resolve package context.",
-        "description": "Classifies canonical exact versions and declared requirements against indexed package versions.",
+        "description": "Answers each canonical entry with a collected release of its package. An exact version answers with that release and a requirement with the newest release it admits; when the package holds no such release, the entry answers with the release nearest the version it names, for a requirement the lowest version it admits. An entry whose package holds no collected release answers as missing.",
         "security": [
           {},
           {
@@ -268,6 +268,25 @@
                         "name": "typescript",
                         "availability": "canonical",
                         "requirement": "^5.7.2"
+                      }
+                    ]
+                  }
+                },
+                "nearest": {
+                  "summary": "Entries no collected release answers exactly",
+                  "value": {
+                    "entries": [
+                      {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "availability": "canonical",
+                        "requirement": "~5.7.2"
+                      },
+                      {
+                        "manager": "pypi",
+                        "name": "sqlalchemy",
+                        "availability": "canonical",
+                        "version": "2.0.30"
                       }
                     ]
                   }
@@ -312,6 +331,58 @@
                       ],
                       "missing_exact": [],
                       "missing_requirements": []
+                    }
+                  },
+                  "nearest": {
+                    "summary": "Answers from the nearest collected release",
+                    "value": {
+                      "available_exact": [],
+                      "resolved_requirements": [
+                        {
+                          "entry": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "availability": "canonical",
+                            "requirement": "~5.7.2"
+                          },
+                          "package": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "version": "5.9.3"
+                          }
+                        },
+                        {
+                          "entry": {
+                            "manager": "pypi",
+                            "name": "sqlalchemy",
+                            "availability": "canonical",
+                            "version": "2.0.30"
+                          },
+                          "package": {
+                            "manager": "pypi",
+                            "name": "sqlalchemy",
+                            "version": "2.0.28"
+                          }
+                        }
+                      ],
+                      "missing_exact": [],
+                      "missing_requirements": [],
+                      "warnings": [
+                        {
+                          "code": "requirement_unsatisfied",
+                          "entry": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "availability": "canonical",
+                            "requirement": "~5.7.2"
+                          },
+                          "package": {
+                            "manager": "npm",
+                            "name": "typescript",
+                            "version": "5.9.3"
+                          }
+                        }
+                      ]
                     }
                   }
                 }
@@ -2116,7 +2187,7 @@
       },
       "ResolvedRequirement": {
         "additionalProperties": true,
-        "description": "One submitted requirement paired with its resolved package.",
+        "description": "One submitted entry paired with the package that answers it: a requirement with the release it resolves to, or an exact version with the nearest collected release.",
         "properties": {
           "entry": {
             "$ref": "#/components/schemas/PackageContextEntry"
@@ -2144,7 +2215,7 @@
             "maxItems": 20000
           },
           "resolved_requirements": {
-            "description": "Requirements resolved to exact packages.",
+            "description": "Requirements resolved to exact packages, and exact versions the global index answers from the nearest collected release.",
             "items": {
               "$ref": "#/components/schemas/ResolvedRequirement"
             },
@@ -2166,6 +2237,14 @@
             },
             "type": "array",
             "maxItems": 20000
+          },
+          "warnings": {
+            "description": "Conditions the caller must account for, each naming one entry of `resolved_requirements` beside the package that answers it. Absent when none applies.",
+            "items": {
+              "$ref": "#/components/schemas/ResolutionWarning"
+            },
+            "type": "array",
+            "maxItems": 20000
           }
         },
         "required": [
@@ -2173,6 +2252,34 @@
           "resolved_requirements",
           "missing_exact",
           "missing_requirements"
+        ],
+        "type": "object"
+      },
+      "ResolutionWarning": {
+        "additionalProperties": true,
+        "description": "One condition an answered entry carries.",
+        "properties": {
+          "code": {
+            "description": "Stable warning code. `requirement_unsatisfied`: the package answering a requirement lies outside the range the requirement states, since no collected release satisfies it.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "enum": [
+              "requirement_unsatisfied",
+              "unknown"
+            ]
+          },
+          "entry": {
+            "$ref": "#/components/schemas/PackageContextEntry"
+          },
+          "package": {
+            "$ref": "#/components/schemas/PackageIdentity"
+          }
+        },
+        "required": [
+          "code",
+          "entry",
+          "package"
         ],
         "type": "object"
       },

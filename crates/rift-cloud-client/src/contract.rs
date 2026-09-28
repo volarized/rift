@@ -359,6 +359,11 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             "entries",
             DEPENDENCIES_PACKAGES_MAX,
         ),
+        (
+            "PackageResolutionResponse",
+            "warnings",
+            crate::DEPENDENCY_ENTRIES_MAX,
+        ),
         ("PackageSearchPage", "items", page_items_max),
         ("PackageSymbolPage", "items", page_items_max),
         ("PackageSearchRequest", "terms", PARSED_QUERY_MEMBERS_MAX),

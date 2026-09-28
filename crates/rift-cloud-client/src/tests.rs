@@ -2,6 +2,7 @@ use super::*;
 
 mod documentation;
 mod pages;
+mod resolution;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -55,6 +56,10 @@ enum OperationFixture {
     InvalidMatchClass,
     UnknownMatchClass,
     PageLimitMax(i64),
+    NamedSubstitution,
+    UnnamedSubstitution,
+    SubstitutionAtRequestedVersion,
+    RequirementOutsideRange,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -358,6 +363,9 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
 }
 
 fn operation_resolution_response(mode: &OperationFixture) -> Response {
+    if let Some(body) = resolution::substitution_response(mode) {
+        return json_response(&body, Some("max-age=60"));
+    }
     let body = match mode {
         OperationFixture::InvalidResolutionAccounting => serde_json::json!({
             "available_exact": [],

@@ -55,11 +55,11 @@ pub use generated::{
     PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
     PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
     PackageSymbolRequestInclude, Parameter, ProblemDetails, PublicationFormat, QueryTerm,
-    ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
-    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, Signature,
-    SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
-    Warning, WarningCode,
+    ResolutionWarning, ResolutionWarningCode, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagesRequest,
+    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
@@ -1385,11 +1385,7 @@ fn validate_resolution_response(
         }
     }
     for resolved in &response.resolved_requirements {
-        if resolved.package.manager != resolved.entry.manager
-            || resolved.package.name != resolved.entry.name
-            || resolved.entry.requirement.is_none()
-            || resolved.entry.version.is_some()
-        {
+        if !resolved.answers_its_entry() {
             return Err(ClientError::InvalidResponseField {
                 field: "resolved_requirement",
             });
@@ -1422,7 +1418,93 @@ fn validate_resolution_response(
             field: "resolution_accounting",
         });
     }
+    validate_resolution_warnings(response)
+}
+
+/// Checks that every `requirement_unsatisfied` warning names a requirement entry of
+/// `resolved_requirements`, beside the package that answers it, at most once.
+fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<(), ClientError> {
+    let warnings = response.warnings.as_deref().unwrap_or_default();
+    if warnings.len() > DEPENDENCY_ENTRIES_MAX {
+        return Err(ClientError::InvalidResponseField { field: "warnings" });
+    }
+    let mut named = HashSet::new();
+    for warning in warnings {
+        if warning.code != ResolutionWarningCode::RequirementUnsatisfied {
+            continue;
+        }
+        let is_requirement = warning.entry.version.is_none() && warning.entry.requirement.is_some();
+        let answered = response
+            .resolved_requirements
+            .iter()
+            .any(|resolved| resolved.entry == warning.entry && resolved.package == warning.package);
+        let first = named.insert(context_key(&warning.entry));
+        if !(is_requirement && answered && first) {
+            return Err(ClientError::InvalidResponseField {
+                field: "resolution_warning",
+            });
+        }
+    }
     Ok(())
+}
+
+impl ResolvedRequirement {
+    /// Whether the served package is the entry's package, answering a requirement at any
+    /// version or an exact version at another one. An exact entry answered at its own version
+    /// belongs in `available_exact`.
+    fn answers_its_entry(&self) -> bool {
+        let names_the_package =
+            self.package.manager == self.entry.manager && self.package.name == self.entry.name;
+        let selector_holds = match (&self.entry.version, &self.entry.requirement) {
+            (None, Some(_)) => true,
+            (Some(requested), None) => requested != &self.package.version,
+            _ => false,
+        };
+        names_the_package && selector_holds
+    }
+}
+
+/// One entry the global index answers from a release other than the one it names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Substitution {
+    /// The entry as the dependency context states it.
+    pub requested: PackageContextEntry,
+    /// The collected release that answers it.
+    pub served: PackageIdentity,
+}
+
+impl PackageResolutionResponse {
+    /// The substitutions this resolution names, in `resolved_requirements` order: each exact
+    /// entry answered at another version, and each requirement a `requirement_unsatisfied`
+    /// warning names.
+    ///
+    /// The resolution names an exact substitution by answering the exact entry in
+    /// `resolved_requirements` beside the served package. An `available_exact` package at a
+    /// version no entry requested is an unnamed substitution, and the client refuses that
+    /// whole resolution as `resolution_accounting`.
+    #[must_use]
+    pub fn substitutions(&self) -> Vec<Substitution> {
+        let warnings = self.warnings.as_deref().unwrap_or_default();
+        self.resolved_requirements
+            .iter()
+            .filter(|resolved| {
+                let exact_elsewhere = resolved
+                    .entry
+                    .version
+                    .as_ref()
+                    .is_some_and(|requested| requested != &resolved.package.version);
+                let outside_its_range = warnings.iter().any(|warning| {
+                    warning.code == ResolutionWarningCode::RequirementUnsatisfied
+                        && warning.entry == resolved.entry
+                });
+                exact_elsewhere || outside_its_range
+            })
+            .map(|resolved| Substitution {
+                requested: resolved.entry.clone(),
+                served: resolved.package.clone(),
+            })
+            .collect()
+    }
 }
 
 fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientError> {

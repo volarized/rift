@@ -180,7 +180,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 9,
+        checked, 11,
         "each request and success response carries an example"
     );
     Ok(())
@@ -192,7 +192,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 5,
+        checked, 6,
         "each success response carries a generated response type"
     );
     Ok(())
