@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
+
 use crate::{
     Capabilities, ClientError, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
     PackagePatternRequest, PageMetadata, SOURCE_BYTES_MAX, SearchPackagePatternsRequestQuery,
@@ -10,9 +12,6 @@ use crate::{
     validate_body_for_capabilities, validate_hit_common, validate_packages, validate_page,
     validate_read_bounds,
 };
-
-/// Most UTF-8 bytes one pattern carries: the contract's `maxLength` for `pattern`.
-pub const PATTERN_BYTES_MAX: usize = 1_024;
 
 /// Most distinct files one pattern page holds matches from. The server verifies candidate files
 /// in path order and stops a page at this many, so `next_cursor` continues from the next file.
@@ -81,7 +80,7 @@ impl GlobalClient {
 }
 
 pub(crate) fn validate_pattern_request(request: &PackagePatternRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.pattern, PATTERN_BYTES_MAX, "pattern")?;
+    bounded_nonempty(&request.pattern, SEARCH_PATTERN_CHARS_MAX, "pattern")?;
     if request
         .include
         .as_ref()

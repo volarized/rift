@@ -70,7 +70,7 @@ pub use generated::{
 pub mod domain;
 pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
 pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
-pub use pattern::{PATTERN_BYTES_MAX, PATTERN_PAGE_FILES_MAX};
+pub use pattern::PATTERN_PAGE_FILES_MAX;
 
 /// Most bytes one encoded request body carries.
 pub const REQUEST_BODY_BYTES_MAX: usize = 4 * 1024 * 1024;

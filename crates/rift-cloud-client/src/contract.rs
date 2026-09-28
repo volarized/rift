@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use rift_protocol::dependencies::{DEPENDENCIES_PACKAGES_MAX, PackageContextEntry};
 use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
-use rift_protocol::read::{PackageIdentity, SourceUnitId, Symbol, SymbolId};
+use rift_protocol::read::{
+    PackageIdentity, SEARCH_PATTERN_CHARS_MAX, SourceUnitId, Symbol, SymbolId,
+};
 use rift_ranking::{
     IDENTIFIER_CANDIDATES_MAX, PARSED_QUERY_MEMBERS_MAX, QUERY_BYTES_MAX, QUERY_TERM_BYTES_MAX,
 };
@@ -409,7 +411,7 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     let expected_max_lengths = [
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
-        ("PackagePatternRequest", "pattern", crate::PATTERN_BYTES_MAX),
+        ("PackagePatternRequest", "pattern", SEARCH_PATTERN_CHARS_MAX),
         ("Warning", "detail", crate::WARNING_DETAIL_BYTES_MAX),
     ];
     for (component, property, value) in expected_max_lengths {

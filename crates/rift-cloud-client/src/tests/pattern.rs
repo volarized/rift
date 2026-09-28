@@ -2,6 +2,7 @@ use super::*;
 use crate::pattern::{
     PatternPageCheck, validate_pattern_request, validate_pattern_request_for_capabilities,
 };
+use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Value, json};
 
 const UNIT: &str = "rift://source/cargo/demo@1.0.0/src/first.rs";
@@ -159,7 +160,7 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     assert_eq!(validate_pattern_request(&pattern_request()), Ok(()));
     let cases = [
         (String::new(), "pattern"),
-        ("x".repeat(PATTERN_BYTES_MAX + 1), "pattern"),
+        ("x".repeat(SEARCH_PATTERN_CHARS_MAX + 1), "pattern"),
     ];
     for (pattern, field) in cases {
         let mut request = pattern_request();
@@ -170,7 +171,7 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
         );
     }
     let mut request = pattern_request();
-    request.pattern = "x".repeat(PATTERN_BYTES_MAX);
+    request.pattern = "x".repeat(SEARCH_PATTERN_CHARS_MAX);
     assert_eq!(validate_pattern_request(&request), Ok(()));
 
     for include in [
