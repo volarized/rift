@@ -766,11 +766,11 @@ fn process_absent(error: &io::Error) -> bool {
 /// Serves the workspace in this process until interrupted or stopped,
 /// under `check`.
 ///
-/// The listening line prints before blocking. Ctrl-C cancels the shutdown
-/// token; an authorized stop request and the idle timeout end serving the
-/// same way. This is the process that records: the drain writes what the
-/// tracing layer queued into the workspace database until the same token
-/// stops it.
+/// The listening line prints before blocking. Ctrl-C, and SIGTERM on unix,
+/// cancel the shutdown token; an authorized stop request and the idle timeout
+/// end serving the same way. This is the process that records: the drain
+/// writes what the tracing layer queued into the workspace database until the
+/// same token stops it.
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
 /// task drains, the engines and index supervisor shut down, the log drain's
@@ -812,6 +812,7 @@ async fn serve_foreground(
             return Err(foreground_refused(root, error));
         }
     };
+    let stop_signals = cancel_on_stop_signal(shutdown.clone());
     println!(
         "{}",
         ServerOutcome::Listening {
@@ -819,13 +820,12 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    let interrupt = tokio::spawn(cancel_on_interrupt(shutdown.clone()));
     let (guard, deadline, stopped) = server.stopped(SERVER_STOP_DEADLINE).await;
     let stopped =
         stopped.map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
-    interrupt.abort();
-    let _ = interrupt.await;
+    stop_signals.abort();
+    let _ = stop_signals.await;
     stop_log_drain(log_drain, deadline).await;
     // The election releases last: dropping the guard retires the document and
     // unlocks, immediately before the process exits.
@@ -868,6 +868,53 @@ async fn cancel_on_interrupt(shutdown: CancellationToken) {
         Ok(()) => shutdown.cancel(),
         Err(error) => tracing::warn!(component = "cli", %error, "interrupt listener failed"),
     }
+}
+
+/// Cancels `shutdown` when the foreground server receives Ctrl-C or SIGTERM.
+///
+/// `kill` sends SIGTERM by default, and the signal's default action ends the process at
+/// once: no request drains, the log drain never flushes, `server.json` stays behind, and
+/// the OTLP export never flushes. Handled like Ctrl-C, it runs the same stop under
+/// [`SERVER_STOP_DEADLINE`]. Both handlers install when this is called, not when the
+/// returned task first runs, so a signal sent once the listening line appears always
+/// reaches them. Tokio keeps an installed handler for the rest of the process, so a second
+/// signal during the stop does not cut it short; the stop's own deadline bounds it.
+///
+/// # Cancel safety
+///
+/// Aborting the returned task stops listening; the handlers stay installed.
+#[cfg(unix)]
+fn cancel_on_stop_signal(shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let installed = signal(SignalKind::interrupt()).and_then(|interrupt| {
+        signal(SignalKind::terminate()).map(|terminate| (interrupt, terminate))
+    });
+    tokio::spawn(async move {
+        let (mut interrupt, mut terminate) = match installed {
+            Ok(signals) => signals,
+            Err(error) => {
+                tracing::warn!(component = "cli", %error, "interrupt listener failed");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        shutdown.cancel();
+    })
+}
+
+/// Cancels `shutdown` when the foreground server receives Ctrl-C.
+///
+/// Windows has no SIGTERM, so Ctrl-C alone ends serving there.
+///
+/// # Cancel safety
+///
+/// Aborting the returned task stops listening for the interrupt.
+#[cfg(not(unix))]
+fn cancel_on_stop_signal(shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(cancel_on_interrupt(shutdown))
 }
 
 /// Attaches the holder's address facts to a foreground refusal.

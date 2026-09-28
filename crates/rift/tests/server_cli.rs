@@ -58,6 +58,10 @@ const DOCUMENT_GONE_GRACE: Duration = Duration::from_secs(2);
 /// It outlasts `SERVER_STOP_DEADLINE`, the server-side stop's span, so a deadline
 /// derived where the server began listening would already be spent when the stop lands.
 const IDLE_SPAN_PAST_STOP_DEADLINE: Duration = Duration::from_secs(9);
+/// How long a signalled foreground server has to leave: the five-second stop bound, which
+/// the server's own four-second `SERVER_STOP_DEADLINE` sits inside.
+#[cfg(unix)]
+const STOP_EXIT_BOUND: Duration = Duration::from_secs(5);
 
 fn stale_identity() -> ProductIdentity {
     ProductIdentity {
@@ -444,6 +448,203 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("rift server listening on 127.0.0.1:"),
         "the foreground server prints its listening line"
+    );
+    Ok(())
+}
+
+/// A foreground server that has printed its listening line, with the stdout it prints on.
+///
+/// The reader stays open until the process leaves: the server prints its outcome line as
+/// it exits, and a closed stdout would fail that write.
+#[cfg(unix)]
+struct ListeningForeground {
+    child: std::process::Child,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
+#[cfg(unix)]
+impl ListeningForeground {
+    /// Starts a foreground server in `root` with `variables` added to the inherited
+    /// environment, and returns once it has printed its listening line: the server installs
+    /// its stop signal handlers before it prints that line.
+    fn start(root: &Path, variables: &[(&str, &str)]) -> TestResult<Self> {
+        use std::io::BufRead as _;
+
+        let mut child = Command::new(rift_binary()?)
+            .args(["server", "start", "--foreground"])
+            .envs(variables.iter().copied())
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+            serving_document(root)
+        })?;
+        assert_eq!(serving.pid, child.id(), "the child itself must serve");
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("the foreground server's stdout is piped")?;
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut listening = String::new();
+        stdout.read_line(&mut listening)?;
+        assert!(
+            listening.contains("rift server listening on 127.0.0.1:"),
+            "the foreground server prints its listening line first: {listening:?}"
+        );
+        Ok(Self { child, stdout })
+    }
+
+    /// Sends SIGTERM, waits for the process to leave, and returns its status, the time it
+    /// took, and everything it wrote to stderr.
+    fn terminate(mut self) -> TestResult<(std::process::ExitStatus, Duration, String)> {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let pid = Pid::from_raw(i32::try_from(self.child.id())?);
+        let signalled = std::time::Instant::now();
+        kill(pid, Signal::SIGTERM)?;
+        let status = wait_for(
+            GONE_POLL_ATTEMPT_COUNT,
+            "the signalled foreground server to exit",
+            || self.child.try_wait().ok().flatten(),
+        )?;
+        let elapsed = signalled.elapsed();
+        let mut stdout = String::new();
+        self.stdout.read_to_string(&mut stdout)?;
+        let output = self.child.wait_with_output()?;
+        Ok((
+            status,
+            elapsed,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_a_foreground_server_through_its_stop() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+
+    let server = ListeningForeground::start(root, &[])?;
+    let (status, elapsed, stderr) = server.terminate()?;
+
+    assert!(
+        status.success(),
+        "SIGTERM runs the stop, and the process exits cleanly: {status:?}"
+    );
+    assert!(
+        elapsed <= STOP_EXIT_BOUND,
+        "a signalled server exits inside the stop bound: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
+    );
+    let stop_line = stop_line_of(&stderr)?;
+    assert!(
+        stop_line.contains("\"ok\""),
+        "the engines and the index supervisor join inside the budget: {stop_line}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "the stop retires server.json"
+    );
+    Ok(())
+}
+
+/// Every OTLP/HTTP export request one receiver answered, with when it arrived.
+#[cfg(all(unix, feature = "otlp"))]
+type ReceivedExports = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, usize)>>>;
+
+/// An OTLP/HTTP receiver on a loopback port that records each export and answers success.
+#[cfg(all(unix, feature = "otlp"))]
+struct TraceReceiver {
+    _runtime: tokio::runtime::Runtime,
+    port: u16,
+    exports: ReceivedExports,
+}
+
+#[cfg(all(unix, feature = "otlp"))]
+impl TraceReceiver {
+    fn start() -> TestResult<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let listener = runtime.block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))?;
+        let port = listener.local_addr()?.port();
+        let exports = ReceivedExports::default();
+        let recorded = std::sync::Arc::clone(&exports);
+        let receiver = axum::Router::new().route(
+            "/v1/traces",
+            axum::routing::post(move |body: axum::body::Bytes| async move {
+                recorded
+                    .lock()
+                    .expect("the recorded exports are not poisoned")
+                    .push((std::time::Instant::now(), body.len()));
+                axum::http::StatusCode::OK
+            }),
+        );
+        runtime.spawn(async move { axum::serve(listener, receiver).await });
+        Ok(Self {
+            _runtime: runtime,
+            port,
+            exports,
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The byte counts of the exports that arrived at or after `moment`.
+    fn exports_since(&self, moment: std::time::Instant) -> Vec<usize> {
+        self.exports
+            .lock()
+            .expect("the recorded exports are not poisoned")
+            .iter()
+            .filter(|(arrived, _)| *arrived >= moment)
+            .map(|(_, bytes)| *bytes)
+            .collect()
+    }
+}
+
+/// The batch processor's export interval the flush test sets: ten minutes, so no scheduled
+/// export runs while the server serves and only the shutdown flush sends its spans.
+#[cfg(all(unix, feature = "otlp"))]
+const EXPORT_INTERVAL_PAST_THE_TEST_MS: &str = "600000";
+
+#[cfg(all(unix, feature = "otlp"))]
+#[test]
+fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let receiver = TraceReceiver::start()?;
+    let endpoint = receiver.endpoint();
+
+    let server = ListeningForeground::start(
+        root,
+        &[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
+            ("OTEL_BSP_SCHEDULE_DELAY", EXPORT_INTERVAL_PAST_THE_TEST_MS),
+        ],
+    )?;
+    let signalled = std::time::Instant::now();
+    let (status, elapsed, stderr) = server.terminate()?;
+
+    assert!(
+        status.success(),
+        "SIGTERM runs the stop, and the process exits cleanly: {status:?}, stderr: {stderr}"
+    );
+    assert!(
+        elapsed <= STOP_EXIT_BOUND,
+        "a signalled server flushes and exits inside the stop bound: elapsed={elapsed:?}, bound={STOP_EXIT_BOUND:?}"
+    );
+    let flushed = receiver.exports_since(signalled);
+    assert!(
+        flushed.iter().any(|bytes| *bytes > 0),
+        "the export shutdown sends the spans the server closed while serving: {flushed:?}"
     );
     Ok(())
 }
