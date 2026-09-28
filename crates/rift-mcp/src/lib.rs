@@ -3,6 +3,7 @@
 mod election;
 mod failure;
 mod global;
+mod history;
 mod http;
 mod identity;
 pub mod logs;

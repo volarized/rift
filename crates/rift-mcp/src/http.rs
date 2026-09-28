@@ -214,7 +214,7 @@ pub(crate) async fn serve_http_with_storage(
     let token = mint_token()?;
     let (port, listener) = bind_loopback_listener(server_table.serving_ports())?;
     let stop = shutdown.child_token();
-    let idle = Arc::new(IdleTracker::new());
+    let idle = server.request_activity();
     if matches!(check, TokenCheck::Skipped) {
         tracing::warn!(
             component = "mcp",
@@ -627,13 +627,13 @@ struct IdleState {
 
 /// Tracks active authorized requests and the last completed activity.
 #[derive(Debug)]
-struct IdleTracker {
+pub(crate) struct IdleTracker {
     state: Mutex<IdleState>,
     changed: Notify,
 }
 
 impl IdleTracker {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(IdleState {
                 last_activity: Instant::now(),
@@ -644,7 +644,7 @@ impl IdleTracker {
     }
 
     /// Starts one authorized request. Dropping returned guard records completion.
-    fn begin(&self) -> ActiveRequest<'_> {
+    pub(crate) fn begin(&self) -> ActiveRequest<'_> {
         let mut state = self.lock_state();
         state.active_requests = state
             .active_requests
@@ -675,6 +675,27 @@ impl IdleTracker {
         (state.active_requests == 0).then_some(state.last_activity + idle_timeout)
     }
 
+    /// Waits until no authorized request is active, at most `bound`. Answers
+    /// whether the server settled; `false` means the bound passed first.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future ends the wait; it changes no state.
+    pub(crate) async fn settled(&self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.lock_state().active_requests == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return false;
+            }
+        }
+    }
+
     /// The tracked state, recovered from a poisoned lock: the stored
     /// value is plain data, valid regardless of a panicked writer.
     fn lock_state(&self) -> MutexGuard<'_, IdleState> {
@@ -686,7 +707,7 @@ impl IdleTracker {
 }
 
 /// One active authorized request. Completion is cancellation-safe.
-struct ActiveRequest<'a> {
+pub(crate) struct ActiveRequest<'a> {
     idle: &'a IdleTracker,
 }
 

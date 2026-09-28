@@ -54,6 +54,8 @@ use crate::global::{
     local_search_page, local_symbol_page, merge_patterns, merge_search, merge_symbols,
     package_patterns, package_search, package_symbols,
 };
+use crate::history::{AnalysisGate, HistoryLane};
+use crate::http::IdleTracker;
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -1312,6 +1314,13 @@ pub struct RiftMcp {
     /// The last request-time capture's stats and digests: the next capture reads only the
     /// paths whose stat moved since.
     last_capture: Arc<std::sync::Mutex<Arc<LastCapture>>>,
+    /// The authorized requests in flight, which the history task waits on before a batch
+    /// and the HTTP transport counts.
+    activity: Arc<IdleTracker>,
+    /// The history lane, absent when `[providers.history]` is off, the workspace has no
+    /// repository, or no folder takes the store; symbol history then walks git per
+    /// request.
+    history: Option<HistoryLane>,
     /// The capture a test forces in place of reading the tree, so every retry arm of the
     /// bounded reconciliation loop is reached without racing filesystem events.
     #[cfg(test)]
@@ -1407,7 +1416,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
     ) -> Result<Self, ReadError> {
-        let assembled = Self::assemble(root, limits, storage, LexicalLane::spawn).await?;
+        let assembled = Self::assemble(root, limits, storage, LexicalLane::spawn, None).await?;
         Ok(assembled.supervised().await)
     }
 
@@ -1427,6 +1436,7 @@ impl RiftMcp {
             CancellationToken,
             Arc<str>,
         ) -> LexicalLane,
+        history_gate: Option<AnalysisGate>,
     ) -> Result<AssembledServer, ReadError> {
         let identity = crate::identity::product_identity()
             .await
@@ -1444,6 +1454,14 @@ impl RiftMcp {
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
         let storage = Self::resolve_storage(&root, storage).await;
+        let (activity, history) = Self::open_history_tier(
+            &root,
+            &startup_configuration,
+            &executable_digest,
+            validation.cancellation.clone(),
+            history_gate,
+        )
+        .await;
         let SearchTier {
             acquisition,
             search_index,
@@ -1510,6 +1528,8 @@ impl RiftMcp {
             logs,
             engines,
             last_capture: Arc::default(),
+            activity,
+            history,
             #[cfg(test)]
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
@@ -1520,6 +1540,21 @@ impl RiftMcp {
             invalidations,
             context,
         })
+    }
+
+    /// Opens the history tier: the authorized requests in flight, which every transport
+    /// counts, and the history lane that waits on them before each batch.
+    async fn open_history_tier(
+        root: &Path,
+        configuration: &ConfigurationState,
+        executable_digest: &str,
+        cancellation: CancellationToken,
+        gate: Option<AnalysisGate>,
+    ) -> (Arc<IdleTracker>, Option<HistoryLane>) {
+        let activity = Arc::new(IdleTracker::new());
+        let task = (Arc::clone(&activity), cancellation, gate);
+        let history = HistoryLane::start(root, configuration, executable_digest, task).await;
+        (activity, history)
     }
 
     /// Starts the filesystem watcher over `root` on the worker pool.
@@ -1597,6 +1632,12 @@ impl RiftMcp {
     #[must_use]
     pub(crate) fn product_identity(&self) -> &ProductIdentity {
         &self.identity
+    }
+
+    /// The authorized requests in flight, which the HTTP transport counts and the
+    /// history task waits on.
+    pub(crate) fn request_activity(&self) -> Arc<IdleTracker> {
+        Arc::clone(&self.activity)
     }
 
     /// Returns owned supervisor shutdown access for transport adapters.
@@ -2535,6 +2576,7 @@ impl RiftMcp {
             languages,
             history,
         } = self.revision_read(&resolved.published)?;
+        let stored = self.history.as_ref().map(|lane| lane.stored().clone());
         self.blocking
             .run("revision workspace read", move || {
                 let reads = ReadService::at_revision_with_languages(
@@ -2546,6 +2588,9 @@ impl RiftMcp {
                     &languages,
                     history,
                 )?;
+                if let Some(stored) = &stored {
+                    reads.attach_history_store(stored);
+                }
                 operation(&reads)
             })
             .await
@@ -2600,6 +2645,9 @@ impl RiftMcp {
             .configuration
             .accepted(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&resolved.published.reads);
+        if let Some(history) = &self.history {
+            reads.attach_history_store(history.stored());
+        }
         let mut answer = self
             .blocking
             .run("current workspace read", move || operation(&reads))
@@ -4701,6 +4749,7 @@ done
             WorkspaceIndexLimits::default(),
             None,
             LexicalLane::spawn,
+            None,
         )
         .await?;
         drop(watcher);
@@ -4972,6 +5021,129 @@ done
             detail.contains("the next filesystem event retries"),
             "{detail}"
         );
+        Ok(())
+    }
+
+    /// A gate the history task meets before each commit's analysis: the first meeting
+    /// is announced, and every meeting holds its blocking thread until the test opens
+    /// the gate.
+    struct HeldAnalysis {
+        reached: Option<std::sync::mpsc::Receiver<()>>,
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl HeldAnalysis {
+        fn new() -> (Self, crate::history::AnalysisGate) {
+            let (announce, reached) = std::sync::mpsc::channel();
+            let announce = std::sync::Mutex::new(Some(announce));
+            let open = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let held = Arc::clone(&open);
+            let gate: crate::history::AnalysisGate = Arc::new(move || {
+                if let Some(announce) = announce.lock().expect("the announcer lock").take() {
+                    announce
+                        .send(())
+                        .expect("the test waits for the announcement");
+                }
+                let (lock, signal) = &*held;
+                let mut opened = lock.lock().expect("the gate lock");
+                while !*opened {
+                    opened = signal.wait(opened).expect("the gate lock");
+                }
+            });
+            (
+                Self {
+                    reached: Some(reached),
+                    open,
+                },
+                gate,
+            )
+        }
+
+        /// Waits until the task meets the gate for the first time.
+        async fn reached(&mut self) -> TestResult {
+            let reached = self
+                .reached
+                .take()
+                .ok_or("the first meeting is awaited once")?;
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(30)))
+                .await?
+                .map_err(|_| "the history task never reached its first analysis")?;
+            Ok(())
+        }
+
+        /// Opens the gate for every meeting from now on.
+        fn release(&self) {
+            let (lock, signal) = &*self.open;
+            *lock.lock().expect("the gate lock") = true;
+            signal.notify_all();
+        }
+    }
+
+    impl Drop for HeldAnalysis {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// One `get_symbol` for `beacon` with its history.
+    async fn beacon_history(server: &RiftMcp) -> TestResult<rift_protocol::read::SymbolHistory> {
+        let params = serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.get_symbol(Parameters(params)))
+            .await
+            .map_err(|_| "a history read waits on no fill")??
+            .0;
+        let hit = answer.hits.into_iter().next().ok_or("beacon answers")?;
+        Ok(hit.history.ok_or("the hit carries its history")?)
+    }
+
+    #[tokio::test]
+    async fn requests_answer_while_the_history_task_is_held_mid_batch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let (mut held, gate) = HeldAnalysis::new();
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(directory.path())?,
+            WorkspaceIndexLimits::default(),
+            None,
+            LexicalLane::spawn,
+            Some(gate),
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        held.reached().await?;
+
+        let lagging = beacon_history(&server).await?;
+        let search: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let searched = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(search)))
+            .await
+            .map_err(|_| "a search waits on no fill")??
+            .0;
+
+        assert!(
+            !lagging.complete,
+            "the store holds nothing while the task is held"
+        );
+        assert!(lagging.versions.is_empty());
+        assert!(!searched.results.is_empty(), "{searched:#?}");
+
+        held.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let filled = loop {
+            let history = beacon_history(&server).await?;
+            if history.complete {
+                break history;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the store never caught up with the served commit".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let kinds: Vec<_> = filled.versions.iter().map(|version| version.kind).collect();
+        assert_eq!(kinds, [rift_protocol::read::SymbolVersionKind::Introduced]);
+        assert_eq!(filled.versions[0].author.name, "Rift Fixture");
         Ok(())
     }
 
@@ -5687,6 +5859,7 @@ done
                     executable_digest,
                 )
             },
+            None,
         )
         .await?;
         let server = assembled.supervised().await;

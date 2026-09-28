@@ -52,6 +52,7 @@ EXPECTED_EDGES = {
     "rift-mcp -> rift-cloud-client",
     "rift-mcp -> rift-dependency",
     "rift-mcp -> rift-history",
+    "rift-mcp -> rift-history-store",
     "rift-mcp -> rift-index",
     "rift-mcp -> rift-protocol",
     "rift-mcp -> rift-ranking",
