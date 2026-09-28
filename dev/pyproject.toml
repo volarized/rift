@@ -12,7 +12,7 @@ dependencies = [
     "typer==0.27.2",
     "pydantic==2.13.5",
     "dulwich==1.2.15",
-    "starlette==1.6.0",
+    "starlette==1.7.0",
     "uvicorn==0.53.0",
 ]
 
@@ -30,8 +30,8 @@ packages = ["src/rift_dev"]
 dev = [
     "pytest==9.1.1",
     "PyYAML==6.0.3",
-    "ruff==0.16.8",
-    "ty==0.0.82",
+    "ruff==0.16.9",
+    "ty==0.0.84",
     "types-pywin32==312.0.0.20260827",
 ]
 
