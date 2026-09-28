@@ -977,6 +977,11 @@ fn failure_class_label(class: GlobalFailureClass) -> &'static str {
     }
 }
 
+// A read's context, its requested packages applied, holds at most the dependency
+// context's own bound, so every resolution request fits the entry bound the client holds
+// it to.
+const _: () = assert!(rift_dependency::PACKAGES_MAX <= rift_cloud_client::DEPENDENCY_ENTRIES_MAX);
+
 fn resolution_request(context: &DependencyContext) -> PackageResolutionRequest {
     PackageResolutionRequest {
         entries: context

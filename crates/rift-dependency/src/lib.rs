@@ -26,7 +26,8 @@ mod fixture;
 pub use bun::BunResolver;
 pub use cargo::CargoResolver;
 pub use context::{
-    ContextAnswer, Degradation, DependencyContext, InstallFolder, InstallLocation, resolve_context,
+    ContextAnswer, Degradation, Degraded, DependencyContext, InstallFolder, InstallLocation,
+    resolve_context,
 };
 pub use npm::NpmResolver;
 pub use resolver::{

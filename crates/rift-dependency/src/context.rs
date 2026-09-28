@@ -21,13 +21,50 @@ use crate::resolver::{
 };
 use crate::stdlib::{StandardLibrary, StandardLibraryAnswer};
 
-/// One thing a resolver or a standard library probe could not read.
+/// One thing a resolver or a standard library probe could not read, or the entries of
+/// one package manager a read's requested packages left no room for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Degradation {
-    /// What degraded: a resolver, or a standard library entry's probe.
-    pub resolver: ResolverName,
+    /// What degraded, as the `resolver` field of a `package_context_degraded` warning
+    /// names it.
+    pub resolver: Degraded,
     /// What could not be read, and what the context carries instead.
     pub reason: String,
+}
+
+/// What one [`Degradation`] names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Degraded {
+    /// A resolver, or a standard library entry's probe, read less than the workspace
+    /// states.
+    Resolver(ResolverName),
+    /// A read's requested packages took the place of this package manager's entries past
+    /// [`PACKAGES_MAX`]. The manager is spelled as the entries spell it, such as `pypi`.
+    Manager(String),
+}
+
+impl Degraded {
+    /// The spelling a `package_context_degraded` warning carries: the resolver's name,
+    /// or the package manager's.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Resolver(resolver) => resolver.as_str(),
+            Self::Manager(manager) => manager,
+        }
+    }
+}
+
+impl std::fmt::Display for Degraded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl From<ResolverName> for Degraded {
+    fn from(resolver: ResolverName) -> Self {
+        Self::Resolver(resolver)
+    }
 }
 
 /// Where one package the workspace depends on is installed on this machine.
@@ -154,30 +191,45 @@ impl DependencyContext {
     ///
     /// A requested version therefore replaces every version the workspace pins for that
     /// package, a `path` or `git` entry included, and a package the workspace lacks is
-    /// added. Two identical requested entries merge into one. The work is linear in the
-    /// entries held plus the ones requested, so the result may pass [`PACKAGES_MAX`] by
-    /// the requested count alone; the global API client refuses a request past its
-    /// entry bound, and the read then carries the typed global warning.
+    /// added. Two identical requested entries merge into one.
+    ///
+    /// The result stays within [`PACKAGES_MAX`], the entry bound the global API client
+    /// holds a resolution request to. The requested entries always stay, since a read
+    /// names at most `REQUESTED_PACKAGES_MAX` of them, and past the bound the held
+    /// entries sorted last leave in their place: the standard library entries first, as
+    /// they are the last the context itself takes. Each package manager whose entries
+    /// left gets one [`Degraded::Manager`] degradation counting them. The work is linear
+    /// in the entries held plus the ones requested.
     #[must_use]
     pub fn with_requested(&self, requested: &[RequestedPackage]) -> Self {
         let named: BTreeSet<(&str, &str)> = requested
             .iter()
             .map(|package| (package.manager.as_str(), package.name.as_str()))
             .collect();
-        let mut entries: Vec<PackageContextEntry> = self
+        let mut added: Vec<PackageContextEntry> = requested
+            .iter()
+            .map(RequestedPackage::context_entry)
+            .collect();
+        added.sort();
+        added.dedup();
+        let mut kept: Vec<PackageContextEntry> = self
             .entries
             .iter()
             .filter(|entry| !named.contains(&(entry.manager.as_str(), entry.name.as_str())))
             .cloned()
-            .chain(requested.iter().map(RequestedPackage::context_entry))
             .collect();
+        let room = PACKAGES_MAX.saturating_sub(added.len());
+        let displaced = kept.split_off(room.min(kept.len()));
+        let mut degradations = self.degradations.clone();
+        degradations.extend(displacement_degradations(&kept, &displaced));
+        let mut entries = kept;
+        entries.append(&mut added);
         entries.sort();
-        entries.dedup();
         Self {
             entries,
             install_folders: self.install_folders.clone(),
             inputs: self.inputs.clone(),
-            degradations: self.degradations.clone(),
+            degradations,
             libraries: self.libraries.clone(),
         }
     }
@@ -204,13 +256,49 @@ impl DependencyContext {
         self.locate(answer.install_folders);
         self.inputs.extend(answer.inputs);
         self.libraries.extend(answer.libraries);
-        self.degradations.extend(
-            answer
-                .degradations
-                .into_iter()
-                .map(|(resolver, reason)| Degradation { resolver, reason }),
-        );
+        self.degradations
+            .extend(
+                answer
+                    .degradations
+                    .into_iter()
+                    .map(|(resolver, reason)| Degradation {
+                        resolver: resolver.into(),
+                        reason,
+                    }),
+            );
     }
+}
+
+// Every requested entry stays in `with_requested`, so the read's own bound must leave
+// room for the context beside it.
+const _: () = assert!(rift_protocol::dependencies::REQUESTED_PACKAGES_MAX < PACKAGES_MAX);
+
+/// One degradation per package manager whose entries `displaced` holds, counting them
+/// against the entries of that manager the read `kept`, in manager order.
+fn displacement_degradations(
+    kept: &[PackageContextEntry],
+    displaced: &[PackageContextEntry],
+) -> Vec<Degradation> {
+    let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for entry in displaced {
+        counts.entry(entry.manager.as_str()).or_default().1 += 1;
+    }
+    for entry in kept {
+        if let Some((kept_count, _)) = counts.get_mut(entry.manager.as_str()) {
+            *kept_count += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(manager, (kept_count, dropped_count))| Degradation {
+            resolver: Degraded::Manager(manager.to_owned()),
+            reason: format!(
+                "{dropped_count} of {} packages were not reported: at most {PACKAGES_MAX} \
+                 are carried per read, the requested packages first",
+                kept_count + dropped_count
+            ),
+        })
+        .collect()
 }
 
 /// Reads the static dependency context of one workspace.
@@ -322,15 +410,14 @@ impl ContextMerge {
         }
         self.install_folders.extend(answer.install_folders);
         self.inputs.extend(answer.inputs);
-        self.degradations.extend(
-            answer
-                .degradations
-                .into_iter()
-                .map(|reason| Degradation { resolver, reason }),
-        );
+        self.degradations
+            .extend(answer.degradations.into_iter().map(|reason| Degradation {
+                resolver: resolver.into(),
+                reason,
+            }));
         if dropped_count > 0 {
             self.degradations.push(Degradation {
-                resolver,
+                resolver: resolver.into(),
                 reason: format!(
                     "{dropped_count} of {offered_count} packages were not reported: at most \
                      {PACKAGES_MAX} are carried per workspace"
@@ -599,7 +686,7 @@ mod tests {
         assert_eq!(
             context.degradations(),
             [Degradation {
-                resolver: ResolverName::Cargo,
+                resolver: ResolverName::Cargo.into(),
                 reason: "probe.toml: no probe.lock beside it".to_owned(),
             }]
         );
@@ -669,7 +756,7 @@ mod tests {
         assert_eq!(
             context.degradations(),
             [Degradation {
-                resolver: ResolverName::Cargo,
+                resolver: ResolverName::Cargo.into(),
                 reason: format!(
                     "2 of {} packages were not reported: at most {PACKAGES_MAX} are carried \
                      per workspace",
@@ -867,5 +954,104 @@ mod tests {
             ["serde@>=0 Canonical", "serde@1.0.200 Canonical"]
         );
         assert_eq!(context.with_requested(&[]), context);
+    }
+
+    /// A context `count` entries short of the bound, held by the probe resolver, with the
+    /// standard library entry `stdlib/rust` sorted last.
+    fn context_short_of_the_bound_by(count: usize) -> DependencyContext {
+        let mut entries: Vec<PackageContextEntry> = (0..PACKAGES_MAX - 1 - count)
+            .map(|index| pinned(&format!("pkg-{index:05}"), "1.0.0"))
+            .collect();
+        entries.push(PackageContextEntry::new(
+            "stdlib",
+            "rust",
+            PackageSelector::Requirement(">=0".to_owned()),
+            PackageAvailability::Canonical,
+        ));
+        resolve(
+            &ProbeResolver {
+                entries,
+                degradations: Vec::new(),
+            },
+            &[],
+        )
+    }
+
+    /// Requested packages that fill the context exactly to its bound displace nothing.
+    #[test]
+    fn test_requested_packages_at_the_bound_displace_nothing() {
+        let context = context_short_of_the_bound_by(1);
+
+        let read = context.with_requested(&[requested("anyhow", None)]);
+
+        assert_eq!(read.entries().len(), PACKAGES_MAX);
+        assert!(!read.is_degraded(), "{:?}", read.degradations());
+    }
+
+    /// Past the bound the requested packages stay and the held entries sorted last leave,
+    /// the standard library entry first, with one degradation per package manager whose
+    /// entries left.
+    #[test]
+    fn test_requested_packages_past_the_bound_displace_the_entries_sorted_last() {
+        let context = context_short_of_the_bound_by(0);
+        assert_eq!(context.entries().len(), PACKAGES_MAX);
+
+        let read = context.with_requested(&[
+            requested("anyhow", None),
+            requested("pkg-00003", Some("2.0.0")),
+            requested("zlib", Some("1.3.1")),
+        ]);
+
+        assert_eq!(read.entries().len(), PACKAGES_MAX);
+        let spelled = spelled(&read);
+        for kept in [
+            "anyhow@>=0 Canonical",
+            "pkg-00003@2.0.0 Canonical",
+            "zlib@1.3.1 Canonical",
+        ] {
+            assert!(spelled.iter().any(|entry| entry == kept), "{kept}");
+        }
+        let last_held = format!("pkg-{:05}", PACKAGES_MAX - 2);
+        assert!(
+            read.entries()
+                .iter()
+                .all(|entry| entry.manager != "stdlib" && entry.name != last_held),
+            "the standard library entry and the last probe entry leave"
+        );
+        assert_eq!(
+            read.degradations(),
+            [
+                Degradation {
+                    resolver: Degraded::Manager("probe".to_owned()),
+                    reason: format!(
+                        "1 of {} packages were not reported: at most {PACKAGES_MAX} are \
+                         carried per read, the requested packages first",
+                        PACKAGES_MAX - 2
+                    ),
+                },
+                Degradation {
+                    resolver: Degraded::Manager("stdlib".to_owned()),
+                    reason: format!(
+                        "1 of 1 packages were not reported: at most {PACKAGES_MAX} are \
+                         carried per read, the requested packages first"
+                    ),
+                },
+            ]
+        );
+        assert!(
+            !context.is_degraded(),
+            "the snapshot's own context is left as it was"
+        );
+    }
+
+    /// A degradation spells a resolver by its name and a displaced package manager as the
+    /// entries spell it.
+    #[test]
+    fn test_degraded_spells_the_resolver_or_the_manager() {
+        assert_eq!(
+            Degraded::from(ResolverName::StdlibRust).as_str(),
+            "stdlib/rust"
+        );
+        assert_eq!(Degraded::Manager("pypi".to_owned()).to_string(), "pypi");
     }
 }
