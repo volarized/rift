@@ -1914,20 +1914,15 @@ pub(crate) mod tests {
     fn the_context_is_reread_when_a_language_gains_its_first_path_or_loses_its_last() -> TestResult
     {
         let directory = TempDir::new()?;
-        fs::write(
-            directory.path().join("Cargo.toml"),
-            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )?;
+        let manifest = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        fs::write(directory.path().join("Cargo.toml"), manifest)?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(directory.path().join("src/extra.rs"), "pub fn extra() {}\n")?;
-        let service = ReadService::build(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let (limits, visibility) = (WorkspaceIndexLimits::default(), SourceVisibility::default());
+        let text = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text, history)?;
         let digests = |paths: &[(&str, &[u8])]| {
             rift_index::WorkspaceDigests::new(paths.iter().map(|(path, bytes)| {
                 (
@@ -2006,12 +2001,8 @@ pub(crate) mod tests {
             let languages = LanguageFileSelections::from(&configuration);
             let text_inclusion = rift_core::TextFileInclusion::default();
             let limits = WorkspaceIndexLimits::default();
-            Ok(reads_with(
-                directory.path(),
-                limits,
-                &text_inclusion,
-                &languages,
-            )?)
+            let reads = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
+            Ok(reads)
         };
         let named = |service: &ReadService| -> Vec<String> {
             service

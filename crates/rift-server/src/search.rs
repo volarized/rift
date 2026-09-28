@@ -3817,15 +3817,14 @@ impl Tower {
     #[test]
     fn resolve_ranked_hits_resolves_a_project_declaration_and_skips_a_package_unit() -> TestResult {
         let (_directory, service) = project_fixture("pub fn beacon() {}\n")?;
+        let package_unit = "rift://source/cargo/helper@0.1.0/src/lib.rs#helper_beacon";
         let input = lexical_input(vec![
             (
                 declaration_identity("src/lib.rs", "beacon")?,
                 FieldSet::of(SearchableField::Name),
             ),
             (
-                DocumentIdentity::new(
-                    "rift://source/cargo/helper@0.1.0/src/lib.rs#helper_beacon".to_owned(),
-                )?,
+                DocumentIdentity::new(package_unit.to_owned())?,
                 FieldSet::of(SearchableField::QualifiedName),
             ),
         ]);
@@ -4380,11 +4379,8 @@ impl Tower {
     fn search_global_scope_answers_no_project_hit_and_all_answers_the_project() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
         let request = |scope: &str| -> TestResult<SearchParams> {
-            Ok(serde_json::from_value(json!({
-                "query": "beacon",
-                "scope": scope,
-                "target": "symbol"
-            }))?)
+            let request = json!({"query": "beacon", "scope": scope, "target": "symbol"});
+            Ok(serde_json::from_value(request)?)
         };
 
         let global = service.search(&request("global")?, &StoreAnswer::identifier_only())?;
@@ -4508,9 +4504,8 @@ impl Tower {
                 "{request}: {error}"
             );
         }
-        let params: SearchParams = serde_json::from_value(
-            json!({"query": "beacon", "scope": "all", "packages": packages}),
-        )?;
+        let request = json!({"query": "beacon", "scope": "all", "packages": packages});
+        let params: SearchParams = serde_json::from_value(request)?;
         let answer = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(!answer.results.is_empty(), "{answer:?}");
         Ok(())
