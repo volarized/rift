@@ -1490,18 +1490,19 @@ async fn test_lexical_search_index_apply_of_one_change_twice_leaves_one_document
     Ok(())
 }
 
-/// Runs FTS5's own consistency check, comparing the index with the typed rows it reads:
-/// "If the value 1 is inserted into the rank column, the index is also compared to the
-/// content table" (<https://www.sqlite.org/fts5.html>).
+/// Runs FTS5's own consistency check on the word index and the trigram index, comparing
+/// each with the typed rows it reads: "If the value 1 is inserted into the rank column,
+/// the index is also compared to the content table" (<https://www.sqlite.org/fts5.html>).
 async fn assert_index_matches_rows(path: &Path) -> TestResult {
     let probe = open_concurrent_probe(path).await?;
     let mut connection = probe.connection().await?;
-    toasty::sql::statement(
-        "INSERT INTO lexical_documents_fts(lexical_documents_fts, rank) \
-         VALUES('integrity-check', 1)",
-    )
-    .exec(&mut connection)
-    .await?;
+    for index in ["lexical_documents_fts", "lexical_documents_trigram"] {
+        toasty::sql::statement(format!(
+            "INSERT INTO {index}({index}, rank) VALUES('integrity-check', 1)"
+        ))
+        .exec(&mut connection)
+        .await?;
+    }
     Ok(())
 }
 

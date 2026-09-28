@@ -135,16 +135,17 @@ async fn untouched_row_ids(
     Ok(ids)
 }
 
-/// FTS5's own check of the word index against the rows it reads.
+/// FTS5's own check of the word index and the trigram index against the rows they read.
 async fn assert_index_matches_rows(path: &Path) -> TestResult {
     let database = probe(path).await?;
     let mut connection = database.connection().await?;
-    toasty::sql::statement(
-        "INSERT INTO lexical_documents_fts(lexical_documents_fts, rank) \
-         VALUES('integrity-check', 1)",
-    )
-    .exec(&mut connection)
-    .await?;
+    for index in ["lexical_documents_fts", "lexical_documents_trigram"] {
+        toasty::sql::statement(format!(
+            "INSERT INTO {index}({index}, rank) VALUES('integrity-check', 1)"
+        ))
+        .exec(&mut connection)
+        .await?;
+    }
     Ok(())
 }
 

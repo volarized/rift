@@ -24,8 +24,14 @@
 //! row's index entries with the `'delete'` command while the typed row still
 //! holds the values they were indexed from, and indexes a typed row only after
 //! it is written.
+//!
+//! A second external-content index, `lexical_documents_trigram`, holds every three
+//! characters of the file rows' text under [`rift_ranking::TRIGRAM_TOKENIZER`], so a
+//! regex pattern's prefilter selects the rows that could hold a match. It adds no copy of
+//! the text, and every write keeps it in step with the word index inside the same
+//! transaction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -39,8 +45,8 @@ use rift_protocol::configuration::{
 use rift_ranking::{
     BodyTerms, CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
     FieldSet, FileRowFrequencies, IndexCapabilities, IndexDocument, IndexReader, ParsedQuery,
-    PublicationFormat, QueryPhase, RankRequest, RankedIdentity, RankingError, RankingFault,
-    RankingInput, RankingInputKind, RankingInputSet, RankingViolation, ReaderFuture,
+    Prefilter, PublicationFormat, QueryPhase, RankRequest, RankedIdentity, RankingError,
+    RankingFault, RankingInput, RankingInputKind, RankingInputSet, RankingViolation, ReaderFuture,
     SearchableField,
 };
 use serde::Serialize;
@@ -255,6 +261,16 @@ signature, documentation, file_content, content='lexical_documents', content_row
 tokenize='unicode61 remove_diacritics 0')
 -- #[toasty::breakpoint]
 CREATE VIRTUAL TABLE lexical_documents_vocabulary USING fts5vocab('lexical_documents_fts', 'col')",
+    ),
+    MigrationFile::new(
+        10,
+        "trigram_index",
+        "CREATE VIRTUAL TABLE lexical_documents_trigram USING fts5(file_content, \
+content='lexical_documents', content_rowid='id', tokenize='trigram', detail='none', \
+columnsize=0)
+-- #[toasty::breakpoint]
+INSERT INTO lexical_documents_trigram(rowid, file_content) \
+SELECT id, file_content FROM lexical_documents WHERE file_content IS NOT NULL",
     ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
@@ -970,14 +986,20 @@ fn searchable_columns() -> String {
     SearchableField::ALL.map(SearchableField::column).join(", ")
 }
 
-/// Deletes every unit filed under one path, from the FTS index and the typed table alike,
-/// and forgets the digest recorded for the path.
+/// The rows the trigram index holds: every row that stores text. A symbol row holds none,
+/// and `columnsize=0` is what lets the index skip it: under the default, FTS5's
+/// `integrity-check` counts every content row and reports the table malformed.
+const TRIGRAM_ROWS: &str = "file_content IS NOT NULL";
+
+/// Deletes every unit filed under one path, from both FTS indexes and the typed table
+/// alike, and forgets the digest recorded for the path.
 ///
 /// The index entries go first, through the FTS5 `'delete'` command, while the typed rows
 /// still hold the values they were indexed from: the command "must match the values
 /// currently stored in the table" or "the results may be unpredictable"
 /// (<https://www.sqlite.org/fts5.html>). The path index finds the rows, so the work is one
-/// lookup per path and one delete per unit, never a scan of the FTS table.
+/// lookup per path and one delete per unit, never a scan of an FTS table. The trigram
+/// index holds the file rows alone, so its `'delete'` names those rows alone.
 async fn delete_path_units(
     executor: &mut dyn Executor,
     path: &ProjectPath,
@@ -986,6 +1008,15 @@ async fn delete_path_units(
     toasty::sql::statement(format!(
         "INSERT INTO lexical_documents_fts(lexical_documents_fts, rowid, {columns}) \
          SELECT 'delete', id, {columns} FROM lexical_documents WHERE path = ?1"
+    ))
+    .bind(path.as_str().to_owned())
+    .exec(&mut *executor)
+    .await
+    .map_err(storage_error)?;
+    toasty::sql::statement(format!(
+        "INSERT INTO lexical_documents_trigram(lexical_documents_trigram, rowid, file_content) \
+         SELECT 'delete', id, file_content FROM lexical_documents \
+         WHERE path = ?1 AND {TRIGRAM_ROWS}"
     ))
     .bind(path.as_str().to_owned())
     .exec(&mut *executor)
@@ -1012,6 +1043,12 @@ async fn delete_path_units(
 async fn delete_every_unit(executor: &mut dyn Executor) -> Result<(), LexicalIndexError> {
     toasty::sql::statement(
         "INSERT INTO lexical_documents_fts(lexical_documents_fts) VALUES('delete-all')",
+    )
+    .exec(&mut *executor)
+    .await
+    .map_err(storage_error)?;
+    toasty::sql::statement(
+        "INSERT INTO lexical_documents_trigram(lexical_documents_trigram) VALUES('delete-all')",
     )
     .exec(&mut *executor)
     .await
@@ -1174,13 +1211,13 @@ async fn single_i64(
 }
 
 /// Writes each document's typed row, then indexes every row this call wrote in one
-/// statement.
+/// statement per index.
 ///
 /// The typed row and the index entry carry the same fields because the index reads them
 /// from the typed row: a column filled in one and absent from the other would rank a
 /// document the reader cannot then describe. Indexing the batch's rows together, selected
 /// by the ids they took above [`last_unit_id`], hands FTS5 one set-based insert rather
-/// than one statement per document.
+/// than one statement per document. The trigram index takes the file rows among them.
 async fn insert_documents(
     executor: &mut dyn Executor,
     documents: &[IndexDocument],
@@ -1193,6 +1230,14 @@ async fn insert_documents(
     toasty::sql::statement(format!(
         "INSERT INTO lexical_documents_fts(rowid, {columns}) \
          SELECT id, {columns} FROM lexical_documents WHERE id > ?1"
+    ))
+    .bind(last)
+    .exec(&mut *executor)
+    .await
+    .map_err(storage_error)?;
+    toasty::sql::statement(format!(
+        "INSERT INTO lexical_documents_trigram(rowid, file_content) \
+         SELECT id, file_content FROM lexical_documents WHERE id > ?1 AND {TRIGRAM_ROWS}"
     ))
     .bind(last)
     .exec(executor)
@@ -1464,6 +1509,166 @@ fn lexical_search_column_types() -> Vec<Type> {
     ];
     types.extend(SearchableField::ALL.map(|_| Type::F64));
     types
+}
+
+/// One file a regex pattern's prefilter selected, and the spans of it to verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternCandidate {
+    path: ProjectPath,
+    spans: Vec<Range<u64>>,
+}
+
+impl PatternCandidate {
+    /// The file the selected rows belong to.
+    #[must_use]
+    pub const fn path(&self) -> &ProjectPath {
+        &self.path
+    }
+
+    /// The bytes of the file each selected row holds, in file order, or none when the
+    /// whole file is the candidate: a match holding a line feed may cross two rows.
+    #[must_use]
+    pub fn spans(&self) -> &[Range<u64>] {
+        &self.spans
+    }
+}
+
+/// The files one pattern's prefilter selected from the trigram index, or the bound the
+/// selection stopped at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatternCandidates {
+    candidates: Vec<PatternCandidate>,
+    truncated_at: Option<u32>,
+}
+
+impl PatternCandidates {
+    /// The selected files, in project-path order.
+    #[must_use]
+    pub fn candidates(&self) -> &[PatternCandidate] {
+        &self.candidates
+    }
+
+    /// The row bound the selection stopped at, when the index held more rows than it let
+    /// the selection read. The candidates are then a prefix of the selection, and a
+    /// caller refuses rather than answer from them.
+    #[must_use]
+    pub const fn truncated_at(&self) -> Option<u32> {
+        self.truncated_at
+    }
+
+    /// The selected rows grouped by file, from rows in any order.
+    fn from_rows(
+        mut rows: Vec<(ProjectPath, Option<Range<u64>>)>,
+        truncated_at: Option<u32>,
+    ) -> Self {
+        rows.sort_by(|(left, left_span), (right, right_span)| {
+            left.cmp(right)
+                .then_with(|| span_start(left_span.as_ref()).cmp(&span_start(right_span.as_ref())))
+        });
+        let mut candidates: Vec<PatternCandidate> = Vec::new();
+        for (path, span) in rows {
+            match candidates.last_mut() {
+                Some(last) if last.path == path => last.spans.extend(span),
+                _ => candidates.push(PatternCandidate {
+                    path,
+                    spans: span.into_iter().collect(),
+                }),
+            }
+        }
+        Self {
+            candidates,
+            truncated_at,
+        }
+    }
+}
+
+fn span_start(span: Option<&Range<u64>>) -> u64 {
+    span.map_or(0, |span| span.start)
+}
+
+/// The trigram rows `expression` selects, at most `rows_max` of them: each row's file and
+/// the bytes of the file it holds. Reads one row past the bound, and answers `None` when
+/// the index held that row. The read carries no order, so the bound cuts before any sort.
+///
+/// Only a row whose text is the slice of its file starting at `byte_offset` answers. A
+/// notebook cell's row holds the cell's source rather than the file's bytes, records no
+/// offset, and never selects its file: a caller verifies a notebook whole.
+async fn trigram_rows(
+    executor: &mut dyn Executor,
+    expression: &str,
+    rows_max: u32,
+) -> Result<Option<Vec<(ProjectPath, Range<u64>)>>, LexicalIndexError> {
+    let rows = toasty::sql::query(
+        "SELECT lexical_documents.path, lexical_documents.byte_offset, \
+         lexical_documents.byte_length \
+         FROM lexical_documents_trigram \
+         JOIN lexical_documents ON lexical_documents.id = lexical_documents_trigram.rowid \
+         WHERE lexical_documents_trigram MATCH ?1 \
+         AND lexical_documents.byte_offset IS NOT NULL LIMIT ?2",
+    )
+    .bind(expression.to_owned())
+    .bind(i64::from(rows_max) + 1)
+    .column_types([Type::String, Type::I64, Type::I64])
+    .exec(executor)
+    .await
+    .map_err(storage_error)?;
+    if rows.len() > bound_as_usize(rows_max) {
+        return Ok(None);
+    }
+    rows.iter()
+        .map(decode_trigram_row)
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// One trigram row as its file and the bytes of the file it holds.
+fn decode_trigram_row(row: &Value) -> Result<(ProjectPath, Range<u64>), LexicalIndexError> {
+    let Value::Record(record) = row else {
+        unreachable!("trigram row must be a record: row={row:?}");
+    };
+    let [Value::String(path), Value::I64(offset), Value::I64(length)] = record.as_slice() else {
+        unreachable!("trigram row must match its declared column types: row={row:?}");
+    };
+    let path = ProjectPath::new(path.clone()).map_err(|source| {
+        lexical_error_caused_by(LexicalIndexViolation::StoredPathInvalid, None, source)
+    })?;
+    Ok((path, stored_file_range(*offset, *length)?))
+}
+
+/// The files `prefilter` selects when its members may sit in different rows of one file:
+/// one `MATCH` per literal, the literals' files combined as the formula combines them.
+/// Every literal's read counts against one `rows_max` budget.
+async fn literal_candidates(
+    executor: &mut dyn Executor,
+    prefilter: &Prefilter,
+    rows_max: u32,
+) -> Result<PatternCandidates, LexicalIndexError> {
+    let mut remaining = rows_max;
+    let mut holding: BTreeMap<&BTreeSet<String>, BTreeSet<ProjectPath>> = BTreeMap::new();
+    for literal in prefilter.literals() {
+        let expression = Prefilter::literal_expression(literal);
+        let Some(rows) = trigram_rows(&mut *executor, &expression, remaining).await? else {
+            return Ok(PatternCandidates {
+                candidates: Vec::new(),
+                truncated_at: Some(rows_max),
+            });
+        };
+        remaining -= u32::try_from(rows.len()).unwrap_or(remaining);
+        holding.insert(literal, rows.into_iter().map(|(path, _)| path).collect());
+    }
+    let files: BTreeSet<&ProjectPath> = holding.values().flatten().collect();
+    let rows = files
+        .into_iter()
+        .filter(|path| {
+            prefilter.accepts_literals(&|literal| {
+                holding
+                    .get(literal)
+                    .is_some_and(|paths| paths.contains(*path))
+            })
+        })
+        .map(|path| (path.clone(), None))
+        .collect();
+    Ok(PatternCandidates::from_rows(rows, None))
 }
 
 /// What one change set does to the lexical index.
@@ -2148,6 +2353,59 @@ impl LexicalSearchIndex {
         )))
     }
 
+    /// The files a regex pattern's prefilter selects from the trigram index, for the tree
+    /// stamped `tree_revision`, in project-path order.
+    ///
+    /// A `line_bound` pattern matches inside one line, and a line sits inside one row,
+    /// since a chunk packs whole lines: one `MATCH` of the whole formula selects the rows,
+    /// and each candidate carries the spans of its selected rows. A formula nested past
+    /// [`rift_ranking::ROW_EXPRESSION_DEPTH_MAX`], and any pattern that may cross a line,
+    /// runs one `MATCH` per literal and combines their files instead, each file a whole
+    /// candidate. At most `rows_max` rows are read, counted over every `MATCH` the formula
+    /// runs; past it the answer says so and carries no candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when a stored row fails to decode, or on storage
+    /// failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the transaction is read-only.
+    pub async fn pattern_candidates(
+        &self,
+        tree_revision: &str,
+        prefilter: &Prefilter,
+        line_bound: bool,
+        rows_max: u32,
+    ) -> Result<RevisionScoped<PatternCandidates>, LexicalIndexError> {
+        let mut connection = self.database.connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let stored = stored_stamp(&mut transaction).await?;
+        if let Some(scoped) = stamp_scope(stored, tree_revision) {
+            return Ok(scoped);
+        }
+        let row_expression = prefilter.row_expression().filter(|_| line_bound);
+        let candidates = match row_expression {
+            Some(expression) => {
+                match trigram_rows(&mut transaction, &expression, rows_max).await? {
+                    Some(rows) => PatternCandidates::from_rows(
+                        rows.into_iter()
+                            .map(|(path, span)| (path, Some(span)))
+                            .collect(),
+                        None,
+                    ),
+                    None => PatternCandidates {
+                        candidates: Vec::new(),
+                        truncated_at: Some(rows_max),
+                    },
+                }
+            }
+            None => literal_candidates(&mut transaction, prefilter, rows_max).await?,
+        };
+        Ok(RevisionScoped::Matched(candidates))
+    }
+
     /// Runs the full-text ranking as one fusion input, best first.
     ///
     /// The input carries the identities in rank order together with the
@@ -2337,7 +2595,7 @@ mod tests {
     use super::{
         LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault,
         LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch,
-        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, checked_byte_length,
+        LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, TRIGRAM_ROWS, checked_byte_length,
         decode_lexical_match, decode_recorded, isolated_weights, lexical_error,
         lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
         project_location, rank_weights, require_pragma_row, searchable_columns,
@@ -2700,6 +2958,38 @@ mod tests {
             .expect("the corpus migration must exist")
             .sql()
             .replace('\n', " ")
+    }
+
+    /// The trigram index is declared over the file text alone, under the tokenizer the
+    /// prefilter's trigram rule ports, and the migration fills it from exactly the rows
+    /// every later write indexes.
+    #[test]
+    fn test_the_trigram_migration_indexes_the_file_rows_under_the_ported_tokenizer() {
+        let sql = MIGRATION_FILES
+            .iter()
+            .find(|file| file.name() == "trigram_index")
+            .expect("the trigram migration must exist")
+            .sql()
+            .replace('\n', " ");
+        let declared = sql
+            .split_once("USING fts5(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(columns, _)| columns.to_owned())
+            .expect("the migration must declare one FTS5 virtual table");
+        for clause in [
+            "file_content,".to_owned(),
+            "content='lexical_documents'".to_owned(),
+            "content_rowid='id'".to_owned(),
+            format!("tokenize='{}'", rift_ranking::TRIGRAM_TOKENIZER),
+            "detail='none'".to_owned(),
+            "columnsize=0".to_owned(),
+        ] {
+            assert!(declared.contains(&clause), "{clause} in {declared}");
+        }
+        assert!(
+            sql.ends_with(&format!("WHERE {TRIGRAM_ROWS}")),
+            "the fill selects the rows every write indexes: {sql}"
+        );
     }
 
     #[test]

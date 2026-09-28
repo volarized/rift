@@ -24,12 +24,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rift_core::ProjectPath;
 use rift_index::{DatabasePool, WorkspaceDatabase};
 use rift_index::{
-    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalSearchIndex, RevisionScoped,
-    StoredVector, VectorStore,
+    LexicalChange, LexicalIndexError, LexicalIndexLimits, LexicalSearchIndex, PatternCandidates,
+    RevisionScoped, StoredVector, VectorStore,
 };
 use rift_ranking::{
     BodyTerms, DocumentIdentity, DocumentLocation, FieldSet, FileRowFrequencies, IndexDocument,
-    ParsedQuery, QueryPhase, RankedIdentity, RankingInput, RankingInputKind, SearchableField,
+    ParsedQuery, Prefilter, QueryPhase, RankedIdentity, RankingInput, RankingInputKind,
+    SearchableField,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
@@ -882,6 +883,29 @@ impl SearchIndex {
     ) -> Result<RevisionScoped<FileRowFrequencies>, SearchError> {
         self.lexical
             .file_row_frequencies(tree_revision, terms)
+            .await
+            .map_err(store_failed)
+    }
+
+    /// The files a regex pattern's prefilter selects from the lexical tier's trigram index,
+    /// for the tree stamped `tree_revision`; see [`LexicalSearchIndex::pattern_candidates`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the store reads in one read-only transaction.
+    pub async fn pattern_candidates(
+        &self,
+        tree_revision: &str,
+        prefilter: &Prefilter,
+        line_bound: bool,
+        rows_max: u32,
+    ) -> Result<RevisionScoped<PatternCandidates>, SearchError> {
+        self.lexical
+            .pattern_candidates(tree_revision, prefilter, line_bound, rows_max)
             .await
             .map_err(store_failed)
     }
