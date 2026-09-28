@@ -162,8 +162,10 @@ reports the rest as a degradation. A read whose `scope` reaches packages carries
 the warning reads `620 of 876 package.json manifests were not read: at most 256 are read per
 workspace`.
 
-Each readable project file becomes a [`SourceUnit`](/docs/developer/protocol/reference#SourceUnit)
-in the source catalog, and a package file the global index answers from takes the same shape. Its
+Each readable project file becomes a source unit in the source catalog, named by a
+[`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) such as
+`rift://source/project/src/lib.rs`; a package file the global index answers from takes the same
+form. Its
 `location` says whether it belongs to the project, a dependency, the standard library, or an
 external source. Its `source_kind` separately says whether a human authored it or a tool
 generated it.
