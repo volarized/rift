@@ -114,6 +114,7 @@ url = "=2.5.8"
 tree-sitter-rst = "=0.2.0"
 validator = { version = "0.21", features = ["derive"] }
 waitpid-any = "=0.3.0"
+which = "=8.0.6"
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation"] }
 tree-sitter = "=0.26.13"
 tree-sitter-javascript = "=0.25.0"
