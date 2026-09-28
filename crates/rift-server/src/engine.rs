@@ -909,7 +909,7 @@ impl EngineSlot {
     /// does not hold a walk back. The waits between attempts follow the
     /// retry table and continue past its attempt bound up to `deadline`, so a
     /// spent wait ends inside the loop: `finish` runs, the session stays
-    /// live, and the answer is [`OutgoingAnswer::Unsettled`] instead of a
+    /// live, and the answer is `OutgoingAnswer::Unsettled` instead of a
     /// dropped request that discards the session.
     ///
     /// # Errors
