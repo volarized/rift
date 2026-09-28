@@ -35,3 +35,6 @@ tree-sitter-rst = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
