@@ -58,7 +58,7 @@ pub enum MatchedField {
     Path,
     /// A relationship traversal reached the hit.
     Relationship,
-    /// A comparison of two committed revisions found the declaration changed.
+    /// A comparison `change` named found the declaration changed.
     Change,
 }
 
@@ -227,11 +227,11 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64, max = 2_u64))]
     pub distance: Option<u64>,
-    /// How the declaration differs between the two revisions `change` named, present when
-    /// the comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`,
-    /// and `source` read the head revision, except for a removed declaration, which keeps
-    /// its base-side identity, path, range, and source - the head revision no longer holds
-    /// it. A change hit carries no `score`, since a comparison ranks nothing.
+    /// How the declaration differs between the two sides `change` named, present when the
+    /// comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`, and
+    /// `source` read the head side, except for a removed declaration, which keeps its
+    /// base-side identity, path, range, and source - the head side no longer holds it. A
+    /// change hit carries no `score`, since a comparison ranks nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<SymbolChange>,
 }
@@ -288,29 +288,65 @@ pub const SEARCH_CHANGE_HEAD_DEFAULT: &str = "HEAD";
 /// paths that fit and warns `change_truncated`.
 pub const SEARCH_CHANGE_PATHS_MAX: u64 = 512;
 
-/// Two committed revisions to compare. The answer is the declarations the two revisions
-/// hold differently: `base` is the revision compared from, `head` the revision compared
-/// to. Both sides name a commit; uncommitted working-tree bytes take part in no
-/// comparison.
+/// Two sides to compare. The answer is the declarations the two sides hold differently:
+/// `base` is the committed revision compared from, `head` the revision or the working tree
+/// compared to.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("examples" = [
     {
         "base": "main",
         "head": "HEAD"
+    },
+    {
+        "base": "HEAD",
+        "head": {"kind": "working_tree"}
     }
 ]))]
 pub struct SearchChange {
     /// The revision compared from - a branch, tag, or commit id as the workspace's version
     /// control spells it.
     pub base: RevisionId,
-    /// The revision compared to, spelled the same way. Omitted, `HEAD`.
+    /// The side compared to: a revision spelled the same way, or the working tree.
+    /// Omitted, `HEAD`.
     #[serde(default = "default_search_change_head")]
-    pub head: RevisionId,
+    pub head: ChangeHead,
 }
 
-fn default_search_change_head() -> RevisionId {
-    RevisionId(SEARCH_CHANGE_HEAD_DEFAULT.to_owned())
+fn default_search_change_head() -> ChangeHead {
+    ChangeHead::Revision(RevisionId(SEARCH_CHANGE_HEAD_DEFAULT.to_owned()))
+}
+
+/// The side a comparison compares to: a committed revision, or the working tree with its
+/// uncommitted edits.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ChangeHead {
+    /// A branch, tag, or commit id as the workspace's version control spells it.
+    Revision(RevisionId),
+    /// The working tree as the current index serves it: staged and unstaged edits, files
+    /// git does not track, and deleted files.
+    Tree(ChangeTree),
+}
+
+impl ChangeHead {
+    /// The revision this side names, or `None` for the working tree.
+    #[must_use]
+    pub const fn revision(&self) -> Option<&RevisionId> {
+        match self {
+            Self::Revision(revision) => Some(revision),
+            Self::Tree(_) => None,
+        }
+    }
+}
+
+/// A comparison side that names a tree rather than a revision, spelled
+/// `{"kind": "working_tree"}`: no revision spelling can collide with it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeTree {
+    /// The working tree, uncommitted edits included.
+    WorkingTree,
 }
 
 /// How one declaration differs between the two compared revisions, and where it lives on
@@ -344,8 +380,9 @@ pub enum SearchInclude {
 }
 
 /// Criteria for one search. The caller supplies a lexical `query`, a relationship
-/// `traversal`, or both, a regex `pattern`, or a `change` comparing two committed
-/// revisions; `paths` narrows the files eligible for any of them.
+/// `traversal`, or both, a regex `pattern`, or a `change` comparing a committed revision
+/// against another revision or the working tree; `paths` narrows the files eligible for any
+/// of them.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::require_search_selector)]
@@ -525,15 +562,15 @@ pub struct SearchParams {
     /// `change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal: Option<SearchTraversal>,
-    /// Two committed revisions to compare, standing alone. Every declaration the two
-    /// revisions hold differently becomes a hit tagged `change`, carrying a `change` block
-    /// that names what differs and where the declaration lives on each side.
-    /// `target: "file"` never carries a change hit, since the comparison reaches
-    /// declarations alone, and `relevance` orders the hits by path, then name. `paths`
-    /// narrows which changed paths are compared. The server refuses `change` beside `rev`,
-    /// since `change` names its own revisions; beside `query`, since the two select
-    /// different result sets; beside `traversal`, since no lane resolves references for a
-    /// committed revision; and beside a `scope` past `local`.
+    /// A committed revision compared against another revision or the working tree,
+    /// standing alone. Every declaration the two sides hold differently becomes a hit
+    /// tagged `change`, carrying a `change` block that names what differs and where the
+    /// declaration lives on each side. `target: "file"` never carries a change hit, since
+    /// the comparison reaches declarations alone, and `relevance` orders the hits by path,
+    /// then name. `paths` narrows which changed paths are compared. The server refuses
+    /// `change` beside `rev`, since `change` names its own revisions; beside `query`, since
+    /// the two select different result sets; beside `traversal`, which no comparison
+    /// serves; and beside a `scope` past `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<SearchChange>,
 }
@@ -774,10 +811,11 @@ pub enum TraversalDirection {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern, PathPatternViolation,
-        SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
-        SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
-        SearchChange, SearchHit, SearchParams, SearchScope, SearchTraversal, TraversalDirection,
+        ChangeHead, ChangeTree, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PathPattern,
+        PathPatternViolation, RevisionId, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_PATTERN_CHARS_MAX,
+        SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN,
+        SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit, SearchParams, SearchScope,
+        SearchTraversal, TraversalDirection,
     };
     use serde_json::json;
 
@@ -1035,11 +1073,34 @@ mod tests {
             serde_json::from_value(json!({"change": {"base": "main"}})).expect("a change parses");
         let change = params.change.expect("change must be present");
         assert_eq!(change.base.0, "main");
-        assert_eq!(change.head.0, SEARCH_CHANGE_HEAD_DEFAULT);
+        assert_eq!(
+            change.head,
+            ChangeHead::Revision(RevisionId(SEARCH_CHANGE_HEAD_DEFAULT.to_owned()))
+        );
     }
 
-    /// `deny_unknown_fields` refuses a comparison naming a side this model never
-    /// served, such as an uncommitted working-tree side.
+    /// A `head` object naming the working tree parses as the working-tree side, and a
+    /// string that spells the same words stays a revision.
+    #[test]
+    fn search_change_head_names_the_working_tree_or_a_revision() {
+        let tree: SearchChange =
+            serde_json::from_value(json!({"base": "main", "head": {"kind": "working_tree"}}))
+                .expect("a working-tree head parses");
+        assert_eq!(tree.head, ChangeHead::Tree(ChangeTree::WorkingTree));
+        let branch: SearchChange =
+            serde_json::from_value(json!({"base": "main", "head": "working_tree"}))
+                .expect("a branch head parses");
+        assert_eq!(
+            branch.head.revision(),
+            Some(&RevisionId("working_tree".to_owned()))
+        );
+        let unknown: Result<SearchChange, _> =
+            serde_json::from_value(json!({"base": "main", "head": {"kind": "index"}}));
+        assert!(unknown.is_err(), "an unknown tree kind must fail");
+    }
+
+    /// `deny_unknown_fields` refuses a comparison naming a field this model never
+    /// served.
     #[test]
     fn search_change_rejects_an_unknown_field() {
         let result: Result<SearchChange, _> =

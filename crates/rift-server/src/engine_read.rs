@@ -252,8 +252,8 @@ fn reachable_reference_source(
 
 /// The traversal a configured engine may answer for, with the declaration it starts at:
 /// references for an incoming walk, calls for an outgoing one. A walk riding beside
-/// `change` names no `seed` and reaches no engine: both compared sides are committed
-/// revisions, which no engine session serves.
+/// `change` names no `seed` and reaches no engine: the server refuses it before any engine
+/// is asked.
 fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &SymbolId)> {
     let traversal = params.traversal.as_ref()?;
     let seed = traversal.seed.as_ref()?;

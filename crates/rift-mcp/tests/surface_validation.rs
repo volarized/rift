@@ -333,19 +333,29 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// A comparison of the fixture's two committed revisions: the `baseline` tag holds
-/// everything before `change_witness.rs` arrived, so this answer carries the two
-/// `introduced` hits that file brought and validates the `change` arm of the served
-/// output schema against a real payload.
+/// A comparison of the fixture's two committed revisions, then of `baseline` against the
+/// working tree, which holds `HEAD`'s bytes: the `baseline` tag holds everything before
+/// `change_witness.rs` arrived, so each answer carries the two `introduced` hits that file
+/// brought and validates the `change` arm of the served output schema against a real
+/// payload, and the second validates the working-tree `head` against the input schema.
 ///
 fn change_search_corpus() -> Vec<(&'static str, Value)> {
-    vec![(
-        "search",
-        json!({
-            "change": { "base": "baseline", "head": "HEAD" },
-            "include": ["source"]
-        }),
-    )]
+    vec![
+        (
+            "search",
+            json!({
+                "change": { "base": "baseline", "head": "HEAD" },
+                "include": ["source"]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "change": { "base": "baseline", "head": { "kind": "working_tree" } },
+                "include": ["source"]
+            }),
+        ),
+    ]
 }
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {

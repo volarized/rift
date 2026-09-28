@@ -125,7 +125,8 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: Some("with a `traversal` block"),
     },
     DecisionRow {
-        situation: "The declarations two committed revisions hold differently are needed.",
+        situation: "The declarations two revisions, or a revision and the working tree, hold \
+                    differently are needed.",
         tools: &["search"],
         note: Some("with a `change` block"),
     },
@@ -456,8 +457,8 @@ mod tests {
             let rendered = skill_markdown(form);
             assert!(
                 rendered.contains(
-                    "| The declarations two committed revisions hold differently are needed. | \
-                     `search` (with a `change` block) |"
+                    "| The declarations two revisions, or a revision and the working tree, hold \
+                     differently are needed. | `search` (with a `change` block) |"
                 ),
                 "{rendered}"
             );

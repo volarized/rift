@@ -22,7 +22,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | A package version the project does not use, or a package it lacks, is needed. | `get_symbol`, `search` (with `packages` and `scope: "global"` or `"all"`) |
 | The syntax structure at one position is needed. | `nodes` |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with a `traversal` block) |
-| The declarations two committed revisions hold differently are needed. | `search` (with a `change` block) |
+| The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with a `change` block) |
 
 ## When a call refuses
 

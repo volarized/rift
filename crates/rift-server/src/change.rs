@@ -1,31 +1,36 @@
-//! Declaration-level comparison of two committed revisions.
+//! Declaration-level comparison of a committed revision against another
+//! revision or the working tree.
 //!
-//! One `search` request carrying `change` lists the paths the two revisions
-//! hold differently, builds a read index over those paths on each side, and
-//! classifies every declaration the two sides disagree on through the same
+//! One `search` request carrying `change` lists the paths the two sides hold
+//! differently, builds a read index over those paths on each committed side,
+//! and classifies every declaration the two sides disagree on through the same
 //! classifier a symbol timeline runs. Only the changed paths are read and
-//! parsed: the comparison never builds a whole revision index.
+//! parsed: the comparison never builds a whole revision index. A working-tree
+//! side is the current index itself, and the base side reads its files in the
+//! working form, so a line-ending conversion changes no declaration.
 //!
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
-use rift_history::Repository;
+use rift_history::{Repository, WorkingForm};
 use rift_index::{
     IndexedFile, RevisionPaths, SymbolMatch, WorkspaceIndex, WorkspaceIndexLimits,
     WorkspaceIndexWarning,
 };
 use rift_protocol::read::{
-    MatchedField, PathSelector, ReadWarning, ResultOrder, SEARCH_CHANGE_PATHS_MAX, SearchChange,
-    SearchHit, SearchParams, SearchParamsTarget, SearchResult, SymbolChange, SymbolVersionKind,
+    ChangeHead, MatchedField, PathSelector, ReadWarning, ResultOrder, SEARCH_CHANGE_PATHS_MAX,
+    SOURCE_WARNINGS_MAX, SearchChange, SearchHit, SearchParams, SearchParamsTarget, SearchResult,
+    SymbolChange, SymbolVersionKind,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadError, ReadFault, page, project_path, results_truncation_warning, source_warnings,
+    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
+    source_warnings, wire_index_warning,
 };
 use crate::search::{
     HitPayloads, bound_hits, build_symbol_hit, order_hits, path_matcher, search_page_limit,
@@ -33,8 +38,10 @@ use crate::search::{
 };
 
 /// Answers one `search` request that carries `change`: the declarations the two
-/// named revisions hold differently, ordered and paged like any other search
-/// answer.
+/// named sides hold differently, ordered and paged like any other search answer.
+///
+/// `current` is the published current index: the head side when `change` names
+/// the working tree, unread otherwise.
 ///
 /// # Errors
 ///
@@ -46,6 +53,7 @@ pub fn search_change(
     root: &Path,
     params: &SearchParams,
     change: &SearchChange,
+    current: &ReadService,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
     (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
@@ -55,6 +63,7 @@ pub fn search_change(
     let compared = ComparedRevisions::open(
         root,
         change,
+        current,
         params.paths.as_ref(),
         limits,
         visibility,
@@ -62,7 +71,7 @@ pub fn search_change(
     )?;
     let mut results = compared.hits(params)?;
     order_change_hits(&mut results, params.order);
-    let results_max_reached = bound_hits(&mut results, compared.head.results_max());
+    let results_max_reached = bound_hits(&mut results, compared.head().results_max());
     let (results, pagination) = page(results, params.page_index, limit);
     Ok(SearchResult {
         results,
@@ -71,22 +80,83 @@ pub fn search_change(
     })
 }
 
-/// One comparison's two sides: the read index each revision holds over the paths
-/// the two hold differently.
-struct ComparedRevisions {
+/// One comparison's two sides: the read index each side holds over the paths the
+/// two hold differently.
+struct ComparedRevisions<'current> {
     base: WorkspaceIndex,
-    head: WorkspaceIndex,
+    head: HeadIndex<'current>,
     paths: Vec<ProjectPath>,
     truncated: bool,
+    /// The changed paths read in no working form, in path order, each with the
+    /// attribute that kept it out.
+    unconverted: BTreeMap<String, Unconverted>,
 }
 
-impl ComparedRevisions {
-    /// Resolves both revisions, lists the paths they hold differently under the
+/// The head side's read index: one built over the changed paths of a committed
+/// revision, or the published current index for the working tree.
+enum HeadIndex<'current> {
+    /// The index over the changed paths of the committed head revision.
+    Revision(WorkspaceIndex),
+    /// The published current index, which serves the working tree.
+    WorkingTree(&'current WorkspaceIndex),
+}
+
+impl HeadIndex<'_> {
+    /// The words a `change_truncated` detail names the two sides with.
+    const fn sides(&self) -> &'static str {
+        match self {
+            Self::Revision(_) => COMMITTED_SIDES,
+            Self::WorkingTree(_) => WORKING_TREE_SIDES,
+        }
+    }
+}
+
+/// How a `change_truncated` detail names two committed sides.
+const COMMITTED_SIDES: &str = "the two revisions differ";
+
+/// How a `change_truncated` detail names a working-tree head side.
+const WORKING_TREE_SIDES: &str = "the working tree differs from the base revision";
+
+/// Why a changed path answers no working form: the attribute that keeps the
+/// base side from reading it the way the working tree holds it.
+#[derive(Debug)]
+enum Unconverted {
+    /// The path's attributes name this `filter` driver, whose smudge command a
+    /// comparison never runs.
+    Driver(String),
+    /// The path's `working-tree-encoding` names this UTF-16 encoding, which the
+    /// built-in conversion does not write back.
+    Encoding(String),
+}
+
+impl Unconverted {
+    /// The `source_unavailable` warning naming `path` and this attribute.
+    fn warning(&self, path: &str) -> ReadWarning {
+        let reason = match self {
+            Self::Driver(driver) => {
+                format!("names the `{driver}` filter driver, which a comparison never runs")
+            }
+            Self::Encoding(encoding) => format!(
+                "holds {encoding} in the working tree, which a comparison does not convert back"
+            ),
+        };
+        ReadWarning::SourceUnavailable {
+            unit: ProjectPath::new(path.to_owned())
+                .ok()
+                .map(|path| file_id(&path)),
+            detail: format!("{path} {reason}, so the path answers changed with no declarations"),
+        }
+    }
+}
+
+impl<'current> ComparedRevisions<'current> {
+    /// Resolves both sides, lists the paths they hold differently under the
     /// workspace's visible-path policy and the request's own `paths` selector, and
-    /// indexes those paths on each side.
+    /// indexes those paths on each committed side.
     fn open(
         root: &Path,
         change: &SearchChange,
+        current: &'current ReadService,
         selector: Option<&PathSelector>,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
@@ -95,9 +165,6 @@ impl ComparedRevisions {
         let repository = Repository::open(root).map_err(ReadFault::history)?;
         let base = repository
             .resolve(&change.base.0)
-            .map_err(ReadFault::history)?;
-        let head = repository
-            .resolve(&change.head.0)
             .map_err(ReadFault::history)?;
         let visible = RevisionPaths::build(root, visibility).map_err(ReadFault::index)?;
         let requested = path_matcher(root, selector)?;
@@ -108,6 +175,16 @@ impl ComparedRevisions {
                     .is_none_or(|matcher| matcher.includes(&root.join(path)))
         };
         let paths_max = usize::try_from(SEARCH_CHANGE_PATHS_MAX).unwrap_or(usize::MAX);
+        let ChangeHead::Revision(head) = &change.head else {
+            return Self::against_working_tree(
+                &repository,
+                &base,
+                current.index(),
+                &compared,
+                (limits, visibility, (text_inclusion, languages)),
+            );
+        };
+        let head = repository.resolve(&head.0).map_err(ReadFault::history)?;
         let changed = repository
             .changed_files(&base, &head, &compared, paths_max)
             .map_err(ReadFault::history)?;
@@ -127,20 +204,95 @@ impl ComparedRevisions {
         };
         let base_index = index_side(&base)?;
         let head_index = index_side(&head)?;
-        // Every selected path already passed the project-path contract: the index
-        // build over the same selection refuses a spelling that contract forbids
-        // before this list is taken.
-        let paths = changed
+        Ok(Self {
+            base: base_index,
+            head: HeadIndex::Revision(head_index),
+            paths: project_paths(changed.paths()),
+            truncated: changed.is_truncated(),
+            unconverted: BTreeMap::new(),
+        })
+    }
+
+    /// The comparison of `base` against the working tree, whose side is the
+    /// published current index `published`.
+    ///
+    /// A path git's index does not hold and `published` serves or left out is
+    /// untracked; a listed path `published` never read while the working tree
+    /// still holds it - a tracked file under a `.gitignore` pattern, or one
+    /// `[source]` hides - is one no current-tree read serves, and is skipped. The
+    /// base side reads its files in the working form, and a path whose attributes
+    /// name a `filter` driver or a UTF-16 `working-tree-encoding` answers no
+    /// declarations on either side, and the `source_unavailable` warning naming
+    /// the driver or encoding.
+    fn against_working_tree(
+        repository: &Repository,
+        base: &rift_history::ResolvedRevision,
+        published: &'current WorkspaceIndex,
+        compared: &dyn Fn(&str) -> bool,
+        (limits, visibility, (text_inclusion, languages)): (
+            WorkspaceIndexLimits,
+            &SourceVisibility,
+            (&TextFileInclusion, &LanguageFileSelections),
+        ),
+    ) -> Result<Self, ReadError> {
+        let root = repository.root();
+        let served: HashSet<&str> = published
+            .files()
+            .map(|file| file.path().as_str())
+            .chain(published.text_files().map(|file| file.path().as_str()))
+            .chain(published.warnings().iter().map(|left| left.path().as_str()))
+            .collect();
+        let served_paths: Vec<&str> = served.iter().copied().collect();
+        let listed =
+            |path: &str| (served.contains(path) || !root.join(path).exists()) && compared(path);
+        let paths_max = usize::try_from(SEARCH_CHANGE_PATHS_MAX).unwrap_or(usize::MAX);
+        let changed = repository
+            .changed_working_files(base, &served_paths, &listed, paths_max)
+            .map_err(ReadFault::history)?;
+        let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
+        let mut forms = repository.working_forms().map_err(ReadFault::history)?;
+        let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
+        let base_index = WorkspaceIndex::at_revision_with_blob_reader(
+            repository,
+            base,
+            limits,
+            visibility,
+            (text_inclusion, languages),
+            &|path| selected.contains(path),
+            &mut |file, bytes_max| match forms.form(file, bytes_max)? {
+                WorkingForm::Converted(bytes) => Ok(Some(bytes)),
+                WorkingForm::Filtered { driver } => {
+                    unconverted.insert(file.path().to_owned(), Unconverted::Driver(driver));
+                    Ok(None)
+                }
+                WorkingForm::Encoded { encoding } => {
+                    unconverted.insert(file.path().to_owned(), Unconverted::Encoding(encoding));
+                    Ok(None)
+                }
+            },
+        )
+        .map_err(ReadFault::index)?;
+        let kept: Vec<String> = changed
             .paths()
             .iter()
-            .filter_map(|path| ProjectPath::new(path.clone()).ok())
+            .filter(|path| !unconverted.contains_key(*path))
+            .cloned()
             .collect();
         Ok(Self {
             base: base_index,
-            head: head_index,
-            paths,
+            head: HeadIndex::WorkingTree(published),
+            paths: project_paths(&kept),
             truncated: changed.is_truncated(),
+            unconverted,
         })
+    }
+
+    /// The head side's read index.
+    const fn head(&self) -> &WorkspaceIndex {
+        match &self.head {
+            HeadIndex::Revision(index) => index,
+            HeadIndex::WorkingTree(index) => *index,
+        }
     }
 
     /// The hits one comparison answers: every declaration the two sides hold
@@ -174,12 +326,12 @@ impl ComparedRevisions {
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
     ) -> Result<(), ReadError> {
-        match (self.base.file(path), self.head.file(path)) {
+        match (self.base.file(path), self.head().file(path)) {
             (Some(base_file), Some(head_file)) => {
                 self.compare_files(path, (base_file, head_file), payloads, results, unpaired)
             }
             (None, Some(head_file)) => {
-                unpaired.added.extend(held(&self.head, head_file));
+                unpaired.added.extend(held(self.head(), head_file));
                 Ok(())
             }
             (Some(base_file), None) => {
@@ -204,7 +356,7 @@ impl ComparedRevisions {
         let base = declarations(base_file);
         let head = declarations(head_file);
         for (key, head_symbol) in &head {
-            let added = Declaration::new(&self.head, head_file, head_symbol);
+            let added = Declaration::new(self.head(), head_file, head_symbol);
             let Some(base_symbol) = base.get(key).copied() else {
                 // The base side holds no such declaration, in this path or any
                 // other yet: whether it moved here is decided once every path is
@@ -239,33 +391,74 @@ impl ComparedRevisions {
     }
 
     /// The warnings one comparison answer carries: the changed-path bound when the
-    /// comparison reached it, the files either side left out of its index, what a
-    /// walk riding beside the comparison reported, then the result bound when the
-    /// hit set reached it.
+    /// comparison reached it, the files either side left out of its index and the
+    /// paths read in no working form, what a walk riding beside the comparison
+    /// reported, then the result bound when the hit set reached it.
     fn warnings(&self, results_max_reached: Option<usize>) -> Vec<ReadWarning> {
         let mut warnings = Vec::new();
         if self.truncated {
-            warnings.push(change_truncation_warning());
+            warnings.push(change_truncation_warning(self.head.sides()));
         }
-        warnings.extend(source_warnings(&self.left_out()));
+        warnings.extend(self.source_unavailable());
         if let Some(results_max) = results_max_reached {
             warnings.push(results_truncation_warning(results_max));
         }
         warnings
     }
 
-    /// The files either side left out of its index: a blob past the per-file byte
-    /// bound, one whose bytes are not UTF-8, or one a provider refused. Such a file
-    /// contributes no declaration on the side that left it out, and every other
-    /// changed path still answers. A file both sides left out is named once.
+    /// The changed files either side left out of its index: a blob past the
+    /// per-file byte bound, one whose bytes are not UTF-8, or one a provider
+    /// refused. Such a file contributes no declaration on the side that left it
+    /// out, and every other changed path still answers. A file both sides left out
+    /// is named once; a file the published current index left out that did not
+    /// change is not named.
     fn left_out(&self) -> Vec<WorkspaceIndexWarning> {
         let mut left_out: Vec<WorkspaceIndexWarning> = Vec::new();
-        for warning in self.head.warnings().iter().chain(self.base.warnings()) {
-            if !left_out.contains(warning) {
+        for warning in self.head().warnings().iter().chain(self.base.warnings()) {
+            let changed = self.paths.binary_search(warning.path()).is_ok();
+            if changed && !left_out.contains(warning) {
                 left_out.push(warning.clone());
             }
         }
         left_out
+    }
+
+    /// The `source_unavailable` warnings: one per changed file either side left
+    /// out, and one per changed path read in no working form, naming its driver
+    /// or encoding. Both share one list in project-path order under
+    /// [`SOURCE_WARNINGS_MAX`], then one more counting the rest, as
+    /// [`source_warnings`] cuts the files the index left out.
+    fn source_unavailable(&self) -> Vec<ReadWarning> {
+        let left_out = self.left_out();
+        if self.unconverted.is_empty() {
+            return source_warnings(&left_out);
+        }
+        let mut named: Vec<(&str, ReadWarning)> = left_out
+            .iter()
+            .map(|warning| (warning.path().as_str(), wire_index_warning(warning)))
+            .chain(
+                self.unconverted
+                    .iter()
+                    .map(|(path, unconverted)| (path.as_str(), unconverted.warning(path))),
+            )
+            .collect();
+        named.sort_by(|left, right| left.0.cmp(right.0));
+        let rest = named.len().saturating_sub(SOURCE_WARNINGS_MAX);
+        let mut warnings: Vec<ReadWarning> = named
+            .into_iter()
+            .take(SOURCE_WARNINGS_MAX)
+            .map(|(_, warning)| warning)
+            .collect();
+        if rest > 0 {
+            warnings.push(ReadWarning::SourceUnavailable {
+                unit: None,
+                detail: format!(
+                    "{rest} more changed paths answer no declarations; `paths` narrows a further \
+                     comparison onto them"
+                ),
+            });
+        }
+        warnings
     }
 }
 
@@ -453,16 +646,27 @@ fn order_change_hits(results: &mut [SearchHit], order: ResultOrder) {
     order_hits(results, order);
 }
 
-/// The warning a comparison that reached its changed-path bound carries.
-fn change_truncation_warning() -> ReadWarning {
+/// The warning a comparison that reached its changed-path bound carries, naming
+/// its two sides in the words `sides` holds.
+fn change_truncation_warning(sides: &str) -> ReadWarning {
     ReadWarning::ChangeTruncated {
         paths_max: SEARCH_CHANGE_PATHS_MAX,
         detail: format!(
-            "the two revisions differ in more than {SEARCH_CHANGE_PATHS_MAX} paths, so the \
-             comparison stopped there; declarations in the changed paths past it are absent, \
-             and `paths` narrows a further comparison onto them"
+            "{sides} in more than {SEARCH_CHANGE_PATHS_MAX} paths, so the comparison stopped \
+             there; declarations in the changed paths past it are absent, and `paths` narrows \
+             a further comparison onto them"
         ),
     }
+}
+
+/// The changed paths as project paths. Every one already passed the project-path
+/// contract: the index build over the same selection refuses a spelling that
+/// contract forbids before this list is taken.
+fn project_paths(changed: &[String]) -> Vec<ProjectPath> {
+    changed
+        .iter()
+        .filter_map(|path| ProjectPath::new(path.clone()).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -472,6 +676,7 @@ mod tests {
 
     use rift_core::{ErrorCode, ErrorName, Fault as _};
     use rift_history::fixture::{commit_all, git, init};
+    use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::ProjectPath as WireProjectPath;
     use serde_json::{Value, json};
 
@@ -527,15 +732,24 @@ mod tests {
             Ok(self)
         }
 
-        /// Answers the comparison `params` asks for over this fixture.
+        /// Answers the comparison `params` asks for over this fixture, against a
+        /// current index built from the working tree as it stands.
         fn search(&self, params: &serde_json::Value) -> Result<SearchResult, ReadError> {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
+            let current = ReadService::build(
+                self.directory.path(),
+                self.limits,
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+                HistoryConfiguration::default(),
+            )?;
             search_change(
                 self.directory.path(),
                 &params,
                 &change,
+                &current,
                 self.limits,
                 &SourceVisibility::default(),
                 (
@@ -731,6 +945,351 @@ mod tests {
 
         assert!(answer.results.is_empty(), "{answer:?}");
         assert!(answer.warnings.is_empty(), "{answer:?}");
+        Ok(())
+    }
+
+    /// The pointer git-lfs 3.8.0 writes for a file holding `binary payload of unedited\n`.
+    const LFS_POINTER: &str = "version https://git-lfs.github.com/spec/v1\noid sha256:84479338e39d2628d302e12c4dfc313cb10e7c1c2aa907b3a8b5a1b24fb61bf2\nsize 27\n";
+
+    /// Every hit's row, sorted, so a test states the set a comparison answers.
+    fn sorted_changes(answer: &SearchResult) -> Vec<ChangeRow> {
+        let mut rows = changes(answer);
+        rows.sort();
+        rows
+    }
+
+    fn row(name: &str, kind: &str, base: Option<&str>, head: Option<&str>) -> ChangeRow {
+        (
+            name.to_owned(),
+            kind.to_owned(),
+            base.map(str::to_owned),
+            head.map(str::to_owned),
+        )
+    }
+
+    /// The working tree as `head` answers the declarations every kind of
+    /// uncommitted edit changed, on a checkout under `core.autocrlf=true`: a
+    /// staged edit, an unstaged one, a file git does not track, one only git's
+    /// own excludes name, a deleted file, a pure rename, and a CRLF file with one
+    /// edited declaration. An LFS pointer left as committed answers nothing.
+    #[test]
+    fn change_against_the_working_tree_answers_every_uncommitted_edit() -> TestResult {
+        let crlf = "pub fn kept() {\n    let x = 1;\n}\npub fn edited() {\n    let x = 1;\n}\n";
+        let base = [
+            (
+                ".gitattributes",
+                "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+            ),
+            ("assets/model.bin", LFS_POINTER),
+            ("src/staged.rs", "pub fn staged() {\n    let x = 1;\n}\n"),
+            ("src/unstaged.rs", "pub fn unstaged() {}\n"),
+            ("src/deleted.rs", "pub fn deleted() {}\n"),
+            (
+                "src/renamed.rs",
+                "pub fn travelled() {\n    let x = 1;\n}\n",
+            ),
+            ("src/crlf.rs", crlf),
+        ];
+        let fixture = Fixture::baseline(&base)?;
+        let root = fixture.directory.path();
+        git(root, &["config", "core.autocrlf", "true"]);
+        // What a checkout under `core.autocrlf=true` leaves: every text file in CRLF.
+        let checked_out: Vec<(&str, String)> = base[2..]
+            .iter()
+            .map(|(path, text)| (*path, text.replace('\n', "\r\n")))
+            .collect();
+        for (path, text) in &checked_out {
+            fs::write(root.join(path), text)?;
+        }
+        let edits = [
+            ("src/staged.rs", "pub fn staged() {\n    let x = 2;\n}\n"),
+            ("src/unstaged.rs", "pub fn unstaged(flag: bool) {}\n"),
+            (
+                "src/crlf.rs",
+                "pub fn kept() {\n    let x = 1;\n}\npub fn edited() {\n    let x = 2;\n}\n",
+            ),
+            ("src/untracked.rs", "pub fn untracked() {}\n"),
+            ("src/excluded.rs", "pub fn excluded() {}\n"),
+        ];
+        for (path, text) in edits {
+            fs::write(root.join(path), text.replace('\n', "\r\n"))?;
+        }
+        git(root, &["add", "src/staged.rs"]);
+        fs::remove_file(root.join("src/deleted.rs"))?;
+        git(root, &["mv", "src/renamed.rs", "src/moved.rs"]);
+        fs::write(root.join(".git/info/exclude"), "src/excluded.rs\n")?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        }))?;
+
+        assert_eq!(
+            sorted_changes(&answer),
+            [
+                row("deleted", "removed", Some("src/deleted.rs"), None),
+                row(
+                    "edited",
+                    "body_changed",
+                    Some("src/crlf.rs"),
+                    Some("src/crlf.rs")
+                ),
+                row("excluded", "introduced", None, Some("src/excluded.rs")),
+                row(
+                    "staged",
+                    "body_changed",
+                    Some("src/staged.rs"),
+                    Some("src/staged.rs")
+                ),
+                row(
+                    "travelled",
+                    "moved",
+                    Some("src/renamed.rs"),
+                    Some("src/moved.rs")
+                ),
+                row(
+                    "unstaged",
+                    "signature_changed",
+                    Some("src/unstaged.rs"),
+                    Some("src/unstaged.rs")
+                ),
+                row("untracked", "introduced", None, Some("src/untracked.rs")),
+            ]
+        );
+        assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
+        Ok(())
+    }
+
+    /// A tracked file the current index does not serve - here one a later `.gitignore`
+    /// pattern names - answers nothing when edited, instead of every base declaration
+    /// answering `removed` against a head side that never held the file.
+    #[test]
+    fn change_against_the_working_tree_skips_a_tracked_path_the_current_index_leaves_out()
+    -> TestResult {
+        let base = [
+            ("src/lib.rs", "pub fn kept() {}\n"),
+            ("generated/out.rs", "pub fn generated() {}\n"),
+        ];
+        let fixture = Fixture::baseline(&base)?;
+        let root = fixture.directory.path();
+        fs::write(root.join(".gitignore"), "generated/\n")?;
+        fs::write(
+            root.join("generated/out.rs"),
+            "pub fn generated(flag: bool) {}\n",
+        )?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        }))?;
+
+        assert!(answer.results.is_empty(), "{answer:?}");
+        assert!(answer.warnings.is_empty(), "{answer:?}");
+        Ok(())
+    }
+
+    /// A working-tree comparison past the changed-path bound warns in words that
+    /// name the working tree, not two revisions.
+    #[test]
+    fn change_against_the_working_tree_stops_at_the_path_bound() -> TestResult {
+        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
+        let root = fixture.directory.path();
+        let paths_max = usize::try_from(SEARCH_CHANGE_PATHS_MAX)?;
+        for index in 0..=paths_max {
+            fs::write(root.join(format!("added{index}.rs")), "pub fn added() {}\n")?;
+        }
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}},
+            "limit": 1
+        }))?;
+
+        let [ReadWarning::ChangeTruncated { detail, .. }, ..] = answer.warnings.as_slice() else {
+            panic!(
+                "the answer must warn change_truncated first: {:?}",
+                answer.warnings
+            );
+        };
+        assert!(detail.starts_with("the working tree differs from the base revision"));
+        Ok(())
+    }
+
+    /// A changed path read in no working form - one under the `lfs` driver, one
+    /// under another `filter` driver, and one whose `working-tree-encoding` names
+    /// UTF-16 - answers no declarations and the `source_unavailable` warning naming
+    /// the path and its driver or encoding, while the edited Rust file beside them
+    /// answers. An LFS file whose bytes match its pointer answers nothing.
+    #[test]
+    fn change_against_the_working_tree_names_each_path_read_in_no_working_form() -> TestResult {
+        let utf16 =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        write_all(
+            root,
+            &[
+                (
+                    ".gitattributes",
+                    "assets/*.md filter=lfs diff=lfs merge=lfs -text\n\
+                     src/shout.rs filter=upper\n\
+                     docs/notes.md working-tree-encoding=UTF-16LE\n",
+                ),
+                ("assets/diagram.md", LFS_POINTER),
+                ("assets/unedited.md", LFS_POINTER),
+                ("src/lib.rs", "pub fn kept() {}\n"),
+                ("src/shout.rs", "pub fn shout() {}\n"),
+            ],
+        )?;
+        fs::create_dir_all(root.join("docs"))?;
+        fs::write(root.join("docs/notes.md"), utf16("# Notes\n"))?;
+        init(root);
+        commit_all(root, "baseline");
+        git(root, &["tag", "baseline"]);
+        let fixture = Fixture {
+            directory,
+            limits: WorkspaceIndexLimits::default(),
+        };
+        let root = fixture.directory.path();
+        write_all(
+            root,
+            &[
+                ("assets/diagram.md", "# Diagram\n\n## Edited\n"),
+                ("assets/unedited.md", "binary payload of unedited\n"),
+                ("src/lib.rs", "pub fn kept(flag: bool) {}\n"),
+                ("src/shout.rs", "pub fn shout(loud: bool) {}\n"),
+            ],
+        )?;
+        fs::write(root.join("docs/notes.md"), utf16("# Notes\n\n## Added\n"))?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        }))?;
+
+        assert_eq!(
+            sorted_changes(&answer),
+            [row(
+                "kept",
+                "signature_changed",
+                Some("src/lib.rs"),
+                Some("src/lib.rs")
+            )]
+        );
+        let named: Vec<(String, &str)> = answer
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::SourceUnavailable {
+                    unit: Some(unit),
+                    detail,
+                } => Some((unit.0.clone(), detail.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answer.warnings.len(), named.len(), "{:?}", answer.warnings);
+        let units: Vec<&str> = named.iter().map(|(unit, _)| unit.as_str()).collect();
+        assert_eq!(
+            units,
+            [
+                "rift://file/assets/diagram.md",
+                "rift://file/docs/notes.md",
+                "rift://file/src/shout.rs"
+            ]
+        );
+        assert!(named[0].1.contains("`lfs` filter driver"), "{named:?}");
+        assert!(named[1].1.contains("UTF-16LE"), "{named:?}");
+        assert!(named[2].1.contains("`upper` filter driver"), "{named:?}");
+        Ok(())
+    }
+
+    /// A changed file the current index left out - here one grown past the
+    /// per-file byte bound - answers its base declarations `removed` and the
+    /// `source_unavailable` warning naming it, as a committed comparison answers
+    /// a head blob the provider refused.
+    #[test]
+    fn change_against_the_working_tree_names_a_changed_file_the_current_index_left_out()
+    -> TestResult {
+        let base = [
+            ("src/lib.rs", "pub fn kept() {}\n"),
+            ("src/grown.rs", "pub fn grown() {}\n"),
+        ];
+        let limits = WorkspaceIndexLimits::new(64, 512, 262_144, 8, 1_000)?;
+        let fixture = Fixture::baseline(&base)?.under(limits);
+        let root = fixture.directory.path();
+        let grown = format!("pub fn grown() {{\n    // {}\n}}\n", "x".repeat(2_048));
+        fs::write(root.join("src/grown.rs"), grown)?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        }))?;
+
+        assert_eq!(
+            sorted_changes(&answer),
+            [row("grown", "removed", Some("src/grown.rs"), None)]
+        );
+        assert!(
+            matches!(
+                answer.warnings.as_slice(),
+                [ReadWarning::SourceUnavailable { unit: Some(unit), .. }]
+                    if unit.0 == "rift://file/src/grown.rs"
+            ),
+            "{answer:?}"
+        );
+        Ok(())
+    }
+
+    /// Past `SOURCE_WARNINGS_MAX` paths that answer no declarations, the answer
+    /// names the first ones in path order, a file the current index left out and
+    /// paths read in no working form sharing one list, and one more warning
+    /// counts the rest.
+    #[test]
+    fn change_against_the_working_tree_names_at_most_the_source_warning_bound() -> TestResult {
+        let filtered: Vec<(String, String)> = (0..9)
+            .map(|index| {
+                (
+                    format!("src/f{index:02}.rs"),
+                    format!("pub fn f{index:02}() {{}}\n"),
+                )
+            })
+            .collect();
+        let mut base: Vec<(&str, &str)> = filtered
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        base.push((".gitattributes", "src/f*.rs filter=upper\n"));
+        base.push(("src/a_grown.rs", "pub fn grown() {}\n"));
+        let limits = WorkspaceIndexLimits::new(64, 512, 262_144, 8, 1_000)?;
+        let fixture = Fixture::baseline(&base)?.under(limits);
+        let root = fixture.directory.path();
+        for (path, _) in &filtered {
+            fs::write(root.join(path), "pub fn edited(flag: bool) {}\n")?;
+        }
+        let grown = format!("pub fn grown() {{\n    // {}\n}}\n", "x".repeat(2_048));
+        fs::write(root.join("src/a_grown.rs"), grown)?;
+
+        let answer = fixture.search(&json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        }))?;
+
+        let units: Vec<Option<&str>> = answer
+            .warnings
+            .iter()
+            .map(|warning| match warning {
+                ReadWarning::SourceUnavailable { unit, .. } => {
+                    unit.as_ref().map(|unit| unit.0.as_str())
+                }
+                other => panic!("only source_unavailable is expected: {other:?}"),
+            })
+            .collect();
+        let mut expected: Vec<Option<String>> = vec![Some("rift://file/src/a_grown.rs".to_owned())];
+        expected.extend((0..7).map(|index| Some(format!("rift://file/src/f{index:02}.rs"))));
+        expected.push(None);
+        let expected: Vec<Option<&str>> = expected.iter().map(Option::as_deref).collect();
+        assert_eq!(units, expected);
+        let Some(ReadWarning::SourceUnavailable { detail, .. }) = answer.warnings.last() else {
+            panic!("the answer must end in the counting warning: {answer:?}");
+        };
+        assert!(
+            detail.starts_with("2 more changed paths answer no declarations"),
+            "{detail}"
+        );
         Ok(())
     }
 
@@ -966,7 +1525,7 @@ mod tests {
         );
         assert_eq!(
             answer.warnings,
-            vec![super::change_truncation_warning()],
+            vec![super::change_truncation_warning(super::COMMITTED_SIDES)],
             "{answer:?}"
         );
         Ok(())
@@ -1205,8 +1764,9 @@ mod tests {
     )];
 
     /// A walk needs references a language engine resolves, and an engine session serves
-    /// the current tree; a comparison names two committed revisions, so the server refuses
-    /// the pairing instead of answering a walk that could follow no edge.
+    /// the current tree; the walk from a comparison's changed declarations is not served,
+    /// so the server refuses the pairing instead of answering a walk that could follow no
+    /// edge.
     #[test]
     fn change_refuses_a_traversal_riding_beside_it() -> TestResult {
         let fixture = Fixture::revisions(IMPACT_BASE, IMPACT_HEAD, &[])?;

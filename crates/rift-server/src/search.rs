@@ -28,9 +28,9 @@ use rift_index::{
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
-    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SOURCE_WARNINGS_MAX, SearchChange,
-    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchScope, SearchTraversal, Symbol, SymbolId,
+    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, RevisionId, SOURCE_WARNINGS_MAX,
+    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchScope, SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
@@ -283,8 +283,8 @@ impl ReadService {
             )?;
         }
         let mut traversal_report = TraversalReport::default();
-        // `validate_search` refuses a `traversal` naming no `seed` unless `change` names
-        // the walk's starting declarations, and this path serves no comparison.
+        // `validate_search` refuses a `traversal` naming no `seed`, and one beside
+        // `change`, so a walk here always starts at its `seed`.
         if let Some(traversal) = params.traversal.as_ref()
             && let Some(seed) = traversal.seed.as_ref()
             && matches!(
@@ -839,8 +839,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
 /// The capability a walk beside a comparison names.
 ///
 /// The language engine lane resolves the references a walk follows, and an engine session
-/// serves the current tree; a comparison names two committed revisions instead. No resend
-/// of the same request clears that.
+/// serves the current tree alone, so a committed revision has none. A comparison against
+/// the working tree is refused the same way: the walk from its changed declarations is not
+/// served. No resend of the same request clears that.
 pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
 
 /// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
@@ -861,14 +862,15 @@ fn validate_traversal_seed(
 }
 
 /// Refuses a `change` beside a field that selects another result set or another tree, and
-/// a revision spelling that breaks the charset [`RevisionId`] advertises.
+/// a revision spelling that breaks the charset [`RevisionId`] advertises. A working-tree
+/// `head` names no revision, so it has no spelling to check.
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
 /// to address, and `query` selects a result set of its own. A `scope` past `local`
 /// follows the rule every revision-addressed read applies, since package facts are
 /// served for the current tree alone. A `traversal` is refused beside a comparison by
-/// [`validate_traversal_seed`], since no lane resolves references for a committed
-/// revision.
+/// [`validate_traversal_seed`], since no lane serves the walk from a comparison's changed
+/// declarations.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
     if params.rev.is_some() {
         return Err(ReadFault::invalid(
@@ -886,11 +888,11 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
         return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
     }
     let sides = [
-        (CHANGE_BASE_FIELD, &change.base),
-        (CHANGE_HEAD_FIELD, &change.head),
+        (CHANGE_BASE_FIELD, Some(&change.base)),
+        (CHANGE_HEAD_FIELD, change.head.revision()),
     ];
     for (field, revision) in sides {
-        if let Some(violation) = revision.violation() {
+        if let Some(violation) = revision.and_then(RevisionId::violation) {
             return Err(ReadFault::invalid(field, violation.as_str()));
         }
     }
@@ -4692,24 +4694,30 @@ impl Tower {
     }
 
     /// A configured language engine resolves the references a walk follows, and an engine
-    /// session serves the current tree; a comparison names two committed revisions.
+    /// session serves the current tree; the walk from a comparison's changed declarations
+    /// is not served, whether `head` names a revision or the working tree.
     #[test]
     fn validate_search_refuses_a_traversal_riding_beside_a_comparison() {
-        let params: SearchParams = serde_json::from_value(json!({
-            "change": {"base": "baseline"},
-            "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
-        }))
-        .expect("the request parses");
+        for change in [
+            json!({"base": "baseline"}),
+            json!({"base": "baseline", "head": {"kind": "working_tree"}}),
+        ] {
+            let params: SearchParams = serde_json::from_value(json!({
+                "change": change,
+                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+            }))
+            .expect("the request parses");
 
-        let error = super::validate_search(&params).expect_err("the pairing must refuse");
+            let error = super::validate_search(&params).expect_err("the pairing must refuse");
 
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
-        assert!(
-            error
-                .to_string()
-                .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
-            "{error}"
-        );
+            assert_eq!(error.descriptor().code(), "capability_unavailable");
+            assert!(
+                error
+                    .to_string()
+                    .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
+                "{error}"
+            );
+        }
     }
 
     /// A walk standing without a comparison and naming its seed passes the rule.

@@ -1703,15 +1703,15 @@ impl RiftMcp {
     /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
     /// regex against the text of every indexed file, line by line as ripgrep reads it, and
     /// answers each match and each declaration holding one, in place of `query` and
-    /// `traversal`. `change` answers the declarations two committed revisions hold
-    /// differently, in place of `query` and `traversal`. `rev` searches a version-control
-    /// revision instead of the current tree, and never combines with `pattern`, `traversal`,
-    /// or `change`. `scope` reaches past the project tree: `global` answers `query` from the
-    /// public declarations the global index holds for the workspace's dependencies alone and
-    /// `pattern` from their source, `all` from both, ordered together. `packages` names
-    /// package versions `query` and `pattern` search beside the workspace's own, such as an
-    /// upgrade target or a package the project does not use yet. Use `get_symbol` when the
-    /// declaration name is known.
+    /// `traversal`. `change` answers the declarations a committed revision and another
+    /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
+    /// `rev` searches a version-control revision instead of the current tree, and never
+    /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
+    /// tree: `global` answers `query` from the public declarations the global index holds for
+    /// the workspace's dependencies alone and `pattern` from their source, `all` from both,
+    /// ordered together. `packages` names package versions `query` and `pattern` search beside
+    /// the workspace's own, such as an upgrade target or a package the project does not use
+    /// yet. Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1740,17 +1740,16 @@ impl RiftMcp {
         .await
     }
 
-    /// Compares the two committed revisions `change` names and answers the declarations
-    /// they hold differently.
+    /// Compares the committed revision `change` names against another revision or the
+    /// working tree, and answers the declarations the two sides hold differently.
     ///
-    /// The comparison reads both sides from the workspace's git objects with no checkout,
-    /// under the same `[source]` policy and bounds a revision read applies, and
-    /// `[providers.history] enabled = false` refuses it the same way. Neither side is the
-    /// current tree, so the search index never takes part.
-    ///
-    /// A `traversal` riding beside the comparison walks the current publication's
-    /// relationship graph, so that publication is resolved once here and handed to the
-    /// comparison along with the revision policy.
+    /// A committed side is read from the workspace's git objects with no checkout, under
+    /// the same `[source]` policy and bounds a revision read applies, and
+    /// `[providers.history] enabled = false` refuses the comparison the same way. The
+    /// working-tree side is the current publication's index, resolved once here, and the
+    /// answer carries `stale_index` when that publication is served in spite of a
+    /// recorded rebuild failure, as any current-tree read does. The search index never
+    /// takes part.
     async fn change_search(
         &self,
         params: SearchParams,
@@ -1769,20 +1768,30 @@ impl RiftMcp {
             languages,
             history: _,
         } = revision_read;
-        self.blocking
+        // A committed head reads no publication, so only the working tree answers for the
+        // publication's lag.
+        let stale = match &change.head {
+            rift_protocol::read::ChangeHead::Tree(_) => resolved.stale.clone(),
+            rift_protocol::read::ChangeHead::Revision(_) => None,
+        };
+        let current = Arc::clone(&resolved.published.reads);
+        let mut answer = self
+            .blocking
             .run("revision comparison read", move || {
                 rift_server::search_change(
                     &root,
                     &params,
                     &change,
+                    &current,
                     limits,
                     &visibility,
                     (&text_inclusion, &languages),
                 )
             })
             .await
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(stale);
+        Ok(Json(answer))
     }
 
     /// Ranks and reads one current-tree search against one publication.
@@ -4962,6 +4971,46 @@ done
         assert!(
             detail.contains("the next filesystem event retries"),
             "{detail}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_working_tree_change_under_a_rebuild_failure_answers_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        fail_rebuild_after_events(directory.path(), server, 1).await?;
+
+        let working_tree: SearchParams = serde_json::from_value(
+            json!({"change": {"base": "HEAD", "head": {"kind": "working_tree"}}}),
+        )?;
+        let answer =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(working_tree)))
+                .await
+                .map_err(|_| "a comparison under a recorded failure must not wait")??
+                .0;
+
+        assert!(
+            answer.results.is_empty(),
+            "the published snapshot predates `lantern`: {answer:#?}"
+        );
+        let (index, _captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_eq!(
+            index,
+            server.published.read().await.current.reads.tree_revision()
+        );
+        assert!(detail.contains("injected failure"), "{detail}");
+
+        let committed: SearchParams = serde_json::from_value(json!({"change": {"base": "HEAD"}}))?;
+        let answer = server.search(Parameters(committed)).await?.0;
+        assert!(
+            stale_index_of(&answer.warnings).is_err(),
+            "a committed head reads no publication: {answer:#?}"
         );
         Ok(())
     }

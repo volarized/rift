@@ -1498,7 +1498,7 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
 }
 
 /// Projects one index-build warning onto its wire form.
-fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
+pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
     let path = warning.path();
     ReadWarning::SourceUnavailable {
         unit: Some(file_id(path)),

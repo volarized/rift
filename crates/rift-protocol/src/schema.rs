@@ -1329,10 +1329,10 @@ pub fn require_search_selector(schema: &mut Schema) {
 }
 
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
-/// starts at through `seed`, and no walk rides beside `change`: a comparison names two
-/// committed revisions, and the language engine lane that resolves references serves the
-/// current tree alone. The server enforces both halves, so the schema states them for a
-/// validating caller.
+/// starts at through `seed`, and no walk rides beside `change`: the language engine lane
+/// that resolves references serves the current tree alone, and the walk from a
+/// comparison's changed declarations is not served. The server enforces both halves, so
+/// the schema states them for a validating caller.
 pub fn require_traversal_seed(schema: &mut Schema) {
     use crate::search::{SearchParams, SearchTraversal};
     let change = property!(SearchParams, change);
