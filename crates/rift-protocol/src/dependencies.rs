@@ -212,6 +212,17 @@ impl ConfiguredPackage {
 /// One package a `get_symbol` or `search` request names beside the dependency context.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {
+        "manager": "cargo",
+        "name": "tokio",
+        "version": "1.47.1"
+    },
+    {
+        "manager": "npm",
+        "name": "zod"
+    }
+]))]
 pub struct RequestedPackage {
     /// Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.
     #[schemars(length(min = 1, max = 128))]

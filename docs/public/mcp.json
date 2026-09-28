@@ -37,6 +37,17 @@
           "RequestedPackage": {
             "additionalProperties": false,
             "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
+            "examples": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              },
+              {
+                "manager": "npm",
+                "name": "zod"
+              }
+            ],
             "properties": {
               "manager": {
                 "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
@@ -4741,6 +4752,17 @@
           "RequestedPackage": {
             "additionalProperties": false,
             "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
+            "examples": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              },
+              {
+                "manager": "npm",
+                "name": "zod"
+              }
+            ],
             "properties": {
               "manager": {
                 "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
