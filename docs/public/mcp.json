@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. Use `search` when the name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. `packages` names package versions the lookup reads beside the\nworkspace's own, such as an upgrade target or a package the project does not use\nyet. Use `search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
@@ -33,6 +33,46 @@
             "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
+          },
+          "RequestedPackage": {
+            "additionalProperties": false,
+            "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
+            "examples": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              },
+              {
+                "manager": "npm",
+                "name": "zod"
+              }
+            ],
+            "properties": {
+              "manager": {
+                "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "version": {
+                "description": "The exact version to read. Absent, the entry asks for the requirement `>=0`, which\nthe global index answers from its newest collected release.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "manager",
+              "name"
+            ],
+            "type": "object"
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
@@ -85,6 +125,18 @@
             "limit": 5,
             "name": "spawn",
             "scope": "all"
+          },
+          {
+            "limit": 5,
+            "name": "spawn",
+            "packages": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              }
+            ],
+            "scope": "global"
           }
         ],
         "properties": {
@@ -115,6 +167,14 @@
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
+          },
+          "packages": {
+            "description": "Packages this lookup reads beside the ones the workspace's manifests and\nlockfiles name, at most 64. An entry naming a package the workspace depends on\nreplaces that package's versions for this read, and an entry naming another\npackage adds it. The server refuses `packages` beside the `local` scope, since a\nproject read consults no package, and beside `rev`, since package facts are\nserved for the current tree alone.",
+            "items": {
+              "$ref": "#/$defs/RequestedPackage"
+            },
+            "maxItems": 64,
+            "type": "array"
           },
           "page_index": {
             "default": 0,
@@ -4717,7 +4777,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone, `all` from both,\nordered together. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone, `all` from both,\nordered together. `packages` names package versions `query` searches beside the\nworkspace's own, such as an upgrade target or a package the project does not use yet.\nUse `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -4918,6 +4978,46 @@
                 "type": "string"
               }
             ]
+          },
+          "RequestedPackage": {
+            "additionalProperties": false,
+            "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
+            "examples": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              },
+              {
+                "manager": "npm",
+                "name": "zod"
+              }
+            ],
+            "properties": {
+              "manager": {
+                "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "version": {
+                "description": "The exact version to read. Absent, the entry asks for the requirement `>=0`, which\nthe global index answers from its newest collected release.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "manager",
+              "name"
+            ],
+            "type": "object"
           },
           "ResultOrder": {
             "description": "The total order a paginated answer comes back in. Every order ends in the result's own\nidentity, so two results that tie never swap places between pages.",
@@ -5206,6 +5306,19 @@
             "target": "file"
           },
           {
+            "limit": 10,
+            "packages": [
+              {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+              }
+            ],
+            "query": "spawn_blocking",
+            "scope": "all",
+            "target": "symbol"
+          },
+          {
             "change": {
               "base": "main",
               "head": "HEAD"
@@ -5237,6 +5350,14 @@
             "$ref": "#/$defs/ResultOrder",
             "default": "relevance",
             "description": "Which total order the page comes back in. Omitted, relevance."
+          },
+          "packages": {
+            "description": "Packages `query` searches beside the ones the workspace's manifests and lockfiles\nname, at most 64. An entry naming a package the workspace depends on replaces that\npackage's versions for this search, and an entry naming another package adds it.\nThe server refuses `packages` beside the `local` scope, since a project search\nconsults no package, and beside `rev`, since package facts are served for the\ncurrent tree alone.",
+            "items": {
+              "$ref": "#/$defs/RequestedPackage"
+            },
+            "maxItems": 64,
+            "type": "array"
           },
           "page_index": {
             "default": 0,
