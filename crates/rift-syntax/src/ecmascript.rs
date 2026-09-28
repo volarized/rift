@@ -12,11 +12,12 @@
 //! - The `Public` facet marks a declaration the module exports. An `export`
 //!   statement wrapping a declaration adds it, and so does an export naming a
 //!   module-scope declaration: `a` and `b` in `export { a, b as c }`, `a` in
-//!   `export default a`, and the declarations a `module.exports = a`,
-//!   `module.exports = { a, b: c }`, `module.exports.name = a`, or
-//!   `exports.name = a` assignment names. The declaration keeps its own
-//!   name. A method written in an object literal the module exports whole
-//!   (`export default { .. }`, `module.exports = { .. }`) is exported too.
+//!   `export default a` and the TypeScript `export = a`, and the declarations
+//!   a `module.exports = a`, `module.exports = { a, b: c }`,
+//!   `module.exports.name = a`, or `exports.name = a` assignment names. The
+//!   declaration keeps its own name. A method written in an object literal
+//!   the module exports whole (`export default { .. }`, `export = { .. }`,
+//!   `module.exports = { .. }`) is exported too.
 //! - Exports are read from the module's top-level statements: an assignment
 //!   nested in a block or a function marks nothing. A re-export
 //!   (`export { x } from './y'`, `export * from './y'`) names another
@@ -117,6 +118,9 @@ const OBJECT_KIND: &str = "object";
 const SHORTHAND_PROPERTY_IDENTIFIER_KIND: &str = "shorthand_property_identifier";
 /// Grammar spelling of a `pair`, `b: c` in `{ b: c }`.
 const PAIR_KIND: &str = "pair";
+/// Grammar spelling of the anonymous `=` token, the one direct token that
+/// separates the TypeScript `export = value` form from every other `export`.
+const EQUALS_TOKEN: &str = "=";
 /// The variable naming the running module, `module` in `module.exports`.
 const MODULE_VARIABLE: &str = "module";
 /// The property of `module`, and the variable, holding a module's exports:
@@ -253,6 +257,7 @@ pub(crate) struct EcmaScriptKinds {
     member_bodies: Vec<u16>,
     program: u16,
     export_clause: u16,
+    equals_token: u16,
     expression_statement: u16,
     assignment_expression: u16,
     member_expression: u16,
@@ -310,6 +315,7 @@ impl EcmaScriptKinds {
             member_bodies: Vec::new(),
             program: kind_id(language, PROGRAM_KIND),
             export_clause: kind_id(language, EXPORT_CLAUSE_KIND),
+            equals_token: token_id(language, EQUALS_TOKEN),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
             member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
@@ -438,9 +444,10 @@ impl EcmaScriptKinds {
     }
 
     /// The local names an `export` statement's clause names (`a` in
-    /// `export { a as b }`) and its default value (`a` in `export default a`).
-    /// A re-export (`export { x } from './y'`, `export * from './y'`) carries
-    /// a `source` and names another module's declarations, so it yields none.
+    /// `export { a as b }`), its default value (`a` in `export default a`),
+    /// and the value a TypeScript `export = a` exports whole. A re-export
+    /// (`export { x } from './y'`, `export * from './y'`) carries a `source`
+    /// and names another module's declarations, so it yields none.
     fn export_statement_exports<'tree>(&self, statement: Node<'tree>) -> Vec<Node<'tree>> {
         if self
             .child(statement, EcmaScriptGrammarField::Source)
@@ -454,7 +461,20 @@ impl EcmaScriptKinds {
         specifiers
             .filter_map(|specifier| self.child(specifier, EcmaScriptGrammarField::Name))
             .chain(self.child(statement, EcmaScriptGrammarField::Value))
+            .chain(self.export_assignment_value(statement))
             .collect()
+    }
+
+    /// The value of a TypeScript `export = value` statement: the first named
+    /// child after its `=` token. The grammar gives the value no field, and
+    /// `export as namespace name` places an identifier in the same child
+    /// position, so the token decides; `None` for any other `export`.
+    fn export_assignment_value<'tree>(&self, statement: Node<'tree>) -> Option<Node<'tree>> {
+        let mut children = statement
+            .child_indices()
+            .filter_map(|index| statement.child(index));
+        children.find(|child| child.kind_id() == self.equals_token)?;
+        children.find(Node::is_named)
     }
 
     /// The value an assignment statement exports: `module.exports = value`,
@@ -590,6 +610,18 @@ fn kind_id(language: &tree_sitter::Language, kind: &str) -> u16 {
         id != 0,
         "pinned ECMAScript grammar must define node kind used by symbol \
          extraction: kind={kind}"
+    );
+    id
+}
+
+/// Resolves one anonymous token's kind id, proving the pinned grammar defines
+/// it.
+fn token_id(language: &tree_sitter::Language, token: &str) -> u16 {
+    let id = language.id_for_node_kind(token, false);
+    assert!(
+        id != 0,
+        "pinned ECMAScript grammar must define token used by symbol \
+         extraction: token={token}"
     );
     id
 }

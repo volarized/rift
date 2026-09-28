@@ -337,6 +337,43 @@ mod tests {
         );
     }
 
+    /// `export = X` marks the module-scope declaration `X`, and an object
+    /// literal behind it the declarations its properties name; `export as
+    /// namespace` exports nothing by name.
+    #[test]
+    fn test_an_export_assignment_marks_the_declaration_it_names() {
+        let public = |text: &str| {
+            analyze(text)
+                .symbols()
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.qualified_name.clone(),
+                        symbol.facets.contains(&SymbolFacet::Public),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            public(
+                "class Runner {\n  run(): void {}\n}\nfunction helper(): void {}\nexport = Runner;\n"
+            ),
+            [
+                ("Runner".to_owned(), true),
+                ("Runner.run".to_owned(), false),
+                ("helper".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            public("function parse(): void {}\nfunction hidden(): void {}\nexport = { parse };\n"),
+            [("parse".to_owned(), true), ("hidden".to_owned(), false)]
+        );
+        assert_eq!(
+            public("function helper(): void {}\nexport as namespace helper;\n"),
+            [("helper".to_owned(), false)]
+        );
+    }
+
     /// Body ranges span the interface, enum, namespace, and class bodies,
     /// the type alias value, and stay absent on bodyless signatures and
     /// ambient declarations.
