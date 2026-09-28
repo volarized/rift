@@ -1187,6 +1187,69 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
+/// A standard library callee the global API names answers as a hit carrying the global
+/// identity and a `unit` in place of `path`, and a callee it names nothing at drops: the
+/// answer validates against the served output schema.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> TestResult {
+    let global = GlobalFixture::start_with(global_api::FixtureOptions {
+        python_collection: true,
+        ..global_api::FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"5s\"\n\n\
+         [languages.python.lsp]\nembedded = \"ty\"\n",
+        global.endpoint
+    );
+    let (_directory, client, _server_task) = workspace_client::served_workspace(
+        &[(
+            "caller.py",
+            "import json\n\n\ndef caller() -> int:\n    return len(json.dumps(1))\n",
+        )],
+        Some(configuration),
+    )
+    .await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input_validator, output_validator) = validators
+        .get("search")
+        .ok_or("search must be advertised")?;
+    let walk = json!({
+        "traversal": { "seed": "rift://symbol/python/caller.py/caller", "direction": "outgoing" }
+    });
+    assert_validates(input_validator, &walk, "an outgoing walk");
+    let structured = workspace_client::call_retrying_acceptance(
+        &client,
+        workspace_client::tool_request("search", &walk),
+    )
+    .await?;
+    assert_validates(
+        output_validator,
+        &structured,
+        "an outgoing walk naming package callees",
+    );
+    let units: Vec<&Value> = structured["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| &hit["unit"])
+        .collect();
+    assert_eq!(
+        units,
+        [&json!("rift://source/stdlib/python@3.12.9/builtins.pyi")],
+        "{structured:#}"
+    );
+    assert_eq!(
+        warning_count(&structured, "callees_dropped"),
+        1,
+        "`json.dumps` is named nothing: {structured:#}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
 /// `packages` beside the `local` scope and beside `rev` are schema-valid, runtime-refused
 /// requests on both reads: a project read consults no package, and package facts follow
 /// the current tree alone, so the server refuses `invalid_request` naming `packages`.

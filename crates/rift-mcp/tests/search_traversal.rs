@@ -12,6 +12,11 @@
 
 #[cfg(unix)]
 mod fake_engine;
+#[allow(
+    dead_code,
+    reason = "shared fixture global API exposes helpers this suite does not use"
+)]
+mod global_api;
 mod hermetic_search;
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
@@ -737,9 +742,9 @@ fn live_typescript_engine() -> String {
 
 /// typescript-language-server answers both walk directions through `search`, each on its
 /// first walk, since the walk waits out the project load. The outgoing walk from `larger`
-/// reaches `beacon` and counts `Math.max`, which TypeScript's own lib declares, as a
-/// dropped callee; the incoming walk to `beacon` reaches `larger`, `total`, and the TSX
-/// `Banner`.
+/// reaches `beacon`, and addresses `Math.max` in the `typescript` package the workspace
+/// installs, whose lib declares it: with the global API off it drops, and the answer names
+/// why. The incoming walk to `beacon` reaches `larger`, `total`, and the TSX `Banner`.
 #[cfg(unix)]
 #[tokio::test]
 async fn live_typescript_language_server_walks_both_directions() -> TestResult {
@@ -771,12 +776,17 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("the walk counts the callee it dropped")?;
-    assert_eq!(warnings.len(), 1, "{answer}");
+    assert_eq!(warnings.len(), 2, "{answer}");
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{answer}");
     assert_eq!(
         warnings[0]["callees"],
         json!(1),
         "`Math.max` sits in TypeScript's own lib: {answer}"
+    );
+    assert_eq!(
+        warnings[1],
+        json!({"code": "global_access_disabled"}),
+        "the lib is a package file the global API names: {answer}"
     );
     let (incoming, answer) = live_walk(
         &client,
@@ -988,10 +998,11 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     Ok(())
 }
 
-/// A standard library callee (`len`, answered in ty's vendored `builtins.pyi`) has no
-/// declaration in the tree, so its edge drops, the answer counts it in `callees_dropped`,
-/// and the project callee stays; a class seed answers the calls in its own body alone
-/// (`counted`, not `root_call` inside `grow`).
+/// With `[global] enabled = false`, a standard library callee (`len`, answered in ty's
+/// vendored `builtins.pyi`) is named by no declaration, so its edge drops, the answer counts
+/// it in `callees_dropped` beside the warning naming the global API off, and the project
+/// callee stays; a class seed answers the calls in its own body alone (`counted`, not
+/// `root_call` inside `grow`).
 #[tokio::test]
 async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_class_body()
 -> TestResult {
@@ -1014,9 +1025,14 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
     let warnings = counted["warnings"]
         .as_array()
         .ok_or("a dropped callee warns")?;
-    assert_eq!(warnings.len(), 1, "{counted}");
+    assert_eq!(warnings.len(), 2, "{counted}");
     assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
     assert_eq!(warnings[0]["callees"], json!(1), "{counted}");
+    assert_eq!(
+        warnings[1],
+        json!({"code": "global_access_disabled"}),
+        "{counted}"
+    );
 
     let holder = call_retrying_acceptance(
         &client,
@@ -1299,6 +1315,279 @@ async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult 
         error.message.contains("traversal"),
         "the refusal names the field: {}",
         error.message
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The `[global]` table pointing at `endpoint`, with bounds a loopback fixture meets.
+fn global_table(endpoint: &str) -> String {
+    format!(
+        "[global]\nenabled = true\nendpoint = \"{endpoint}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"5s\"\n"
+    )
+}
+
+/// The fixture global API holding the Python collection the callee walks name.
+async fn python_global_api() -> TestResult<global_api::GlobalFixture> {
+    Ok(
+        global_api::GlobalFixture::start_with(global_api::FixtureOptions {
+            python_collection: true,
+            ..global_api::FixtureOptions::default()
+        })
+        .await?,
+    )
+}
+
+/// The declaration requests the fixture received.
+async fn declaration_requests(fixture: &global_api::GlobalFixture) -> Vec<Value> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.ends_with("/declarations"))
+        .filter_map(|request| request.body)
+        .collect()
+}
+
+/// The hit whose symbol `name` names, with its identity, unit, and the edge reaching it.
+fn callee_hit(structured: &Value, name: &str) -> TestResult<Value> {
+    results(structured)
+        .into_iter()
+        .find(|hit| hit["hit"]["symbol"]["name"] == json!(name))
+        .ok_or_else(|| format!("{name} must be a hit: {structured}").into())
+}
+
+/// A standard library callee's position goes to the global API as `stdlib/python` at the
+/// release the resolution served, at typeshed's own path, and the answered declaration ends
+/// the edge: the callee is a hit addressed by its unit, and nothing drops.
+#[tokio::test]
+async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global_id() -> TestResult
+{
+    let fixture = python_global_api().await?;
+    let configuration = format!("{}\n{OUTGOING_ENGINE}", global_table(&fixture.endpoint));
+    let (_directory, client, _server_task) =
+        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+
+    let counted = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&counted), ["leaf", "len"], "{counted}");
+    let len = callee_hit(&counted, "len")?;
+    let id = "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len";
+    assert_eq!(len["hit"]["symbol"]["id"], json!(id), "{len}");
+    assert_eq!(len["hit"]["symbol"]["kind"], json!("function"), "{len}");
+    assert_eq!(
+        len["hit"]["symbol"]["origin"],
+        json!({"location": "stdlib", "source_kind": "authored"}),
+        "{len}"
+    );
+    assert_eq!(
+        len["unit"],
+        json!("rift://source/stdlib/python@3.12.9/builtins.pyi"),
+        "{len}"
+    );
+    assert!(len["path"].is_null() && len["range"].is_null(), "{len}");
+    assert_eq!(len["distance"], json!(1), "{len}");
+    let hop = &len["traversal_path"][0]["relationship"];
+    assert_eq!(hop["from"], json!("rift://symbol/python/extra.py/counted"));
+    assert_eq!(hop["to"], json!(id), "{len}");
+    assert_eq!(hop["facets"], json!(["calls"]), "{len}");
+    assert!(counted["warnings"].is_null(), "{counted}");
+
+    let requests = declaration_requests(&fixture).await;
+    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
+    let positions = requests[0]["positions"]
+        .as_array()
+        .ok_or("the request carries positions")?;
+    assert_eq!(positions.len(), 1, "{requests:?}");
+    assert_eq!(
+        positions[0]["package"],
+        json!({"manager": "stdlib", "name": "python", "version": "3.12.9"})
+    );
+    assert_eq!(positions[0]["path"], json!("builtins.pyi"));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// `greeting` 1.0.0 as `uv sync` installs it into the workspace's own `.venv`, with the
+/// lockfile naming it and a module calling both its functions.
+#[cfg(unix)]
+const INSTALLED_FILES: &[(&str, &str)] = &[
+    (
+        "pyproject.toml",
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"greeting\"]\n",
+    ),
+    (
+        "uv.lock",
+        "version = 1\n\n\
+         [[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n\n\
+         [[package]]\nname = \"greeting\"\nversion = \"1.0.0\"\n\
+         source = { registry = \"https://pypi.org/simple\" }\n",
+    ),
+    (
+        ".venv/pyvenv.cfg",
+        "home = /usr/bin\nversion_info = 3.12.4\n",
+    ),
+    (
+        ".venv/lib/python3.12/site-packages/greeting/__init__.py",
+        "from greeting.core import greet, quiet\n",
+    ),
+    (
+        ".venv/lib/python3.12/site-packages/greeting/core.py",
+        "def greet(name: str) -> str:\n    return name\n\n\ndef quiet() -> None:\n    return None\n",
+    ),
+    (
+        ".venv/lib/python3.12/site-packages/greeting-1.0.0.dist-info/RECORD",
+        "greeting/__init__.py,,\ngreeting/core.py,,\ngreeting-1.0.0.dist-info/RECORD,,\n",
+    ),
+    (
+        "app.py",
+        "from greeting.core import greet, quiet\n\n\n\
+         def hello() -> str:\n    quiet()\n    return greet(\"rift\")\n",
+    ),
+];
+
+/// A dependency callee's file below the package's import folder in `.venv` addresses the
+/// package at its locked version, at its installed path, so the global API names `greet`;
+/// `quiet`, a position it answers no declaration at, drops and is counted.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answered_none()
+-> TestResult {
+    let fixture = python_global_api().await?;
+    let configuration = format!(
+        "[source]\nexclude = [\".venv/**\"]\n\n{}\n{OUTGOING_ENGINE}",
+        global_table(&fixture.endpoint)
+    );
+    let (_directory, client, _server_task) =
+        served_workspace(INSTALLED_FILES, Some(configuration)).await?;
+
+    let hello = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
+    let greet = callee_hit(&hello, "greet")?;
+    assert_eq!(
+        greet["hit"]["symbol"]["id"],
+        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        "{greet}"
+    );
+    assert_eq!(
+        greet["hit"]["symbol"]["origin"],
+        json!({
+            "location": "dependency",
+            "package": {"manager": "pypi", "name": "greeting", "version": "1.0.0"},
+            "source_kind": "authored"
+        }),
+        "{greet}"
+    );
+    assert_eq!(
+        greet["unit"],
+        json!("rift://source/pypi/greeting@1.0.0/greeting/core.py"),
+        "{greet}"
+    );
+    let warnings = hello["warnings"]
+        .as_array()
+        .ok_or("a dropped callee warns")?;
+    assert_eq!(
+        warnings.as_slice(),
+        [json!({
+            "code": "callees_dropped",
+            "callees": 1,
+            "detail": "the language engine named callees outside the project and every \
+                       installed package, or at a position the global index answered no \
+                       declaration at, so the walk carries no edge to them"
+        })],
+        "{hello}"
+    );
+
+    let requests = declaration_requests(&fixture).await;
+    let mut asked: Vec<(String, String, u64)> = requests
+        .iter()
+        .flat_map(|request| request["positions"].as_array().cloned().unwrap_or_default())
+        .map(|position| {
+            (
+                position["package"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                position["path"].as_str().unwrap_or_default().to_owned(),
+                position["line"].as_u64().unwrap_or(u64::MAX),
+            )
+        })
+        .collect();
+    asked.sort();
+    assert_eq!(
+        asked,
+        [
+            ("greeting".to_owned(), "greeting/core.py".to_owned(), 0),
+            ("greeting".to_owned(), "greeting/core.py".to_owned(), 4),
+        ],
+        "each callee's position at its installed path, in one request: {requests:?}"
+    );
+    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A global API that refuses the connection names no callee: every package callee drops,
+/// and the answer carries the typed warning naming the failure.
+#[tokio::test]
+async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_callees()
+-> TestResult {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    let configuration = format!(
+        "{}\n{OUTGOING_ENGINE}",
+        global_table(&format!("http://127.0.0.1:{port}/rift/rest"))
+    );
+    let (_directory, client, _server_task) =
+        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+
+    let counted = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    let codes: Vec<&Value> = counted["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|warning| &warning["code"])
+        .collect();
+    assert_eq!(
+        codes,
+        [&json!("callees_dropped"), &json!("global_api_unavailable")],
+        "{counted}"
     );
 
     client.cancel().await?;

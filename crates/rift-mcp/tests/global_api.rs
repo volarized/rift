@@ -8,6 +8,11 @@
 //! each answer passes the client's own validation. The
 //! collected release also answers, as the nearest release, an exact `demo` entry at another
 //! version and every `demo` requirement.
+//!
+//! A fixture started with [`FixtureOptions::python_collection`] also holds
+//! [`PYTHON_STANDARD_LIBRARY`] and [`GREETING`], and names the declarations
+//! [`NAMED_POSITIONS`] lists at a position in their files, as the declaration endpoint does
+//! for the callees an outgoing walk meets.
 
 use std::{sync::Arc, time::Duration};
 
@@ -51,6 +56,43 @@ pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 /// The query the fixture answers with `beacon` matched inside its body: a word no
 /// declaration name holds, so the hit claims the `unknown` class and `file_content`.
 pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
+
+/// The Python standard library release a Python collection holds: every `stdlib/python`
+/// entry resolves to it, as the nearest release when it names another.
+pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) = ("stdlib", "python", "3.12.9");
+
+/// The `pypi` release a Python collection holds, whose `greeting/core.py` declares `greet`
+/// on its first line.
+pub(crate) const GREETING: (&str, &str, &str) = ("pypi", "greeting", "1.0.0");
+
+/// One declaration a Python collection names at a package position.
+pub(crate) struct NamedPosition {
+    /// The package, as `manager`, `name`, and `version`.
+    pub(crate) package: (&'static str, &'static str, &'static str),
+    /// The file below the package's root.
+    pub(crate) path: &'static str,
+    /// The line a position must fall on, or any line when absent.
+    pub(crate) line: Option<i64>,
+    /// The declaration's qualified name.
+    pub(crate) qualified_name: &'static str,
+}
+
+/// The declarations a Python collection names at package positions. Every other position
+/// answers no declaration.
+pub(crate) const NAMED_POSITIONS: [NamedPosition; 2] = [
+    NamedPosition {
+        package: PYTHON_STANDARD_LIBRARY,
+        path: "builtins.pyi",
+        line: None,
+        qualified_name: "len",
+    },
+    NamedPosition {
+        package: GREETING,
+        path: "greeting/core.py",
+        line: Some(0),
+        qualified_name: "greet",
+    },
+];
 
 /// Largest request body the fixture reads.
 const REQUEST_BODY_BYTES_MAX: usize = 4_194_304;
@@ -99,6 +141,8 @@ pub(crate) struct FixtureOptions {
     /// The features the capabilities leave out of `supported_features`. Without both
     /// documentation features they carry no `documentation_revision` either.
     pub(crate) withheld_features: &'static [&'static str],
+    /// Whether the collection also holds [`PYTHON_STANDARD_LIBRARY`] and [`GREETING`].
+    pub(crate) python_collection: bool,
 }
 
 impl Default for FixtureOptions {
@@ -110,6 +154,7 @@ impl Default for FixtureOptions {
             dependency_entries_max: DEPENDENCY_ENTRIES_ADVERTISED,
             stopped_at_body_bound: false,
             withheld_features: &[],
+            python_collection: false,
         }
     }
 }
@@ -223,7 +268,10 @@ async fn global_handler(
     }
     if path.ends_with("/resolutions") {
         state.hold_resolution().await;
-        return json_response(&resolution(&body));
+        return json_response(&resolution(&body, options.python_collection));
+    }
+    if path.ends_with("/declarations") {
+        return json_response(&declarations(&body));
     }
     if path.ends_with("/search") {
         state.hold_read().await;
@@ -263,6 +311,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
         "documentation_search",
         "symbol_documentation",
         "patterns",
+        "declarations",
     ]
     .into_iter()
     .filter(|feature| !withheld.contains(feature))
@@ -305,39 +354,43 @@ fn capabilities(options: &FixtureOptions) -> Value {
     advertised
 }
 
-fn collected_package() -> Value {
-    json!({"manager": COLLECTED.0, "name": COLLECTED.1, "version": COLLECTED.2})
-}
-
 /// The resolution of `requested`. The collected release answers an exact `demo` entry at
 /// its own version as available, and one at another version, or a `demo` requirement, as
 /// the nearest release, warning `requirement_unsatisfied` for [`UNSATISFIED_REQUIREMENT`].
-/// Every other exact entry and requirement is missing, so each entry the request carries,
-/// the standard library entries included, is accounted for once.
-fn resolution(requested: &Value) -> Value {
+/// With `python_collection`, [`PYTHON_STANDARD_LIBRARY`] and [`GREETING`] answer their
+/// entries the same way. Every other exact entry and requirement is missing, so each entry
+/// the request carries, the standard library entries included, is accounted for once.
+fn resolution(requested: &Value, python_collection: bool) -> Value {
+    let held: &[(&str, &str, &str)] = if python_collection {
+        &[COLLECTED, PYTHON_STANDARD_LIBRARY, GREETING]
+    } else {
+        &[COLLECTED]
+    };
     let (mut available, mut resolved, mut missing_exact, mut missing_requirements) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut warnings = Vec::new();
     for entry in requested["entries"].as_array().into_iter().flatten() {
         let manager = entry["manager"].as_str().unwrap_or_default();
         let name = entry["name"].as_str().unwrap_or_default();
-        let collected = (manager, name) == (COLLECTED.0, COLLECTED.1);
-        match (&entry["version"], collected) {
-            (Value::String(version), true) if version == COLLECTED.2 => {
-                available.push(collected_package());
+        let release = held
+            .iter()
+            .find(|(held_manager, held_name, _)| (*held_manager, *held_name) == (manager, name));
+        match (&entry["version"], release) {
+            (Value::String(version), Some(release)) if version == release.2 => {
+                available.push(package_value(*release));
             }
-            (Value::String(version), false) => missing_exact.push(json!({
+            (Value::String(version), None) => missing_exact.push(json!({
                 "manager": manager, "name": name, "version": version
             })),
-            (_, false) => missing_requirements.push(entry.clone()),
-            (_, true) => {
-                resolved.push(json!({"entry": entry, "package": collected_package()}));
+            (_, None) => missing_requirements.push(entry.clone()),
+            (_, Some(release)) => {
+                resolved.push(json!({"entry": entry, "package": package_value(*release)}));
                 if entry["requirement"] == UNSATISFIED_REQUIREMENT {
                     warnings.push(json!({
                         "code": "requirement_unsatisfied",
                         "detail": format!(
                             "{manager}/{name} {UNSATISFIED_REQUIREMENT} answered by {}",
-                            COLLECTED.2
+                            release.2
                         )
                     }));
                 }
@@ -354,6 +407,42 @@ fn resolution(requested: &Value) -> Value {
         body["warnings"] = json!(warnings);
     }
     body
+}
+
+fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
+    json!({"manager": manager, "name": name, "version": version})
+}
+
+/// The declaration answer for `request`: each position [`NAMED_POSITIONS`] lists names its
+/// declaration, by the identity package analysis mints; every other position names none.
+fn declarations(request: &Value) -> Value {
+    let results: Vec<Value> = request["positions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|position| {
+            let package = &position["package"];
+            let named = NAMED_POSITIONS.iter().find(|named| {
+                package == &package_value(named.package)
+                    && position["path"] == named.path
+                    && named.line.is_none_or(|line| position["line"] == line)
+            });
+            match named {
+                Some(named) => {
+                    let (manager, name, version) = named.package;
+                    let (path, qualified) = (named.path, named.qualified_name);
+                    json!({
+                        "position": position,
+                        "declaration": format!(
+                            "rift://symbol/python/{manager}/{name}@{version}/{path}/{qualified}"
+                        )
+                    })
+                }
+                None => json!({"position": position}),
+            }
+        })
+        .collect();
+    json!({"results": results})
 }
 
 /// One page of `items` and `warnings`, with the revision fields every page carries and no
@@ -465,7 +554,7 @@ fn pattern_hit(matched: &std::ops::Range<usize>, with_source: bool) -> Value {
         .find('\n')
         .map_or(COLLECTED_SOURCE.len(), |newline| matched.start + newline);
     let mut hit = json!({
-        "package": collected_package(),
+        "package": package_value(COLLECTED),
         "unit": COLLECTED_UNIT,
         "range": {"start": matched.start, "end": matched.end},
         "line": COLLECTED_SOURCE[..matched.start].matches('\n').count() + 1,
