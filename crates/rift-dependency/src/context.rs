@@ -85,7 +85,8 @@ pub struct InstallFolder {
 pub enum InstallLocation {
     /// An absolute folder a package's files take their path below: an npm package's
     /// `node_modules/<name>` folder, nested copies included, resolved through any link the
-    /// install made, or the Rust standard library below the sysroot.
+    /// install made, the Rust standard library below the sysroot, or a registry package
+    /// that library vendors, in its `vendor/<name>-<version>` folder.
     Path(PathBuf),
     /// One import folder or single-file module a Python distribution's `RECORD` lists,
     /// such as `jwt` or `six.py`. A file below it takes that path, then its own path below
