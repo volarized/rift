@@ -20,11 +20,13 @@ use lsp_types::notification::{
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
-    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
+    CallHierarchyOutgoingCalls, CallHierarchyPrepare, DocumentDiagnosticRequest, Initialize,
+    References, RegisterCapability, Request, Shutdown, WorkDoneProgressCreate,
+    WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
-    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyPrepareParams, ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
@@ -352,7 +354,9 @@ pub enum EngineReadiness {
     /// The engine announced work it has not yet ended. Its most recent
     /// answer is provisional.
     Analyzing,
-    /// The engine announced work and every token it began has since ended.
+    /// The engine announced work and every token it began has since ended,
+    /// or it declared itself ready at its start and has no work outstanding
+    /// ([`EngineSession::declare_ready`]).
     Ready,
 }
 
@@ -407,12 +411,33 @@ fn watch_kind(change: FileChangeType) -> Option<WatchKind> {
     }
 }
 
+/// The prefix of the progress token rust-analyzer names its `cargo check`
+/// with: `format!("rust-analyzer/flycheck/{id}")` in
+/// `crates/rust-analyzer/src/main_loop.rs` at rust-analyzer 1.98.1.
+///
+/// Call hierarchy answers do not wait for the check, so a walk's readiness
+/// leaves these tokens out while a diagnostics read still waits for them.
+const FLYCHECK_TOKEN_PREFIX: &str = "rust-analyzer/flycheck/";
+
+/// Whether one token names rust-analyzer's `cargo check`.
+fn is_flycheck(token: &ProgressToken) -> bool {
+    matches!(token, ProgressToken::String(name) if name.starts_with(FLYCHECK_TOKEN_PREFIX))
+}
+
 #[derive(Debug, Default)]
 struct WorkProgress {
     announced: bool,
     outstanding: Vec<ProgressToken>,
     last_transition: Option<Instant>,
     last_read: Option<Instant>,
+    first_read: Option<Instant>,
+    /// Announcement and last transition over every token but the flycheck ones.
+    walk_announced: bool,
+    walk_transition: Option<Instant>,
+    /// The engine declared itself ready at its start: it answers each
+    /// request on demand, so with nothing announced it reads ready, not
+    /// unconfirmed. A change leaves the declaration in place.
+    declared_ready: bool,
 }
 
 impl WorkProgress {
@@ -426,6 +451,10 @@ impl WorkProgress {
     fn began(&mut self, token: ProgressToken, now: Instant) {
         self.announced = true;
         self.last_transition = Some(now);
+        if !is_flycheck(&token) {
+            self.walk_announced = true;
+            self.walk_transition = Some(now);
+        }
         if self.outstanding.len() >= PROGRESS_TOKENS_MAX || self.outstanding.contains(&token) {
             return;
         }
@@ -439,16 +468,34 @@ impl WorkProgress {
         if self.outstanding.len() < held {
             self.announced = true;
             self.last_transition = Some(now);
+            if !is_flycheck(token) {
+                self.walk_announced = true;
+                self.walk_transition = Some(now);
+            }
         }
     }
 
     /// Invalidates settlement after workspace bytes change.
     ///
     /// Outstanding work remains outstanding. With no outstanding token,
-    /// next answer needs fresh progress or repeated report evidence.
+    /// next answer needs fresh progress or repeated report evidence, unless
+    /// the engine declared itself ready: an engine that answers on demand
+    /// reads the change at its next request, so waiting changes no answer.
     fn invalidated(&mut self, now: Instant) {
         self.announced = false;
         self.last_transition = Some(now);
+        self.walk_announced = false;
+        self.walk_transition = Some(now);
+    }
+
+    /// What an engine that announced nothing reads: ready when it declared
+    /// itself ready at its start, unconfirmed otherwise.
+    fn unannounced(&self) -> EngineReadiness {
+        if self.declared_ready {
+            EngineReadiness::Ready
+        } else {
+            EngineReadiness::Unconfirmed
+        }
     }
 
     /// Stamps the moment the session last read the engine's own output.
@@ -457,7 +504,46 @@ impl WorkProgress {
     /// answers ready only once the session has read engine bytes at least
     /// one settle delay after the record's last transition.
     fn read(&mut self, now: Instant) {
+        self.first_read.get_or_insert(now);
         self.last_read = Some(now);
+    }
+
+    /// The readiness a call hierarchy walk reads: [`WorkProgress::readiness`]
+    /// with the flycheck tokens left out.
+    fn walk_readiness(&self, settle_delay: Duration) -> EngineReadiness {
+        if self.outstanding.iter().any(|token| !is_flycheck(token)) {
+            EngineReadiness::Analyzing
+        } else if !self.walk_announced {
+            self.unannounced()
+        } else if self.walk_is_quiet(settle_delay) {
+            EngineReadiness::Ready
+        } else {
+            EngineReadiness::Analyzing
+        }
+    }
+
+    /// Whether the session has read engine output at least `settle_delay`
+    /// after the walk's last transition, or after its first read when
+    /// nothing was announced since the session started.
+    fn walk_is_quiet(&self, settle_delay: Duration) -> bool {
+        let (Some(since), Some(read)) = (self.walk_transition.or(self.first_read), self.last_read)
+        else {
+            return false;
+        };
+        read.saturating_duration_since(since) >= settle_delay
+    }
+
+    /// The next moment after `now` at which a read could prove a settle
+    /// delay of quiet: one settle delay past the last transition, the walk's
+    /// last transition, or the first read. `None` when every such moment has
+    /// passed.
+    fn next_quiet_boundary(&self, now: Instant, settle_delay: Duration) -> Option<Instant> {
+        [self.last_transition, self.walk_transition, self.first_read]
+            .into_iter()
+            .flatten()
+            .map(|since| since + settle_delay)
+            .filter(|boundary| *boundary > now)
+            .min()
     }
 
     /// Whether the record has stayed empty for `settle_delay`, up to the
@@ -490,7 +576,7 @@ impl WorkProgress {
         if self.is_outstanding() {
             EngineReadiness::Analyzing
         } else if !self.is_announced() {
-            EngineReadiness::Unconfirmed
+            self.unannounced()
         } else if self.is_settled(settle_delay) {
             EngineReadiness::Ready
         } else {
@@ -779,6 +865,36 @@ impl EngineSession {
         self.progress.readiness(self.settle_delay)
     }
 
+    /// What this session has proven for a call hierarchy walk:
+    /// [`EngineSession::readiness`] with rust-analyzer's `cargo check`
+    /// tokens (`rust-analyzer/flycheck/<id>`) left out, since call
+    /// hierarchy answers do not wait for the check.
+    #[must_use]
+    pub fn walk_readiness(&self) -> EngineReadiness {
+        self.progress.walk_readiness(self.settle_delay)
+    }
+
+    /// Whether the session has read engine output at least `settle_delay`
+    /// after the last transition a walk counts, or after its first read
+    /// when the engine announced nothing: the quiet an
+    /// [`EngineReadiness::Unconfirmed`] engine must show before a walk
+    /// trusts its answer.
+    #[must_use]
+    pub fn walk_is_quiet(&self) -> bool {
+        self.progress.walk_is_quiet(self.settle_delay)
+    }
+
+    /// Records that the engine answers each request on demand from its
+    /// current state, so it reads [`EngineReadiness::Ready`] from its start
+    /// with no work to announce and no `settle_delay` to wait out.
+    ///
+    /// The declaration survives a file change: the engine reads the
+    /// change at its next request, so after the change the session still
+    /// reads [`EngineReadiness::Ready`] unless the engine announces work.
+    pub fn declare_ready(&mut self) {
+        self.progress.declared_ready = true;
+    }
+
     /// Revision of diagnostic refresh requests received from engine.
     ///
     /// A changed revision invalidates an earlier pull even when both reports
@@ -885,6 +1001,167 @@ impl EngineSession {
         Ok(locations)
     }
 
+    /// The call hierarchy items the engine prepares at one position: the
+    /// callable declarations there, none off one. An engine answering `null`
+    /// prepares nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when call hierarchy is not advertised or the
+    /// exchange breaks.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future leaves the request pending; a later call discards
+    /// the engine's stale response.
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        path: &ProjectPath,
+        position: Position,
+    ) -> Result<Vec<CallHierarchyItem>, EngineError> {
+        require(
+            self.capabilities.call_hierarchy,
+            CallHierarchyPrepare::METHOD,
+        )?;
+        let params = CallHierarchyPrepareParams {
+            text_document_position_params: self.position_params(path, position)?,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let items = self.request::<CallHierarchyPrepare>(params).await?;
+        Ok(items.unwrap_or_default())
+    }
+
+    /// The calls one prepared item makes: each callee, and the ranges of its
+    /// calls inside the item. An engine answering `null` names no call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when call hierarchy is not advertised or the
+    /// exchange breaks.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future leaves the request pending; a later call discards
+    /// the engine's stale response.
+    pub async fn outgoing_calls(
+        &mut self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyOutgoingCall>, EngineError> {
+        require(
+            self.capabilities.call_hierarchy,
+            CallHierarchyOutgoingCalls::METHOD,
+        )?;
+        let params = CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let calls = self.request::<CallHierarchyOutgoingCalls>(params).await?;
+        Ok(calls.unwrap_or_default())
+    }
+
+    /// Reads engine output until `until`, or until `settled` holds: the wait
+    /// between two attempts, spent reading instead of sleeping.
+    ///
+    /// Progress is stamped when it arrives rather than at the next request,
+    /// and the engine's own requests are answered while the caller waits. A
+    /// stretch with no output counts as read up to the moment the wait saw it
+    /// end, since the session was reading the whole time. The wait wakes one
+    /// settle delay past the last transition, so a caller waiting for
+    /// readiness stops there instead of at its next scheduled attempt.
+    ///
+    /// A response read here belongs to the next exchange, which settles it:
+    /// it goes back to the queue unread, and the wait sleeps out the rest of
+    /// its time, so the attempt that reads it keeps its place in the retry
+    /// schedule.
+    ///
+    /// Each iteration consumes one engine message or ends at a wake-up, so
+    /// the loop is bounded by what the engine sends before `until`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the session ended or the engine's side of
+    /// the connection broke; a broken connection ends the session.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel safe: a stream read that did not complete read nothing.
+    pub async fn read_output(
+        &mut self,
+        until: Instant,
+        settled: impl Fn(&Self) -> bool,
+    ) -> Result<(), EngineError> {
+        self.refuse_ended()?;
+        loop {
+            let now = Instant::now();
+            if settled(self) || now >= until {
+                return Ok(());
+            }
+            let wake = self
+                .progress
+                .next_quiet_boundary(now, self.settle_delay)
+                .map_or(until, |boundary| boundary.min(until));
+            let read = tokio::time::timeout_at(wake, self.next_payload(Progress::METHOD)).await;
+            let unread = match read {
+                Err(_elapsed) => {
+                    self.progress.read(Instant::now());
+                    Ok(None)
+                }
+                Ok(Ok(payload)) => self.route_waited(payload).await,
+                Ok(Err(error)) => Err(error),
+            };
+            match unread {
+                Ok(None) => {}
+                Ok(Some(response)) => {
+                    self.queue.push_front(response);
+                    tokio::time::sleep_until(until).await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    if error.fault().ends_session() {
+                        self.end().await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Routes one message [`EngineSession::read_output`] read: an engine
+    /// notification or request is handled here, and a response comes back
+    /// unread, since it belongs to the next exchange.
+    async fn route_waited(&mut self, payload: Vec<u8>) -> Result<Option<Vec<u8>>, EngineError> {
+        let Some(incoming) = correlation::classify(&payload) else {
+            return Err(Error::new(EngineFault::MessageUnreadable));
+        };
+        let Some(method) = incoming.method else {
+            return Ok(Some(payload));
+        };
+        self.route_unrequested(&method, incoming.id, incoming.params, Progress::METHOD)
+            .await?;
+        Ok(None)
+    }
+
+    /// Routes one message the engine sent on its own: a notification is
+    /// recorded and an engine request is answered.
+    ///
+    /// `during` names the exchange a broken connection is reported under.
+    async fn route_unrequested(
+        &mut self,
+        method: &str,
+        id: Option<Value>,
+        params: Option<Value>,
+        during: &str,
+    ) -> Result<(), EngineError> {
+        let Some(request_id) = id else {
+            self.record_notification(method, params);
+            return Ok(());
+        };
+        self.record_server_request(method, params.clone());
+        let answer = answer_server_request(method, &request_id, params);
+        self.write_payload(answer, during).await
+    }
+
     /// Pulls the engine's current diagnostics for one document.
     ///
     /// Full reports keep their result id and bounded findings. Findings are
@@ -972,6 +1249,11 @@ impl EngineSession {
     /// session includes it only when one registered watcher matches both
     /// path and classification, preserving caller order in one notification.
     ///
+    /// Readiness resets only when the batch matched a registered watcher:
+    /// an engine that registers none, such as
+    /// typescript-language-server, which watches files itself, is told
+    /// nothing, so its readiness stands.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] when the session ended, a path cannot form
@@ -986,9 +1268,6 @@ impl EngineSession {
         &mut self,
         paths: &[(ProjectPath, FileChangeType)],
     ) -> Result<Vec<ProjectPath>, EngineError> {
-        if !paths.is_empty() {
-            self.progress.invalidated(Instant::now());
-        }
         let matched: Vec<(ProjectPath, FileChangeType)> = paths
             .iter()
             .filter(|(path, change)| self.matches_watched_file(path, *change))
@@ -997,6 +1276,7 @@ impl EngineSession {
         if matched.is_empty() {
             return Ok(Vec::new());
         }
+        self.progress.invalidated(Instant::now());
         let mut changes = Vec::with_capacity(matched.len());
         for (path, change) in &matched {
             changes.push(FileEvent {
@@ -1152,14 +1432,8 @@ impl EngineSession {
                 return Err(Error::new(EngineFault::MessageUnreadable));
             };
             if let Some(method) = incoming.method {
-                match incoming.id {
-                    Some(request_id) => {
-                        self.record_server_request(&method, incoming.params.clone());
-                        let answer = answer_server_request(&method, &request_id, incoming.params);
-                        self.write_payload(answer, R::METHOD).await?;
-                    }
-                    None => self.record_notification(&method, incoming.params),
-                }
+                self.route_unrequested(&method, incoming.id, incoming.params, R::METHOD)
+                    .await?;
                 continue;
             }
             let response_id = incoming.id.unwrap_or(Value::Null);
@@ -1985,6 +2259,168 @@ mod tests {
             record.readiness(TEST_SETTLE_DELAY),
             EngineReadiness::Unconfirmed,
             "changed workspace bytes move a settled record back"
+        );
+    }
+
+    /// A recorded warm start of rust-analyzer 1.98.1 on this repository:
+    /// every `$/progress` begin and end, in milliseconds from the engine's
+    /// start.
+    const RUST_ANALYZER_WARM_START: &[(u64, bool, &str)] = &[
+        (20, true, "rustAnalyzer/Fetching"),
+        (400, false, "rustAnalyzer/Fetching"),
+        (420, true, "rustAnalyzer/Building CrateGraph"),
+        (440, false, "rustAnalyzer/Building CrateGraph"),
+        (440, true, "rustAnalyzer/Roots Scanned"),
+        (450, true, "rustAnalyzer/Fetching"),
+        (730, false, "rustAnalyzer/Roots Scanned"),
+        (950, false, "rustAnalyzer/Fetching"),
+        (950, true, "rustAnalyzer/Fetching"),
+        (1320, false, "rustAnalyzer/Fetching"),
+        (1320, true, "rustAnalyzer/Building CrateGraph"),
+        (1340, false, "rustAnalyzer/Building CrateGraph"),
+        (1340, true, "rustAnalyzer/Building compile-time-deps"),
+        (1340, true, "rustAnalyzer/Loading proc-macros"),
+        (1350, false, "rustAnalyzer/Loading proc-macros"),
+        (1670, false, "rustAnalyzer/Building compile-time-deps"),
+        (1670, true, "rustAnalyzer/Building CrateGraph"),
+        (1750, false, "rustAnalyzer/Building CrateGraph"),
+        (1750, true, "rustAnalyzer/Roots Scanned"),
+        (1770, true, "rustAnalyzer/Loading proc-macros"),
+        (1950, false, "rustAnalyzer/Loading proc-macros"),
+        (1960, false, "rustAnalyzer/Roots Scanned"),
+        (2070, true, "rustAnalyzer/Fetching"),
+        (2460, false, "rustAnalyzer/Fetching"),
+        (2460, true, "rustAnalyzer/cachePriming"),
+        (7970, false, "rustAnalyzer/cachePriming"),
+        (8160, true, "rust-analyzer/flycheck/0"),
+        (8710, false, "rust-analyzer/flycheck/0"),
+    ];
+
+    /// Replays [`RUST_ANALYZER_WARM_START`] with a read every 10 ms and
+    /// answers the first read at which the walk, and the session, read
+    /// ready.
+    fn replay_ready_at(timeline: &[(u64, bool, &str)]) -> (u64, u64) {
+        let start = Instant::now();
+        let mut record = WorkProgress::default();
+        let mut events = timeline.iter().peekable();
+        let (mut walk, mut session) = (None, None);
+        for millis in (0..=12_000_u64).step_by(10) {
+            let now = start + Duration::from_millis(millis);
+            while let Some((_, begin, name)) = events.next_if(|(at, _, _)| *at <= millis) {
+                let token = ProgressToken::String((*name).to_owned());
+                if *begin {
+                    record.began(token, now);
+                } else {
+                    record.ended(&token, now);
+                }
+            }
+            record.read(now);
+            if walk.is_none() && record.walk_readiness(TEST_SETTLE_DELAY) == EngineReadiness::Ready
+            {
+                walk = Some(millis);
+            }
+            if session.is_none() && record.readiness(TEST_SETTLE_DELAY) == EngineReadiness::Ready {
+                session = Some(millis);
+            }
+        }
+        (
+            walk.expect("the walk reads ready inside the replay"),
+            session.expect("the session reads ready inside the replay"),
+        )
+    }
+
+    /// A walk reads rust-analyzer ready at `cachePriming` end plus the
+    /// settle delay, while the session's own readiness waits for the
+    /// `cargo check` flycheck token.
+    #[test]
+    fn a_walk_reads_rust_analyzer_ready_at_cache_priming_end_and_skips_flycheck() {
+        let (walk, session) = replay_ready_at(RUST_ANALYZER_WARM_START);
+        assert_eq!(walk, 7_970 + 500, "cachePriming ends at 7.97s");
+        assert_eq!(session, 8_710 + 500, "flycheck/0 ends at 8.71s");
+
+        let unchecked: Vec<_> = RUST_ANALYZER_WARM_START
+            .iter()
+            .copied()
+            .filter(|(_, _, name)| !is_flycheck(&ProgressToken::String((*name).to_owned())))
+            .collect();
+        assert_eq!(
+            replay_ready_at(&unchecked),
+            (8_470, 8_470),
+            "without the check both readings agree"
+        );
+    }
+
+    /// An engine that announces nothing reads unconfirmed for a walk,
+    /// and quiet once a read lands one settle delay past its first read.
+    #[test]
+    fn a_walk_reads_an_engine_that_announces_nothing_as_unconfirmed_and_quiet_after_the_delay() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut record = WorkProgress::default();
+        record.read(at(0));
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Unconfirmed
+        );
+        assert!(!record.walk_is_quiet(TEST_SETTLE_DELAY));
+        record.read(at(499));
+        assert!(!record.walk_is_quiet(TEST_SETTLE_DELAY));
+        record.read(at(500));
+        assert!(record.walk_is_quiet(TEST_SETTLE_DELAY));
+        record.invalidated(at(600));
+        record.read(at(700));
+        assert!(
+            !record.walk_is_quiet(TEST_SETTLE_DELAY),
+            "a file change restarts the quiet"
+        );
+        record.read(at(1_100));
+        assert!(record.walk_is_quiet(TEST_SETTLE_DELAY));
+    }
+
+    /// An engine that declared itself ready reads ready from its
+    /// first read, for a walk and for the session, with no settle delay to
+    /// wait out; announced work still holds it, and a change leaves it ready.
+    #[test]
+    fn a_declared_engine_reads_ready_at_start_and_after_a_change() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut record = WorkProgress {
+            declared_ready: true,
+            ..WorkProgress::default()
+        };
+        record.read(at(0));
+        assert_eq!(record.readiness(TEST_SETTLE_DELAY), EngineReadiness::Ready);
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Ready
+        );
+
+        let token = ProgressToken::String("ty/check".to_owned());
+        record.began(token.clone(), at(10));
+        record.read(at(20));
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing
+        );
+        record.ended(&token, at(30));
+        record.read(at(529));
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Analyzing
+        );
+        record.read(at(530));
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Ready
+        );
+
+        record.invalidated(at(600));
+        record.read(at(601));
+        assert_eq!(record.readiness(TEST_SETTLE_DELAY), EngineReadiness::Ready);
+        assert_eq!(
+            record.walk_readiness(TEST_SETTLE_DELAY),
+            EngineReadiness::Ready,
+            "the declaration survives a change, with no settle delay to wait out"
         );
     }
 

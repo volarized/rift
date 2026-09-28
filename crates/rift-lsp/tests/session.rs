@@ -1086,14 +1086,94 @@ async fn readiness_moves_from_unconfirmed_through_analyzing_to_ready() {
          token"
     );
 
-    session
+    let matched = session
         .notify_changed_paths(&[(document.clone(), FileChangeType::CHANGED)])
         .await
         .expect("an unregistered path needs no notification");
+    assert!(matched.is_empty(), "the engine registered no watcher");
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Ready,
+        "a batch no registered watcher matched leaves readiness standing"
+    );
+
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// A batch that matched a registered watcher reaches the engine and resets
+/// readiness; one that matched none sends nothing and leaves readiness standing.
+#[tokio::test]
+async fn only_a_batch_a_registered_watcher_matched_resets_readiness() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": "register-watched-files",
+                "method": "client/registerCapability",
+                "params": {
+                    "registrations": [{
+                        "id": "watch-rust",
+                        "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {"watchers": [{"globPattern": "**/*.rs"}]}
+                    }]
+                }
+            }))
+            .await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.begin_progress().await;
+        engine.end_progress().await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let notified = engine.next_message().await;
+        assert_eq!(
+            notified["method"],
+            json!("workspace/didChangeWatchedFiles"),
+            "{notified:#}"
+        );
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers");
+    tokio::time::sleep(SETTLE_DELAY).await;
+    session
+        .references(&document, position)
+        .await
+        .expect("references answers again");
+    assert_eq!(session.readiness(), EngineReadiness::Ready);
+
+    let unmatched = session
+        .notify_changed_paths(&[(path("README.md"), FileChangeType::CHANGED)])
+        .await
+        .expect("an unmatched batch sends nothing");
+    assert!(unmatched.is_empty());
+    assert_eq!(
+        session.readiness(),
+        EngineReadiness::Ready,
+        "no registered watcher matched, so the engine was told nothing"
+    );
+
+    let matched = session
+        .notify_changed_paths(&[(document.clone(), FileChangeType::CHANGED)])
+        .await
+        .expect("the notification sends");
+    assert_eq!(matched, vec![document]);
     assert_eq!(
         session.readiness(),
         EngineReadiness::Unconfirmed,
-        "changed workspace bytes invalidate earlier readiness"
+        "the engine was told of a change, so earlier readiness no longer stands"
     );
 
     session.shutdown().await;
@@ -1212,6 +1292,132 @@ async fn an_engine_that_never_settles_lets_a_caller_report_its_spent_budget() {
     );
     session.shutdown().await;
     join(engine_task).await;
+}
+
+/// A recorded warm start of rust-analyzer 1.98.1 on this repository: every
+/// `$/progress` begin and end, in milliseconds from the engine's start.
+const RUST_ANALYZER_WARM_START: &[(u64, bool, &str)] = &[
+    (20, true, "rustAnalyzer/Fetching"),
+    (400, false, "rustAnalyzer/Fetching"),
+    (420, true, "rustAnalyzer/Building CrateGraph"),
+    (440, false, "rustAnalyzer/Building CrateGraph"),
+    (440, true, "rustAnalyzer/Roots Scanned"),
+    (450, true, "rustAnalyzer/Fetching"),
+    (730, false, "rustAnalyzer/Roots Scanned"),
+    (950, false, "rustAnalyzer/Fetching"),
+    (950, true, "rustAnalyzer/Fetching"),
+    (1320, false, "rustAnalyzer/Fetching"),
+    (1320, true, "rustAnalyzer/Building CrateGraph"),
+    (1340, false, "rustAnalyzer/Building CrateGraph"),
+    (1340, true, "rustAnalyzer/Building compile-time-deps"),
+    (1340, true, "rustAnalyzer/Loading proc-macros"),
+    (1350, false, "rustAnalyzer/Loading proc-macros"),
+    (1670, false, "rustAnalyzer/Building compile-time-deps"),
+    (1670, true, "rustAnalyzer/Building CrateGraph"),
+    (1750, false, "rustAnalyzer/Building CrateGraph"),
+    (1750, true, "rustAnalyzer/Roots Scanned"),
+    (1770, true, "rustAnalyzer/Loading proc-macros"),
+    (1950, false, "rustAnalyzer/Loading proc-macros"),
+    (1960, false, "rustAnalyzer/Roots Scanned"),
+    (2070, true, "rustAnalyzer/Fetching"),
+    (2460, false, "rustAnalyzer/Fetching"),
+    (2460, true, "rustAnalyzer/cachePriming"),
+    (7970, false, "rustAnalyzer/cachePriming"),
+    (8160, true, "rust-analyzer/flycheck/0"),
+    (8710, false, "rust-analyzer/flycheck/0"),
+];
+
+/// A scripted engine that sends [`RUST_ANALYZER_WARM_START`]'s progress at its
+/// own times from the end of the handshake, and answers every references
+/// request with no location, until shutdown.
+async fn warm_start_script(mut engine: ScriptedEngine<DuplexStream>) {
+    engine.handshake(full_capabilities()).await;
+    let start = tokio::time::Instant::now();
+    let mut events = RUST_ANALYZER_WARM_START.iter().peekable();
+    loop {
+        let next = events
+            .peek()
+            .map(|(at, _, _)| start + Duration::from_millis(*at));
+        tokio::select! {
+            () = tokio::time::sleep_until(next.unwrap_or(start)), if next.is_some() => {
+                let Some((_, begin, token)) = events.next() else { continue };
+                let kind = if *begin { "begin" } else { "end" };
+                engine
+                    .notify(
+                        "$/progress",
+                        json!({"token": token, "value": {"kind": kind, "title": token}}),
+                    )
+                    .await;
+            }
+            message = engine.next_message() => match message["method"].as_str() {
+                Some("textDocument/references") => engine.respond(&message["id"], json!([])).await,
+                Some("shutdown") => {
+                    engine.respond(&message["id"], Value::Null).await;
+                    engine.next_message().await;
+                    return;
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+/// The time from the engine's start at which a walk on the default retry
+/// schedule (250 ms doubling to a 2 s cap, `lsp.retry`) first reads the
+/// engine ready, waiting between attempts by sleeping or by reading output.
+async fn walk_ready_at(read_between_attempts: bool) -> Duration {
+    let launch = EngineLaunch {
+        settle_delay: Duration::from_millis(500),
+        ..transport_launch()
+    };
+    let (_workspace, result, engine_task) = begin(launch, warm_start_script).await;
+    let mut session = result.expect("the scripted engine completes the handshake");
+    let start = tokio::time::Instant::now();
+    let document = path("src/lib.rs");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    let mut wait = Duration::from_millis(250);
+    let mut ready_at = None;
+    for _attempt in 0..32 {
+        session
+            .references(&document, position)
+            .await
+            .expect("references answers");
+        if session.walk_readiness() == EngineReadiness::Ready {
+            ready_at = Some(start.elapsed());
+            break;
+        }
+        if read_between_attempts {
+            session
+                .read_output(tokio::time::Instant::now() + wait, |session| {
+                    session.walk_readiness() == EngineReadiness::Ready
+                })
+                .await
+                .expect("the engine output reads");
+        } else {
+            tokio::time::sleep(wait).await;
+        }
+        wait = (wait * 2).min(Duration::from_secs(2));
+    }
+    session.shutdown().await;
+    join(engine_task).await;
+    ready_at.expect("the walk reads ready inside the attempt bound")
+}
+
+/// Sleeping between attempts stamps the `cachePriming` end when the 9.75 s
+/// attempt reads it, so the walk reads ready one attempt later, at 11.75 s.
+/// Reading output during the wait stamps the end at 7.97 s, wakes one settle
+/// delay later, and the next attempt reads ready at 8.47 s, before the
+/// `cargo check` a walk skips has ended.
+#[tokio::test(start_paused = true)]
+async fn reading_output_between_attempts_reads_rust_analyzer_ready_at_cache_priming_end() {
+    let slept = walk_ready_at(false).await;
+    let read = walk_ready_at(true).await;
+    eprintln!("walk ready from the engine's start: sleeping {slept:?}, reading output {read:?}");
+    assert_eq!(slept, Duration::from_millis(11_750));
+    assert_eq!(read, Duration::from_millis(8_470));
 }
 
 /// Each registered watcher receives its requested create, change, or delete event.
