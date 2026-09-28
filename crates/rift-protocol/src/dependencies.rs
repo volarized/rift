@@ -4,7 +4,7 @@
 //! probes, how long one probe may take, and which packages the operator names beside the
 //! ones the workspace's files state. [`PackageContextEntry`] carries one package the
 //! workspace depends on, as an exact version a lockfile pins or as the requirement a
-//! manifest declares.
+//! manifest declares. [`RequestedPackage`] carries one package a read names for itself.
 
 use crate::configuration::{ConfigurationViolation, Duration, first_out_of_range};
 use schemars::JsonSchema;
@@ -21,6 +21,17 @@ pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN: u64 = 1_000;
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Entries the configured package list may hold, at most.
 pub const DEPENDENCIES_PACKAGES_MAX: usize = 20_000;
+/// Entries one read's `packages` argument may hold, at most.
+pub const REQUESTED_PACKAGES_MAX: usize = 64;
+/// Characters a requested package's `manager` holds, at most.
+pub const PACKAGE_MANAGER_CHARS_MAX: usize = 128;
+/// Characters a requested package's `name` holds, at most.
+pub const PACKAGE_NAME_CHARS_MAX: usize = 4_096;
+/// Characters a requested package's `version` holds, at most.
+pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
+/// The requirement every stable release admits under Cargo's, npm's, and PEP 440's
+/// version rules, so the global index answers it from its newest collected release.
+pub const REQUIREMENT_ANY: &str = ">=0";
 
 /// Whether the dependency context runs the standard library version probes, or reads
 /// the static inputs alone.
@@ -196,6 +207,88 @@ impl ConfiguredPackage {
             _ => None,
         }
     }
+}
+
+/// One package a `get_symbol` or `search` request names beside the dependency context.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedPackage {
+    /// Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.
+    #[schemars(length(min = 1, max = 128))]
+    pub manager: String,
+    /// Package name in that ecosystem.
+    #[schemars(length(min = 1, max = 4096))]
+    pub name: String,
+    /// The exact version to read. Absent, the entry asks for the requirement `>=0`, which
+    /// the global index answers from its newest collected release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub version: Option<String>,
+}
+
+impl RequestedPackage {
+    /// Classifies this entry against the lengths the schema advertises, in field order.
+    /// `schemars` constraints are declarative only, so the server classifies each entry
+    /// before it reaches the global API.
+    #[must_use]
+    pub fn violation(&self) -> Option<RequestedPackageViolation> {
+        let fields = [
+            (
+                Some(self.manager.as_str()),
+                PACKAGE_MANAGER_CHARS_MAX,
+                RequestedPackageViolation::ManagerLength,
+            ),
+            (
+                Some(self.name.as_str()),
+                PACKAGE_NAME_CHARS_MAX,
+                RequestedPackageViolation::NameLength,
+            ),
+            (
+                self.version.as_deref(),
+                PACKAGE_VERSION_CHARS_MAX,
+                RequestedPackageViolation::VersionLength,
+            ),
+        ];
+        fields
+            .into_iter()
+            .find_map(|(value, chars_max, violation)| {
+                let within_length =
+                    value.is_none_or(|value| (1..=chars_max).contains(&value.chars().count()));
+                (!within_length).then_some(violation)
+            })
+    }
+
+    /// The context entry this package goes out as: its exact `version`, or the
+    /// requirement [`REQUIREMENT_ANY`] when it names none.
+    ///
+    /// The entry is `canonical`: the request names a package by manager and name, which
+    /// is what a public registry answers for, and carries no source this machine could
+    /// classify otherwise.
+    #[must_use]
+    pub fn context_entry(&self) -> PackageContextEntry {
+        let selector = self.version.as_ref().map_or_else(
+            || PackageSelector::Requirement(REQUIREMENT_ANY.to_owned()),
+            |version| PackageSelector::Version(version.clone()),
+        );
+        PackageContextEntry::new(
+            &self.manager,
+            &self.name,
+            selector,
+            PackageAvailability::Canonical,
+        )
+    }
+}
+
+/// Rule one requested package breaks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedPackageViolation {
+    /// `manager` is empty, or longer than [`PACKAGE_MANAGER_CHARS_MAX`] characters.
+    ManagerLength,
+    /// `name` is empty, or longer than [`PACKAGE_NAME_CHARS_MAX`] characters.
+    NameLength,
+    /// `version` is empty, or longer than [`PACKAGE_VERSION_CHARS_MAX`] characters.
+    VersionLength,
 }
 
 /// Reason one package entry states no single version selector.
@@ -711,5 +804,122 @@ mod tests {
             serde_json::from_value::<PackageAvailability>(json!("local_only")).is_err(),
             "the kinds replace `local_only`"
         );
+    }
+
+    fn requested(manager: &str, name: &str, version: Option<&str>) -> RequestedPackage {
+        RequestedPackage {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+        }
+    }
+
+    /// Each field is classified against its advertised length in field order: empty and
+    /// one character past the bound refuse, the bound itself and an absent version pass.
+    #[test]
+    fn test_a_requested_package_is_classified_by_each_field_length() {
+        let at = |chars_max: usize| "a".repeat(chars_max);
+        let past = |chars_max: usize| "a".repeat(chars_max + 1);
+        let cases = [
+            (requested("cargo", "serde", None), None),
+            (requested("cargo", "serde", Some("1.0.228")), None),
+            (
+                requested(
+                    &at(PACKAGE_MANAGER_CHARS_MAX),
+                    &at(PACKAGE_NAME_CHARS_MAX),
+                    Some(&at(PACKAGE_VERSION_CHARS_MAX)),
+                ),
+                None,
+            ),
+            (
+                requested("", "serde", None),
+                Some(RequestedPackageViolation::ManagerLength),
+            ),
+            (
+                requested(&past(PACKAGE_MANAGER_CHARS_MAX), "serde", None),
+                Some(RequestedPackageViolation::ManagerLength),
+            ),
+            (
+                requested("cargo", "", Some("")),
+                Some(RequestedPackageViolation::NameLength),
+            ),
+            (
+                requested("cargo", &past(PACKAGE_NAME_CHARS_MAX), None),
+                Some(RequestedPackageViolation::NameLength),
+            ),
+            (
+                requested("cargo", "serde", Some("")),
+                Some(RequestedPackageViolation::VersionLength),
+            ),
+            (
+                requested("cargo", "serde", Some(&past(PACKAGE_VERSION_CHARS_MAX))),
+                Some(RequestedPackageViolation::VersionLength),
+            ),
+        ];
+        for (package, expected) in cases {
+            assert_eq!(package.violation(), expected, "{package:?}");
+        }
+    }
+
+    /// A length counts characters, as the schema's `maxLength` does, so a multi-byte name
+    /// at the character bound passes.
+    #[test]
+    fn test_a_requested_package_length_counts_characters() {
+        let name = "é".repeat(PACKAGE_NAME_CHARS_MAX);
+        assert!(name.len() > PACKAGE_NAME_CHARS_MAX);
+        assert_eq!(requested("npm", &name, None).violation(), None);
+    }
+
+    /// A requested package goes out canonical, at its exact version or as `>=0`.
+    #[test]
+    fn test_a_requested_package_goes_out_as_one_canonical_entry() {
+        assert_eq!(
+            requested("cargo", "serde", Some("1.0.228")).context_entry(),
+            context_entry(Some("1.0.228"), None)
+        );
+        assert_eq!(
+            requested("cargo", "serde", None).context_entry(),
+            context_entry(None, Some(REQUIREMENT_ANY))
+        );
+        assert_eq!(REQUIREMENT_ANY, ">=0");
+    }
+
+    #[test]
+    fn test_a_requested_package_refuses_an_unknown_field() {
+        let parsed = serde_json::from_value::<RequestedPackage>(
+            json!({ "manager": "cargo", "name": "serde", "requirement": "^1" }),
+        );
+        assert!(parsed.is_err(), "a read names an exact version alone");
+    }
+
+    /// The lengths the schema advertises are the constants the classifier enforces.
+    #[test]
+    fn test_requested_package_schema_lengths_equal_the_enforced_constants() {
+        let schema = serde_json::to_value(schemars::schema_for!(RequestedPackage)).expect("schema");
+        let properties = &schema["properties"];
+        for (field, chars_max) in [
+            ("manager", PACKAGE_MANAGER_CHARS_MAX),
+            ("name", PACKAGE_NAME_CHARS_MAX),
+            ("version", PACKAGE_VERSION_CHARS_MAX),
+        ] {
+            assert_eq!(properties[field]["minLength"], json!(1), "{field}");
+            assert_eq!(properties[field]["maxLength"], json!(chars_max), "{field}");
+        }
+        assert_eq!(schema["required"], json!(["manager", "name"]));
+    }
+
+    /// The serde spelling of each violation is the label a refusal names.
+    #[test]
+    fn test_requested_package_violations_spell_their_field() {
+        for (violation, spelling) in [
+            (RequestedPackageViolation::ManagerLength, "manager_length"),
+            (RequestedPackageViolation::NameLength, "name_length"),
+            (RequestedPackageViolation::VersionLength, "version_length"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(violation).expect("serializes"),
+                json!(spelling)
+            );
+        }
     }
 }

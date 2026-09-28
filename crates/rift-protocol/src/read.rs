@@ -5,6 +5,7 @@
 //! request and response schemas from these definitions.
 
 use crate::configuration::Duration;
+use crate::dependencies::RequestedPackage;
 use crate::schema;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,18 @@ pub enum GetSymbolInclude {
         "name": "spawn",
         "scope": "all",
         "limit": 5
+    },
+    {
+        "name": "spawn",
+        "scope": "global",
+        "packages": [
+            {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+            }
+        ],
+        "limit": 5
     }
 ]))]
 pub struct GetSymbolParams {
@@ -260,6 +273,15 @@ pub struct GetSymbolParams {
     /// together with `rev`, since package facts are served for the current tree alone.
     #[serde(default)]
     pub scope: SearchScope,
+    /// Packages this lookup reads beside the ones the workspace's manifests and
+    /// lockfiles name, at most 64. An entry naming a package the workspace depends on
+    /// replaces that package's versions for this read, and an entry naming another
+    /// package adds it. The server refuses `packages` beside the `local` scope, since a
+    /// project read consults no package, and beside `rev`, since package facts are
+    /// served for the current tree alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub packages: Vec<RequestedPackage>,
     /// Optional hit fields to attach: `source`, `history`. Omitted defaults to
     /// `["source"]`; an explicit empty list carries neither.
     #[serde(default = "default_get_symbol_params_include")]

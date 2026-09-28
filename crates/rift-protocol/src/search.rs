@@ -2,6 +2,7 @@
 //! [`crate::read`] so that module stays below its size bound; every type here is re-exported
 //! from `read` so existing `rift_protocol::read::SearchParams`-style paths keep resolving.
 
+use crate::dependencies::RequestedPackage;
 use crate::read::{
     Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
     Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol, SymbolId,
@@ -390,6 +391,19 @@ pub enum SearchInclude {
     },
     {
         "target": "symbol",
+        "query": "spawn_blocking",
+        "scope": "all",
+        "packages": [
+            {
+                "manager": "cargo",
+                "name": "tokio",
+                "version": "1.47.1"
+            }
+        ],
+        "limit": 10
+    },
+    {
+        "target": "symbol",
         "change": {
             "base": "main",
             "head": "HEAD"
@@ -422,6 +436,15 @@ pub struct SearchParams {
     /// `traversal`, since a walk runs over the project alone.
     #[serde(default)]
     pub scope: SearchScope,
+    /// Packages `query` searches beside the ones the workspace's manifests and lockfiles
+    /// name, at most 64. An entry naming a package the workspace depends on replaces that
+    /// package's versions for this search, and an entry naming another package adds it.
+    /// The server refuses `packages` beside the `local` scope, since a project search
+    /// consults no package, and beside `rev`, since package facts are served for the
+    /// current tree alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub packages: Vec<RequestedPackage>,
     /// Files eligible for the search, selected by project-relative globs. Omitted selects
     /// every visible file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -831,6 +854,25 @@ mod tests {
             properties["depth"]["maximum"],
             json!(SEARCH_TRAVERSAL_DEPTH_MAX)
         );
+    }
+
+    /// `#[schemars(length(max = ...))]` takes only literals, so this pins the bound both
+    /// reads advertise on `packages` to the constant the server enforces.
+    #[test]
+    fn packages_schema_bound_equals_the_enforced_constant() {
+        use crate::dependencies::REQUESTED_PACKAGES_MAX;
+        let schemas = [
+            serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema"),
+            serde_json::to_value(schemars::schema_for!(crate::read::GetSymbolParams))
+                .expect("schema"),
+        ];
+        for schema in schemas {
+            assert_eq!(
+                schema["properties"]["packages"]["maxItems"],
+                json!(REQUESTED_PACKAGES_MAX),
+                "{schema:#}"
+            );
+        }
     }
 
     /// A hop count and a path length name the same walk: `SearchTraversal.depth`,
