@@ -1,6 +1,7 @@
 //! Maps one qualifying call to the `search` arguments answering the same question.
 //!
-//! A `Grep` call maps to a `search` call carrying `pattern`; a `Glob` call maps to
+//! A `Grep` call, and the `grep` or `rg` command [`super::bash`] reads as one, maps to a
+//! `search` call carrying `pattern`; a `Glob` call, and a `find` command, map to
 //! `paths.include` globs. A call holding a field `search` has no form for maps to nothing, so
 //! the steer lets it through without a deny. Sans-I/O: every path arrives classified as a
 //! [`GrepPath`], which the shell probes.
@@ -43,6 +44,11 @@ pub(super) enum GrepPath {
 }
 
 impl GrepPath {
+    /// Whether the path names a directory, the root included.
+    pub(super) const fn is_directory(&self) -> bool {
+        matches!(self, Self::Root | Self::Directory(_))
+    }
+
     /// The `paths.include` globs selecting `globs` below this path; an empty list selects
     /// every file. `None` when no glob list states the selection: an unmapped path, a file
     /// beside a glob, a file at the root, whose slashless name a glob would match in every
@@ -258,6 +264,18 @@ pub(super) fn glob_suggestion(pattern: &str) -> Option<String> {
     serde_json::to_string(&include).ok()
 }
 
+/// The `paths.include` list one `find DIRECTORY -name NAME` maps to: `NAME` in every
+/// directory below `DIRECTORY`. `None` for a start path that is not a directory in the
+/// workspace.
+pub(super) fn find_suggestion(directory: &GrepPath, name: &str) -> Option<String> {
+    let pattern = match directory {
+        GrepPath::Root => format!("**/{name}"),
+        GrepPath::Directory(directory) => format!("{directory}/**/{name}"),
+        GrepPath::File(_) | GrepPath::Unmapped => return None,
+    };
+    glob_suggestion(&pattern)
+}
+
 /// Splits one `Grep` `glob` as Claude Code 2.1.280 does before passing each piece to
 /// `rg --glob`: on whitespace, then on commas, except that a piece holding both `{` and `}`
 /// stays whole.
@@ -327,7 +345,7 @@ pub(super) mod tests {
 
     use super::{
         DENY_PATTERN_BYTES_MAX, GrepPath, GrepRequest, INCLUDE_GLOBS_MAX, SUGGESTION_BYTES_MAX,
-        glob_suggestion, grep_globs, truncate_pattern,
+        find_suggestion, glob_suggestion, grep_globs, truncate_pattern,
     };
 
     /// Proves one suggestion is a `search` call the server takes: it deserializes into
@@ -614,6 +632,32 @@ pub(super) mod tests {
         );
         assert_eq!(glob_suggestion("/etc/**"), None);
         assert_eq!(glob_suggestion(""), None);
+    }
+
+    #[test]
+    fn a_find_name_maps_below_its_start_directory() {
+        assert_eq!(
+            find_suggestion(&GrepPath::Root, "*.rs").as_deref(),
+            Some(r#"["**/*.rs"]"#)
+        );
+        assert_eq!(
+            find_suggestion(&GrepPath::Directory("src".to_owned()), "*.rs").as_deref(),
+            Some(r#"["src/**/*.rs"]"#)
+        );
+        assert_eq!(
+            find_suggestion(&GrepPath::File("src/lib.rs".to_owned()), "*.rs"),
+            None
+        );
+        assert_eq!(find_suggestion(&GrepPath::Unmapped, "*.rs"), None);
+        assert_eq!(find_suggestion(&GrepPath::Root, r"a\b"), None);
+    }
+
+    #[test]
+    fn grep_path_is_directory_names_the_root_and_directories() {
+        assert!(GrepPath::Root.is_directory());
+        assert!(GrepPath::Directory("src".to_owned()).is_directory());
+        assert!(!GrepPath::File("src/lib.rs".to_owned()).is_directory());
+        assert!(!GrepPath::Unmapped.is_directory());
     }
 
     #[test]
