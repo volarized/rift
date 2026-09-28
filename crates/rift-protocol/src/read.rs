@@ -1183,16 +1183,45 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// A language engine serves the seed's language, and this read dropped what it
-    /// answered: the answer addressed bytes the served revision does not carry. The
-    /// indexed relationships stand; whatever the engine resolves on top of them is
-    /// missing. The warning states that an engine's analysis is absent from this answer;
-    /// it never states that the seed has no such neighbor. A later read served from a
-    /// revision the engine has caught up with carries the engine's edges again.
+    /// A language engine serves the seed's language, and this read carries none of its
+    /// edges: the engine answered about bytes the served revision does not carry, answered
+    /// more than the walk's node bound holds, or was still analyzing when
+    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
+    /// the engine resolves on top of them is missing. The warning states that an engine's
+    /// analysis is absent from this answer; it never states that the seed has no such
+    /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
+    /// revision the engine has caught up with or sent once it reads ready, carries the
+    /// engine's edges again.
     EngineAnalysisUnavailable {
         /// The seed declaration's language, whose engine's answer was dropped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<Language>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// An outgoing walk dropped its edges to callees no declaration of the project holds:
+    /// the language engine's call hierarchy named them in a standard library or package
+    /// file, which the local index does not analyze. The walk stops at such a callee, and
+    /// every other edge stands. The warning states that edges are missing from this
+    /// answer; it never states that the seed calls nothing outside the project.
+    CalleesDropped {
+        /// Edges the walk dropped over every depth, one per caller and callee.
+        callees: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// The walk took a language engine's answer without progress evidence that the engine
+    /// had settled: it announced no work since it started or was last told of a changed
+    /// file, and stayed quiet past its `settle_delay`. The answer stands. An engine that
+    /// recomputes without announcing work may have answered before it read that change, and
+    /// a later read meets it settled.
+    EngineReadinessUnconfirmed {
+        /// The engines the walk took unconfirmed, by accepted process key, sorted. Inline
+        /// processes use the exact language identity segment.
+        #[schemars(length(min = 1))]
+        processes: Vec<String>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,

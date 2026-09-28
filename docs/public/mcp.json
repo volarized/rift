@@ -1806,7 +1806,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -1824,6 +1824,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees no declaration of the project holds:\nthe language engine's call hierarchy named them in a standard library or package\nfile, which the local index does not analyze. The walk stops at such a callee, and\nevery other edge stands. The warning states that edges are missing from this\nanswer; it never states that the seed calls nothing outside the project.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per caller and callee.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"
@@ -4277,7 +4333,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -4295,6 +4351,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees no declaration of the project holds:\nthe language engine's call hierarchy named them in a standard library or package\nfile, which the local index does not analyze. The walk stops at such a callee, and\nevery other edge stands. The warning states that edges are missing from this\nanswer; it never states that the seed calls nothing outside the project.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per caller and callee.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"
@@ -5307,6 +5419,11 @@
               {
                 "const": "incoming",
                 "description": "Walks edges arriving at each visited symbol.",
+                "type": "string"
+              },
+              {
+                "const": "outgoing",
+                "description": "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it.",
                 "type": "string"
               }
             ]
@@ -7014,7 +7131,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -7032,6 +7149,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees no declaration of the project holds:\nthe language engine's call hierarchy named them in a standard library or package\nfile, which the local index does not analyze. The walk stops at such a callee, and\nevery other edge stands. The warning states that edges are missing from this\nanswer; it never states that the seed calls nothing outside the project.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per caller and callee.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"

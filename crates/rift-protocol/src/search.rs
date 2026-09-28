@@ -751,6 +751,9 @@ pub enum TraversalDirection {
     /// Walks edges arriving at each visited symbol.
     #[default]
     Incoming,
+    /// Walks edges leaving each visited symbol: the calls a language engine's call
+    /// hierarchy names for it.
+    Outgoing,
 }
 
 #[cfg(test)]
