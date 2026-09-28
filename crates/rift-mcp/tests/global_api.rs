@@ -44,6 +44,10 @@ pub(crate) const PAGE_LIMIT_ADVERTISED: u64 = 200;
 /// The cursor a search page stopped at the response body bound names.
 pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 
+/// The query the fixture answers with `beacon` matched inside its body: a word no
+/// declaration name holds, so the hit claims the `unknown` class and `file_content`.
+pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
+
 /// Largest request body the fixture reads.
 const REQUEST_BODY_BYTES_MAX: usize = 4_194_304;
 
@@ -382,11 +386,19 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
 /// its identifiers matches, at the best class any of them reaches, with a `query_narrowed`
-/// page warning; the broad phase answers no further declaration. A page stopped at the
-/// response body bound adds `result_truncated` and [`BODY_BOUND_CURSOR`].
+/// page warning; the broad phase answers no further declaration. [`BODY_MATCH_QUERY`]
+/// answers `beacon` as a body match. A page stopped at the response body bound adds
+/// `result_truncated` and [`BODY_BOUND_CURSOR`].
 fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: bool) -> Value {
     if request["phase"] != "precise" {
         return page(&[], &json!([]));
+    }
+    if request["query"] == BODY_MATCH_QUERY {
+        let mut hit = collected_hit(fixture, "beacon", includes_source(request));
+        hit["target"] = json!("symbol");
+        hit["match_class"] = json!("unknown");
+        hit["contributing_fields"] = json!(["file_content"]);
+        return page(&[hit], &json!([]));
     }
     let identifiers: Vec<String> = request["identifiers"]
         .as_array()

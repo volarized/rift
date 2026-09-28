@@ -13,8 +13,8 @@ mod workspace_client;
 use std::{fs, time::Duration};
 
 use global_api::{
-    BODY_BOUND_CURSOR, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold, SymbolFixture,
-    UNSATISFIED_REQUIREMENT,
+    BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
+    SymbolFixture, UNSATISFIED_REQUIREMENT,
 };
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
@@ -1476,6 +1476,47 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         .filter(|uri| !uri.ends_with("/v1/capabilities") && !uri.ends_with("/v1/resolutions"))
         .collect();
     assert!(reads_asked.is_empty(), "{reads_asked:#?}");
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A package declaration the global index matched inside its body, which the page names
+/// with the `file_content` field and the `unknown` match class, answers as a `content`
+/// match beside no global warning.
+#[tokio::test]
+async fn a_body_matched_package_declaration_answers_as_a_content_match() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query": BODY_MATCH_QUERY, "scope": "global"}),
+    )
+    .await?;
+    let package_hits: Vec<&Value> = answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit["unit"] == COLLECTED_UNIT)
+        .collect();
+    assert_eq!(package_hits.len(), 1, "{answer:#}");
+    assert_eq!(
+        package_hits[0]["matched_by"],
+        json!(["content"]),
+        "{answer:#}"
+    );
+    assert!(
+        !answer.to_string().contains("\"global_"),
+        "the page passes the client: {answer:#}"
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
