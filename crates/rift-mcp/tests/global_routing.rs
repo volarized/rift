@@ -1296,3 +1296,103 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     server_task.await?;
     Ok(())
 }
+
+/// A workspace whose lockfile fills the dependency context to its bound still answers a
+/// read naming one more package: the requested package goes out, the context entry sorted
+/// last leaves with a `package_context_degraded` warning naming its package manager, and
+/// the resolution request stays within the entry bound the client holds it to.
+#[tokio::test]
+async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() -> TestResult {
+    use std::fmt::Write as _;
+
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let bound = rift_dependency::PACKAGES_MAX;
+    let mut lockfile =
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+    for index in 0..bound {
+        write!(
+            lockfile,
+            "\n[[package]]\nname = \"pkg-{index:05}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        )?;
+    }
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| warning["code"] == "package_context_degraded")
+        .collect();
+    assert_eq!(
+        degraded,
+        [&json!({
+            "code": "package_context_degraded",
+            "resolver": "cargo",
+            "reason": format!(
+                "1 of {bound} packages were not reported: at most {bound} are carried per \
+                 read, the requested packages first"
+            )
+        })],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+
+    let resolutions = resolution_entries(&fixture).await;
+    assert_eq!(resolutions.len(), 1);
+    let sent = &resolutions[0];
+    assert_eq!(sent.len(), rift_cloud_client::DEPENDENCY_ENTRIES_MAX);
+    assert_eq!(
+        demo_entries(sent).len(),
+        1,
+        "the requested package goes out"
+    );
+    let last = format!("pkg-{:05}", bound - 1);
+    assert!(
+        sent.iter().all(|entry| entry["name"] != last.as_str()),
+        "the entry sorted last leaves"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
