@@ -1278,12 +1278,7 @@ fn validate_resolution_request_for_capabilities(
     request: &PackageResolutionRequest,
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
-    if request.entries.len()
-        > smaller_bound(
-            capabilities.bounds.dependency_entries_max,
-            DEPENDENCY_ENTRIES_MAX,
-        )
-    {
+    if request.entries.len() > capabilities.dependency_entries_max() {
         return Err(ClientError::InvalidRequest { field: "entries" });
     }
     Ok(())
@@ -1552,6 +1547,16 @@ pub struct Substitution {
     pub requested: PackageContextEntry,
     /// The collected release that answers it.
     pub served: PackageIdentity,
+}
+
+impl Capabilities {
+    /// Most entries one resolution request carries under these capabilities: the smaller of
+    /// the advertised `dependency_entries_max` and [`DEPENDENCY_ENTRIES_MAX`]. The client
+    /// refuses a longer request naming `entries` before it reaches the network.
+    #[must_use]
+    pub fn dependency_entries_max(&self) -> usize {
+        smaller_bound(self.bounds.dependency_entries_max, DEPENDENCY_ENTRIES_MAX)
+    }
 }
 
 impl PackageResolutionResponse {

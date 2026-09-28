@@ -50,8 +50,9 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalState, GlobalSymbolCandidates, local_search_page, local_symbol_page,
-    merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, local_search_page,
+    local_symbol_page, merge_patterns, merge_search, merge_symbols, package_patterns,
+    package_search, package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1658,15 +1659,17 @@ impl RiftMcp {
             .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
             .await?
             .0;
-        let context = resolved
-            .published
-            .reads
-            .read_context(params.scope, params.rev.as_ref(), &params.packages)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (mut route, remote) = self
-            .global_read(deadline, &configuration, &context, |client, packages| async move {
+            .global_read(deadline, &configuration, &read_context, |client, packages| async move {
                 package_symbols(&client, requested, &packages).await
             })
             .await;
@@ -1893,11 +1896,13 @@ impl RiftMcp {
             .await?
             .0;
         local.warnings.extend(warnings);
-        let context = resolved
-            .published
-            .reads
-            .read_context(params.scope, params.rev.as_ref(), &params.packages)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
@@ -1905,7 +1910,7 @@ impl RiftMcp {
             .global_read(
                 deadline,
                 &configuration,
-                &context,
+                &read_context,
                 |client, packages| async move {
                     package_search(&client, requested, parsed, &packages).await
                 },
@@ -1950,15 +1955,17 @@ impl RiftMcp {
             .await?
             .0;
         local.warnings.extend(warnings);
-        let context = resolved
-            .published
-            .reads
-            .read_context(params.scope, params.rev.as_ref(), &params.packages)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let (route, remote) = self
-            .global_read(deadline, &configuration, &context, |client, packages| async move {
+            .global_read(deadline, &configuration, &read_context, |client, packages| async move {
                 package_patterns(&client, requested, &packages).await
             })
             .await;
@@ -1977,7 +1984,7 @@ impl RiftMcp {
         &self,
         deadline: RequestDeadline,
         configuration: &rift_protocol::configuration::GlobalConfiguration,
-        context: &Arc<rift_dependency::DependencyContext>,
+        read_context: &ReadContext<'_>,
         read: Read,
     ) -> (GlobalRoute, T)
     where
@@ -1990,12 +1997,12 @@ impl RiftMcp {
     {
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.route(configuration, context)),
+            Box::pin(self.global.route(configuration, read_context)),
         )
         .await
         {
             Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(context),
+            Err(_) => self.global.deadline_exceeded(read_context),
         };
         let (Some(client), false) = (route.client.clone(), route.remote_packages.is_empty()) else {
             return (route, T::default());

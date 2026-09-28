@@ -15,17 +15,18 @@ use rift_cloud_client::{
 };
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
-use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry};
+use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
-    SearchResult, SearchScope,
+    ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
+    SearchParamsTarget, SearchResult, SearchScope,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
+use rift_server::{ReadError, ReadService};
 use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
@@ -47,6 +48,50 @@ struct ClientSlot {
     config: Config,
     credential: Option<OsString>,
     client: GlobalClient,
+}
+
+/// The dependency context one current-tree read sends, beside the snapshot context and the
+/// request's `packages` it was derived from, so the route can derive it again under a
+/// smaller entry bound the global API advertises.
+#[derive(Debug)]
+pub(crate) struct ReadContext<'a> {
+    /// The context under the compiled entry bound, as `ReadService::read_context` answered it.
+    context: Arc<DependencyContext>,
+    /// The snapshot's own context.
+    snapshot: &'a Arc<DependencyContext>,
+    /// The request's `packages`.
+    requested: &'a [RequestedPackage],
+}
+
+impl<'a> ReadContext<'a> {
+    /// The context a read of `reads` sends for `requested` under `scope` and `rev`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming `packages` where `ReadService::read_context` refuses
+    /// the argument.
+    pub(crate) fn accepted(
+        reads: &'a ReadService,
+        scope: SearchScope,
+        rev: Option<&RevisionId>,
+        requested: &'a [RequestedPackage],
+    ) -> Result<Self, ReadError> {
+        Ok(Self {
+            context: reads.read_context(scope, rev, requested)?,
+            snapshot: reads.dependency_context(),
+            requested,
+        })
+    }
+
+    /// The context this read sends under `entries_max`: its own when it fits, otherwise the
+    /// snapshot's with the requested packages applied under that bound.
+    fn within(&self, entries_max: usize) -> Arc<DependencyContext> {
+        if self.context.entries().len() <= entries_max {
+            Arc::clone(&self.context)
+        } else {
+            Arc::new(self.snapshot.with_requested(self.requested, entries_max))
+        }
+    }
 }
 
 /// What the global API resolved for one read: the packages it serves, the context
@@ -104,22 +149,23 @@ enum ServiceState {
 }
 
 impl GlobalState {
-    /// Resolves the context's canonical entries through the global API.
+    /// Resolves the read's canonical entries through the global API, within the entry
+    /// bound its capabilities advertise.
     pub(crate) async fn route(
         &self,
         configuration: &GlobalConfiguration,
-        context: &Arc<DependencyContext>,
+        read: &ReadContext<'_>,
     ) -> GlobalRoute {
-        let route = self.route_inner(configuration, context).await;
+        let route = self.route_inner(configuration, read).await;
         route.record_observation();
         route
     }
 
     /// The route of a read whose enclosing MCP request deadline expired before the
     /// global API answered.
-    pub(crate) fn deadline_exceeded(&self, context: &Arc<DependencyContext>) -> GlobalRoute {
+    pub(crate) fn deadline_exceeded(&self, read: &ReadContext<'_>) -> GlobalRoute {
         let route = GlobalRoute::unanswered(
-            context,
+            &read.context,
             failure_state(&ClientError::Deadline),
             Arc::clone(&self.observation),
         );
@@ -127,11 +173,15 @@ impl GlobalState {
         route
     }
 
+    /// The route of one read. The capabilities come first, so the resolution request
+    /// holds the context cut at the entry bound they advertise; a read past it would
+    /// otherwise answer no package at all.
     async fn route_inner(
         &self,
         configuration: &GlobalConfiguration,
-        context: &Arc<DependencyContext>,
+        read: &ReadContext<'_>,
     ) -> GlobalRoute {
+        let context = &read.context;
         if !configuration.enabled {
             return GlobalRoute::unanswered(
                 context,
@@ -157,12 +207,28 @@ impl GlobalState {
                 );
             }
         };
+        let capabilities = match client.get_capabilities().await {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                return GlobalRoute::unanswered(
+                    context,
+                    failure_state(&error),
+                    Arc::clone(&self.observation),
+                );
+            }
+        };
+        let bounded = read.within(capabilities.dependency_entries_max());
+        let request = if Arc::ptr_eq(&bounded, context) {
+            request
+        } else {
+            resolution_request(&bounded)
+        };
         match client.resolve_package_context(&request).await {
             Ok(resolution) => {
-                resolved_route(context, client, resolution, Arc::clone(&self.observation))
+                resolved_route(&bounded, client, resolution, Arc::clone(&self.observation))
             }
             Err(error) => GlobalRoute::unanswered(
-                context,
+                &bounded,
                 failure_state(&error),
                 Arc::clone(&self.observation),
             ),
@@ -1003,8 +1069,8 @@ fn failure_class_label(class: GlobalFailureClass) -> &'static str {
 }
 
 // A read's context, its requested packages applied, holds at most the dependency
-// context's own bound, so every resolution request fits the entry bound the client holds
-// it to.
+// context's own bound, so every resolution request fits the compiled entry bound the
+// client holds it to; the route cuts it again at a smaller bound the capabilities advertise.
 const _: () = assert!(rift_dependency::PACKAGES_MAX <= rift_cloud_client::DEPENDENCY_ENTRIES_MAX);
 
 fn resolution_request(context: &DependencyContext) -> PackageResolutionRequest {

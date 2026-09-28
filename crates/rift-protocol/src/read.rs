@@ -1281,15 +1281,16 @@ pub enum ReadWarning {
         reason: String,
     },
     /// One resolver or standard library probe read less than the workspace states, or the
-    /// request's `packages` took the place of context entries past the bound on the entries
-    /// one read carries, so the dependency context may miss packages or name a standard
-    /// library by its static reading. Rides only an answer whose `scope` reaches packages;
-    /// at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one
-    /// answer, this one first, in resolver order.
+    /// context passed the bound on the entries one read carries, the smaller of the
+    /// server's own and the one the global API advertises, and its entries sorted last left
+    /// while the request's `packages` stayed. The dependency context may then miss packages
+    /// or name a standard library by its static reading. Rides only an answer whose `scope`
+    /// reaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
+    /// warnings ride one answer, this one first, in resolver order.
     PackageContextDegraded {
         /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a
         /// standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the
-        /// package manager whose entries the request's `packages` displaced, such as `pypi`.
+        /// package manager whose entries left past the entry bound, such as `pypi`.
         #[schemars(length(max = 128))]
         resolver: String,
         /// What the resolver could not do - prose for a reader; nothing keys on it.

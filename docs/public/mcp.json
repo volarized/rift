@@ -2039,7 +2039,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, or the\nrequest's `packages` took the place of context entries past the bound on the entries\none read carries, so the dependency context may miss packages or name a standard\nlibrary by its static reading. Rides only an answer whose `scope` reaches packages;\nat most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer, this one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left\nwhile the request's `packages` stayed. The dependency context may then miss packages\nor name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -2051,7 +2051,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries the request's `packages` displaced, such as `pypi`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries left past the entry bound, such as `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }
@@ -4510,7 +4510,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, or the\nrequest's `packages` took the place of context entries past the bound on the entries\none read carries, so the dependency context may miss packages or name a standard\nlibrary by its static reading. Rides only an answer whose `scope` reaches packages;\nat most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer, this one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left\nwhile the request's `packages` stayed. The dependency context may then miss packages\nor name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -4522,7 +4522,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries the request's `packages` displaced, such as `pypi`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries left past the entry bound, such as `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }
@@ -7247,7 +7247,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, or the\nrequest's `packages` took the place of context entries past the bound on the entries\none read carries, so the dependency context may miss packages or name a standard\nlibrary by its static reading. Rides only an answer whose `scope` reaches packages;\nat most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer, this one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left\nwhile the request's `packages` stayed. The dependency context may then miss packages\nor name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -7259,7 +7259,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries the request's `packages` displaced, such as `pypi`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose entries left past the entry bound, such as `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }

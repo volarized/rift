@@ -828,8 +828,10 @@ impl ReadService {
 
     /// The dependency context one current-tree read resolves through the global API:
     /// this snapshot's own, with the request's `packages` applied through
-    /// [`DependencyContext::with_requested`]. A request naming no package reads the
-    /// snapshot's context as it is.
+    /// [`DependencyContext::with_requested`] under the compiled entry bound
+    /// [`rift_dependency::PACKAGES_MAX`]. A request naming no package reads the snapshot's
+    /// context as it is. A caller that learns a smaller bound from the global API applies
+    /// the same packages to [`Self::dependency_context`] under it.
     ///
     /// # Errors
     ///
@@ -846,7 +848,10 @@ impl ReadService {
         if packages.is_empty() {
             return Ok(Arc::clone(&self.context));
         }
-        Ok(Arc::new(self.context.with_requested(packages)))
+        Ok(Arc::new(
+            self.context
+                .with_requested(packages, rift_dependency::PACKAGES_MAX),
+        ))
     }
 
     /// The accepted `[dependencies]` table this snapshot was built under.

@@ -22,7 +22,7 @@ use crate::resolver::{
 use crate::stdlib::{StandardLibrary, StandardLibraryAnswer};
 
 /// One thing a resolver or a standard library probe could not read, or the entries of
-/// one package manager a read's requested packages left no room for.
+/// one package manager a read left out past its entry bound.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Degradation {
     /// What degraded, as the `resolver` field of a `package_context_degraded` warning
@@ -38,8 +38,9 @@ pub enum Degraded {
     /// A resolver, or a standard library entry's probe, read less than the workspace
     /// states.
     Resolver(ResolverName),
-    /// A read's requested packages took the place of this package manager's entries past
-    /// [`PACKAGES_MAX`]. The manager is spelled as the entries spell it, such as `pypi`.
+    /// A read left out this package manager's entries sorted last, past the entry bound
+    /// [`DependencyContext::with_requested`] holds it to. The manager is spelled as the
+    /// entries spell it, such as `pypi`.
     Manager(String),
 }
 
@@ -193,15 +194,17 @@ impl DependencyContext {
     /// package, a `path` or `git` entry included, and a package the workspace lacks is
     /// added. Two identical requested entries merge into one.
     ///
-    /// The result stays within [`PACKAGES_MAX`], the entry bound the global API client
-    /// holds a resolution request to. The requested entries always stay, since a read
-    /// names at most `REQUESTED_PACKAGES_MAX` of them, and past the bound the held
-    /// entries sorted last leave in their place: the standard library entries first, as
-    /// they are the last the context itself takes. Each package manager whose entries
-    /// left gets one [`Degraded::Manager`] degradation counting them. The work is linear
-    /// in the entries held plus the ones requested.
+    /// The result stays within the smaller of `entries_max` and [`PACKAGES_MAX`]: a
+    /// caller passes the entry bound the global API advertises for one resolution request,
+    /// or [`PACKAGES_MAX`] before it knows one. The requested entries always stay, since
+    /// the read names them, and past the bound the held entries sorted last leave in their
+    /// place: the standard library entries first, as they are the last the context itself
+    /// takes. Each package manager whose entries left gets one [`Degraded::Manager`]
+    /// degradation counting them. The work is linear in the entries held plus the ones
+    /// requested.
     #[must_use]
-    pub fn with_requested(&self, requested: &[RequestedPackage]) -> Self {
+    pub fn with_requested(&self, requested: &[RequestedPackage], entries_max: usize) -> Self {
+        let entries_max = entries_max.min(PACKAGES_MAX);
         let named: BTreeSet<(&str, &str)> = requested
             .iter()
             .map(|package| (package.manager.as_str(), package.name.as_str()))
@@ -218,10 +221,10 @@ impl DependencyContext {
             .filter(|entry| !named.contains(&(entry.manager.as_str(), entry.name.as_str())))
             .cloned()
             .collect();
-        let room = PACKAGES_MAX.saturating_sub(added.len());
+        let room = entries_max.saturating_sub(added.len());
         let displaced = kept.split_off(room.min(kept.len()));
         let mut degradations = self.degradations.clone();
-        degradations.extend(displacement_degradations(&kept, &displaced));
+        degradations.extend(displacement_degradations(&kept, &displaced, entries_max));
         let mut entries = kept;
         entries.append(&mut added);
         entries.sort();
@@ -278,6 +281,7 @@ const _: () = assert!(rift_protocol::dependencies::REQUESTED_PACKAGES_MAX < PACK
 fn displacement_degradations(
     kept: &[PackageContextEntry],
     displaced: &[PackageContextEntry],
+    entries_max: usize,
 ) -> Vec<Degradation> {
     let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for entry in displaced {
@@ -293,7 +297,7 @@ fn displacement_degradations(
         .map(|(manager, (kept_count, dropped_count))| Degradation {
             resolver: Degraded::Manager(manager.to_owned()),
             reason: format!(
-                "{dropped_count} of {} packages were not reported: at most {PACKAGES_MAX} \
+                "{dropped_count} of {} packages were not reported: at most {entries_max} \
                  are carried per read, the requested packages first",
                 kept_count + dropped_count
             ),
@@ -877,10 +881,13 @@ mod tests {
         };
         let context = resolve(&resolver, &[]);
 
-        let read = context.with_requested(&[
-            requested("serde", Some("1.0.200")),
-            requested("helper", Some("0.1.4")),
-        ]);
+        let read = context.with_requested(
+            &[
+                requested("serde", Some("1.0.200")),
+                requested("helper", Some("0.1.4")),
+            ],
+            PACKAGES_MAX,
+        );
 
         assert_eq!(
             spelled(&read),
@@ -918,11 +925,14 @@ mod tests {
         };
         let context = resolve(&resolver, &[]);
 
-        let read = context.with_requested(&[
-            requested("anyhow", None),
-            requested("itoa", Some("1.0.17")),
-            requested("itoa", Some("1.0.17")),
-        ]);
+        let read = context.with_requested(
+            &[
+                requested("anyhow", None),
+                requested("itoa", Some("1.0.17")),
+                requested("itoa", Some("1.0.17")),
+            ],
+            PACKAGES_MAX,
+        );
 
         assert_eq!(
             spelled(&read),
@@ -944,16 +954,19 @@ mod tests {
         };
         let context = resolve(&resolver, &[]);
 
-        let read = context.with_requested(&[
-            requested("serde", Some("1.0.200")),
-            requested("serde", None),
-        ]);
+        let read = context.with_requested(
+            &[
+                requested("serde", Some("1.0.200")),
+                requested("serde", None),
+            ],
+            PACKAGES_MAX,
+        );
 
         assert_eq!(
             spelled(&read),
             ["serde@>=0 Canonical", "serde@1.0.200 Canonical"]
         );
-        assert_eq!(context.with_requested(&[]), context);
+        assert_eq!(context.with_requested(&[], PACKAGES_MAX), context);
     }
 
     /// A context `count` entries short of the bound, held by the probe resolver, with the
@@ -982,7 +995,7 @@ mod tests {
     fn test_requested_packages_at_the_bound_displace_nothing() {
         let context = context_short_of_the_bound_by(1);
 
-        let read = context.with_requested(&[requested("anyhow", None)]);
+        let read = context.with_requested(&[requested("anyhow", None)], PACKAGES_MAX);
 
         assert_eq!(read.entries().len(), PACKAGES_MAX);
         assert!(!read.is_degraded(), "{:?}", read.degradations());
@@ -996,11 +1009,14 @@ mod tests {
         let context = context_short_of_the_bound_by(0);
         assert_eq!(context.entries().len(), PACKAGES_MAX);
 
-        let read = context.with_requested(&[
-            requested("anyhow", None),
-            requested("pkg-00003", Some("2.0.0")),
-            requested("zlib", Some("1.3.1")),
-        ]);
+        let read = context.with_requested(
+            &[
+                requested("anyhow", None),
+                requested("pkg-00003", Some("2.0.0")),
+                requested("zlib", Some("1.3.1")),
+            ],
+            PACKAGES_MAX,
+        );
 
         assert_eq!(read.entries().len(), PACKAGES_MAX);
         let spelled = spelled(&read);
@@ -1041,6 +1057,56 @@ mod tests {
         assert!(
             !context.is_degraded(),
             "the snapshot's own context is left as it was"
+        );
+    }
+
+    /// A bound below the context's own, such as the one the global API advertises, cuts the
+    /// held entries sorted last with or without requested packages, and the requested
+    /// entries stay.
+    #[test]
+    fn test_a_smaller_entry_bound_displaces_the_entries_sorted_last() {
+        let resolver = ProbeResolver {
+            entries: ["alpha", "beta", "gamma", "delta"]
+                .into_iter()
+                .map(|name| pinned(name, "1.0.0"))
+                .collect(),
+            degradations: Vec::new(),
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[requested("zlib", Some("1.3.1"))], 3);
+        assert_eq!(
+            spelled(&read),
+            [
+                "alpha@1.0.0 Canonical",
+                "beta@1.0.0 Canonical",
+                "zlib@1.3.1 Canonical"
+            ]
+        );
+        assert_eq!(
+            read.degradations(),
+            [Degradation {
+                resolver: Degraded::Manager("probe".to_owned()),
+                reason: "2 of 4 packages were not reported: at most 3 are carried per read, \
+                         the requested packages first"
+                    .to_owned(),
+            }]
+        );
+
+        let unrequested = context.with_requested(&[], 3);
+        assert_eq!(
+            spelled(&unrequested),
+            [
+                "alpha@1.0.0 Canonical",
+                "beta@1.0.0 Canonical",
+                "delta@1.0.0 Canonical"
+            ]
+        );
+        assert_eq!(unrequested.degradations().len(), 1);
+        assert_eq!(
+            context.with_requested(&[], PACKAGES_MAX + 1),
+            context,
+            "a bound past the context's own cuts nothing"
         );
     }
 
