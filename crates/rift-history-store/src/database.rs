@@ -143,23 +143,7 @@ impl StoreFiller {
     ///
     /// Returns [`StoreError`] when `SQLite` refuses the read.
     pub fn held(&self) -> Result<HashMap<String, HeldCommit>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT id, base, boundary FROM commits")
-            .map_err(database_error("read held commits"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    HeldCommit {
-                        base: row.get(1)?,
-                        boundary: row.get(2)?,
-                    },
-                ))
-            })
-            .map_err(database_error("read held commits"))?;
-        rows.collect::<Result<_, _>>()
-            .map_err(database_error("read held commits"))
+        held_commits(&self.connection)
     }
 
     /// Writes one batch in one `BEGIN IMMEDIATE` transaction. A commit the
@@ -237,6 +221,26 @@ impl StoreFiller {
             .map(|_| ())
             .map_err(database_error("check message index"))
     }
+}
+
+/// Every commit the store `connection` reads holds, keyed by commit id.
+fn held_commits(connection: &Connection) -> Result<HashMap<String, HeldCommit>, StoreError> {
+    let mut statement = connection
+        .prepare_cached("SELECT id, base, boundary FROM commits")
+        .map_err(database_error("read held commits"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                HeldCommit {
+                    base: row.get(1)?,
+                    boundary: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(database_error("read held commits"))?;
+    rows.collect::<Result<_, _>>()
+        .map_err(database_error("read held commits"))
 }
 
 /// Writes one commit's rows, the message index entry after the commit row.
@@ -426,6 +430,17 @@ impl StoreReads {
     #[cfg(test)]
     pub(crate) const fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Every commit the store holds, keyed by commit id, as the filler reads
+    /// them: a server whose task does not hold the fill lock plans against
+    /// this to know how far another server's fill has got.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` refuses the read.
+    pub fn held(&self) -> Result<HashMap<String, HeldCommit>, StoreError> {
+        held_commits(&self.connection)
     }
 
     /// The commit `id` names, when the store holds it.

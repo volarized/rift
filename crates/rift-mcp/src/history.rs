@@ -20,7 +20,8 @@ use rift_core::{ErrorCode, ErrorName};
 use rift_history_store::{HistoryStore, StoreFiller, StoreLocation};
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_server::{
-    AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, ReadError, StoredHistory,
+    AnalyzedCommit, FillPlan, FillProgress, HistoryAnalysis, PendingCommit, ReadError,
+    StoredHistory,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
@@ -138,9 +139,14 @@ impl HistoryLane {
             history.strategy,
             Arc::new(move || signal.notify_one()),
         );
+        let progress = stored.progress();
+        if let Some(plan) = &opened.plan {
+            progress.record_plan(plan.keep().len(), plan.pending().len());
+        }
         let task = HistoryTask {
             store: Arc::new(opened.store),
             analysis: Arc::new(opened.analysis),
+            progress,
             bounds: FillBounds::from_configuration(&history),
             activity,
             warned_tags: HashSet::new(),
@@ -152,15 +158,18 @@ impl HistoryLane {
     }
 }
 
-/// The store and the analysis one lane opened.
+/// The store and the analysis one lane opened, with the fill plan it met the
+/// store with.
 struct OpenedStore {
     store: HistoryStore,
     analysis: HistoryAnalysis,
+    plan: Option<FillPlan>,
 }
 
 impl OpenedStore {
-    /// The blocking open: the repository, the policy, the store, and a sweep
-    /// of the store files no live server holds.
+    /// The blocking open: the repository, the policy, the store, a sweep of
+    /// the store files no live server holds, and a first plan against what the
+    /// store holds, so the first read already knows how far the fill has got.
     fn open(
         root: &Path,
         configuration: &ConfigurationState,
@@ -200,9 +209,28 @@ impl OpenedStore {
                 .ok()?;
             record_fallback(&store);
             sweep(&store);
-            Some(Self { store, analysis })
+            let plan = observed_plan(&store, &analysis)
+                .map_err(|error| fill_failed(&error))
+                .ok();
+            Some(Self {
+                store,
+                analysis,
+                plan,
+            })
         }
     }
+}
+
+/// Plans against what the store holds through a read connection, which
+/// needs no fill lock: the view of a server whose task another server's
+/// task has kept from filling.
+fn observed_plan(store: &HistoryStore, analysis: &HistoryAnalysis) -> Result<FillPlan, String> {
+    let held = store
+        .reader()
+        .connect()
+        .and_then(|reads| reads.held())
+        .map_err(|error| error.to_string())?;
+    analysis.plan(&held).map_err(|error| error.to_string())
 }
 
 /// Logs why the history lane did not start. A capability the workspace lacks -
@@ -274,6 +302,7 @@ fn sweep(store: &HistoryStore) {
 struct HistoryTask {
     store: Arc<HistoryStore>,
     analysis: Arc<HistoryAnalysis>,
+    progress: Arc<FillProgress>,
     bounds: FillBounds,
     activity: Arc<IdleTracker>,
     warned_tags: HashSet<String>,
@@ -315,9 +344,13 @@ impl HistoryTask {
         held: Option<StoreFiller>,
         cancellation: &CancellationToken,
     ) -> Option<StoreFiller> {
-        let filler = match held {
-            Some(filler) => filler,
-            None => self.take_filler().await?,
+        let filler = if let Some(filler) = held {
+            filler
+        } else if let Some(filler) = self.take_filler().await {
+            filler
+        } else {
+            self.observe().await;
+            return None;
         };
         let analysis = Arc::clone(&self.analysis);
         let planned = blocking(move || {
@@ -339,7 +372,23 @@ impl HistoryTask {
             }
         };
         self.record_releases(&plan);
+        self.progress
+            .record_plan(plan.keep().len(), plan.pending().len());
         self.fill_planned(filler, &plan, cancellation).await
+    }
+
+    /// Records how far another server's fill has got, planning through a read
+    /// connection while that server's task holds the fill lock.
+    async fn observe(&self) {
+        let store = Arc::clone(&self.store);
+        let analysis = Arc::clone(&self.analysis);
+        match blocking(move || observed_plan(&store, &analysis)).await {
+            Some(Ok(plan)) => self
+                .progress
+                .record_plan(plan.keep().len(), plan.pending().len()),
+            Some(Err(error)) => fill_failed(&error),
+            None => {}
+        }
     }
 
     /// The fill lock, taken on the first fill that finds it free and held
@@ -429,6 +478,7 @@ impl HistoryTask {
             });
         }
         let records: Vec<_> = batch.into_iter().map(AnalyzedCommit::into_record).collect();
+        let written_commits = records.len();
         let parent = tracing::Span::current();
         let (filler, written) = blocking(move || {
             let mut filler = filler;
@@ -442,7 +492,10 @@ impl HistoryTask {
         })
         .await?;
         let outcome = match written {
-            Ok(()) => BatchOutcome::Written,
+            Ok(()) => {
+                self.progress.record_written(written_commits);
+                BatchOutcome::Written
+            }
             Err(error) => {
                 fill_failed(&error.to_string());
                 BatchOutcome::Failed

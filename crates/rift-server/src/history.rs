@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rift_core::ProjectPath;
 use rift_history::{
@@ -23,7 +23,7 @@ use rift_history_store::{StoreReader, StoreReads, StoredCommit};
 use rift_index::SymbolMatch;
 use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration, HistoryStrategy};
 use rift_protocol::read::{
-    CommitAuthor, ProjectPath as WireProjectPath, RevisionId, SymbolHistory, SymbolId,
+    CommitAuthor, ProjectPath as WireProjectPath, ReadWarning, RevisionId, SymbolHistory, SymbolId,
     SymbolVersion, SymbolVersionKind,
 };
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
@@ -43,13 +43,15 @@ struct ParsedRevision {
     document: SyntaxDocument,
 }
 
-/// The history store a symbol-history read answers from, and the signal
-/// that asks the history task to fill when the store lags a read.
+/// The history store a symbol-history read answers from, the signal that
+/// asks the history task to fill when the store lags a read, and how far the
+/// task's latest fill has got.
 #[derive(Clone)]
 pub struct StoredHistory {
     reader: StoreReader,
     strategy: HistoryStrategy,
     lagging: Arc<dyn Fn() + Send + Sync>,
+    progress: Arc<FillProgress>,
 }
 
 impl StoredHistory {
@@ -66,12 +68,151 @@ impl StoredHistory {
             reader,
             strategy,
             lagging,
+            progress: Arc::default(),
         }
     }
 
     /// Opens one read connection to the store.
     pub(crate) fn connect(&self) -> Result<StoreReads, ReadError> {
         self.reader.connect().map_err(ReadFault::history_store)
+    }
+
+    /// How far the history task's latest fill has got, which the task records
+    /// and a commit search reports.
+    #[must_use]
+    pub fn progress(&self) -> Arc<FillProgress> {
+        Arc::clone(&self.progress)
+    }
+
+    /// The `history_store_filling` warning a commit search over `reads`
+    /// carries, or `None` when the store holds every commit the latest fill
+    /// selects and, under `everything`, the commit `HEAD` names in the
+    /// workspace at `root`.
+    ///
+    /// A store missing `HEAD`'s commit was planned against an older head, so
+    /// the read asks the history task to fill, as a lagging timeline does.
+    /// Before the task's first plan lands there is nothing to compare with,
+    /// and no warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] when `HEAD` does not resolve or the store cannot
+    /// be read.
+    pub(crate) fn filling(
+        &self,
+        reads: &StoreReads,
+        root: &Path,
+    ) -> Result<Option<ReadWarning>, ReadError> {
+        let Some(counts) = self.progress.counts() else {
+            return Ok(None);
+        };
+        let head_missing = match self.strategy {
+            HistoryStrategy::Everything => {
+                let head = Repository::open(root)
+                    .and_then(|repository| repository.resolve("HEAD"))
+                    .map_err(ReadFault::history)?;
+                reads
+                    .commit(&head.commit_id())
+                    .map_err(ReadFault::history_store)?
+                    .is_none()
+            }
+            HistoryStrategy::Selective => false,
+        };
+        if head_missing {
+            (self.lagging)();
+        }
+        Ok(counts.filling_warning(head_missing))
+    }
+}
+
+/// How far the history task's latest fill has got: the commits its plan
+/// selects and how many of them the store still lacks. The task records each
+/// plan and each written batch; readers take a consistent copy.
+#[derive(Debug, Default)]
+pub struct FillProgress {
+    latest: Mutex<Option<FillCounts>>,
+}
+
+impl FillProgress {
+    /// Records one plan: it selects `selected` commits and the store lacks
+    /// `owed` of them.
+    pub fn record_plan(&self, selected: usize, owed: usize) {
+        let counts = FillCounts {
+            total: u64::try_from(selected).unwrap_or(u64::MAX),
+            owed: u64::try_from(owed.min(selected)).unwrap_or(u64::MAX),
+        };
+        *self.lock() = Some(counts);
+    }
+
+    /// Records one written batch of `commits` commits the latest plan owed.
+    pub fn record_written(&self, commits: usize) {
+        if let Some(counts) = self.lock().as_mut() {
+            counts.owed = counts
+                .owed
+                .saturating_sub(u64::try_from(commits).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// The latest plan's counts, or `None` before the first plan lands.
+    #[must_use]
+    pub fn counts(&self) -> Option<FillCounts> {
+        *self.lock()
+    }
+
+    /// The counts, whatever a panicking holder left: each write replaces or
+    /// decrements whole values, so no holder can leave them half-written.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<FillCounts>> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One plan's counts: the commits it selects and how many the store lacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FillCounts {
+    total: u64,
+    owed: u64,
+}
+
+impl FillCounts {
+    /// Commits the store holds of the ones the fill plan selects.
+    #[must_use]
+    pub const fn analyzed(self) -> u64 {
+        self.total.saturating_sub(self.owed)
+    }
+
+    /// Commits the fill plan selects.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.total
+    }
+
+    /// The warning these counts call for: one while the store lacks a
+    /// selected commit, or the served `HEAD` commit when `head_missing`.
+    fn filling_warning(self, head_missing: bool) -> Option<ReadWarning> {
+        let analyzed = self.analyzed();
+        let detail = match (head_missing, self.owed) {
+            (true, _) => format!(
+                "the history store has not analyzed the commit HEAD names yet, and holds \
+                 {analyzed} of the {} commits its latest fill selects, so a commit it has \
+                 not reached answers nothing; the fill runs in the background, and a later \
+                 search answers the rest",
+                self.total
+            ),
+            (false, 0) => return None,
+            (false, _) => format!(
+                "the history store holds {analyzed} of the {} commits its latest fill \
+                 selects, so a commit it has not reached answers nothing; the fill runs in \
+                 the background, and a later search answers the rest",
+                self.total
+            ),
+        };
+        Some(ReadWarning::HistoryStoreFilling {
+            analyzed,
+            total: self.total,
+            detail,
+        })
     }
 }
 

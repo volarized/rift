@@ -22,7 +22,7 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
-pub use history::StoredHistory;
+pub use history::{FillCounts, FillProgress, StoredHistory};
 pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,

@@ -1297,6 +1297,19 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The history store the server fills in the background has not analyzed every commit
+    /// `[providers.history]` selects, so a commit search answers from the `analyzed` ones
+    /// alone and a commit the store has not reached answers nothing. The fill runs newest
+    /// first and continues without a request; a later search answers the rest.
+    HistoryStoreFilling {
+        /// Commits the history store holds of the ones its latest fill selects.
+        analyzed: u64,
+        /// Commits the history store's latest fill selects.
+        total: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The comparison reached `paths_max` changed paths and stopped there, so declarations
     /// in the changed paths past it are missing from this answer. Narrow the comparison
     /// with `paths`, or name two sides that differ in fewer files.
@@ -2738,6 +2751,19 @@ mod tests {
                 }),
             ),
             (
+                ReadWarning::HistoryStoreFilling {
+                    analyzed: 40,
+                    total: 100,
+                    detail: "the history store has analyzed 40 of 100 commits".to_owned(),
+                },
+                json!({
+                    "code": "history_store_filling",
+                    "analyzed": 40,
+                    "total": 100,
+                    "detail": "the history store has analyzed 40 of 100 commits",
+                }),
+            ),
+            (
                 ReadWarning::VectorRankingUnavailable {
                     detail: "the model weights could not be acquired".to_owned(),
                 },
@@ -3126,6 +3152,7 @@ mod tests {
             "package_unavailable",
             "package_context_degraded",
             "relationship_coverage_missing",
+            "history_store_filling",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),

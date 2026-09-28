@@ -6,12 +6,13 @@ use std::collections::HashSet;
 
 use rift_history_store::StoreReads;
 use rift_protocol::read::{
-    COMMIT_MESSAGE_BYTES_MAX, COMMIT_PATHS_MAX, CommitHit, ProjectPath, RevisionId, SearchHit,
-    SearchHitTarget, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
+    COMMIT_MESSAGE_BYTES_MAX, COMMIT_PATHS_MAX, CommitHit, ProjectPath, ReadWarning, RevisionId,
+    SearchHit, SearchHitTarget, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
 };
 use rift_ranking::{ParsedQuery, QueryPhase};
 
 use super::{parsed_query, query_narrowing_warning, required_query, search_page_limit};
+use crate::history::StoredHistory;
 use crate::read::{ReadError, ReadFault, ReadService, page, results_truncation_warning};
 
 /// The capability a commit search names when no history store answers it.
@@ -69,7 +70,9 @@ pub(super) fn commit_conflict(params: &SearchParams) -> Option<ReadError> {
 impl ReadService {
     /// Answers one commit search from the attached history store: the commits whose
     /// message carries every term of `query`, then the ones carrying some, each group
-    /// newest first, bounded by the index's `results_max`.
+    /// newest first, bounded by the index's `results_max`. While the store lacks a commit
+    /// the history task's latest fill selects, or the commit `HEAD` names, the answer
+    /// carries `history_store_filling`.
     ///
     /// # Errors
     ///
@@ -85,7 +88,8 @@ impl ReadService {
         let query = required_query(params)?;
         let limit = search_page_limit(params)?;
         let parsed = parsed_query(query)?;
-        let reads = self.commit_store()?;
+        let stored = self.commit_store()?;
+        let reads = stored.connect()?;
         let results_max = self.index().results_max();
         let matched = rift_core::traced!(component = "search", operation = "search.commits", {
             matched_commits(&reads, &parsed, results_max)
@@ -95,7 +99,10 @@ impl ReadService {
         for id in &ids {
             results.extend(commit_hit(&reads, id)?);
         }
-        let mut warnings = Vec::new();
+        let mut warnings: Vec<ReadWarning> = stored
+            .filling(&reads, self.index().root())?
+            .into_iter()
+            .collect();
         if parsed.is_narrowed() {
             warnings.push(query_narrowing_warning());
         }
@@ -109,16 +116,15 @@ impl ReadService {
         })
     }
 
-    /// One read connection to the attached history store.
-    fn commit_store(&self) -> Result<StoreReads, ReadError> {
+    /// The attached history store a commit search reads.
+    fn commit_store(&self) -> Result<&StoredHistory, ReadError> {
         if !self.history_configuration().enabled {
             return Err(ReadFault::unsupported(
                 "commit search (providers.history disabled)",
             ));
         }
         self.stored_history()
-            .ok_or_else(|| ReadFault::unsupported(COMMIT_SEARCH_CAPABILITY))?
-            .connect()
+            .ok_or_else(|| ReadFault::unsupported(COMMIT_SEARCH_CAPABILITY))
     }
 }
 
