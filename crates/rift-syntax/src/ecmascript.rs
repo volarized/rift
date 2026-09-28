@@ -36,21 +36,29 @@
 //!   bytes, so a name can run to any length. A declaration whose name or
 //!   qualified name passes `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes is left out
 //!   of the document with every declaration nested under it, and counted.
-//! - A declaration's complete span includes directly attached `JSDoc` comments.
-//!   Decorators remain children of the declared node.
+//! - A declaration's complete span starts at the statement carrying it - the
+//!   `export_statement`, or the `lexical_declaration` or `variable_declaration`
+//!   holding it as its first declarator - and extends over the `JSDoc`
+//!   comments directly attached before that statement. Decorators remain
+//!   children of the declared node.
 //! - A `method_signature` or `property_signature` declares a `method` or a
 //!   `property` only inside an interface or class body, qualified by it
 //!   (`Array.map`); the same kinds inside a type literal (`{ size: number }`)
 //!   declare nothing.
-//! - `documentation` remains empty. A `Signature` renders for a callable
-//!   declaration from `body_range` and the `Callable` facet, and a bodyless
-//!   one, an overload or a member signature, renders its own text.
+//! - `documentation` carries those attached `JSDoc` blocks, nearest last,
+//!   joined by a line break, with the `/**`, `*/`, and leading `*` markers
+//!   stripped and `@` tags kept as written. A `//` or `/* */` comment is not
+//!   documentation, and it stops the walk, as a blank line does. A
+//!   `Signature` renders for a callable declaration from `body_range` and the
+//!   `Callable` facet, and a bodyless one, an overload or a member signature,
+//!   renders its own text.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU16;
 
 use rift_core::Error;
-use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
+use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
@@ -126,6 +134,14 @@ const MODULE_VARIABLE: &str = "module";
 /// The property of `module`, and the variable, holding a module's exports:
 /// `module.exports`, `exports.name`.
 const EXPORTS_NAME: &str = "exports";
+/// Grammar spelling of a `comment`, line or block.
+const COMMENT_KIND: &str = "comment";
+/// Opens a `JSDoc` block: a block comment whose first delimiter carries a second `*`.
+const JSDOC_OPEN: &str = "/**";
+/// Closes every block comment, a `JSDoc` block included.
+const BLOCK_COMMENT_CLOSE: &str = "*/";
+/// Leads each continuation line inside a `JSDoc` block.
+const JSDOC_LINE_MARKER: char = '*';
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -245,6 +261,7 @@ pub(crate) struct EcmaScriptKinds {
     variable_declaration: u16,
     export_statement: u16,
     identifier: u16,
+    comment: u16,
     /// `Some` on the TypeScript grammars; the JavaScript grammar spells no
     /// accessibility.
     accessibility_modifier: Option<u16>,
@@ -310,6 +327,7 @@ impl EcmaScriptKinds {
             variable_declaration: kind_id(language, VARIABLE_DECLARATION_KIND),
             export_statement: kind_id(language, EXPORT_STATEMENT_KIND),
             identifier: kind_id(language, IDENTIFIER_KIND),
+            comment: kind_id(language, COMMENT_KIND),
             accessibility_modifier: None,
             member_signatures: Vec::new(),
             member_bodies: Vec::new(),
@@ -673,6 +691,92 @@ impl EcmaScriptRules<'_> {
         wrapped || named || in_exported_object
     }
 
+    /// The statement carrying `node`: the declaration itself, the
+    /// `lexical_declaration` or `variable_declaration` holding it as its
+    /// first declarator, and the `export_statement` wrapping either. A
+    /// `JSDoc` block written above `export` or `const` stands before this
+    /// node, since the grammar makes `export` the declaration's previous
+    /// sibling.
+    fn statement<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
+        let mut front = node;
+        if let Some(parent) = front.parent().filter(|parent| {
+            self.kinds.is_declaration_statement(*parent) && parent.named_child(0) == Some(front)
+        }) {
+            front = parent;
+        }
+        if let Some(parent) = front
+            .parent()
+            .filter(|parent| parent.kind_id() == self.kinds.export_statement)
+        {
+            front = parent;
+        }
+        front
+    }
+
+    /// The `JSDoc` comments directly attached before `front`, nearest first:
+    /// a run of `/**` comment siblings, each separated from the next by
+    /// whitespace holding at most one line break.
+    fn jsdoc_run<'tree>(&self, front: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
+        let mut run = Vec::new();
+        let mut front = front;
+        while let Some(previous) = front.prev_sibling() {
+            if !self.attaches(previous, front, text) {
+                break;
+            }
+            run.push(previous);
+            front = previous;
+        }
+        run
+    }
+
+    /// Whether `previous` is a `JSDoc` comment attached to `front`: a `/**`
+    /// block separated from it by whitespace holding at most one line break.
+    fn attaches(&self, previous: Node<'_>, front: Node<'_>, text: &str) -> bool {
+        let is_jsdoc = previous.kind_id() == self.kinds.comment
+            && text
+                .get(previous.byte_range())
+                .is_some_and(|comment| comment.trim_start().starts_with(JSDOC_OPEN));
+        let adjacent = text
+            .get(previous.end_byte()..front.start_byte())
+            .is_some_and(|gap| {
+                gap.chars().all(char::is_whitespace)
+                    && gap.bytes().filter(|byte| *byte == LINE_FEED).count() <= 1
+            });
+        is_jsdoc && adjacent
+    }
+
+    /// The attached `JSDoc` before `statement` as one documentation block, and
+    /// each comment's range; empty when nothing attaches or every block is
+    /// empty once its markers are stripped.
+    fn attached_jsdoc(
+        &self,
+        statement: Node<'_>,
+        text: &str,
+    ) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
+        let mut run = self.jsdoc_run(statement, text);
+        run.reverse();
+        let mut blocks = Vec::with_capacity(run.len());
+        let mut ranges = Vec::with_capacity(run.len());
+        for comment in run {
+            let written = text
+                .get(comment.byte_range())
+                .map(jsdoc_text)
+                .unwrap_or_default();
+            if !written.is_empty() {
+                blocks.push(written);
+            }
+            ranges.push(extract::byte_range(comment)?);
+        }
+        if blocks.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let documentation = Documentation {
+            format: DocumentationFormat::Markdown,
+            text: blocks.join(LineEnding::Lf.as_str()),
+        };
+        Ok((vec![documentation], ranges))
+    }
+
     /// Whether an `export_statement` wraps the declaration: its direct
     /// parent, or - for a declarator - the parent of its declaration
     /// statement.
@@ -748,14 +852,16 @@ impl GrammarRules for EcmaScriptRules<'_> {
         if self.exported(node, &name) {
             facets.push(SymbolFacet::Public);
         }
+        let (documentation, documentation_ranges) =
+            self.attached_jsdoc(self.statement(node), text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
             facets,
             visibility: self.accessibility(node, text),
             body_range: self.body_range(node, kind)?,
-            documentation: Vec::new(),
-            documentation_ranges: Vec::new(),
+            documentation,
+            documentation_ranges,
         }))
     }
 
@@ -768,34 +874,41 @@ impl GrammarRules for EcmaScriptRules<'_> {
         text.get(name.byte_range()).map(Into::into)
     }
 
-    /// Extends declaration start over directly attached `JSDoc` comments.
+    /// Starts the declaration at the statement carrying it, extended over the
+    /// `JSDoc` comments attached before that statement.
     fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
-        let mut front = node;
-        while let Some(previous) = front.prev_sibling() {
-            if previous.kind() != "comment" {
-                break;
-            }
-            let Some(comment) = text.get(previous.byte_range()) else {
-                break;
-            };
-            if !comment.trim_start().starts_with("/**") {
-                break;
-            }
-            let Some(gap) = text.get(previous.end_byte()..front.start_byte()) else {
-                break;
-            };
-            if !gap.chars().all(char::is_whitespace)
-                || gap.bytes().filter(|byte| *byte == b'\n').count() > 1
-            {
-                break;
-            }
-            front = previous;
-        }
-        front.start_byte()
+        let statement = self.statement(node);
+        self.jsdoc_run(statement, text)
+            .last()
+            .map_or(statement.start_byte(), Node::start_byte)
     }
 
     fn qualification_separator(&self) -> &'static str {
         "."
+    }
+}
+
+/// One `/** ... */` comment's written text: the delimiters, each line's
+/// leading whitespace and `*`, and one space after it stripped, and blank
+/// edge lines dropped. `@` tags stay as written.
+fn jsdoc_text(comment: &str) -> String {
+    let inner = comment
+        .trim()
+        .strip_prefix(JSDOC_OPEN)
+        .and_then(|rest| rest.strip_suffix(BLOCK_COMMENT_CLOSE))
+        .unwrap_or_default();
+    let lines: Vec<&str> = lines_inclusive(inner)
+        .map(|line| {
+            let line = without_ending(line).trim_start();
+            let line = line.strip_prefix(JSDOC_LINE_MARKER).unwrap_or(line);
+            line.strip_prefix(' ').unwrap_or(line).trim_end()
+        })
+        .collect();
+    let first = lines.iter().position(|line| !line.is_empty());
+    let last = lines.iter().rposition(|line| !line.is_empty());
+    match (first, last) {
+        (Some(first), Some(last)) => lines[first..=last].join(LineEnding::Lf.as_str()),
+        _ => String::new(),
     }
 }
 

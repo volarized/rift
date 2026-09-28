@@ -561,4 +561,69 @@ mod tests {
         assert_eq!(names, ["Kept"]);
         assert_eq!(document.left_out_declaration_count(), 1);
     }
+
+    /// A member signature carries the `JSDoc` written above it inside the
+    /// interface or class body: the block becomes its documentation and
+    /// joins its span, while its signature stays the member's own text.
+    #[test]
+    fn test_member_signatures_carry_the_jsdoc_above_them() {
+        let text = "/** A list. */\nexport interface Array<T> {\n  length: number;\n  \
+                    /** Maps each value. */\n  map<U>(callbackfn: (value: T) => U): U[];\n}\n\
+                    declare class Reader {\n  /**\n   * Reads bytes.\n   */\n  \
+                    read(size?: number): string;\n}\n";
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        let symbol = |qualified_name: &str| {
+            document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.qualified_name == qualified_name)
+                .unwrap_or_else(|| panic!("fixture declares {qualified_name}"))
+        };
+        let documentation = |qualified_name: &str| {
+            symbol(qualified_name)
+                .documentation
+                .first()
+                .map(|documentation| documentation.text.clone())
+        };
+        let spanned = |range: crate::document::ByteRange| {
+            let start = usize::try_from(range.start).expect("fixture span fits usize");
+            let end = usize::try_from(range.end).expect("fixture span fits usize");
+            &text[start..end]
+        };
+
+        assert_eq!(documentation("Array").as_deref(), Some("A list."));
+        assert_eq!(documentation("Array.length"), None);
+        assert_eq!(
+            documentation("Array.map").as_deref(),
+            Some("Maps each value.")
+        );
+        assert_eq!(
+            documentation("Reader.read").as_deref(),
+            Some("Reads bytes.")
+        );
+
+        let map = symbol("Array.map");
+        assert!(
+            spanned(map.range).starts_with("/** Maps each value. */\n  map<U>"),
+            "the member's span covers its JSDoc: {:?}",
+            spanned(map.range)
+        );
+        assert!(spanned(map.item_range).starts_with("map<U>"));
+        assert_eq!(map.documentation_ranges.len(), 1);
+        assert_eq!(
+            map.signatures
+                .first()
+                .map(|signature| signature.display.as_str()),
+            Some("map<U>(callbackfn: (value: T) => U): U[]"),
+            "the JSDoc stays out of the signature"
+        );
+        assert_eq!(
+            symbol("Reader.read")
+                .signatures
+                .first()
+                .map(|signature| signature.display.as_str()),
+            Some("read(size?: number): string")
+        );
+    }
 }

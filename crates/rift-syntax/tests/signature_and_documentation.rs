@@ -35,12 +35,14 @@ fn fixtures_for(language: &Language) -> ProviderFixtures {
         ("javascript", _) => ProviderFixtures {
             neither: "const beacon = 1;\n",
             header: Some("function beacon() {\n  return 1;\n}\n"),
-            documentation: None,
+            documentation: Some("/** Beacon docs. */\nfunction beacon() {\n  return 1;\n}\n"),
         },
         ("typescript", _) => ProviderFixtures {
             neither: "const beacon: number = 1;\n",
             header: Some("function beacon(): number {\n  return 1;\n}\n"),
-            documentation: None,
+            documentation: Some(
+                "/** Beacon docs. */\nfunction beacon(): number {\n  return 1;\n}\n",
+            ),
         },
         ("markdown", _) => ProviderFixtures {
             neither: "# Beacon\n\nSome text.\n",

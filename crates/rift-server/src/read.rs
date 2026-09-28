@@ -3583,8 +3583,8 @@ pub fn compute() -> i32 {
             json!("rift://symbol/typescript/src/routes.ts/Route")
         );
         assert_eq!(
-            value["hits"][0]["source"],
-            "interface Route {\n  path: string;\n}"
+            value["hits"][0]["source"], "export interface Route {\n  path: string;\n}",
+            "the source starts at the `export` statement carrying the declaration"
         );
         Ok(())
     }
