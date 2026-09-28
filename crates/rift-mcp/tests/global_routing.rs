@@ -880,8 +880,9 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     client.cancel().await?;
     server_task.await?;
 
-    // The client answers every request as unavailable for `failure_ttl` after a failed
-    // one, so the search runs against a server of its own to meet the invalid page.
+    // Inside `failure_ttl` the client hands back the failure it recorded and asks the
+    // global API nothing, so the search runs against a server of its own to meet the
+    // invalid page.
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let answer = call_tool(&client, "search", json!({"query":"beacon","scope":"all"})).await?;
