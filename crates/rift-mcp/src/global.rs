@@ -1188,6 +1188,124 @@ mod tests {
         }
     }
 
+    /// The authored example `T`'s schema states, the value a caller sees documented.
+    fn authored_example<T: schemars::JsonSchema + serde::de::DeserializeOwned>() -> T {
+        let schema = schemars::schema_for!(T);
+        let example = schema
+            .get("examples")
+            .and_then(|examples| examples.get(0))
+            .cloned()
+            .expect("the model states an example");
+        serde_json::from_value(example).expect("the example is a value of the model")
+    }
+
+    /// A read whose remote lane failed pages the project's own hits in the order the
+    /// snapshot ranked them, and keeps the snapshot's warnings.
+    #[test]
+    fn a_local_symbol_page_keeps_the_snapshot_order_and_its_warnings() {
+        use rift_protocol::read::{GetSymbolParams, GetSymbolResult, ReadWarning};
+
+        let example: GetSymbolResult = authored_example();
+        let hits = ["first", "second", "third"].map(|name| {
+            let mut hit = example.hits[0].clone();
+            hit.symbol.name = name.to_owned();
+            hit
+        });
+        let local = GetSymbolResult {
+            hits: hits.to_vec(),
+            pagination: example.pagination,
+            warnings: vec![ReadWarning::GlobalAccessDisabled],
+        };
+        let request = serde_json::json!({"name": "load_config", "limit": 2, "page_index": 1});
+        let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+
+        let page = super::local_symbol_page(&params, local);
+
+        let names: Vec<&str> = page
+            .hits
+            .iter()
+            .map(|hit| hit.symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["third"]);
+        assert_eq!(page.pagination.page_index, 1);
+        assert_eq!(page.pagination.total_pages, 2);
+        assert_eq!(page.warnings, [ReadWarning::GlobalAccessDisabled]);
+    }
+
+    /// The search counterpart pages under the request's `limit`, or the default one when
+    /// the request names none.
+    #[test]
+    fn a_local_search_page_keeps_the_snapshot_order_and_its_warnings() {
+        use rift_protocol::read::{ReadWarning, SearchParams, SearchResult};
+
+        let example: SearchResult = authored_example();
+        let paths: Vec<_> = example.results.iter().map(|hit| hit.path.clone()).collect();
+        let local = |results| SearchResult {
+            results,
+            pagination: example.pagination.clone(),
+            warnings: vec![ReadWarning::GlobalAccessDisabled],
+        };
+
+        let request = serde_json::json!({"query": "load_config", "limit": 1, "page_index": 1});
+        let params: SearchParams = serde_json::from_value(request).expect("a search");
+        let page = super::local_search_page(&params, local(example.results.clone()));
+        let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
+        assert_eq!(paged, paths[1..]);
+        assert_eq!(page.pagination.total_pages, 2);
+        assert_eq!(page.warnings, [ReadWarning::GlobalAccessDisabled]);
+
+        let request = serde_json::json!({"query": "load_config"});
+        let params: SearchParams = serde_json::from_value(request).expect("a search");
+        let page = super::local_search_page(&params, local(example.results.clone()));
+        let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
+        assert_eq!(paged, paths);
+        assert_eq!(page.pagination.total_pages, 1);
+    }
+
+    /// A context with nothing to resolve sends nothing: the route answers the service as
+    /// available and builds no client.
+    #[tokio::test]
+    async fn a_context_with_nothing_to_resolve_routes_available_without_a_client() {
+        let state = super::GlobalState::default();
+        let configuration = rift_protocol::configuration::GlobalConfiguration::default();
+        let context = Arc::new(DependencyContext::default());
+
+        let route = state.route(&configuration, &context).await;
+
+        assert_eq!(route.state, RouteState::Available);
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
+        assert!(route.warnings().is_empty());
+    }
+
+    /// A configuration the client refuses leaves the route unanswered: no client, and the
+    /// API failure the read's warning names.
+    #[tokio::test]
+    async fn a_configuration_the_client_refuses_routes_unavailable_without_a_client() {
+        let state = super::GlobalState::default();
+        let configuration = rift_protocol::configuration::GlobalConfiguration {
+            endpoint: "ftp://global.example.test/rift/rest".to_owned(),
+            ..rift_protocol::configuration::GlobalConfiguration::default()
+        };
+        let context = context_with_path_dependencies(0);
+
+        let route = state.route(&configuration, &context).await;
+
+        let route_state = route.state;
+        assert!(
+            matches!(
+                route_state,
+                RouteState::Unavailable {
+                    kind: FailureKind::Api,
+                    ..
+                }
+            ),
+            "{route_state:?}"
+        );
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
+    }
+
     #[test]
     fn page_window_reports_empty_page_after_last_page() {
         let (page, pagination) = page_window(vec![1, 2, 3], 4, 2);
