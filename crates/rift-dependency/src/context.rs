@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use rift_protocol::dependencies::{ConfiguredPackage, PackageAvailability, PackageContextEntry};
+use rift_protocol::dependencies::{
+    ConfiguredPackage, PackageAvailability, PackageContextEntry, RequestedPackage,
+};
 use rift_protocol::read::{PackageIdentity, ProjectPath};
 
 use crate::manifest::claimed_manifests;
@@ -144,6 +146,40 @@ impl DependencyContext {
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         !self.degradations.is_empty()
+    }
+
+    /// This context as one read sends it: every entry held for a package `requested`
+    /// names leaves, and each requested package joins as the entry
+    /// [`RequestedPackage::context_entry`] builds.
+    ///
+    /// A requested version therefore replaces every version the workspace pins for that
+    /// package, a `path` or `git` entry included, and a package the workspace lacks is
+    /// added. Two identical requested entries merge into one. The work is linear in the
+    /// entries held plus the ones requested, so the result may pass [`PACKAGES_MAX`] by
+    /// the requested count alone; the global API client refuses a request past its
+    /// entry bound, and the read then carries the typed global warning.
+    #[must_use]
+    pub fn with_requested(&self, requested: &[RequestedPackage]) -> Self {
+        let named: BTreeSet<(&str, &str)> = requested
+            .iter()
+            .map(|package| (package.manager.as_str(), package.name.as_str()))
+            .collect();
+        let mut entries: Vec<PackageContextEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| !named.contains(&(entry.manager.as_str(), entry.name.as_str())))
+            .cloned()
+            .chain(requested.iter().map(RequestedPackage::context_entry))
+            .collect();
+        entries.sort();
+        entries.dedup();
+        Self {
+            entries,
+            install_folders: self.install_folders.clone(),
+            inputs: self.inputs.clone(),
+            degradations: self.degradations.clone(),
+            libraries: self.libraries.clone(),
+        }
     }
 
     /// Adds the standard library entries, one per package: an entry whose manager and
@@ -712,5 +748,124 @@ mod tests {
         );
         assert!(context.depends_on(&project("rust-toolchain.toml")));
         assert!(context.depends_on(&project(".nvmrc")));
+    }
+
+    fn requested(name: &str, version: Option<&str>) -> RequestedPackage {
+        RequestedPackage {
+            manager: "probe".to_owned(),
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+        }
+    }
+
+    /// Each entry as `name@selector availability`, in context order.
+    fn spelled(context: &DependencyContext) -> Vec<String> {
+        context
+            .entries()
+            .iter()
+            .map(|entry| {
+                let selector = entry
+                    .version
+                    .as_deref()
+                    .or(entry.requirement.as_deref())
+                    .unwrap_or_default();
+                format!("{}@{selector} {:?}", entry.name, entry.availability)
+            })
+            .collect()
+    }
+
+    /// A requested version replaces every version the context holds for the package, a
+    /// path entry included, and the entries of the packages the request leaves alone
+    /// stand as the context read them.
+    #[test]
+    fn test_a_requested_version_replaces_every_entry_of_its_package() {
+        let resolver = ProbeResolver {
+            entries: vec![
+                pinned("serde", "1.0.228"),
+                pinned("serde", "1.0.100"),
+                declared("helper", "^0.1"),
+                pinned("tokio", "1.53.1"),
+            ],
+            degradations: vec!["one manifest was unreadable".to_owned()],
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("serde", Some("1.0.200")),
+            requested("helper", Some("0.1.4")),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            [
+                "helper@0.1.4 Canonical",
+                "serde@1.0.200 Canonical",
+                "tokio@1.53.1 Canonical"
+            ]
+        );
+        assert_eq!(read.unavailable_entries().count(), 0);
+        assert_eq!(read.degradations(), context.degradations());
+        assert_eq!(
+            read.install_folders().collect::<Vec<_>>(),
+            context.install_folders().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spelled(&context),
+            [
+                "helper@^0.1 Path",
+                "serde@1.0.100 Canonical",
+                "serde@1.0.228 Canonical",
+                "tokio@1.53.1 Canonical"
+            ],
+            "the snapshot's own context is left as it was"
+        );
+    }
+
+    /// A package the context lacks joins, an entry without a version asks for `>=0`, and
+    /// two identical requested entries merge into one.
+    #[test]
+    fn test_a_requested_package_the_context_lacks_is_added() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("serde", "1.0.228")],
+            degradations: Vec::new(),
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("anyhow", None),
+            requested("itoa", Some("1.0.17")),
+            requested("itoa", Some("1.0.17")),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            [
+                "anyhow@>=0 Canonical",
+                "itoa@1.0.17 Canonical",
+                "serde@1.0.228 Canonical"
+            ]
+        );
+    }
+
+    /// Two requested versions of one package both go out, and an empty request leaves
+    /// the context as it was.
+    #[test]
+    fn test_requested_versions_of_one_package_each_go_out() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("serde", "1.0.228")],
+            degradations: Vec::new(),
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("serde", Some("1.0.200")),
+            requested("serde", None),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            ["serde@>=0 Canonical", "serde@1.0.200 Canonical"]
+        );
+        assert_eq!(context.with_requested(&[]), context);
     }
 }
