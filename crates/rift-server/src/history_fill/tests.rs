@@ -532,3 +532,60 @@ fn the_deleted_file_bound_counts_the_deletions_pure_renames_leave() -> TestResul
     );
     Ok(())
 }
+
+#[test]
+fn a_commit_changing_a_lockfile_writes_no_row_for_it() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    init(root);
+    write(root, "src/lib.rs", "pub fn beacon() {}\n")?;
+    write(root, "package-lock.json", "{\"lockfileVersion\": 3}\n")?;
+    commit_all(root, "introduce");
+    write(root, "src/lib.rs", "pub fn beacon() { let _grown = 1; }\n")?;
+    write(
+        root,
+        "package-lock.json",
+        "{\"lockfileVersion\": 3, \"packages\": {}}\n",
+    )?;
+    commit_all(root, "grow beacon and relock");
+
+    let record = head_record(&analysis(root, &everything(10))?)?;
+
+    let paths: Vec<&str> = record
+        .paths
+        .iter()
+        .map(|changed| changed.path.as_str())
+        .collect();
+    assert_eq!(paths, ["src/lib.rs"], "the lockfile writes no path row");
+    assert!(
+        record
+            .declarations
+            .iter()
+            .all(|change| change.path == "src/lib.rs"),
+        "the lockfile writes no declaration row: {:?}",
+        record.declarations
+    );
+
+    let indexed = HistoryAnalysis::open(
+        root,
+        &everything(10),
+        (
+            &SourceVisibility::default(),
+            &TextFileInclusion::default().excluding_lockfiles(Vec::new()),
+            &LanguageFileSelections::default(),
+        ),
+        SyntaxLimits::default(),
+    )?;
+    let record = head_record(&indexed)?;
+    let paths: Vec<&str> = record
+        .paths
+        .iter()
+        .map(|changed| changed.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        ["package-lock.json", "src/lib.rs"],
+        "an empty lockfile list records every lockfile"
+    );
+    Ok(())
+}

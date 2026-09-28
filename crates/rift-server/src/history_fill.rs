@@ -7,8 +7,9 @@
 //! changed against the commit it is compared with, pairs the pure renames by
 //! blob id, parses both sides of every other changed path the workspace's
 //! language policy gives a provider, and classifies each declaration the way a
-//! symbol timeline does. Nothing here schedules, sleeps, or writes: the
-//! history task decides when a plan runs and when a batch commits.
+//! symbol timeline does. A lockfile the search index leaves out writes no row.
+//! Nothing here schedules, sleeps, or writes: the history task decides when a
+//! plan runs and when a batch commits.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -412,7 +413,7 @@ impl HistoryAnalysis {
                 parsed_bytes: 0,
             }));
         }
-        let includes = |path: &str| self.visible.includes(path);
+        let includes = |path: &str| self.records(path);
         let changed = repository
             .changed_blobs(
                 pending.base.as_ref(),
@@ -462,6 +463,13 @@ impl HistoryAnalysis {
             record,
             parsed_bytes,
         }))
+    }
+
+    /// Whether the store records a changed `path`: a visible path the search index
+    /// would read, so a lockfile `[search.text].excluded_lockfiles` names writes no row,
+    /// as it stores none in the search index.
+    fn records(&self, path: &str) -> bool {
+        self.visible.includes(path) && !self.language.excludes_lockfile(Path::new(path))
     }
 
     /// Classifies every declaration one changed path holds differently on its

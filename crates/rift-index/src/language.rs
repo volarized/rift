@@ -276,7 +276,8 @@ impl WorkspaceLanguagePolicy {
     /// the workspace and the dependency context reads it again, but no syntax provider
     /// parses it and it stores no row. [`Self::classifies`] still answers for it, so
     /// `paths.force_include` reaches it for one request.
-    pub(crate) fn excludes_lockfile(&self, path: &Path) -> bool {
+    #[must_use]
+    pub fn excludes_lockfile(&self, path: &Path) -> bool {
         path.file_name()
             .and_then(std::ffi::OsStr::to_str)
             .is_some_and(|name| self.excluded_lockfiles.contains(name))
