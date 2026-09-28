@@ -321,10 +321,12 @@ impl HistoryTask {
         };
         let analysis = Arc::clone(&self.analysis);
         let planned = blocking(move || {
-            let plan = filler
-                .held()
-                .map_err(|error| error.to_string())
-                .and_then(|held| analysis.plan(&held).map_err(|error| error.to_string()));
+            let plan = rift_core::traced!(component = "history", operation = "history.plan", {
+                filler
+                    .held()
+                    .map_err(|error| error.to_string())
+                    .and_then(|held| analysis.plan(&held).map_err(|error| error.to_string()))
+            });
             (filler, plan)
         })
         .await;
@@ -369,27 +371,31 @@ impl HistoryTask {
                 return Some(filler);
             }
             let settled = self.activity.settled(self.bounds.idle_wait);
-            tokio::select! {
-                () = cancellation.cancelled() => return Some(filler),
-                _ = settled => {}
-            }
-            let (batch, rest) = self
-                .next_batch(carried.take(), &mut pending, cancellation)
+            let stopped =
+                rift_core::traced_async!(component = "history", operation = "history.idle_wait", {
+                    tokio::select! {
+                        () = cancellation.cancelled() => true,
+                        _ = settled => false,
+                    }
+                })
                 .await;
-            carried = rest;
-            if batch.is_empty() {
-                break;
-            }
-            let records: Vec<_> = batch.into_iter().map(AnalyzedCommit::into_record).collect();
-            let (returned, written) = blocking(move || {
-                let written = filler.write_batch(&records);
-                (filler, written)
-            })
-            .await?;
-            filler = returned;
-            if let Err(error) = written {
-                fill_failed(&error.to_string());
+            if stopped {
                 return Some(filler);
+            }
+            let first = carried.take();
+            let remaining = &mut pending;
+            let batch =
+                rift_core::traced_async!(component = "history", operation = "history.batch", {
+                    self.fill_batch(filler, first, remaining, cancellation)
+                        .await
+                })
+                .await?;
+            filler = batch.filler;
+            carried = batch.carried;
+            match batch.outcome {
+                BatchOutcome::Written => {}
+                BatchOutcome::Drained => break,
+                BatchOutcome::Failed => return Some(filler),
             }
         }
         let keep: BTreeSet<String> = plan.keep().clone();
@@ -402,6 +408,51 @@ impl HistoryTask {
             fill_failed(&error.to_string());
         }
         Some(filler)
+    }
+
+    /// Analyzes and writes one batch, starting at the commit `carried` over from the last
+    /// one. Answers the filler back with the commit that overflowed the batch, or `None`
+    /// when a blocking step panicked with the filler.
+    async fn fill_batch(
+        &self,
+        filler: StoreFiller,
+        carried: Option<AnalyzedCommit>,
+        pending: &mut std::slice::Iter<'_, PendingCommit>,
+        cancellation: &CancellationToken,
+    ) -> Option<FilledBatch> {
+        let (batch, carried) = self.next_batch(carried, pending, cancellation).await;
+        if batch.is_empty() {
+            return Some(FilledBatch {
+                filler,
+                carried,
+                outcome: BatchOutcome::Drained,
+            });
+        }
+        let records: Vec<_> = batch.into_iter().map(AnalyzedCommit::into_record).collect();
+        let parent = tracing::Span::current();
+        let (filler, written) = blocking(move || {
+            let mut filler = filler;
+            let written = rift_core::traced!(
+                parent: &parent,
+                component = "history",
+                operation = "history.write",
+                { filler.write_batch(&records) }
+            );
+            (filler, written)
+        })
+        .await?;
+        let outcome = match written {
+            Ok(()) => BatchOutcome::Written,
+            Err(error) => {
+                fill_failed(&error.to_string());
+                BatchOutcome::Failed
+            }
+        };
+        Some(FilledBatch {
+            filler,
+            carried,
+            outcome,
+        })
     }
 
     /// Analyzes pending commits into one batch: the commit `carried` over
@@ -448,11 +499,17 @@ impl HistoryTask {
         let pending = pending.clone();
         let stop = cancellation.clone();
         let gate = self.gate.clone();
+        let parent = tracing::Span::current();
         let analyzed = blocking(move || {
             if let Some(gate) = gate {
                 gate();
             }
-            analysis.analyze(&pending, &|| stop.is_cancelled())
+            rift_core::traced!(
+                parent: &parent,
+                component = "history",
+                operation = "history.analyze",
+                { analysis.analyze(&pending, &|| stop.is_cancelled()) }
+            )
         })
         .await?;
         match analyzed {
@@ -501,6 +558,24 @@ impl HistoryTask {
             );
         }
     }
+}
+
+/// One written batch: the filler back, the commit that overflowed the batch bounds, and
+/// what the batch did.
+struct FilledBatch {
+    filler: StoreFiller,
+    carried: Option<AnalyzedCommit>,
+    outcome: BatchOutcome,
+}
+
+/// What one batch did.
+enum BatchOutcome {
+    /// The batch committed its commits.
+    Written,
+    /// No pending commit was left to analyze, so nothing was written.
+    Drained,
+    /// The store refused the batch, which was logged.
+    Failed,
 }
 
 /// Logs one failed fill step.

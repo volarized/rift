@@ -185,8 +185,10 @@ impl<'current> ComparedRevisions<'current> {
             );
         };
         let head = repository.resolve(&head.0).map_err(ReadFault::history)?;
-        let changed = repository
-            .changed_files(&base, &head, &compared, paths_max)
+        let changed =
+            rift_core::traced!(component = "search", operation = "search.change_paths", {
+                repository.changed_files(&base, &head, &compared, paths_max)
+            })
             .map_err(ReadFault::history)?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let holds = |path: &str| selected.contains(path);
@@ -202,8 +204,14 @@ impl<'current> ComparedRevisions<'current> {
             )
             .map_err(ReadFault::index)
         };
-        let base_index = index_side(&base)?;
-        let head_index = index_side(&head)?;
+        let base_index =
+            rift_core::traced!(component = "search", operation = "search.change_base", {
+                index_side(&base)
+            })?;
+        let head_index =
+            rift_core::traced!(component = "search", operation = "search.change_head", {
+                index_side(&head)
+            })?;
         Ok(Self {
             base: base_index,
             head: HeadIndex::Revision(Box::new(head_index)),
@@ -246,32 +254,38 @@ impl<'current> ComparedRevisions<'current> {
         let listed =
             |path: &str| (served.contains(path) || !root.join(path).exists()) && compared(path);
         let paths_max = usize::try_from(SEARCH_CHANGE_PATHS_MAX).unwrap_or(usize::MAX);
-        let changed = repository
-            .changed_working_files(base, &served_paths, &listed, paths_max)
+        let changed =
+            rift_core::traced!(component = "search", operation = "search.change_paths", {
+                repository.changed_working_files(base, &served_paths, &listed, paths_max)
+            })
             .map_err(ReadFault::history)?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let mut forms = repository.working_forms().map_err(ReadFault::history)?;
         let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
-        let base_index = WorkspaceIndex::at_revision_with_blob_reader(
-            repository,
-            base,
-            limits,
-            visibility,
-            (text_inclusion, languages),
-            &|path| selected.contains(path),
-            &mut |file, bytes_max| match forms.form(file, bytes_max)? {
-                WorkingForm::Converted(bytes) => Ok(Some(bytes)),
-                WorkingForm::Filtered { driver } => {
-                    unconverted.insert(file.path().to_owned(), Unconverted::Driver(driver));
-                    Ok(None)
-                }
-                WorkingForm::Encoded { encoding } => {
-                    unconverted.insert(file.path().to_owned(), Unconverted::Encoding(encoding));
-                    Ok(None)
-                }
-            },
-        )
-        .map_err(ReadFault::index)?;
+        let base_index =
+            rift_core::traced!(component = "search", operation = "search.change_base", {
+                WorkspaceIndex::at_revision_with_blob_reader(
+                    repository,
+                    base,
+                    limits,
+                    visibility,
+                    (text_inclusion, languages),
+                    &|path| selected.contains(path),
+                    &mut |file, bytes_max| match forms.form(file, bytes_max)? {
+                        WorkingForm::Converted(bytes) => Ok(Some(bytes)),
+                        WorkingForm::Filtered { driver } => {
+                            unconverted.insert(file.path().to_owned(), Unconverted::Driver(driver));
+                            Ok(None)
+                        }
+                        WorkingForm::Encoded { encoding } => {
+                            unconverted
+                                .insert(file.path().to_owned(), Unconverted::Encoding(encoding));
+                            Ok(None)
+                        }
+                    },
+                )
+            })
+            .map_err(ReadFault::index)?;
         let kept: Vec<String> = changed
             .paths()
             .iter()
