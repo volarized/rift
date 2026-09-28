@@ -67,7 +67,7 @@ rayon = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }
 regex = "1.12.3"
 rig-core = { version = "=0.42.0", default-features = false }
-rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.4.1", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
