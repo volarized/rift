@@ -499,3 +499,36 @@ fn a_commit_past_the_deleted_file_bound_pairs_no_move() -> TestResult {
     }));
     Ok(())
 }
+
+#[test]
+fn the_deleted_file_bound_counts_the_deletions_pure_renames_leave() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    init(root);
+    write(
+        root,
+        "src/from.rs",
+        "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n",
+    )?;
+    write(root, "src/renamed.rs", "pub fn renamed() {}\n")?;
+    commit_all(root, "introduce");
+    fs::remove_file(root.join("src/from.rs"))?;
+    git(root, &["mv", "src/renamed.rs", "src/moved.rs"]);
+    write(
+        root,
+        "src/to.rs",
+        "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n",
+    )?;
+    commit_all(root, "move both");
+
+    let bounded = analysis(root, &everything(10))?.with_move_deletions_max(1);
+    let record = head_record(&bounded)?;
+
+    assert_eq!(record.renames.len(), 1, "the pure rename pairs by blob id");
+    assert_eq!(
+        record.moves.len(),
+        1,
+        "two files were deleted, and the one the pure rename leaves is within a bound of one"
+    );
+    Ok(())
+}

@@ -1242,4 +1242,60 @@ mod tests {
         assert!(timeline.complete);
         Ok(())
     }
+
+    #[test]
+    fn a_moved_head_owes_only_its_new_commits_and_a_rewrite_trims_the_orphans() -> TestResult {
+        let (directory, _service) = shared_path_fixture()?;
+        let root = directory.path();
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(root, folder.path(), &history)?;
+        let analysis = crate::HistoryAnalysis::open(
+            root,
+            &history,
+            (
+                &SourceVisibility::default(),
+                &rift_core::TextFileInclusion::default(),
+                &rift_core::LanguageFileSelections::default(),
+            ),
+            SyntaxLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut filler = store.filler()?.ok_or("no other filler runs")?;
+        let orphan = Repository::open(root)
+            .map_err(|error| error.to_string())?
+            .resolve("HEAD")
+            .map_err(|error| error.to_string())?
+            .commit_id();
+
+        fs::write(root.join("lib.rs"), "pub fn beacon_one() {}\n")?;
+        rift_history::fixture::commit_all(root, "shrink beacon_one");
+        let moved = analysis
+            .plan(&filler.held()?)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(moved.pending().len(), 1, "only the new commit is owed");
+
+        rift_history::fixture::git(root, &["reset", "-q", "--hard", "HEAD~2"]);
+        fs::write(
+            root.join("lib.rs"),
+            "pub fn beacon_one() { let _rewritten = 1; }\n",
+        )?;
+        rift_history::fixture::commit_all(root, "rewrite");
+        let rewritten = analysis
+            .plan(&filler.held()?)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            filler.trim(rewritten.keep())?,
+            1,
+            "the rewritten-away commit leaves"
+        );
+        let held = filler.held()?;
+        assert!(!held.contains_key(&orphan));
+        assert_eq!(
+            held.len(),
+            1,
+            "the root commit every window still reaches stays"
+        );
+        Ok(())
+    }
 }
