@@ -75,11 +75,13 @@
             "type": "object"
           },
           "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
               "main"
             ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
           "SearchScope": {
@@ -1905,6 +1907,40 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The history store the server fills in the background has not analyzed every commit\n`[providers.history]` selects, so a commit search answers from the `analyzed` ones\nalone and a commit the store has not reached answers nothing. The fill runs newest\nfirst and continues without a request; a later search answers the rest.",
+                "properties": {
+                  "analyzed": {
+                    "description": "Commits the history store holds of the ones its latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "history_store_filling",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "total": {
+                    "description": "Commits the history store's latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "analyzed",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
@@ -2291,11 +2327,13 @@
             ]
           },
           "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
               "main"
             ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
           "Signature": {
@@ -3147,11 +3185,13 @@
             "type": "string"
           },
           "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
               "main"
             ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           }
         },
@@ -4445,6 +4485,40 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The history store the server fills in the background has not analyzed every commit\n`[providers.history]` selects, so a commit search answers from the `analyzed` ones\nalone and a commit the store has not reached answers nothing. The fill runs newest\nfirst and continues without a request; a later search answers the rest.",
+                "properties": {
+                  "analyzed": {
+                    "description": "Commits the history store holds of the ones its latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "history_store_filling",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "total": {
+                    "description": "Commits the history store's latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "analyzed",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
@@ -5332,11 +5406,13 @@
             ]
           },
           "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
               "main"
             ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
           "SearchChange": {
@@ -7371,6 +7447,40 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The history store the server fills in the background has not analyzed every commit\n`[providers.history]` selects, so a commit search answers from the `analyzed` ones\nalone and a commit the store has not reached answers nothing. The fill runs newest\nfirst and continues without a request; a later search answers the rest.",
+                "properties": {
+                  "analyzed": {
+                    "description": "Commits the history store holds of the ones its latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "history_store_filling",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "total": {
+                    "description": "Commits the history store's latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "analyzed",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
                 "properties": {
                   "code": {
@@ -7835,11 +7945,13 @@
             ]
           },
           "RevisionId": {
-            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
               "main"
             ],
-            "pattern": "^[A-Za-z0-9._/-]{1,128}$",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
           "SearchHit": {
