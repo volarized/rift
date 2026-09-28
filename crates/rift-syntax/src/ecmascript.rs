@@ -9,8 +9,21 @@
 //! Decisions this module fixes for the family:
 //! - Qualified names join with `.`, the member access spelling
 //!   (`Router.route`), the way `rust` joins with `::`.
-//! - An `export` statement wrapping a declaration adds the `Public` facet.
-//!   `export` is not a visibility spelling: the `visibility` field carries
+//! - The `Public` facet marks a declaration the module exports. An `export`
+//!   statement wrapping a declaration adds it, and so does an export naming a
+//!   module-scope declaration: `a` and `b` in `export { a, b as c }`, `a` in
+//!   `export default a`, and the declarations a `module.exports = a`,
+//!   `module.exports = { a, b: c }`, `module.exports.name = a`, or
+//!   `exports.name = a` assignment names. The declaration keeps its own
+//!   name. A method written in an object literal the module exports whole
+//!   (`export default { .. }`, `module.exports = { .. }`) is exported too.
+//! - Exports are read from the module's top-level statements: an assignment
+//!   nested in a block or a function marks nothing. A re-export
+//!   (`export { x } from './y'`, `export * from './y'`) names another
+//!   module's declarations, so it marks none here. A function or class
+//!   expression assigned to an export (`exports.run = function () {}`)
+//!   declares nothing, so nothing carries the facet for it.
+//! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
 //!   `protected`), and stays `None` everywhere else.
 //! - A `variable_declarator` under a `lexical_declaration` or
@@ -32,6 +45,7 @@
 //!   declaration from `body_range` and the `Callable` facet, and a bodyless
 //!   one, an overload or a member signature, renders its own text.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU16;
 
 use rift_core::Error;
@@ -86,6 +100,28 @@ const PROPERTY_SIGNATURE_KIND: &str = "property_signature";
 const INTERFACE_BODY_KIND: &str = "interface_body";
 /// Grammar spelling of a `class_body`.
 const CLASS_BODY_KIND: &str = "class_body";
+/// Grammar spelling of the root `program`, whose statements sit at module
+/// scope.
+const PROGRAM_KIND: &str = "program";
+/// Grammar spelling of an `export_clause`, the braces of `export { a, b as c }`.
+const EXPORT_CLAUSE_KIND: &str = "export_clause";
+/// Grammar spelling of an `expression_statement`.
+const EXPRESSION_STATEMENT_KIND: &str = "expression_statement";
+/// Grammar spelling of an `assignment_expression`.
+const ASSIGNMENT_EXPRESSION_KIND: &str = "assignment_expression";
+/// Grammar spelling of a `member_expression`, such as `module.exports`.
+const MEMBER_EXPRESSION_KIND: &str = "member_expression";
+/// Grammar spelling of an `object` literal.
+const OBJECT_KIND: &str = "object";
+/// Grammar spelling of a `shorthand_property_identifier`, `a` in `{ a }`.
+const SHORTHAND_PROPERTY_IDENTIFIER_KIND: &str = "shorthand_property_identifier";
+/// Grammar spelling of a `pair`, `b: c` in `{ b: c }`.
+const PAIR_KIND: &str = "pair";
+/// The variable naming the running module, `module` in `module.exports`.
+const MODULE_VARIABLE: &str = "module";
+/// The property of `module`, and the variable, holding a module's exports:
+/// `module.exports`, `exports.name`.
+const EXPORTS_NAME: &str = "exports";
 
 /// ECMAScript declaration kind emitted by the JavaScript and TypeScript
 /// providers.
@@ -167,8 +203,31 @@ enum EcmaScriptGrammarField {
     Name,
     /// `body` field on block-bodied declaration nodes.
     Body,
-    /// `value` field on `variable_declarator` and `type_alias_declaration`.
+    /// `value` field on `variable_declarator`, `type_alias_declaration`,
+    /// `pair`, and a default `export_statement`.
     Value,
+    /// `source` field on an `export_statement` that re-exports another module.
+    Source,
+    /// `left` field on an `assignment_expression`.
+    Left,
+    /// `right` field on an `assignment_expression`.
+    Right,
+    /// `object` field on a `member_expression`, `module` in `module.exports`.
+    Object,
+    /// `property` field on a `member_expression`, `exports` in `module.exports`.
+    Property,
+}
+
+/// What an assignment's left side exports, ordered so an assignment chain
+/// keeps the widest target it passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExportTarget {
+    /// `module.exports.name` or `exports.name`: one export, taken from a
+    /// declaration the value names.
+    Property,
+    /// `module.exports`: the module's whole export, a declaration name or an
+    /// object literal.
+    Module,
 }
 
 /// Numeric grammar ids for every kind and field this module reads, resolved
@@ -192,9 +251,22 @@ pub(crate) struct EcmaScriptKinds {
     /// The bodies a member signature declares in: `interface_body` and
     /// `class_body`. Empty on the JavaScript grammar.
     member_bodies: Vec<u16>,
+    program: u16,
+    export_clause: u16,
+    expression_statement: u16,
+    assignment_expression: u16,
+    member_expression: u16,
+    object_literal: u16,
+    shorthand_property_identifier: u16,
+    pair: u16,
     name: NonZeroU16,
     body: NonZeroU16,
     value: NonZeroU16,
+    source: NonZeroU16,
+    left: NonZeroU16,
+    right: NonZeroU16,
+    object: NonZeroU16,
+    property: NonZeroU16,
 }
 
 impl EcmaScriptKinds {
@@ -236,9 +308,22 @@ impl EcmaScriptKinds {
             accessibility_modifier: None,
             member_signatures: Vec::new(),
             member_bodies: Vec::new(),
+            program: kind_id(language, PROGRAM_KIND),
+            export_clause: kind_id(language, EXPORT_CLAUSE_KIND),
+            expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
+            assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
+            member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
+            object_literal: kind_id(language, OBJECT_KIND),
+            shorthand_property_identifier: kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
+            pair: kind_id(language, PAIR_KIND),
             name: field_id(language, "name"),
             body: field_id(language, "body"),
             value: field_id(language, "value"),
+            source: field_id(language, "source"),
+            left: field_id(language, "left"),
+            right: field_id(language, "right"),
+            object: field_id(language, "object"),
+            property: field_id(language, "property"),
         }
     }
 
@@ -312,7 +397,189 @@ impl EcmaScriptKinds {
             EcmaScriptGrammarField::Name => self.name,
             EcmaScriptGrammarField::Body => self.body,
             EcmaScriptGrammarField::Value => self.value,
+            EcmaScriptGrammarField::Source => self.source,
+            EcmaScriptGrammarField::Left => self.left,
+            EcmaScriptGrammarField::Right => self.right,
+            EcmaScriptGrammarField::Object => self.object,
+            EcmaScriptGrammarField::Property => self.property,
         }
+    }
+
+    /// `node`'s child in `field`; `None` when the node omits it.
+    fn child<'tree>(
+        &self,
+        node: Node<'tree>,
+        field: EcmaScriptGrammarField,
+    ) -> Option<Node<'tree>> {
+        node.child_by_field_id(self.field(field).get())
+    }
+
+    /// Whether `node` is a `let`, `const`, or `var` statement holding
+    /// declarators.
+    fn is_declaration_statement(&self, node: Node<'_>) -> bool {
+        node.kind_id() == self.lexical_declaration || node.kind_id() == self.variable_declaration
+    }
+
+    /// Whether `node` is the plain identifier `spelling`.
+    fn is_identifier(&self, node: Node<'_>, text: &str, spelling: &str) -> bool {
+        node.kind_id() == self.identifier && text.get(node.byte_range()) == Some(spelling)
+    }
+
+    /// The nodes one top-level statement exports without wrapping a
+    /// declaration: an identifier naming a local declaration, or an object
+    /// literal the module exports whole.
+    fn statement_exports<'tree>(&self, statement: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
+        if statement.kind_id() == self.export_statement {
+            return self.export_statement_exports(statement);
+        }
+        self.assignment_export(statement, text)
+            .into_iter()
+            .collect()
+    }
+
+    /// The local names an `export` statement's clause names (`a` in
+    /// `export { a as b }`) and its default value (`a` in `export default a`).
+    /// A re-export (`export { x } from './y'`, `export * from './y'`) carries
+    /// a `source` and names another module's declarations, so it yields none.
+    fn export_statement_exports<'tree>(&self, statement: Node<'tree>) -> Vec<Node<'tree>> {
+        if self
+            .child(statement, EcmaScriptGrammarField::Source)
+            .is_some()
+        {
+            return Vec::new();
+        }
+        let clauses =
+            named_children(statement).filter(|child| child.kind_id() == self.export_clause);
+        let specifiers = clauses.flat_map(named_children);
+        specifiers
+            .filter_map(|specifier| self.child(specifier, EcmaScriptGrammarField::Name))
+            .chain(self.child(statement, EcmaScriptGrammarField::Value))
+            .collect()
+    }
+
+    /// The value an assignment statement exports: `module.exports = value`,
+    /// `module.exports.name = value`, or `exports.name = value`, following a
+    /// chain such as `exports = module.exports = value` to its value. A
+    /// property export yields a declaration name alone; `None` for any other
+    /// statement.
+    ///
+    /// The chain walk descends one child per step, so it ends within the
+    /// tree's depth.
+    fn assignment_export<'tree>(&self, statement: Node<'tree>, text: &str) -> Option<Node<'tree>> {
+        if statement.kind_id() != self.expression_statement {
+            return None;
+        }
+        let mut value = statement.named_child(0)?;
+        let mut target = None;
+        while value.kind_id() == self.assignment_expression {
+            let left = self.child(value, EcmaScriptGrammarField::Left)?;
+            target = target.max(self.export_target(left, text));
+            value = self.child(value, EcmaScriptGrammarField::Right)?;
+        }
+        match target? {
+            ExportTarget::Module => Some(value),
+            ExportTarget::Property => (value.kind_id() == self.identifier).then_some(value),
+        }
+    }
+
+    /// The export an assignment's left side addresses; `None` for any other
+    /// target.
+    fn export_target(&self, left: Node<'_>, text: &str) -> Option<ExportTarget> {
+        if self.is_module_exports(left, text) {
+            return Some(ExportTarget::Module);
+        }
+        let object = self.member_object(left)?;
+        let exports_variable = self.is_identifier(object, text, EXPORTS_NAME);
+        let module_exports = self.is_module_exports(object, text);
+        (exports_variable || module_exports).then_some(ExportTarget::Property)
+    }
+
+    /// Whether `node` spells `module.exports`.
+    fn is_module_exports(&self, node: Node<'_>, text: &str) -> bool {
+        let Some(object) = self.member_object(node) else {
+            return false;
+        };
+        let module_variable = self.is_identifier(object, text, MODULE_VARIABLE);
+        let exports_property = self
+            .child(node, EcmaScriptGrammarField::Property)
+            .and_then(|property| text.get(property.byte_range()))
+            == Some(EXPORTS_NAME);
+        module_variable && exports_property
+    }
+
+    /// The `object` of a `member_expression`; `None` for any other node.
+    fn member_object<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        if node.kind_id() != self.member_expression {
+            return None;
+        }
+        self.child(node, EcmaScriptGrammarField::Object)
+    }
+
+    /// The identifier one property of an exported object literal names: `a`
+    /// in `{ a }` and `c` in `{ b: c }`; `None` for a method, a spread, or a
+    /// value that is no identifier.
+    fn property_export<'tree>(&self, property: Node<'tree>) -> Option<Node<'tree>> {
+        if property.kind_id() == self.shorthand_property_identifier {
+            return Some(property);
+        }
+        if property.kind_id() != self.pair {
+            return None;
+        }
+        self.child(property, EcmaScriptGrammarField::Value)
+            .filter(|value| value.kind_id() == self.identifier)
+    }
+}
+
+/// Every named child of `node`, in order.
+fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    node.named_child_indices()
+        .filter_map(move |index| node.named_child(index))
+}
+
+/// What a module exports without an `export` wrapping the declaration, read
+/// from its top-level statements before the walk.
+///
+/// The read visits the program's statements, their export clauses and
+/// assignment chains, and the properties of an object literal exported
+/// whole, each node once, so its work is linear in the source
+/// `source_bytes_max` admits. An assignment nested in a block or a function
+/// is not read.
+#[derive(Debug, Default)]
+struct ModuleExports<'text> {
+    /// Names an export gives to module-scope declarations.
+    names: BTreeSet<&'text str>,
+    /// Ids of the object literals the module exports whole; a method written
+    /// in one is exported.
+    objects: BTreeSet<usize>,
+}
+
+impl<'text> ModuleExports<'text> {
+    /// Reads what `program`'s top-level statements export by name or as a
+    /// whole object literal.
+    fn read(program: Node<'_>, text: &'text str, kinds: &EcmaScriptKinds) -> Self {
+        let mut exports = Self::default();
+        for statement in named_children(program) {
+            for exported in kinds.statement_exports(statement, text) {
+                exports.add(exported, text, kinds);
+            }
+        }
+        exports
+    }
+
+    /// Records one exported node: an identifier's name, or an object literal
+    /// with the names its properties give.
+    fn add(&mut self, exported: Node<'_>, text: &'text str, kinds: &EcmaScriptKinds) {
+        if exported.kind_id() == kinds.identifier {
+            self.names.extend(text.get(exported.byte_range()));
+            return;
+        }
+        if exported.kind_id() != kinds.object_literal {
+            return;
+        }
+        self.objects.insert(exported.id());
+        let named = named_children(exported).filter_map(|property| kinds.property_export(property));
+        self.names
+            .extend(named.filter_map(|name| text.get(name.byte_range())));
     }
 }
 
@@ -337,13 +604,15 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
     })
 }
 
-/// One pinned grammar's decisions for the shared bounded walk.
+/// One pinned grammar's decisions for the shared bounded walk over one
+/// source.
 #[derive(Debug)]
-pub(crate) struct EcmaScriptRules {
+pub(crate) struct EcmaScriptRules<'text> {
     kinds: &'static EcmaScriptKinds,
+    exports: ModuleExports<'text>,
 }
 
-impl EcmaScriptRules {
+impl EcmaScriptRules<'_> {
     /// The declared name's text: the grammar `name` field. A `variable`
     /// requires a plain identifier name; a destructuring pattern declares no
     /// single name.
@@ -360,22 +629,45 @@ impl EcmaScriptRules {
         text.get(name.byte_range()).map(Into::into)
     }
 
+    /// Whether the module exports the declaration `node` names `name`: an
+    /// `export_statement` wraps it, an export names it at module scope, or it
+    /// is a method of an object literal the module exports whole.
+    fn exported(&self, node: Node<'_>, name: &str) -> bool {
+        let wrapped = self.wrapped_by_export(node);
+        let named = self.exports.names.contains(name) && self.at_module_scope(node);
+        let in_exported_object = node
+            .parent()
+            .is_some_and(|parent| self.exports.objects.contains(&parent.id()));
+        wrapped || named || in_exported_object
+    }
+
     /// Whether an `export_statement` wraps the declaration: its direct
     /// parent, or - for a declarator - the parent of its declaration
     /// statement.
-    fn exported(&self, node: Node<'_>) -> bool {
+    fn wrapped_by_export(&self, node: Node<'_>) -> bool {
         let Some(parent) = node.parent() else {
             return false;
         };
         if parent.kind_id() == self.kinds.export_statement {
             return true;
         }
-        let declaration_statement = parent.kind_id() == self.kinds.lexical_declaration
-            || parent.kind_id() == self.kinds.variable_declaration;
-        declaration_statement
+        self.kinds.is_declaration_statement(parent)
             && parent
                 .parent()
                 .is_some_and(|wrapper| wrapper.kind_id() == self.kinds.export_statement)
+    }
+
+    /// Whether `node` declares at module scope: its statement - the node
+    /// itself, or a declarator's declaration statement - sits directly in the
+    /// program.
+    fn at_module_scope(&self, node: Node<'_>) -> bool {
+        let statement = node
+            .parent()
+            .filter(|parent| self.kinds.is_declaration_statement(*parent))
+            .unwrap_or(node);
+        statement
+            .parent()
+            .is_some_and(|parent| parent.kind_id() == self.kinds.program)
     }
 
     /// The authored `accessibility_modifier` text on `node`; `None` when the
@@ -403,7 +695,7 @@ impl EcmaScriptRules {
     }
 }
 
-impl GrammarRules for EcmaScriptRules {
+impl GrammarRules for EcmaScriptRules<'_> {
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
         node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
             .map(extract::byte_range)
@@ -421,7 +713,7 @@ impl GrammarRules for EcmaScriptRules {
             return Ok(None);
         };
         let mut facets = kind.facets();
-        if self.exported(node) {
+        if self.exported(node, &name) {
             facets.push(SymbolFacet::Public);
         }
         Ok(Some(Declaration {
@@ -506,7 +798,10 @@ pub(crate) fn analyze(
             path: Some(source.path.clone()),
         })
     })?;
-    let rules = EcmaScriptRules { kinds };
+    let rules = EcmaScriptRules {
+        kinds,
+        exports: ModuleExports::read(tree.root_node(), source.text, kinds),
+    };
     let (nodes, symbols) = extract::extract(tree.root_node(), source, limits, language, &rules)?;
     Ok(SyntaxDocument::new(
         language.clone(),

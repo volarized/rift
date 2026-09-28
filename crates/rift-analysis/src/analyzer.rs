@@ -1538,10 +1538,9 @@ impl PackageLanguage {
 enum ExportRule {
     /// A package language's own rule.
     Language(PackageLanguage),
-    /// A JavaScript module exports what an ES `export` wraps: a declaration the provider
-    /// marks `Public`, and a member of a class so marked other than an ES private
-    /// element. A `module.exports` or `exports.name` assignment wraps no declaration, so
-    /// it marks none.
+    /// A JavaScript module exports a declaration the provider marks `Public`, one an
+    /// `export` wraps or an export names (`export { a }`, `module.exports = { a }`), and a
+    /// member of a class so marked other than an ES private element.
     JavaScriptModule,
 }
 
@@ -1563,8 +1562,8 @@ impl ExportRule {
     }
 }
 
-/// Whether a JavaScript module exports `symbol`: an ES `export` wraps it, or it is a
-/// member of a class an `export` wraps and no ES private element.
+/// Whether a JavaScript module exports `symbol`: the provider marks it `Public`, or it is a
+/// member of a class so marked and no ES private element.
 fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
     let exported = is_exported(symbol);
     let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
@@ -1578,7 +1577,7 @@ fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxS
     exported || (member_of_exported_class && !private_element)
 }
 
-/// Whether the provider marks `symbol` public, as an ES `export` does.
+/// Whether the provider marks `symbol` public, as an export of it does.
 fn is_exported(symbol: &SyntaxSymbol) -> bool {
     symbol.facets.contains(&SymbolFacet::Public)
 }
@@ -1932,12 +1931,11 @@ mod tests {
             .collect()
     }
 
-    /// An unpaired JavaScript module exports what an ES `export` wraps, a default export
-    /// included, and the members of an exported class other than a `#` private element. A
-    /// helper nothing wraps stays private, and so does one an `export { name }` clause
-    /// names, since the provider marks the declaration and not the clause.
+    /// An unpaired JavaScript module exports what an ES `export` wraps or names, a default
+    /// export included, and the members of an exported class other than a `#` private
+    /// element. A helper no export wraps or names stays private.
     #[test]
-    fn test_an_unpaired_javascript_module_exports_what_export_wraps() {
+    fn test_an_unpaired_javascript_module_exports_what_export_wraps_or_names() {
         let source = "export function open() {}\n\
                       function helper() {}\n\
                       export class Client {\n  connect() {}\n  static make() {}\n  #hidden() {}\n}\n\
@@ -1945,7 +1943,8 @@ mod tests {
                       export const answer = 42, other = 1;\n\
                       export default function main() {}\n\
                       function later() {}\n\
-                      export { later };\n";
+                      class Session {\n  close() {}\n  #token() {}\n}\n\
+                      export { later, Session as Connection };\n";
         let mut public = public_names(ShippedLanguage::JavaScript, "index.js", source);
         public.sort();
         assert_eq!(
@@ -1954,7 +1953,10 @@ mod tests {
                 "Client",
                 "Client.connect",
                 "Client.make",
+                "Session",
+                "Session.close",
                 "answer",
+                "later",
                 "main",
                 "open",
                 "other"
@@ -1975,27 +1977,37 @@ mod tests {
         }
     }
 
-    /// The JavaScript provider declares nothing for an `exports.name = function`
-    /// assignment, and marks no declaration `Public` for `module.exports = { .. }`, so a
-    /// module exporting through them keeps its declarations and exports none of them.
+    /// A module exporting through `module.exports` and `exports.name` assignments exports
+    /// the declarations they name, the members of an exported class other than a `#`
+    /// private element, and a method written in the exported object. The provider declares
+    /// nothing for an `exports.name = function` assignment, so it adds no record.
     #[test]
-    fn test_a_commonjs_module_exports_no_declaration() {
+    fn test_a_module_exports_assignment_exports_the_declarations_it_names() {
         let source = "function helper() {}\n\
-                      class Runner {\n  run() {}\n}\n\
+                      class Runner {\n  run() {}\n  #secret() {}\n}\n\
+                      function internal() {}\n\
+                      function load() {}\n\
                       module.exports = { helper, Runner, start() {} };\n\
+                      exports.read = load;\n\
                       exports.extra = function extra() {};\n";
         let publication = analyzed(ShippedLanguage::JavaScript, vec![("index.cjs", source)]);
-        let mut declared: Vec<&str> = publication
+        let mut declared: Vec<(&str, bool)> = publication
             .symbols
             .iter()
-            .map(|symbol| symbol.qualified_name.as_str())
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.public))
             .collect();
         declared.sort_unstable();
-        assert_eq!(declared, ["Runner", "Runner.run", "helper", "start"]);
-        assert!(
-            publication.symbols.iter().all(|symbol| !symbol.public),
-            "{:?}",
-            publication.symbols
+        assert_eq!(
+            declared,
+            [
+                ("Runner", true),
+                ("Runner.#secret", false),
+                ("Runner.run", true),
+                ("helper", true),
+                ("internal", false),
+                ("load", true),
+                ("start", true),
+            ]
         );
     }
 

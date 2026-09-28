@@ -309,6 +309,34 @@ mod tests {
         );
     }
 
+    /// The TypeScript grammars share the export rules: a type-only clause
+    /// and a plain clause mark the interface, alias, and enum they name.
+    #[test]
+    fn test_an_export_clause_marks_typescript_declarations() {
+        let text = "interface Route { path: string }\ntype Alias = Route;\nenum Mode { Fast }\ninterface Hidden {}\nexport type { Route };\nexport { Alias, Mode };\n";
+        let document = analyze(text);
+        let facts = document
+            .symbols()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.facets.contains(&SymbolFacet::Public),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            [
+                ("Route", true),
+                ("Route.path", false),
+                ("Alias", true),
+                ("Mode", true),
+                ("Hidden", false),
+            ]
+        );
+    }
+
     /// Body ranges span the interface, enum, namespace, and class bodies,
     /// the type alias value, and stay absent on bodyless signatures and
     /// ambient declarations.
