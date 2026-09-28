@@ -22,7 +22,7 @@ mod source;
 #[cfg(feature = "collector")]
 pub use analyzer::{
     AnalyzedFile, PackageAnalysis, PackageAnalysisError, PackageAnalysisFault,
-    PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, public_qualified_names,
+    PackageAnalysisViolation, PackageAnalyzer, PackageLanguage, StubForm, public_qualified_names,
 };
 pub use chunk::{TextChunk, text_chunks};
 #[cfg(feature = "collector")]

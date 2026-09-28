@@ -54,6 +54,15 @@ use sha2::{Digest as _, Sha256};
 
 use rift_ranking::split_identifier_words;
 
+#[cfg(test)]
+mod fixture;
+mod join;
+#[cfg(test)]
+mod join_tests;
+
+use join::ModuleRole;
+pub use join::StubForm;
+
 /// Package analysis failure classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,13 +176,14 @@ impl Fault for PackageAnalysisFault {
 /// Opaque package analysis failure.
 pub type PackageAnalysisError = Error<PackageAnalysisFault>;
 
-/// One package file as the analyzer holds it: the parsed document, where it is filed, and
-/// the public declarations it carries.
+/// One package file as the analyzer holds it: the parsed document, where it is filed, the
+/// public declarations it carries, and what the stub and module join decided for it.
 #[derive(Debug)]
 pub struct AnalyzedFile {
     file: IndexedFile,
     placement: DocumentPlacement,
     public_names: BTreeSet<String>,
+    role: ModuleRole,
 }
 
 impl AnalyzedFile {
@@ -193,6 +203,14 @@ impl AnalyzedFile {
     #[must_use]
     pub fn is_public(&self, qualified_name: &str) -> bool {
         self.public_names.contains(qualified_name)
+    }
+
+    /// The stub declarations the declaration spelled by `qualified_name` answers for, in the
+    /// stub's source order: each one's identity, stub path, and range. Empty unless this
+    /// file is an implementation whose declaration joined its stub.
+    #[must_use]
+    pub fn stub_forms(&self, qualified_name: &str) -> &[StubForm] {
+        self.role.stub_forms(qualified_name)
     }
 }
 
@@ -252,8 +270,11 @@ impl PackageAnalyzer {
     /// Each file is placed under `rift://source/<manager>/<name>@<version>/<path>` with
     /// the identity path `<manager>/<name>@<version>/<path>`, and its origin is the
     /// input origin: a dependency carrying the package identity, or the standard library.
-    /// Records are emitted in unit, symbol, and document identity order, and a
-    /// collection that reaches its bound stops there and reports the stop as a warning.
+    /// A stub and the module it declares (`mod.pyi` and `mod.py`, `index.d.ts` and
+    /// `index.js`) join: each name both declare answers once, at the module, with the
+    /// stub's signatures and types. Records are emitted in unit, symbol, and document
+    /// identity order, and a collection that reaches its bound stops there and reports the
+    /// stop as a warning.
     ///
     /// The work is proportional to the selected bytes: one parse per file, one scan per
     /// file for its line starts, one assembly pass over the parsed declarations, and one
@@ -278,9 +299,11 @@ impl PackageAnalyzer {
                 file: parsed,
                 placement,
                 public_names,
+                role: ModuleRole::Unpaired,
             });
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
+        join::join_modules(&mut analyzed);
         let placed: Vec<PlacedDocument<'_>> = analyzed
             .iter()
             .map(|held| PlacedDocument {
@@ -1057,6 +1080,9 @@ impl Records {
             path,
             line_starts,
         } = *context;
+        if held.role.answers_elsewhere(&declaration.qualified_name) {
+            return Ok(());
+        }
         if self.symbols.len() >= bound(PACKAGE_SYMBOLS_MAX) {
             if !self.symbols_truncated {
                 self.symbols_truncated = true;
@@ -1077,7 +1103,7 @@ impl Records {
             held.placement.identity_path(),
             &declaration.qualified_name,
         ));
-        let presentation = semantics
+        let mut presentation = semantics
             .assembled(&symbol.0)
             .and_then(|assembled| {
                 assembled
@@ -1089,6 +1115,11 @@ impl Records {
                     .at(held.file.path())
                     .into_error()
             })?;
+        let signature = if join::lay_join(&mut presentation, semantics, &held.role, declaration) {
+            presentation.signatures.first().cloned()
+        } else {
+            declaration.signatures.first().cloned()
+        };
         let mut record = PackageSymbol {
             symbol,
             presentation,
@@ -1106,7 +1137,7 @@ impl Records {
                 end: declaration.range.end,
             },
             line: line_of(line_starts, declaration.range.start),
-            signature: declaration.signatures.first().cloned(),
+            signature,
             documentation: declaration.documentation.first().cloned(),
             source: retained.text,
             source_complete: retained.complete,
@@ -1420,7 +1451,8 @@ fn placement_of(
 /// The languages package analysis reads an API from, and each one's rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageLanguage {
-    /// Rust declarations use `pub`; items of a public trait also count.
+    /// Rust declarations use `pub`; items of a public trait and variants of a public enum
+    /// also count.
     Rust,
     /// Python names without a leading underscore count.
     Python,
@@ -1428,6 +1460,10 @@ pub enum PackageLanguage {
     /// ships its JavaScript builds beside its declaration files.
     TypeScript,
 }
+
+/// Rust container kinds whose private members a `pub` container exports: a trait's
+/// items and an enum's variants carry no visibility of their own.
+const PUBLIC_MEMBER_CONTAINERS: [&str; 2] = ["trait", "enum"];
 
 impl PackageLanguage {
     /// Rules for one language, when a shipped definition serves it.
@@ -1471,7 +1507,8 @@ impl PackageLanguage {
                     .as_deref()
                     .and_then(|container| by_name.get(container))
                     .is_some_and(|container| {
-                        container.kind == "trait" && container.visibility.as_deref() == Some("pub")
+                        PUBLIC_MEMBER_CONTAINERS.contains(&container.kind)
+                            && container.visibility.as_deref() == Some("pub")
                     }),
                 _ => false,
             },
@@ -1524,18 +1561,15 @@ mod tests {
         PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
         PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
     };
-    use rift_protocol::read::{Language, PackageIdentity};
     use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
-    use super::{PackageAnalysis, PackageAnalyzer, bound};
+    use super::fixture::{analyzed, identity, language, package_analysis, package_result};
+    use super::{PackageAnalyzer, bound};
     use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
 
-    fn identity() -> PackageIdentity {
-        PackageIdentity {
-            manager: "cargo".to_owned(),
-            name: "beacon".to_owned(),
-            version: "1.0.0".to_owned(),
-        }
+    /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
+    fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
+        package_analysis(shipped, files)
     }
 
     #[test]
@@ -1654,68 +1688,6 @@ mod tests {
         let documentation = &publication.documentation;
         assert_eq!(documentation.sources[0].media_type, "text/plain");
         assert_eq!(documentation.blocks.len(), 1);
-    }
-
-    fn language(shipped: ShippedLanguage) -> Language {
-        shipped.language()
-    }
-
-    fn package_analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> PackageAnalysis {
-        package_result(shipped, files, None).expect("the package analyzes")
-    }
-
-    /// One package of `files` in `shipped`, analyzed under `syntax` bounds when set.
-    fn package_result(
-        shipped: ShippedLanguage,
-        files: Vec<(&str, &str)>,
-        syntax: Option<rift_syntax::SyntaxLimits>,
-    ) -> Result<PackageAnalysis, super::PackageAnalysisError> {
-        let package = identity();
-        let language = language(shipped);
-        let origin = ContributionOrigin::new(
-            Some(SourceLocation::Dependency {
-                package: package.clone(),
-            }),
-            SourceKind::Authored,
-        )
-        .expect("origin");
-        let files: Vec<(ProjectPath, &str)> = files
-            .into_iter()
-            .map(|(path, text)| (ProjectPath::new(path).expect("path"), text))
-            .collect();
-        let sources: Vec<PackageSource<'_>> = files
-            .iter()
-            .map(|(path, text)| PackageSource::new(path, text))
-            .collect();
-        let files_max = u32::try_from(files.len()).expect("test file count");
-        let bytes_max = files
-            .iter()
-            .map(|(_, text)| u64::try_from(text.len()).expect("test byte count"))
-            .sum();
-        let input = ExactPackageInput::new(
-            &package,
-            &language,
-            &origin,
-            &sources,
-            syntax.map_or(ExactPackageLimits::new(files_max, bytes_max), |limits| {
-                ExactPackageLimits::new(files_max, bytes_max).with_syntax(limits)
-            }),
-        )
-        .expect("bounded package input");
-        PackageAnalyzer::analyze(input, 1)
-    }
-
-    /// One package of `files` in `shipped`, analyzed.
-    fn analyzed(
-        shipped: ShippedLanguage,
-        files: Vec<(&str, &str)>,
-    ) -> rift_protocol::index::PackagePublication {
-        package_analysis(shipped, files).publication().clone()
-    }
-
-    /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
-    fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
-        package_analysis(shipped, files)
     }
 
     /// The `identity` of every document of one kind, in publication order.
