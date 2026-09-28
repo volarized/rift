@@ -1431,7 +1431,8 @@ mod tests {
         let request = serde_json::json!({"name": "load_config", "limit": 2, "page_index": 1});
         let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
 
-        let page = super::local_symbol_page(&params, local);
+        let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
+        let page = super::local_symbol_page(&params, limit, local);
 
         let names: Vec<&str> = page
             .hits
@@ -1460,7 +1461,8 @@ mod tests {
 
         let request = serde_json::json!({"query": "load_config", "limit": 1, "page_index": 1});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
-        let page = super::local_search_page(&params, local(example.results.clone()));
+        let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
+        let page = super::local_search_page(&params, limit, local(example.results.clone()));
         let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
         assert_eq!(paged, paths[1..]);
         assert_eq!(page.pagination.total_pages, 2);
@@ -1468,10 +1470,20 @@ mod tests {
 
         let request = serde_json::json!({"query": "load_config"});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
-        let page = super::local_search_page(&params, local(example.results.clone()));
+        let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
+        let page = super::local_search_page(&params, limit, local(example.results.clone()));
         let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
         assert_eq!(paged, paths);
         assert_eq!(page.pagination.total_pages, 1);
+    }
+
+    /// A read that sends `context` as it stands, requesting no packages.
+    fn read_context(context: &Arc<DependencyContext>) -> super::ReadContext<'_> {
+        super::ReadContext {
+            context: Arc::clone(context),
+            snapshot: context,
+            requested: &[],
+        }
     }
 
     /// A context with nothing to resolve sends nothing: the route answers the service as
@@ -1482,7 +1494,7 @@ mod tests {
         let configuration = rift_protocol::configuration::GlobalConfiguration::default();
         let context = Arc::new(DependencyContext::default());
 
-        let route = state.route(&configuration, &context).await;
+        let route = state.route(&configuration, &read_context(&context)).await;
 
         assert_eq!(route.state, RouteState::Available);
         assert!(route.client.is_none());
@@ -1501,7 +1513,7 @@ mod tests {
         };
         let context = context_with_path_dependencies(0);
 
-        let route = state.route(&configuration, &context).await;
+        let route = state.route(&configuration, &read_context(&context)).await;
 
         let route_state = route.state;
         assert!(
