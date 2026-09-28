@@ -463,11 +463,22 @@ a workspace declaring more than the index holds: the files that fit are served a
 are reported. The [`[source]`](/docs/developer/configuration#source)
 exclusion remains the way to keep such files out of the walk altogether.
 
+<VersionBadge version="v0.0.46" />
+
+Under the default [`[search.text]`](/docs/developer/configuration#search)
+`large_files = "split"`, a file past [`[providers.syntax]`](/docs/developer/configuration#providers)
+`max_file` stays in the index as text the syntax provider does not parse: search reads it in
+chunks, its declarations are absent, and every answer names it in a `large_file_unparsed`
+warning. Under `skip` the per-file byte bound is `max_file`, so such a file is left out as above,
+and a file past `max_chunk` keeps no text in search, which a search whose `paths` reach it counts
+in a `large_file_skipped` warning.
+
 ### Search
 
 [`search`](/docs/mcp#tool-search) is for reads where the exact name isn't known.
-It ranks declaration names, signatures, documentation, declaration source, and file content
-from the index.
+It ranks declaration names, signatures, documentation, and file content from the index, and it
+answers a regex [`pattern`](/docs/developer/protocol/mcp#search-pattern) from the same stored
+text.
 
 #### The document shape
 
@@ -483,14 +494,25 @@ a content digest, and the searchable fields below:
 | `identifier_terms` | The names split on case, acronym, and separator boundaries | 4 |
 | `signature` | The rendered signature, when a provider published one | 2 |
 | `documentation` | The attached doc comment, when a provider published one | 1.5 |
-| `declaration_source` | The declaration's own source text | 1 |
-| `file_content` | A visible text file's content | 1 |
+| `file_content` | An indexed file's text, parsed source and plain text alike | 1 |
 
-A fact no provider published stays absent. Nothing substitutes declaration source into the
+A fact no provider published stays absent. Nothing substitutes a declaration's own text into the
 signature or documentation field, because the two are weighed apart and filling one with the
 other would count the same bytes twice. The weights are what make a name hit outrank a hit
 buried in a comment, and the answer reports which field placed each hit, so a documentation
 match and a name match are distinguishable rather than both reported as "the ranking found it".
+
+<VersionBadge version="v0.0.46" />
+
+The index holds each file's text once, in the file's own documents, and a declaration's
+document carries the derived fields alone. Keeping one copy is what lets the regex search below
+read every match from one set of rows: a copy split between declarations and the rest of the
+file would put a match that crosses a declaration's edge in neither.
+
+A word only a function's body holds therefore ranks the function's file. The read path then
+finds the query's terms in the first file documents of the ranked list, maps each position to
+the smallest declaration containing it, and answers those declarations in place of the first file
+document, scored together by BM25 over the terms each one holds.
 
 The project path, the source unit, the package identity, the language, and the kind stay
 metadata. None of them enters the ranked text: indexing one tree below two different host
@@ -584,6 +606,28 @@ Fusion holds no project path and resolves no symbol. It answers ordered identiti
 read path resolves them afterwards, which is what lets package hits from the global index rank
 through the same code. A hit's `score` is derived from its place in the final order: it is
 comparable inside one answer and nowhere else.
+
+#### Regex patterns
+
+<VersionBadge
+  version="v0.0.46"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+A regex [`pattern`](/docs/developer/protocol/mcp#search-pattern) answers from a trigram index
+over the same stored file text, so the text still lives in one place. A trigram index records
+which rows hold each run of three characters.
+
+The pattern's query plan derives the trigrams any match must contain - `load_config\(` requires
+`loa`, `oad`, and every other run of three characters in `load_config(` - and the index answers
+the rows holding them. The pattern's matcher then verifies those rows over the text the
+published index holds, line by line as ripgrep reads it.
+
+The plan never rules out a row that could hold a match: a class too large to expand, a
+repetition that can match nothing, and a literal shorter than three characters each require
+nothing. A pattern that requires nothing, such as `[0-9a-f]{40}`, verifies every file its
+`paths` select. Each match maps to its smallest containing declaration through the same lookup
+body matches use, which is how a symbol hit names the declaration holding a match.
 
 #### Vector ranking
 

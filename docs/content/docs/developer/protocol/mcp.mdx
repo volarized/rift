@@ -117,10 +117,10 @@ or `stdlib/python`. Its version comes from the workspace's pins, or from a versi
 
 <McpTool name="search" />
 
-`search` takes a lexical `query`, narrowed or extended by a `paths` selector. `paths.include` and
-`paths.exclude` glob the project-relative path - the same glob engine backs the workspace's
-[`[source]`](/docs/developer/configuration#source) policy - narrowing the indexed candidates before
-scoring.
+`search` takes a lexical `query` or a regex [`pattern`](#search-pattern), narrowed or extended by
+a `paths` selector. `paths.include` and `paths.exclude` glob the project-relative path - the same
+glob engine backs the workspace's [`[source]`](/docs/developer/configuration#source) policy -
+narrowing the indexed candidates before scoring.
 
 `paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
 index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
@@ -153,8 +153,8 @@ This request narrows the search to the tests tree, then reaches one file the wor
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-`query` matches declaration names, qualified names, signatures, attached documentation,
-declaration sources, and file contents through a full-text index, and the identifiers it
+`query` matches declaration names, qualified names, signatures, and attached documentation,
+and the contents of every indexed file, through a full-text index, and the identifiers it
 carries against the indexed names. A multi-word query is answered first by the documents
 carrying every term; only when that leaves the answer short do documents carrying some of
 them join, behind every exact one. Double quotes keep a phrase together in both passes.
@@ -171,16 +171,15 @@ inside the bound.
 The read has its own bound of 1,000, applied to the candidates it ranks and again to the hits
 it orders and pages: a read that reached it warns `results_truncated`.
 
-A symbol whose only match sits in its documentation and its source, not in its name, still
-returns as a `symbol` hit. `matched_by` names every field that carried a term, so this one
-is tagged `["documentation", "content"]`: the attached doc comment carried both words, and
-the declaration's own source carries that comment. A hit tagged `["ranked"]` is one the
-vector ranking placed, where no indexed field carries the query's literal bytes at all.
+A symbol whose only match sits in its documentation, not in its name, still returns as a
+`symbol` hit. `matched_by` names every field that carried a term, so this one is tagged
+`["documentation"]`. A hit tagged `["ranked"]` is one the vector ranking placed, where no
+indexed field carries the query's literal bytes at all.
 
 **Request:**
 
 ```json
-{ "query": "literal minted" }
+{ "query": "loads workspace configuration", "target": "symbol" }
 ```
 
 **Search hit:**
@@ -190,20 +189,43 @@ vector ranking placed, where no indexed field carries the query's literal bytes 
   "hit": {
     "target": "symbol",
     "symbol": {
-      "id": "rift://symbol/rust/crates/rift-core/src/identity.rs/encode_path",
+      "id": "rift://symbol/rust/src/config.rs/load_config",
       "language": "rust",
-      "name": "encode_path",
+      "name": "load_config",
       "kind": "function",
       "facets": ["value", "callable", "public"],
-      "visibility": "pub"
+      "visibility": "pub",
+      "signatures": [
+        {
+          "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+          "language": "rust"
+        }
+      ],
+      "documentation": [
+        {
+          "format": "markdown",
+          "text": "Loads the workspace configuration from `rift.toml`."
+        }
+      ]
     }
   },
-  "matched_by": ["documentation", "content"],
-  "range": { "start": 1496, "end": 1925 },
-  "line": 43,
-  "path": "crates/rift-core/src/identity.rs"
+  "matched_by": ["documentation"],
+  "range": { "start": 162, "end": 355 },
+  "line": 10,
+  "path": "src/config.rs"
 }
 ```
+
+<VersionBadge version="v0.0.46" />
+
+The index holds a file's text once, in the file's own rows, and a declaration's row carries its
+names, signature, and documentation alone. A term only a declaration's body holds therefore
+ranks the file.
+
+The server reads the first 20 file rows of the ranked list, finds the declarations holding the
+query's terms in them, and answers those declarations in place of the first of those rows, best
+first. Each is tagged `matched_by: ["content"]`, and a declaration its own row placed ahead of
+that file row keeps its place and its tags.
 
 <VersionBadge version="v0.0.25" />
 
@@ -244,6 +266,94 @@ the hit's symbol or file, `path`, `range`, and `line` alone, as both hits above 
 A hit's `score` follows the same rule: absent unless `include` names it. `include: ["score"]`
 attaches the fused ranking value that ordered the page, comparable only within this one
 answer.
+
+### Pattern [#search-pattern]
+
+<VersionBadge
+  version="v0.0.46"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
+
+`pattern` answers every match of a regular expression in the text of the indexed files, in place
+of `query`. The syntax is the Rust [`regex`](https://docs.rs/regex) crate's, the dialect ripgrep
+reads, so a pattern written for `rg` or Claude Code's `Grep` carries over unchanged. Matching
+runs line by line, as ripgrep's does:
+
+- `^` and `$` match at line boundaries
+- a `\r` before a line feed belongs to its line
+- no class matches a line feed, so only a literal `\n` crosses a line
+- `(?i)` makes the match case-insensitive; the request carries no case field
+
+The server selects the files to read through a trigram index over the stored text, then verifies
+each one with the pattern, so the answer equals a scan of every indexed file. A pattern whose
+literals hold no run of three characters, such as `[0-9a-f]{40}`, verifies every file `paths`
+selects.
+
+With `target: "file"`, every match is one hit: `range` holds the match's bytes, `line` its line,
+and `source`, when `include` names it, the matched line. With `target: "symbol"`, every
+declaration holding a match is one hit at its first match, and `range` holds the declaration's
+bytes; `all` answers both. Each hit is tagged `matched_by: ["content"]` and carries no score, so
+`relevance` orders the hits by path, then offset, while `path` and `identity` order as they do in
+every other search answer.
+
+**Request:**
+
+```json
+{
+  "pattern": "tokio::\\w+",
+  "paths": { "include": ["src/**"] },
+  "target": "file",
+  "include": ["source"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "hit": { "target": "file", "size": 344, "languages": ["rust"] },
+      "matched_by": ["content"],
+      "source": "#[tokio::main]",
+      "range": { "start": 98, "end": 109 },
+      "line": 9,
+      "path": "src/main.rs"
+    },
+    {
+      "hit": { "target": "file", "size": 344, "languages": ["rust"] },
+      "matched_by": ["content"],
+      "source": "    let config = tokio::task::spawn_blocking(|| {",
+      "range": { "start": 173, "end": 184 },
+      "line": 11,
+      "path": "src/main.rs"
+    }
+  ],
+  "pagination": { "page_index": 0, "total_pages": 1 }
+}
+```
+
+A `pattern` search is bounded at every step it takes. The pattern holds at most 1,024
+characters, the schema's `maxLength`, and the
+[`[search]`](/docs/developer/configuration#search) keys bound the rest:
+
+- `pattern_compiled_size` - the bytes the pattern's matcher compiles to
+- `pattern_candidate_rows` - the trigram index rows one search reads to select its files
+- `pattern_verified_size` - the file text one search verifies
+- `pattern_matches_per_file` - the matches one file contributes
+
+A search past the length or one of the first three keys refuses `invalid_request` naming the
+field `pattern` and the key, as in
+`` more than 10000 candidate rows, the [search] pattern_candidate_rows bound; narrow `pattern` or `paths` ``.
+
+A file past `pattern_matches_per_file` is cut there, and the answer carries a
+`pattern_matches_truncated` warning naming it, while every other file answers in full.
+`results_truncated` still reports the result bound alone.
+
+The server refuses `pattern` beside `query`, `traversal`, `change`, or `rev`, and with a `scope`
+past `local`, with `invalid_request`: the trigram index holds the current project tree alone, and
+the other fields select another result set, tree, or index. `target: "documentation"` refuses
+`capability_unavailable`, since a documentation block carries no file text.
 
 ### Traversal [#search-traversal]
 
@@ -739,6 +849,23 @@ a file past its per-file bound, or a syntax tree the provider refused - so it an
 lookup while every other file stays available. An answer carries at most eight of them, in
 project-path order; when more files were left out, one more `source_unavailable` carries no `unit`
 and counts the rest, and `rift://logs` names each.
+
+<VersionBadge version="v0.0.46" />
+
+Text search answers can carry these warnings:
+
+- `pattern_matches_truncated` - a file held more matches of `pattern` than the `[search]` key
+  `pattern_matches_per_file`, so its later matches are missing while every other file answers in
+  full. `files` names the cut files, at most eight, in project-path order.
+- `large_file_skipped` - under `[search.text] large_files = "skip"`, files past `max_chunk` are
+  left out of the text index; `skipped` counts the ones the request's `paths` reach. A
+  declaration such a file holds still answers.
+- `large_file_unparsed` - files past `[providers.syntax] max_file` are held as text the syntax
+  provider does not parse: their text answers `search`, and none of their declarations answers a
+  symbol hit or `get_symbol`. `files` names them, at most eight, in project-path order.
+- `lockfile_excluded` - a lockfile the request's `paths.include` selects is left out of search
+  under the `[search.text]` key `excluded_lockfiles`. `rift://map` still carries the versions it
+  pins, and naming the file in `paths.force_include` searches it for one request.
 
 A package-scope answer whose read never reached the global API, or met no answer from it,
 carries no package facts and one of these warnings naming why:

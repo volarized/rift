@@ -213,10 +213,12 @@ server log; the next write compares its whole publication with the recorded dige
 
 The database tables:
 
-- `lexical_documents` - one row per indexed document: a code symbol, or a text file split into
-  chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk bound. The row
-  carries an integer `id`, the document's identity, path, kind, and content digest beside the
-  searchable fields.
+- `lexical_documents` - one row per indexed document: a declaration, carrying its names,
+  signature, and documentation, or an indexed file's text, the one copy of it the store keeps,
+  split into chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk
+  bound. The row carries an integer `id`, the document's identity, path, kind, and content digest
+  beside the searchable fields, and a chunk row its `byte_offset` in the file, so a position in
+  the chunk maps back to the file without chunking it again.
 - `lexical_files` - one row per file the published index holds, the files it left out
   included, carrying the SHA-256 of the bytes that file's rows were derived from. A change
   writes a path's rows and its digest in one transaction.
@@ -241,8 +243,21 @@ The database tables:
   than in a name. The tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what
   lets Rift split the same text the same way outside SQLite without carrying a folding table
   of its own.
+- `lexical_documents_vocabulary` - an [`fts5vocab`](https://www.sqlite.org/fts5.html) table over
+  the word index's columns. Its per-column document counts are the document frequencies body
+  matches score by.
+- `lexical_documents_trigram` - a second external-content FTS5 index over `file_content` alone,
+  tokenized `trigram` with `detail=none`: it records which rows hold each run of three
+  characters, case-folded, and no positions, which is all a regex prefilter reads. Declaration
+  rows carry no text and stay out of it, and `columnsize=0` keeps FTS5's `integrity-check` from
+  counting them as missing. The statements that keep `lexical_documents_fts` in step keep this
+  index too, inside the same transaction.
 - `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
+
+The store's migrations reach this layout from any earlier one. The migration that took each
+declaration's text out of its row drops that column and rebuilds both indexes, so the first start
+after an upgrade rewrites the whole store.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
 `lexical_documents` carries an index on `path`: the index finds a path's rows and their index
@@ -407,6 +422,15 @@ APIs never leave the syntax crate.
 The registry itself assembles from one shipped definition list in `rift-syntax`: each entry
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
+
+<VersionBadge version="v0.0.46" languages={["JavaScript", "TypeScript"]} />
+
+The JavaScript and TypeScript providers publish a declaration's attached JSDoc as its
+`documentation`. The walk starts at the statement carrying the declaration - an `export`, or the
+`const`, `let`, or `var` statement it is the first declarator of - and the declaration's `range`
+starts there too, so the JSDoc sits inside the range `get_symbol` answers. Several blocks join
+with a line break, `@` tags stay as written, and the `/**`, `*/`, and leading `*` markers are
+stripped; a `//` or `/* */` comment or a blank line ends the walk.
 
 ## Dependency context
 

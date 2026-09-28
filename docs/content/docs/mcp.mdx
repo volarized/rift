@@ -83,7 +83,8 @@ to read it in more detail.
 
 Full-text search matches words in declaration names, signatures, documentation, source code,
 and included text files. Rift also recognizes identifier words, so `loadConfig` can find
-`load_config`.
+`load_config`. A word that only appears in a function's body still finds that function: Rift
+looks it up in the file's text and answers the declaration holding it.
 
 Double quotes keep a phrase together. For example, the agent can look for this wording in
 indexed content:
@@ -124,6 +125,26 @@ The [read reference](/docs/developer/protocol/mcp#reads) describes these warning
 
 </Accordion>
 </Accordions>
+
+### Regex search [#search-pattern]
+
+Sometimes the agent needs every place a piece of code occurs, not the best matches for a phrase:
+every `TODO`, every call written as `spawn_blocking(`, every path into a crate. It then sends a
+regular expression as `pattern` instead of `query`. The syntax is the one ripgrep reads, so a pattern the
+agent would write for `Grep` or `rg` works unchanged:
+
+```json
+{ "pattern": "tokio::\\w+", "paths": { "include": ["src/**"] }, "target": "file" }
+```
+
+Every match comes back as a file hit with its byte range and line; `target: "symbol"` answers
+each declaration holding a match instead. Matching runs line by line, and a `(?i)` prefix makes it
+case-insensitive. Rift reads only the files a trigram index says can match, then checks them
+with the pattern, so the answer holds every match the files carry.
+
+`pattern` doesn't combine with `query`, `traversal`, `change`, or `rev`, and it searches project
+code alone. The [pattern reference](/docs/developer/protocol/mcp#search-pattern) describes the
+bounds a search runs under and the warning a file with too many matches carries.
 
 ### More search options
 
@@ -334,6 +355,9 @@ it which page was served and how many pages are available.
 Warnings explain when an answer is incomplete or a capability could not contribute.
 For example, `stale_index` reports an index behind the captured project state or a rebuild failure;
 `results_truncated` means a narrower query or path selection can bring results within the bound.
+Large files and lockfiles carry their own: `large_file_unparsed` names a file too large to parse,
+whose text still answers, `large_file_skipped` counts files left out of text search, and
+`lockfile_excluded` names a lockfile the path selection reached but search leaves out.
 The [read reference](/docs/developer/protocol/mcp#reads) describes each warning.
 
 <Accordions>
