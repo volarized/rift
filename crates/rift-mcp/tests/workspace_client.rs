@@ -34,6 +34,20 @@ pub(crate) async fn served_workspace(
     Ok((directory, client, server_task))
 }
 
+/// Builds one workspace of `files`, runs `prepare` over its directory, and serves it to
+/// one client: a suite installing the packages its engine runs from does it here, so the
+/// server's first capture already holds them.
+pub(crate) async fn served_prepared_workspace(
+    files: &[(&str, &str)],
+    lsp_configuration: Option<String>,
+    prepare: impl FnOnce(&Path),
+) -> TestResult<ServedWorkspace> {
+    let directory = laid_out_workspace(files, lsp_configuration)?;
+    prepare(directory.path());
+    let (client, server_task) = served_root(directory.path()).await?;
+    Ok((directory, client, server_task))
+}
+
 /// The same workspace, served under a root spelled relative to the process
 /// working directory.
 ///

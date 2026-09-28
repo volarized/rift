@@ -7,14 +7,17 @@
 //! A configured language engine resolves the references and calls the walk follows. Most
 //! fixtures select the embedded `ty` engine over a Python workspace: no external process,
 //! and the same lane a real read uses. Fake `sh` engines script the answers a real engine
-//! gives while it loads or after an edit, and one suite drives rust-analyzer itself under
-//! `RIFT_ENGINE_LIVE`.
+//! gives while it loads or after an edit, and two suites drive rust-analyzer and
+//! typescript-language-server themselves under `RIFT_ENGINE_LIVE`.
 
 #[cfg(unix)]
 mod fake_engine;
 mod hermetic_search;
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
+#[cfg(unix)]
+#[path = "../../rift-lsp/tests/typescript_install.rs"]
+mod typescript_install;
 // `served_relative_workspace` and its `relative_spelling` helper are part of
 // `workspace_client`'s shared surface; this binary serves its root the plain way.
 #[allow(dead_code)]
@@ -686,6 +689,118 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         (outgoing, incoming),
         (1, 1),
         "both answer the edit on the first walk"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The rift-lsp live TypeScript fixture: `larger` in walk.ts calls `beacon` from hub.ts and
+/// `Math.max` from TypeScript's own lib, and `total` and the TSX `Banner` call `beacon` too.
+#[cfg(unix)]
+const LIVE_TYPESCRIPT_FILES: &[(&str, &str)] = &[
+    (
+        "tsconfig.json",
+        include_str!("../../rift-lsp/tests/fixtures/typescript/tsconfig.json"),
+    ),
+    (
+        "hub.ts",
+        include_str!("../../rift-lsp/tests/fixtures/typescript/hub.ts"),
+    ),
+    (
+        "caller.ts",
+        include_str!("../../rift-lsp/tests/fixtures/typescript/caller.ts"),
+    ),
+    (
+        "view.tsx",
+        include_str!("../../rift-lsp/tests/fixtures/typescript/view.tsx"),
+    ),
+    (
+        "walk.ts",
+        include_str!("../../rift-lsp/tests/fixtures/typescript/walk.ts"),
+    ),
+];
+
+/// The typescript-language-server the fixture's lockfile pins, run from the workspace's
+/// own `node_modules` for both dialects, with that folder left out of the index.
+#[cfg(unix)]
+fn live_typescript_engine() -> String {
+    format!(
+        "[source]\nexclude = [\"node_modules/**\"]\n\n\
+         [languages.typescript]\nlsp = \"typescript\"\n\n\
+         [languages.\"typescript:tsx\"]\nlsp = \"typescript\"\n\n\
+         [lsp.typescript]\ncommand = [\"{}\", \"--stdio\"]\n\n\
+         [lsp.typescript.initialization_options.tsserver]\nuseSyntaxServer = \"never\"\n",
+        typescript_install::LANGUAGE_SERVER_PROGRAM
+    )
+}
+
+/// typescript-language-server answers both walk directions through `search`, each on its
+/// first walk, since the walk waits out the project load. The outgoing walk from `larger`
+/// reaches `beacon` and counts `Math.max`, which TypeScript's own lib declares, as a
+/// dropped callee; the incoming walk to `beacon` reaches `larger`, `total`, and the TSX
+/// `Banner`.
+#[cfg(unix)]
+#[tokio::test]
+async fn live_typescript_language_server_walks_both_directions() -> TestResult {
+    if !live_engine_gate::engine_live() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let mut files = typescript_install::typescript_package_files().to_vec();
+    files.extend_from_slice(LIVE_TYPESCRIPT_FILES);
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        &files,
+        Some(live_typescript_engine()),
+        typescript_install::install_typescript_engine,
+    )
+    .await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    let (outgoing, answer) = live_walk(
+        &client,
+        "typescript outgoing",
+        "rift://symbol/typescript/walk.ts/larger",
+        "outgoing",
+        &["beacon"],
+    )
+    .await?;
+    eprintln!("live typescript: outgoing after {:?}", started.elapsed());
+    let hop = &results(&answer)[0]["traversal_path"][0];
+    assert_eq!(hop["direction"], json!("outgoing"), "{answer}");
+    assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{answer}");
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("the walk counts the callee it dropped")?;
+    assert_eq!(warnings.len(), 1, "{answer}");
+    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{answer}");
+    assert_eq!(
+        warnings[0]["callees"],
+        json!(1),
+        "`Math.max` sits in TypeScript's own lib: {answer}"
+    );
+    let (incoming, answer) = live_walk(
+        &client,
+        "typescript incoming",
+        "rift://symbol/typescript/hub.ts/beacon",
+        "incoming",
+        &["Banner", "larger", "total"],
+    )
+    .await?;
+    eprintln!("live typescript: incoming after {:?}", started.elapsed());
+    for hit in results(&answer) {
+        let hop = &hit["traversal_path"][0];
+        assert_eq!(hop["direction"], json!("incoming"), "{hit}");
+        assert_eq!(
+            hop["relationship"]["facets"],
+            json!(["references"]),
+            "{hit}"
+        );
+    }
+    assert!(answer["warnings"].is_null(), "{answer}");
+    assert_eq!(
+        (outgoing, incoming),
+        (1, 1),
+        "both walks answer on the first request"
     );
 
     client.cancel().await?;
