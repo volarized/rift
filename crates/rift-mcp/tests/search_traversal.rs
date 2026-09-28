@@ -330,6 +330,41 @@ async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> Te
     Ok(())
 }
 
+/// The relationship graph serves the project alone, and package facts come from the
+/// global index, so a `global` search leaves a walk nothing to run over and refuses naming
+/// `traversal`.
+#[tokio::test]
+async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({
+                "query": "beacon",
+                "scope": "global",
+                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+            }),
+        ))
+        .await
+        .expect_err("the server must refuse a global walk");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+
+    let wire = error.data.ok_or("a refusal carries its wire data")?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(
+        error.message.contains("traversal"),
+        "the refusal names the field: {}",
+        error.message
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
 /// The `code` the server refuses `arguments` with.
 async fn refusal_code(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,

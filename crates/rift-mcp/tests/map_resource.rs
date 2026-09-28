@@ -204,13 +204,21 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
     let body = resource_body(&client, "rift://map").await?;
     assert_eq!(
         body["packages"],
-        serde_json::json!([{
-            "manager": "cargo",
-            "name": "serde",
-            "version": "1.0.228",
-            "availability": "canonical"
-        }]),
-        "{body:#}"
+        serde_json::json!([
+            {
+                "manager": "cargo",
+                "name": "serde",
+                "version": "1.0.228",
+                "availability": "canonical"
+            },
+            {
+                "manager": "stdlib",
+                "name": "rust",
+                "requirement": ">=0",
+                "availability": "canonical"
+            }
+        ]),
+        "the Rust source names its standard library beside the lockfile's packages: {body:#}"
     );
 
     std::fs::write(
@@ -230,7 +238,7 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
         .iter()
         .filter_map(|package| package["name"].as_str())
         .collect();
-    assert_eq!(names, ["itoa", "serde"], "{body:#}");
+    assert_eq!(names, ["itoa", "serde", "rust"], "{body:#}");
 
     client.cancel().await?;
     server_task.abort();

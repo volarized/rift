@@ -57,10 +57,6 @@ name = "configuration_admission"
 path = "tests/configuration_admission.rs"
 
 [[test]]
-name = "dependency_index"
-path = "tests/dependency_index.rs"
-
-[[test]]
 name = "error_contract"
 path = "tests/error_contract.rs"
 

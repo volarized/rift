@@ -1,4 +1,5 @@
-//! The `[search.vector]` table every fixture outside the live suite declares.
+//! The `[search.vector]` and `[dependencies]` tables every fixture outside the live suite
+//! declares.
 //!
 //! Rift ships the vector ranking on: a workspace with no `rift.toml` acquires the
 //! default model from the hub, and `live_vector_search` is the suite that proves
@@ -8,9 +9,16 @@
 //! retry budget inside a detached task nobody waits on, so the suite would pay for
 //! an acquisition no test reads.
 //!
-//! `rift-mcp`'s own unit tests declare the same table again, in `server.rs`: an
+//! Rift also runs the standard library version probes by default, and a probe answers
+//! from the machine's own toolchain, so a fixture's package context would follow
+//! whatever `rustc` and `node` the runner installed. `resolution = "static"` reads the
+//! pins alone and runs no program.
+//!
+//! `rift-mcp`'s own unit tests declare the same tables again, in `server.rs`: an
 //! integration test and a unit test are two crates, and a value shared between
 //! them would have to leave the library's public surface to do it.
 
-/// The table that turns the vector ranking off for one fixture workspace.
-pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
+/// The tables that turn the vector ranking and the version probes off for one fixture
+/// workspace.
+pub(crate) const HERMETIC_TABLES: &str =
+    "[search.vector]\ndisabled = true\n\n[dependencies]\nresolution = \"static\"\n";

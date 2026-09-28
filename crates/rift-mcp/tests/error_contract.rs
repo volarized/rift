@@ -24,7 +24,7 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::VECTOR_DISABLED,
+        hermetic_search::HERMETIC_TABLES,
     )?;
     let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
@@ -130,7 +130,7 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::VECTOR_DISABLED,
+        hermetic_search::HERMETIC_TABLES,
     )?;
     let wire = failing_wire_error(
         directory.path(),
@@ -154,7 +154,7 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::VECTOR_DISABLED,
+        hermetic_search::HERMETIC_TABLES,
     )?;
     let wire = failing_wire_error(
         directory.path(),
@@ -180,7 +180,7 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
         directory.path().join("rift.toml"),
         format!(
             "{}[providers.history]\nenabled = false\n",
-            hermetic_search::VECTOR_DISABLED
+            hermetic_search::HERMETIC_TABLES
         ),
     )?;
     let wire = failing_wire_error(
@@ -206,7 +206,7 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
         directory.path().join("rift.toml"),
         format!(
             "{}[providers.history]\nenabled = false\n",
-            hermetic_search::VECTOR_DISABLED
+            hermetic_search::HERMETIC_TABLES
         ),
     )?;
     let wire = failing_wire_error(
@@ -233,7 +233,7 @@ async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
-        hermetic_search::VECTOR_DISABLED,
+        hermetic_search::HERMETIC_TABLES,
     )?;
     let wire =
         failing_wire_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;

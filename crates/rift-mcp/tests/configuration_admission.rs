@@ -59,7 +59,7 @@ failure_ttl = "1h"
 fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-    let mut contents = hermetic_search::VECTOR_DISABLED.to_owned();
+    let mut contents = hermetic_search::HERMETIC_TABLES.to_owned();
     if let Some(configuration) = configuration {
         contents.push_str(configuration);
     }
@@ -110,7 +110,7 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
     let client = client_for(directory.path()).await?;
 
     refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    let contents = format!("{}{VALID_CONFIGURATION}", hermetic_search::VECTOR_DISABLED);
+    let contents = format!("{}{VALID_CONFIGURATION}", hermetic_search::HERMETIC_TABLES);
     fs::write(directory.path().join("rift.toml"), contents)?;
 
     let recovered = client
@@ -143,7 +143,7 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
 
     let contents = format!(
         "{}{INVALID_CONFIGURATION}",
-        hermetic_search::VECTOR_DISABLED
+        hermetic_search::HERMETIC_TABLES
     );
     fs::write(directory.path().join("rift.toml"), contents)?;
     let refused = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
@@ -169,21 +169,34 @@ async fn retired_binding_table_fails_reads_typed() -> TestResult {
     Ok(())
 }
 
+/// The package bounds of the removed local package analysis are no keys of the
+/// `[dependencies]` table any more: a `rift.toml` that still sets one is refused like any
+/// unknown key, and reads fail typed until the operator removes it.
 #[tokio::test]
-async fn out_of_range_dependencies_package_files_fails_reads_naming_the_field() -> TestResult {
-    let directory = workspace_with(Some("[dependencies]\npackage_files = 0\n"))?;
-    let client = client_for(directory.path()).await?;
+async fn removed_dependencies_bound_keys_fail_reads_as_unknown_keys() -> TestResult {
+    for key in [
+        "package_size = \"8mb\"",
+        "index_size = \"1gb\"",
+        "package_files = 10",
+    ] {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        // The hermetic tables close with `[dependencies]`, so the key lands inside it.
+        let contents = format!("{}{key}\n", hermetic_search::HERMETIC_TABLES);
+        assert!(contents.contains(&format!("[dependencies]\nresolution = \"static\"\n{key}")));
+        fs::write(directory.path().join("rift.toml"), contents)?;
+        let client = client_for(directory.path()).await?;
 
-    let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
-    assert_eq!(read["code"], json!("configuration_invalid"));
-    assert_eq!(read["retry"], json!("operator_action"));
-    let message = read["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("dependencies.package_files") && message.contains("1..=100000"),
-        "the refusal must name the field and its range: {message}"
-    );
+        let read = refused_call(&client, "get_symbol", json!({"name": "beacon"})).await?;
+        assert_eq!(
+            read["code"],
+            json!("configuration_invalid"),
+            "{key}: {read:#}"
+        );
+        assert_eq!(read["retry"], json!("operator_action"), "{key}: {read:#}");
 
-    client.cancel().await?;
+        client.cancel().await?;
+    }
     Ok(())
 }
 

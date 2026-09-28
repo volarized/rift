@@ -69,7 +69,7 @@ fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> 
     };
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{}{configuration}", hermetic_search::VECTOR_DISABLED),
+        format!("{}{configuration}", hermetic_search::HERMETIC_TABLES),
     )?;
     Ok(directory)
 }

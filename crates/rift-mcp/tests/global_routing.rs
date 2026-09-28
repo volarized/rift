@@ -1,5 +1,8 @@
-//! Global package routing through served `get_symbol` reads.
+//! Global package routing through served `get_symbol` and `search` reads: the project hits
+//! come from the served snapshot, the package hits from a fixture global API, and every
+//! context entry no public registry serves answers with its typed warning.
 
+mod global_api;
 mod hermetic_search;
 #[allow(
     dead_code,
@@ -7,36 +10,25 @@ mod hermetic_search;
 )]
 mod workspace_client;
 
-use std::{collections::VecDeque, fs, sync::Arc, time::Duration};
+use std::{fs, time::Duration};
 
-use axum::{
-    Router,
-    body::{Body, to_bytes},
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use global_api::{COLLECTED_UNIT, GlobalFixture, SymbolFixture};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+use tokio::net::TcpListener;
 use workspace_client::{ServedWorkspace, TestResult, served_workspace, tool_request};
 
-const HELPER_SOURCE: &str = "pub fn helper_beacon() {}\n";
 const LOCK_WITH_HELPER: &str = "version = 4\n\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n]\n";
 
+/// A served workspace whose manifest depends on `helper` by a path outside it.
 struct DependentWorkspace {
+    /// Held for the life of the server: the directory the path dependency names.
     _helper: tempfile::TempDir,
     served: ServedWorkspace,
 }
 
 async fn served_dependent_workspace(configuration: Option<&str>) -> TestResult<DependentWorkspace> {
     let helper = tempfile::tempdir()?;
-    fs::create_dir_all(helper.path().join("src"))?;
-    fs::write(
-        helper.path().join("Cargo.toml"),
-        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )?;
-    fs::write(helper.path().join("src/lib.rs"), HELPER_SOURCE)?;
     let manifest = format!(
         "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nhelper = {{ path = '{}' }}\n",
         helper.path().display()
@@ -45,7 +37,10 @@ async fn served_dependent_workspace(configuration: Option<&str>) -> TestResult<D
         &[
             ("Cargo.toml", manifest.as_str()),
             ("Cargo.lock", LOCK_WITH_HELPER),
-            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+            (
+                "src/lib.rs",
+                "pub fn local_beacon() {}\npub fn beacon() {}\n",
+            ),
         ],
         configuration.map(str::to_owned),
     )
@@ -53,253 +48,6 @@ async fn served_dependent_workspace(configuration: Option<&str>) -> TestResult<D
     Ok(DependentWorkspace {
         _helper: helper,
         served,
-    })
-}
-
-struct GlobalFixture {
-    endpoint: String,
-    state: FixtureState,
-    task: JoinHandle<()>,
-}
-
-#[derive(Clone, Copy)]
-enum SymbolFixture {
-    Valid,
-    InvalidIdentity,
-}
-
-#[derive(Clone)]
-struct FixtureState {
-    symbol: SymbolFixture,
-    resolution_delay: Option<Duration>,
-    requests: Arc<Mutex<Vec<ObservedRequest>>>,
-    search_responses: Arc<Mutex<VecDeque<Value>>>,
-}
-
-#[derive(Clone, Debug)]
-struct ObservedRequest {
-    uri: String,
-    body: Option<Value>,
-}
-
-impl GlobalFixture {
-    async fn start(symbol_fixture: SymbolFixture) -> Result<Self, std::io::Error> {
-        Self::start_with_resolution_delay(symbol_fixture, None).await
-    }
-
-    async fn start_with_resolution_delay(
-        symbol_fixture: SymbolFixture,
-        resolution_delay: Option<Duration>,
-    ) -> Result<Self, std::io::Error> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let state = FixtureState {
-            symbol: symbol_fixture,
-            resolution_delay,
-            requests: Arc::new(Mutex::new(Vec::new())),
-            search_responses: Arc::new(Mutex::new(VecDeque::from([
-                search_page(true),
-                search_page(false),
-            ]))),
-        };
-        let app = Router::new()
-            .fallback(global_handler)
-            .with_state(state.clone());
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        Ok(Self {
-            endpoint: format!("http://{address}/rift/rest"),
-            state,
-            task,
-        })
-    }
-
-    async fn requests(&self) -> Vec<ObservedRequest> {
-        self.state.requests.lock().await.clone()
-    }
-}
-
-impl Drop for GlobalFixture {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn global_handler(
-    State(state): State<FixtureState>,
-    request: axum::http::Request<Body>,
-) -> Response {
-    let uri = request.uri().to_string();
-    let path = request.uri().path().to_owned();
-    let Ok(bytes) = to_bytes(request.into_body(), 4_194_304).await else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    };
-    let body = if bytes.is_empty() {
-        None
-    } else {
-        match serde_json::from_slice(&bytes) {
-            Ok(body) => Some(body),
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        }
-    };
-    state
-        .requests
-        .lock()
-        .await
-        .push(ObservedRequest { uri, body });
-    if path.ends_with("/capabilities") {
-        return json_response(&capabilities());
-    }
-    if path.ends_with("/resolutions") {
-        if let Some(delay) = state.resolution_delay {
-            tokio::time::sleep(delay).await;
-        }
-        return json_response(&resolution());
-    }
-    if path.ends_with("/search") {
-        let Some(page) = state.search_responses.lock().await.pop_front() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        return json_response(&page);
-    }
-    if path.ends_with("/symbols") {
-        return json_response(&symbols(state.symbol));
-    }
-    StatusCode::NOT_FOUND.into_response()
-}
-
-fn json_response(value: &Value) -> Response {
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        value.to_string(),
-    )
-        .into_response()
-}
-
-fn capabilities() -> Value {
-    json!({
-        "supported_package_managers": ["cargo"],
-        "supported_features": ["resolutions", "search", "symbols", "documentation_search", "symbol_documentation"],
-        "publication_format": "rift-package-index-v2",
-        "analyzer_revision": "analyzer-v1",
-        "corpus_revision": "corpus-v1",
-        "documentation_revision": "0123abcd",
-        "required_search_fields": [
-            "name", "qualified_name", "documentation", "signature", "declaration_source"
-        ],
-        "bounds": {
-            "request_body_bytes_max": 4_194_304,
-            "response_body_bytes_max": 33_554_432,
-            "dependency_entries_max": 20000,
-            "query_bytes_max": 4096,
-            "query_terms_max": 32,
-            "query_term_bytes_max": 256,
-            "identifiers_max": 16,
-            "identifier_bytes_max": 4096,
-            "packages_max": 20000,
-            "page_limit_min": 1,
-            "page_limit_max": 200,
-            "page_limit_default": 20,
-            "cursor_bytes_max": 4096,
-            "candidate_pool_max": 1000,
-            "warnings_max": 32,
-            "source_bytes_max": 1_048_576
-        }
-    })
-}
-
-fn resolution() -> Value {
-    json!({
-        "available_exact": [{"manager":"cargo","name":"demo","version":"1.0.0"}],
-        "resolved_requirements": [],
-        "missing_exact": [{"manager":"cargo","name":"absent","version":"1.0.0"}],
-        "missing_requirements": [{
-            "availability":"canonical",
-            "manager":"cargo",
-            "name":"wanted",
-            "requirement":"^1"
-        }]
-    })
-}
-
-fn symbols(fixture: SymbolFixture) -> Value {
-    let identity = match fixture {
-        SymbolFixture::Valid => "rift://symbol/rust/src/lib.rs/helper_beacon",
-        SymbolFixture::InvalidIdentity => "rift://symbol/rust/other.rs/helper_beacon",
-    };
-    json!({
-        "items": [{
-            "package": {"manager":"cargo","name":"demo","version":"1.0.0"},
-            "symbol": {
-                "id": identity,
-                "kind": "function",
-                "language": "rust",
-                "name": "helper_beacon",
-                "origin": {
-                    "location": "dependency",
-                    "package": {"manager":"cargo","name":"demo","version":"1.0.0"},
-                    "source_kind": "authored"
-                }
-            },
-            "unit": "rift://source/cargo/demo@1.0.0/src/lib.rs",
-            "range": {"start": 0, "end": 4},
-            "line": 1,
-            "match_class": "qualified_exact"
-        }],
-        "next_cursor": null,
-        "warnings": [{
-            "code": "source_truncated",
-            "detail": "source exceeded the active bound"
-        }],
-        "publication_format": "rift-package-index-v2",
-        "analyzer_revision": "analyzer-v1",
-        "corpus_revision": "corpus-v1",
-        "documentation_revision": "0123abcd"
-    })
-}
-
-fn search_page(with_item: bool) -> Value {
-    let items = if with_item {
-        vec![json!({
-            "target": "symbol",
-            "package": {"manager":"cargo","name":"demo","version":"1.0.0"},
-            "symbol": {
-                "id": "rift://symbol/rust/src/lib.rs/helper_beacon",
-                "kind": "function",
-                "language": "rust",
-                "name": "helper_beacon",
-                "origin": {
-                    "location": "dependency",
-                    "package": {"manager":"cargo","name":"demo","version":"1.0.0"},
-                    "source_kind": "authored"
-                }
-            },
-            "unit": "rift://source/cargo/demo@1.0.0/src/lib.rs",
-            "range": {"start": 0, "end": 4},
-            "line": 1,
-            "contributing_fields": ["qualified_name"],
-            "match_class": "qualified_exact"
-        })]
-    } else {
-        Vec::new()
-    };
-    json!({
-        "items": items,
-        "next_cursor": null,
-        "warnings": if with_item {
-            json!([{
-                "code": "query_narrowed",
-                "detail": "query exceeded the active term bound"
-            }])
-        } else {
-            json!([])
-        },
-        "publication_format": "rift-package-index-v2",
-        "analyzer_revision": "analyzer-v1",
-        "corpus_revision": "corpus-v1",
-        "documentation_revision": "0123abcd"
     })
 }
 
@@ -321,6 +69,17 @@ async fn get_symbol(
     call_tool(client, "get_symbol", args).await
 }
 
+/// The configured package list naming the collected `demo` release. The fixture tables
+/// already open `[dependencies]`, so the list lands as an array of tables below it.
+const DEMO_PACKAGE: &str =
+    "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n";
+
+/// The configured package list naming `demo`, an exact `absent` the fixture collection
+/// lacks, and a `wanted` requirement it cannot resolve.
+const THREE_PACKAGES: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"absent\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"wanted\"\nrequirement = \"^1\"\n";
+
 /// The `[global]` connect bound under which a refused loopback port still answers as
 /// refused.
 ///
@@ -331,7 +90,7 @@ const REFUSAL_CONNECT_TIMEOUT: &str = "10s";
 const REFUSAL_REQUEST_TIMEOUT: &str = "20s";
 
 #[tokio::test]
-async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() -> TestResult {
+async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     drop(listener);
@@ -339,8 +98,7 @@ async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() ->
         "[global]\nenabled = true\nendpoint = \"http://127.0.0.1:{port}/rift/rest\"\n\
          token_env = \"RIFT_TEST_GLOBAL_TOKEN\"\nattempts = 1\n\
          request_timeout = \"{REFUSAL_REQUEST_TIMEOUT}\"\n\
-         connect_timeout = \"{REFUSAL_CONNECT_TIMEOUT}\"\n\
-         [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n"
+         connect_timeout = \"{REFUSAL_CONNECT_TIMEOUT}\"\n\n{DEMO_PACKAGE}"
     );
     let (_directory, client, server_task) = served_workspace(
         &[
@@ -365,9 +123,11 @@ async fn refused_global_api_returns_typed_warning_and_local_fallback_counts() ->
         .iter()
         .find(|warning| warning["code"] == "global_api_unavailable")
         .ok_or_else(|| format!("missing global API warning: {answer:#}"))?;
-    assert_eq!(warning["failure_class"], "connection");
-    assert_eq!(warning["fallback_indexed"], 0);
-    assert_eq!(warning["fallback_unresolved"], 1);
+    assert_eq!(
+        warning,
+        &json!({"code": "global_api_unavailable", "failure_class": "connection"}),
+        "the warning carries no package counts"
+    );
     let rendered = serde_json::to_string(warning)?;
     assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     assert!(!rendered.contains("local_beacon"));
@@ -390,8 +150,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
-         [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n",
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
     let (_directory, client, server_task) = served_workspace(
@@ -429,74 +188,95 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     Ok(())
 }
 
+/// A path dependency outside the workspace reaches no index: the package hits come from
+/// the global index alone, and the answer names the path entry with the capability Rift
+/// does not have yet, the exact package the collection lacks, and each requirement it
+/// cannot resolve, the standard library entry the Rust source names included.
 #[tokio::test]
-async fn successful_resolution_keeps_local_only_and_reports_missing_package() -> TestResult {
+async fn successful_resolution_reports_unserved_entries_and_missing_packages() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [dependencies]\npackages = [\n  {{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }},\n\
-  {{ manager = \"cargo\", name = \"absent\", version = \"1.0.0\" }},\n\
-  {{ manager = \"cargo\", name = \"wanted\", requirement = \"^1\" }}\n]\n",
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{THREE_PACKAGES}",
         fixture.endpoint
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"all"})).await?;
     let hits = answer["hits"].as_array().ok_or("hits are an array")?;
-    assert!(
-        hits.iter().any(|hit| {
-            hit["unit"] == "rift://source/cargo/helper@0.1.0/src/lib.rs"
-                && hit["symbol"]["origin"]["package"]["name"] == "helper"
-        }),
-        "{answer:#}"
-    );
-    assert!(
+    assert_eq!(
         hits.iter()
-            .any(|hit| hit["unit"] == "rift://source/cargo/demo@1.0.0/src/lib.rs"),
+            .map(|hit| hit["unit"].clone())
+            .collect::<Vec<_>>(),
+        [json!(COLLECTED_UNIT)],
+        "the helper outside the workspace is analyzed nowhere: {answer:#}"
+    );
+    let (warnings, page_warnings): (Vec<&Value>, Vec<&Value>) = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .partition(|warning| warning["code"] != "global_page_warning");
+    let codes: Vec<&str> = warnings
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "package_unavailable",
+            "package_absent",
+            "package_requirement_absent",
+            "package_requirement_absent"
+        ],
         "{answer:#}"
     );
-    let missing = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|warning| warning["code"] == "package_absent")
-        .ok_or_else(|| format!("missing package warning: {answer:#}"))?;
     assert_eq!(
-        missing["package"],
-        json!({"manager":"cargo","name":"absent","version":"1.0.0"})
+        page_warnings
+            .iter()
+            .map(|warning| &warning["warning_code"])
+            .collect::<Vec<_>>(),
+        [&json!("source_truncated")]
     );
-    let missing_requirement = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|warning| warning["code"] == "package_requirement_absent")
-        .ok_or_else(|| format!("missing requirement warning: {answer:#}"))?;
     assert_eq!(
-        missing_requirement["entry"],
+        *warnings[0],
         json!({
-            "manager":"cargo",
-            "name":"wanted",
-            "requirement":"^1",
-            "availability":"canonical"
+            "code": "package_unavailable",
+            "entry": {
+                "manager": "cargo",
+                "name": "helper",
+                "version": "0.1.0",
+                "availability": "path"
+            },
+            "reason": "Currently rift doesn't support indexing dependencies by path. If you're \
+                       interested in this capability, please upvote it at \
+                       https://github.com/volarized/rift/issues/392."
         })
     );
-    assert!(
-        answer["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "package_unavailable" && warning["package"]["name"] == "absent"
-            })
-        }),
-        "{answer:#}"
+    assert_eq!(
+        warnings[1]["package"],
+        json!({"manager":"cargo","name":"absent","version":"1.0.0"})
     );
-    assert!(answer.to_string().contains("helper_beacon"));
-    let page_warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|warning| warning["code"] == "global_page_warning")
-        .ok_or_else(|| format!("missing page warning: {answer:#}"))?;
-    assert_eq!(page_warning["warning_code"], "source_truncated");
+    let requirements: Vec<&Value> = warnings[2..4]
+        .iter()
+        .map(|warning| &warning["entry"])
+        .collect();
+    assert_eq!(
+        requirements,
+        [
+            &json!({
+                "manager":"cargo",
+                "name":"wanted",
+                "requirement":"^1",
+                "availability":"canonical"
+            }),
+            &json!({
+                "manager":"stdlib",
+                "name":"rust",
+                "requirement":">=0",
+                "availability":"canonical"
+            }),
+        ]
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -508,10 +288,7 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [dependencies]\npackages = [\n  {{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }},\n\
-  {{ manager = \"cargo\", name = \"absent\", version = \"1.0.0\" }},\n\
-  {{ manager = \"cargo\", name = \"wanted\", requirement = \"^1\" }}\n]\n",
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{THREE_PACKAGES}",
         fixture.endpoint
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
@@ -523,11 +300,9 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     )
     .await?;
     assert!(
-        answer["results"].as_array().is_some_and(|results| {
-            results
-                .iter()
-                .any(|hit| hit["unit"] == "rift://source/cargo/demo@1.0.0/src/lib.rs")
-        }),
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| { results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT) }),
         "{answer:#}"
     );
     assert!(answer["warnings"].as_array().is_some_and(|warnings| {
@@ -545,8 +320,19 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     let resolution_text = resolution.to_string();
     assert!(resolution_text.contains("demo"));
     assert!(resolution_text.contains("absent"));
-    assert!(!resolution_text.contains("helper"));
-    assert!(!resolution_text.contains("local_only"));
+    assert!(resolution_text.contains("stdlib"));
+    assert!(
+        !resolution_text.contains("helper"),
+        "a path entry reaches no index: {resolution_text}"
+    );
+    assert!(
+        resolution["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|entry| entry["availability"] == "canonical"),
+        "{resolution_text}"
+    );
 
     let searches = requests
         .iter()
@@ -618,40 +404,186 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
     Ok(())
 }
 
+/// A remote page that fails validation discards the remote lane: `beacon` is declared in
+/// the project and in the collected package, and the answer carries the project hits
+/// alone, with the typed warning naming the failure and no package counts.
 #[tokio::test]
-async fn invalid_remote_page_discards_lane_and_reports_local_fallback() -> TestResult {
+async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [dependencies]\npackages = [{{ manager = \"cargo\", name = \"demo\", version = \"1.0.0\" }}]\n",
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    let answer = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|warning| warning["code"] == "global_response_invalid")
         .ok_or_else(|| format!("missing invalid-response warning: {answer:#}"))?;
-    assert_eq!(warning["failure_class"], "invalid_response");
-    assert_eq!(warning["fallback_indexed"], 1);
-    assert_eq!(warning["fallback_unresolved"], 1);
-    assert!(answer["hits"].as_array().is_some_and(|hits| {
-        hits.iter().any(|hit| {
-            hit["unit"] == "rift://source/cargo/helper@0.1.0/src/lib.rs"
-                && hit["symbol"]["origin"]["package"]["name"] == "helper"
-        })
-    }));
-    assert!(
-        answer["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "package_unavailable" && warning["package"]["name"] == "demo"
-            })
-        }),
+    assert_eq!(
+        warning,
+        &json!({"code": "global_response_invalid", "failure_class": "invalid_response"})
+    );
+    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let names: Vec<&Value> = hits.iter().map(|hit| &hit["symbol"]["name"]).collect();
+    assert_eq!(
+        names,
+        [&json!("beacon"), &json!("local_beacon")],
         "{answer:#}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit["path"] == "src/lib.rs"),
+        "every hit is a project hit: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Package facts are served for the current tree alone, so a `scope` past `local` beside
+/// `rev` refuses naming `scope`.
+#[tokio::test]
+async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> TestResult {
+    let (directory, client, server_task) =
+        served_workspace(&[("src/lib.rs", "pub fn local_beacon() {}\n")], None).await?;
+    // A committed baseline, so `main` resolves and the scope rule is what refuses; the
+    // workspace database stays out of the commit.
+    fs::write(directory.path().join(".gitignore"), ".rift/\n")?;
+    rift_history::fixture::init(directory.path());
+    rift_history::fixture::commit_all(directory.path(), "fixture baseline");
+    call_tool(&client, "search", json!({"query": "local_beacon"})).await?;
+
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"query": "local_beacon", "scope": "all", "rev": "main"}),
+        ))
+        .await
+        .expect_err("rev pairs with the project scope alone");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+
+    let wire = error.data.ok_or("a refusal carries its wire data")?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(
+        error.message.contains("scope"),
+        "the refusal names the field: {}",
+        error.message
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Each kind of entry no public registry serves answers with `package_unavailable` and the
+/// sentence naming the capability Rift does not have yet: a path outside the workspace and
+/// a git repository link the issue collecting demand for them, a private registry and a
+/// URL link none. A path dependency inside the workspace is project source and answers
+/// nothing, and a disabled global API says so once.
+#[tokio::test]
+async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_source_out()
+-> TestResult {
+    let manifest = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                    [dependencies]\ninner = { path = \"crates/inner\" }\n\
+                    outside = { path = \"../outside-probe\" }\n\
+                    sourced = { git = \"https://example.test/sourced\" }\n\
+                    private = { version = \"0.6\", registry = \"internal\" }\n";
+    let lockfile = "version = 4\n\n\
+                    [[package]]\nname = \"inner\"\nversion = \"0.1.0\"\n\n\
+                    [[package]]\nname = \"outside\"\nversion = \"0.2.0\"\n\n\
+                    [[package]]\nname = \"private\"\nversion = \"0.6.1\"\n\
+                    source = \"registry+https://registry.example.test/index\"\n\n\
+                    [[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
+                    [[package]]\nname = \"sourced\"\nversion = \"0.3.0\"\n\
+                    source = \"git+https://example.test/sourced#0123456789abcdef\"\n";
+    let (directory, client, server_task) = served_workspace(
+        &[
+            ("Cargo.toml", manifest),
+            ("Cargo.lock", lockfile),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+            (
+                "crates/inner/Cargo.toml",
+                "[package]\nname = \"inner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("crates/inner/src/lib.rs", "pub fn inner_beacon() {}\n"),
+            (
+                "package.json",
+                "{\"dependencies\":{\"tarball\":\"https://example.test/tarball-1.0.0.tgz\"}}\n",
+            ),
+        ],
+        None,
+    )
+    .await?;
+
+    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"all"})).await?;
+
+    assert_eq!(answer["hits"][0]["symbol"]["name"], "local_beacon");
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    assert_eq!(warnings[0], json!({"code": "global_access_disabled"}));
+    let unavailable: Vec<(String, String, String)> = warnings[1..]
+        .iter()
+        .map(|warning| {
+            (
+                warning["entry"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                warning["entry"]["availability"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                warning["reason"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let upvote = |issue: u32| {
+        format!(
+            "If you're interested in this capability, please upvote it at \
+             https://github.com/volarized/rift/issues/{issue}."
+        )
+    };
+    let expected = [
+        (
+            "outside",
+            "path",
+            format!(
+                "Currently rift doesn't support indexing dependencies by path. {}",
+                upvote(392)
+            ),
+        ),
+        (
+            "private",
+            "private_registry",
+            "Currently rift doesn't support indexing dependencies from private registries."
+                .to_owned(),
+        ),
+        (
+            "sourced",
+            "git",
+            format!(
+                "Currently rift doesn't support indexing dependencies from git repositories. {}",
+                upvote(393)
+            ),
+        ),
+        (
+            "tarball",
+            "url",
+            "Currently rift doesn't support indexing dependencies from URLs.".to_owned(),
+        ),
+    ]
+    .map(|(name, availability, reason)| (name.to_owned(), availability.to_owned(), reason));
+    assert_eq!(unavailable, expected, "{answer:#}");
+    assert!(
+        !answer.to_string().contains("\"inner\""),
+        "a path dependency inside the workspace is project source: {answer:#}"
     );
     drop(directory);
     client.cancel().await?;
