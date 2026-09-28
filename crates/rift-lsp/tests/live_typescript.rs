@@ -12,6 +12,7 @@
 mod engine_fixture;
 mod live_engine_gate;
 mod typescript_engine;
+mod typescript_install;
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ use live_engine_gate::engine_live;
 use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
-use typescript_engine::{install_typescript_engine, typescript_package_files};
+use typescript_install::{install_typescript_engine, typescript_package_files};
 
 /// The live launch, built from the shared fixture's typescript-language-server
 /// data - `tsserver.useSyntaxServer = "never"` keeps the engine to one
