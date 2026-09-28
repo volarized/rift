@@ -248,17 +248,37 @@ At `depth: 1`, the result contains declarations that reference `load_config`. At
 Rift also follows references to those declarations, helping the agent inspect the effect of a change.
 Use the returned symbol identity for `seed`, since names alone do not identify a declaration.
 
+Reading a declaration raises the opposite question: what does it rely on? `direction: "outgoing"`
+follows the calls the declaration makes, and each hop carries the `calls` facet:
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/rust/src/config.rs/load_config",
+    "direction": "outgoing",
+    "facets": ["calls"],
+    "depth": 1
+  },
+  "target": "symbol"
+}
+```
+
+For the example project, the result contains `parse_config`. The standard library's
+`std::fs::read_to_string` has no declaration in the local index, so a `callees_dropped` warning
+counts it in place of a result.
+
 Traversal works on current local code and needs a configured
-[language engine](/docs/developer/configuration#languages-and-lsp) that resolves references.
-The [traversal reference](/docs/developer/protocol/mcp#search-traversal) describes result paths,
-coverage warnings, and unsupported requests.
+[language engine](/docs/developer/configuration#languages-and-lsp) that resolves references and
+calls. The [traversal reference](/docs/developer/protocol/mcp#search-traversal) describes result
+paths, coverage warnings, and unsupported requests.
 
 </Accordion>
 <Accordion title="Language-engine references" id="search-engine-references">
 
-During traversal, the configured language engine resolves reference locations. Rift finds the
-smallest indexed declaration containing each location, so the result identifies the caller.
-These references belong to this read and do not become indexed relationships in the map.
+During traversal, the configured language engine resolves reference locations, or the callees of
+an outgoing walk. Rift finds the smallest indexed declaration containing each location, so the
+result identifies the caller or the callee. These relationships belong to this read and do not
+become indexed relationships in the map.
 
 See [language-engine references](/docs/developer/protocol/mcp#search-engine-references) for
 validation, retries, and failure behavior.
