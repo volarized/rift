@@ -315,12 +315,15 @@ impl OwedChanges {
         }
     }
 
-    /// Sends the held changes to `session` as one batch.
+    /// Sends the held changes to `session` as one batch, before its next exchange.
+    ///
+    /// Every failure leaves the session ended: a write that fails or times out ends it
+    /// inside the notification, and a project path always forms a document URI. The
+    /// caller then starts a replacement, which reads every file from disk.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended, a path cannot form a
-    /// document URI, or the connection broke.
+    /// Returns [`EngineError`] when the session ended or the connection broke.
     async fn send(self, session: &mut EngineSession) -> Result<(), EngineError> {
         if self.paths.is_empty() {
             return Ok(());
@@ -636,34 +639,6 @@ impl EngineSlot {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
-    }
-
-    /// Sends `owed` to the live `session` before its next exchange.
-    ///
-    /// A failure that leaves the session running is logged and the exchange goes
-    /// on: the engine then answers from its older view of those files.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] when the session ended while sending.
-    async fn tell(
-        &self,
-        session: &mut EngineSession,
-        owed: OwedChanges,
-    ) -> Result<(), EngineError> {
-        match owed.send(session).await {
-            Err(error) if session.is_ended() => Err(error),
-            Err(error) => {
-                tracing::warn!(
-                    component = "engine",
-                    engine = self.name(),
-                    %error,
-                    "changed files did not reach the language engine"
-                );
-                Ok(())
-            }
-            Ok(()) => Ok(()),
-        }
     }
 
     /// Ends the running session under the slot's lock and reports the slot stopped.
@@ -1028,7 +1003,7 @@ impl EngineSlot {
             let session = match state.session.take() {
                 Some(running) if !running.is_ended() && !owed.overflowed => {
                     let running = state.session.insert(running);
-                    if let Err(error) = self.tell(running, owed).await {
+                    if let Err(error) = owed.send(running).await {
                         reported = Some(error);
                         continue;
                     }
