@@ -1200,13 +1200,16 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// An outgoing walk dropped its edges to callees no declaration of the project holds:
-    /// the language engine's call hierarchy named them in a standard library or package
-    /// file, which the local index does not analyze. The walk stops at such a callee, and
-    /// every other edge stands. The warning states that edges are missing from this
-    /// answer; it never states that the seed calls nothing outside the project.
+    /// An outgoing walk dropped its edges to callees it named no declaration for. The
+    /// language engine's call hierarchy named each in a file outside the project and every
+    /// installed package the workspace's dependencies name, or in a package or standard
+    /// library file where the global index answered no declaration at the callee's
+    /// position. Every package callee drops when the global API is off or did not answer,
+    /// and the answer then carries the global warning naming why. Every other edge stands.
+    /// The warning states that edges are missing from this answer; it never states that
+    /// the seed calls nothing more.
     CalleesDropped {
-        /// Edges the walk dropped over every depth, one per caller and callee.
+        /// Edges the walk dropped over every depth, one per call the engine named.
         callees: u64,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]

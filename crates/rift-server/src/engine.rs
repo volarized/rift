@@ -200,6 +200,14 @@ impl EnginePool {
         self.engines.get(key).map(Arc::as_ref)
     }
 
+    /// Each exact language identity segment this pool binds, with the slot serving it.
+    pub(crate) fn served_slots(&self) -> impl Iterator<Item = (&str, &EngineSlot)> {
+        self.served.iter().filter_map(|(language, key)| {
+            let slot = self.engines.get(key)?;
+            Some((language.as_str(), slot.as_ref()))
+        })
+    }
+
     /// Whether any slot reports an engine it started and has not stopped.
     #[must_use]
     pub fn runs_an_engine(&self) -> bool {

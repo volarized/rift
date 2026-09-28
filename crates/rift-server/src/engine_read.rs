@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lsp_types::{Location, Position, Range, Uri};
-use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
+use lsp_types::{CallHierarchyItem, Location, Position, Range, Uri};
+use rift_core::{PackageIdentity, ProjectPath, SymbolId as CoreSymbolId};
 use rift_index::{IndexedFile, RelationshipStore};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
@@ -13,11 +13,12 @@ use rift_lsp::uri::{TreeRoot, UriFault};
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
-    SymbolId, TraversalDirection,
+    SourceUnitId, Symbol, SymbolId, TraversalDirection,
 };
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
 
+use crate::callee::{CalleeFile, CalleeRoots, NamedCallee, PackageCallee, callee_file};
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
 use crate::read::{ReadError, ReadFault, ReadService, symbol_id};
 use crate::traversal::{
@@ -31,7 +32,12 @@ pub struct EngineReferences {
     revision: Option<String>,
     incoming: BTreeMap<CoreSymbolId, Vec<GraphHop>>,
     outgoing: BTreeMap<CoreSymbolId, Vec<GraphHop>>,
-    /// Edges to callees the engines named outside every declaration this tree indexes.
+    /// Callees in package files, each waiting for the global API to name its declaration.
+    package_callees: Vec<PackageCallee>,
+    /// The package declarations the global API named, each the end of an outgoing edge.
+    package_declarations: BTreeMap<CoreSymbolId, PackageDeclaration>,
+    /// Edges to callees the walk could not name: under no root, answered by no
+    /// declaration, or left unasked.
     dropped_callees: u64,
     /// Engines whose answer the walk took unconfirmed, quiet past `settle_delay`.
     unconfirmed: BTreeSet<String>,
@@ -77,6 +83,8 @@ impl EngineReferences {
     fn degrade(&mut self, warning: ReadWarning) {
         self.incoming.clear();
         self.outgoing.clear();
+        self.package_callees.clear();
+        self.package_declarations.clear();
         self.dropped_callees = 0;
         self.unconfirmed.clear();
         self.analysis_unavailable = Some(warning);
@@ -105,6 +113,64 @@ impl EngineReferences {
         self.outgoing.get(symbol).map_or(&[], Vec::as_slice)
     }
 
+    /// The callees the walk found in package files, in the order it met them, each
+    /// waiting for [`Self::name_package_callees`] or [`Self::drop_package_callees`].
+    #[must_use]
+    pub fn package_callees(&self) -> &[PackageCallee] {
+        &self.package_callees
+    }
+
+    /// Ends each waiting callee's edge at the declaration `named` answers for it, with
+    /// the exact package that holds it, and counts the callees `named` answers nothing
+    /// for as dropped.
+    ///
+    /// A caller keeps one edge per callee declaration, whatever the number of calls the
+    /// engine named for it. The walk does not continue from a package declaration: the
+    /// local index holds no declaration of it to ask an engine about.
+    pub fn name_package_callees(
+        &mut self,
+        mut named: impl FnMut(&PackageCallee) -> Option<(SymbolId, PackageIdentity)>,
+    ) {
+        for callee in std::mem::take(&mut self.package_callees) {
+            let declaration = named(&callee).and_then(|(id, package)| {
+                Some(PackageDeclaration {
+                    symbol: callee.symbol(&id, &package)?,
+                    unit: callee.unit(&package)?,
+                })
+            });
+            let Some(declaration) = declaration else {
+                self.dropped_callees = self.dropped_callees.saturating_add(1);
+                continue;
+            };
+            let Some(id) = declaration.symbol.id.clone() else {
+                continue;
+            };
+            let Ok(end) = CoreSymbolId::new(id.0.clone()) else {
+                self.dropped_callees = self.dropped_callees.saturating_add(1);
+                continue;
+            };
+            let caller = SymbolId(callee.caller().as_str().to_owned());
+            let edges = self.outgoing.entry(callee.caller().clone()).or_default();
+            if !edges.iter().any(|edge| edge.relationship.to == id) {
+                edges.push(call_hop(&caller, id));
+                edges.sort_by(|left, right| left.relationship.to.cmp(&right.relationship.to));
+            }
+            self.package_declarations.entry(end).or_insert(declaration);
+        }
+    }
+
+    /// Counts every waiting callee as dropped: the global API is off or did not answer.
+    pub fn drop_package_callees(&mut self) {
+        let waiting = u64::try_from(self.package_callees.len()).unwrap_or(u64::MAX);
+        self.dropped_callees = self.dropped_callees.saturating_add(waiting);
+        self.package_callees.clear();
+    }
+
+    /// The package declaration an outgoing edge ends at, `None` for a project one.
+    pub(crate) fn package_declaration(&self, symbol: &CoreSymbolId) -> Option<&PackageDeclaration> {
+        self.package_declarations.get(symbol)
+    }
+
     pub(crate) fn validate_revision(&self, reads: &ReadService) -> Result<(), ReadError> {
         if self
             .revision
@@ -118,6 +184,14 @@ impl EngineReferences {
         }
         Ok(())
     }
+}
+
+/// A package declaration an outgoing edge ends at: the symbol its hit carries, and the
+/// package file holding it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PackageDeclaration {
+    pub(crate) symbol: Symbol,
+    pub(crate) unit: SourceUnitId,
 }
 
 /// Whether this search can request references from a configured language engine.
@@ -228,6 +302,10 @@ fn reference_source<'source>(
 /// wait spent before the engine reads ready drops the engine's contribution with an
 /// `engine_analysis_unavailable` warning and keeps the session loading.
 ///
+/// An outgoing walk addresses each callee's file through `roots`. A callee in a package
+/// file waits in [`EngineReferences::package_callees`] for the global API to name its
+/// declaration, and the walk does not continue from it.
+///
 /// # Errors
 ///
 /// Returns invalid traversal or engine failure, and refuses an outgoing seed the ready
@@ -241,7 +319,7 @@ pub async fn resolve_engine_references(
     reads: &ReadService,
     engines: &EnginePool,
     params: &SearchParams,
-    deadline: Instant,
+    (deadline, roots): (Instant, &CalleeRoots),
 ) -> Result<EngineReferences, ReadError> {
     if !uses_engine_references(reads, engines, params)? {
         return Ok(EngineReferences::default());
@@ -275,6 +353,7 @@ pub async fn resolve_engine_references(
                 let walk = OutgoingWalk {
                     seed: &seed,
                     deadline,
+                    roots,
                 };
                 Box::pin(extend_callees(
                     reads,
@@ -424,14 +503,14 @@ fn walk_unsettled_warning(language: Language, attempts: u64) -> ReadWarning {
     )
 }
 
-/// The warning an outgoing walk carries for the edges it dropped at callees no
-/// declaration of the project holds.
+/// The warning an outgoing walk carries for the edges it dropped at callees it named no
+/// declaration for.
 fn callees_dropped_warning(callees: u64) -> ReadWarning {
     ReadWarning::CalleesDropped {
         callees,
-        detail: "the language engine named callees in standard library or package files, \
-                 which the local index does not analyze, so the walk carries no edge to them \
-                 and does not continue past them"
+        detail: "the language engine named callees outside the project and every installed \
+                 package, or at a position the global index answered no declaration at, so \
+                 the walk carries no edge to them"
             .to_owned(),
     }
 }
@@ -468,28 +547,34 @@ fn callee_hops(seed: &SymbolId, callees: impl IntoIterator<Item = SymbolId>) -> 
         .filter(|callee| callee != seed)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|callee| GraphHop {
-            relationship: Relationship {
-                from: seed.clone(),
-                to: callee,
-                kind: ExactKind(rift_core::fault_label(&RelationshipFacet::Calls)),
-                facets: vec![RelationshipFacet::Calls],
-                evidence: Vec::new(),
-                derivation: RelationshipDerivation::Resolution,
-                confidence: None,
-                extensions: Extensions::default(),
-            },
-            direction: HopDirection::Outgoing,
-        })
+        .map(|callee| call_hop(seed, callee))
         .collect()
 }
 
-/// Where one outgoing walk stands: the seed a refusal names, and the instant each
-/// engine's readiness wait ends.
+/// The outgoing edge from `from` to the declaration `to` it calls.
+fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
+    GraphHop {
+        relationship: Relationship {
+            from: from.clone(),
+            to,
+            kind: ExactKind(rift_core::fault_label(&RelationshipFacet::Calls)),
+            facets: vec![RelationshipFacet::Calls],
+            evidence: Vec::new(),
+            derivation: RelationshipDerivation::Resolution,
+            confidence: None,
+            extensions: Extensions::default(),
+        },
+        direction: HopDirection::Outgoing,
+    }
+}
+
+/// Where one outgoing walk stands: the seed a refusal names, the instant each engine's
+/// readiness wait ends, and the package roots its callees' files are addressed through.
 #[derive(Clone, Copy)]
 struct OutgoingWalk<'walk> {
     seed: &'walk CoreSymbolId,
     deadline: Instant,
+    roots: &'walk CalleeRoots,
 }
 
 async fn extend_callees(
@@ -500,44 +585,46 @@ async fn extend_callees(
     requested: &mut BTreeSet<CoreSymbolId>,
     walk: OutgoingWalk<'_>,
 ) -> Result<Option<ReadWarning>, ReadError> {
-    let stored: usize = references.outgoing.values().map(Vec::len).sum();
+    let stored: usize = references.outgoing.values().map(Vec::len).sum::<usize>()
+        + references.package_callees.len();
     let mut remaining = TRAVERSAL_NODES_MAX - stored;
     for identity in pending {
         if !requested.insert(identity.clone()) {
             continue;
         }
-        let (edges, language) =
-            match resolve_symbol_callees(reads, engines, &identity, walk.deadline).await? {
-                SymbolCallees::Resolved {
-                    callees,
-                    dropped,
-                    language,
-                    unconfirmed,
-                } => {
-                    references.dropped_callees = references.dropped_callees.saturating_add(dropped);
-                    references.unconfirmed.extend(unconfirmed);
-                    let seed = SymbolId(identity.as_str().to_owned());
-                    (callee_hops(&seed, callees), language)
-                }
-                SymbolCallees::NotServed => continue,
-                SymbolCallees::Unprepared { kind } if identity == *walk.seed => {
-                    return Err(ReadFault::unsupported(format!(
-                        "outgoing traversal from a declaration of kind `{kind}` (the language \
-                         engine prepares no call hierarchy item at the seed)"
-                    )));
-                }
-                SymbolCallees::Unprepared { .. } => {
-                    references.outgoing.insert(identity, Vec::new());
-                    continue;
-                }
-                SymbolCallees::Unmapped { language, detail } => {
-                    return Ok(Some(engine_analysis_warning(language, detail)));
-                }
-                SymbolCallees::Unsettled { language, attempts } => {
-                    return Ok(Some(walk_unsettled_warning(language, attempts)));
-                }
-            };
-        let Some(left) = remaining.checked_sub(edges.len()) else {
+        let resolved = resolve_symbol_callees(reads, engines, &identity, walk).await?;
+        let (edges, held, language) = match resolved {
+            SymbolCallees::Resolved {
+                callees,
+                held,
+                dropped,
+                language,
+                unconfirmed,
+            } => {
+                references.dropped_callees = references.dropped_callees.saturating_add(dropped);
+                references.unconfirmed.extend(unconfirmed);
+                let seed = SymbolId(identity.as_str().to_owned());
+                (callee_hops(&seed, callees), held, language)
+            }
+            SymbolCallees::NotServed => continue,
+            SymbolCallees::Unprepared { kind } if identity == *walk.seed => {
+                return Err(ReadFault::unsupported(format!(
+                    "outgoing traversal from a declaration of kind `{kind}` (the language \
+                     engine prepares no call hierarchy item at the seed)"
+                )));
+            }
+            SymbolCallees::Unprepared { .. } => {
+                references.outgoing.insert(identity, Vec::new());
+                continue;
+            }
+            SymbolCallees::Unmapped { language, detail } => {
+                return Ok(Some(engine_analysis_warning(language, detail)));
+            }
+            SymbolCallees::Unsettled { language, attempts } => {
+                return Ok(Some(walk_unsettled_warning(language, attempts)));
+            }
+        };
+        let Some(left) = remaining.checked_sub(edges.len() + held.len()) else {
             return Ok(Some(engine_analysis_warning(
                 language,
                 format!(
@@ -548,13 +635,14 @@ async fn extend_callees(
         };
         remaining = left;
         references.outgoing.insert(identity, edges);
+        references.package_callees.extend(held);
     }
     if !references.unconfirmed.is_empty() || references.dropped_callees > 0 {
         tracing::info!(
             component = "engine",
             unconfirmed = ?references.unconfirmed,
             dropped_callees = references.dropped_callees,
-            "outgoing walk took unconfirmed answers or dropped callees outside the tree"
+            "outgoing walk took unconfirmed answers or dropped callees outside every root"
         );
     }
     Ok(None)
@@ -562,11 +650,14 @@ async fn extend_callees(
 
 /// What one declaration's outgoing calls request contributed to a walk.
 enum SymbolCallees {
-    /// The callees the engine named inside this tree, and the count it named outside.
+    /// The callees the engine named inside this tree and in package files, and the count
+    /// it named under no root.
     Resolved {
         /// Callee declarations, one per call the engine named, repeats included.
         callees: Vec<SymbolId>,
-        /// Callees named outside every declaration this tree indexes.
+        /// Callees in package files, waiting for the global API to name them.
+        held: Vec<PackageCallee>,
+        /// Callees under no root, or outside every declaration of a project file.
         dropped: u64,
         /// The declaration's language, the one whose engine answered.
         language: Language,
@@ -601,14 +692,14 @@ async fn resolve_symbol_callees(
     reads: &ReadService,
     engines: &EnginePool,
     identity: &CoreSymbolId,
-    deadline: Instant,
+    walk: OutgoingWalk<'_>,
 ) -> Result<SymbolCallees, ReadError> {
     let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
         return Ok(SymbolCallees::NotServed);
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let (report, unconfirmed) = match callees_on_engine(slot, &target, deadline).await {
+    let (report, unconfirmed) = match callees_on_engine(slot, &target, walk.deadline).await {
         Ok(OutgoingAnswer::Ready(report)) => (report, None),
         Ok(OutgoingAnswer::Unconfirmed(report)) => (report, Some(slot.name().to_owned())),
         Ok(OutgoingAnswer::Unprepared) => {
@@ -622,9 +713,15 @@ async fn resolve_symbol_callees(
         }
         Err(error) => return Err(ReadFault::engine(error)),
     };
-    match map_callees(reads, report, slot.workspace_root()) {
-        Ok((callees, dropped)) => Ok(SymbolCallees::Resolved {
+    let trees = [slot.workspace_root(), reads.index().root()];
+    match map_callees(reads, report, identity, (walk.roots, &trees)) {
+        Ok(MappedCallees {
             callees,
+            held,
+            dropped,
+        }) => Ok(SymbolCallees::Resolved {
+            callees,
+            held,
             dropped,
             language,
             unconfirmed,
@@ -639,10 +736,10 @@ async fn resolve_symbol_callees(
     }
 }
 
-/// One outgoing calls answer: each callee's file and name range, or the count past the
+/// One outgoing calls answer: each callee the engine named, or the count past the
 /// traversal bound.
 struct CalleeReport {
-    calls: Result<Vec<(Uri, Range)>, usize>,
+    calls: Result<Vec<CallHierarchyItem>, usize>,
     encoding: PositionEncoding,
 }
 
@@ -671,11 +768,7 @@ async fn callees_on_engine(
                 let mut calls = Vec::new();
                 for item in items {
                     let answered = session.outgoing_calls(item).await?;
-                    calls.extend(
-                        answered
-                            .into_iter()
-                            .map(|call| (call.to.uri, call.to.selection_range)),
-                    );
+                    calls.extend(answered.into_iter().map(|call| call.to));
                     if calls.len() > TRAVERSAL_NODES_MAX {
                         return Ok(Some(CalleeReport {
                             calls: Err(calls.len()),
@@ -695,14 +788,26 @@ async fn callees_on_engine(
     .await
 }
 
-/// Maps each callee the engine named to the declaration holding its name, and counts
-/// the callees no declaration of this tree holds: a standard library stub
-/// (`vendored://stdlib/...`), a file outside the root, or a file the tree does not index.
+/// What one outgoing calls answer maps to.
+struct MappedCallees {
+    /// The project declarations holding each callee's name, one per call.
+    callees: Vec<SymbolId>,
+    /// The callees in package files, one per call.
+    held: Vec<PackageCallee>,
+    /// The callees under no root, or outside every declaration of a project file.
+    dropped: u64,
+}
+
+/// Maps each callee the engine named: a project file's callee to the declaration holding
+/// its name, and a package file's callee, or a typeshed stub's, to the position the global
+/// API names its declaration at. A callee under no root, or outside every declaration of
+/// its project file, is counted.
 fn map_callees(
     reads: &ReadService,
     report: CalleeReport,
-    workspace_root: &std::path::Path,
-) -> Result<(Vec<SymbolId>, u64), ReadError> {
+    caller: &CoreSymbolId,
+    (roots, trees): (&CalleeRoots, &[&std::path::Path]),
+) -> Result<MappedCallees, ReadError> {
     let calls = report.calls.map_err(|observed| {
         ReadFault::engine_answer(
             "engine calls",
@@ -711,30 +816,40 @@ fn map_callees(
             ),
         )
     })?;
-    let root = TreeRoot::new(workspace_root)
-        .map_err(|error| ReadFault::task("callee root conversion", error.detail()))?;
-    let mut callees = Vec::new();
-    let mut dropped = 0_u64;
-    for (uri, range) in &calls {
-        let file_scheme = uri
-            .scheme()
-            .is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"));
-        let at = EngineLocation {
-            uri,
-            range: *range,
+    let mut mapped = MappedCallees {
+        callees: Vec::new(),
+        held: Vec::new(),
+        dropped: 0,
+    };
+    for item in &calls {
+        let call = NamedCallee {
+            uri: &item.uri,
+            name: &item.name,
+            kind: item.kind,
+            position: item.selection_range.start,
             encoding: report.encoding,
         };
-        let callee = if file_scheme {
-            enclosing_declaration(reads, &root, at, "engine calls")?
-        } else {
-            None
+        let file = callee_file(roots, trees, caller, call)
+            .map_err(|error| ReadFault::task("callee URI conversion", error.detail()))?;
+        let declaration = match file {
+            CalleeFile::Project(path) => project_declaration(
+                reads,
+                &path,
+                (item.selection_range, report.encoding),
+                "engine calls",
+            )?,
+            CalleeFile::Package(held) => {
+                mapped.held.push(held);
+                continue;
+            }
+            CalleeFile::Unaddressed => None,
         };
-        match callee {
-            Some(callee) => callees.push(callee),
-            None => dropped += 1,
+        match declaration {
+            Some(declaration) => mapped.callees.push(declaration),
+            None => mapped.dropped += 1,
         }
     }
-    Ok((callees, dropped))
+    Ok(mapped)
 }
 
 async fn resolve_symbol_references(
@@ -981,7 +1096,7 @@ fn map_references(
             range: location.range,
             encoding: report.encoding,
         };
-        if let Some(caller) = enclosing_declaration(reads, &root, at, "engine references")?
+        if let Some(caller) = reference_caller(reads, &root, at)?
             && caller.0 != target.as_str()
         {
             callers.insert(caller);
@@ -1013,14 +1128,13 @@ struct EngineLocation<'location> {
     encoding: PositionEncoding,
 }
 
-/// The declaration whose complete span, attached documentation included, holds `at`: the
-/// caller holding a reference, or the callee whose name an outgoing call names. `None` for
-/// a location outside the served tree or outside every declaration of its file.
-fn enclosing_declaration(
+/// The declaration whose complete span, attached documentation included, holds one
+/// reference location: the caller an incoming hop names. `None` for a location outside the
+/// served tree or outside every declaration of its file.
+fn reference_caller(
     reads: &ReadService,
     root: &TreeRoot,
     at: EngineLocation<'_>,
-    operation: &'static str,
 ) -> Result<Option<SymbolId>, ReadError> {
     let relative = root.project_path(at.uri).or_else(|error| {
         if matches!(error.fault(), UriFault::OutsideRoot) {
@@ -1034,17 +1148,30 @@ fn enclosing_declaration(
         Err(error) if matches!(error.fault(), UriFault::OutsideRoot) => return Ok(None),
         Err(error) => return Err(ReadFault::task("reference URI conversion", error.detail())),
     };
-    let Some(file) = reads.index().file(&path) else {
+    project_declaration(reads, &path, (at.range, at.encoding), "engine references")
+}
+
+/// The declaration of the project file at `path` whose complete span, attached
+/// documentation included, holds `range`: the caller holding a reference, or the callee
+/// whose name an outgoing call names. `None` for a file this tree does not index, or a
+/// range outside every declaration of it.
+fn project_declaration(
+    reads: &ReadService,
+    path: &ProjectPath,
+    (range, encoding): (Range, PositionEncoding),
+    operation: &'static str,
+) -> Result<Option<SymbolId>, ReadError> {
+    let Some(file) = reads.index().file(path) else {
         return Ok(None);
     };
     let index = LineIndex::new(file.source());
     let convert = |position| {
         index
-            .byte_offset(at.encoding, position)
+            .byte_offset(encoding, position)
             .map_err(|error| ReadFault::engine_answer(operation, error.detail()))
     };
-    let start = convert(at.range.start)? as u64;
-    let end = convert(at.range.end)? as u64;
+    let start = convert(range.start)? as u64;
+    let end = convert(range.end)? as u64;
     if start > end {
         return Err(ReadFault::engine_answer(
             operation,
@@ -1098,6 +1225,7 @@ mod tests {
         CalleeReport, EngineReferences, ReferenceReport, declaration_name_offset, map_callees,
         map_references, resolve_engine_references,
     };
+    use crate::callee::CalleeRoots;
     use crate::search::StoreAnswer;
     use crate::{EnginePool, LspProcessKey, ReadService};
 
@@ -1106,6 +1234,12 @@ mod tests {
     /// A walk deadline no test reaches.
     fn far() -> tokio::time::Instant {
         tokio::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    /// A walk's far deadline, with no installed package to address a callee through.
+    fn walk() -> (tokio::time::Instant, &'static CalleeRoots) {
+        static NO_PACKAGES: std::sync::OnceLock<CalleeRoots> = std::sync::OnceLock::new();
+        (far(), NO_PACKAGES.get_or_init(CalleeRoots::default))
     }
 
     #[test]
@@ -1149,39 +1283,96 @@ mod tests {
         );
     }
 
+    /// One call hierarchy item naming `name` at `location`.
+    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyItem {
+        lsp_types::CallHierarchyItem {
+            name: name.to_owned(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: location.uri,
+            range: location.range,
+            selection_range: location.range,
+            data: None,
+        }
+    }
+
     /// Each callee maps to the declaration holding its name when the tree indexes that
-    /// file; a vendored stub, a file outside the root, and a file the tree does not index
-    /// are counted instead, one per call.
+    /// file; a vendored stub and a file below an installed package's root wait for the
+    /// global API, and a file outside every root and a file the tree does not index are
+    /// counted instead, one per call.
     #[test]
-    fn callee_mapping_holds_project_callees_and_counts_the_rest() -> TestResult {
+    fn callee_mapping_holds_project_and_package_callees_and_counts_the_rest() -> TestResult {
         let directory = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
+        let installed = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon() {}\n\npub fn larger() { beacon(); }\n",
         )?;
         let reads = reads(directory.path())?;
         let beacon = location(directory.path(), "lib.rs", 0, 7, 13);
-        let stub: lsp_types::Uri = "vendored://stdlib/builtins.pyi".parse()?;
+        let stub = Location {
+            uri: "vendored://stdlib/json/__init__.pyi".parse()?,
+            range: beacon.range,
+        };
+        let package = rift_core::PackageIdentity {
+            manager: "cargo".to_owned(),
+            name: "serde".to_owned(),
+            version: "1.0.228".to_owned(),
+        };
+        let roots = CalleeRoots::from_packages(vec![rift_lsp::uri::PackageRoot::new(
+            TreeRoot::new(installed.path())?,
+            package.clone(),
+        )]);
         let calls = vec![
-            (beacon.uri.clone(), beacon.range),
-            (stub, beacon.range),
-            {
-                let foreign = location(outside.path(), "lib.rs", 0, 7, 13);
-                (foreign.uri, foreign.range)
-            },
-            {
-                let unindexed = location(directory.path(), "absent.rs", 0, 0, 1);
-                (unindexed.uri, unindexed.range)
-            },
+            item(beacon, "beacon"),
+            item(stub, "loads"),
+            item(
+                location(installed.path(), "src/de.rs", 4, 11, 22),
+                "deserialize",
+            ),
+            item(location(outside.path(), "lib.rs", 0, 7, 13), "beacon"),
+            item(location(directory.path(), "absent.rs", 0, 0, 1), "absent"),
         ];
         let report = CalleeReport {
             calls: Ok(calls),
             encoding: PositionEncoding::Utf16,
         };
-        let (callees, dropped) = map_callees(&reads, report, directory.path())?;
-        assert_eq!(callees, [symbol(&reads, "beacon")]);
-        assert_eq!(dropped, 3);
+        let caller = rift_core::SymbolId::new(symbol(&reads, "larger").0)?;
+        let mapped = map_callees(&reads, report, &caller, (&roots, &[directory.path()]))?;
+        assert_eq!(mapped.callees, [symbol(&reads, "beacon")]);
+        assert_eq!(mapped.dropped, 2);
+        let held: Vec<(String, String, u32, u32)> = mapped
+            .held
+            .iter()
+            .map(|callee| {
+                (
+                    format!("{}/{}", callee.package().manager(), callee.package().name()),
+                    callee.path().as_str().to_owned(),
+                    callee.position().line,
+                    callee.position().character,
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (
+                    "stdlib/python".to_owned(),
+                    "json/__init__.pyi".to_owned(),
+                    0,
+                    7
+                ),
+                ("cargo/serde".to_owned(), "src/de.rs".to_owned(), 4, 11),
+            ]
+        );
+        assert!(
+            mapped
+                .held
+                .iter()
+                .all(|callee| callee.encoding() == PositionEncoding::Utf16)
+        );
         Ok(())
     }
 
@@ -1193,21 +1384,112 @@ mod tests {
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let reads = reads(directory.path())?;
         let past_the_line = location(directory.path(), "lib.rs", 0, 80, 81);
+        let caller = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
         for calls in [
-            Ok(vec![(past_the_line.uri, past_the_line.range)]),
+            Ok(vec![item(past_the_line.clone(), "beacon")]),
             Err(super::TRAVERSAL_NODES_MAX + 1),
         ] {
             let report = CalleeReport {
                 calls,
                 encoding: PositionEncoding::Utf16,
             };
-            let error = map_callees(&reads, report, directory.path())
-                .expect_err("an unmappable answer is refused");
+            let roots = CalleeRoots::default();
+            let Err(error) = map_callees(&reads, report, &caller, (&roots, &[directory.path()]))
+            else {
+                panic!("an unmappable answer is refused");
+            };
             assert!(
                 matches!(error.fault(), super::ReadFault::EngineAnswer { .. }),
                 "{error}"
             );
         }
+        Ok(())
+    }
+
+    /// One callee a walk holds for the global API, from a typeshed stub the embedded
+    /// engine names.
+    fn held_stub(
+        stub: &str,
+        name: &str,
+    ) -> Result<crate::callee::PackageCallee, Box<dyn std::error::Error>> {
+        let caller = rift_core::SymbolId::new("rift://symbol/python/app.py/hello")?;
+        let uri: lsp_types::Uri = format!("vendored://stdlib/{stub}").parse()?;
+        let call = crate::callee::NamedCallee {
+            uri: &uri,
+            name,
+            kind: lsp_types::SymbolKind::FUNCTION,
+            position: Position {
+                line: 1,
+                character: 4,
+            },
+            encoding: PositionEncoding::Utf8,
+        };
+        match crate::callee::callee_file(&CalleeRoots::default(), &[], &caller, call)? {
+            crate::callee::CalleeFile::Package(held) => Ok(held),
+            _ => Err("a typeshed stub is held for the global API".into()),
+        }
+    }
+
+    /// A named callee ends one edge per declaration however many calls named it, carries
+    /// the package declaration its hit reads, and every callee named nothing drops.
+    #[test]
+    fn named_package_callees_end_one_edge_each_and_the_rest_drop() -> TestResult {
+        let caller = rift_core::SymbolId::new("rift://symbol/python/app.py/hello")?;
+        let len = SymbolId("rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len".into());
+        let python = rift_core::PackageIdentity {
+            manager: "stdlib".to_owned(),
+            name: "python".to_owned(),
+            version: "3.12.9".to_owned(),
+        };
+        let mut references = EngineReferences {
+            package_callees: vec![
+                held_stub("builtins.pyi", "len")?,
+                held_stub("builtins.pyi", "len")?,
+                held_stub("json/__init__.pyi", "loads")?,
+            ],
+            ..EngineReferences::default()
+        };
+        assert_eq!(references.package_callees().len(), 3);
+        references.name_package_callees(|callee| {
+            (callee.path().as_str() == "builtins.pyi").then(|| (len.clone(), python.clone()))
+        });
+        let edges: Vec<&SymbolId> = references
+            .outgoing(&caller)
+            .iter()
+            .map(|edge| &edge.relationship.to)
+            .collect();
+        assert_eq!(edges, [&len], "one edge per callee declaration");
+        assert_eq!(references.dropped_callees, 1, "`loads` is named nothing");
+        assert!(references.package_callees().is_empty());
+        let declaration = references
+            .package_declaration(&rift_core::SymbolId::new(len.0.clone())?)
+            .ok_or("the edge's end is a package declaration")?;
+        assert_eq!(
+            declaration.unit.0,
+            "rift://source/stdlib/python@3.12.9/builtins.pyi"
+        );
+        assert_eq!(declaration.symbol.name, "len");
+
+        references.package_callees = vec![held_stub("json/__init__.pyi", "loads")?];
+        references.drop_package_callees();
+        assert_eq!(references.dropped_callees, 2);
+        assert!(references.package_callees().is_empty());
+
+        references.package_callees = vec![held_stub("builtins.pyi", "len")?];
+        references.degrade(super::engine_analysis_warning(
+            rift_protocol::read::Language {
+                name: "python".to_owned(),
+                dialect: None,
+            },
+            "dropped",
+        ));
+        assert!(references.package_callees().is_empty());
+        assert!(
+            references
+                .package_declaration(&rift_core::SymbolId::new(len.0)?)
+                .is_none(),
+            "a dropped contribution takes its package declarations with it"
+        );
         Ok(())
     }
 
@@ -1536,7 +1818,7 @@ mod tests {
         let engines = pool(directory.path(), "python", configuration);
         let mut params = request(&symbol(&reads, "beacon"));
         params.traversal.as_mut().expect("traversal").depth = 2;
-        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, far())).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let references = result?;
         let seed = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
@@ -1600,7 +1882,7 @@ mod tests {
             &reads,
             &engines,
             &request(&symbol(&reads, "beacon")),
-            far(),
+            walk(),
         ))
         .await;
         std::io::Write::write_all(&mut release, b"done\n")?;
@@ -1714,7 +1996,7 @@ mod tests {
         let engines = EnginePool::new(directory.path(), BTreeMap::new(), BTreeMap::new());
         assert!(!super::uses_engine_references(&reads, &engines, &params)?);
         let references =
-            Box::pin(resolve_engine_references(&reads, &engines, &params, far())).await?;
+            Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await?;
         assert!(references.is_empty());
         let refused = reads
             .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
@@ -1736,7 +2018,7 @@ mod tests {
             &reads,
             &engines,
             &request(&symbol(&reads, "beacon")),
-            far(),
+            walk(),
         ))
         .await;
         engines.shutdown().await;
@@ -1759,7 +2041,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let resolved = Box::pin(resolve_engine_references(&reads, &engines, &params, far())).await;
+        let resolved = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let references = resolved?;
         assert!(
@@ -1806,7 +2088,7 @@ mod tests {
         command[2] = command[2].replace("referencesProvider\":true", "referencesProvider\":null");
         // true and null have identical byte lengths, so the fixture's frame stays valid.
         let engines = pool(directory.path(), "rust", fixture.configuration);
-        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, far())).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());
@@ -1831,7 +2113,7 @@ mod tests {
             &reads,
             &engines,
             &request(&symbol(&reads, "beacon")),
-            far(),
+            walk(),
         ))
         .await;
         engines.shutdown().await;
@@ -1867,7 +2149,7 @@ mod tests {
             let expected = reads
                 .search(&params, &StoreAnswer::identifier_only())
                 .expect_err("invalid search");
-            let error = Box::pin(resolve_engine_references(&reads, &engines, &params, far()))
+            let error = Box::pin(resolve_engine_references(&reads, &engines, &params, walk()))
                 .await
                 .expect_err("invalid search before engine");
             assert_eq!(error.descriptor().code(), expected.descriptor().code());
@@ -1898,7 +2180,7 @@ mod tests {
         )?;
         let engines = pool(directory.path(), "python", configuration);
         let params = request(&symbol(&reads, "beacon"));
-        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, far())).await;
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let references = result?;
         assert!(references.is_empty());

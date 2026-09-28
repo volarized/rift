@@ -12,13 +12,13 @@ use rift_index::{
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId,
-    TraversalDirection,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
+    SearchTraversal, SymbolId, TraversalDirection,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
-use crate::engine_read::EngineReferences;
+use crate::engine_read::{EngineReferences, PackageDeclaration};
 use crate::read::parse_symbol_address;
 use crate::read::{ReadError, ReadFault, ReadService};
 use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes, resolve_symbol};
@@ -112,6 +112,7 @@ pub(crate) fn collect_traversal_hits(
         root,
         to: traversal.to.as_ref(),
         payloads,
+        references,
     };
     merge_walk_hits(reads, walk.discovered, merge, results)?;
     Ok(TraversalReport {
@@ -121,21 +122,24 @@ pub(crate) fn collect_traversal_hits(
 }
 
 /// What one walk's discoveries pass before they become hits: the files the request's
-/// `paths` selector reaches, the one symbol `to` keeps, and what the walk's own hits are
-/// scored by.
+/// `paths` selector reaches, the one symbol `to` keeps, what the walk's own hits are
+/// scored by, and the package declarations its outgoing edges end at.
 #[derive(Clone, Copy)]
 pub(crate) struct WalkMerge<'merge> {
     pub(crate) matcher: Option<&'merge PathMatcher>,
     pub(crate) root: &'merge Path,
     pub(crate) to: Option<&'merge SymbolId>,
     pub(crate) payloads: HitPayloads,
+    pub(crate) references: &'merge EngineReferences,
 }
 
 /// Merges every symbol one walk discovered into `results`, in the order the walk found
 /// them.
 ///
 /// A discovery `results` already holds absorbs the walk; any other becomes a new hit
-/// tagged [`MatchedField::Relationship`].
+/// tagged [`MatchedField::Relationship`]. A package declaration an outgoing edge ends at
+/// becomes a hit addressed by its `unit`, unless a `paths` selector narrows the answer to
+/// project files.
 ///
 /// # Errors
 ///
@@ -151,9 +155,14 @@ pub(crate) fn merge_walk_hits(
             continue;
         }
         let Some((file, symbol)) = resolve_graph_symbol(reads.index(), &identity) else {
-            // A graph node with no lexical declaration in this snapshot: the store outlived
-            // the file it was built from. Skipping it is the same choice `merge_symbol_hit`
-            // makes for a ranked unit whose declaration is likewise gone.
+            if let Some(declaration) = merge.references.package_declaration(&identity)
+                && merge.matcher.is_none()
+            {
+                results.push(package_traversal_hit(declaration, path));
+            }
+            // Any other graph node with no lexical declaration in this snapshot: the store
+            // outlived the file it was built from. Skipping it is the same choice
+            // `merge_symbol_hit` makes for a ranked unit whose declaration is likewise gone.
             continue;
         };
         if !includes(merge.matcher, merge.root, file.path()) {
@@ -527,6 +536,28 @@ fn merge_traversal_hit(
     hit.distance = Some(distance);
     results.push(hit);
     Ok(())
+}
+
+/// The hit for one package declaration an outgoing edge ends at: its symbol, addressed by
+/// the unit of the package file holding it. The local index holds none of its bytes, so
+/// the hit carries no range, line, or source.
+fn package_traversal_hit(declaration: &PackageDeclaration, path: Vec<GraphHop>) -> SearchHit {
+    let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
+    SearchHit {
+        hit: SearchHitTarget::Symbol {
+            symbol: Box::new(declaration.symbol.clone()),
+        },
+        score: Some(distance_score(distance)),
+        matched_by: vec![MatchedField::Relationship],
+        source: None,
+        range: None,
+        line: None,
+        path: None,
+        unit: Some(declaration.unit.clone()),
+        traversal_path: Some(path),
+        distance: Some(distance),
+        change: None,
+    }
 }
 
 /// Records that `existing` was also reached by the walk: adds [`MatchedField::Relationship`]
