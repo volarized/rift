@@ -911,7 +911,7 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), Contributi
             "facts.language",
         ));
     }
-    if !valid_kind(&facts.kind.0) {
+    if !facts.kind.is_valid() {
         return Err(contribution_error(
             ContributionViolation::InvalidKind,
             "facts.kind",
@@ -1031,12 +1031,6 @@ fn valid_language(language: &Language) -> bool {
             .dialect
             .as_deref()
             .is_none_or(|dialect| is_canonical_ascii_name(dialect, 64, b"._-"))
-}
-
-fn valid_kind(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
 fn valid_namespace(value: &str) -> bool {

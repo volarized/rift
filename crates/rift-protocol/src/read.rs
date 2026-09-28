@@ -166,6 +166,61 @@ pub enum DocumentationFormat {
 #[schemars(transparent)]
 pub struct ExactKind(#[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9._-]*$"))] pub String);
 
+impl ExactKind {
+    /// Whether the kind has the form the schema pattern advertises: an ASCII letter, then
+    /// ASCII letters, digits, `.`, `_`, or `-`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        is_kind_word(&self.0)
+    }
+}
+
+impl TryFrom<String> for ExactKind {
+    type Error = ExactKindError;
+
+    fn try_from(kind: String) -> Result<Self, Self::Error> {
+        if is_kind_word(&kind) {
+            Ok(Self(kind))
+        } else {
+            Err(ExactKindError { kind })
+        }
+    }
+}
+
+/// A kind outside the form [`ExactKind`] advertises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactKindError {
+    kind: String,
+}
+
+impl ExactKindError {
+    /// The kind that was refused.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+impl std::fmt::Display for ExactKindError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "kind {:?} must start with an ASCII letter followed by ASCII letters, digits, `.`, \
+             `_`, or `-`, such as `function` or `type_alias`",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for ExactKindError {}
+
+/// Whether one kind matches the form `ExactKind` advertises.
+fn is_kind_word(kind: &str) -> bool {
+    let mut bytes = kind.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
 /// A reverse-domain namespaced extension or extension-operation identifier.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -2154,6 +2209,46 @@ mod tests {
     };
     use schemars::schema_for;
     use serde_json::json;
+
+    /// The kinds the advertised schema pattern accepts are the kinds `ExactKind` accepts,
+    /// over both sides of every rule the pattern states.
+    #[test]
+    fn exact_kind_schema_pattern_equals_the_kind_rule() {
+        let schema = serde_json::to_value(schema_for!(super::ExactKind)).expect("kind schema");
+        let validator = jsonschema::validator_for(&schema).expect("the kind schema compiles");
+        let samples = [
+            ("function", true),
+            ("type_alias", true),
+            ("rust.struct", true),
+            ("enum-member", true),
+            ("F9", true),
+            ("", false),
+            ("9struct", false),
+            ("_private", false),
+            (".hidden", false),
+            ("two words", false),
+            ("kind:dialect", false),
+            ("naïve", false),
+        ];
+        for (kind, accepted) in samples {
+            assert_eq!(
+                validator.is_valid(&json!(kind)),
+                accepted,
+                "schema: {kind:?}"
+            );
+            let parsed = super::ExactKind::try_from(kind.to_owned());
+            assert_eq!(parsed.is_ok(), accepted, "rule: {kind:?}");
+            assert_eq!(
+                super::ExactKind(kind.to_owned()).is_valid(),
+                accepted,
+                "held: {kind:?}"
+            );
+            if let Err(error) = parsed {
+                assert_eq!(error.kind(), kind);
+                assert!(error.to_string().contains("such as `function`"), "{error}");
+            }
+        }
+    }
 
     /// A refused identity segment renders with the segment it read and the two
     /// forms it accepts, so an operator fixing `rift.toml` sees both.
