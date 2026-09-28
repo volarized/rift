@@ -45,7 +45,7 @@ use rift_protocol::index::{
 };
 use rift_protocol::read::{
     Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceLocationKind, SourceUnitId,
-    SymbolId, SymbolOrigin, TextRange,
+    SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxSymbol};
@@ -1465,15 +1465,27 @@ pub enum PackageLanguage {
 /// items and an enum's variants carry no visibility of their own.
 const PUBLIC_MEMBER_CONTAINERS: [&str; 2] = ["trait", "enum"];
 
+/// JavaScript container kinds whose members an exported container exports: a class's
+/// methods carry no `export` of their own.
+const JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS: [&str; 1] = ["class"];
+
+/// The prefix of an ES private element's name (`#secret`), which nothing outside its
+/// class reaches.
+const PRIVATE_ELEMENT_PREFIX: char = '#';
+
+/// The shipped language a definition serves `language` under.
+fn shipped_language(language: &Language) -> Option<ShippedLanguage> {
+    rift_syntax::definitions()
+        .iter()
+        .map(|definition| definition.shipped())
+        .find(|shipped| &shipped.language() == language)
+}
+
 impl PackageLanguage {
     /// Rules for one language, when a shipped definition serves it.
     #[must_use]
     pub fn for_language(language: &Language) -> Option<Self> {
-        let shipped = rift_syntax::definitions()
-            .iter()
-            .map(|definition| definition.shipped())
-            .find(|shipped| &shipped.language() == language)?;
-        match shipped {
+        match shipped_language(language)? {
             ShippedLanguage::Rust => Some(Self::Rust),
             ShippedLanguage::Python => Some(Self::Python),
             ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
@@ -1521,11 +1533,65 @@ impl PackageLanguage {
     }
 }
 
-/// Qualified names of declarations a package language exposes.
+/// The rule deciding which declarations of one package file are public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportRule {
+    /// A package language's own rule.
+    Language(PackageLanguage),
+    /// A JavaScript module exports what an ES `export` wraps: a declaration the provider
+    /// marks `Public`, and a member of a class so marked other than an ES private
+    /// element. A CommonJS `module.exports` or `exports.name` assignment wraps no
+    /// declaration, so it marks none.
+    JavaScriptModule,
+}
+
+impl ExportRule {
+    /// The rule for files in `language`. Absent for a language with no export rule, whose
+    /// every declaration is public.
+    fn for_language(language: &Language) -> Option<Self> {
+        if shipped_language(language)? == ShippedLanguage::JavaScript {
+            return Some(Self::JavaScriptModule);
+        }
+        PackageLanguage::for_language(language).map(Self::Language)
+    }
+
+    fn is_public(self, symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+        match self {
+            Self::Language(rules) => rules.is_public(symbol, by_name),
+            Self::JavaScriptModule => is_javascript_export(symbol, by_name),
+        }
+    }
+}
+
+/// Whether a JavaScript module exports `symbol`: an ES `export` wraps it, or it is a
+/// member of a class an `export` wraps and no ES private element.
+fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+    let exported = is_exported(symbol);
+    let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
+    let member_of_exported_class = symbol
+        .container
+        .as_deref()
+        .and_then(|container| by_name.get(container))
+        .is_some_and(|container| {
+            JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind) && is_exported(container)
+        });
+    exported || (member_of_exported_class && !private_element)
+}
+
+/// Whether the provider marks `symbol` public, as an ES `export` does.
+fn is_exported(symbol: &SyntaxSymbol) -> bool {
+    symbol.facets.contains(&SymbolFacet::Public)
+}
+
+/// Qualified names of declarations a package file exposes under its language's export
+/// rule.
+///
+/// A paired module's set is replaced afterwards by the one its stub defines, so this rule
+/// decides an unpaired file alone.
 #[must_use]
 pub fn public_qualified_names(language: &Language, document: &SyntaxDocument) -> BTreeSet<String> {
     let symbols = document.symbols();
-    let Some(rules) = PackageLanguage::for_language(language) else {
+    let Some(rule) = ExportRule::for_language(language) else {
         return symbols
             .iter()
             .map(|symbol| symbol.qualified_name.clone())
@@ -1537,7 +1603,7 @@ pub fn public_qualified_names(language: &Language, document: &SyntaxDocument) ->
         .collect();
     symbols
         .iter()
-        .filter(|symbol| rules.is_public(symbol, &by_name))
+        .filter(|symbol| rule.is_public(symbol, &by_name))
         .map(|symbol| symbol.qualified_name.clone())
         .collect()
 }
@@ -1819,8 +1885,8 @@ mod tests {
     }
 
     /// Every shipped package language reaches the publication through the same pass,
-    /// each under its own export rule: JavaScript ships none, so every declaration is
-    /// public, while TypeScript and TSX drop a `private` member.
+    /// each under its own export rule: JavaScript exports what `export` wraps, while
+    /// TypeScript and TSX drop a `private` member.
     #[test]
     fn test_every_package_language_publishes_its_public_declarations() {
         let cases = [
@@ -1828,7 +1894,7 @@ mod tests {
                 ShippedLanguage::JavaScript,
                 "index.js",
                 "export function open() {}\nfunction helper() {}\n",
-                vec!["helper", "open"],
+                vec!["open"],
             ),
             (
                 ShippedLanguage::TypeScript,
@@ -1854,6 +1920,112 @@ mod tests {
             assert_eq!(public, expected, "{path}");
             assert_eq!(publication.units.len(), 1, "{path}");
         }
+    }
+
+    /// The public names of the one file `path` holds, analyzed alone under `shipped`.
+    fn public_names(shipped: ShippedLanguage, path: &str, source: &str) -> Vec<String> {
+        analyzed(shipped, vec![(path, source)])
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.public)
+            .map(|symbol| symbol.qualified_name.clone())
+            .collect()
+    }
+
+    /// An unpaired JavaScript module exports what an ES `export` wraps, a default export
+    /// included, and the members of an exported class other than a `#` private element. A
+    /// helper nothing wraps stays private, and so does one an `export { name }` clause
+    /// names, since the provider marks the declaration and not the clause.
+    #[test]
+    fn test_an_unpaired_javascript_module_exports_what_export_wraps() {
+        let source = "export function open() {}\n\
+                      function helper() {}\n\
+                      export class Client {\n  connect() {}\n  static make() {}\n  #hidden() {}\n}\n\
+                      class Internal {\n  run() {}\n}\n\
+                      export const answer = 42, other = 1;\n\
+                      export default function main() {}\n\
+                      function later() {}\n\
+                      export { later };\n";
+        let mut public = public_names(ShippedLanguage::JavaScript, "index.js", source);
+        public.sort();
+        assert_eq!(
+            public,
+            [
+                "Client",
+                "Client.connect",
+                "Client.make",
+                "answer",
+                "main",
+                "open",
+                "other"
+            ]
+        );
+        for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
+            let publication = analyzed(shipped, vec![("lib/index.mjs", source)]);
+            let module_public = publication
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.public)
+                .count();
+            assert_eq!(
+                module_public,
+                public.len(),
+                "a TypeScript package's JavaScript build takes the same rule"
+            );
+        }
+    }
+
+    /// The JavaScript provider declares nothing for a CommonJS `exports.name = function`
+    /// assignment, and marks no declaration `Public` for `module.exports = { .. }`, so a
+    /// CommonJS module keeps its declarations and exports none of them.
+    #[test]
+    fn test_a_commonjs_module_exports_no_declaration() {
+        let source = "function helper() {}\n\
+                      class Runner {\n  run() {}\n}\n\
+                      module.exports = { helper, Runner, start() {} };\n\
+                      exports.extra = function extra() {};\n";
+        let publication = analyzed(ShippedLanguage::JavaScript, vec![("index.cjs", source)]);
+        let mut declared: Vec<&str> = publication
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(declared, ["Runner", "Runner.run", "helper", "start"]);
+        assert!(
+            publication.symbols.iter().all(|symbol| !symbol.public),
+            "{:?}",
+            publication.symbols
+        );
+    }
+
+    /// A paired JavaScript module keeps the public set its declaration file defines: an
+    /// `export` the stub does not declare leaves the set.
+    #[test]
+    fn test_a_paired_javascript_module_keeps_the_stub_public_set() {
+        let publication = analyzed(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.d.ts", "export declare function open(): void;\n"),
+                (
+                    "index.js",
+                    "export function open() {}\nexport function internal() {}\n",
+                ),
+            ],
+        );
+        let public: Vec<&str> = publication
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.public)
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect();
+        assert_eq!(public, ["open"]);
+        assert!(
+            publication
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name == "internal" && !symbol.public)
+        );
     }
 
     #[test]
