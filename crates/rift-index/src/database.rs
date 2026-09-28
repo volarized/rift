@@ -31,22 +31,39 @@ use crate::lexical::{
 use crate::log::LogRecordRow;
 use crate::vector::VectorRecord;
 
-/// Connection count and lock-wait bounds for one database file.
+/// Connection count, lock-wait bounds, and memory map size for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
     slots: u32,
     busy_timeout_ms: u32,
+    mmap_bytes: u64,
 }
 
 impl DatabasePool {
     /// Builds the pool's bounds: connection slots, and the busy-wait budget
-    /// `SQLite` grants a connection before it refuses.
+    /// `SQLite` grants a connection before it refuses. Connections read through
+    /// `SQLite`'s page cache alone until [`Self::memory_mapped`] sets a map.
     #[must_use]
     pub const fn new(slots: u32, busy_timeout_ms: u32) -> Self {
         Self {
             slots,
             busy_timeout_ms,
+            mmap_bytes: 0,
         }
+    }
+
+    /// The same pool with each connection mapping up to `mmap_bytes` of the file,
+    /// the `[search.lexical] mmap_size` key. `SQLite` caps the map at its compiled
+    /// `SQLITE_MAX_MMAP_SIZE`, the key's accepted maximum.
+    #[must_use]
+    pub const fn memory_mapped(self, mmap_bytes: u64) -> Self {
+        Self { mmap_bytes, ..self }
+    }
+
+    /// The bytes of the file each connection maps; `0` maps nothing.
+    #[must_use]
+    pub const fn mmap_bytes(self) -> u64 {
+        self.mmap_bytes
     }
 
     /// Pooled connection slots.
@@ -215,7 +232,10 @@ async fn configure_journal(connection: &mut Connection) -> Result<(), LexicalInd
     require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
 }
 
-/// Applies connection-local durability, lock wait, and access policy.
+/// Applies connection-local durability, lock wait, memory map, and access policy.
+///
+/// Every checkout sets each pragma again, one statement each, so a pooled connection
+/// answers under this pool's policy whichever checkout opened it.
 async fn configure_connection(
     connection: &mut Connection,
     pool: DatabasePool,
@@ -227,6 +247,11 @@ async fn configure_connection(
         .map_err(storage_error)?;
     let busy_timeout_ms = pool.busy_timeout_ms();
     toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
+        .exec(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+    let mmap_bytes = pool.mmap_bytes();
+    toasty::sql::query(format!("PRAGMA mmap_size = {mmap_bytes}"))
         .exec(&mut *connection)
         .await
         .map_err(storage_error)?;
@@ -327,6 +352,47 @@ mod tests {
             .exec(&mut transaction)
             .await?;
         crate::lexical::require_pragma_row(&query_only, &[Value::I64(0)])?;
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_checkout_maps_the_pool_memory_map_size() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let unmapped = WorkspaceDatabase::open(&path, pool()).await?;
+        let mut reading = unmapped.connection().await?;
+        crate::lexical::require_pragma_row(
+            &toasty::sql::query("PRAGMA mmap_size")
+                .column_types([Type::I64])
+                .exec(&mut reading)
+                .await?,
+            &[Value::I64(0)],
+        )?;
+        drop(reading);
+        drop(unmapped);
+
+        let mapped_pool = pool().memory_mapped(1 << 20);
+        assert_eq!(mapped_pool.mmap_bytes(), 1 << 20);
+        let database = WorkspaceDatabase::open(&path, mapped_pool).await?;
+        let mut reading = database.connection().await?;
+        crate::lexical::require_pragma_row(
+            &toasty::sql::query("PRAGMA mmap_size")
+                .column_types([Type::I64])
+                .exec(&mut reading)
+                .await?,
+            &[Value::I64(1 << 20)],
+        )?;
+        drop(reading);
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        crate::lexical::require_pragma_row(
+            &toasty::sql::query("PRAGMA mmap_size")
+                .column_types([Type::I64])
+                .exec(&mut transaction)
+                .await?,
+            &[Value::I64(1 << 20)],
+        )?;
         transaction.rollback().await?;
         Ok(())
     }

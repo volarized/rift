@@ -54,6 +54,7 @@ fn configured_pool(root: &Path) -> DatabasePool {
         u32::try_from(search.pool_slots).unwrap_or(u32::MAX),
         u32::try_from(search.busy_timeout.milliseconds()).unwrap_or(u32::MAX),
     )
+    .memory_mapped(search.lexical.mmap_size.bytes())
 }
 
 /// Opens the file without replacing a failed database.
@@ -124,6 +125,25 @@ mod tests {
         assert!(
             database_path.is_dir(),
             "the failed path must not be deleted"
+        );
+    }
+
+    #[test]
+    fn the_pool_maps_what_search_lexical_mmap_size_names() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        assert_eq!(
+            super::configured_pool(directory.path()).mmap_bytes(),
+            rift_protocol::configuration::LEXICAL_MMAP_BYTES_DEFAULT,
+            "an absent key maps the default"
+        );
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            "[search.lexical]\nmmap_size = \"8mb\"\n",
+        )
+        .expect("the workspace configuration writes");
+        assert_eq!(
+            super::configured_pool(directory.path()).mmap_bytes(),
+            8 << 20
         );
     }
 

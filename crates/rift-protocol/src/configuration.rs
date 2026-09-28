@@ -1197,8 +1197,8 @@ fn is_repository_word(word: &str) -> bool {
         })
 }
 
-/// The `[search.lexical]` table: how many units the lexical index holds, and how many one
-/// transaction writes.
+/// The `[search.lexical]` table: how many units the lexical index holds, how many one
+/// transaction writes, and how much of the store file a connection memory-maps.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LexicalSearchConfiguration {
@@ -1217,6 +1217,11 @@ pub struct LexicalSearchConfiguration {
     /// Most content one lexical transaction writes, 1mb to 1gb, counted and
     /// applied the way `transaction_units` is.
     pub transaction_size: ByteSize,
+    /// How much of the workspace database each connection reads through a
+    /// memory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page
+    /// cache alone. Every connection maps the file on its own, so resident
+    /// memory counts the mapped pages once per open connection.
+    pub mmap_size: ByteSize,
 }
 
 impl Default for LexicalSearchConfiguration {
@@ -1225,6 +1230,7 @@ impl Default for LexicalSearchConfiguration {
             units_max: LEXICAL_UNITS_MAX_DEFAULT,
             transaction_units: LEXICAL_TRANSACTION_UNITS_DEFAULT,
             transaction_size: ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT),
+            mmap_size: ByteSize::from_bytes(LEXICAL_MMAP_BYTES_DEFAULT),
         }
     }
 }
@@ -1250,6 +1256,12 @@ impl LexicalSearchConfiguration {
                 self.transaction_size.bytes(),
                 LEXICAL_TRANSACTION_BYTES_MIN,
                 LEXICAL_TRANSACTION_BYTES_MAX,
+            ),
+            (
+                "search.lexical.mmap_size",
+                self.mmap_size.bytes(),
+                0,
+                LEXICAL_MMAP_BYTES_MAX,
             ),
         ])
     }
@@ -1817,6 +1829,12 @@ pub const LEXICAL_TRANSACTION_BYTES_MAX: u64 = 1 << 30;
 /// `search.lexical.transaction_size` when the key is absent: sixteen of the largest text
 /// chunks `[search.text] max_chunk` accepts by default.
 pub const LEXICAL_TRANSACTION_BYTES_DEFAULT: u64 = 16 << 20;
+/// `search.lexical.mmap_size` accepted, at most: the bundled `SQLite`'s
+/// `SQLITE_MAX_MMAP_SIZE`, which caps the map whatever a connection asks for.
+pub const LEXICAL_MMAP_BYTES_MAX: u64 = 2_147_418_112;
+/// `search.lexical.mmap_size` when the key is absent: one gigabyte, which maps the whole
+/// store of a workspace the size of the bun or next.js repositories.
+pub const LEXICAL_MMAP_BYTES_DEFAULT: u64 = 1 << 30;
 
 /// What stands in for a credential an endpoint value carried.
 const CREDENTIAL_REDACTED: &str = "[redacted]";
@@ -3092,6 +3110,10 @@ mod tests {
         assert_eq!(
             configuration.search.lexical.transaction_size,
             ByteSize::from_bytes(16 << 20)
+        );
+        assert_eq!(
+            configuration.search.lexical.mmap_size,
+            ByteSize::from_bytes(1_073_741_824)
         );
         assert_eq!(ranking.fusion_k, 60);
         assert_eq!(
@@ -4430,6 +4452,37 @@ mod tests {
             configuration.search.lexical.transaction_size = ByteSize::from_bytes(bytes);
             assert_eq!(configuration.validate(), Ok(()));
         }
+    }
+
+    #[test]
+    fn test_search_lexical_mmap_size_refuses_past_the_bundled_cap() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.lexical.mmap_size = ByteSize::from_bytes(2_147_418_113);
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "search.lexical.mmap_size",
+                    ..
+                })
+            ),
+            "a map past SQLITE_MAX_MMAP_SIZE must be refused naming the key"
+        );
+        for bytes in [0, LEXICAL_MMAP_BYTES_MAX] {
+            configuration.search.lexical.mmap_size = ByteSize::from_bytes(bytes);
+            assert_eq!(configuration.validate(), Ok(()), "mmap_size {bytes}");
+        }
+        let written = json!({ "search": { "lexical": { "mmap_size": "256mb" } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the memory map size deserializes");
+        assert_eq!(
+            configuration.search.lexical.mmap_size,
+            ByteSize::from_bytes(256 << 20)
+        );
+        assert_eq!(
+            configuration.search.lexical.transaction_size,
+            ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT)
+        );
     }
 
     #[test]
