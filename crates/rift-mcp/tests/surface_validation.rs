@@ -339,6 +339,11 @@ fn lexical_search_corpus() -> Vec<(&'static str, Value)> {
 fn revision_read_corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("get_symbol", json!({ "name": "beacon_one", "rev": "main" })),
+        // An ancestry suffix names the fixture's baseline, one commit below `HEAD`.
+        (
+            "get_symbol",
+            json!({ "name": "beacon_one", "rev": "HEAD^" }),
+        ),
         ("search", json!({ "query": "beacon", "rev": "main" })),
         (
             "nodes",
@@ -368,6 +373,10 @@ fn change_search_corpus() -> Vec<(&'static str, Value)> {
                 "change": { "base": "baseline", "head": { "kind": "working_tree" } },
                 "include": ["source"]
             }),
+        ),
+        (
+            "search",
+            json!({ "change": { "base": "HEAD~1", "head": "HEAD" } }),
         ),
     ]
 }
@@ -1424,6 +1433,49 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
     assert_eq!(commit["paths"], json!(["change_witness.rs"]));
     assert_eq!(commit["paths_truncated"], json!(false));
     assert_eq!(structured["results"].as_array().map(Vec::len), Some(1));
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A revision spelling past the advertised form - a reflog selector, or an ancestry suffix
+/// followed by a path - refuses `invalid_request` naming the field that carried it.
+#[tokio::test]
+async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let refused = [
+        (
+            "get_symbol",
+            json!({ "name": "beacon_one", "rev": "HEAD@{1}" }),
+            "field rev",
+        ),
+        (
+            "search",
+            json!({ "change": { "base": "HEAD~1/lib.rs" } }),
+            "field change.base",
+        ),
+    ];
+    for (name, arguments, field) in refused {
+        let error = client
+            .call_tool(tools_call_request(name, &arguments)?)
+            .await
+            .expect_err("the spelling must be refused");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{arguments}: {wire:#}"
+        );
+        assert!(
+            error.message.contains(field),
+            "{arguments}: {}",
+            error.message
+        );
+    }
 
     client.cancel().await?;
     server_task.await?;
