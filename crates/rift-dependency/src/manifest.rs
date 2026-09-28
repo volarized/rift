@@ -343,6 +343,20 @@ mod tests {
         );
     }
 
+    /// The lexical form drops a leading `.`, which `Path::components` keeps, and each
+    /// `..` takes its parent away.
+    #[test]
+    fn test_the_lexical_form_drops_current_and_parent_components() {
+        assert_eq!(
+            lexical(Path::new("./packages/../api/./src")),
+            PathBuf::from("api/src")
+        );
+        assert_eq!(
+            lexical(Path::new("/workspace/crates/../../outside")),
+            PathBuf::from("/outside")
+        );
+    }
+
     #[test]
     fn test_read_static_file_names_the_file_in_every_failure() {
         let oversized = vec![b'#'; usize::try_from(LOCKFILE_BYTES_MAX).expect("bound fits") + 1];

@@ -118,7 +118,8 @@ mod tests {
     const ROOT: &str = "/workspace";
 
     /// A lockfile pinning one registry package, one package from a private registry, one
-    /// nested copy, one repository package, and the workspace's own member.
+    /// nested copy, one repository package, a directory inside the root, and the
+    /// workspace's own member.
     const LOCKFILE: &str = r#"{
   "lockfileVersion": 1,
   "workspaces": {
@@ -131,6 +132,7 @@ mod tests {
     "typescript/@types/node": ["@types/node@24.3.1", "", {}, "sha512-tn"],
     "tool": ["tool@git+https://example.test/tool.git#abc1234", {}, "abc1234"],
     "api": ["api@workspace:packages/api"],
+    "local": ["local@file:packages/local", {}],
     "broken": ["no-separator"],
   }
 }
@@ -181,7 +183,8 @@ mod tests {
                 "typescript: version 5.9.3 (Canonical)",
                 "@types/node: version 24.3.1 (Canonical)"
             ],
-            "a workspace package and a malformed tuple pin nothing"
+            "a workspace package, a directory inside the root, and a malformed tuple pin \
+             nothing"
         );
         let folders: Vec<(String, &InstallLocation)> = answer
             .install_folders

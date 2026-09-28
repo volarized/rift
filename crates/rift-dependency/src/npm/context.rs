@@ -951,6 +951,33 @@ mod tests {
         );
     }
 
+    /// An empty `workspaces` list names no member, so a package declared under a member's
+    /// name is a registry package, and nothing degrades.
+    #[test]
+    fn test_an_empty_workspaces_list_names_no_member() {
+        let manifest = r#"{"name":"probe","workspaces":[],"dependencies":{"api":"*"}}"#;
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/package.json"), manifest)
+            .with_file(
+                format!("{ROOT}/packages/api/package.json"),
+                r#"{"name":"api"}"#,
+            );
+
+        let answer = context(
+            &["package.json", "packages/api/package.json"],
+            &mut inspector,
+        );
+
+        assert_eq!(
+            reported(&answer),
+            [(
+                "api: requirement *".to_owned(),
+                PackageAvailability::Canonical
+            )]
+        );
+        assert!(answer.degradations.is_empty());
+    }
+
     #[test]
     fn test_an_invalid_workspaces_glob_is_a_degradation_and_the_declarations_stand() {
         let manifest = r#"{"name":"probe","workspaces":["packages/["],"dependencies":{"api":"*"}}"#;

@@ -249,6 +249,25 @@ mod tests {
         }
     }
 
+    /// Inputs that read files alone resolve no link and list no directory, so a caller
+    /// compares the lexical path and finds no installed entry.
+    #[test]
+    fn test_inputs_reading_files_alone_resolve_no_link_and_list_nothing() {
+        struct FilesAlone;
+
+        impl StaticInputs for FilesAlone {
+            fn read_file(&mut self, _path: &Path, _bytes_max: u64) -> FileObservation {
+                FileObservation::Absent
+            }
+        }
+
+        let mut inputs = FilesAlone;
+        let folder = Path::new("/workspace/.venv/lib");
+        assert_eq!(inputs.read_file(folder, 1), FileObservation::Absent);
+        assert_eq!(inputs.canonical_path(folder), None);
+        assert!(inputs.list_directory(folder, 8).is_empty());
+    }
+
     #[test]
     fn test_command_rendering_joins_program_and_arguments() {
         let command = ToolchainCommand {

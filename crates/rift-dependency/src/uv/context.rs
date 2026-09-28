@@ -786,6 +786,47 @@ source = { virtual = "." }
         );
     }
 
+    /// uv writes no `version` for a source tree whose version is dynamic, so the lockfile
+    /// pins nothing for it, and the manifest's requirement for it, a directory outside the
+    /// root, goes out as a `path` entry.
+    #[test]
+    fn test_a_dynamic_version_directory_outside_the_root_reports_the_requirement() {
+        let manifest = r#"[project]
+name = "probe"
+version = "0.1.0"
+dependencies = ["sibling>=2"]
+
+[tool.uv.sources]
+sibling = { path = "../sibling", editable = true }
+"#;
+        let lockfile = r#"version = 1
+revision = 3
+
+[[package]]
+name = "probe"
+version = "0.1.0"
+source = { virtual = "." }
+
+[[package]]
+name = "sibling"
+source = { editable = "../sibling" }
+"#;
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/pyproject.toml"), manifest)
+            .with_file(format!("{ROOT}/uv.lock"), lockfile);
+
+        let answer = context(&["pyproject.toml"], &mut inspector);
+
+        assert_eq!(
+            reported(&answer),
+            [(
+                "sibling: requirement >=2".to_owned(),
+                PackageAvailability::Path
+            )]
+        );
+        assert!(answer.degradations.is_empty());
+    }
+
     #[test]
     fn test_a_nested_project_locking_the_root_reports_it_as_project_source() {
         // ~/projects/crosswire/bench/py311 locks the repository root it sits two levels
@@ -844,6 +885,7 @@ dependencies = [
   "member>=0.2",
   "mirrored>=1",
   "marked>=1",
+  "unlocated>=1",
 ]
 
 [tool.uv.sources]
@@ -858,6 +900,7 @@ marked = [
   { path = "libs/marked", marker = "sys_platform == 'linux'" },
   { url = "https://example.test/marked-1.0.tar.gz", marker = "sys_platform != 'linux'" },
 ]
+unlocated = { marker = "sys_platform == 'linux'" }
 "#;
         let mut inspector = RecordedInspector::default()
             .with_file(format!("{ROOT}/pyproject.toml"), manifest)
@@ -898,9 +941,13 @@ marked = [
                     "marked: requirement >=1".to_owned(),
                     PackageAvailability::Url
                 ),
+                (
+                    "unlocated: requirement >=1".to_owned(),
+                    PackageAvailability::Canonical
+                ),
             ],
             "a directory inside the root and a member are project source; an archive \
-             inside it is not"
+             inside it is not; a source naming no location leaves the registry deciding"
         );
     }
 

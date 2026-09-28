@@ -774,4 +774,22 @@ version = \"0.3.0\"
             "helper is project source; `..` and a link leaving the root are not"
         );
     }
+
+    /// One package several manifests declare: a declaration naming a source anywhere
+    /// else decides, then a path inside the root, and inheritance alone says nothing.
+    #[test]
+    fn test_declarations_join_elsewhere_over_inside_over_inherited() {
+        use Declaration::{Elsewhere, Inherited, Inside};
+
+        let cases = [
+            (Inside, Elsewhere, Elsewhere),
+            (Elsewhere, Inherited, Elsewhere),
+            (Inherited, Inside, Inside),
+            (Inside, Inside, Inside),
+            (Inherited, Inherited, Inherited),
+        ];
+        for (standing, found, joined) in cases {
+            assert_eq!(standing.joined(found), joined, "{standing:?} and {found:?}");
+        }
+    }
 }
