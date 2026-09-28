@@ -32,6 +32,11 @@ pub enum RankingViolation {
     /// The store behind one reader refused, and its own failure rides as the
     /// cause.
     ReaderFailed,
+    /// A regex pattern is not valid `regex` crate syntax; the parser's own message
+    /// rides as the subject.
+    PatternSyntax,
+    /// A regex pattern compiles past the accepted program size.
+    PatternSize,
 }
 
 impl RankingViolation {
@@ -42,7 +47,9 @@ impl RankingViolation {
             | Self::QueryLength
             | Self::QueryTermLength
             | Self::QueryQuoteUnterminated
-            | Self::QueryPhraseLimit => ErrorName::Wire(ErrorCode::InvalidRequest),
+            | Self::QueryPhraseLimit
+            | Self::PatternSyntax
+            | Self::PatternSize => ErrorName::Wire(ErrorCode::InvalidRequest),
             Self::DocumentIdentityEmpty
             | Self::DocumentFieldLength
             | Self::CapabilitiesIncompatible => ErrorName::Wire(ErrorCode::InternalError),
@@ -171,7 +178,7 @@ mod tests {
 
     /// Every violation this crate can raise, so a new one has to name its code
     /// here before it can reach a caller.
-    const EVERY_VIOLATION: [RankingViolation; 11] = [
+    const EVERY_VIOLATION: [RankingViolation; 13] = [
         RankingViolation::QueryEmpty,
         RankingViolation::QueryLength,
         RankingViolation::QueryTermLength,
@@ -183,6 +190,8 @@ mod tests {
         RankingViolation::FusionConstantInvalid,
         RankingViolation::CapabilitiesIncompatible,
         RankingViolation::ReaderFailed,
+        RankingViolation::PatternSyntax,
+        RankingViolation::PatternSize,
     ];
 
     #[test]
@@ -194,7 +203,9 @@ mod tests {
                 | RankingViolation::QueryLength
                 | RankingViolation::QueryTermLength
                 | RankingViolation::QueryQuoteUnterminated
-                | RankingViolation::QueryPhraseLimit => ErrorCode::InvalidRequest,
+                | RankingViolation::QueryPhraseLimit
+                | RankingViolation::PatternSyntax
+                | RankingViolation::PatternSize => ErrorCode::InvalidRequest,
                 RankingViolation::DocumentIdentityEmpty
                 | RankingViolation::DocumentFieldLength
                 | RankingViolation::CapabilitiesIncompatible => ErrorCode::InternalError,

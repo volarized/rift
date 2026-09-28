@@ -1,6 +1,7 @@
 //! The retrieval decisions every Rift index shares: what a searchable document
 //! holds, how a caller's query becomes bounded terms, how an identifier match
-//! is classed, and how ordered identities fuse into one answer.
+//! is classed, how ordered identities fuse into one answer, and which trigrams
+//! a regex pattern requires of the text it matches.
 //!
 //! Nothing here opens a database, loads a model, or resolves a project path. A
 //! reader hands this crate ordered identities and receives ordered identities
@@ -15,9 +16,11 @@ mod document;
 mod error;
 mod fusion;
 mod identifier;
+mod pattern;
 mod query;
 mod reader;
 mod tokenizer;
+mod trigram;
 
 pub use body::{BODY_MATCH_FILE_ROWS_MAX, BodyMatchPool, BodyTerms, FileRowFrequencies};
 pub use document::{
@@ -34,6 +37,9 @@ pub use identifier::{
     IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatchClass, IdentifierRanking,
     identifier_candidates, identifier_terms, match_class, split_identifier_words,
 };
+pub use pattern::{
+    CLASS_EXPANSION_MAX, EXACT_STRINGS_MAX, Pattern, Prefilter, ROW_EXPRESSION_DEPTH_MAX, prefilter,
+};
 pub use query::{
     PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QUERY_BYTES_MAX, QUERY_BYTES_MIN,
     QUERY_PREFIX_ALPHANUMERIC_MIN, QUERY_TERM_BYTES_MAX, QueryMember, QueryPhase,
@@ -43,6 +49,7 @@ pub use reader::{
     ReaderFuture,
 };
 pub use tokenizer::tokenize;
+pub use trigram::{TRIGRAM_TOKENIZER, fold, trigram_set, trigrams};
 
 /// Compile-time marker for ranking-layer ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
