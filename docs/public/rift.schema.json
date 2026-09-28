@@ -85,41 +85,15 @@
     },
     "DependenciesConfiguration": {
       "additionalProperties": false,
-      "description": "The `[dependencies]` table. It states how the catalog is resolved, which packages\nthe operator names beside the ones the workspace's manifests and lockfiles state,\nand the bounds the package index reads and holds under.",
+      "description": "The `[dependencies]` table. It states whether the dependency context runs the\nstandard library version probes, how long one probe may take, and which packages the\noperator names beside the ones the workspace's manifests and lockfiles state.",
       "properties": {
         "command_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "2m",
-          "description": "Wall-clock bound one toolchain run may take before it is killed, 1s to 1h.",
+          "description": "Wall-clock bound one standard library version probe may take before it is\nkilled, 1s to 1h.",
           "rift:range": {
             "max": "1h",
             "min": "1s"
-          }
-        },
-        "index_size": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "256mb",
-          "description": "Bytes every indexed package may hold together, 1mb to 16gb. A package that\nwould cross it is skipped.",
-          "rift:range": {
-            "max": "16gb",
-            "min": "1mb"
-          }
-        },
-        "package_files": {
-          "default": 2000,
-          "description": "Files one package's selection may hold, 1 to 100000. A package past it is\nskipped.",
-          "format": "uint64",
-          "maximum": 100000,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "package_size": {
-          "$ref": "#/$defs/ByteSize",
-          "default": "4mb",
-          "description": "Bytes one package's selected source may hold, 64kb to 1gb. A package past it is\nskipped.",
-          "rift:range": {
-            "max": "1gb",
-            "min": "64kb"
           }
         },
         "packages": {
@@ -134,22 +108,22 @@
         "resolution": {
           "$ref": "#/$defs/DependencyResolution",
           "default": "auto",
-          "description": "How the catalog is resolved: `auto` runs each toolchain, `static` reads the\nlockfiles and package caches alone."
+          "description": "Whether a standard library version probe runs: `auto` runs `rustc --version` or\n`node --version` when no pin names the version, `static` reads the pins and project\nfiles alone and runs no program."
         }
       },
       "type": "object"
     },
     "DependencyResolution": {
-      "description": "How the resolvers reach a package graph: through each toolchain, or from the\nstatic inputs alone.",
+      "description": "Whether the dependency context runs the standard library version probes, or reads\nthe static inputs alone.",
       "oneOf": [
         {
           "const": "auto",
-          "description": "Each resolver runs its toolchain and answers from its static inputs when the run\nfails.",
+          "description": "A standard library version no pin names is read from `rustc --version` or\n`node --version`, and the static reading stands when the probe fails.",
           "type": "string"
         },
         {
           "const": "static",
-          "description": "No toolchain runs. Each resolver answers from its static inputs, and an entry only\na toolchain can name is reported as a degradation.",
+          "description": "No program runs. Every standard library version comes from the pins and project\nfiles alone.",
           "type": "string"
         }
       ]
@@ -538,6 +512,11 @@
             }
           ],
           "description": "Inline LSP process or name of one shared process."
+        },
+        "stdlib": {
+          "default": true,
+          "description": "Whether the package context names this language's standard library: `stdlib/rust`\nfor `rust`, `stdlib/node` and npm `typescript` for `javascript`, `typescript`, and\n`typescript:tsx`, and `stdlib/python` for `python`. A library stays in the context\nwhile any language the workspace uses that names it keeps this key on.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1203,13 +1182,10 @@
       "$ref": "#/$defs/DependenciesConfiguration",
       "default": {
         "command_timeout": "2m",
-        "index_size": "256mb",
-        "package_files": 2000,
-        "package_size": "4mb",
         "packages": [],
         "resolution": "auto"
       },
-      "description": "Whether the dependency index runs, how the catalog is resolved, which\ncataloged packages it indexes, and the bounds it indexes under."
+      "description": "Whether the dependency context runs the standard library version probes, how long\none probe may take, and which packages the context carries beside the ones the\nworkspace's manifests and lockfiles state."
     },
     "execution": {
       "$ref": "#/$defs/ExecutionConfiguration",

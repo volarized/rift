@@ -1,20 +1,19 @@
-//! The resolver contract, and the inspector a resolver observes the workspace through.
+//! The resolver contract, and the inputs a resolver reads the workspace through.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use rift_protocol::read::{Language, ProjectPath};
+use rift_protocol::read::ProjectPath;
 use serde::Serialize;
 use strum::VariantArray;
 
-use crate::catalog::Resolution;
 use crate::context::ContextAnswer;
 
-/// Bytes one toolchain run may write to standard output before the inspector stops
-/// keeping it. Held below the server's stream drain ceiling, so an output that reaches
-/// this bound is still counted past it and reported as truncated; a package graph past
-/// it answers as a command failure.
-pub const TOOLCHAIN_OUTPUT_BYTES_MAX: u64 = 32 << 20;
+/// Bytes one version probe may write to standard output before the inputs stop keeping
+/// it. A version line or a sysroot path takes well under a kilobyte, so an output that
+/// reaches this bound answers as a failed probe. Held below the server's stream drain
+/// ceiling, so an output past it is still counted and reported as truncated.
+pub const TOOLCHAIN_OUTPUT_BYTES_MAX: u64 = 64 << 10;
 // At the ceiling itself a drained stream stops counting, so an output that filled the
 // capture exactly could not be told from one cut short.
 const _: () = assert!(
@@ -26,30 +25,37 @@ pub const LOCKFILE_BYTES_MAX: u64 = 16 << 20;
 /// Manifests one resolver reads per workspace, at most. The rest are dropped and the
 /// drop reported as a degradation.
 pub const MANIFESTS_MAX: usize = 256;
-/// Packages one resolver catalogs per workspace, at most. The rest are dropped and the
-/// drop reported as a degradation.
+/// Packages the dependency context carries per workspace, at most. The rest are dropped
+/// and the drop reported as a degradation.
 pub const PACKAGES_MAX: usize = 20_000;
-/// Directory entries one listing returns, at most. A flat `node_modules` or a
-/// `site-packages` directory is listed whole, so the bound sits above what an installed
-/// application holds.
+/// Directory entries one listing returns, at most. A `site-packages` directory is listed
+/// whole, so the bound sits above what an installed application holds.
 pub const DIRECTORY_ENTRIES_MAX: usize = 16_384;
 
-/// Identity of one shipped resolver.
+/// Identity of one shipped resolver, or of one standard library entry's version probe.
 ///
-/// The lowercase spelling names the resolver in degradation text. The resolver segment
-/// of a source unit is the package namespace instead, [`DependencyResolver::manager`],
-/// so two resolvers over one namespace mint one spelling.
+/// The lowercase spelling names what degraded in degradation text, the `resolver` field
+/// of a `package_context_degraded` warning.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, VariantArray)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolverName {
-    /// Rust packages, as `cargo metadata` resolved them.
+    /// Rust packages, as `Cargo.lock` pins them and `Cargo.toml` declares them.
     Cargo,
-    /// Python distributions, as `uv.lock` pins them and the workspace environment holds them.
+    /// Python distributions, as `uv.lock` pins them and `pyproject.toml` declares them.
     Uv,
-    /// npm packages, as `package-lock.json` pins them and `node_modules` holds them.
+    /// npm packages, as `package-lock.json` pins them and `package.json` declares them.
     Npm,
-    /// npm packages, as `bun.lock` pins them and `node_modules` holds them.
+    /// npm packages, as `bun.lock` pins them.
     Bun,
+    /// The Rust standard library, as `rustc --version` or the toolchain file names it.
+    #[serde(rename = "stdlib/rust")]
+    StdlibRust,
+    /// The Node.js runtime modules, as a version pin or `node --version` names them.
+    #[serde(rename = "stdlib/node")]
+    StdlibNode,
+    /// The Python standard library, as the project environment's `pyvenv.cfg` names it.
+    #[serde(rename = "stdlib/python")]
+    StdlibPython,
 }
 
 impl ResolverName {
@@ -61,6 +67,9 @@ impl ResolverName {
             Self::Uv => "uv",
             Self::Npm => "npm",
             Self::Bun => "bun",
+            Self::StdlibRust => "stdlib/rust",
+            Self::StdlibNode => "stdlib/node",
+            Self::StdlibPython => "stdlib/python",
         }
     }
 }
@@ -71,20 +80,26 @@ impl fmt::Display for ResolverName {
     }
 }
 
-/// One toolchain invocation a resolver asks the inspector to run.
+/// One version probe the standard library pass asks its inputs to run.
 ///
-/// The program is a bare name the inspector resolves on its own `PATH`; a resolver
-/// never names an absolute executable. The run is bounded by the inspector's own
-/// wall-clock timeout, which the `[dependencies]` table's `command_timeout` sets, and by
+/// The program is a bare name the inputs resolve on their own `PATH`; the pass never
+/// names an absolute executable. The run is bounded by the inputs' own wall-clock
+/// timeout, which the `[dependencies]` table's `command_timeout` sets, and by
 /// [`TOOLCHAIN_OUTPUT_BYTES_MAX`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolchainCommand {
-    /// The program to run, resolved on the inspector's `PATH`.
+    /// The program to run, resolved on the inputs' `PATH`.
     pub program: &'static str,
     /// The arguments, each one literal: no shell parses them.
     pub arguments: Vec<String>,
     /// The directory the program starts in.
     pub working_directory: PathBuf,
+    /// Variables laid over the inherited environment, each winning over the inherited
+    /// value, such as `RUSTUP_AUTO_INSTALL=0`.
+    pub environment: Vec<(&'static str, &'static str)>,
+    /// Variables removed from the inherited environment, such as `RUSTUP_TOOLCHAIN`,
+    /// which would otherwise override the project's toolchain file.
+    pub environment_removed: Vec<&'static str>,
 }
 
 impl ToolchainCommand {
@@ -119,13 +134,13 @@ impl CommandOutput {
     }
 }
 
-/// Why the inspector produced no output for one toolchain run: the program was not
-/// found, the run overstayed its bound, or the process could not be observed.
+/// Why the inputs produced no output for one probe: the program was not found, the run
+/// overstayed its bound, or the process could not be observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandFailure {
-    /// The program the inspector tried to run.
+    /// The program the inputs tried to run.
     pub program: String,
-    /// What stopped the run, in the inspector's own words.
+    /// What stopped the run, in the inputs' own words.
     pub reason: String,
 }
 
@@ -135,7 +150,7 @@ impl fmt::Display for CommandFailure {
     }
 }
 
-/// What the inspector found at one file path.
+/// What the inputs found at one file path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileObservation {
     /// No readable file stands at the path.
@@ -151,56 +166,46 @@ pub enum FileObservation {
 
 /// The workspace files a static pass reads.
 ///
-/// A pass holding only this trait reads files and nothing else: it cannot run a
-/// toolchain, inspect a package cache, or read the environment, because the trait
-/// declares no way to ask for any of them. The dependency context pass takes
-/// `&mut dyn StaticInputs` for exactly that reason.
+/// A pass holding only this trait reads files and directory listings and nothing else:
+/// it cannot run a toolchain or read the environment, because the trait declares no way
+/// to ask for either. A resolver's [`DependencyResolver::context`] takes
+/// `&mut dyn StaticInputs` for exactly that reason. The server supplies filesystem-backed
+/// inputs; tests supply recorded ones.
 pub trait StaticInputs {
     /// The content of one file, refused past `bytes_max`.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation;
+
+    /// The path with every symlink resolved, absent when nothing stands there or the
+    /// inputs resolve no link; the caller then compares the lexical path.
+    fn canonical_path(&mut self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// The entry names directly below `path`, at most `entries_max`, in name order. Empty
+    /// when no directory stands there or the inputs list none.
+    fn list_directory(&mut self, _path: &Path, _entries_max: usize) -> Vec<String> {
+        Vec::new()
+    }
 }
 
-/// The workspace and machine facts a resolver reads.
+/// The inputs the dependency context reads: static files, and the version probes the
+/// standard library entries run.
 ///
-/// Resolvers hold no I/O: every file, directory, environment value, and toolchain run
-/// comes through this trait, so a catalog is a function of the inspector's answers.
-/// The server supplies a filesystem-backed inspector; tests supply a recorded one.
-pub trait Inspector: StaticInputs {
-    /// Whether a directory stands at `path`.
-    fn directory_exists(&mut self, path: &Path) -> bool;
-
-    /// The entry names directly below `path`, at most `entries_max`, in name order.
-    /// Empty when no directory stands there.
-    fn list_directory(&mut self, path: &Path, entries_max: usize) -> Vec<String>;
-
-    /// Runs one toolchain command to completion under the inspector's bounds.
+/// A resolver's [`DependencyResolver::context`] still takes [`StaticInputs`] alone; only
+/// the standard library pass holds this trait, so the one place a context runs a
+/// program is the version probe.
+pub trait ContextInputs: StaticInputs {
+    /// Runs one probe to completion under the inputs' bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`CommandFailure`] when the inspector runs no toolchain, when the
-    /// program cannot be started, overstays the inspector's timeout, or cannot be
-    /// observed to its end.
+    /// Returns [`CommandFailure`] when the inputs run no program, when the program
+    /// cannot be started, overstays the timeout, or cannot be observed to its end.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure>;
-
-    /// The value of one environment variable, absent when unset.
-    fn environment(&mut self, name: &str) -> Option<String>;
-
-    /// The current user's home directory, absent when the platform names none.
-    fn home_directory(&mut self) -> Option<PathBuf>;
 }
 
-/// One resolver's view of a workspace: the absolute root and every visible manifest
-/// carrying the resolver's manifest file name, in path order.
-#[derive(Clone, Copy, Debug)]
-pub struct ResolutionRequest<'a> {
-    /// The workspace root, absolute.
-    pub root: &'a Path,
-    /// The visible manifests the resolver claims, project-relative, in path order.
-    pub manifests: &'a [ProjectPath],
-}
-
-/// One resolver's view of a workspace for the static context pass: the same root and
-/// claimed manifests [`ResolutionRequest`] carries.
+/// One resolver's view of a workspace for the static context pass: the absolute root and
+/// every visible manifest carrying the resolver's manifest file name, in path order.
 #[derive(Clone, Copy, Debug)]
 pub struct ContextRequest<'a> {
     /// The workspace root, absolute.
@@ -209,34 +214,24 @@ pub struct ContextRequest<'a> {
     pub manifests: &'a [ProjectPath],
 }
 
-/// One shipped resolver: the ecosystem it serves and how it catalogs that ecosystem's packages.
+/// One shipped resolver: the ecosystem it serves and what its manifests and lockfiles
+/// state.
 pub trait DependencyResolver: fmt::Debug + Send + Sync {
     /// The resolver's identity.
     fn name(&self) -> ResolverName;
 
-    /// The package namespace its entries belong to, as `PackageIdentity.manager` spells it
-    /// and as the resolver segment of every source unit those entries mint.
-    fn manager(&self) -> &'static str;
-
-    /// The language whose syntax provider parses the cataloged packages' source.
-    fn language(&self) -> Language;
-
     /// The manifest file name this resolver claims. Every visible file so named reaches
-    /// [`DependencyResolver::resolve`]; no other resolver claims the same name.
+    /// [`DependencyResolver::context`]; npm and Bun both claim `package.json`, and every
+    /// other name is claimed by one resolver alone.
     fn manifest_file_name(&self) -> &'static str;
-
-    /// Catalogs the packages the request's manifests resolve to, reading only through
-    /// `inspector`. A toolchain the inspector cannot run degrades the answer to what the
-    /// static inputs state; it never fails the resolution.
-    fn resolve(&self, request: &ResolutionRequest<'_>, inspector: &mut dyn Inspector)
-    -> Resolution;
 
     /// Reports what the request's manifests and lockfiles state about each package the
     /// workspace depends on, reading only through `inputs`.
     ///
     /// A lockfile entry contributes the exact version it pins; a manifest entry no
-    /// lockfile pins contributes the requirement it declares. No toolchain runs and no
-    /// package cache is read, because [`StaticInputs`] offers neither.
+    /// lockfile pins contributes the requirement it declares. No toolchain runs, because
+    /// [`StaticInputs`] offers none. The only installed package files read are Python
+    /// `.dist-info/RECORD` lists, for the install folders the answer records.
     fn context(&self, request: &ContextRequest<'_>, inputs: &mut dyn StaticInputs)
     -> ContextAnswer;
 }
@@ -257,11 +252,13 @@ mod tests {
     #[test]
     fn test_command_rendering_joins_program_and_arguments() {
         let command = ToolchainCommand {
-            program: "cargo",
-            arguments: vec!["metadata".to_owned(), "--locked".to_owned()],
+            program: "rustc",
+            arguments: vec!["--print".to_owned(), "sysroot".to_owned()],
             working_directory: PathBuf::from("/workspace"),
+            environment: Vec::new(),
+            environment_removed: Vec::new(),
         };
-        assert_eq!(command.rendered(), "cargo metadata --locked");
+        assert_eq!(command.rendered(), "rustc --print sysroot");
     }
 
     #[test]
@@ -284,9 +281,9 @@ mod tests {
         };
         assert!(!failed.succeeded());
         let failure = CommandFailure {
-            program: "cargo".to_owned(),
+            program: "rustc".to_owned(),
             reason: "failed to launch".to_owned(),
         };
-        assert_eq!(failure.to_string(), "cargo: failed to launch");
+        assert_eq!(failure.to_string(), "rustc: failed to launch");
     }
 }

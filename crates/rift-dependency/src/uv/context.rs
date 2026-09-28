@@ -1,21 +1,25 @@
 //! The uv static context: what `uv.lock` pins and `pyproject.toml` declares.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
-use rift_protocol::read::ProjectPath;
+use rift_protocol::read::{PackageIdentity, ProjectPath};
 use serde::Deserialize;
 
+use super::environment::SitePackages;
 use super::{
-    PYPI_MANAGER, UV_LOCK_FILE_NAME, UV_MANIFEST_FILE_NAME, normalized_name, parse_lockfile,
+    LockedSource, PYPI_MANAGER, UV_LOCK_FILE_NAME, UV_MANIFEST_FILE_NAME, normalized_name,
+    parse_lockfile,
 };
-use crate::context::{ContextAnswer, is_whole_version};
-use crate::manifest::{StaticFileFailure, file_beside, manifest_directory_path, read_static_file};
+use crate::context::{ContextAnswer, InstallFolder, InstallLocation, is_whole_version};
+use crate::manifest::{
+    StaticFileFailure, WorkspacePaths, file_beside, manifest_directory_path, read_static_file,
+};
 use crate::resolver::{ContextRequest, StaticInputs};
 
 /// The `source` registry of a distribution the Python Package Index serves, trailing
-/// separator dropped. Every other index is one this machine alone resolves.
+/// separator dropped. Every other index is a private registry.
 const PYPI_REGISTRY_URL: &str = "https://pypi.org/simple";
 /// The operator that pins one exact version in a PEP 508 requirement.
 const EXACT_OPERATOR: &str = "==";
@@ -32,34 +36,81 @@ const EXTRAS_OPEN: char = '[';
 const EXTRAS_CLOSE: char = ']';
 /// The character opening a PEP 508 direct reference: a URL in place of a specifier.
 const DIRECT_REFERENCE: char = '@';
+/// The prefixes of a direct reference to a URL no index serves.
+const URL_PREFIXES: [&str; 2] = ["http://", "https://"];
+/// The prefix of a direct reference to a git repository.
+const GIT_REFERENCE_PREFIX: &str = "git+";
+/// The file name endings of a built or source distribution. The local index reads no
+/// archive, so one inside the root is not project source.
+const ARCHIVE_SUFFIXES: [&str; 3] = [".whl", ".tar.gz", ".zip"];
 /// The characters a PEP 503 distribution name is spelled with.
 const NAME_CHARACTERS: [char; 3] = ['-', '_', '.'];
 
 /// Reports what each listed manifest's `uv.lock` pins and what its `pyproject.toml`
-/// declares.
+/// declares. Each pinned distribution the environment beside the lockfile installed
+/// records the import folders its `RECORD` lists.
 ///
 /// Each manifest and each lockfile beside one is an input. A requirement for a
 /// distribution some lockfile pins is dropped where the answers merge, so one selector
 /// reaches the context per distribution. An absent file is the manifest-only case, not a
 /// degradation; a file over its bound or unparsable is one, naming the path.
+///
+/// The lockfiles and manifests are read first: a distribution any lockfile locks from a
+/// directory is declared by path, so a member's `inner>=0.3` names the workspace's own
+/// project, not the index's; and a `{ workspace = true }` source is project source only
+/// when a claimed manifest inside the root declares that name.
 pub(super) fn uv_context(
     request: &ContextRequest<'_>,
     inputs: &mut dyn StaticInputs,
 ) -> ContextAnswer {
     let mut answer = ContextAnswer::default();
+    let workspace = WorkspacePaths::new(request.root, inputs);
+    let mut located = BTreeMap::new();
+    let mut parsed = Vec::new();
     for manifest in request.manifests {
         answer.inputs.push(manifest.clone());
-        pin_lockfile(request.root, manifest, inputs, &mut answer);
-        declare_manifest(request.root, manifest, inputs, &mut answer);
+        pin_lockfile(
+            request.root,
+            manifest,
+            &workspace,
+            inputs,
+            &mut located,
+            &mut answer,
+        );
+        let directory = manifest_directory_path(request.root, manifest);
+        let observed = read_static_file(&directory, UV_MANIFEST_FILE_NAME, inputs);
+        match observed.and_then(|bytes| parse_manifest(&bytes)) {
+            Ok(document) => parsed.push((directory, document)),
+            Err(failure) => report(&mut answer, manifest, &failure),
+        }
+    }
+    let claimed_names: BTreeSet<String> = parsed
+        .iter()
+        .filter_map(|(_, document)| document.name())
+        .map(normalized_name)
+        .collect();
+    for (directory, document) in &parsed {
+        declare_manifest(
+            directory,
+            document,
+            &workspace,
+            &located,
+            &claimed_names,
+            inputs,
+            &mut answer,
+        );
     }
     answer
 }
 
-/// Reports every distribution the `uv.lock` beside one manifest pins.
+/// Reports every distribution the `uv.lock` beside one manifest pins, and records each
+/// one it locks from a directory by whether the directory lies inside the root.
 fn pin_lockfile(
     root: &Path,
     manifest: &ProjectPath,
+    workspace: &WorkspacePaths,
     inputs: &mut dyn StaticInputs,
+    located: &mut BTreeMap<String, bool>,
     answer: &mut ContextAnswer,
 ) {
     let directory = manifest_directory_path(root, manifest);
@@ -74,35 +125,114 @@ fn pin_lockfile(
         Ok(lockfile) => lockfile,
         Err(failure) => return report(answer, manifest, &failure),
     };
-    let pinned = lockfile
-        .package
-        .iter()
-        .filter(|package| !package.source.is_member())
-        .filter_map(|package| {
-            Some(PackageContextEntry::new(
-                PYPI_MANAGER,
-                &normalized_name(&package.name),
-                PackageSelector::Version(package.version.clone()?),
-                registry_availability(package.source.registry.as_deref()),
-            ))
-        });
-    answer.entries.extend(pinned);
+    let site_packages = SitePackages::observe(&directory, inputs);
+    for package in &lockfile.package {
+        let name = normalized_name(&package.name);
+        if let Some(path) = package.source.directory_path() {
+            let inside = workspace.contains(&directory.join(path), inputs);
+            located
+                .entry(name.clone())
+                .and_modify(|standing| *standing &= inside)
+                .or_insert(inside);
+            if inside {
+                continue;
+            }
+        }
+        let Some(version) = package.version.clone() else {
+            continue;
+        };
+        if let Some(site_packages) = &site_packages {
+            answer.install_folders.extend(
+                site_packages
+                    .import_folders(&name, &version, inputs)
+                    .into_iter()
+                    .map(|folder| InstallFolder {
+                        package: PackageIdentity {
+                            manager: PYPI_MANAGER.to_owned(),
+                            name: name.clone(),
+                            version: version.clone(),
+                        },
+                        location: InstallLocation::Path(folder),
+                    }),
+            );
+        }
+        answer.entries.push(PackageContextEntry::new(
+            PYPI_MANAGER,
+            &name,
+            PackageSelector::Version(version),
+            package.source.availability(),
+        ));
+    }
 }
 
-/// Reports every requirement one `pyproject.toml` declares.
+/// Reports every requirement one `pyproject.toml`, standing in `directory`, declares. A
+/// distribution a lockfile locks from a directory inside the root is project source and
+/// is left out; one outside it is a `path` entry. Otherwise the manifest's
+/// `[tool.uv.sources]` entry, then the specifier, decides.
 fn declare_manifest(
-    root: &Path,
-    manifest: &ProjectPath,
+    directory: &Path,
+    document: &Manifest,
+    workspace: &WorkspacePaths,
+    located: &BTreeMap<String, bool>,
+    claimed_names: &BTreeSet<String>,
     inputs: &mut dyn StaticInputs,
     answer: &mut ContextAnswer,
 ) {
-    let directory = manifest_directory_path(root, manifest);
-    let observed = read_static_file(&directory, UV_MANIFEST_FILE_NAME, inputs);
-    let parsed = match observed.and_then(|bytes| parse_manifest(&bytes)) {
-        Ok(parsed) => parsed,
-        Err(failure) => return report(answer, manifest, &failure),
-    };
-    answer.entries.extend(parsed.declared());
+    let sources = document.sources();
+    let declared = document
+        .requirements()
+        .filter_map(declared_requirement)
+        .filter_map(|(name, specifier)| {
+            let availability = match located.get(&name) {
+                Some(true) => return None,
+                Some(false) => PackageAvailability::Path,
+                None => match sources.get(&name) {
+                    Some(source) => {
+                        let claimed = claimed_names.contains(&name);
+                        source.availability(claimed, directory, workspace, inputs)?
+                    }
+                    None => specifier_availability(specifier),
+                },
+            };
+            Some(PackageContextEntry::new(
+                PYPI_MANAGER,
+                &name,
+                selector(specifier),
+                availability,
+            ))
+        });
+    answer.entries.extend(declared);
+}
+
+impl LockedSource {
+    /// The directory a package locks from, relative to the lockfile: a member, the
+    /// root project, or a path dependency on a directory, editable or not.
+    fn directory_path(&self) -> Option<&str> {
+        self.editable
+            .as_deref()
+            .or(self.virtual_directory.as_deref())
+            .or(self.directory.as_deref())
+    }
+
+    /// Whether a global package index can answer for a distribution locked from this
+    /// source: the Python Package Index can. A direct URL is a `url` entry, a repository
+    /// a `git` one, every other index a private registry, and an archive or a directory
+    /// outside the root a `path` entry.
+    fn availability(&self) -> PackageAvailability {
+        if self.url.is_some() {
+            return PackageAvailability::Url;
+        }
+        if self.git.is_some() {
+            return PackageAvailability::Git;
+        }
+        match self.registry.as_deref() {
+            Some(registry) if registry.trim_end_matches('/') == PYPI_REGISTRY_URL => {
+                PackageAvailability::Canonical
+            }
+            Some(_) => PackageAvailability::PrivateRegistry,
+            None => PackageAvailability::Path,
+        }
+    }
 }
 
 /// Records one unreadable input, naming the path. An absent file is the manifest-only
@@ -117,27 +247,105 @@ fn report(answer: &mut ContextAnswer, manifest: &ProjectPath, failure: &StaticFi
         .push(format!("{manifest_path}: {failure}; no packages reported"));
 }
 
-/// Whether a global package index can answer for a distribution fetched from `registry`.
-fn registry_availability(registry: Option<&str>) -> PackageAvailability {
-    match registry {
-        Some(registry) if registry.trim_end_matches('/') == PYPI_REGISTRY_URL => {
-            PackageAvailability::Canonical
-        }
-        _ => PackageAvailability::LocalOnly,
-    }
-}
-
-/// The `pyproject.toml` document, the dependency lists this pass reads.
+/// The `pyproject.toml` document, the dependency lists this pass reads and the sources
+/// uv resolves them from.
 #[derive(Deserialize)]
 struct Manifest {
     project: Option<Project>,
     #[serde(default, rename = "dependency-groups")]
     dependency_groups: BTreeMap<String, Vec<GroupEntry>>,
+    tool: Option<Tool>,
 }
 
-/// The `[project]` table, the one key this pass reads.
+/// The `[tool]` table, the one key this pass reads.
+#[derive(Deserialize)]
+struct Tool {
+    uv: Option<UvTool>,
+}
+
+/// The `[tool.uv]` table, the one key this pass reads.
+#[derive(Deserialize)]
+struct UvTool {
+    #[serde(default)]
+    sources: BTreeMap<String, Sources>,
+}
+
+/// One `[tool.uv.sources]` value: one source, or several split by marker.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Sources {
+    One(Source),
+    Several(Vec<Source>),
+}
+
+/// One uv source table, the keys naming where the distribution comes from.
+#[derive(Deserialize)]
+struct Source {
+    workspace: Option<bool>,
+    path: Option<String>,
+    git: Option<String>,
+    url: Option<String>,
+    index: Option<String>,
+}
+
+impl Sources {
+    /// Whether a global package index can answer for a distribution from these
+    /// sources, `None` for project source; `claimed` says whether a claimed manifest
+    /// declares the distribution's name. Of several, the first that is not project
+    /// source decides.
+    fn availability(
+        &self,
+        claimed: bool,
+        directory: &Path,
+        workspace: &WorkspacePaths,
+        inputs: &mut dyn StaticInputs,
+    ) -> Option<PackageAvailability> {
+        match self {
+            Self::One(source) => source.availability(claimed, directory, workspace, inputs),
+            Self::Several(sources) => sources
+                .iter()
+                .find_map(|source| source.availability(claimed, directory, workspace, inputs)),
+        }
+    }
+}
+
+impl Source {
+    /// Whether a global package index can answer for a distribution from this source,
+    /// `None` for project source: a workspace member a claimed manifest declares
+    /// (`claimed`), or a directory inside the root. A member no claimed manifest declares
+    /// stands outside the root, where the local index does not read it.
+    fn availability(
+        &self,
+        claimed: bool,
+        directory: &Path,
+        workspace: &WorkspacePaths,
+        inputs: &mut dyn StaticInputs,
+    ) -> Option<PackageAvailability> {
+        if self.workspace == Some(true) {
+            return (!claimed).then_some(PackageAvailability::Path);
+        }
+        if let Some(path) = self.path.as_deref() {
+            let archive = ARCHIVE_SUFFIXES.iter().any(|suffix| path.ends_with(suffix));
+            return (archive || !workspace.contains(&directory.join(path), inputs))
+                .then_some(PackageAvailability::Path);
+        }
+        if self.url.is_some() {
+            return Some(PackageAvailability::Url);
+        }
+        if self.git.is_some() {
+            return Some(PackageAvailability::Git);
+        }
+        if self.index.is_some() {
+            return Some(PackageAvailability::PrivateRegistry);
+        }
+        Some(PackageAvailability::Canonical)
+    }
+}
+
+/// The `[project]` table, the two keys this pass reads.
 #[derive(Deserialize)]
 struct Project {
+    name: Option<String>,
     #[serde(default)]
     dependencies: Vec<String>,
 }
@@ -169,8 +377,13 @@ impl GroupEntry {
 }
 
 impl Manifest {
-    /// One entry per declared requirement stating a version, in project then group order.
-    fn declared(&self) -> impl Iterator<Item = PackageContextEntry> {
+    /// The `[project]` name this manifest declares.
+    fn name(&self) -> Option<&str> {
+        self.project.as_ref()?.name.as_deref()
+    }
+
+    /// Every declared PEP 508 requirement, in project then group order.
+    fn requirements(&self) -> impl Iterator<Item = &str> {
         let project = self
             .project
             .iter()
@@ -180,7 +393,17 @@ impl Manifest {
             .values()
             .flatten()
             .filter_map(GroupEntry::requirement);
-        project.chain(groups).filter_map(declared_entry)
+        project.chain(groups)
+    }
+
+    /// The `[tool.uv.sources]` entries, keyed by normalized distribution name.
+    fn sources(&self) -> BTreeMap<String, &Sources> {
+        self.tool
+            .iter()
+            .filter_map(|tool| tool.uv.as_ref())
+            .flat_map(|uv| uv.sources.iter())
+            .map(|(name, sources)| (normalized_name(name), sources))
+            .collect()
     }
 }
 
@@ -192,11 +415,11 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, StaticFileFailure> {
     })
 }
 
-/// The entry one PEP 508 requirement declares.
+/// The normalized name and specifier one PEP 508 requirement declares.
 ///
 /// A requirement stating no specifier names no version, so it is not reported: the
 /// context carries one selector per entry and has none to state for it.
-fn declared_entry(requirement: &str) -> Option<PackageContextEntry> {
+fn declared_requirement(requirement: &str) -> Option<(String, &str)> {
     let stated = requirement
         .split_once(MARKER_SEPARATOR)
         .map_or(requirement, |(dependency, _)| dependency)
@@ -221,21 +444,26 @@ fn declared_entry(requirement: &str) -> Option<PackageContextEntry> {
     if specifier.is_empty() {
         return None;
     }
-    Some(PackageContextEntry::new(
-        PYPI_MANAGER,
-        &normalized_name(name),
-        selector(specifier),
-        specifier_availability(specifier),
-    ))
+    Some((normalized_name(name), specifier))
 }
 
 /// Whether a global package index can answer for a declared specifier: a direct
-/// reference names a URL this machine alone resolves.
+/// reference to an `http:` or `https:` URL is a `url` entry, one to a `git+` URL a `git`
+/// entry, and any other direct reference, such as `file:`, a `path` one.
 fn specifier_availability(specifier: &str) -> PackageAvailability {
-    if specifier.starts_with(DIRECT_REFERENCE) {
-        PackageAvailability::LocalOnly
+    let Some(reference) = specifier.strip_prefix(DIRECT_REFERENCE) else {
+        return PackageAvailability::Canonical;
+    };
+    let reference = reference.trim_start();
+    if URL_PREFIXES
+        .iter()
+        .any(|prefix| reference.starts_with(prefix))
+    {
+        PackageAvailability::Url
+    } else if reference.starts_with(GIT_REFERENCE_PREFIX) {
+        PackageAvailability::Git
     } else {
-        PackageAvailability::Canonical
+        PackageAvailability::Path
     }
 }
 
@@ -269,7 +497,8 @@ mod tests {
     const ROOT: &str = "/workspace";
 
     /// A lockfile pinning one distribution from the Python Package Index, one from a
-    /// private index, and the workspace's own project.
+    /// private index, one from a git repository, one from an archive path, and the
+    /// workspace's own project.
     const LOCKFILE: &str = r#"version = 1
 
 [[package]]
@@ -286,6 +515,16 @@ source = { registry = "https://pypi.org/simple" }
 name = "internal-tool"
 version = "2.0.0"
 source = { registry = "https://pypi.example.test/simple" }
+
+[[package]]
+name = "sourced"
+version = "0.5.0"
+source = { git = "https://example.test/sourced.git?rev=v0.5.0#0123456789abcdef" }
+
+[[package]]
+name = "vendored"
+version = "1.0"
+source = { path = "vendor/vendored-1.0-py3-none-any.whl" }
 "#;
 
     fn project(path: &str) -> ProjectPath {
@@ -321,30 +560,37 @@ source = { registry = "https://pypi.example.test/simple" }
     }
 
     #[test]
-    fn test_a_lockfile_pins_exact_versions_and_marks_a_private_index_local_only() {
+    fn test_a_lockfile_pins_exact_versions_and_sorts_every_source_by_kind() {
         let mut inspector =
             RecordedInspector::default().with_file(format!("{ROOT}/uv.lock"), LOCKFILE);
 
         let answer = context(&["pyproject.toml"], &mut inspector);
 
         assert_eq!(
-            spelled(&answer),
+            reported(&answer),
             [
-                "typing-extensions: version 4.15.0",
-                "internal-tool: version 2.0.0"
+                (
+                    "typing-extensions: version 4.15.0".to_owned(),
+                    PackageAvailability::Canonical
+                ),
+                (
+                    "internal-tool: version 2.0.0".to_owned(),
+                    PackageAvailability::PrivateRegistry
+                ),
+                (
+                    "sourced: version 0.5.0".to_owned(),
+                    PackageAvailability::Git
+                ),
+                (
+                    "vendored: version 1.0".to_owned(),
+                    PackageAvailability::Path
+                ),
             ],
             "the workspace's own project pins nothing, and a name normalizes"
         );
-        assert_eq!(
-            answer
-                .entries
-                .iter()
-                .map(|entry| entry.availability)
-                .collect::<Vec<_>>(),
-            [
-                PackageAvailability::Canonical,
-                PackageAvailability::LocalOnly
-            ]
+        assert!(
+            answer.install_folders.is_empty(),
+            "no environment stands beside the lockfile"
         );
         assert!(
             answer
@@ -368,6 +614,8 @@ dependencies = [
   "Typing_Extensions==4.15.0",
   "rich[jupyter] >= 13, < 14",
   "tool @ https://example.test/tool-1.0.tar.gz",
+  "repo @ git+https://example.test/repo.git@v1",
+  "local @ file:///opt/local-1.0.tar.gz",
   "requests",
   "pinned === 1.2.3",
   "== 1.0",
@@ -389,19 +637,28 @@ lint = ["ruff>=0.14"]
                 "typing-extensions: version 4.15.0",
                 "rich: requirement >= 13, < 14",
                 "tool: requirement @ https://example.test/tool-1.0.tar.gz",
+                "repo: requirement @ git+https://example.test/repo.git@v1",
+                "local: requirement @ file:///opt/local-1.0.tar.gz",
                 "pinned: requirement === 1.2.3",
                 "pytest: version 8.4.2",
                 "ruff: requirement >=0.14"
             ],
             "a requirement stating no specifier, and one stating no name, are not reported"
         );
-        let local_only: Vec<&str> = answer
+        let sourced: Vec<(&str, PackageAvailability)> = answer
             .entries
             .iter()
-            .filter(|entry| entry.availability == PackageAvailability::LocalOnly)
-            .map(|entry| entry.name.as_str())
+            .filter(|entry| entry.availability != PackageAvailability::Canonical)
+            .map(|entry| (entry.name.as_str(), entry.availability))
             .collect();
-        assert_eq!(local_only, ["tool"]);
+        assert_eq!(
+            sourced,
+            [
+                ("tool", PackageAvailability::Url),
+                ("repo", PackageAvailability::Git),
+                ("local", PackageAvailability::Path)
+            ]
+        );
         assert!(
             answer
                 .entries
@@ -445,5 +702,350 @@ lint = ["ruff>=0.14"]
         assert!(answer.entries.is_empty());
         assert_eq!(answer.inputs, [project("pyproject.toml")]);
         assert!(answer.degradations.is_empty());
+    }
+
+    /// `<name>: <selector>` and availability per entry, in answer order.
+    fn reported(answer: &ContextAnswer) -> Vec<(String, PackageAvailability)> {
+        spelled(answer)
+            .into_iter()
+            .zip(answer.entries.iter().map(|entry| entry.availability))
+            .collect()
+    }
+
+    #[test]
+    fn test_a_directory_inside_the_root_is_project_source() {
+        // `uv lock --offline` (uv 0.9.5) over a workspace with one member, a directory
+        // inside the root, one outside it, and an editable one outside it.
+        let manifest = r#"[project]
+name = "probe"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["member", "inner>=0.3", "outer", "editable-outer"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+member = { workspace = true }
+inner = { path = "libs/inner" }
+outer = { path = "../outer" }
+editable-outer = { path = "../editable-outer", editable = true }
+"#;
+        let lockfile = r#"version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[manifest]
+members = [
+    "member",
+    "probe",
+]
+
+[[package]]
+name = "editable-outer"
+version = "1.1.0"
+source = { editable = "../editable-outer" }
+
+[[package]]
+name = "inner"
+version = "0.3.0"
+source = { directory = "libs/inner" }
+
+[[package]]
+name = "member"
+version = "0.2.0"
+source = { editable = "packages/member" }
+
+[[package]]
+name = "outer"
+version = "1.0.0"
+source = { directory = "../outer" }
+
+[[package]]
+name = "probe"
+version = "0.1.0"
+source = { virtual = "." }
+"#;
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/pyproject.toml"), manifest)
+            .with_file(format!("{ROOT}/uv.lock"), lockfile);
+
+        let answer = context(&["pyproject.toml"], &mut inspector);
+
+        assert_eq!(
+            reported(&answer),
+            [
+                (
+                    "editable-outer: version 1.1.0".to_owned(),
+                    PackageAvailability::Path
+                ),
+                ("outer: version 1.0.0".to_owned(), PackageAvailability::Path),
+            ],
+            "`inner` and `member` lie inside the root, so `inner>=0.3` reaches no index; \
+             an editable directory outside it is no member"
+        );
+    }
+
+    #[test]
+    fn test_a_nested_project_locking_the_root_reports_it_as_project_source() {
+        // ~/projects/crosswire/bench/py311 locks the repository root it sits two levels
+        // below; the real lock carries no version, which the fixture adds.
+        let manifest = r#"[project]
+name = "crosswire-bench-py311"
+version = "0.0.0"
+dependencies = ["crosswire>=0.1", "typer>=0.15"]
+
+[tool.uv.sources]
+crosswire = { path = "../.." }
+"#;
+        let lockfile = r#"version = 1
+
+[[package]]
+name = "crosswire"
+version = "0.1.0"
+source = { directory = "../../" }
+
+[[package]]
+name = "typer"
+version = "0.19.2"
+source = { registry = "https://pypi.org/simple" }
+"#;
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/bench/py311/pyproject.toml"), manifest)
+            .with_file(format!("{ROOT}/bench/py311/uv.lock"), lockfile);
+
+        let answer = context(&["bench/py311/pyproject.toml"], &mut inspector);
+
+        assert_eq!(
+            reported(&answer),
+            [
+                (
+                    "typer: version 0.19.2".to_owned(),
+                    PackageAvailability::Canonical
+                ),
+                (
+                    "typer: requirement >=0.15".to_owned(),
+                    PackageAvailability::Canonical
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_manifest_source_decides_without_a_lockfile() {
+        let manifest = r#"[project]
+name = "probe"
+dependencies = [
+  "inner>=0.3",
+  "outer>=1",
+  "wheel>=1",
+  "sourced>=1",
+  "fetched>=1",
+  "member>=0.2",
+  "mirrored>=1",
+  "marked>=1",
+]
+
+[tool.uv.sources]
+inner = { path = "libs/inner" }
+outer = { path = "../outer" }
+wheel = { path = "vendor/wheel-1.0-py3-none-any.whl" }
+sourced = { git = "https://example.test/sourced.git" }
+fetched = { url = "https://example.test/fetched-1.0-py3-none-any.whl" }
+member = { workspace = true }
+mirrored = { index = "internal" }
+marked = [
+  { path = "libs/marked", marker = "sys_platform == 'linux'" },
+  { url = "https://example.test/marked-1.0.tar.gz", marker = "sys_platform != 'linux'" },
+]
+"#;
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/pyproject.toml"), manifest)
+            .with_file(
+                format!("{ROOT}/packages/member/pyproject.toml"),
+                "[project]\nname = \"Member\"\n",
+            );
+
+        let answer = context(
+            &["packages/member/pyproject.toml", "pyproject.toml"],
+            &mut inspector,
+        );
+
+        assert_eq!(
+            reported(&answer),
+            [
+                (
+                    "outer: requirement >=1".to_owned(),
+                    PackageAvailability::Path
+                ),
+                (
+                    "wheel: requirement >=1".to_owned(),
+                    PackageAvailability::Path
+                ),
+                (
+                    "sourced: requirement >=1".to_owned(),
+                    PackageAvailability::Git
+                ),
+                (
+                    "fetched: requirement >=1".to_owned(),
+                    PackageAvailability::Url
+                ),
+                (
+                    "mirrored: requirement >=1".to_owned(),
+                    PackageAvailability::PrivateRegistry
+                ),
+                (
+                    "marked: requirement >=1".to_owned(),
+                    PackageAvailability::Url
+                ),
+            ],
+            "a directory inside the root and a member are project source; an archive \
+             inside it is not"
+        );
+    }
+
+    #[test]
+    fn test_a_direct_url_source_is_a_url_entry() {
+        let lockfile = r#"version = 1
+
+[[package]]
+name = "fetched"
+version = "1.0"
+source = { url = "https://example.test/fetched-1.0-py3-none-any.whl" }
+"#;
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/uv.lock"), lockfile);
+
+        let answer = context(&["pyproject.toml"], &mut inspector);
+
+        assert_eq!(
+            reported(&answer),
+            [("fetched: version 1.0".to_owned(), PackageAvailability::Url)]
+        );
+    }
+
+    #[test]
+    fn test_a_workspace_source_is_project_source_only_when_a_claimed_manifest_declares_it() {
+        // A uv workspace served at `packages/app`: the workspace root, its `uv.lock`, and
+        // the sibling `shared` stand outside the served root; `plugin` stands inside.
+        let app = r#"[project]
+name = "app"
+dependencies = ["shared>=0.1", "plugin>=0.1", "httpx>=0.28"]
+
+[tool.uv.sources]
+shared = { workspace = true }
+plugin = { workspace = true }
+"#;
+        let files = [
+            (
+                "/mono/pyproject.toml",
+                "[tool.uv.workspace]\nmembers = [\"packages/*\", \"packages/app/plugins/*\"]\n",
+            ),
+            ("/mono/packages/app/pyproject.toml", app),
+            (
+                "/mono/packages/app/plugins/plugin/pyproject.toml",
+                "[project]\nname = \"plugin\"\n",
+            ),
+            (
+                "/mono/packages/shared/pyproject.toml",
+                "[project]\nname = \"shared\"\n",
+            ),
+        ];
+        let inspector = || {
+            files
+                .iter()
+                .fold(RecordedInspector::default(), |inspector, (path, text)| {
+                    inspector.with_file(*path, *text)
+                })
+        };
+        let context_at = |root: &str, manifests: &[&str]| {
+            let manifests: Vec<ProjectPath> = manifests.iter().map(|path| project(path)).collect();
+            let request = ContextRequest {
+                root: Path::new(root),
+                manifests: &manifests,
+            };
+            UvResolver::new().context(&request, &mut inspector())
+        };
+
+        let below = context_at(
+            "/mono/packages/app",
+            &["plugins/plugin/pyproject.toml", "pyproject.toml"],
+        );
+        let whole = context_at(
+            "/mono",
+            &[
+                "packages/app/plugins/plugin/pyproject.toml",
+                "packages/app/pyproject.toml",
+                "packages/shared/pyproject.toml",
+                "pyproject.toml",
+            ],
+        );
+
+        assert_eq!(
+            reported(&below),
+            [
+                (
+                    "shared: requirement >=0.1".to_owned(),
+                    PackageAvailability::Path
+                ),
+                (
+                    "httpx: requirement >=0.28".to_owned(),
+                    PackageAvailability::Canonical
+                ),
+            ],
+            "served at `packages/app`, `shared` stands outside the root and `plugin` inside"
+        );
+        assert_eq!(
+            reported(&whole),
+            [(
+                "httpx: requirement >=0.28".to_owned(),
+                PackageAvailability::Canonical
+            )]
+        );
+    }
+
+    #[test]
+    fn test_a_pinned_distribution_records_the_import_folders_its_record_lists() {
+        let site_packages = format!("{ROOT}/.venv/lib/python3.12/site-packages");
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/uv.lock"), LOCKFILE)
+            .with_file(
+                format!("{site_packages}/typing_extensions-4.15.0.dist-info/RECORD"),
+                "typing_extensions.py,,
+typing_extensions-4.15.0.dist-info/RECORD,,
+",
+            )
+            .with_file(
+                format!("{site_packages}/internal_tool-2.0.0.dist-info/RECORD"),
+                "internal_tool/__init__.py,,
+../../../bin/internal-tool,,
+",
+            );
+
+        let answer = context(&["pyproject.toml"], &mut inspector);
+
+        let folders: Vec<(String, &InstallLocation)> = answer
+            .install_folders
+            .iter()
+            .map(|folder| {
+                let package = &folder.package;
+                (
+                    format!("{}/{}@{}", package.manager, package.name, package.version),
+                    &folder.location,
+                )
+            })
+            .collect();
+        let at = |path: &str| InstallLocation::Path(Path::new(&site_packages).join(path));
+        assert_eq!(
+            folders,
+            [
+                (
+                    "pypi/typing-extensions@4.15.0".to_owned(),
+                    &at("typing_extensions.py")
+                ),
+                ("pypi/internal-tool@2.0.0".to_owned(), &at("internal_tool")),
+            ],
+            "a distribution the environment does not hold records no folder"
+        );
     }
 }

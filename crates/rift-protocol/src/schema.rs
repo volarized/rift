@@ -128,8 +128,43 @@ impl DeclaredKey {
 /// members from the root and returns at most `DECLARED_KEYS_MAX` keys.
 #[must_use]
 pub fn declared_keys(schema: &Value) -> Vec<DeclaredKey> {
+    walked_keys(schema, vec![(resolved(schema, schema), Vec::new())])
+}
+
+/// The keys each of `names` declares as a member of `table`, a table whose members
+/// the caller names, such as `["languages", "python", "enabled"]` for `[languages]`
+/// and `python`. A table with fixed members, or none named `table`, declares none.
+/// The walk and its bounds are [`declared_keys`]'s.
+#[must_use]
+pub fn declared_named_keys(schema: &Value, table: &str, names: &[&str]) -> Vec<DeclaredKey> {
+    let Some(member) = resolved(schema, schema)
+        .get(keyword::PROPERTIES)
+        .and_then(|members| members.get(table))
+    else {
+        return Vec::new();
+    };
+    let Some(value) = resolved(schema, member)
+        .get(keyword::ADDITIONAL_PROPERTIES)
+        .filter(|value| value.is_object())
+    else {
+        return Vec::new();
+    };
+    let value = resolved(schema, value);
+    walked_keys(
+        schema,
+        names
+            .iter()
+            .map(|name| (value, vec![table.to_owned(), (*name).to_owned()]))
+            .collect(),
+    )
+}
+
+/// Every key below the `pending` starting nodes, each paired with its path.
+fn walked_keys<'schema>(
+    schema: &'schema Value,
+    mut pending: Vec<(&'schema Value, Vec<String>)>,
+) -> Vec<DeclaredKey> {
     let mut keys = Vec::new();
-    let mut pending = vec![(resolved(schema, schema), Vec::new())];
     while let Some((node, path)) = pending.pop() {
         if keys.len() == DECLARED_KEYS_MAX {
             break;
@@ -872,42 +907,24 @@ pub fn declare_source_ranges(schema: &mut Schema) {
 }
 
 /// A [`DependenciesConfiguration`](crate::dependencies::DependenciesConfiguration) states
-/// its `ByteSize` and `Duration` bounds as `rift:range` on each key: schema validation
-/// alone cannot compare `"4mb"` against a ceiling, so the server enforces the bounds at
-/// load and the schema carries them for readers.
+/// its `command_timeout` bounds as `rift:range` on the key: schema validation alone cannot
+/// compare `"2m"` against a ceiling, so the server enforces the bounds at load and the
+/// schema carries them for readers.
 pub fn declare_dependencies_ranges(schema: &mut Schema) {
-    use crate::configuration::{ByteSize, Duration};
+    use crate::configuration::Duration;
     use crate::dependencies::{
         DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX, DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN,
-        DEPENDENCIES_INDEX_BYTES_MAX, DEPENDENCIES_INDEX_BYTES_MIN, DEPENDENCIES_PACKAGE_BYTES_MAX,
-        DEPENDENCIES_PACKAGE_BYTES_MIN, DependenciesConfiguration,
+        DependenciesConfiguration,
     };
-    let ranges = [
-        (
-            property!(DependenciesConfiguration, package_size),
-            range(
-                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MIN),
-                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MAX),
-            ),
+    annotate_property(
+        schema,
+        property!(DependenciesConfiguration, command_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
+            &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
         ),
-        (
-            property!(DependenciesConfiguration, index_size),
-            range(
-                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MIN),
-                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX),
-            ),
-        ),
-        (
-            property!(DependenciesConfiguration, command_timeout),
-            range(
-                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
-                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
-            ),
-        ),
-    ];
-    for (name, range) in ranges {
-        annotate_property(schema, name, RIFT_RANGE, range);
-    }
+    );
 }
 
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration)

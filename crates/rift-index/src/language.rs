@@ -16,6 +16,7 @@ pub struct EffectiveLanguage {
     enabled: bool,
     include: Vec<String>,
     exclude: Vec<String>,
+    stdlib: bool,
     provider: Option<&'static dyn SyntaxProvider>,
     matcher: Option<PathMatcher>,
 }
@@ -43,6 +44,13 @@ impl EffectiveLanguage {
     #[must_use]
     pub fn exclude(&self) -> &[String] {
         &self.exclude
+    }
+
+    /// Whether the dependency context names this language's standard library for the
+    /// paths it matches: the `[languages.<name>] stdlib` key, on by default.
+    #[must_use]
+    pub const fn stdlib(&self) -> bool {
+        self.stdlib
     }
 
     /// Whether this build ships syntax analysis for the language.
@@ -94,6 +102,7 @@ impl WorkspaceLanguagePolicy {
                 .iter()
                 .find(|selection| selection.identity() == identity);
             let enabled = configured.is_none_or(LanguageFileSelection::enabled);
+            let stdlib = configured.is_none_or(LanguageFileSelection::stdlib);
             let include = configured
                 .and_then(LanguageFileSelection::include)
                 .map_or_else(
@@ -112,9 +121,8 @@ impl WorkspaceLanguagePolicy {
             languages.push(Self::entry(
                 root,
                 identity,
-                enabled,
-                include,
-                exclude,
+                (enabled, stdlib),
+                (include, exclude),
                 Some(provider),
             )?);
         }
@@ -138,9 +146,8 @@ impl WorkspaceLanguagePolicy {
             languages.push(Self::entry(
                 root,
                 selection.identity().to_owned(),
-                selection.enabled(),
-                include,
-                selection.exclude().to_vec(),
+                (selection.enabled(), selection.stdlib()),
+                (include, selection.exclude().to_vec()),
                 None,
             )?);
         }
@@ -155,12 +162,13 @@ impl WorkspaceLanguagePolicy {
         })
     }
 
+    /// One effective entry: the first pair holds the entry's `enabled` and `stdlib` keys,
+    /// the second its effective include and exclude patterns.
     fn entry(
         root: &Path,
         identity: String,
-        enabled: bool,
-        include: Vec<String>,
-        exclude: Vec<String>,
+        (enabled, stdlib): (bool, bool),
+        (include, exclude): (Vec<String>, Vec<String>),
         provider: Option<&'static dyn SyntaxProvider>,
     ) -> Result<EffectiveLanguage, WorkspaceIndexError> {
         let matcher = (!include.is_empty())
@@ -171,6 +179,7 @@ impl WorkspaceLanguagePolicy {
             enabled,
             include,
             exclude,
+            stdlib,
             provider,
             matcher,
         })

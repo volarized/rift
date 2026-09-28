@@ -12,7 +12,7 @@ use rift_core::Error;
 pub use rift_core::acceptance::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault,
 };
-use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
+use rift_core::acceptance::{ConfigurationEnvironment, NamedMembers, accept_configuration_naming};
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
@@ -57,8 +57,18 @@ fn accept_workspace(
     document: Option<&str>,
     environment: &ConfigurationEnvironment,
 ) -> Result<WorkspaceConfiguration, ConfigurationError> {
+    let shipped: Vec<String> = rift_syntax::definitions()
+        .iter()
+        .map(|definition| definition.shipped().language().identity_segment())
+        .collect();
+    let languages: Vec<&str> = shipped.iter().map(String::as_str).collect();
+    let members = [NamedMembers {
+        table: "languages",
+        names: &languages,
+    }];
     let (configuration, variables) =
-        accept_configuration::<WorkspaceConfiguration>(document, environment)?.into_parts();
+        accept_configuration_naming::<WorkspaceConfiguration>(document, environment, &members)?
+            .into_parts();
     let invalid = |violation| {
         Error::new(ConfigurationFault::Invalid {
             violation,

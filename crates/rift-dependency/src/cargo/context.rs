@@ -1,22 +1,23 @@
 //! The Cargo static context: the packages `Cargo.lock` pins and `Cargo.toml` declares.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
-use rift_protocol::read::ProjectPath;
+use rift_protocol::read::{PackageIdentity, ProjectPath};
 use serde::Deserialize;
 
-use super::lockfile::parse_lockfile;
+use super::lockfile::{GIT_SOURCE_PREFIX, LockedPackage, parse_lockfile};
 use super::{CARGO_LOCK_FILE_NAME, CARGO_MANAGER, CARGO_MANIFEST_FILE_NAME};
-use crate::context::{ContextAnswer, is_whole_version};
+use crate::context::{ContextAnswer, InstallFolder, InstallLocation, is_whole_version};
 use crate::manifest::{
-    StaticFileFailure, file_beside, manifest_directory_path, read_static_file, top_level_manifests,
+    StaticFileFailure, WorkspacePaths, file_beside, manifest_directory_path, read_static_file,
+    top_level_manifests,
 };
 use crate::resolver::{ContextRequest, StaticInputs};
 
 /// The lockfile `source` values naming crates.io, trailing separator dropped: the git
-/// index and the sparse index. Every other registry is one this machine alone resolves.
+/// index and the sparse index. Every other registry is a private one.
 const CRATES_IO_SOURCES: [&str; 2] = [
     "registry+https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io",
@@ -30,8 +31,9 @@ const CLAUSE_SEPARATOR: char = ',';
 /// declare.
 ///
 /// Every top-level manifest's lockfile contributes the exact version it pins, and every
-/// listed manifest the requirements it declares. Each manifest and each top-level
-/// lockfile is an input. A requirement for a package some lockfile pins is dropped where
+/// listed manifest the requirements it declares. Each registry package the lockfile pins
+/// records its install folder, the `<name>-<version>` folder Cargo unpacks it into. Each
+/// manifest and each top-level lockfile is an input. A requirement for a package some lockfile pins is dropped where
 /// the answers merge, so the context reports one selector per package. An absent file is
 /// the manifest-only case, not a degradation; a file over its bound or unparsable is
 /// one, naming the path.
@@ -44,22 +46,83 @@ pub(super) fn cargo_context(
     for manifest in request.manifests {
         answer.inputs.push(manifest.clone());
         match read_manifest(request.root, manifest, inputs) {
-            Ok(Some(document)) => parsed.push(document),
+            Ok(Some(document)) => {
+                parsed.push((manifest_directory_path(request.root, manifest), document));
+            }
             Ok(None) => {}
             Err(failure) => report(&mut answer, manifest, &failure),
         }
     }
-    let declared: BTreeSet<String> = parsed.iter().flat_map(Manifest::declared_names).collect();
+    let workspace = WorkspacePaths::new(request.root, inputs);
+    let mut declared: BTreeMap<String, Declaration> = BTreeMap::new();
+    for (directory, document) in &parsed {
+        for (name, dependency) in document.named() {
+            let found = declaration(&workspace, directory, dependency, inputs);
+            declared
+                .entry(name.to_owned())
+                .and_modify(|standing| *standing = standing.joined(found))
+                .or_insert(found);
+        }
+    }
     for manifest in top_level_manifests(request.manifests) {
         answer
             .inputs
             .push(file_beside(manifest, CARGO_LOCK_FILE_NAME));
         pin_lockfile(request.root, manifest, inputs, &declared, &mut answer);
     }
-    for document in &parsed {
-        answer.entries.extend(document.declared());
+    for (directory, document) in &parsed {
+        answer.entries.extend(
+            document.declared(|dependency| declaration(&workspace, directory, dependency, inputs)),
+        );
     }
     answer
+}
+
+/// How the manifests declare one package: by a path inside the workspace root alone,
+/// which the local index covers as project source, or otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Declaration {
+    /// Every path declaration resolves inside the root; no declaration names a source.
+    Inside,
+    /// A path outside the root, or a declaration naming no path.
+    Elsewhere,
+    /// Inherited from the workspace table, `{ workspace = true }`: says nothing alone.
+    Inherited,
+}
+
+impl Declaration {
+    const fn joined(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Elsewhere, _) | (_, Self::Elsewhere) => Self::Elsewhere,
+            (Self::Inside, _) | (_, Self::Inside) => Self::Inside,
+            (Self::Inherited, Self::Inherited) => Self::Inherited,
+        }
+    }
+}
+
+/// How one dependency table value declares its package, from the manifest in
+/// `directory`.
+fn declaration(
+    workspace: &WorkspacePaths,
+    directory: &Path,
+    dependency: &Dependency,
+    inputs: &mut dyn StaticInputs,
+) -> Declaration {
+    let Dependency::Detailed(detailed) = dependency else {
+        return Declaration::Elsewhere;
+    };
+    let Some(path) = detailed.path.as_deref() else {
+        return if detailed.workspace == Some(true) {
+            Declaration::Inherited
+        } else {
+            Declaration::Elsewhere
+        };
+    };
+    if workspace.contains(&directory.join(path), inputs) {
+        Declaration::Inside
+    } else {
+        Declaration::Elsewhere
+    }
 }
 
 /// Reports every package the `Cargo.lock` beside one manifest pins.
@@ -67,7 +130,7 @@ fn pin_lockfile(
     root: &Path,
     manifest: &ProjectPath,
     inputs: &mut dyn StaticInputs,
-    declared: &BTreeSet<String>,
+    declared: &BTreeMap<String, Declaration>,
     answer: &mut ContextAnswer,
 ) {
     let directory = manifest_directory_path(root, manifest);
@@ -76,18 +139,45 @@ fn pin_lockfile(
         Ok(lockfile) => lockfile,
         Err(failure) => return report(answer, manifest, &failure),
     };
-    let pinned = lockfile.package.iter().filter_map(|package| {
-        let availability = source_availability(package.source.as_deref(), || {
-            declared.contains(&package.name)
-        })?;
-        Some(PackageContextEntry::new(
+    for package in &lockfile.package {
+        let Some(availability) = source_availability(
+            package.source.as_deref(),
+            declared.get(&package.name).copied(),
+        ) else {
+            continue;
+        };
+        if let Some(folder) = registry_folder(package, availability) {
+            answer.install_folders.push(folder);
+        }
+        answer.entries.push(PackageContextEntry::new(
             CARGO_MANAGER,
             &package.name,
             PackageSelector::Version(package.version.clone()),
             availability,
-        ))
-    });
-    answer.entries.extend(pinned);
+        ));
+    }
+}
+
+/// The folder a registry package unpacks into, `<name>-<version>`, minted from the
+/// lockfile's own name and version: a folder name is never parsed, since `md-5-0.11.0`
+/// and `toml-0.9.12+spec-1.1.0` split no way that holds. Absent for a git or path
+/// package, whose checkout folder Cargo names by a hash this pass cannot mint.
+fn registry_folder(
+    package: &LockedPackage,
+    availability: PackageAvailability,
+) -> Option<InstallFolder> {
+    let registry = matches!(
+        availability,
+        PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+    );
+    registry.then(|| InstallFolder {
+        package: PackageIdentity {
+            manager: CARGO_MANAGER.to_owned(),
+            name: package.name.clone(),
+            version: package.version.clone(),
+        },
+        location: InstallLocation::CargoRegistry(format!("{}-{}", package.name, package.version)),
+    })
 }
 
 /// One `Cargo.toml`'s parsed dependency tables, absent when no file stands there.
@@ -121,19 +211,24 @@ fn report(answer: &mut ContextAnswer, manifest: &ProjectPath, failure: &StaticFi
 ///
 /// A package with no `source` is one of the workspace's own or a path dependency, and
 /// the lockfile does not tell the two apart. A manifest's dependency table does: a path
-/// dependency is declared there and is reported local-only, while the workspace's own
-/// package is declared by nobody and is reported by nobody.
+/// dependency outside the root is declared there and is reported as a path entry, while
+/// the workspace's own package, declared by nobody or by a path inside the root, is
+/// project source and is reported by nobody. A `git+` source is a git entry, and every
+/// registry but crates.io a private one.
 fn source_availability(
     source: Option<&str>,
-    is_declared: impl Fn() -> bool,
+    declaration: Option<Declaration>,
 ) -> Option<PackageAvailability> {
     let Some(source) = source.map(|source| source.trim_end_matches('/')) else {
-        return is_declared().then_some(PackageAvailability::LocalOnly);
+        return (declaration == Some(Declaration::Elsewhere)).then_some(PackageAvailability::Path);
     };
     if CRATES_IO_SOURCES.contains(&source) {
         return Some(PackageAvailability::Canonical);
     }
-    Some(PackageAvailability::LocalOnly)
+    if source.starts_with(GIT_SOURCE_PREFIX) {
+        return Some(PackageAvailability::Git);
+    }
+    Some(PackageAvailability::PrivateRegistry)
 }
 
 /// The `Cargo.toml` document, the dependency tables this pass reads.
@@ -159,14 +254,16 @@ struct ManifestWorkspace {
 }
 
 impl Manifest {
-    /// Every package name the dependency tables name, whatever selector each states.
+    /// Every package the dependency tables name, whatever selector each states, with
+    /// the value naming it.
     ///
-    /// A lockfile package with no `source` is reported only when one of these names it:
-    /// that is what separates a path dependency from the workspace's own package.
-    fn declared_names(&self) -> impl Iterator<Item = String> {
+    /// A lockfile package with no `source` is reported only when one of these names it
+    /// by a path outside the root: that is what separates a path dependency from the
+    /// workspace's own package.
+    fn named(&self) -> impl Iterator<Item = (&str, &Dependency)> {
         self.tables()
             .flat_map(|table| table.iter())
-            .map(|(key, dependency)| dependency.package_name(key).to_owned())
+            .map(|(key, dependency)| (dependency.package_name(key), dependency))
     }
 
     /// Every dependency table this pass reads, in the order it reads them.
@@ -185,9 +282,14 @@ impl Manifest {
     }
 
     /// One entry per dependency table value stating a version, in table then key order.
-    fn declared(&self) -> impl Iterator<Item = PackageContextEntry> {
+    /// A value whose path lies inside the root is project source and states none.
+    fn declared<'a>(
+        &'a self,
+        mut declaration: impl FnMut(&Dependency) -> Declaration + 'a,
+    ) -> impl Iterator<Item = PackageContextEntry> + 'a {
         self.tables()
             .flat_map(|table| table.iter())
+            .filter(move |(_, dependency)| declaration(dependency) != Declaration::Inside)
             .filter_map(|(key, dependency)| dependency.entry(key))
     }
 }
@@ -217,6 +319,7 @@ struct DetailedDependency {
     #[serde(rename = "registry-index")]
     registry_index: Option<String>,
     package: Option<String>,
+    workspace: Option<bool>,
 }
 
 impl Dependency {
@@ -253,15 +356,16 @@ impl Dependency {
 }
 
 impl DetailedDependency {
-    /// Whether a global package index can answer for this declaration: a path, git, or
-    /// custom-registry entry names bytes this machine alone resolves.
+    /// Whether a global package index can answer for this declaration. A `path` decides
+    /// first, since Cargo builds from it whatever else the table states; then `git`, then
+    /// a `registry` or `registry-index` other than crates.io.
     fn availability(&self) -> PackageAvailability {
-        let elsewhere = self.path.is_some()
-            || self.git.is_some()
-            || self.registry.is_some()
-            || self.registry_index.is_some();
-        if elsewhere {
-            PackageAvailability::LocalOnly
+        if self.path.is_some() {
+            PackageAvailability::Path
+        } else if self.git.is_some() {
+            PackageAvailability::Git
+        } else if self.registry.is_some() || self.registry_index.is_some() {
+            PackageAvailability::PrivateRegistry
         } else {
             PackageAvailability::Canonical
         }
@@ -299,11 +403,16 @@ fn pinned_version(requirement: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture::{ROOT, project};
     use super::*;
     use crate::CargoResolver;
     use crate::fixture::RecordedInspector;
     use crate::resolver::{DependencyResolver, LOCKFILE_BYTES_MAX};
+
+    const ROOT: &str = "/workspace";
+
+    fn project(path: &str) -> ProjectPath {
+        ProjectPath(path.to_owned())
+    }
 
     /// A lockfile pinning one crates.io package, one custom-registry package, and one
     /// git package, beside the workspace's own member.
@@ -359,7 +468,7 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
     }
 
     #[test]
-    fn test_a_lockfile_pins_exact_versions_and_marks_every_other_source_local_only() {
+    fn test_a_lockfile_pins_exact_versions_and_sorts_every_other_source_by_kind() {
         // No manifest declares `workspace-member`, so its source-less entry is the
         // workspace's own package rather than a path dependency.
         let mut inspector =
@@ -385,8 +494,8 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
             availability,
             [
                 PackageAvailability::Canonical,
-                PackageAvailability::LocalOnly,
-                PackageAvailability::LocalOnly
+                PackageAvailability::PrivateRegistry,
+                PackageAvailability::Git
             ]
         );
         assert!(
@@ -395,6 +504,25 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
                 .iter()
                 .all(|entry| entry.violation().is_none() && entry.requirement.is_none()),
             "a pinned entry states a version and no requirement"
+        );
+        let folders: Vec<(&str, &InstallLocation)> = answer
+            .install_folders
+            .iter()
+            .map(|folder| (folder.package.name.as_str(), &folder.location))
+            .collect();
+        assert_eq!(
+            folders,
+            [
+                (
+                    "serde",
+                    &InstallLocation::CargoRegistry("serde-1.0.228".to_owned())
+                ),
+                (
+                    "internal-tool",
+                    &InstallLocation::CargoRegistry("internal-tool-2.0.0".to_owned())
+                ),
+            ],
+            "a registry package records its unpacked folder; a git checkout records none"
         );
         assert_eq!(
             answer.inputs,
@@ -449,13 +577,24 @@ shared = \"3.1\"
             "a bare `1.2.3` is a caret requirement and `=1.2.3` pins one version; a \
              declaration stating no version is not reported"
         );
-        let local_only: Vec<&str> = answer
+        let unserved: Vec<(&str, PackageAvailability)> = answer
             .entries
             .iter()
-            .filter(|entry| entry.availability == PackageAvailability::LocalOnly)
-            .map(|entry| entry.name.as_str())
+            .filter(|entry| entry.availability != PackageAvailability::Canonical)
+            .map(|entry| (entry.name.as_str(), entry.availability))
             .collect();
-        assert_eq!(local_only, ["local", "private", "sourced"]);
+        assert_eq!(
+            unserved,
+            [
+                ("local", PackageAvailability::Path),
+                ("private", PackageAvailability::PrivateRegistry),
+                ("sourced", PackageAvailability::Git)
+            ]
+        );
+        assert!(
+            answer.install_folders.is_empty(),
+            "a manifest alone pins no version, so nothing is located"
+        );
         assert!(
             answer
                 .entries
@@ -464,6 +603,47 @@ shared = \"3.1\"
             "no entry states both selectors or neither"
         );
         assert!(answer.degradations.is_empty());
+    }
+
+    #[test]
+    fn test_each_lockfile_source_sorts_into_its_kind() {
+        let cases = [
+            (None, None, None),
+            (None, Some(Declaration::Inside), None),
+            (None, Some(Declaration::Inherited), None),
+            (
+                None,
+                Some(Declaration::Elsewhere),
+                Some(PackageAvailability::Path),
+            ),
+            (
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                None,
+                Some(PackageAvailability::Canonical),
+            ),
+            (
+                Some("sparse+https://index.crates.io/"),
+                None,
+                Some(PackageAvailability::Canonical),
+            ),
+            (
+                Some("sparse+https://registry.example.test/index/"),
+                None,
+                Some(PackageAvailability::PrivateRegistry),
+            ),
+            (
+                Some("git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210"),
+                None,
+                Some(PackageAvailability::Git),
+            ),
+        ];
+        for (source, declaration, expected) in cases {
+            assert_eq!(
+                source_availability(source, declaration),
+                expected,
+                "{source:?} {declaration:?}"
+            );
+        }
     }
 
     #[test]
@@ -531,5 +711,67 @@ shared = \"3.1\"
                 "{requirement} admits a range"
             );
         }
+    }
+
+    #[test]
+    fn test_a_path_dependency_inside_the_root_is_project_source() {
+        let manifest = "\
+[workspace.dependencies]
+helper = { path = \"crates/helper\" }
+
+[dependencies]
+helper = { workspace = true }
+outside = { path = \"../outside\", version = \"0.1\" }
+climber = { path = \"crates/../../climber\" }
+linked = { path = \"vendor/linked\" }
+";
+        let member = "[dependencies]\nhelper = { workspace = true }\n";
+        let lockfile = "\
+version = 4
+
+[[package]]
+name = \"helper\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"outside\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"climber\"
+version = \"0.2.0\"
+
+[[package]]
+name = \"linked\"
+version = \"0.3.0\"
+";
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/Cargo.toml"), manifest)
+            .with_file(format!("{ROOT}/crates/app/Cargo.toml"), member)
+            .with_file(format!("{ROOT}/Cargo.lock"), lockfile)
+            .with_canonical(ROOT, ROOT)
+            .with_canonical(
+                format!("{ROOT}/crates/helper"),
+                format!("{ROOT}/crates/helper"),
+            )
+            .with_canonical(format!("{ROOT}/vendor/linked"), "/elsewhere/linked");
+
+        let answer = context(&["Cargo.toml", "crates/app/Cargo.toml"], &mut inspector);
+
+        let reported: Vec<(String, PackageAvailability)> = answer
+            .entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.availability))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("outside".to_owned(), PackageAvailability::Path),
+                ("climber".to_owned(), PackageAvailability::Path),
+                ("linked".to_owned(), PackageAvailability::Path),
+                ("outside".to_owned(), PackageAvailability::Path),
+            ],
+            "helper is project source; `..` and a link leaving the root are not"
+        );
     }
 }

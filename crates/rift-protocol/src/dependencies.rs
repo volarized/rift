@@ -1,69 +1,92 @@
 //! The `[dependencies]` table of `rift.toml`, and the static dependency context models.
 //!
-//! The table states how the catalog is resolved, which packages the operator names
-//! beside the ones the workspace's files state, and the bounds the package index reads
-//! and holds under. [`PackageContextEntry`] carries one package the workspace depends
-//! on, as an exact version a lockfile pins or as the requirement a manifest declares.
+//! The table states whether the dependency context runs the standard library version
+//! probes, how long one probe may take, and which packages the operator names beside the
+//! ones the workspace's files state. [`PackageContextEntry`] carries one package the
+//! workspace depends on, as an exact version a lockfile pins or as the requirement a
+//! manifest declares.
 
-use crate::configuration::{ByteSize, ConfigurationViolation, Duration, first_out_of_range};
+use crate::configuration::{ConfigurationViolation, Duration, first_out_of_range};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// How the catalog is resolved, by default: through each toolchain.
+/// Whether the dependency context runs the version probes, by default: it does.
 pub const DEPENDENCIES_RESOLUTION_DEFAULT: DependencyResolution = DependencyResolution::Auto;
-/// Bytes one indexed package's selected source may hold, by default: 4 MiB.
-pub const DEPENDENCIES_PACKAGE_BYTES_DEFAULT: u64 = 4 << 20;
-/// Bytes one indexed package's selected source may hold, at least: 64 KiB.
-pub const DEPENDENCIES_PACKAGE_BYTES_MIN: u64 = 64 << 10;
-/// Bytes one indexed package's selected source may hold, at most: 1 GiB.
-pub const DEPENDENCIES_PACKAGE_BYTES_MAX: u64 = 1 << 30;
-/// Bytes every indexed package may hold together, by default: 256 MiB.
-pub const DEPENDENCIES_INDEX_BYTES_DEFAULT: u64 = 256 << 20;
-/// Bytes every indexed package may hold together, at least: 1 MiB.
-pub const DEPENDENCIES_INDEX_BYTES_MIN: u64 = 1 << 20;
-/// Bytes every indexed package may hold together, at most: 16 GiB.
-pub const DEPENDENCIES_INDEX_BYTES_MAX: u64 = 16 << 30;
-/// Files one indexed package's selection may hold, by default.
-pub const DEPENDENCIES_PACKAGE_FILES_DEFAULT: u64 = 2_000;
-/// Files one indexed package's selection may hold, at least.
-pub const DEPENDENCIES_PACKAGE_FILES_MIN: u64 = 1;
-/// Files one indexed package's selection may hold, at most.
-pub const DEPENDENCIES_PACKAGE_FILES_MAX: u64 = 100_000;
-/// Milliseconds one toolchain run may take before it is killed, by default: two
+/// Milliseconds one version probe may take before it is killed, by default: two
 /// minutes.
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
-/// Milliseconds one toolchain run may take before it is killed, at least: one second.
+/// Milliseconds one version probe may take before it is killed, at least: one second.
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN: u64 = 1_000;
-/// Milliseconds one toolchain run may take before it is killed, at most: one hour.
+/// Milliseconds one version probe may take before it is killed, at most: one hour.
 pub const DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX: u64 = 3_600_000;
 /// Entries the configured package list may hold, at most.
 pub const DEPENDENCIES_PACKAGES_MAX: usize = 20_000;
 
-/// How the resolvers reach a package graph: through each toolchain, or from the
-/// static inputs alone.
+/// Whether the dependency context runs the standard library version probes, or reads
+/// the static inputs alone.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyResolution {
-    /// Each resolver runs its toolchain and answers from its static inputs when the run
-    /// fails.
+    /// A standard library version no pin names is read from `rustc --version` or
+    /// `node --version`, and the static reading stands when the probe fails.
     Auto,
-    /// No toolchain runs. Each resolver answers from its static inputs, and an entry only
-    /// a toolchain can name is reported as a degradation.
+    /// No program runs. Every standard library version comes from the pins and project
+    /// files alone.
     Static,
 }
 
-/// Whether a global package index can answer for one package.
+/// Whether a global package index can answer for one package, and where the entry's
+/// source comes from when none can.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PackageAvailability {
-    /// The entry names a package a public registry serves: crates.io, npm, or the
-    /// Python Package Index.
+    /// The entry names a package a public registry serves, crates.io, npm, or the
+    /// Python Package Index, or a standard library: `stdlib/rust`, `stdlib/node`, or
+    /// `stdlib/python`.
     Canonical,
-    /// The entry names a path, git, or custom-registry package only this machine can
-    /// answer for.
-    LocalOnly,
+    /// The entry names a path outside the workspace, or an archive at a path, that only
+    /// this machine can read.
+    Path,
+    /// The entry names a git repository.
+    Git,
+    /// The entry names a registry other than the public one its package manager reads.
+    PrivateRegistry,
+    /// The entry names a package fetched from a URL no registry serves, such as a uv
+    /// wheel URL or an npm tarball URL.
+    Url,
+}
+
+/// The `package_unavailable` reason for a [`PackageAvailability::Path`] entry.
+pub const PATH_UNAVAILABLE_REASON: &str = "Currently rift doesn't support indexing dependencies \
+    by path. If you're interested in this capability, please upvote it at \
+    https://github.com/volarized/rift/issues/392.";
+/// The `package_unavailable` reason for a [`PackageAvailability::Git`] entry.
+pub const GIT_UNAVAILABLE_REASON: &str = "Currently rift doesn't support indexing dependencies \
+    from git repositories. If you're interested in this capability, please upvote it at \
+    https://github.com/volarized/rift/issues/393.";
+/// The `package_unavailable` reason for a [`PackageAvailability::PrivateRegistry`] entry.
+pub const PRIVATE_REGISTRY_UNAVAILABLE_REASON: &str =
+    "Currently rift doesn't support indexing dependencies from private registries.";
+/// The `package_unavailable` reason for a [`PackageAvailability::Url`] entry.
+pub const URL_UNAVAILABLE_REASON: &str =
+    "Currently rift doesn't support indexing dependencies from URLs.";
+
+impl PackageAvailability {
+    /// Why no global package index answers for an entry of this kind, naming the
+    /// capability Rift does not have yet. Absent for a [`Self::Canonical`] entry, which
+    /// the global index answers for.
+    #[must_use]
+    pub const fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Canonical => None,
+            Self::Path => Some(PATH_UNAVAILABLE_REASON),
+            Self::Git => Some(GIT_UNAVAILABLE_REASON),
+            Self::PrivateRegistry => Some(PRIVATE_REGISTRY_UNAVAILABLE_REASON),
+            Self::Url => Some(URL_UNAVAILABLE_REASON),
+        }
+    }
 }
 
 /// One package the workspace depends on, as its manifests and lockfiles state it.
@@ -198,35 +221,24 @@ fn selector_violation(
     }
 }
 
-/// The `[dependencies]` table. It states how the catalog is resolved, which packages
-/// the operator names beside the ones the workspace's manifests and lockfiles state,
-/// and the bounds the package index reads and holds under.
+/// The `[dependencies]` table. It states whether the dependency context runs the
+/// standard library version probes, how long one probe may take, and which packages the
+/// operator names beside the ones the workspace's manifests and lockfiles state.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_dependencies_ranges)]
 pub struct DependenciesConfiguration {
-    /// How the catalog is resolved: `auto` runs each toolchain, `static` reads the
-    /// lockfiles and package caches alone.
+    /// Whether a standard library version probe runs: `auto` runs `rustc --version` or
+    /// `node --version` when no pin names the version, `static` reads the pins and project
+    /// files alone and runs no program.
     #[serde(default = "default_dependencies_resolution")]
     pub resolution: DependencyResolution,
     /// Packages carried beside the ones the workspace's manifests and lockfiles state.
     /// Each entry names exactly one of `version` and `requirement`.
     #[schemars(length(max = 20_000))]
     pub packages: Vec<ConfiguredPackage>,
-    /// Bytes one package's selected source may hold, 64kb to 1gb. A package past it is
-    /// skipped.
-    #[serde(default = "default_dependencies_package_size")]
-    pub package_size: ByteSize,
-    /// Bytes every indexed package may hold together, 1mb to 16gb. A package that
-    /// would cross it is skipped.
-    #[serde(default = "default_dependencies_index_size")]
-    pub index_size: ByteSize,
-    /// Files one package's selection may hold, 1 to 100000. A package past it is
-    /// skipped.
-    #[schemars(range(min = 1, max = 100_000))]
-    #[serde(default = "default_dependencies_package_files")]
-    pub package_files: u64,
-    /// Wall-clock bound one toolchain run may take before it is killed, 1s to 1h.
+    /// Wall-clock bound one standard library version probe may take before it is
+    /// killed, 1s to 1h.
     #[serde(default = "default_dependencies_command_timeout")]
     pub command_timeout: Duration,
 }
@@ -236,9 +248,6 @@ impl Default for DependenciesConfiguration {
         Self {
             resolution: default_dependencies_resolution(),
             packages: Vec::new(),
-            package_size: default_dependencies_package_size(),
-            index_size: default_dependencies_index_size(),
-            package_files: default_dependencies_package_files(),
             command_timeout: default_dependencies_command_timeout(),
         }
     }
@@ -256,24 +265,6 @@ impl DependenciesConfiguration {
                 DEPENDENCIES_PACKAGES_MAX as u64,
             ),
             (
-                "dependencies.package_size",
-                self.package_size.bytes(),
-                DEPENDENCIES_PACKAGE_BYTES_MIN,
-                DEPENDENCIES_PACKAGE_BYTES_MAX,
-            ),
-            (
-                "dependencies.index_size",
-                self.index_size.bytes(),
-                DEPENDENCIES_INDEX_BYTES_MIN,
-                DEPENDENCIES_INDEX_BYTES_MAX,
-            ),
-            (
-                "dependencies.package_files",
-                self.package_files,
-                DEPENDENCIES_PACKAGE_FILES_MIN,
-                DEPENDENCIES_PACKAGE_FILES_MAX,
-            ),
-            (
                 "dependencies.command_timeout",
                 self.command_timeout.milliseconds(),
                 DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN,
@@ -286,18 +277,6 @@ impl DependenciesConfiguration {
 
 fn default_dependencies_resolution() -> DependencyResolution {
     DEPENDENCIES_RESOLUTION_DEFAULT
-}
-
-fn default_dependencies_package_size() -> ByteSize {
-    ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_DEFAULT)
-}
-
-fn default_dependencies_index_size() -> ByteSize {
-    ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_DEFAULT)
-}
-
-fn default_dependencies_package_files() -> u64 {
-    DEPENDENCIES_PACKAGE_FILES_DEFAULT
 }
 
 fn default_dependencies_command_timeout() -> Duration {
@@ -355,15 +334,6 @@ mod tests {
         assert_eq!(table.resolution, DependencyResolution::Auto);
         assert!(table.packages.is_empty());
         assert_eq!(
-            table.package_size,
-            ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_DEFAULT)
-        );
-        assert_eq!(
-            table.index_size,
-            ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_DEFAULT)
-        );
-        assert_eq!(table.package_files, DEPENDENCIES_PACKAGE_FILES_DEFAULT);
-        assert_eq!(
             table.command_timeout,
             Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_DEFAULT)
         );
@@ -396,40 +366,14 @@ mod tests {
 
     #[test]
     fn test_dependencies_numeric_bounds_are_enforced_naming_the_field() {
-        let cases: [(&str, Setter, [u64; 2]); 4] = [
-            (
-                "dependencies.package_size",
-                |table, value| table.package_size = ByteSize::from_bytes(value),
-                [
-                    DEPENDENCIES_PACKAGE_BYTES_MIN - 1,
-                    DEPENDENCIES_PACKAGE_BYTES_MAX + 1,
-                ],
-            ),
-            (
-                "dependencies.index_size",
-                |table, value| table.index_size = ByteSize::from_bytes(value),
-                [
-                    DEPENDENCIES_INDEX_BYTES_MIN - 1,
-                    DEPENDENCIES_INDEX_BYTES_MAX + 1,
-                ],
-            ),
-            (
-                "dependencies.package_files",
-                |table, value| table.package_files = value,
-                [
-                    DEPENDENCIES_PACKAGE_FILES_MIN - 1,
-                    DEPENDENCIES_PACKAGE_FILES_MAX + 1,
-                ],
-            ),
-            (
-                "dependencies.command_timeout",
-                |table, value| table.command_timeout = Duration::from_millis(value),
-                [
-                    DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN - 1,
-                    DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX + 1,
-                ],
-            ),
-        ];
+        let cases: [(&str, Setter, [u64; 2]); 1] = [(
+            "dependencies.command_timeout",
+            |table, value| table.command_timeout = Duration::from_millis(value),
+            [
+                DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN - 1,
+                DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX + 1,
+            ],
+        )];
         for (field, set, values) in cases {
             for value in values {
                 let mut configuration = WorkspaceConfiguration::default();
@@ -452,9 +396,6 @@ mod tests {
     fn test_dependencies_bounds_accept_their_edges() {
         let mut configuration = WorkspaceConfiguration::default();
         let table = &mut configuration.dependencies;
-        table.package_size = ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MIN);
-        table.index_size = ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX);
-        table.package_files = DEPENDENCIES_PACKAGE_FILES_MAX;
         table.command_timeout = Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN);
         table.packages =
             vec![configured("cargo", "serde", Some("1.0.228"), None); DEPENDENCIES_PACKAGES_MAX];
@@ -560,9 +501,6 @@ mod tests {
                 { "manager": "cargo", "name": "serde", "version": "1.0.228" },
                 { "manager": "npm", "name": "typescript", "requirement": "^5.9.0" },
             ],
-            "package_size": "8mb",
-            "index_size": "1gb",
-            "package_files": 10,
             "command_timeout": "5m",
         }))
         .expect("every documented key parses");
@@ -574,12 +512,17 @@ mod tests {
                 configured("npm", "typescript", None, Some("^5.9.0")),
             ]
         );
-        assert_eq!(table.package_size, ByteSize::from_bytes(8 << 20));
-        assert_eq!(table.index_size, ByteSize::from_bytes(1 << 30));
-        assert_eq!(table.package_files, 10);
         assert_eq!(table.command_timeout, Duration::from_millis(300_000));
         assert_eq!(table.violation(), None);
-        for removed in ["enabled", "include", "exclude", "package_bytes_max"] {
+        for removed in [
+            "enabled",
+            "include",
+            "exclude",
+            "package_bytes_max",
+            "package_size",
+            "index_size",
+            "package_files",
+        ] {
             let refused = serde_json::from_value::<DependenciesConfiguration>(
                 json!({ removed: serde_json::Value::Null }),
             );
@@ -603,47 +546,6 @@ mod tests {
                 "packages max",
                 &table["packages"]["maxItems"],
                 json!(DEPENDENCIES_PACKAGES_MAX),
-            ),
-            (
-                "package size default",
-                &table["package_size"]["default"],
-                json!(ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_DEFAULT)),
-            ),
-            (
-                "package size range",
-                &table["package_size"]["rift:range"],
-                json!({
-                    "min": ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MIN),
-                    "max": ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MAX),
-                }),
-            ),
-            (
-                "index size default",
-                &table["index_size"]["default"],
-                json!(ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_DEFAULT)),
-            ),
-            (
-                "index size range",
-                &table["index_size"]["rift:range"],
-                json!({
-                    "min": ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MIN),
-                    "max": ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX),
-                }),
-            ),
-            (
-                "package files default",
-                &table["package_files"]["default"],
-                json!(DEPENDENCIES_PACKAGE_FILES_DEFAULT),
-            ),
-            (
-                "package files min",
-                &table["package_files"]["minimum"],
-                json!(DEPENDENCIES_PACKAGE_FILES_MIN),
-            ),
-            (
-                "package files max",
-                &table["package_files"]["maximum"],
-                json!(DEPENDENCIES_PACKAGE_FILES_MAX),
             ),
             (
                 "command timeout default",
@@ -757,6 +659,57 @@ mod tests {
                 "cargo/serde@1.0.228",
                 "npm/typescript@^5.9.0"
             ]
+        );
+    }
+
+    /// Each kind no public registry serves names the missing capability, linking the
+    /// enhancement issue that collects demand for path and git dependencies alone.
+    #[test]
+    fn test_each_unserved_kind_names_its_missing_capability() {
+        assert_eq!(PackageAvailability::Canonical.unavailable_reason(), None);
+        let cases = [
+            (
+                PackageAvailability::Path,
+                "path",
+                Some("https://github.com/volarized/rift/issues/392."),
+            ),
+            (
+                PackageAvailability::Git,
+                "git",
+                Some("https://github.com/volarized/rift/issues/393."),
+            ),
+            (
+                PackageAvailability::PrivateRegistry,
+                "private_registry",
+                None,
+            ),
+            (PackageAvailability::Url, "url", None),
+        ];
+        for (availability, spelling, link) in cases {
+            let reason = availability
+                .unavailable_reason()
+                .unwrap_or_else(|| panic!("{spelling} names no reason"));
+            assert!(
+                reason.starts_with("Currently rift doesn't support indexing dependencies "),
+                "{reason}"
+            );
+            assert_eq!(
+                link.is_some_and(|link| reason.ends_with(link)),
+                link.is_some(),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("  ") && !reason.contains('\n'),
+                "{reason:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(availability).expect("serializes"),
+                json!(spelling)
+            );
+        }
+        assert!(
+            serde_json::from_value::<PackageAvailability>(json!("local_only")).is_err(),
+            "the kinds replace `local_only`"
         );
     }
 }

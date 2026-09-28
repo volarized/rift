@@ -430,8 +430,9 @@ pub struct WorkspaceConfiguration {
     /// Which files below the workspace root the index and reads consider visible, and how
     /// many files and bytes the index holds together.
     pub source: SourceConfiguration,
-    /// Whether the dependency index runs, how the catalog is resolved, which
-    /// cataloged packages it indexes, and the bounds it indexes under.
+    /// Whether the dependency context runs the standard library version probes, how long
+    /// one probe may take, and which packages the context carries beside the ones the
+    /// workspace's manifests and lockfiles state.
     pub dependencies: DependenciesConfiguration,
     /// The server's own log records: how many the workspace database keeps,
     /// how many one read returns, and which targets are captured.
@@ -2267,6 +2268,11 @@ pub struct LanguageConfiguration {
     pub exclude: Vec<PathPattern>,
     /// Whether caller-provided code may execute under this exact language.
     pub execution: bool,
+    /// Whether the package context names this language's standard library: `stdlib/rust`
+    /// for `rust`, `stdlib/node` and npm `typescript` for `javascript`, `typescript`, and
+    /// `typescript:tsx`, and `stdlib/python` for `python`. A library stays in the context
+    /// while any language the workspace uses that names it keeps this key on.
+    pub stdlib: bool,
     /// Inline LSP process or name of one shared process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lsp: Option<LanguageLspConfiguration>,
@@ -2279,6 +2285,7 @@ impl Default for LanguageConfiguration {
             include: None,
             exclude: Vec::new(),
             execution: false,
+            stdlib: true,
             lsp: None,
         }
     }
@@ -3091,7 +3098,6 @@ mod tests {
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
         assert!(configuration.dependencies.packages.is_empty());
-        assert_eq!(configuration.dependencies.package_files, 2_000);
 
         assert!(configuration.languages.is_empty());
         assert!(configuration.lsp.is_empty());
@@ -5124,7 +5130,17 @@ mod tests {
         assert!(language.include.is_none());
         assert!(language.exclude.is_empty());
         assert!(!language.execution);
+        assert!(
+            language.stdlib,
+            "a language names its standard library by default"
+        );
         assert!(language.lsp.is_none());
+        let off: LanguageConfiguration =
+            serde_json::from_value(json!({"stdlib": false})).expect("language");
+        assert!(!off.stdlib);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(LanguageConfiguration)).expect("schema");
+        assert_eq!(schema["properties"]["stdlib"]["default"], json!(true));
     }
 
     #[test]

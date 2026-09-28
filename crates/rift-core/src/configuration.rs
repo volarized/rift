@@ -104,6 +104,7 @@ pub struct LanguageFileSelection {
     enabled: bool,
     include: Option<Vec<String>>,
     exclude: Vec<String>,
+    stdlib: bool,
 }
 
 impl LanguageFileSelection {
@@ -131,6 +132,13 @@ impl LanguageFileSelection {
         &self.exclude
     }
 
+    /// Whether the dependency context names this language's standard library for the
+    /// paths it matches.
+    #[must_use]
+    pub const fn stdlib(&self) -> bool {
+        self.stdlib
+    }
+
     fn from_entry(identity: &str, configuration: &LanguageConfiguration) -> Self {
         let patterns = |list: &[rift_protocol::read::PathPattern]| {
             list.iter().map(|pattern| pattern.0.clone()).collect()
@@ -140,6 +148,7 @@ impl LanguageFileSelection {
             enabled: configuration.enabled,
             include: configuration.include.as_deref().map(patterns),
             exclude: patterns(&configuration.exclude),
+            stdlib: configuration.stdlib,
         }
     }
 }
