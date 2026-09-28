@@ -1575,6 +1575,40 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The trigram index `pattern` selects its files through lacks rows of stored file\ntext, and verifying those rows beside the selected ones would pass the `[search]`\nkey `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the\nrows the index holds and a match in the other rows is missing from it. The server\nindexes those rows in the background after each write; `prepared` and `total` state\nhow far it has got. Resend the request once the index has caught up.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Rows of stored file text the trigram index holds: one per file, or one per\nchunk of a file split under `[search.text]`.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "description": "Rows of stored file text the store holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
@@ -3983,6 +4017,40 @@
                   "code",
                   "matches_per_file",
                   "files"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The trigram index `pattern` selects its files through lacks rows of stored file\ntext, and verifying those rows beside the selected ones would pass the `[search]`\nkey `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the\nrows the index holds and a match in the other rows is missing from it. The server\nindexes those rows in the background after each write; `prepared` and `total` state\nhow far it has got. Resend the request once the index has caught up.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Rows of stored file text the trigram index holds: one per file, or one per\nchunk of a file split under `[search.text]`.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "description": "Rows of stored file text the store holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "detail"
                 ],
                 "type": "object"
               },
@@ -6662,6 +6730,40 @@
                   "code",
                   "matches_per_file",
                   "files"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The trigram index `pattern` selects its files through lacks rows of stored file\ntext, and verifying those rows beside the selected ones would pass the `[search]`\nkey `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the\nrows the index holds and a match in the other rows is missing from it. The server\nindexes those rows in the background after each write; `prepared` and `total` state\nhow far it has got. Resend the request once the index has caught up.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Rows of stored file text the trigram index holds: one per file, or one per\nchunk of a file split under `[search.text]`.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "description": "Rows of stored file text the store holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "detail"
                 ],
                 "type": "object"
               },
