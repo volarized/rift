@@ -752,6 +752,20 @@ mod tests {
         }
     }
 
+    /// A channel rustup does not spell, such as a bare major or a four-part release,
+    /// names no version rule, so it goes out named.
+    #[test]
+    fn test_a_channel_rustup_does_not_spell_goes_out_named() {
+        assert_eq!(
+            rust_toolchain_pin("[toolchain]\nchannel = \"1\"\n", false),
+            Some(named("1"))
+        );
+        assert_eq!(
+            rust_toolchain_pin("1.98.0.1\n", true),
+            Some(named("1.98.0.1"))
+        );
+    }
+
     #[test]
     fn test_rustup_and_rustc_version_lines_parse() {
         assert_eq!(
@@ -915,6 +929,33 @@ mod tests {
         assert!(answer.degradations[0].1.contains("is not installed"));
     }
 
+    /// A `rustc` that answers without a version line, such as a wrapper printing its own
+    /// banner, degrades to the toolchain file's channel and names what it printed.
+    #[test]
+    fn test_a_rustc_printing_no_version_degrades_to_the_toolchain_file() {
+        let mut inputs = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/rust-toolchain.toml"),
+                "[toolchain]\nchannel = \"1.80\"\n",
+            )
+            .with_command(
+                "rustc --version",
+                RecordedInspector::succeeded("rustc-wrapper 0.4\n"),
+            );
+
+        let answer = answer(&[StandardLibrary::Rust], true, &mut inputs);
+
+        assert_eq!(selector_of(&answer, "rust"), range("~1.80"));
+        assert_eq!(
+            answer.degradations,
+            [(
+                ResolverName::StdlibRust,
+                "rustc --version printed no version: rustc-wrapper 0.4".to_owned()
+            )]
+        );
+        assert!(answer.install_folders.is_empty());
+    }
+
     #[test]
     fn test_static_resolution_runs_nothing_and_reads_the_channel() {
         let mut inputs = RecordedInspector::default()
@@ -976,6 +1017,11 @@ mod tests {
         );
         assert_eq!(mise_toml_node("[env]\nNODE_ENV = \"dev\"\n"), None);
         assert_eq!(
+            mise_toml_node("[tools]\nnode = 22\n"),
+            None,
+            "a bare number is no version word mise reads"
+        );
+        assert_eq!(
             package_volta_node(r#"{"volta": {"node": "22.3.0", "npm": "10.8.1"}}"#),
             Some(exact("22.3.0"))
         );
@@ -1012,6 +1058,63 @@ mod tests {
         let answer_absent = answer(&[StandardLibrary::Node], true, &mut absent);
         assert_eq!(selector_of(&answer_absent, "node"), range(">=20"));
         assert_eq!(answer_absent.degradations[0].0.as_str(), "stdlib/node");
+    }
+
+    /// `.tool-versions` and `mise.toml` pin Node.js when no earlier file does, and no
+    /// probe runs.
+    #[test]
+    fn test_tool_versions_and_mise_pins_name_the_node_entry() {
+        let mut tool_versions = RecordedInspector::default()
+            .with_file(format!("{ROOT}/.tool-versions"), "nodejs 22.3.0\n");
+        let answer_tool_versions = answer(&[StandardLibrary::Node], true, &mut tool_versions);
+        assert_eq!(
+            selector_of(&answer_tool_versions, "node"),
+            version("22.3.0")
+        );
+
+        let mut mise = RecordedInspector::default()
+            .with_file(format!("{ROOT}/mise.toml"), "[tools]\nnode = \"22\"\n");
+        let answer_mise = answer(&[StandardLibrary::Node], true, &mut mise);
+        assert_eq!(selector_of(&answer_mise, "node"), range("22"));
+
+        for asked in [&tool_versions.asked, &mise.asked] {
+            assert!(!asked.iter().any(|asked| asked.starts_with("run ")));
+        }
+    }
+
+    /// A `node` that exits nonzero, or answers without a whole version, degrades to
+    /// `engines.node` and names what it printed.
+    #[test]
+    fn test_a_node_probe_without_a_version_degrades_naming_its_output() {
+        let engines = r#"{"engines": {"node": ">=20"}}"#;
+        let mut failed = RecordedInspector::default()
+            .with_file(format!("{ROOT}/package.json"), engines)
+            .with_command(
+                "node --version",
+                RecordedInspector::failed("node: bad option\n"),
+            );
+        let answer_failed = answer(&[StandardLibrary::Node], true, &mut failed);
+        assert_eq!(selector_of(&answer_failed, "node"), range(">=20"));
+        assert_eq!(
+            answer_failed.degradations,
+            [(
+                ResolverName::StdlibNode,
+                "node --version: node: bad option".to_owned()
+            )]
+        );
+
+        let mut partial = RecordedInspector::default()
+            .with_file(format!("{ROOT}/package.json"), engines)
+            .with_command("node --version", RecordedInspector::succeeded("v22\n"));
+        let answer_partial = answer(&[StandardLibrary::Node], true, &mut partial);
+        assert_eq!(selector_of(&answer_partial, "node"), range(">=20"));
+        assert_eq!(
+            answer_partial.degradations,
+            [(
+                ResolverName::StdlibNode,
+                "node --version printed no version: v22".to_owned()
+            )]
+        );
     }
 
     #[test]
@@ -1061,5 +1164,22 @@ mod tests {
             Some(StandardLibrary::Node)
         );
         assert_eq!(StandardLibrary::for_language("markdown"), None);
+    }
+
+    /// Each library's degradations carry `stdlib/<name>`, the entry name its entries go
+    /// out under.
+    #[test]
+    fn test_each_library_names_its_degradations_after_its_entry() {
+        for library in [
+            StandardLibrary::Rust,
+            StandardLibrary::Node,
+            StandardLibrary::Python,
+        ] {
+            assert_eq!(
+                library.resolver().as_str(),
+                format!("stdlib/{}", library.name()),
+                "{library:?}"
+            );
+        }
     }
 }
