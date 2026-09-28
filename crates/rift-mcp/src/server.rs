@@ -1638,14 +1638,26 @@ impl RiftMcp {
     /// resolves the snapshot's dependency context with the request's `packages` applied.
     /// A route the global API did not answer, or a remote read that failed, leaves the
     /// project hits alone with the typed global warning.
+    ///
+    /// The page arguments are accepted and the project side reads first, so a lookup the
+    /// server refuses spends no global request.
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        let limit = rift_server::accepted_limit(params.limit)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
+        let mut collected = params.clone();
+        collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
+        collected.page_index = 0;
+        let local = self
+            .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
+            .await?
+            .0;
         let context = resolved
             .published
             .reads
@@ -1662,21 +1674,14 @@ impl RiftMcp {
             items: remote,
             warnings: mut remote_warnings,
         } = remote;
-        let mut collected = params.clone();
-        collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
-        collected.page_index = 0;
-        let local = self
-            .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
-            .await?
-            .0;
-        let mut answer = match merge_symbols(&params, local.clone(), remote) {
+        let mut answer = match merge_symbols(&params, limit, local.clone(), remote) {
             Ok(mut answer) => {
                 answer.warnings.append(&mut remote_warnings);
                 answer
             }
             Err(error) => {
                 route.discard_remote(&error);
-                local_symbol_page(&params, local)
+                local_symbol_page(&params, limit, local)
             }
         };
         answer.warnings.extend(route.warnings());
@@ -1845,6 +1850,9 @@ impl RiftMcp {
     /// ordered together, for the snapshot's dependency context with the request's
     /// `packages` applied. A route the global API did not answer, or a remote read that
     /// failed, leaves the project hits alone with the typed global warning.
+    ///
+    /// The page arguments are accepted and the project side reads first, so a search the
+    /// server refuses spends no global request.
     async fn route_current_tree_search(
         &self,
         resolved: ResolvedWorkspace,
@@ -1875,6 +1883,16 @@ impl RiftMcp {
             return Ok(answer);
         };
 
+        let limit = rift_server::search_page_limit(&params)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let mut collected = params.clone();
+        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page_index = 0;
+        let mut local = self
+            .current_tree_search_selected(&resolved, collected, answer, references)
+            .await?
+            .0;
+        local.warnings.extend(warnings);
         let context = resolved
             .published
             .reads
@@ -1894,22 +1912,14 @@ impl RiftMcp {
             )
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
-        let mut collected = params.clone();
-        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
-        collected.page_index = 0;
-        let mut local = self
-            .current_tree_search_selected(&resolved, collected, answer, references)
-            .await?
-            .0;
-        local.warnings.extend(warnings);
-        let mut answer = match merge_search(&params, local.clone(), remote) {
+        let mut answer = match merge_search(&params, limit, local.clone(), remote) {
             Ok(mut answer) => {
                 answer.warnings.extend(remote_warnings);
                 answer
             }
             Err(error) => {
                 route.discard_remote(&error);
-                local_search_page(&params, local)
+                local_search_page(&params, limit, local)
             }
         };
         answer.warnings.extend(route.warnings());
@@ -1919,7 +1929,8 @@ impl RiftMcp {
     /// Routes one current-tree `pattern` search whose `scope` reaches packages: the
     /// project's matches come from the published snapshot, `global` verifying no project
     /// file, and the package matches from one page of the global API's pattern search. The
-    /// project side reads first, so a pattern the server refuses spends no global request.
+    /// page arguments are accepted and the project side reads first, so a pattern the
+    /// server refuses spends no global request.
     async fn route_pattern_search(
         &self,
         resolved: ResolvedWorkspace,
@@ -1929,6 +1940,8 @@ impl RiftMcp {
         references: Arc<EngineReferences>,
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        let limit = rift_server::search_page_limit(&params)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -1949,7 +1962,7 @@ impl RiftMcp {
                 package_patterns(&client, requested, &packages).await
             })
             .await;
-        let mut answer = merge_patterns(&params, local, remote);
+        let mut answer = merge_patterns(&params, limit, local, remote);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }

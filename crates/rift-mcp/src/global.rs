@@ -408,9 +408,11 @@ fn search_request(
     }
 }
 
-/// Merges local and remote symbol hits, then applies requested pagination.
+/// Merges local and remote symbol hits, then pages them at `limit`, the request's accepted
+/// page size.
 pub(crate) fn merge_symbols(
     params: &GetSymbolParams,
+    limit: usize,
     mut local: GetSymbolResult,
     remote: Vec<PackageSymbolCandidate>,
 ) -> Result<GetSymbolResult, ClientError> {
@@ -446,9 +448,7 @@ pub(crate) fn merge_symbols(
         .into_iter()
         .map(|entry| entry.hit)
         .collect::<Vec<_>>();
-    let page_limit = usize::try_from(params.limit)
-        .map_err(|_| ClientError::InvalidRequest { field: "limit" })?;
-    let (hits, pagination) = page_window(hits, params.page_index, page_limit);
+    let (hits, pagination) = page_window(hits, params.page_index, limit);
     Ok(GetSymbolResult {
         hits,
         pagination,
@@ -519,9 +519,11 @@ fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
         .unwrap_or_default()
 }
 
-/// Merges package candidates into local search hits while retaining traversal-only hits.
+/// Merges package candidates into local search hits while retaining traversal-only hits,
+/// then pages them at `limit`, the request's accepted page size.
 pub(crate) fn merge_search(
     params: &SearchParams,
+    limit: usize,
     mut local: SearchResult,
     remote: GlobalSearchCandidates,
 ) -> Result<SearchResult, ClientError> {
@@ -605,7 +607,6 @@ pub(crate) fn merge_search(
         })
         .collect::<Vec<_>>();
     order_search_hits(&mut ordered, params.order);
-    let limit = search_page_limit(params);
     let (results, pagination) = page_window(ordered, params.page_index, limit);
     Ok(SearchResult {
         results,
@@ -615,7 +616,7 @@ pub(crate) fn merge_search(
 }
 
 /// Adds the package matches of a `pattern` search after the project's, then pages the
-/// answer.
+/// answer at `limit`, the request's accepted page size.
 ///
 /// Pattern hits carry no score, so `relevance` keeps the collected order: the project's
 /// matches by path, then offset, then the packages' in the order the global API answered
@@ -623,6 +624,7 @@ pub(crate) fn merge_search(
 /// its first match, and `target` selects the file hits, the declaration hits, or both.
 pub(crate) fn merge_patterns(
     params: &SearchParams,
+    limit: usize,
     local: SearchResult,
     remote: GlobalPatternMatches,
 ) -> SearchResult {
@@ -640,7 +642,6 @@ pub(crate) fn merge_patterns(
         }
     }
     order_search_hits(&mut hits, params.order);
-    let limit = search_page_limit(params);
     let (results, pagination) = page_window(hits, params.page_index, limit);
     let mut warnings = local.warnings;
     warnings.extend(remote.warnings);
@@ -651,21 +652,13 @@ pub(crate) fn merge_patterns(
     }
 }
 
-/// The page size a search asks for: its `limit`, or the default page size when it names none.
-fn search_page_limit(params: &SearchParams) -> usize {
-    let limit = params
-        .limit
-        .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64);
-    usize::try_from(limit).unwrap_or(usize::MAX)
-}
-
-/// One page of the project's own symbol hits, for a read whose remote lane failed: the
-/// hits keep the order the snapshot ranked them in.
+/// One page of the project's own symbol hits at `limit`, for a read whose remote lane
+/// failed: the hits keep the order the snapshot ranked them in.
 pub(crate) fn local_symbol_page(
     params: &GetSymbolParams,
+    limit: usize,
     local: GetSymbolResult,
 ) -> GetSymbolResult {
-    let limit = usize::try_from(params.limit).unwrap_or(usize::MAX);
     let (hits, pagination) = page_window(local.hits, params.page_index, limit);
     GetSymbolResult {
         hits,
@@ -674,10 +667,13 @@ pub(crate) fn local_symbol_page(
     }
 }
 
-/// One page of the project's own search hits, for a read whose remote lane failed: the
-/// hits keep the order the snapshot answered them in under `params.order`.
-pub(crate) fn local_search_page(params: &SearchParams, local: SearchResult) -> SearchResult {
-    let limit = search_page_limit(params);
+/// One page of the project's own search hits at `limit`, for a read whose remote lane
+/// failed: the hits keep the order the snapshot answered them in under `params.order`.
+pub(crate) fn local_search_page(
+    params: &SearchParams,
+    limit: usize,
+    local: SearchResult,
+) -> SearchResult {
     let (results, pagination) = page_window(local.results, params.page_index, limit);
     SearchResult {
         results,
@@ -1820,7 +1816,8 @@ mod tests {
                     detail: None,
                 }],
             };
-            super::merge_patterns(&params, local, remote)
+            let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
+            super::merge_patterns(&params, limit, local, remote)
         };
 
         let all = merged(json!({"pattern": "beacon", "scope": "all", "target": "all"}));

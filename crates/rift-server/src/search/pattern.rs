@@ -23,10 +23,8 @@ use super::{
     populate_symbol_lines, text_file_hit_target,
 };
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, file_id, page, project_path,
-    results_truncation_warning,
+    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
 };
-use rift_core::constants::SEARCH_RESULTS_DEFAULT;
 
 /// The `[search]` bounds one `pattern` search runs under.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,7 +394,7 @@ impl ReadService {
     ) -> Result<SearchResult, ReadError> {
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         let bounds = store.pattern_bounds();
-        let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        let limit = super::search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
         let (candidates, preparing) = if params.scope == SearchScope::Global {
             (Vec::new(), None)

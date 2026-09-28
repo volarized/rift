@@ -1172,7 +1172,12 @@ impl ReadService {
 
 /// Accepts a caller-supplied result limit: positive and at most `PAGE_LIMIT_MAX`. The
 /// maximum fits `usize` on every platform, so the conversion below cannot fail.
-pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
+///
+/// # Errors
+///
+/// Returns `invalid_request` naming `limit` for zero, or for a limit past
+/// `PAGE_LIMIT_MAX`.
+pub fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
     if requested == 0 {
         return Err(ReadFault::invalid("limit", "zero"));
     }
