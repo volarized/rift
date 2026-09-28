@@ -1229,3 +1229,70 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     server_task.await?;
     Ok(())
 }
+
+/// A read the server refuses spends no global request, whichever route it takes: the page
+/// arguments are accepted and the project side reads before the package side is asked, so
+/// a zero `limit` is refused, never paged.
+#[tokio::test]
+async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let refused = [
+        (
+            "search",
+            json!({"query": "beacon", "pattern": "beacon", "scope": "all"}),
+            "pattern",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all", "traversal": {"depth": 1}}),
+            "seed",
+        ),
+        (
+            "search",
+            json!({"pattern": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+        (
+            "get_symbol",
+            json!({"name": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+    ];
+    for (tool, request, field) in refused {
+        let error = client
+            .call_tool(tool_request(tool, &request))
+            .await
+            .expect_err("the read refuses before any package is asked");
+        let rmcp::ServiceError::McpError(error) = error else {
+            panic!("the refusal must arrive as an MCP error: {error}");
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{request}: {wire:#}"
+        );
+        assert!(
+            error.message.contains(&format!("field {field}")),
+            "{request}: {}",
+            error.message
+        );
+    }
+    assert!(fixture.requests().await.is_empty());
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
