@@ -51,22 +51,22 @@ pub struct PackageIdentity {
 /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
 /// where byte-identity is required.
 pub type SourceUnitId = String;
-/// Identity of one symbol. The name after the language is the provider's stable qualified
-/// name for the declaration; where the language derives module identity from the file path,
-/// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-/// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-/// change the identity when the language includes module path in that qualified name.
+/// Identity of one symbol: the language, the path of the declaring file, and the provider's
+/// stable qualified name for the declaration. No shipped provider puts the file path into a
+/// qualified name, so a declaration moved to another file keeps its qualified name while its
+/// identity names the new path. A `~N` suffix separates declarations the qualified name
+/// alone cannot, such as overloads that dispatch separately.
 pub type SymbolId = String;
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct Symbol {
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub container: Option<String>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model; absent when `false`.
@@ -84,11 +84,11 @@ pub struct Symbol {
     /// kinds `trait` and `interface` can both carry the `type` facet.
     #[default(Some(Default::default()))]
     pub facets: Option<Vec<SymbolFacet>>,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub id: Option<String>,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: String,
@@ -689,11 +689,11 @@ pub struct TypeExpression {
     pub extensions: Option<serde_json::Value>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: String,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub resolved: Option<String>,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     pub source: String,
@@ -708,11 +708,11 @@ pub struct SignatureLink {
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
     pub range: TextRange,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub symbol: String,
 }
 /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -1310,11 +1310,11 @@ pub struct PackagePosition {
 pub struct PackageDeclarationResult {
     /// One position in one file of an exact package version.
     pub position: PackagePosition,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub declaration: Option<String>,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: Option<String>,
@@ -1374,11 +1374,11 @@ pub struct DocumentationBlock {
     pub range: TextRange,
     /// One content owner: a regular source or decoded notebook cell.
     pub source: DocumentationContentIdentity,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub symbol: Option<String>,
 }
 /// The content a documentation block addresses.
@@ -1511,11 +1511,11 @@ pub struct DocumentationReference {
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
     pub range: TextRange,
-    /// Identity of one symbol. The name after the language is the provider's stable qualified
-    /// name for the declaration; where the language derives module identity from the file path,
-    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-    /// change the identity when the language includes module path in that qualified name.
+    /// Identity of one symbol: the language, the path of the declaring file, and the provider's
+    /// stable qualified name for the declaration. No shipped provider puts the file path into a
+    /// qualified name, so a declaration moved to another file keeps its qualified name while its
+    /// identity names the new path. A `~N` suffix separates declarations the qualified name
+    /// alone cannot, such as overloads that dispatch separately.
     pub target: String,
 }
 /// Evidence establishing a documentation reference, ordered strongest first.

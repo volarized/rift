@@ -2017,11 +2017,11 @@ pub struct SymbolHistory {
     pub complete: bool,
 }
 
-/// Identity of one symbol. The name after the language is the provider's stable qualified
-/// name for the declaration; where the language derives module identity from the file path,
-/// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-/// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-/// change the identity when the language includes module path in that qualified name.
+/// Identity of one symbol: the language, the path of the declaring file, and the provider's
+/// stable qualified name for the declaration. No shipped provider puts the file path into a
+/// qualified name, so a declaration moved to another file keeps its qualified name while its
+/// identity names the new path. A `~N` suffix separates declarations the qualified name
+/// alone cannot, such as overloads that dispatch separately.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]

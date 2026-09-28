@@ -1773,7 +1773,7 @@
       ]
     },
     "SymbolId": {
-      "description": "Identity of one symbol. The name after the language is the provider's stable qualified\nname for the declaration; where the language derives module identity from the file path,\nas TypeScript does, that path is part of the name. A `~N` suffix separates declarations\nthe qualified name alone cannot, such as overloads that dispatch separately. A move can\nchange the identity when the language includes module path in that qualified name.",
+      "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
       "examples": [
         "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
       ],
