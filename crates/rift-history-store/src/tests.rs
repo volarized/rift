@@ -133,6 +133,22 @@ fn a_reader_answers_commits_declarations_renames_and_message_terms() -> TestResu
 }
 
 #[test]
+fn changed_paths_answer_in_path_order_up_to_the_limit() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = filled(folder.path(), "aa")?;
+    let reads = store.reader().connect()?;
+    let commit = reads.commit("c2")?.ok_or("c2 is held")?;
+
+    assert_eq!(
+        reads.changed_paths(&commit, 10)?,
+        ["new.rs", "old.rs", "src/lib.rs"]
+    );
+    assert_eq!(reads.changed_paths(&commit, 2)?, ["new.rs", "old.rs"]);
+    assert!(reads.changed_paths(&commit, 0)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_filler_reports_what_it_holds_and_replaces_a_commit_held_under_another_base() -> TestResult {
     let folder = tempfile::tempdir()?;
     let store = filled(folder.path(), "aa")?;

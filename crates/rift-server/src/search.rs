@@ -7,6 +7,8 @@ mod body;
 #[cfg(test)]
 mod body_tests;
 mod commit;
+#[cfg(test)]
+mod commit_tests;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;

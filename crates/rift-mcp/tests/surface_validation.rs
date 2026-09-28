@@ -105,10 +105,24 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(package_argument_corpus());
     requests.extend(revision_read_corpus());
     requests.extend(change_search_corpus());
+    requests.extend(commit_search_corpus());
     requests.extend(lexical_search_corpus());
     requests.extend(pattern_search_corpus());
     requests.extend(traversal_search_corpus());
     requests
+}
+
+/// Commit searches over the fixture's two commit messages. The history store fills in the
+/// background, so an answer holds the commits it analyzed so far;
+/// `a_commit_search_hit_validates_against_the_served_output_schema` waits for a hit.
+fn commit_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        ("search", json!({ "target": "commit", "query": "witness" })),
+        (
+            "search",
+            json!({ "target": "commit", "query": "fixture change", "limit": 1 }),
+        ),
+    ]
 }
 
 /// Regex `pattern` searches: file and symbol hits verified from the trigram candidates,
@@ -1352,6 +1366,111 @@ async fn search_pattern_refusals_carry_their_codes() -> TestResult {
             error.data.as_ref().and_then(|data| data.get("code")),
             Some(&json!(code)),
             "{arguments}: {error:?}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// How long a test waits for the history store to hold the fixture's two commits.
+const COMMIT_FILL_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The poll interval a test asks again at while the history store lags.
+const COMMIT_FILL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A commit hit, once the background fill holds the fixture's second commit, validates
+/// against the served output schema and carries the commit's message, author, and paths.
+#[tokio::test]
+async fn a_commit_search_hit_validates_against_the_served_output_schema() -> TestResult {
+    let (_fixture, client, server_task) = served_fixture().await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input_validator, output_validator) =
+        validators.get("search").ok_or("search is advertised")?;
+    let request = json!({ "target": "commit", "query": "witness" });
+    assert_validates(input_validator, &request, "commit search request");
+
+    let deadline = tokio::time::Instant::now() + COMMIT_FILL_WAIT_MAX;
+    let structured = loop {
+        let result =
+            call_tool_retrying_acceptance(&client, tools_call_request("search", &request)?).await?;
+        let structured = result
+            .structured_content
+            .ok_or("search must return structured content")?;
+        if structured["results"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty())
+        {
+            break structured;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("the history store never answered the commit: {structured}").into(),
+            );
+        }
+        tokio::time::sleep(COMMIT_FILL_POLL).await;
+    };
+
+    assert_validates(output_validator, &structured, "commit search result");
+    let commit = &structured["results"][0]["hit"]["commit"];
+    assert_eq!(structured["results"][0]["hit"]["target"], json!("commit"));
+    assert_eq!(commit["message"], json!("introduce the change witness\n"));
+    assert_eq!(commit["message_truncated"], json!(false));
+    assert_eq!(
+        commit["author"],
+        json!({ "name": "Rift Fixture", "email": "fixture@rift.invalid" })
+    );
+    assert_eq!(commit["paths"], json!(["change_witness.rs"]));
+    assert_eq!(commit["paths_truncated"], json!(false));
+    assert_eq!(structured["results"].as_array().map(Vec::len), Some(1));
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A commit search takes `query` alone: beside another selector, a revision, a package
+/// argument, a path selector, or a `scope` past `local`, the server refuses
+/// `invalid_request` naming the field.
+#[tokio::test]
+async fn search_commit_refusals_name_the_field() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let refused = [
+        (json!({ "pattern": "witness" }), "pattern"),
+        (
+            json!({ "traversal": { "seed": "rift://symbol/rust/lib.rs/beacon_one" } }),
+            "traversal",
+        ),
+        (json!({ "change": { "base": "baseline" } }), "change"),
+        (json!({ "rev": "main" }), "rev"),
+        (json!({ "packages": packages, "scope": "all" }), "packages"),
+        (json!({ "paths": { "include": ["lib.rs"] } }), "paths"),
+        (json!({ "scope": "global" }), "scope"),
+    ];
+    for (extra, field) in refused {
+        let mut arguments = json!({ "target": "commit", "query": "witness" });
+        if let (Some(arguments), Some(extra)) = (arguments.as_object_mut(), extra.as_object()) {
+            arguments.extend(extra.clone());
+        }
+        let error = client
+            .call_tool(tools_call_request("search", &arguments)?)
+            .await
+            .expect_err("the commit search must be refused");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{arguments}: {wire:#}"
+        );
+        assert!(
+            error.message.contains(&format!("field {field}")),
+            "the refusal names {field}: {arguments}: {}",
+            error.message
         );
     }
 

@@ -91,6 +91,24 @@ pub fn commit_all(root: &Path, message: &str) {
     git(root, &["commit", "-q", "-m", message]);
 }
 
+/// Stages everything in `root` and commits it with `message`, authored and committed at
+/// `date`, a date git reads such as `2026-01-01T00:01:00 +0000`, so a fixture orders its
+/// commits by time.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_all_at(root: &Path, message: &str, date: &str) {
+    git(root, &["add", "--all"]);
+    let status = command(root)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .args(["commit", "-q", "-m", message])
+        .status()
+        .expect("git must run");
+    assert!(status.success(), "git commit at {date} must succeed");
+}
+
 /// Commits a tree naming a subtree the object store does not hold, reachable
 /// as the ref `branch`.
 ///
