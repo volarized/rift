@@ -5174,6 +5174,82 @@ done
         Ok(())
     }
 
+    /// One commit search for `beacon`, validated against the output schema the router serves
+    /// for `search`.
+    async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
+        let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params)))
+            .await
+            .map_err(|_| "a commit search waits on no fill")??
+            .0;
+        let output_schema = RiftMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "search")
+            .and_then(|tool| tool.output_schema)
+            .ok_or("search serves an output schema")?;
+        let validator =
+            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
+        let wire = serde_json::to_value(&answer)?;
+        let errors: Vec<String> = validator
+            .iter_errors(&wire)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}: {wire:#}");
+        Ok(answer)
+    }
+
+    /// While the history task is held before its first commit, a commit search answers
+    /// nothing and says the store is filling, naming how many selected commits it holds;
+    /// once the fill lands, the same search answers the commit and carries no warning.
+    #[tokio::test]
+    async fn a_commit_search_says_the_store_is_filling_until_the_fill_lands() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let (mut held, gate) = HeldAnalysis::new();
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(directory.path())?,
+            WorkspaceIndexLimits::default(),
+            None,
+            LexicalLane::spawn,
+            Some(gate),
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        held.reached().await?;
+
+        let filling = beacon_commits(&server).await?;
+
+        assert!(filling.results.is_empty(), "{filling:#?}");
+        let [
+            ReadWarning::HistoryStoreFilling {
+                analyzed, total, ..
+            },
+        ] = filling.warnings.as_slice()
+        else {
+            return Err(format!("one filling warning: {:?}", filling.warnings).into());
+        };
+        assert_eq!((*analyzed, *total), (0, 1));
+
+        held.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let filled = loop {
+            let answer = beacon_commits(&server).await?;
+            if answer.warnings.is_empty() {
+                break answer;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("the store never filled: {answer:#?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(filled.results.len(), 1, "{filled:#?}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_working_tree_change_under_a_rebuild_failure_answers_stale() -> TestResult {
         let directory = tempfile::tempdir()?;

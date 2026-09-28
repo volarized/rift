@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_history::fixture::{commit_all, commit_all_at, git, init};
@@ -19,7 +20,7 @@ use tempfile::TempDir;
 
 use super::commit::commit_conflict;
 use crate::HistoryAnalysis;
-use crate::history::StoredHistory;
+use crate::history::{FillProgress, StoredHistory};
 use crate::read::{ReadFault, ReadService};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -442,4 +443,163 @@ fn a_commit_query_past_the_member_bound_narrows_and_warns() -> TestResult {
         "{answer:?}"
     );
     Ok(())
+}
+
+/// A store under `folder` holding the newest `written` of the commits the default table
+/// selects in the workspace at `root`, a snapshot it is attached to, and the count of reads
+/// that asked for a fill. The progress records the fill plan and the written batch the way the
+/// history task does.
+fn partly_filled(
+    root: &Path,
+    folder: &Path,
+    written: usize,
+) -> TestResult<(HistoryStore, ReadService, Arc<AtomicUsize>)> {
+    let history = HistoryConfiguration::default();
+    let store = HistoryStore::open(&StoreLocation::new(folder, "aa"))?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    let analysis = HistoryAnalysis::open(
+        root,
+        &history,
+        (
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        ),
+        SyntaxLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let plan = analysis
+        .plan(&filler.held()?)
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for pending in plan.pending().iter().take(written) {
+        let analyzed = analysis
+            .analyze(pending, &|| false)
+            .map_err(|error| error.to_string())?
+            .ok_or("nothing cancels the analysis")?;
+        records.push(analyzed.into_record());
+    }
+    filler.write_batch(&records)?;
+    let lagged = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&lagged);
+    let stored = StoredHistory::new(
+        store.reader(),
+        history.strategy,
+        Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let progress = stored.progress();
+    progress.record_plan(plan.keep().len(), plan.pending().len());
+    progress.record_written(records.len());
+    let service = ReadService::build(
+        root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        history,
+    )?;
+    service.attach_history_store(&stored);
+    Ok((store, service, lagged))
+}
+
+/// The filling warning an answer carries, as its two counts.
+fn filling_counts(answer: &SearchResult) -> Vec<(u64, u64)> {
+    answer
+        .warnings
+        .iter()
+        .filter_map(|warning| match warning {
+            ReadWarning::HistoryStoreFilling {
+                analyzed, total, ..
+            } => Some((*analyzed, *total)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_partly_filled_store_answers_what_it_holds_and_says_so() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let (_store, service, lagged) = partly_filled(directory.path(), folder.path(), 1)?;
+
+    let answer = service.search_commits(&commit_search("the")?)?;
+
+    assert_eq!(summaries(&answer), ["Fix the release notes"]);
+    assert_eq!(filling_counts(&answer), [(1, 3)], "{answer:?}");
+    assert_eq!(lagged.load(Ordering::SeqCst), 0, "the store holds HEAD");
+    Ok(())
+}
+
+#[test]
+fn a_filled_store_carries_no_filling_warning() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let (_store, service, _) = partly_filled(directory.path(), folder.path(), 3)?;
+
+    let answer = service.search_commits(&commit_search("the")?)?;
+
+    assert_eq!(summaries(&answer).len(), 3);
+    assert!(filling_counts(&answer).is_empty(), "{answer:?}");
+    Ok(())
+}
+
+#[test]
+fn a_store_missing_the_checked_out_head_says_so_and_asks_for_a_fill() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let (_store, service, lagged) = partly_filled(directory.path(), folder.path(), 3)?;
+    write(directory.path(), "NOTES.md", "# Notes\n\nMore.\n")?;
+    commit_all_at(
+        directory.path(),
+        "Extend the release notes\n",
+        "2026-01-01T00:04:00 +0000",
+    );
+
+    let answer = service.search_commits(&commit_search("release")?)?;
+
+    assert_eq!(summaries(&answer), ["Fix the release notes"]);
+    assert_eq!(filling_counts(&answer), [(3, 3)], "{answer:?}");
+    let detail = answer
+        .warnings
+        .iter()
+        .find_map(|warning| match warning {
+            ReadWarning::HistoryStoreFilling { detail, .. } => Some(detail.as_str()),
+            _ => None,
+        })
+        .ok_or("the answer says the store is filling")?;
+    assert!(detail.contains("HEAD"), "{detail}");
+    assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
+    Ok(())
+}
+
+#[test]
+fn fill_progress_counts_what_the_latest_plan_still_owes() {
+    let progress = FillProgress::default();
+    assert_eq!(progress.counts(), None, "no plan has landed");
+    progress.record_written(5);
+    assert_eq!(
+        progress.counts(),
+        None,
+        "a write before any plan records nothing"
+    );
+
+    progress.record_plan(10, 4);
+    let counts = progress.counts().expect("a plan landed");
+    assert_eq!((counts.analyzed(), counts.total()), (6, 10));
+    progress.record_written(3);
+    progress.record_written(3);
+    let counts = progress.counts().expect("a plan landed");
+    assert_eq!(
+        (counts.analyzed(), counts.total()),
+        (10, 10),
+        "a write past what the fill plan owed saturates"
+    );
+    progress.record_plan(2, 9);
+    let counts = progress.counts().expect("a plan landed");
+    assert_eq!(
+        (counts.analyzed(), counts.total()),
+        (0, 2),
+        "a plan never owes more than it selects"
+    );
 }
