@@ -91,7 +91,11 @@ pub const CURSOR_BYTES_MAX: usize = 4_096;
 /// Fewest entries one requested page carries.
 pub const PAGE_LIMIT_MIN: i64 = 1;
 /// Most entries one requested page carries.
-pub const PAGE_LIMIT_MAX: i64 = 200;
+///
+/// A paged read asks for the smaller of its limit and the advertised `page_limit_max`, so one
+/// client pages against a server advertising 200 and reads one page per search phase against a
+/// server advertising 1,000.
+pub const PAGE_LIMIT_MAX: i64 = 1_000;
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
 /// Most UTF-8 bytes one source payload carries.
@@ -715,7 +719,8 @@ impl GlobalClient {
         Ok(page)
     }
 
-    /// Reads package search pages through the active candidate bound.
+    /// Reads package search pages through the active candidate bound, asking each page for the
+    /// smaller of `limit` and the advertised `page_limit_max`.
     ///
     /// # Errors
     ///
@@ -729,6 +734,7 @@ impl GlobalClient {
         validate_search_request(request)?;
         validate_page(limit, None)?;
         let capabilities = self.get_capabilities().await?;
+        let limit = advertised_page_limit(limit, &capabilities);
         validate_search_request_for_capabilities(request, limit, None, &capabilities)?;
         let candidate_max = bounded_candidate_pool(&capabilities);
         let mut cursor = None;
@@ -777,7 +783,8 @@ impl GlobalClient {
         }
     }
 
-    /// Reads package symbol pages through the active candidate bound.
+    /// Reads package symbol pages through the active candidate bound, asking each page for the
+    /// smaller of `limit` and the advertised `page_limit_max`.
     ///
     /// # Errors
     ///
@@ -791,6 +798,7 @@ impl GlobalClient {
         validate_symbol_request(request)?;
         validate_page(limit, None)?;
         let capabilities = self.get_capabilities().await?;
+        let limit = advertised_page_limit(limit, &capabilities);
         validate_symbol_request_for_capabilities(request, limit, None, &capabilities)?;
         let candidate_max = bounded_candidate_pool(&capabilities);
         let mut cursor = None;
@@ -1500,6 +1508,12 @@ fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+/// The page size one paged read asks for: the caller's limit, cut to the advertised
+/// `page_limit_max`.
+fn advertised_page_limit(limit: i64, capabilities: &Capabilities) -> i64 {
+    limit.min(capabilities.bounds.page_limit_max)
 }
 
 fn validate_page(limit: i64, cursor: Option<&str>) -> Result<(), ClientError> {

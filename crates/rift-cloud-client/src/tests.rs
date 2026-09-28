@@ -1,6 +1,7 @@
 use super::*;
 
 mod documentation;
+mod pages;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -53,6 +54,7 @@ enum OperationFixture {
     InvalidSourceIdentity,
     InvalidMatchClass,
     UnknownMatchClass,
+    PageLimitMax(i64),
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -347,6 +349,9 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         }
         OperationFixture::AdditiveResponse => {
             value["future_field"] = serde_json::json!("ignored by this client");
+        }
+        OperationFixture::PageLimitMax(advertised) => {
+            value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
         _ => {}
     })

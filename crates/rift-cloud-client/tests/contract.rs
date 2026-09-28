@@ -148,6 +148,19 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "Limit/schema/default")?;
 
     let mut document = contract()?;
+    document["components"]["schemas"]["CapabilityBounds"]["properties"]["page_limit_max"]["maximum"] =
+        json!(200);
+    assert_invalid(
+        &document,
+        "CapabilityBounds/properties/page_limit_max/maximum",
+    )?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageSymbolPage"]["properties"]["items"]["maxItems"] =
+        json!(200);
+    assert_invalid(&document, "PackageSymbolPage/properties/items/maxItems")?;
+
+    let mut document = contract()?;
     document["components"]["parameters"]["Cursor"]["schema"]["maxLength"] = json!(4095);
     assert_invalid(&document, "Cursor/schema/maxLength")?;
 

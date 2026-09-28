@@ -69,7 +69,7 @@
                         "identifier_bytes_max": 4096,
                         "packages_max": 20000,
                         "page_limit_min": 1,
-                        "page_limit_max": 200,
+                        "page_limit_max": 1000,
                         "page_limit_default": 100,
                         "cursor_bytes_max": 4096,
                         "candidate_pool_max": 1000,
@@ -1096,7 +1096,7 @@
         "schema": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 200,
+          "maximum": 1000,
           "default": 100
         }
       },
@@ -1959,17 +1959,17 @@
           "page_limit_min": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 200
+            "maximum": 1000
           },
           "page_limit_max": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 200
+            "maximum": 1000
           },
           "page_limit_default": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 200
+            "maximum": 1000
           },
           "cursor_bytes_max": {
             "type": "integer",
@@ -2342,7 +2342,7 @@
               "$ref": "#/components/schemas/PackageSearchItem"
             },
             "type": "array",
-            "maxItems": 200
+            "maxItems": 1000
           },
           "next_cursor": {
             "description": "Opaque cursor for the next page.",
@@ -2512,7 +2512,7 @@
               "$ref": "#/components/schemas/PackageSymbol"
             },
             "type": "array",
-            "maxItems": 200
+            "maxItems": 1000
           },
           "next_cursor": {
             "description": "Opaque cursor for the next page.",

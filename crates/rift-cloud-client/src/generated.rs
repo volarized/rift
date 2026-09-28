@@ -2036,7 +2036,7 @@ pub enum ResolvePackageContextResponse {
 )]
 pub struct SearchPackagesRequestQuery {
     /// Maximum entries in one page.
-    #[validate(range(min = 1i64, max = 200i64))]
+    #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,
     /// Opaque cursor for the next page.
@@ -2187,7 +2187,7 @@ pub enum SearchPackagesResponse {
 )]
 pub struct ListPackageSymbolsRequestQuery {
     /// Maximum entries in one page.
-    #[validate(range(min = 1i64, max = 200i64))]
+    #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,
     /// Opaque cursor for the next page.

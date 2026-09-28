@@ -351,12 +351,16 @@ fn validate_request(spec: &Spec, endpoint: Endpoint, operation: &Operation) -> R
 }
 
 fn validate_bounds(spec: &Spec) -> Result<(), String> {
+    let page_items_max =
+        usize::try_from(crate::PAGE_LIMIT_MAX).map_err(|error| error.to_string())?;
     let expected_max_items = [
         (
             "PackageResolutionRequest",
             "entries",
             DEPENDENCIES_PACKAGES_MAX,
         ),
+        ("PackageSearchPage", "items", page_items_max),
+        ("PackageSymbolPage", "items", page_items_max),
         ("PackageSearchRequest", "terms", PARSED_QUERY_MEMBERS_MAX),
         (
             "PackageSearchRequest",
@@ -391,8 +395,16 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
     expect_bound(
         "Limit/schema/maximum",
         limit.maximum,
-        serde_json::Number::from(200),
+        serde_json::Number::from(crate::PAGE_LIMIT_MAX),
     )?;
+    for property in ["page_limit_min", "page_limit_max", "page_limit_default"] {
+        let schema = property_schema(spec, "CapabilityBounds", property)?;
+        expect_bound(
+            &format!("CapabilityBounds/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::PAGE_LIMIT_MAX),
+        )?;
+    }
     let cursor = parameter_schema(spec, "Cursor")?;
     expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
     Ok(())
