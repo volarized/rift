@@ -44,6 +44,20 @@ fn run_steer(root: &Path, stdin: &str, env: &[(&str, &str)]) -> TestResult<Outpu
 }
 
 fn hook_payload(tool_name: &str, pattern: &str, session_id: &str, cwd: &Path) -> String {
+    tool_payload(
+        tool_name,
+        &serde_json::json!({"pattern": pattern}),
+        session_id,
+        cwd,
+    )
+}
+
+fn tool_payload(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    session_id: &str,
+    cwd: &Path,
+) -> String {
     serde_json::json!({
         "session_id": session_id,
         "transcript_path": "/tmp/transcript.jsonl",
@@ -51,9 +65,25 @@ fn hook_payload(tool_name: &str, pattern: &str, session_id: &str, cwd: &Path) ->
         "permission_mode": "default",
         "hook_event_name": "PreToolUse",
         "tool_name": tool_name,
-        "tool_input": {"pattern": pattern},
+        "tool_input": tool_input,
     })
     .to_string()
+}
+
+/// The `search` arguments a deny reason suggests, parsed from the text
+/// between `tool: ` and ` finds`.
+fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
+    let decision = decision(output)?;
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+    let reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .ok_or("a deny carries a reason")?;
+    let call = reason
+        .split("tool: ")
+        .nth(1)
+        .and_then(|rest| rest.split(" finds").next())
+        .ok_or_else(|| format!("the reason names no call: {reason}"))?;
+    Ok(serde_json::from_str(call)?)
 }
 
 fn indexed_workspace(root: &Path) -> TestResult {
@@ -194,5 +224,90 @@ fn malformed_stdin_answers_allow_with_exit_zero() -> TestResult {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.is_empty(), "steer never fails: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_grep_pattern_holding_a_quote_and_a_backslash_suggests_valid_json() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let pattern = r#"say\("hi"\)"#;
+    let input = serde_json::json!({"pattern": pattern, "output_mode": "content", "-n": true});
+    let payload = tool_payload("Grep", &input, "session-quote", root);
+
+    let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        suggested_call(&output)?,
+        serde_json::json!({"pattern": pattern})
+    );
+    Ok(())
+}
+
+#[test]
+fn a_grep_call_search_has_no_form_for_answers_allow_and_creates_no_marker() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let input = serde_json::json!({"pattern": "TODO", "output_mode": "content", "-C": 3});
+    let payload = tool_payload("Grep", &input, "session-context", root);
+
+    let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        decision(&output)?["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    assert!(!root.join(".rift").join("steer").exists());
+    Ok(())
+}
+
+#[test]
+fn a_bash_grep_from_a_subdirectory_denies_with_its_search_call() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    let source = root.join("src");
+    fs::create_dir(&source)?;
+    let input = serde_json::json!({"command": r#"grep -rn "cfg(test)" . 2>/dev/null"#});
+    let payload = tool_payload("Bash", &input, "session-bash", &source);
+
+    let output = run_steer(root, &payload, &[])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        suggested_call(&output)?,
+        serde_json::json!({"pattern": r"cfg\(test\)", "paths": {"include": ["src/**"]}})
+    );
+    assert!(
+        root.join(".rift")
+            .join("steer")
+            .join("session-bash")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_bash_pipeline_or_other_command_answers_allow_and_creates_no_marker() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    indexed_workspace(root)?;
+    for command in [
+        r#"grep -rn "cfg(test)" . | head -20"#,
+        "cargo test",
+        "grep -rn x missing-directory",
+    ] {
+        let input = serde_json::json!({"command": command});
+        let payload = tool_payload("Bash", &input, "session-pipeline", root);
+        let output = run_steer(root, &payload, &[])?;
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            decision(&output)?["hookSpecificOutput"]["permissionDecision"],
+            "allow",
+            "{command}"
+        );
+    }
+    assert!(!root.join(".rift").join("steer").exists());
     Ok(())
 }
