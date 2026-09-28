@@ -60,6 +60,7 @@ enum OperationFixture {
     UnnamedSubstitution,
     SubstitutionAtRequestedVersion,
     RequirementOutsideRange,
+    BodyBoundStop,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -324,7 +325,7 @@ fn operation_response(
         return operation_search_response(mode, query, request_number);
     }
     if path.ends_with("/symbols") {
-        return operation_symbol_response(query);
+        return operation_symbol_response(mode, query);
     }
     status_response(StatusCode::NOT_FOUND)
 }
@@ -436,6 +437,11 @@ fn operation_search_response(
             if cursor.is_some() { "second" } else { "first" },
         ),
         OperationFixture::MismatchedCursor => mismatched_cursor_page(query),
+        OperationFixture::BodyBoundStop => pages::body_bound_page(
+            search_page_json("demo", Some("next"), "analyzer-v2", "first"),
+            search_page_json("demo", None, "analyzer-v2", "second"),
+            cursor,
+        ),
         OperationFixture::SearchPages
         | OperationFixture::CandidateBound
         | OperationFixture::PartialFailure
@@ -455,7 +461,15 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
     }
 }
 
-fn operation_symbol_response(query: Option<&str>) -> Response {
+fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Response {
+    if matches!(mode, OperationFixture::BodyBoundStop) {
+        let body = pages::body_bound_page(
+            symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
+            symbol_page_json("demo", None, "analyzer-v2", "second"),
+            query_cursor(query),
+        );
+        return json_response(&body, None);
+    }
     let body = if query_cursor(query).is_none() {
         symbol_page_json("demo", Some("next"), "analyzer-v2", "first")
     } else {

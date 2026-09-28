@@ -59,3 +59,100 @@ fn test_advertised_page_limit_cuts_the_caller_limit() {
     assert_eq!(advertised_page_limit(PAGE_LIMIT_MAX, &capabilities), 200);
     assert_eq!(advertised_page_limit(20, &capabilities), 20);
 }
+
+/// The first page stopped at the response body bound, marked `result_truncated`, and the page
+/// its cursor leads to.
+pub(super) fn body_bound_page(
+    mut first: serde_json::Value,
+    second: serde_json::Value,
+    cursor: Option<&str>,
+) -> serde_json::Value {
+    if cursor.is_some() {
+        return second;
+    }
+    first["warnings"] = serde_json::json!([
+        {"code": "result_truncated", "detail": "the page stopped at the response body bound"}
+    ]);
+    first
+}
+
+fn is_result_truncated(warning: &Warning) -> bool {
+    warning.code == WarningCode::ResultTruncated
+}
+
+/// A page the server stopped at the response body bound ends the assembly: the caller gets
+/// what fit, the warning, and the cursor, and the client sends no second request.
+#[tokio::test]
+async fn test_fixture_page_assembly_leaves_a_body_bound_cursor_to_the_caller() {
+    let (server, client) = operation_client(OperationFixture::BodyBoundStop).await;
+    let pages = client
+        .search_packages_pages(&search_request(), 20)
+        .await
+        .unwrap_or_else(|error| panic!("search pages: {error:?}"));
+    assert_eq!(pages.items.len(), 1);
+    assert_eq!(pages.next_cursor.as_deref(), Some("next"));
+    assert!(pages.warnings.iter().any(is_result_truncated));
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+
+    let (server, client) = operation_client(OperationFixture::BodyBoundStop).await;
+    let pages = client
+        .list_package_symbols_pages(&symbol_request(), 20)
+        .await
+        .unwrap_or_else(|error| panic!("symbol pages: {error:?}"));
+    assert_eq!(pages.items.len(), 1);
+    assert_eq!(pages.next_cursor.as_deref(), Some("next"));
+    assert!(pages.warnings.iter().any(is_result_truncated));
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+}
+
+/// A page carrying its full `limit` ended at the limit, not at the body bound, so the
+/// assembly follows its cursor even beside `result_truncated`.
+#[tokio::test]
+async fn test_fixture_page_assembly_follows_a_full_page_cursor() {
+    let (server, client) = operation_client(OperationFixture::BodyBoundStop).await;
+    let pages = client
+        .search_packages_pages(&search_request(), 1)
+        .await
+        .unwrap_or_else(|error| panic!("search pages: {error:?}"));
+    assert_eq!(pages.items.len(), 2);
+    assert_eq!(pages.next_cursor, None);
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
+
+    let (_server, client) = operation_client(OperationFixture::SearchPages).await;
+    let pages = client
+        .search_packages_pages(&search_request(), 20)
+        .await
+        .unwrap_or_else(|error| panic!("search pages: {error:?}"));
+    assert_eq!(
+        pages.next_cursor, None,
+        "an unmarked short page is followed"
+    );
+}
+
+#[test]
+fn test_stopped_at_body_bound_needs_a_short_marked_page() {
+    let truncated = Warning {
+        code: WarningCode::ResultTruncated,
+        ..Warning::default()
+    };
+    let narrowed = Warning {
+        code: WarningCode::QueryNarrowed,
+        ..Warning::default()
+    };
+    assert!(stopped_at_body_bound(
+        std::slice::from_ref(&truncated),
+        3,
+        20
+    ));
+    assert!(!stopped_at_body_bound(
+        std::slice::from_ref(&truncated),
+        20,
+        20
+    ));
+    assert!(!stopped_at_body_bound(
+        std::slice::from_ref(&narrowed),
+        3,
+        20
+    ));
+    assert!(!stopped_at_body_bound(&[], 3, 20));
+}

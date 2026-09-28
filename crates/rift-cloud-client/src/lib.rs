@@ -390,6 +390,9 @@ pub struct PackageSearchPages {
     pub corpus_revision: String,
     /// Documentation revision shared by every page that returns documentation.
     pub documentation_revision: Option<String>,
+    /// Cursor of the last page when the server stopped it at the response body bound. The
+    /// assembly does not follow it; a caller **MAY** pass it to `search_packages`.
+    pub next_cursor: Option<String>,
 }
 
 /// Symbol pages assembled under one capability and candidate bound.
@@ -405,6 +408,9 @@ pub struct PackageSymbolPages {
     pub corpus_revision: String,
     /// Documentation revision shared by every page that returns documentation.
     pub documentation_revision: Option<String>,
+    /// Cursor of the last page when the server stopped it at the response body bound. The
+    /// assembly does not follow it; a caller **MAY** pass it to `list_package_symbols`.
+    pub next_cursor: Option<String>,
 }
 
 impl GlobalClient {
@@ -722,6 +728,9 @@ impl GlobalClient {
     /// Reads package search pages through the active candidate bound, asking each page for the
     /// smaller of `limit` and the advertised `page_limit_max`.
     ///
+    /// A page the server stopped at the response body bound ends the assembly, and its cursor
+    /// lands in [`PackageSearchPages::next_cursor`] unfollowed.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] when any page is unavailable, changes revision, repeats an identity,
@@ -756,6 +765,7 @@ impl GlobalClient {
                 self.record_failure().await;
                 return Err(error);
             }
+            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
                 let identity = search_hit_identity(&hit)?;
@@ -767,12 +777,15 @@ impl GlobalClient {
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
-                    return Ok(search_pages(hits, warnings, revisions));
+                    return Ok(search_pages(hits, warnings, revisions, None));
                 }
             }
             let Some(next) = page.next_cursor else {
-                return Ok(search_pages(hits, warnings, revisions));
+                return Ok(search_pages(hits, warnings, revisions, None));
             };
+            if stopped {
+                return Ok(search_pages(hits, warnings, revisions, Some(next)));
+            }
             if !seen_cursors.insert(next.clone()) {
                 self.record_failure().await;
                 return Err(ClientError::InvalidResponseField {
@@ -785,6 +798,9 @@ impl GlobalClient {
 
     /// Reads package symbol pages through the active candidate bound, asking each page for the
     /// smaller of `limit` and the advertised `page_limit_max`.
+    ///
+    /// A page the server stopped at the response body bound ends the assembly, and its cursor
+    /// lands in [`PackageSymbolPages::next_cursor`] unfollowed.
     ///
     /// # Errors
     ///
@@ -819,6 +835,7 @@ impl GlobalClient {
                 self.record_failure().await;
                 return Err(error);
             }
+            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
                 let identity = symbol_hit_identity(&hit);
@@ -833,12 +850,15 @@ impl GlobalClient {
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
-                    return Ok(symbol_pages(hits, warnings, revisions));
+                    return Ok(symbol_pages(hits, warnings, revisions, None));
                 }
             }
             let Some(next) = page.next_cursor else {
-                return Ok(symbol_pages(hits, warnings, revisions));
+                return Ok(symbol_pages(hits, warnings, revisions, None));
             };
+            if stopped {
+                return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
+            }
             if !seen_cursors.insert(next.clone()) {
                 self.record_failure().await;
                 return Err(ClientError::InvalidResponseField {
@@ -2126,10 +2146,22 @@ fn assembled_revisions(
     revisions.unwrap_or_default()
 }
 
+/// Whether a page ended short of `limit` at the response body bound. The server marks such a
+/// page with `result_truncated` beside a cursor at its first left-out item; a page carrying
+/// `limit` items ended at `limit`, whatever it warns.
+fn stopped_at_body_bound(warnings: &[Warning], item_count: usize, limit: i64) -> bool {
+    let short = i64::try_from(item_count).is_ok_and(|count| count < limit);
+    let marked = warnings
+        .iter()
+        .any(|warning| warning.code == WarningCode::ResultTruncated);
+    short && marked
+}
+
 fn search_pages(
     items: Vec<PackageSearchItem>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
+    next_cursor: Option<String>,
 ) -> PackageSearchPages {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
@@ -2139,6 +2171,7 @@ fn search_pages(
         analyzer_revision,
         corpus_revision,
         documentation_revision,
+        next_cursor,
     }
 }
 
@@ -2146,6 +2179,7 @@ fn symbol_pages(
     items: Vec<PackageSymbol>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
+    next_cursor: Option<String>,
 ) -> PackageSymbolPages {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
@@ -2155,6 +2189,7 @@ fn symbol_pages(
         analyzer_revision,
         corpus_revision,
         documentation_revision,
+        next_cursor,
     }
 }
 

@@ -2441,7 +2441,7 @@
       },
       "PackageSearchPage": {
         "additionalProperties": true,
-        "description": "One ranked page of package declarations.",
+        "description": "One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.",
         "properties": {
           "items": {
             "description": "Ranked package declarations.",
@@ -2611,7 +2611,7 @@
       },
       "PackageSymbolPage": {
         "additionalProperties": true,
-        "description": "One page of package declarations.",
+        "description": "One page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.",
         "properties": {
           "items": {
             "description": "Package declarations.",
