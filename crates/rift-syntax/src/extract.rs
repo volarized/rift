@@ -5,47 +5,31 @@
 //! starts - come from the grammar's [`GrammarRules`], so a new language
 //! plugs in without touching the walk or its node and depth budgets.
 
-use core::ops::Range;
-
 use rift_core::Error;
 use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
-use tree_sitter::Node;
+use tree_sitter::{Node, TreeCursor};
 
 use crate::document::{ByteRange, SyntaxNode, SyntaxSymbol};
 use crate::failure::{SyntaxError, SyntaxFault, position_overflow};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
-/// The child index ranges tree-sitter's child accessors accept.
+/// Pushes one worklist entry per named child of `node`, reversed, so a
+/// worklist that pops from its end visits the children in source order.
 ///
-/// [`Node::child_count`] and [`Node::named_child_count`] widen the grammar's
-/// `uint32_t` counts to `usize`, while [`Node::child`] and
-/// [`Node::named_child`] take that same width back as `u32`. Every walk that
-/// indexes children builds its range here, so the conversion is spelled once.
-pub(crate) trait ChildIndices {
-    /// Every child index, in order.
-    fn child_indices(&self) -> Range<u32>;
-
-    /// Every named child index, in order.
-    fn named_child_indices(&self) -> Range<u32>;
-}
-
-impl ChildIndices for Node<'_> {
-    fn child_indices(&self) -> Range<u32> {
-        0..child_index_bound(self.child_count())
-    }
-
-    fn named_child_indices(&self) -> Range<u32> {
-        0..child_index_bound(self.named_child_count())
-    }
-}
-
-/// A child count in the width tree-sitter's child accessors take.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "tree-sitter widens its own uint32_t child count, so narrowing it back cannot truncate"
-)]
-fn child_index_bound(count: usize) -> u32 {
-    count as u32
+/// `cursor` steps from each child to its next sibling, so the work is linear
+/// in the child count. [`Node::child`] and [`Node::named_child`] start again
+/// from the first child on every call, so indexing each child in turn is
+/// quadratic in that count, and a file of comment lines alone places every
+/// line under the root.
+pub(crate) fn push_named_children<'tree, T>(
+    pending: &mut Vec<T>,
+    cursor: &mut TreeCursor<'tree>,
+    node: Node<'tree>,
+    entry: impl FnMut(Node<'tree>) -> T,
+) {
+    let first_child = pending.len();
+    pending.extend(node.named_children(cursor).map(entry));
+    pending[first_child..].reverse();
 }
 
 /// Per-grammar decisions the shared walk delegates.
@@ -124,6 +108,7 @@ pub(crate) fn extract(
     let mut nodes = Vec::new();
     let mut symbols = Vec::new();
     let mut pending = vec![(root, None, String::new(), 0_usize)];
+    let mut cursor = root.walk();
     while let Some((node, parent, qualification, depth)) = pending.pop() {
         if depth > limits.syntax_depth_max() {
             return Err(Error::new(SyntaxFault::TooDeep {
@@ -164,23 +149,17 @@ pub(crate) fn extract(
             |name| qualify(rules.qualification_separator(), &qualification, &name),
         );
 
-        for child_index in node.child_indices().rev() {
-            let Some(child) = node.child(child_index) else {
-                continue;
-            };
-            if !child.is_named() {
-                continue;
-            }
-            if pending.len() + nodes.len() >= limits.syntax_nodes_max() {
-                return Err(too_many_nodes(source, limits));
-            }
-            pending.push((
+        if pending.len() + nodes.len() + node.named_child_count() > limits.syntax_nodes_max() {
+            return Err(too_many_nodes(source, limits));
+        }
+        push_named_children(&mut pending, &mut cursor, node, |child| {
+            (
                 child,
                 Some(node_index),
                 child_qualification.clone(),
                 depth + 1,
-            ));
-        }
+            )
+        });
     }
     Ok((nodes, symbols))
 }

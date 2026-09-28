@@ -198,6 +198,7 @@ fn bounded_nodes(
 ) -> Result<Vec<RstNode<'_>>, DocumentationError> {
     let mut nodes = Vec::new();
     let mut pending = vec![(root, 0_usize, None)];
+    let mut cursor = root.walk();
     while let Some((node, depth, parent)) = pending.pop() {
         if depth > bounds.depth {
             return Err(refused(DocumentationViolation::LimitExceeded, "rst_depth"));
@@ -207,19 +208,18 @@ fn bounded_nodes(
         }
         let node_id = node.id();
         nodes.push(RstNode { node, parent });
-        for index in (0..node.child_count()).rev() {
-            let child_index = u32::try_from(index)
-                .map_err(|_| refused(DocumentationViolation::LimitExceeded, "rst_nodes"))?;
-            let Some(child) = node.child(child_index) else {
-                continue;
-            };
-            if child.is_named() {
-                if nodes.len() + pending.len() >= bounds.node_count {
-                    return Err(refused(DocumentationViolation::LimitExceeded, "rst_nodes"));
-                }
-                pending.push((child, depth + 1, Some(node_id)));
-            }
+        if nodes.len() + pending.len() + node.named_child_count() > bounds.node_count {
+            return Err(refused(DocumentationViolation::LimitExceeded, "rst_nodes"));
         }
+        // The cursor steps sibling to sibling; `Node::child` restarts from the
+        // first child on every call, which makes a wide node quadratic. The
+        // children go on reversed so the worklist pops them in source order.
+        let first_child = pending.len();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, depth + 1, Some(node_id))),
+        );
+        pending[first_child..].reverse();
     }
     Ok(nodes)
 }
@@ -641,19 +641,14 @@ fn build_facts(
 }
 
 fn child_of_kind(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
-    (0..node.child_count()).find_map(|index| {
-        u32::try_from(index)
-            .ok()
-            .and_then(|index| node.child(index))
-            .filter(|child| child.kind_id() == kind)
-    })
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| child.kind_id() == kind)
 }
 
 fn section_adornment(node: Node<'_>, kind: u16, text: &str) -> Option<char> {
-    for index in 0..node.child_count() {
-        let child = u32::try_from(index)
-            .ok()
-            .and_then(|index| node.child(index))?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         if child.kind_id() == kind {
             return text.get(child.byte_range())?.chars().next();
         }
@@ -795,19 +790,14 @@ fn reference_name_range(
 
 fn collect_errors(node: Node<'_>, output: &mut Vec<TextRange>) -> Result<(), DocumentationError> {
     let mut pending = vec![node];
+    let mut cursor = node.walk();
     while let Some(current) = pending.pop() {
         if current.is_error() || current.is_missing() {
             output.push(byte_range(current)?);
         }
-        for index in (0..current.child_count()).rev() {
-            if let Some(child) = u32::try_from(index)
-                .ok()
-                .and_then(|index| current.child(index))
-                .filter(Node::is_named)
-            {
-                pending.push(child);
-            }
-        }
+        let first_child = pending.len();
+        pending.extend(current.named_children(&mut cursor));
+        pending[first_child..].reverse();
     }
     Ok(())
 }

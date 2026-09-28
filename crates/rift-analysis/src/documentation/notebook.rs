@@ -272,6 +272,7 @@ fn decode_cell(
 fn validate_tree(root: Node<'_>) -> Result<(), DocumentationError> {
     let mut pending = vec![(root, 0_usize)];
     let mut nodes_seen = 0_usize;
+    let mut cursor = root.walk();
     while let Some((node, depth)) = pending.pop() {
         nodes_seen = nodes_seen
             .checked_add(1)
@@ -288,14 +289,7 @@ fn validate_tree(root: Node<'_>) -> Result<(), DocumentationError> {
                 "notebook.depth",
             ));
         }
-        let children = node.child_count();
-        for index in 0..children {
-            let child_index = u32::try_from(index)
-                .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.nodes"))?;
-            if let Some(child) = node.child(child_index) {
-                pending.push((child, depth + 1));
-            }
-        }
+        pending.extend(node.children(&mut cursor).map(|child| (child, depth + 1)));
     }
     Ok(())
 }
@@ -306,13 +300,13 @@ fn selected_cells<'tree>(
     kinds: &JsonKinds,
 ) -> Result<Vec<SelectedCell<'tree>>, DocumentationError> {
     let mut selected = Vec::new();
-    for index in 0..cells.named_child_count() {
+    let mut cursor = cells.walk();
+    for (index, cell) in cells.named_children(&mut cursor).enumerate() {
         let cell_index = u32::try_from(index)
             .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.cells"))?;
-        let cell = cells
-            .named_child(cell_index)
-            .filter(|node| node.kind_id() == kinds.object)
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.cell"))?;
+        if cell.kind_id() != kinds.object {
+            return Err(refused(DocumentationViolation::Notebook, "notebook.cell"));
+        }
         let cell_type = object_value(cell, "cell_type", source, kinds)?;
         let kind = match cell_type {
             Some(node) if node.kind_id() == kinds.string => {
@@ -402,13 +396,11 @@ fn decode_source(
         )?;
         return Ok((decoded, physical_ranges));
     }
-    for index in 0..source_node.named_child_count() {
-        let child_index = u32::try_from(index)
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.source"))?;
-        let child = source_node
-            .named_child(child_index)
-            .filter(|node| node.kind_id() == kinds.string)
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.source"))?;
+    let mut cursor = source_node.walk();
+    for child in source_node.named_children(&mut cursor) {
+        if child.kind_id() != kinds.string {
+            return Err(refused(DocumentationViolation::Notebook, "notebook.source"));
+        }
         append_string(child, source, kinds, &mut decoded, &mut physical_ranges)?;
     }
     Ok((decoded, physical_ranges))
@@ -476,13 +468,11 @@ fn object_value<'tree>(
         return Ok(None);
     }
     let mut value = None;
-    for index in 0..object.named_child_count() {
-        let child_index = u32::try_from(index)
-            .map_err(|_| refused(DocumentationViolation::LimitExceeded, "notebook.object"))?;
-        let pair = object
-            .named_child(child_index)
-            .filter(|node| node.kind_id() == kinds.pair)
-            .ok_or_else(|| refused(DocumentationViolation::Notebook, "notebook.object"))?;
+    let mut cursor = object.walk();
+    for pair in object.named_children(&mut cursor) {
+        if pair.kind_id() != kinds.pair {
+            return Err(refused(DocumentationViolation::Notebook, "notebook.object"));
+        }
         let key = pair
             .child_by_field_id(kinds.key.get())
             .filter(|node| node.kind_id() == kinds.string)

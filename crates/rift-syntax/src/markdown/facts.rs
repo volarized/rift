@@ -5,7 +5,7 @@ use rift_core::{Error, ProjectPath};
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range, Tree};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, ChildIndices};
+use crate::extract;
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -530,6 +530,7 @@ fn extract_block_facts(
     let mut node_blocks = HashMap::with_capacity(block_nodes.len());
     // `bounded_tree_nodes` already checked this tree's node and depth limits.
     let mut stack = vec![(trees.block.root_node(), None::<usize>, None::<ByteRange>)];
+    let mut cursor = trees.block.walk();
     while let Some((node, inherited_heading, inherited_block)) = stack.pop() {
         let mut child_heading = inherited_heading;
         if node.kind_id() == kinds.section {
@@ -585,15 +586,9 @@ fn extract_block_facts(
             node_blocks.insert(node.id(), block_range);
         }
 
-        for child_index in node.child_indices().rev() {
-            let Some(child) = node.child(child_index) else {
-                continue;
-            };
-            if !child.is_named() {
-                continue;
-            }
-            stack.push((child, child_heading, current_block));
-        }
+        extract::push_named_children(&mut stack, &mut cursor, node, |child| {
+            (child, child_heading, current_block)
+        });
     }
 
     Ok(MarkdownBlockExtraction {
@@ -779,6 +774,7 @@ fn bounded_tree_nodes<'tree>(
 ) -> Result<Vec<BoundedNode<'tree>>, SyntaxError> {
     let mut result = Vec::new();
     let mut pending = vec![(root, base_depth)];
+    let mut cursor = root.walk();
     while let Some((node, depth)) = pending.pop() {
         if depth > depth_max {
             return Err(Error::new(SyntaxFault::TooDeep {
@@ -793,21 +789,13 @@ fn bounded_tree_nodes<'tree>(
             }));
         }
         result.push(BoundedNode { node, depth });
-        for index in node.child_indices().rev() {
-            let Some(child) = node.child(index) else {
-                continue;
-            };
-            if !child.is_named() {
-                continue;
-            }
-            if result.len() + pending.len() >= nodes_max {
-                return Err(Error::new(SyntaxFault::TooManyNodes {
-                    path: path.clone(),
-                    syntax_nodes_max: nodes_max,
-                }));
-            }
-            pending.push((child, depth + 1));
+        if result.len() + pending.len() + node.named_child_count() > nodes_max {
+            return Err(Error::new(SyntaxFault::TooManyNodes {
+                path: path.clone(),
+                syntax_nodes_max: nodes_max,
+            }));
         }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| (child, depth + 1));
     }
     Ok(result)
 }
@@ -816,11 +804,9 @@ fn inline_parse_ranges(node: Node<'_>, block_continuation: u16) -> Vec<Range> {
     let mut ranges = Vec::new();
     let mut start_byte = node.start_byte();
     let mut start_point = node.start_position();
-    for index in node.child_indices() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
-        if !child.is_named() || child.kind_id() != block_continuation {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind_id() != block_continuation {
             continue;
         }
         let child_range = child.range();
@@ -957,6 +943,7 @@ fn block_is_code(node_kind: u16, kinds: &MarkdownFactKinds) -> bool {
 
 fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<String> {
     let mut pending = vec![node];
+    let mut cursor = node.walk();
     while let Some(current) = pending.pop() {
         if current.kind_id() == info_string_kind {
             let start = current.start_byte();
@@ -964,13 +951,7 @@ fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<
             let info = source.get(start..end)?.trim();
             return info.split_whitespace().next().map(str::to_owned);
         }
-        for index in current.child_indices().rev() {
-            if let Some(child) = current.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, current, |child| child);
     }
     None
 }
@@ -1022,6 +1003,7 @@ fn collect_block_links(
     links: &mut Vec<MarkdownLinkFact>,
 ) -> Result<(), SyntaxError> {
     let mut pending = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
         if node.kind_id() == kinds.link_reference_definition {
             let range = extract::byte_range(node)?;
@@ -1037,20 +1019,14 @@ fn collect_block_links(
                 label_range: label.map(extract::byte_range).transpose()?,
             });
         }
-        for index in node.child_indices().rev() {
-            if let Some(child) = node.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
     }
     Ok(())
 }
 
 fn child_node(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
-    node.child_indices()
-        .filter_map(|index| node.child(index))
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
         .find(|child| child.kind_id() == kind)
 }
 
@@ -1088,10 +1064,8 @@ fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
 fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRange, SyntaxError> {
     let mut first = None;
     let mut last = None;
-    for index in node.child_indices() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         if child.kind_id() == delimiter_kind {
             let range = extract::byte_range(child)?;
             first.get_or_insert(range);
@@ -1116,17 +1090,12 @@ fn tree_error_ranges(root: Node<'_>) -> Result<Vec<ByteRange>, SyntaxError> {
 
 fn append_tree_errors(root: Node<'_>, ranges: &mut Vec<ByteRange>) -> Result<(), SyntaxError> {
     let mut pending = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
         if node.is_error() || node.is_missing() {
             ranges.push(extract::byte_range(node)?);
         }
-        for index in node.child_indices().rev() {
-            if let Some(child) = node.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
     }
     Ok(())
 }

@@ -47,7 +47,7 @@ use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
@@ -161,9 +161,9 @@ impl YamlRules {
     /// document ordinals once so each lookup during the walk is a binary
     /// search rather than a sibling scan.
     fn new(kinds: &'static YamlKinds, root: Node<'_>) -> Self {
+        let mut cursor = root.walk();
         let mut document_ordinals: Vec<(usize, usize)> = root
-            .named_child_indices()
-            .filter_map(|index| root.named_child(index))
+            .named_children(&mut cursor)
             .filter(|child| child.kind_id() == kinds.document)
             .enumerate()
             .map(|(index, child)| (child.id(), index + 1))
@@ -185,8 +185,8 @@ impl YamlRules {
         if let Some(spelling) = self.direct_scalar_spelling(node, text) {
             return Some(spelling);
         }
-        node.named_child_indices()
-            .filter_map(|index| node.named_child(index))
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
             .find_map(|child| self.direct_scalar_spelling(child, text))
     }
 
@@ -270,12 +270,10 @@ impl YamlRules {
 
     /// The document's content span; `None` for a bare `---`.
     fn document_body_range(&self, document: Node<'_>) -> Result<Option<ByteRange>, SyntaxError> {
-        let content = document
-            .named_child_indices()
-            .filter_map(|index| document.named_child(index))
-            .find(|child| {
-                child.kind_id() == self.kinds.block_node || child.kind_id() == self.kinds.flow_node
-            });
+        let mut cursor = document.walk();
+        let content = document.named_children(&mut cursor).find(|child| {
+            child.kind_id() == self.kinds.block_node || child.kind_id() == self.kinds.flow_node
+        });
         match content {
             Some(node) => extract::byte_range(node).map(Some),
             None => Ok(None),

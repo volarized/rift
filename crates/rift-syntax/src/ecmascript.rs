@@ -62,7 +62,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFace
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -488,9 +488,8 @@ impl EcmaScriptKinds {
     /// `export as namespace name` places an identifier in the same child
     /// position, so the token decides; `None` for any other `export`.
     fn export_assignment_value<'tree>(&self, statement: Node<'tree>) -> Option<Node<'tree>> {
-        let mut children = statement
-            .child_indices()
-            .filter_map(|index| statement.child(index));
+        let mut cursor = statement.walk();
+        let mut children = statement.children(&mut cursor);
         children.find(|child| child.kind_id() == self.equals_token)?;
         children.find(Node::is_named)
     }
@@ -568,10 +567,11 @@ impl EcmaScriptKinds {
     }
 }
 
-/// Every named child of `node`, in order.
+/// Every named child of `node`, in order, read in one cursor walk.
 fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    node.named_child_indices()
-        .filter_map(move |index| node.named_child(index))
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    children.into_iter()
 }
 
 /// What a module exports without an `export` wrapping the declaration, read
@@ -810,8 +810,8 @@ impl EcmaScriptRules<'_> {
     /// grammar spells none or the declaration carries none.
     fn accessibility(&self, node: Node<'_>, text: &str) -> Option<String> {
         let modifier = self.kinds.accessibility_modifier?;
-        node.named_child_indices()
-            .filter_map(|index| node.named_child(index))
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
             .find(|child| child.kind_id() == modifier)
             .and_then(|child| text.get(child.byte_range()))
             .map(Into::into)
