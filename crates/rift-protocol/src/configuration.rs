@@ -1356,8 +1356,9 @@ pub struct RankingConfiguration {
     #[serde(default = "default_identifier_weight")]
     pub identifier_weight: f64,
     /// The lexical ranking's share of a fused score, 0.0 to 1.0. The lexical
-    /// ranking is the `SQLite` full-text index over names, signatures,
-    /// attached documentation, declaration source, and selected text files.
+    /// ranking is the `SQLite` full-text index over declaration names,
+    /// signatures, and attached documentation, and over the text of every
+    /// indexed file, stored once.
     #[schemars(range(min = 0.0, max = 1.0))]
     #[serde(default = "default_lexical_weight")]
     pub lexical_weight: f64,

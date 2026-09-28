@@ -1923,16 +1923,16 @@ impl WorkspaceIndex {
     }
 
     /// Derives index documents from this index: one document per indexed symbol, carrying
-    /// its name, qualified name, derived identifier terms, signature, attached
-    /// documentation, and declaration source, and one or more documents per baseline text
-    /// file - one whole document when the file is within `[search.text].max_chunk`, one per
-    /// chunk otherwise. A chunked file's documents share its real path and share an
-    /// identity built from that path plus the chunk index, so a hit still maps back to the
-    /// file it came from.
+    /// its name, qualified name, derived identifier terms, signature, and attached
+    /// documentation, and one or more documents per file text search reads, parsed or text
+    /// alone, carrying the file's text, the one copy the store keeps: one whole document
+    /// when the file is within `[search.text].max_chunk`, one per chunk otherwise. A chunked
+    /// file's documents share its real path and share an identity built from that path plus
+    /// the chunk index, so a hit still maps back to the file it came from.
     ///
-    /// A fact no provider published stays absent. Nothing substitutes declaration source
-    /// into the signature or documentation field, because a reader weighs those fields
-    /// apart and would then be weighing the same bytes twice.
+    /// A fact no provider published stays absent. Nothing substitutes a declaration's own
+    /// text into the signature or documentation field, because a reader weighs those
+    /// fields apart and would then be weighing the same bytes twice.
     ///
     /// `force_include` files stay outside this derivation: that on-demand walk's contract
     /// covers source units read for one request, not the persistent lexical index.

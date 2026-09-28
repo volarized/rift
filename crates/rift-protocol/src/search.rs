@@ -437,13 +437,14 @@ pub struct SearchParams {
     #[serde(default = "default_search_params_order")]
     pub order: ResultOrder,
     /// Text to match against declaration names, qualified names, signatures, attached
-    /// documentation, declaration source, and file contents. Matching is case-insensitive
-    /// and identifier-aware: the query and the indexed names split on case, acronym, and
-    /// separator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a
-    /// phrase together, and an identifier written inside a question reaches its
-    /// declaration without being quoted. A query naming several terms is answered by the
-    /// declarations carrying all of them before the ones carrying some. Scoring is
-    /// server-defined and comparable within one answer.
+    /// documentation, and file contents. A declaration whose body alone holds the terms
+    /// answers through its file's contents, tagged `content`, when that file ranks among
+    /// the first 20 files. Matching is case-insensitive and identifier-aware: the query and
+    /// the indexed names split on case, acronym, and separator boundaries, so `loadConfig`
+    /// finds `load_config`. Double quotes keep a phrase together, and an identifier written
+    /// inside a question reaches its declaration without being quoted. A query naming
+    /// several terms is answered by the declarations carrying all of them before the ones
+    /// carrying some. Scoring is server-defined and comparable within one answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     /// A regex matched against the text of every indexed file, in the syntax of the Rust

@@ -5377,7 +5377,7 @@
             "type": "string"
           },
           "query": {
-            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, declaration source, and file contents. Matching is case-insensitive\nand identifier-aware: the query and the indexed names split on case, acronym, and\nseparator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a\nphrase together, and an identifier written inside a question reaches its\ndeclaration without being quoted. A query naming several terms is answered by the\ndeclarations carrying all of them before the ones carrying some. Scoring is\nserver-defined and comparable within one answer.",
+            "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, and file contents. A declaration whose body alone holds the terms\nanswers through its file's contents, tagged `content`, when that file ranks among\nthe first 20 files. Matching is case-insensitive and identifier-aware: the query and\nthe indexed names split on case, acronym, and separator boundaries, so `loadConfig`\nfinds `load_config`. Double quotes keep a phrase together, and an identifier written\ninside a question reaches its declaration without being quoted. A query naming\nseveral terms is answered by the declarations carrying all of them before the ones\ncarrying some. Scoring is server-defined and comparable within one answer.",
             "type": "string"
           },
           "rev": {
