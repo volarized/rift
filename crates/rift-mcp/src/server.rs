@@ -3443,14 +3443,33 @@ mod tests {
         Ok(())
     }
 
+    /// A file past `[providers.syntax] max_file` extracts no declaration. Under the default
+    /// `[search.text] large_files = "split"` its text stays in the index and every answer
+    /// names it `large_file_unparsed`; under `skip` it leaves the index and answers carry
+    /// its `source_unavailable`.
     #[tokio::test]
-    async fn build_skips_one_oversized_file_and_serves_its_warning() -> TestResult {
+    async fn build_serves_the_warning_of_a_file_past_max_file_under_each_strategy() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
         super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"1b\"\n")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::LargeFileUnparsed { files, .. }
+                if files.iter().any(|file| file.0.ends_with("/wide.rs"))
+        )));
+        drop(server);
 
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let result = get_symbol(&server, "wide").await?;
         assert!(result.hits.is_empty());
         assert!(result.warnings.iter().any(|warning| matches!(
             warning,
@@ -3547,7 +3566,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"60b\"\n")?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
+        )?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
@@ -5981,25 +6003,23 @@ mod tests {
         Ok(())
     }
 
-    /// A file row past the lexical unit bound leaves the lexical index alone: the
-    /// publication lands, the sibling answers `search`, the declaration inside the file
-    /// still answers `search` by name, since its own row holds no source, and
-    /// `get_symbol`, and the record names the file. A `[search.text] max_chunk` above the
-    /// unit bound is what lets one row grow past it. The lexical commit runs on the
-    /// building task, so the thread-local subscriber sees it.
+    /// Under `[search.text] large_files = "split"`, the default, a whole-file row as large
+    /// as a `max_chunk` above the old 1mb unit bound lands in the lexical index: the store
+    /// takes every row a `max_chunk` the configuration accepts can derive, so the file's
+    /// text answers `search`, its declaration answers `search` by name and `get_symbol`, and
+    /// no unit is recorded as left out. The lexical commit runs on the building task, so
+    /// the thread-local subscriber sees every record it raises.
     #[tokio::test]
-    async fn an_oversized_file_row_is_left_out_of_search_and_its_declaration_serves() -> TestResult
-    {
+    async fn a_file_row_as_large_as_max_chunk_answers_search_and_its_declaration_serves()
+    -> TestResult {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        let unit_bytes_max =
-            usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
         let blob = format!(
-            "pub const BLOB: &str = \"{}\";\n",
-            "b".repeat(unit_bytes_max)
+            "pub const BLOB: &str = \"{}\";\n// lantern harbor\n",
+            "b".repeat(1 << 20)
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
         super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
@@ -6010,34 +6030,152 @@ mod tests {
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
+        let text = serde_json::to_value(run_search(&server, "lantern harbor").await?)?;
+        assert!(
+            hit_paths(&text).contains(&"src/blob.rs"),
+            "the whole-file row answers: {text:#}"
+        );
         let named = serde_json::to_value(run_search(&server, "BLOB").await?)?;
         let named_hits = named["results"].as_array().ok_or("results are an array")?;
-        assert_eq!(named_hits.len(), 1, "{named:#}");
-        assert_eq!(
-            named_hits[0]["hit"]["symbol"]["name"],
-            json!("BLOB"),
+        assert!(
+            named_hits
+                .iter()
+                .any(|hit| hit["hit"]["symbol"]["name"] == json!("BLOB")),
             "{named:#}"
         );
         let symbol = get_symbol(&server, "BLOB").await?;
-        assert_eq!(
-            symbol.hits.len(),
-            1,
-            "the declaration stays in the syntax index: {symbol:?}"
-        );
-        let recorded = loop {
-            match drain.try_recv_record() {
-                Ok(record) if record.message().contains("lexical unit left out") => break record,
-                Ok(_) => {}
-                Err(_) => return Err("the left-out unit must be recorded".into()),
-            }
-        };
-        assert_eq!(recorded.level(), "warn");
-        assert_eq!(recorded.component(), "index");
+        assert_eq!(symbol.hits.len(), 1, "{symbol:?}");
+        while let Ok(record) = drain.try_recv_record() {
+            assert!(
+                !record.message().contains("lexical unit left out"),
+                "no unit is left out: {}",
+                record.fields()
+            );
+        }
+        Ok(())
+    }
+
+    /// Writes the large-file tree the two strategies are proven over: a small parsed file,
+    /// a parsed file past a 1kb `max_chunk`, and a file past an 8kb `max_file`, under the
+    /// `[search.text]` lines `text` adds.
+    fn large_file_workspace(root: &std::path::Path, text: &str) -> TestResult {
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            root.join("src/blob.rs"),
+            format!(
+                "pub const BLOB: &str = \"{}\";\n// harbor lantern\n",
+                "b".repeat(3_000)
+            ),
+        )?;
+        fs::write(
+            root.join("src/huge.rs"),
+            format!(
+                "pub const HUGE: &str = \"{}\";\n// harbor relay\n",
+                "h".repeat(9_000)
+            ),
+        )?;
+        super::hermetic_workspace(
+            root,
+            &format!(
+                "[providers.syntax]\nmax_file = \"8kb\"\n\n[search.text]\nmax_chunk = \"1kb\"\n{text}"
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// The paths of an answer's hits, in answer order.
+    fn answered_paths(answer: &SearchResult) -> Vec<&str> {
+        answer
+            .results
+            .iter()
+            .filter_map(|hit| hit.path.as_ref().map(|path| path.0.as_str()))
+            .collect()
+    }
+
+    /// Under `[search.text] large_files = "split"`, the default, a file past `max_chunk`
+    /// answers search from its chunk rows and its declaration answers `get_symbol`, and a
+    /// file past `[providers.syntax] max_file` is held as text the provider does not parse:
+    /// its text answers a `pattern`, and every answer names it in `large_file_unparsed`.
+    /// The store takes every row a `max_chunk` the configuration accepts can derive, so no
+    /// row of either file is left out of the lexical index, and the capture agrees with
+    /// the index on the held text.
+    #[tokio::test]
+    async fn split_answers_files_past_the_chunk_and_the_parse_bounds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        large_file_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let lantern = search_after_population(&server, "lantern").await?;
         assert!(
-            recorded.fields().contains("src/blob.rs"),
-            "the record names the path: {}",
-            recorded.fields()
+            answered_paths(&lantern).contains(&"src/blob.rs"),
+            "a chunk row answers: {lantern:?}"
         );
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(answered_paths(&answer), ["src/blob.rs", "src/huge.rs"]);
+        let unparsed = answer
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                ReadWarning::LargeFileUnparsed { files, .. } => Some(files.clone()),
+                _ => None,
+            })
+            .ok_or("the answer names the unparsed file")?;
+        assert_eq!(
+            unparsed,
+            [rift_protocol::read::FileId(
+                "rift://file/src/huge.rs".to_owned()
+            )]
+        );
+        assert!(
+            !answer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "the capture reads the held text as the build did: {:?}",
+            answer.warnings
+        );
+        assert_eq!(get_symbol(&server, "BLOB").await?.hits.len(), 1);
+        let huge = get_symbol(&server, "HUGE").await?;
+        assert!(
+            huge.hits.is_empty(),
+            "no declaration of huge.rs was extracted"
+        );
+        assert!(
+            huge.warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. })),
+            "{:?}",
+            huge.warnings
+        );
+        Ok(())
+    }
+
+    /// Under `large_files = "skip"`, a file past `max_chunk` leaves text search and an
+    /// answer whose `paths` reach it counts it in `large_file_skipped`, while its
+    /// declaration still answers `get_symbol`; a file past `max_file` leaves the index.
+    #[tokio::test]
+    async fn skip_answers_with_the_count_of_the_files_it_leaves_out() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        large_file_workspace(directory.path(), "large_files = \"skip\"\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert!(answer.results.is_empty(), "{answer:?}");
+        assert!(
+            answer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LargeFileSkipped { skipped: 2, .. })),
+            "{:?}",
+            answer.warnings
+        );
+        assert_eq!(get_symbol(&server, "BLOB").await?.hits.len(), 1);
+        assert!(get_symbol(&server, "HUGE").await?.hits.is_empty());
         Ok(())
     }
 

@@ -435,6 +435,10 @@ impl ReadService {
         let index = self.index();
         let matcher = path_matcher(index.root(), selector)?;
         let lockfiles = selected_lockfiles(index, selector, matcher.as_ref());
+        let skipped = index
+            .skipped_paths()
+            .filter(|path| includes(matcher.as_ref(), index.root(), path))
+            .count();
         let force_include = match selector {
             Some(selector) if !selector.force_include.is_empty() => Some(
                 index
@@ -450,6 +454,7 @@ impl ReadService {
             matcher,
             force_include,
             lockfiles,
+            skipped,
         })
     }
 
@@ -712,6 +717,9 @@ struct SelectedPaths {
     force_include: Option<WorkspaceIndex>,
     /// The lockfiles `paths.include` selects that the index leaves out of search.
     lockfiles: Vec<ProjectPath>,
+    /// The held files the selection reaches that text search leaves out under
+    /// `[search.text] large_files = "skip"`.
+    skipped: usize,
 }
 
 impl SelectedPaths {
@@ -727,6 +735,7 @@ impl SelectedPaths {
             .map(|extra| source_warnings(extra.warnings()))
             .unwrap_or_default();
         warnings.extend(lockfile_warning(&self.lockfiles));
+        warnings.extend(skipped_warning(self.skipped));
         warnings
     }
 }
@@ -751,6 +760,19 @@ fn selected_lockfiles(
         .filter(|path| includes(matcher, index.root(), path))
         .cloned()
         .collect()
+}
+
+/// The one warning counting the selected files text search leaves out under
+/// `[search.text] large_files = "skip"`, or none when the selection reaches none.
+fn skipped_warning(skipped: usize) -> Option<ReadWarning> {
+    (skipped > 0).then(|| ReadWarning::LargeFileSkipped {
+        skipped: u64::try_from(skipped).unwrap_or(u64::MAX),
+        detail: format!(
+            "{skipped} selected files are past [search.text] max_chunk and left out of the \
+             text index under large_files = \"skip\"; setting large_files to \"split\" \
+             indexes them in chunks"
+        ),
+    })
 }
 
 /// The one warning naming the selected lockfiles search leaves out, at most

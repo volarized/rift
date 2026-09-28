@@ -1500,15 +1500,18 @@ fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
     }
 }
 
-/// The `source_unavailable` warnings one answer carries for the files the index left
-/// out: the first [`SOURCE_WARNINGS_MAX`] in project-path order, the order the index
-/// keeps them in, then - when more were left out - one more counting the rest, which
-/// `rift://logs` names one by one.
-pub(crate) fn source_warnings(left_out: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+/// The warnings one answer carries for the files the index left out, whole or in part:
+/// the `source_unavailable` warnings for the files left out whole, the first
+/// [`SOURCE_WARNINGS_MAX`] in project-path order, the order the index keeps them in, then -
+/// when more were left out - one more counting the rest, which `rift://logs` names one by
+/// one; and one `large_file_unparsed` naming the files held as text alone.
+pub(crate) fn source_warnings(warnings: &[WorkspaceIndexWarning]) -> Vec<ReadWarning> {
+    let (unparsed, left_out): (Vec<&WorkspaceIndexWarning>, Vec<&WorkspaceIndexWarning>) =
+        warnings.iter().partition(|warning| warning.holds_text());
     let mut warnings: Vec<ReadWarning> = left_out
         .iter()
         .take(SOURCE_WARNINGS_MAX)
-        .map(wire_index_warning)
+        .map(|warning| wire_index_warning(warning))
         .collect();
     let rest = left_out.len().saturating_sub(SOURCE_WARNINGS_MAX);
     if rest > 0 {
@@ -1517,7 +1520,28 @@ pub(crate) fn source_warnings(left_out: &[WorkspaceIndexWarning]) -> Vec<ReadWar
             detail: format!("{rest} more files are absent from the index; rift://logs names each"),
         });
     }
+    warnings.extend(unparsed_warning(&unparsed));
     warnings
+}
+
+/// The one warning naming the files held as text the syntax provider does not parse, at
+/// most [`SOURCE_WARNINGS_MAX`] of them, or none when no file is.
+fn unparsed_warning(unparsed: &[&WorkspaceIndexWarning]) -> Option<ReadWarning> {
+    if unparsed.is_empty() {
+        return None;
+    }
+    let files = unparsed
+        .iter()
+        .take(SOURCE_WARNINGS_MAX)
+        .map(|warning| file_id(warning.path()))
+        .collect();
+    let detail = format!(
+        "{count} files are past [providers.syntax] max_file, so the index holds their text \
+         alone: search reads it, and none of their declarations were extracted; raising \
+         max_file parses them",
+        count = unparsed.len(),
+    );
+    Some(ReadWarning::LargeFileUnparsed { files, detail })
 }
 
 /// Mints the project resolver's source-unit identity: the resolver name, then the

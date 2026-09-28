@@ -411,8 +411,10 @@ impl ConfigurationState {
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
         let syntax = self.syntax_configuration();
+        let large_files = self.text_inclusion().large_files();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
+            .map(|limits| limits.with_large_files(large_files))
             .map_err(|error| ReadError::from(ReadFault::Index(error)))
     }
 
@@ -3874,7 +3876,7 @@ pub(crate) mod tests {
         let limits = WorkspaceIndexLimits::new(4, 60, 60, 4, 100)?;
         fs::write(
             directory.path().join("rift.toml"),
-            "[providers.syntax]\nmax_file = \"60b\"\n",
+            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
         )?;
         fs::write(&absolute, "pub fn beacon() {}\n")?;
         let before = candidate_with_limits(directory.path(), 0, limits)?;

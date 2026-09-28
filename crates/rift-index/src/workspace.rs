@@ -26,7 +26,7 @@ use rift_core::{
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
-use rift_protocol::configuration::SyntaxConfiguration;
+use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
 use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
@@ -216,6 +216,25 @@ impl WorkspaceIndexLimits {
     #[must_use]
     pub const fn syntax(self) -> SyntaxLimits {
         self.syntax
+    }
+
+    /// The per-file byte bound `[search.text] large_files` sets, applied last: under
+    /// `split` a file is held as text up to the workspace byte bound whatever its size, and
+    /// one past the syntax source bound is held unparsed; under `skip` a file past the
+    /// syntax source bound is left out, as the provider cannot parse it.
+    #[must_use]
+    pub const fn with_large_files(self, strategy: LargeFileStrategy) -> Self {
+        let parsed = self.syntax.source_bytes_max();
+        let file_bytes_max = match strategy {
+            LargeFileStrategy::Split if self.workspace_bytes_max > parsed => {
+                self.workspace_bytes_max
+            }
+            LargeFileStrategy::Split | LargeFileStrategy::Skip => parsed,
+        };
+        Self {
+            file_bytes_max,
+            ..self
+        }
     }
 }
 
@@ -1036,7 +1055,9 @@ pub enum WorkspaceIndexWarning {
     BinarySource(ProjectPath),
     /// File exceeds the configured per-file byte bound.
     FileTooLarge(ProjectPath),
-    /// The syntax provider refused the file under one of its bounds.
+    /// The syntax provider refused the file under one of its bounds. A file refused for its
+    /// source size stays in the index as text the provider does not parse; see
+    /// [`Self::holds_text`].
     SyntaxTooLarge {
         /// The file left out.
         path: ProjectPath,
@@ -1163,7 +1184,9 @@ impl IndexContents {
         Ok(())
     }
 
-    /// Holds one cataloged file with the syntax outcome already read for it.
+    /// Holds one cataloged file with the syntax outcome already read for it. A file the
+    /// provider refused for its source size alone is held as text, since its text still
+    /// answers search; any other refusal keeps only its digests.
     fn hold_parsed_source(
         &mut self,
         text_file: TextSourceFile,
@@ -1173,6 +1196,10 @@ impl IndexContents {
             IndexRead::Included(file) => {
                 self.files.insert(file.path().clone(), file);
                 self.hold_text_file(text_file);
+            }
+            IndexRead::Skipped(warning) if warning.holds_text() => {
+                self.hold_text_file(text_file);
+                self.warnings.push(warning);
             }
             IndexRead::Skipped(warning) => {
                 self.left_out
@@ -1314,6 +1341,19 @@ impl IndexContents {
 }
 
 impl WorkspaceIndexWarning {
+    /// Whether the file keeps its text in the index: the provider refused its source for
+    /// its size alone, so the file is held as text no declaration was extracted from.
+    #[must_use]
+    pub const fn holds_text(&self) -> bool {
+        matches!(
+            self,
+            Self::SyntaxTooLarge {
+                violation: SyntaxViolation::SourceTooLarge,
+                ..
+            }
+        )
+    }
+
     /// The file this warning names.
     #[must_use]
     pub fn path(&self) -> &ProjectPath {
@@ -1335,6 +1375,10 @@ impl WorkspaceIndexWarning {
             Self::InvalidUtf8Source(_) => "holds bytes that are not valid UTF-8".to_owned(),
             Self::BinarySource(_) => "contains a NUL byte".to_owned(),
             Self::FileTooLarge(_) => "exceeds the file byte limit".to_owned(),
+            Self::SyntaxTooLarge { violation, .. } if self.holds_text() => format!(
+                "exceeds a syntax bound ({}), so the index holds its text unparsed",
+                fault_label(violation)
+            ),
             Self::SyntaxTooLarge { violation, .. } => {
                 format!("exceeds a syntax bound ({})", fault_label(violation))
             }
@@ -1901,7 +1945,7 @@ impl WorkspaceIndex {
                         documents.extend(symbol_document(file, symbol, &mut left_out));
                     }
                 }
-                for file in self.text_files() {
+                for file in self.searched_text_files() {
                     if is_notebook_path(file.path()) {
                         continue;
                     }
@@ -1990,6 +2034,7 @@ impl WorkspaceIndex {
             }
             if let Some(file) = self.text_files.get(path)
                 && !is_notebook_path(file.path())
+                && !self.text_inclusion.skips(file.content().len())
             {
                 push_text_documents(&mut units, file, self.text_chunk_bytes_max(), &mut left_out);
             }
@@ -2007,7 +2052,7 @@ impl WorkspaceIndex {
     /// count, so a caller can report the split instead of the index silently absorbing it.
     #[must_use]
     pub fn chunked_text_files(&self) -> Vec<(ProjectPath, usize)> {
-        self.text_files()
+        self.searched_text_files()
             .filter(|file| exceeds_chunk_bound(file.content().len(), self.text_chunk_bytes_max()))
             .map(|file| {
                 let chunks = text_chunks(
@@ -2062,11 +2107,12 @@ impl WorkspaceIndex {
             .ok_or_else(|| provider_error(None, ReadableSymbolMissing { identity }))
     }
 
-    /// Files the build left out of the index, in project-path order.
+    /// Files the build left out of the index, whole or in part, in project-path order.
     ///
     /// Build and rebuild continue after invalid UTF-8, NUL bytes, a file beyond
     /// the configured per-file byte bound, or a syntax tree the provider refuses
-    /// under one of its bounds.
+    /// under one of its bounds. A file refused for its source size alone keeps its text
+    /// ([`WorkspaceIndexWarning::holds_text`]).
     #[must_use]
     pub fn warnings(&self) -> &[WorkspaceIndexWarning] {
         &self.warnings
@@ -2134,10 +2180,37 @@ impl WorkspaceIndex {
         self.text_files.get(path).map(AsRef::as_ref)
     }
 
-    /// Every held file whose text a `pattern` search reads, parsed or text alone, in
-    /// project-path order.
+    /// Every held file whose text search reads, parsed or text alone, in project-path
+    /// order: under `[search.text] large_files = "skip"`, a file past `max_chunk` is left
+    /// out.
     pub fn searched_text_files(&self) -> impl Iterator<Item = &TextSourceFile> {
         self.text_files()
+            .filter(|file| !self.text_inclusion.skips(file.content().len()))
+    }
+
+    /// The held files text search leaves out under `[search.text] large_files = "skip"`,
+    /// in project-path order.
+    pub fn skipped_text_files(&self) -> impl Iterator<Item = &TextSourceFile> {
+        self.text_files()
+            .filter(|file| self.text_inclusion.skips(file.content().len()))
+    }
+
+    /// Every file `[search.text] large_files = "skip"` keeps out of text search: the held
+    /// files past `max_chunk`, then the files past the per-file byte bound the build left
+    /// out, which under `skip` is `[providers.syntax] max_file`. Under `split` there are
+    /// none.
+    pub fn skipped_paths(&self) -> impl Iterator<Item = &ProjectPath> {
+        let skip = self.text_inclusion.large_files() == LargeFileStrategy::Skip;
+        let past_file_bound = self
+            .warnings
+            .iter()
+            .filter(move |warning| {
+                skip && matches!(warning, WorkspaceIndexWarning::FileTooLarge(_))
+            })
+            .map(WorkspaceIndexWarning::path);
+        self.skipped_text_files()
+            .map(TextSourceFile::path)
+            .chain(past_file_bound)
     }
 
     /// The searched files a `pattern` search verifies whole whatever the trigram index
@@ -2340,13 +2413,10 @@ impl WorkspaceIndex {
             let context_path = self.root.join(file.path().as_str());
             if let Some(ClassifiedPath::Source(provider)) =
                 self.language.classifies(&context_path)?
+                && let IndexRead::Included(indexed) =
+                    syntax_read(file, &context_path, provider, self.limits.syntax())?
             {
-                files.push(indexed_file_from_catalog(
-                    file,
-                    &context_path,
-                    provider,
-                    self.limits.syntax(),
-                )?);
+                files.push(indexed);
             }
         }
         Self::from_parts(
@@ -2916,7 +2986,10 @@ fn capture_paths(
         last,
         next: &mut next,
     };
-    let source = capture.path_class(&source)?;
+    let (source, unparsed): (Vec<_>, Vec<_>) = capture
+        .path_class(&source)?
+        .into_iter()
+        .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
     let text = capture.path_class(&text)?;
     tracing::debug!(
         component = "index",
@@ -2926,10 +2999,24 @@ fn capture_paths(
         text = text.len(),
     );
     let digests = WorkspaceDigests::classified(
-        source,
-        text.into_iter().map(|(path, state, _)| (path, state)),
+        source
+            .into_iter()
+            .map(|captured| (captured.path, captured.state, captured.content)),
+        text.into_iter()
+            .chain(unparsed)
+            .map(|captured| (captured.path, captured.state)),
     );
     Ok((digests, next))
+}
+
+/// One file the capture kept: its digests, and the bytes it counts. A claimed file past
+/// the syntax source bound is held as text the provider does not parse, so the capture
+/// files it beside the text files, as the build does.
+struct CapturedEntry {
+    path: ProjectPath,
+    state: FileDigest,
+    content: FileDigest,
+    length: usize,
 }
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
@@ -3015,10 +3102,7 @@ impl PathCapture<'_> {
     /// so the capture holds one file per worker. The kept lengths, reused ones included,
     /// are then summed in walk order: the `workspace_bytes_max` refusal names the path a
     /// sequential read would name, and an earlier path's failure wins over a later one's.
-    fn path_class(
-        &mut self,
-        paths: &[PathBuf],
-    ) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
+    fn path_class(&mut self, paths: &[PathBuf]) -> Result<Vec<CapturedEntry>, WorkspaceIndexError> {
         let (limits, last) = (self.limits, self.last);
         let read: Vec<Result<(CapturedPath, bool), WorkspaceIndexError>> = paths
             .par_iter()
@@ -3032,11 +3116,12 @@ impl PathCapture<'_> {
                 continue;
             };
             count_workspace_bytes(self.workspace_bytes, file.length, path, limits)?;
-            captured.push((
-                project_path_below(self.root, path)?,
-                file.state,
-                file.content,
-            ));
+            captured.push(CapturedEntry {
+                path: project_path_below(self.root, path)?,
+                state: file.state,
+                content: file.content,
+                length: file.length,
+            });
         }
         Ok(captured)
     }

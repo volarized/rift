@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. `packages` names package versions the lookup reads beside the\nworkspace's own, such as an upgrade target or a package the project does not use\nyet. Use `search` when the name is not exactly known.",
+      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. Use `search` when the name is not exactly known.",
       "input_schema": {
         "$defs": {
           "GetSymbolInclude": {
@@ -33,46 +33,6 @@
             "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
-          },
-          "RequestedPackage": {
-            "additionalProperties": false,
-            "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
-            "examples": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              },
-              {
-                "manager": "npm",
-                "name": "zod"
-              }
-            ],
-            "properties": {
-              "manager": {
-                "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
-                "maxLength": 128,
-                "minLength": 1,
-                "type": "string"
-              },
-              "name": {
-                "description": "Package name in that ecosystem.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              },
-              "version": {
-                "description": "The exact version to read. Absent, the entry asks for the requirement `>=0`, which\nthe global index answers from its newest collected release.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "manager",
-              "name"
-            ],
-            "type": "object"
           },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it. Rift carries it opaquely and never orders two revisions\nby comparing their identifiers.",
@@ -125,18 +85,6 @@
             "limit": 5,
             "name": "spawn",
             "scope": "all"
-          },
-          {
-            "limit": 5,
-            "name": "spawn",
-            "packages": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              }
-            ],
-            "scope": "global"
           }
         ],
         "properties": {
@@ -167,14 +115,6 @@
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
-          },
-          "packages": {
-            "description": "Packages this lookup reads beside the ones the workspace's manifests and\nlockfiles name, at most 64. An entry naming a package the workspace depends on\nreplaces that package's versions for this read, and an entry naming another\npackage adds it. The server refuses `packages` beside the `local` scope, since a\nproject read consults no package, and beside `rev`, since package facts are\nserved for the current tree alone.",
-            "items": {
-              "$ref": "#/$defs/RequestedPackage"
-            },
-            "maxItems": 64,
-            "type": "array"
           },
           "page_index": {
             "default": 0,
@@ -1540,6 +1480,36 @@
                 "required": [
                   "code",
                   "results_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file held more matches of `pattern` than `matches_per_file`, so its later matches\nare missing from this answer while every other file answers in full. `files` names\nthe cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow\n`pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_matches_truncated",
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The files cut at the bound.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "matches_per_file": {
+                    "description": "Matches one file contributes at most: the server's bound on one file's matches.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_per_file",
+                  "files"
                 ],
                 "type": "object"
               },
@@ -3928,6 +3898,36 @@
               },
               {
                 "additionalProperties": false,
+                "description": "A file held more matches of `pattern` than `matches_per_file`, so its later matches\nare missing from this answer while every other file answers in full. `files` names\nthe cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow\n`pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_matches_truncated",
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The files cut at the bound.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "matches_per_file": {
+                    "description": "Matches one file contributes at most: the server's bound on one file's matches.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_per_file",
+                  "files"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "A claimed file is left out of the index - its bytes are not valid UTF-8, or it\ncrosses a per-file bound - so it answers no search or lookup, and addressing it\ndirectly still refuses `content_unavailable`. Every other file in the workspace\nstays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are left out, one more carries no `unit` and\ncounts the rest, and `rift://logs` names each of them.",
                 "properties": {
                   "code": {
@@ -4717,7 +4717,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `change` answers the\ndeclarations two committed revisions hold differently, in place of `query` and\n`traversal`. `rev` searches a version-control revision instead of the current tree,\nand never combines with `traversal` or `change`. `scope` reaches past the project\ntree: `global` answers `query` from the public declarations the global index holds\nfor the workspace's dependencies alone, `all` from both, ordered together.\n`packages` names package versions `query` searches beside the workspace's own, such\nas an upgrade target or a package the project does not use yet. Use `get_symbol`\nwhen the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone, `all` from both,\nordered together. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -4919,46 +4919,6 @@
               }
             ]
           },
-          "RequestedPackage": {
-            "additionalProperties": false,
-            "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
-            "examples": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              },
-              {
-                "manager": "npm",
-                "name": "zod"
-              }
-            ],
-            "properties": {
-              "manager": {
-                "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
-                "maxLength": 128,
-                "minLength": 1,
-                "type": "string"
-              },
-              "name": {
-                "description": "Package name in that ecosystem.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              },
-              "version": {
-                "description": "The exact version to read. Absent, the entry asks for the requirement `>=0`, which\nthe global index answers from its newest collected release.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "manager",
-              "name"
-            ],
-            "type": "object"
-          },
           "ResultOrder": {
             "description": "The total order a paginated answer comes back in. Every order ends in the result's own\nidentity, so two results that tie never swap places between pages.",
             "oneOf": [
@@ -5148,6 +5108,11 @@
               },
               {
                 "required": [
+                  "pattern"
+                ]
+              },
+              {
+                "required": [
                   "traversal"
                 ]
               },
@@ -5157,7 +5122,7 @@
                 ]
               }
             ],
-            "description": "a search selects its result set with query, traversal, or change"
+            "description": "a search selects its result set with query, pattern, traversal, or change"
           },
           {
             "description": "a traversal starts at seed",
@@ -5228,17 +5193,17 @@
             "target": "symbol"
           },
           {
-            "limit": 10,
-            "packages": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              }
+            "include": [
+              "source"
             ],
-            "query": "spawn_blocking",
-            "scope": "all",
-            "target": "symbol"
+            "limit": 25,
+            "paths": {
+              "include": [
+                "src/**"
+              ]
+            },
+            "pattern": "fn\\s+load_\\w+\\(",
+            "target": "file"
           },
           {
             "change": {
@@ -5273,14 +5238,6 @@
             "default": "relevance",
             "description": "Which total order the page comes back in. Omitted, relevance."
           },
-          "packages": {
-            "description": "Packages `query` searches beside the ones the workspace's manifests and lockfiles\nname, at most 64. An entry naming a package the workspace depends on replaces that\npackage's versions for this search, and an entry naming another package adds it.\nThe server refuses `packages` beside the `local` scope, since a project search\nconsults no package, and beside `rev`, since package facts are served for the\ncurrent tree alone.",
-            "items": {
-              "$ref": "#/$defs/RequestedPackage"
-            },
-            "maxItems": 64,
-            "type": "array"
-          },
           "page_index": {
             "default": 0,
             "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
@@ -5291,6 +5248,12 @@
           "paths": {
             "$ref": "#/$defs/PathSelector",
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
+          },
+          "pattern": {
+            "description": "A regex matched against the text of every indexed file, in the syntax of the Rust\n`regex` crate that ripgrep reads. Matching runs line by line: `^` and `$` match at\nline boundaries, a `\\r` before a line feed belongs to its line, and no class matches\na line feed, so only a literal `\\n` crosses a line; `(?i)` makes the match\ncase-insensitive. Every match becomes one file hit whose `range` is the match's\nbytes, and every declaration holding a match one symbol hit at its first match;\neach hit is tagged `content` and carries no score, and `relevance` orders the hits\nby path, then offset. The server refuses `pattern` beside `query`, `traversal`,\n`change`, and `rev`, with a `scope` past `local`, and with `target:\n\"documentation\"`, and it refuses a pattern whose compiled size, candidate rows, or\nverified bytes pass the `[search]` bounds, naming the bound.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
           },
           "query": {
             "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, declaration source, and file contents. Matching is case-insensitive\nand identifier-aware: the query and the indexed names split on case, acronym, and\nseparator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a\nphrase together, and an identifier written inside a question reaches its\ndeclaration without being quoted. A query naming several terms is answered by the\ndeclarations carrying all of them before the ones carrying some. Scoring is\nserver-defined and comparable within one answer.",
@@ -6548,6 +6511,36 @@
                 "required": [
                   "code",
                   "results_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file held more matches of `pattern` than `matches_per_file`, so its later matches\nare missing from this answer while every other file answers in full. `files` names\nthe cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow\n`pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_matches_truncated",
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The files cut at the bound.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "matches_per_file": {
+                    "description": "Matches one file contributes at most: the server's bound on one file's matches.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_per_file",
+                  "files"
                 ],
                 "type": "object"
               },

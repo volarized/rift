@@ -107,38 +107,51 @@ async fn a_workspace_page_past_the_end_answers_an_empty_catalog() -> TestResult 
     Ok(())
 }
 
-/// One byte past the 4 MiB per-file bound every shipped provider declares, the bound the
-/// workspace scan applies to text files too.
+/// One byte past the 4 MiB `[providers.syntax] max_file` every shipped provider
+/// declares by default.
 const OVERSIZED_FILE_BYTES: usize = 4 * 1024 * 1024 + 1;
 
-/// A file past the per-file byte bound is left out of the index, so the source listing
-/// omits it the way the index does instead of refusing the whole resource.
-#[tokio::test]
-async fn a_file_past_the_per_file_bound_is_absent_from_the_source_listing() -> TestResult {
-    let oversized = "x".repeat(OVERSIZED_FILE_BYTES);
-    let (_directory, client, server_task) = served_workspace(
-        &[
-            ("lib.rs", "pub fn beacon() {}\n"),
-            ("blob.txt", oversized.as_str()),
-        ],
-        None,
-    )
-    .await?;
-
-    let body = resource_body(&client, "rift://workspace").await?;
-
-    let paths: Vec<&str> = body["source"]
+/// The source listing's paths.
+async fn listed_paths(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Vec<String>> {
+    let body = resource_body(client, "rift://workspace").await?;
+    Ok(body["source"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|unit| unit["path"].as_str())
-        .collect();
-    assert!(paths.contains(&"lib.rs"), "{body:#}");
-    assert!(
-        !paths.contains(&"blob.txt"),
-        "a file the index leaves out is no source unit: {body:#}"
-    );
+        .filter_map(|unit| unit["path"].as_str().map(str::to_owned))
+        .collect())
+}
 
+/// Under the default `[search.text] large_files = "split"`, a file past `max_file` is held
+/// as text, so the source listing names it; under `skip` the index leaves it out, and the
+/// listing omits it the way the index does instead of refusing the whole resource.
+#[tokio::test]
+async fn a_file_past_max_file_is_listed_under_split_and_absent_under_skip() -> TestResult {
+    let oversized = "x".repeat(OVERSIZED_FILE_BYTES);
+    let files = [
+        ("lib.rs", "pub fn beacon() {}\n"),
+        ("blob.txt", oversized.as_str()),
+    ];
+    let (_directory, client, server_task) = served_workspace(&files, None).await?;
+    let paths = listed_paths(&client).await?;
+    assert!(paths.iter().any(|path| path == "lib.rs"), "{paths:?}");
+    assert!(
+        paths.iter().any(|path| path == "blob.txt"),
+        "split holds the file as text: {paths:?}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+
+    let skip = Some("[search.text]\nlarge_files = \"skip\"\n".to_owned());
+    let (_directory, client, server_task) = served_workspace(&files, skip).await?;
+    let paths = listed_paths(&client).await?;
+    assert!(paths.iter().any(|path| path == "lib.rs"), "{paths:?}");
+    assert!(
+        !paths.iter().any(|path| path == "blob.txt"),
+        "a file the index leaves out is no source unit: {paths:?}"
+    );
     client.cancel().await?;
     server_task.await?;
     Ok(())

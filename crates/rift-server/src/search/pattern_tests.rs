@@ -4,7 +4,9 @@ use std::fs;
 
 use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
-use rift_protocol::configuration::{ByteSize, HistoryConfiguration, SearchConfiguration};
+use rift_protocol::configuration::{
+    ByteSize, HistoryConfiguration, LargeFileStrategy, SearchConfiguration,
+};
 use rift_protocol::read::{
     MatchedField, ReadWarning, SEARCH_PATTERN_BYTES_MAX, SearchHitTarget, SearchParams,
     SearchResult,
@@ -596,5 +598,129 @@ async fn paths_narrow_the_verified_files() -> TestResult {
         .map(|(path, ..)| path)
         .collect();
     assert_eq!(paths, ["src/lib.rs"]);
+    Ok(())
+}
+
+/// A service over `root` whose syntax provider parses at most 2kb of one source, under
+/// `strategy`.
+fn service_under(root: &std::path::Path, strategy: LargeFileStrategy) -> TestResult<ReadService> {
+    let limits = WorkspaceIndexLimits::default()
+        .with_syntax(rift_syntax::SyntaxLimits::new(2_048, 250_000, 512)?)
+        .with_large_files(strategy);
+    let include = TextFileInclusion::default().include().to_vec();
+    Ok(ReadService::build(
+        root,
+        limits,
+        &SourceVisibility::default(),
+        &TextFileInclusion::new(include, CHUNK_BYTES).with_large_files(strategy),
+        HistoryConfiguration::default(),
+    )?)
+}
+
+/// Writes a parsed file, a parsed file past the chunk bound, and one past the parse bound.
+fn large_tree() -> TestResult<TempDir> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+    fs::write(
+        root.join("wide.rs"),
+        format!(
+            "pub fn wide() {{}}\n{}// harbor wide\n",
+            "// filler line\n".repeat(80)
+        ),
+    )?;
+    fs::write(
+        root.join("huge.rs"),
+        format!(
+            "pub const HUGE: &str = \"{}\";\n// harbor huge\n",
+            "h".repeat(3_000)
+        ),
+    )?;
+    Ok(directory)
+}
+
+/// Under `split`, a file past the parse bound answers a pattern from its held text, and
+/// every answer names it as unparsed.
+#[test]
+fn split_verifies_unparsed_text_and_names_it_on_every_answer() -> TestResult {
+    let directory = large_tree()?;
+    let service = service_under(directory.path(), LargeFileStrategy::Split)?;
+    let result = service.search(
+        &params(json!({"pattern": "harbor \\w+", "target": "file"}))?,
+        &StoreAnswer::identifier_only(),
+    )?;
+    let paths: Vec<String> = located(&result)
+        .into_iter()
+        .map(|(path, ..)| path)
+        .collect();
+    assert_eq!(paths, ["huge.rs", "wide.rs"]);
+    let unparsed: Vec<&ReadWarning> = result
+        .warnings
+        .iter()
+        .filter(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. }))
+        .collect();
+    let [ReadWarning::LargeFileUnparsed { files, detail }] = unparsed.as_slice() else {
+        return Err(format!("one warning names the unparsed file: {:?}", result.warnings).into());
+    };
+    assert_eq!(
+        files,
+        &[rift_protocol::read::FileId(
+            "rift://file/huge.rs".to_owned()
+        )]
+    );
+    assert!(detail.contains("max_file"), "{detail}");
+    let symbol = service.get_symbol(&serde_json::from_value(json!({"name": "HUGE"}))?)?;
+    assert!(
+        symbol.hits.is_empty(),
+        "no declaration of huge.rs was extracted"
+    );
+    assert!(
+        symbol
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. })),
+        "{:?}",
+        symbol.warnings
+    );
+    Ok(())
+}
+
+/// Under `skip`, the parsed file past the chunk bound and the file past the parse bound
+/// both leave text search, and the count names both.
+#[test]
+fn skip_counts_the_selected_files_text_search_leaves_out() -> TestResult {
+    let directory = large_tree()?;
+    let service = service_under(directory.path(), LargeFileStrategy::Skip)?;
+    let result = service.search(
+        &params(json!({"pattern": "harbor \\w+", "target": "file"}))?,
+        &StoreAnswer::identifier_only(),
+    )?;
+    assert!(result.results.is_empty(), "{:?}", located(&result));
+    assert!(
+        result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::LargeFileSkipped { skipped: 2, detail } if detail.contains("large_files")
+        )),
+        "{:?}",
+        result.warnings
+    );
+    let narrowed = service.search(
+        &params(json!({"pattern": "beacon", "paths": {"include": ["lib.rs"]}}))?,
+        &StoreAnswer::identifier_only(),
+    )?;
+    assert!(
+        !narrowed
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::LargeFileSkipped { .. })),
+        "a selection reaching no skipped file carries no count: {:?}",
+        narrowed.warnings
+    );
+    let symbol = service.get_symbol(&serde_json::from_value(json!({"name": "wide"}))?)?;
+    assert_eq!(
+        symbol.hits.len(),
+        1,
+        "a skipped file's declaration still answers"
+    );
     Ok(())
 }

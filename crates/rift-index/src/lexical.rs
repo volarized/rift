@@ -60,8 +60,10 @@ use toasty::stmt::{Type, Value};
 use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::WorkspaceDatabase;
 
-/// Default maximum content bytes accepted for one lexical document (1 MiB).
-const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 1_048_576;
+/// Default maximum content bytes accepted for one lexical document: the largest chunk
+/// `[search.text] max_chunk` accepts (16 MiB), so the store takes every row the
+/// configuration can derive, whatever `max_chunk` a later reload sets.
+const LEXICAL_UNIT_BYTES_MAX_DEFAULT: u32 = 16 << 20;
 /// Default maximum search results returned per query.
 const LEXICAL_MATCHES_MAX_DEFAULT: u32 = 1_000;
 /// Default pooled `SQLite` connection slots.
@@ -2760,7 +2762,10 @@ mod tests {
         assert_eq!(limits.pool_slots(), 4);
         assert_eq!(limits.busy_timeout_ms(), 5_000);
         assert_eq!(limits.matches_max(), 1_000);
-        assert_eq!(limits.unit_bytes_max(), 1_048_576);
+        assert_eq!(
+            u64::from(limits.unit_bytes_max()),
+            rift_protocol::configuration::TEXT_CHUNK_BYTES_MAX
+        );
     }
 
     #[test]
