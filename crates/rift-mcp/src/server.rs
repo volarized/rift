@@ -2267,7 +2267,7 @@ impl RiftMcp {
                 .index_limits(self.limits)
                 .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
             visibility: SourceVisibility::from(&configuration.source),
-            text_inclusion: rift_core::TextFileInclusion::from(&configuration.search),
+            text_inclusion: rift_core::TextFileInclusion::from(&configuration),
             languages: rift_core::LanguageFileSelections::from(&configuration),
             history: configuration.providers.history.clone(),
         })

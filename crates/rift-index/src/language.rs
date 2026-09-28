@@ -319,7 +319,7 @@ mod tests {
         WorkspaceLanguagePolicy::build(
             Path::new("/workspace"),
             &LanguageFileSelections::from(configuration),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(configuration),
         )
         .expect("language policy")
     }
@@ -378,7 +378,7 @@ mod tests {
         let error = WorkspaceLanguagePolicy::build(
             Path::new("/workspace"),
             &LanguageFileSelections::from(&configuration),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
         )
         .expect_err("missing include");
         assert_eq!(
@@ -399,7 +399,7 @@ mod tests {
         let error = WorkspaceLanguagePolicy::build(
             Path::new("/workspace"),
             &LanguageFileSelections::from(&configuration),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
         )
         .expect_err("a misspelled shipped name carries no shipped patterns");
         assert_eq!(
@@ -485,7 +485,7 @@ mod tests {
             let error = WorkspaceLanguagePolicy::build(
                 Path::new("/workspace"),
                 &LanguageFileSelections::from(&configuration),
-                &TextFileInclusion::from(&configuration.search),
+                &TextFileInclusion::from(&configuration),
             )
             .expect_err("an unclosed character class must refuse");
             assert_eq!(

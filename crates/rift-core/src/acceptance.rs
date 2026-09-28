@@ -681,6 +681,55 @@ mod tests {
         );
     }
 
+    /// The `[documentation]` table reads its variables through the same overlay every
+    /// table does, and a variable prevails over the document's key.
+    #[test]
+    fn test_documentation_variables_override_the_document_and_the_default() {
+        let document = "[documentation]\nexclude = [\"docs/old/**\"]\n";
+        let (configuration, variables) = accept(
+            Some(document),
+            &[
+                ("RIFT_DOCUMENTATION_ENABLED", "false"),
+                ("RIFT_DOCUMENTATION_FORCE_INCLUDE", r#"["CHANGELOG.md"]"#),
+            ],
+        )
+        .expect("each value is its key's shape");
+
+        assert!(!configuration.documentation.enabled);
+        let force_included: Vec<&str> = configuration
+            .documentation
+            .force_include
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(force_included, ["CHANGELOG.md"]);
+        let excluded: Vec<&str> = configuration
+            .documentation
+            .exclude
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(
+            excluded,
+            ["docs/old/**"],
+            "a key no variable names keeps the document's"
+        );
+        assert_eq!(
+            variables,
+            [
+                "RIFT_DOCUMENTATION_ENABLED",
+                "RIFT_DOCUMENTATION_FORCE_INCLUDE"
+            ]
+        );
+
+        let error = accept(None, &[("RIFT_DOCUMENTATION_INCLUDE", r#"["docs/**"]"#)])
+            .expect_err("the table declares no include key");
+        assert!(
+            matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn test_a_value_outside_the_key_shape_refuses_naming_the_variable() {
         for (variable, value) in [

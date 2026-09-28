@@ -5817,7 +5817,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect("workspace index");
@@ -5879,7 +5879,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect("workspace index");
@@ -5923,7 +5923,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect_err("a path two entries claim must refuse the candidate");

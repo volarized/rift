@@ -425,13 +425,12 @@ impl ConfigurationState {
         )
     }
 
-    /// The `[search.text]` inclusion from the last acceptance, or the default inclusion while
-    /// `rift.toml` is invalid.
+    /// The `[search.text]` inclusion and `[documentation]` table from the last acceptance, or
+    /// the defaults while `rift.toml` is invalid.
     pub(crate) fn text_inclusion(&self) -> TextFileInclusion {
-        self.accepted.as_ref().map_or_else(
-            |_| TextFileInclusion::default(),
-            |configuration| TextFileInclusion::from(&configuration.search),
-        )
+        self.accepted
+            .as_ref()
+            .map_or_else(|_| TextFileInclusion::default(), TextFileInclusion::from)
     }
 
     /// Effective language file entries from the last acceptance.
@@ -448,7 +447,9 @@ impl ConfigurationState {
     /// dependency context under the table's packages and resolution policy.
     ///
     /// `[providers.syntax]` counts too: its bounds decide which declarations a file's parse
-    /// keeps, so a publication built under other bounds holds other units.
+    /// keeps, so a publication built under other bounds holds other units. The
+    /// `[documentation]` table rides the text inclusion: it decides which text files the
+    /// index collects as documentation.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
             || self.text_inclusion() != other.text_inclusion()
@@ -458,16 +459,18 @@ impl ConfigurationState {
     }
 
     /// Digest of every configuration table the index derives its content under: the
-    /// `[source]`, `[search.text]`, `[languages]`, `[dependencies]`, and `[providers.syntax]`
-    /// tables [`Self::index_configuration_differs`] compares, and the `[search.lexical]`
-    /// bounds the lexical lane writes under. An invalid `rift.toml` digests the defaults,
-    /// the configuration every accessor here answers while acceptance refuses the file.
+    /// `[source]`, `[search.text]`, `[documentation]`, `[languages]`, `[dependencies]`, and
+    /// `[providers.syntax]` tables [`Self::index_configuration_differs`] compares, and the
+    /// `[search.lexical]` bounds the lexical lane writes under. An invalid `rift.toml`
+    /// digests the defaults, the configuration every accessor here answers while
+    /// acceptance refuses the file.
     pub(crate) fn index_configuration_digest(&self) -> String {
         let defaults = WorkspaceConfiguration::default();
         let configuration = self.accepted.as_ref().unwrap_or(&defaults);
         let tables = serde_json::json!({
             "source": configuration.source,
             "text": configuration.search.text,
+            "documentation": configuration.documentation,
             "lexical": configuration.search.lexical,
             "languages": configuration.languages,
             "dependencies": configuration.dependencies,

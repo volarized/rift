@@ -128,6 +128,36 @@
         }
       ]
     },
+    "DocumentationConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[documentation]` table: which documentation files the index collects beside the\nsource. By default every Markdown, MDX, reStructuredText, plain text, and notebook file is\ncollected, except change logs, licenses, codes of conduct, and archived, deprecated, or\ntranslated copies.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Whether documentation files are collected at all. `false` collects none; the\ndocumentation comments attached to declarations stay.",
+          "type": "boolean"
+        },
+        "exclude": {
+          "default": [],
+          "description": "Exact file paths or globs whose documentation is left out beside the default\nexclusions, in [`PathPattern`] syntax.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 512,
+          "type": "array"
+        },
+        "force_include": {
+          "default": [],
+          "description": "Exact file paths or globs collected although a default exclusion leaves them out, in\n[`PathPattern`] syntax. A match `exclude` also names is still left out.",
+          "items": {
+            "$ref": "#/$defs/PathPattern"
+          },
+          "maxItems": 512,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "Duration": {
       "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
       "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
@@ -1186,6 +1216,15 @@
         "resolution": "auto"
       },
       "description": "Whether the dependency context runs the standard library version probes, how long\none probe may take, and which packages the context carries beside the ones the\nworkspace's manifests and lockfiles state."
+    },
+    "documentation": {
+      "$ref": "#/$defs/DocumentationConfiguration",
+      "default": {
+        "enabled": true,
+        "exclude": [],
+        "force_include": []
+      },
+      "description": "Which documentation files the index collects beside the source."
     },
     "execution": {
       "$ref": "#/$defs/ExecutionConfiguration",

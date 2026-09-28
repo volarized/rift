@@ -1,9 +1,14 @@
-//! Documentation metadata over existing symbol and file content.
+//! Documentation metadata over existing symbol and file content, and the `[documentation]`
+//! table of `rift.toml` that selects which documentation files the index collects.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{Digest, Language, ProjectPath, SourceUnitId, SymbolId, SymbolOrigin, TextRange};
+use crate::configuration::{ConfigurationViolation, first_out_of_range};
+use crate::read::{
+    Digest, Language, PathPattern, ProjectPath, SourceUnitId, SymbolId, SymbolOrigin, TextRange,
+};
+use crate::source::pattern_list_violation;
 
 /// Full lowercase SHA-256 digest for documentation content and identity.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -506,9 +511,67 @@ pub struct DocumentationContext {
     pub warnings: Vec<DocumentationWarning>,
 }
 
+/// Entries `documentation.exclude` or `documentation.force_include` may hold, at most.
+pub const DOCUMENTATION_PATTERNS_MAX: usize = 512;
+
+/// The `[documentation]` table: which documentation files the index collects beside the
+/// source. By default every Markdown, MDX, reStructuredText, plain text, and notebook file is
+/// collected, except change logs, licenses, codes of conduct, and archived, deprecated, or
+/// translated copies.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocumentationConfiguration {
+    /// Whether documentation files are collected at all. `false` collects none; the
+    /// documentation comments attached to declarations stay.
+    pub enabled: bool,
+    /// Exact file paths or globs whose documentation is left out beside the default
+    /// exclusions, in [`PathPattern`] syntax.
+    #[schemars(length(max = 512))]
+    pub exclude: Vec<PathPattern>,
+    /// Exact file paths or globs collected although a default exclusion leaves them out, in
+    /// [`PathPattern`] syntax. A match `exclude` also names is still left out.
+    #[schemars(length(max = 512))]
+    pub force_include: Vec<PathPattern>,
+}
+
+impl Default for DocumentationConfiguration {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            exclude: Vec::new(),
+            force_include: Vec::new(),
+        }
+    }
+}
+
+impl DocumentationConfiguration {
+    /// The table's list-length bounds, then each pattern's forward-slash-only contract, in
+    /// key then list order.
+    pub(crate) fn violation(&self) -> Option<ConfigurationViolation> {
+        first_out_of_range([
+            (
+                "documentation.exclude",
+                self.exclude.len() as u64,
+                0,
+                DOCUMENTATION_PATTERNS_MAX as u64,
+            ),
+            (
+                "documentation.force_include",
+                self.force_include.len() as u64,
+                0,
+                DOCUMENTATION_PATTERNS_MAX as u64,
+            ),
+        ])
+        .or_else(|| pattern_list_violation("documentation.exclude", &self.exclude))
+        .or_else(|| pattern_list_violation("documentation.force_include", &self.force_include))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DocumentationDigest;
+    use super::{DOCUMENTATION_PATTERNS_MAX, DocumentationDigest};
+    use crate::configuration::{ConfigurationViolation, WorkspaceConfiguration};
+    use crate::read::PathPattern;
 
     #[test]
     fn documentation_digest_schema_requires_full_sha256() {
@@ -518,5 +581,80 @@ mod tests {
         assert_eq!(schema["minLength"], 64);
         assert_eq!(schema["maxLength"], 64);
         assert_eq!(schema["pattern"], "^[0-9a-f]{64}$");
+    }
+
+    #[test]
+    fn test_documentation_defaults_collect_every_file_the_defaults_leave() {
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(serde_json::json!({})).expect("an empty document");
+        assert!(configuration.documentation.enabled);
+        assert!(configuration.documentation.exclude.is_empty());
+        assert!(configuration.documentation.force_include.is_empty());
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_documentation_table_parses_its_keys_and_refuses_an_unknown_one() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(serde_json::json!({
+            "documentation": {
+                "enabled": false,
+                "exclude": ["docs/internal/**"],
+                "force_include": ["CHANGELOG.md"],
+            }
+        }))
+        .expect("a documentation table");
+        assert!(!configuration.documentation.enabled);
+        assert_eq!(
+            configuration.documentation.exclude,
+            [PathPattern("docs/internal/**".to_owned())]
+        );
+        assert_eq!(
+            configuration.documentation.force_include,
+            [PathPattern("CHANGELOG.md".to_owned())]
+        );
+        let unknown = serde_json::from_value::<WorkspaceConfiguration>(serde_json::json!({
+            "documentation": { "include": ["docs/**"] }
+        }));
+        assert!(unknown.is_err(), "the table denies unknown keys");
+    }
+
+    #[test]
+    fn test_documentation_pattern_lists_accept_the_cap_and_refuse_above_it() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.documentation.exclude =
+            vec![PathPattern("docs/**".to_owned()); DOCUMENTATION_PATTERNS_MAX];
+        assert_eq!(configuration.validate(), Ok(()));
+        configuration
+            .documentation
+            .force_include
+            .push(PathPattern("../outside.md".to_owned()));
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PathPatternInvalid {
+                field: "documentation.force_include",
+                pattern: "../outside.md".to_owned(),
+            })
+        );
+
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.documentation.force_include =
+            vec![PathPattern("x.md".to_owned()); DOCUMENTATION_PATTERNS_MAX + 1];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "documentation.force_include",
+                ..
+            })
+        ));
+
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.documentation.exclude = vec![PathPattern("docs\\old".to_owned())];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::PathPatternInvalid {
+                field: "documentation.exclude",
+                ..
+            })
+        ));
     }
 }

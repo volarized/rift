@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::dependencies::DependenciesConfiguration;
+use crate::documentation::DocumentationConfiguration;
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
 use crate::read::{Language, PathPattern};
 use crate::retry::{
@@ -430,6 +431,8 @@ pub struct WorkspaceConfiguration {
     /// Which files below the workspace root the index and reads consider visible, and how
     /// many files and bytes the index holds together.
     pub source: SourceConfiguration,
+    /// Which documentation files the index collects beside the source.
+    pub documentation: DocumentationConfiguration,
     /// Whether the dependency context runs the standard library version probes, how long
     /// one probe may take, and which packages the context carries beside the ones the
     /// workspace's manifests and lockfiles state.
@@ -487,6 +490,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.syntax.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.documentation.violation())
             .or_else(|| self.dependencies.violation())
             .or_else(|| self.logs.violation())
             .or_else(|| languages_violation(&self.languages, &self.lsp))
@@ -4821,6 +4825,7 @@ mod tests {
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
         let source = &definitions["SourceConfiguration"]["properties"];
+        let documentation = &definitions["DocumentationConfiguration"]["properties"];
         let cases = [
             (
                 "num workers min",
@@ -4881,6 +4886,16 @@ mod tests {
                 "source exclude max",
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
+            ),
+            (
+                "documentation exclude max",
+                &documentation["exclude"]["maxItems"],
+                json!(crate::documentation::DOCUMENTATION_PATTERNS_MAX),
+            ),
+            (
+                "documentation force include max",
+                &documentation["force_include"]["maxItems"],
+                json!(crate::documentation::DOCUMENTATION_PATTERNS_MAX),
             ),
         ];
         assert_schema_bounds(&cases);
