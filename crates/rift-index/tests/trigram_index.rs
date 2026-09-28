@@ -403,8 +403,8 @@ async fn a_row_recording_no_offset_selects_no_file() -> TestResult {
 }
 
 /// The trigram index stays in step with the rows through a replace, an apply that
-/// rewrites and removes paths, a repeated apply, and a clear, and a selection answers
-/// for the tree it names alone.
+/// rewrites and removes paths, a repeated apply, and the clear and refill a new derivation
+/// revision runs, and a selection answers for the tree it names alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> TestResult {
     let (tree, workspace) = chunked_tree(&[
@@ -457,6 +457,10 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
         RevisionScoped::OtherRevision("revision-3".to_owned())
     );
 
+    // A binary with another executable digest derives under another derivation revision:
+    // it finds nothing it can keep, clears the store, and fills it again. The trigram
+    // index carries no revision of its own and is cleared and refilled with the rows.
+    assert_eq!(index.recorded_files("derivation-b").await?, None);
     index.clear("derivation-b").await?;
     assert_trigram_index_matches_rows(&path).await?;
     assert_eq!(
@@ -464,6 +468,20 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
             .pattern_candidates("revision-3", prefilter, true, ROWS_MAX)
             .await?,
         RevisionScoped::NoRevision
+    );
+    let reloaded = LexicalChange::new(replaced.clone(), rebuilt.index_documents_for(&replaced));
+    index
+        .apply(
+            &reloaded,
+            &LexicalStamp::published("revision-4", "derivation-b"),
+        )
+        .await?;
+    assert_trigram_index_matches_rows(&path).await?;
+    let found = candidates(&index, "revision-4", "second lantern", ROWS_MAX).await?;
+    assert_eq!(
+        found.candidates().len(),
+        1,
+        "the reload refills the trigram index"
     );
     Ok(())
 }
