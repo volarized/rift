@@ -1313,7 +1313,7 @@ impl AssembledServer {
     }
 }
 
-#[tool_router(router = tool_router, vis = "pub(crate)")]
+#[tool_router(router = declared_tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one direct-workspace snapshot, applying the
     /// accepted `rift.toml`'s `[source]` policy to the initial index and its

@@ -926,3 +926,72 @@ async fn every_advertised_output_schema_declares_the_object_type() -> TestResult
     server_task.await?;
     Ok(())
 }
+
+/// Whether one property schema accepts `null` beside another value.
+fn has_null_arm(property: &Value) -> bool {
+    let null_type = property["type"]
+        .as_array()
+        .is_some_and(|kinds| kinds.len() > 1 && kinds.contains(&json!("null")));
+    let null_branch = property["anyOf"]
+        .as_array()
+        .is_some_and(|branches| branches.len() > 1 && branches.contains(&json!({"type": "null"})));
+    null_type || null_branch
+}
+
+/// Every property below `node` that its object does not require and whose schema
+/// accepts `null` beside another value, named by the path to it.
+fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
+    match node {
+        Value::Object(object) => {
+            let required = object.get("required").and_then(Value::as_array);
+            let properties = object.get("properties").and_then(Value::as_object);
+            found.extend(
+                properties
+                    .into_iter()
+                    .flatten()
+                    .filter(|(name, property)| {
+                        has_null_arm(property)
+                            && !required.is_some_and(|names| names.contains(&json!(name)))
+                    })
+                    .map(|(name, _)| format!("{path}/{name}")),
+            );
+            for (key, child) in object {
+                optional_null_properties(child, &format!("{path}/{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                optional_null_properties(item, &format!("{path}/{index}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A wire model omits an absent optional field, so no property a served schema does not
+/// require accepts `null`: the arm would advertise a value no request needs and no answer
+/// carries. A required property may keep it, the form reserved for a `null` the server
+/// treats apart from absence.
+#[tokio::test]
+async fn no_advertised_optional_property_accepts_null() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let mut found = Vec::new();
+    for tool in &tools {
+        let input = Value::Object(tool.input_schema.as_ref().clone());
+        optional_null_properties(&input, &format!("{}/input_schema", tool.name), &mut found);
+        let output = tool
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object(schema.as_ref().clone()))
+            .ok_or_else(|| format!("tool {} must advertise an output schema", tool.name))?;
+        optional_null_properties(&output, &format!("{}/output_schema", tool.name), &mut found);
+    }
+    assert!(
+        found.is_empty(),
+        "tools/list advertises optional properties that accept null: {found:#?}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}

@@ -99,14 +99,7 @@
             "type": "array"
           },
           "language": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/Language"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/Language",
             "description": "Narrows the answer to one language. Omitted searches every served language."
           },
           "limit": {
@@ -131,14 +124,7 @@
             "type": "integer"
           },
           "rev": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/RevisionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/RevisionId",
             "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
           },
           "scope": {
@@ -214,10 +200,7 @@
               },
               "language": {
                 "description": "Authored code language, when supplied by the format.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "line": {
                 "description": "One-based line where the block starts.",
@@ -234,14 +217,7 @@
                 "description": "Source record containing revision, format, origin, and license facts."
               },
               "symbol": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "Owning declaration for an attached comment."
               }
             },
@@ -294,14 +270,7 @@
             "description": "One content owner: a regular source or decoded notebook cell.",
             "properties": {
               "cell": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NotebookCell"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NotebookCell",
                 "description": "Decoded cell when the parent source is a notebook."
               },
               "source": {
@@ -426,10 +395,7 @@
             "properties": {
               "expression": {
                 "description": "Declared expression; collection does not infer a license from source text.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "files": {
                 "description": "License files whose bytes the adapter verified.",
@@ -535,10 +501,7 @@
               "excerpt": {
                 "description": "Bytes read from the existing content owner within the response bound.",
                 "maxLength": 16384,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "reference": {
                 "$ref": "#/$defs/DocumentationReference",
@@ -599,25 +562,11 @@
                 "description": "Canonical address of the bytes block ranges use."
               },
               "language": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Language"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/Language",
                 "description": "Declared source language, when known."
               },
               "license": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/DocumentationLicense"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/DocumentationLicense",
                 "description": "License facts recorded by the source adapter."
               },
               "media_type": {
@@ -896,25 +845,11 @@
             "description": "One declaration a `get_symbol` lookup found.",
             "properties": {
               "documentation": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/DocumentationContext"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/DocumentationContext",
                 "description": "Exact documentation references, present only when `include` names `documentation`."
               },
               "history": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolHistory"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolHistory",
                 "description": "The symbol's timeline, present when `include` names `history`."
               },
               "line": {
@@ -924,25 +859,11 @@
                 "type": "integer"
               },
               "node": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NodeId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NodeId",
                 "description": "The declaration node's identity, including its source range and witness.\nAbsent unless `include` names `source`, or when source is unavailable or outside\nthe project."
               },
               "path": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ProjectPath"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/ProjectPath",
                 "description": "Project-relative path, present for a declaration that belongs to the project.\nExactly one of `path` and `unit` is present."
               },
               "range": {
@@ -951,24 +872,14 @@
               },
               "source": {
                 "description": "The declaration source, present when `include` names `source` and the provider\ncan read it. Absent for a source-less declaration.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "symbol": {
                 "$ref": "#/$defs/Symbol",
                 "description": "The declaration that matched."
               },
               "unit": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceUnitId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SourceUnitId",
                 "description": "Source-catalog unit, present for a declaration that belongs to a dependency or the\nstandard library. Exactly one of `path` and `unit` is present."
               }
             },
@@ -1239,18 +1150,12 @@
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "version": {
                 "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               }
             },
             "required": [
@@ -1317,10 +1222,7 @@
             "properties": {
               "default": {
                 "description": "The default value as written in the source. Absent where there is none.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -1329,20 +1231,10 @@
               },
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "node": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NodeId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NodeId",
                 "description": "Where this parameter is written in the source."
               },
               "optional": {
@@ -1605,14 +1497,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/FileId"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/FileId",
                     "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -1724,14 +1609,7 @@
                     "type": "string"
                   },
                   "language": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/Language"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/Language",
                     "description": "The seed declaration's language, whose engine's answer was dropped."
                   }
                 },
@@ -1850,10 +1728,7 @@
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
                     "maxLength": 1024,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
@@ -2156,14 +2031,7 @@
                 "type": "array"
               },
               "receiver": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Parameter"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/Parameter",
                 "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
@@ -2271,14 +2139,7 @@
             "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
               },
               "document_local": {
@@ -2308,14 +2169,7 @@
                 "type": "array"
               },
               "id": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
               },
               "kind": {
@@ -2365,10 +2219,7 @@
               },
               "visibility": {
                 "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               }
             },
             "required": [
@@ -2574,25 +2425,11 @@
             "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceLocationKind"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SourceLocationKind",
                 "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
               },
               "package": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/PackageIdentity"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/PackageIdentity",
                 "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
               },
               "source_kind": {
@@ -2624,10 +2461,7 @@
               "summary": {
                 "description": "The revision's own first summary line, where the version control records one.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "timestamp": {
                 "description": "When the revision was recorded, as RFC 3339 date-time.",
@@ -2823,14 +2657,7 @@
                 "description": "The language the spelling is in, and so which provider produced it."
               },
               "resolved": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
               },
               "source": {
@@ -3028,14 +2855,7 @@
             "type": "integer"
           },
           "rev": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/RevisionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/RevisionId",
             "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
           }
         },
@@ -3062,14 +2882,7 @@
             "description": "One content owner: a regular source or decoded notebook cell.",
             "properties": {
               "cell": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NotebookCell"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NotebookCell",
                 "description": "Decoded cell when the parent source is a notebook."
               },
               "source": {
@@ -3400,14 +3213,7 @@
                 "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
               },
               "parent": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NodeId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NodeId",
                 "description": "The region this one is nested inside. Absent at the top level of a unit."
               },
               "range": {
@@ -3423,14 +3229,7 @@
                 "type": "array"
               },
               "symbol": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
               },
               "unit": {
@@ -3717,18 +3516,12 @@
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "version": {
                 "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               }
             },
             "required": [
@@ -4002,14 +3795,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/FileId"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/FileId",
                     "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -4121,14 +3907,7 @@
                     "type": "string"
                   },
                   "language": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/Language"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/Language",
                     "description": "The seed declaration's language, whose engine's answer was dropped."
                   }
                 },
@@ -4247,10 +4026,7 @@
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
                     "maxLength": 1024,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
@@ -5059,25 +4835,11 @@
                 "type": "array"
               },
               "seed": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The declaration the walk starts at. The seed itself is never a hit."
               },
               "to": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "When set, the answer keeps only the hit whose walk reaches this symbol. That hit's\npath is the shortest one the walk found. A `to` the walk cannot reach within `depth`\nanswers empty, not refused."
               }
             },
@@ -5206,14 +4968,7 @@
         ],
         "properties": {
           "change": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/SearchChange"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/SearchChange",
             "description": "Two committed revisions to compare, standing alone. Every declaration the two\nrevisions hold differently becomes a hit tagged `change`, carrying a `change` block\nthat names what differs and where the declaration lives on each side.\n`target: \"file\"` never carries a change hit, since the comparison reaches\ndeclarations alone, and `relevance` orders the hits by path, then name. `paths`\nnarrows which changed paths are compared. The server refuses `change` beside `rev`,\nsince `change` names its own revisions; beside `query`, since the two select\ndifferent result sets; beside `traversal`, since no lane resolves references for a\ncommitted revision; and beside a `scope` past `local`."
           },
           "include": {
@@ -5221,20 +4976,14 @@
             "items": {
               "$ref": "#/$defs/SearchInclude"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "limit": {
             "description": "Most hits to return in one page, at most 10,000; the server refuses a larger\n`limit` naming the field. The server's result bound caps the set itself, and an\nanswer whose set reached it warns `results_truncated`.",
             "format": "uint64",
             "maximum": 10000,
             "minimum": 1,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "order": {
             "$ref": "#/$defs/ResultOrder",
@@ -5249,32 +4998,15 @@
             "type": "integer"
           },
           "paths": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/PathSelector"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/PathSelector",
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
           "query": {
             "description": "Text to match against declaration names, qualified names, signatures, attached\ndocumentation, declaration source, and file contents. Matching is case-insensitive\nand identifier-aware: the query and the indexed names split on case, acronym, and\nseparator boundaries, so `loadConfig` finds `load_config`. Double quotes keep a\nphrase together, and an identifier written inside a question reaches its\ndeclaration without being quoted. A query naming several terms is answered by the\ndeclarations carrying all of them before the ones carrying some. Scoring is\nserver-defined and comparable within one answer.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "rev": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/RevisionId"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/RevisionId",
             "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree. The server\nrefuses a revision search when the workspace has no version-control repository."
           },
           "scope": {
@@ -5288,14 +5020,7 @@
             "description": "Which entity kinds may be returned - a kind selector, never the text to search for;\nthat is `query`. Omitted, every kind may match."
           },
           "traversal": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/SearchTraversal"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "$ref": "#/$defs/SearchTraversal",
             "description": "A bounded relationship walk from `seed`, standing alone or beside `query`. A symbol\nthe walk reaches becomes a hit tagged `relationship`; one also matched lexically\nkeeps its own score and payload and gains the walk's path. `target: \"file\"` never\ncarries a walked hit, since a traversal only reaches symbols. With no `query`,\n`relevance` orders hits by ascending `distance`, then identity. A configured\nlanguage engine resolves the references the walk follows, and an engine session\nserves the current tree, so the server refuses `traversal` beside `rev` and beside\n`change`."
           }
         },
@@ -5363,10 +5088,7 @@
               },
               "language": {
                 "description": "Authored code language, when supplied by the format.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "line": {
                 "description": "One-based line where the block starts.",
@@ -5383,14 +5105,7 @@
                 "description": "Source record containing revision, format, origin, and license facts."
               },
               "symbol": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "Owning declaration for an attached comment."
               }
             },
@@ -5443,14 +5158,7 @@
             "description": "One content owner: a regular source or decoded notebook cell.",
             "properties": {
               "cell": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NotebookCell"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NotebookCell",
                 "description": "Decoded cell when the parent source is a notebook."
               },
               "source": {
@@ -5539,10 +5247,7 @@
             "properties": {
               "expression": {
                 "description": "Declared expression; collection does not infer a license from source text.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "files": {
                 "description": "License files whose bytes the adapter verified.",
@@ -5621,25 +5326,11 @@
                 "description": "Canonical address of the bytes block ranges use."
               },
               "language": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Language"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/Language",
                 "description": "Declared source language, when known."
               },
               "license": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/DocumentationLicense"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/DocumentationLicense",
                 "description": "License facts recorded by the source adapter."
               },
               "media_type": {
@@ -6236,18 +5927,12 @@
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "version": {
                 "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
                 "maxLength": 4096,
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               }
             },
             "required": [
@@ -6314,10 +5999,7 @@
             "properties": {
               "default": {
                 "description": "The default value as written in the source. Absent where there is none.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -6326,20 +6008,10 @@
               },
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "node": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/NodeId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/NodeId",
                 "description": "Where this parameter is written in the source."
               },
               "optional": {
@@ -6602,14 +6274,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/FileId"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/FileId",
                     "description": "The file whose bytes could not be read. Absent on the one warning that counts\nthe files past `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -6721,14 +6386,7 @@
                     "type": "string"
                   },
                   "language": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/Language"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
+                    "$ref": "#/$defs/Language",
                     "description": "The seed declaration's language, whose engine's answer was dropped."
                   }
                 },
@@ -6847,10 +6505,7 @@
                   "detail": {
                     "description": "Optional bounded explanation returned by the global package service.",
                     "maxLength": 1024,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
@@ -6963,10 +6618,7 @@
                 "format": "double",
                 "maximum": 1,
                 "minimum": 0,
-                "type": [
-                  "number",
-                  "null"
-                ]
+                "type": "number"
               },
               "derivation": {
                 "$ref": "#/$defs/RelationshipDerivation",
@@ -7240,14 +6892,7 @@
             "description": "One search hit. Its file, node, or symbol payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
             "properties": {
               "change": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolChange"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolChange",
                 "description": "How the declaration differs between the two revisions `change` named, present when\nthe comparison produced this hit. The hit's `hit.symbol`, `path`, `range`, `line`,\nand `source` read the head revision, except for a removed declaration, which keeps\nits base-side identity, path, range, and source - the head revision no longer holds\nit. A change hit carries no `score`, since a comparison ranks nothing."
               },
               "distance": {
@@ -7255,10 +6900,7 @@
                 "format": "uint64",
                 "maximum": 2,
                 "minimum": 1,
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "hit": {
                 "$ref": "#/$defs/SearchHitTarget",
@@ -7268,10 +6910,7 @@
                 "description": "The 1-based source line where the hit begins, or absent with `range`.",
                 "format": "uint64",
                 "minimum": 1,
-                "type": [
-                  "integer",
-                  "null"
-                ]
+                "type": "integer"
               },
               "matched_by": {
                 "default": [],
@@ -7282,41 +6921,21 @@
                 "type": "array"
               },
               "path": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ProjectPath"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/ProjectPath",
                 "description": "Project-relative path of the hit, present for a file hit and for a symbol hit whose\ndeclaration belongs to the project. A dependency or standard-library declaration\ncarries `unit` in its place."
               },
               "range": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/TextRange"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/TextRange",
                 "description": "Byte range of the hit within `path` or `unit`. Absent for a symbol whose source is\nunavailable or synthetic."
               },
               "score": {
                 "description": "How well this hit matched, used to order the page and merge duplicate hits.\nPresent on the wire when `include` names `score`; comparable within one answer\nand nowhere else.",
                 "format": "double",
-                "type": [
-                  "number",
-                  "null"
-                ]
+                "type": "number"
               },
               "source": {
                 "description": "The source text around the hit, requested with `include: [\"source\"]`. Covers the\nhit's `range`; a caller that needs the range already has it there.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               },
               "traversal_path": {
                 "description": "Shortest relationship path to this hit, present when a traversal reached it,\nincluding a hit also matched lexically.",
@@ -7325,20 +6944,10 @@
                 },
                 "maxItems": 2,
                 "minItems": 1,
-                "type": [
-                  "array",
-                  "null"
-                ]
+                "type": "array"
               },
               "unit": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceUnitId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SourceUnitId",
                 "description": "Source-catalog unit of a dependency or standard-library declaration. A symbol hit\ncarries exactly one of `path` and `unit`; a file hit carries `path`."
               }
             },
@@ -7480,14 +7089,7 @@
                 "type": "array"
               },
               "receiver": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/Parameter"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/Parameter",
                 "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
               },
               "returns": {
@@ -7595,14 +7197,7 @@
             "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
             "properties": {
               "container": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
               },
               "document_local": {
@@ -7632,14 +7227,7 @@
                 "type": "array"
               },
               "id": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
               },
               "kind": {
@@ -7689,10 +7277,7 @@
               },
               "visibility": {
                 "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
-                "type": [
-                  "string",
-                  "null"
-                ]
+                "type": "string"
               }
             },
             "required": [
@@ -7707,25 +7292,11 @@
             "description": "How one declaration differs between the two compared revisions, and where it lives on\neach side.",
             "properties": {
               "base_path": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ProjectPath"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/ProjectPath",
                 "description": "Where the declaration lived at the base revision. Absent for a declaration the head\nrevision introduced."
               },
               "head_path": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ProjectPath"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/ProjectPath",
                 "description": "Where the declaration lives at the head revision. Absent for a declaration the head\nrevision removed."
               },
               "kind": {
@@ -7907,25 +7478,11 @@
             "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
               "location": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SourceLocationKind"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SourceLocationKind",
                 "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
               },
               "package": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/PackageIdentity"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/PackageIdentity",
                 "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
               },
               "source_kind": {
@@ -8118,14 +7675,7 @@
                 "description": "The language the spelling is in, and so which provider produced it."
               },
               "resolved": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/SymbolId"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "$ref": "#/$defs/SymbolId",
                 "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
               },
               "source": {
