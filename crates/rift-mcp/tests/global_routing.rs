@@ -620,6 +620,180 @@ async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor()
     Ok(())
 }
 
+/// The pattern requests `fixture` received, in order.
+async fn pattern_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.contains("/v1/patterns?"))
+        .collect()
+}
+
+/// A `pattern` whose `scope` reaches packages answers the package matches from one page of
+/// the global API's pattern search: `global` alone, `all` after the project's own. A package
+/// match answers a file hit addressed by `unit` and a symbol hit for the declaration holding
+/// it, each with its source when the request includes it.
+#[tokio::test]
+async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+
+    let global = call_tool(
+        &client,
+        "search",
+        json!({
+            "pattern": r"fn helper_\w+",
+            "scope": "global",
+            "target": "all",
+            "include": ["source"]
+        }),
+    )
+    .await?;
+    assert_eq!(
+        global["results"],
+        json!([
+            {
+                "hit": {
+                    "target": "symbol",
+                    "symbol": {
+                        "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                        "language": "rust",
+                        "name": "helper_beacon",
+                        "kind": "function",
+                        "origin": {
+                            "location": "dependency",
+                            "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
+                            "source_kind": "authored"
+                        }
+                    }
+                },
+                "matched_by": ["content"],
+                "source": "pub fn helper_beacon() {}",
+                "range": {"start": 0, "end": 25},
+                "line": 1,
+                "unit": COLLECTED_UNIT
+            },
+            {
+                "hit": {"target": "file", "size": 45},
+                "matched_by": ["content"],
+                "source": "pub fn helper_beacon() {}",
+                "range": {"start": 4, "end": 20},
+                "line": 1,
+                "unit": COLLECTED_UNIT
+            }
+        ]),
+        "{global:#}"
+    );
+
+    let all = call_tool(
+        &client,
+        "search",
+        json!({"pattern": r"fn \w*beacon", "scope": "all", "target": "file"}),
+    )
+    .await?;
+    let addressed: Vec<(&Value, &Value)> = all["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| (&hit["path"], &hit["unit"]))
+        .collect();
+    let project = json!("src/lib.rs");
+    let package = json!(COLLECTED_UNIT);
+    assert_eq!(
+        addressed,
+        [
+            (&project, &Value::Null),
+            (&project, &Value::Null),
+            (&Value::Null, &package),
+            (&Value::Null, &package),
+        ],
+        "the project's matches first, then the package's: {all:#}"
+    );
+
+    let local = call_tool(&client, "search", json!({"pattern": r"fn \w*beacon"})).await?;
+    assert!(
+        local["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|hit| hit["path"] == project),
+        "{local:#}"
+    );
+
+    let requests = pattern_requests(&fixture).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "one request per package-scoped search: {requests:#?}"
+    );
+    let bodies: Vec<&Value> = requests
+        .iter()
+        .filter_map(|request| request.body.as_ref())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            &json!({
+                "pattern": r"fn helper_\w+",
+                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "include": ["source"]
+            }),
+            &json!({
+                "pattern": r"fn \w*beacon",
+                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            }),
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.uri.ends_with("limit=200")),
+        "{requests:#?}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A pattern the server refuses spends no global request: the project side reads, and
+/// refuses, before the package side is asked.
+#[tokio::test]
+async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"pattern": "beacon(", "scope": "global"}),
+        ))
+        .await
+        .expect_err("a pattern that does not parse is refused");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+    let wire = error.data.ok_or("a refusal carries its wire data")?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(fixture.requests().await.is_empty());
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;

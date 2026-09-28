@@ -1,10 +1,11 @@
 //! A fixture global API on a loopback port.
 //!
-//! It answers the capability, resolution, symbol, and search endpoints
+//! It answers the capability, resolution, symbol, search, and pattern endpoints
 //! `rift-cloud-client` reads, and records every request it receives. Its collection holds
 //! one package, [`COLLECTED`], whose `src/lib.rs` declares [`DECLARATIONS`]; a symbol
-//! request answers the declaration it names and a search request the declarations its
-//! identifiers match, so each answer passes the client's own match class validation. The
+//! request answers the declaration it names, a search request the declarations its
+//! identifiers match, and a pattern request the matches of its pattern in that file, so
+//! each answer passes the client's own validation. The
 //! collected release also answers, as the nearest release, an exact `demo` entry at another
 //! version and every `demo` requirement.
 
@@ -45,6 +46,9 @@ pub(crate) const BODY_BOUND_CURSOR: &str = "after-body-bound";
 
 /// Largest request body the fixture reads.
 const REQUEST_BODY_BYTES_MAX: usize = 4_194_304;
+
+/// Compiled-size bound the fixture parses a pattern under.
+const PATTERN_COMPILED_BYTES_MAX: usize = 1_048_576;
 
 pub(crate) struct GlobalFixture {
     pub(crate) endpoint: String,
@@ -215,6 +219,12 @@ async fn global_handler(
         state.hold_read().await;
         return json_response(&symbols(options.symbol, &body));
     }
+    if path.ends_with("/patterns") {
+        return pattern_page(&body).map_or_else(
+            || StatusCode::BAD_REQUEST.into_response(),
+            |page| json_response(&page),
+        );
+    }
     StatusCode::NOT_FOUND.into_response()
 }
 
@@ -230,7 +240,10 @@ fn json_response(value: &Value) -> Response {
 fn capabilities(page_limit_max: u64) -> Value {
     json!({
         "supported_package_managers": ["cargo"],
-        "supported_features": ["resolutions", "search", "symbols", "documentation_search", "symbol_documentation"],
+        "supported_features": [
+            "resolutions", "search", "symbols", "documentation_search", "symbol_documentation",
+            "patterns"
+        ],
         "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
@@ -386,6 +399,67 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
     stopped
 }
 
+/// The pattern page for `request`: each match of its pattern in the collected source, in
+/// offset order, with the declaration holding it and, when the request includes `source`,
+/// the matched line and the declaration's source. `None` for a pattern that does not parse.
+fn pattern_page(request: &Value) -> Option<Value> {
+    let pattern = request["pattern"].as_str().unwrap_or_default();
+    let pattern = rift_ranking::Pattern::parse(pattern, PATTERN_COMPILED_BYTES_MAX).ok()?;
+    let with_source = includes_source(request);
+    let items: Vec<Value> = pattern
+        .matches(COLLECTED_SOURCE, 0..COLLECTED_SOURCE.len())
+        .map(|matched| pattern_hit(&matched, with_source))
+        .collect();
+    let mut answer = page(&items, &json!([]));
+    answer.as_object_mut()?.remove("documentation_revision");
+    Some(answer)
+}
+
+/// One match of [`COLLECTED_SOURCE`] as a pattern page item.
+fn pattern_hit(matched: &std::ops::Range<usize>, with_source: bool) -> Value {
+    let line_start = COLLECTED_SOURCE[..matched.start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line_end = COLLECTED_SOURCE[matched.start..]
+        .find('\n')
+        .map_or(COLLECTED_SOURCE.len(), |newline| matched.start + newline);
+    let mut hit = json!({
+        "package": collected_package(),
+        "unit": COLLECTED_UNIT,
+        "range": {"start": matched.start, "end": matched.end},
+        "line": COLLECTED_SOURCE[..matched.start].matches('\n').count() + 1,
+        "size": COLLECTED_SOURCE.len()
+    });
+    if with_source {
+        hit["source"] = json!(&COLLECTED_SOURCE[line_start..line_end]);
+    }
+    let holding = DECLARATIONS.into_iter().find(|declaration| {
+        let range = declaration_range(declaration);
+        range.start <= matched.start && matched.end <= range.end
+    });
+    if let Some(declaration) = holding {
+        let located = collected_hit(SymbolFixture::Valid, declaration, with_source);
+        let mut held = json!({
+            "symbol": located["symbol"],
+            "range": located["range"],
+            "line": located["line"]
+        });
+        if with_source {
+            held["source"] = located["source"].clone();
+        }
+        hit["declaration"] = held;
+    }
+    hit
+}
+
+/// The bytes of [`COLLECTED_SOURCE`] one collected declaration spans.
+fn declaration_range(declaration: &str) -> std::ops::Range<usize> {
+    let start = COLLECTED_SOURCE
+        .find(&format!("pub fn {declaration}("))
+        .expect("every declaration sits in the collected source");
+    start..start + format!("pub fn {declaration}() {{}}").len()
+}
+
 /// Each collected declaration one of the lowercase `candidates` matches, at the best
 /// class any of them reaches: the class the client computes again to validate the hit.
 fn matched_declarations(
@@ -424,11 +498,8 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
         SymbolFixture::Valid => "src/lib.rs",
         SymbolFixture::InvalidIdentity => "other.rs",
     };
-    let text = format!("pub fn {declaration}() {{}}");
-    let start = COLLECTED_SOURCE
-        .find(&format!("pub fn {declaration}("))
-        .expect("every declaration sits in the collected source");
-    let line = COLLECTED_SOURCE[..start].matches('\n').count() + 1;
+    let range = declaration_range(declaration);
+    let line = COLLECTED_SOURCE[..range.start].matches('\n').count() + 1;
     let (manager, name, version) = COLLECTED;
     let package = json!({"manager": manager, "name": name, "version": version});
     let mut hit = json!({
@@ -445,11 +516,11 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
             }
         },
         "unit": COLLECTED_UNIT,
-        "range": {"start": start, "end": start + text.len()},
+        "range": {"start": range.start, "end": range.end},
         "line": line
     });
     if with_source {
-        hit["source"] = json!(text);
+        hit["source"] = json!(&COLLECTED_SOURCE[range]);
     }
     hit
 }

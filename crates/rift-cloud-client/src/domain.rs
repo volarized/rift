@@ -6,10 +6,10 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use crate::{
-    ClientError, HitLocation, PackageDocumentationHit, PackageIdentity, PackageSearchHit,
-    PackageSearchHitContributingField, PackageSearchItem, PackageSymbol, SourceKind,
-    SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange, TypeBinding,
-    TypeBindingOrigin, TypeBindingRole, TypeExpression,
+    ClientError, HitLocation, PackageDocumentationHit, PackageIdentity, PackagePatternDeclaration,
+    PackagePatternHit, PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem,
+    PackageSymbol, SourceKind, SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange,
+    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
 };
 
 /// One package declaration returned by global search in the local read model.
@@ -36,6 +36,89 @@ pub struct PackageSymbolCandidate {
     pub hit: rift_protocol::read::GetSymbolHit,
     /// Identifier match class established by global index.
     pub match_class: rift_ranking::IdentifierMatchClass,
+}
+
+/// One package pattern match in the local read model: the file hit for the match, and the
+/// symbol hit for the smallest declaration holding it, when one does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackagePatternMatch {
+    /// Package that owns the file.
+    pub package: rift_protocol::read::PackageIdentity,
+    /// File hit addressed by `unit`, whose `range` is the match's bytes.
+    pub file: rift_protocol::read::SearchHit,
+    /// Symbol hit at the range of the declaration holding the match.
+    pub declaration: Option<rift_protocol::read::SearchHit>,
+}
+
+impl TryFrom<&PackagePatternHit> for PackagePatternMatch {
+    type Error = ClientError;
+
+    fn try_from(value: &PackagePatternHit) -> Result<Self, Self::Error> {
+        crate::package_source_path(&value.package, &value.unit)?;
+        let line = u64::try_from(value.line).map_err(|_| invalid("location"))?;
+        let size = u64::try_from(value.size).map_err(|_| invalid("location"))?;
+        if line == 0 || value.range.end < value.range.start || size < value.range.end {
+            return Err(invalid("location"));
+        }
+        let file = rift_protocol::read::SearchHit {
+            hit: rift_protocol::read::SearchHitTarget::File {
+                size,
+                languages: Vec::new(),
+            },
+            score: None,
+            matched_by: vec![rift_protocol::read::MatchedField::Content],
+            source: value.source.clone(),
+            range: Some(text_range(&value.range)),
+            line: Some(line),
+            path: None,
+            unit: Some(protocol_unit(&value.unit)),
+            traversal_path: None,
+            distance: None,
+            change: None,
+        };
+        let declaration = value
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration_hit(&value.package, &value.unit, declaration))
+            .transpose()?;
+        Ok(Self {
+            package: package_identity(&value.package),
+            file,
+            declaration,
+        })
+    }
+}
+
+/// The symbol hit for the declaration holding one pattern match, tagged `content` as a
+/// project declaration holding a match is.
+fn declaration_hit(
+    package: &PackageIdentity,
+    unit: &str,
+    declaration: &PackagePatternDeclaration,
+) -> Result<rift_protocol::read::SearchHit, ClientError> {
+    let (_, _, line) = validate_location(
+        package,
+        &declaration.symbol,
+        unit,
+        &declaration.range,
+        declaration.line,
+        declaration.source.as_deref(),
+    )?;
+    Ok(rift_protocol::read::SearchHit {
+        hit: rift_protocol::read::SearchHitTarget::Symbol {
+            symbol: Box::new(convert_symbol(&declaration.symbol)?),
+        },
+        score: None,
+        matched_by: vec![rift_protocol::read::MatchedField::Content],
+        source: declaration.source.clone(),
+        range: Some(text_range(&declaration.range)),
+        line: Some(line),
+        path: None,
+        unit: Some(protocol_unit(unit)),
+        traversal_path: None,
+        distance: None,
+        change: None,
+    })
 }
 
 impl TryFrom<PackageSearchHit> for PackageSearchCandidate {

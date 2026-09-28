@@ -8,9 +8,10 @@ use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
     ClientError, Config, ConfigError, GlobalClient, PackageAvailability as WireAvailability,
     PackageContextEntry as WireContextEntry, PackageIdentity as WirePackageIdentity,
-    PackageResolutionRequest, PackageSearchCandidate, PackageSearchRequest,
-    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbolCandidate,
-    PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
+    PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
+    PackageSymbolCandidate, PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning,
+    WarningCode,
 };
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
@@ -18,8 +19,8 @@ use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry};
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchResult,
-    SearchScope,
+    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchScope,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
@@ -282,6 +283,51 @@ pub(crate) struct GlobalSearchCandidates {
     pub(crate) warnings: Vec<ReadWarning>,
 }
 
+/// Reads the package matches of one accepted `pattern` search: one page, asked for through
+/// the advertised page limit.
+///
+/// A page that stopped before the last match carries `result_truncated`, which reaches the
+/// caller as a `global_page_warning`, and its cursor is not followed.
+pub(crate) async fn package_patterns(
+    client: &GlobalClient,
+    params: &SearchParams,
+    packages: &[WirePackageIdentity],
+) -> Result<GlobalPatternMatches, ClientError> {
+    let Some(pattern) = params.pattern.clone() else {
+        return Ok(GlobalPatternMatches::default());
+    };
+    let request = PackagePatternRequest {
+        pattern,
+        packages: packages.to_vec(),
+        include: includes_source(params).then(|| vec!["source".to_owned()]),
+    };
+    let page = client
+        .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
+        .await?;
+    let warnings = page_warnings(page.warnings);
+    let matches = page
+        .items
+        .iter()
+        .map(PackagePatternMatch::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GlobalPatternMatches { matches, warnings })
+}
+
+/// Package pattern matches and page warnings returned by one remote read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct GlobalPatternMatches {
+    pub(crate) matches: Vec<PackagePatternMatch>,
+    pub(crate) warnings: Vec<ReadWarning>,
+}
+
+fn includes_source(params: &SearchParams) -> bool {
+    params
+        .include
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&SearchInclude::Source)
+}
+
 fn page_warnings(warnings: Vec<Warning>) -> Vec<ReadWarning> {
     let mut mapped = Vec::new();
     extend_page_warnings(&mut mapped, warnings);
@@ -345,12 +391,7 @@ fn search_request(
             .into_iter()
             .map(|candidate| candidate.text().to_owned())
             .collect(),
-        include: params
-            .include
-            .as_deref()
-            .unwrap_or_default()
-            .contains(&SearchInclude::Source)
-            .then(|| vec!["source".to_owned()]),
+        include: includes_source(params).then(|| vec!["source".to_owned()]),
         packages: packages.to_vec(),
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
@@ -576,6 +617,48 @@ pub(crate) fn merge_search(
         pagination,
         warnings: local.warnings,
     })
+}
+
+/// Adds the package matches of a `pattern` search after the project's, then pages the
+/// answer.
+///
+/// Pattern hits carry no score, so `relevance` keeps the collected order: the project's
+/// matches by path, then offset, then the packages' in the order the global API answered
+/// them, by package, path, and offset. As in the project, a declaration answers once, at
+/// its first match, and `target` selects the file hits, the declaration hits, or both.
+pub(crate) fn merge_patterns(
+    params: &SearchParams,
+    local: SearchResult,
+    remote: GlobalPatternMatches,
+) -> SearchResult {
+    let mut hits = local.results;
+    let mut declared = std::collections::BTreeSet::new();
+    for matched in remote.matches {
+        if params.target != SearchParamsTarget::File
+            && let Some(declaration) = matched.declaration
+            && declared.insert(search_hit_key(&declaration).to_owned())
+        {
+            hits.push(declaration);
+        }
+        if params.target != SearchParamsTarget::Symbol {
+            hits.push(matched.file);
+        }
+    }
+    order_search_hits(&mut hits, params.order);
+    let limit = usize::try_from(
+        params
+            .limit
+            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
+    )
+    .unwrap_or(usize::MAX);
+    let (results, pagination) = page_window(hits, params.page_index, limit);
+    let mut warnings = local.warnings;
+    warnings.extend(remote.warnings);
+    SearchResult {
+        results,
+        pagination,
+        warnings,
+    }
 }
 
 /// One page of the project's own symbol hits, for a read whose remote lane failed: the

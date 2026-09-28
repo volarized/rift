@@ -340,6 +340,9 @@ fn operation_response(
     status_response(StatusCode::NOT_FOUND)
 }
 
+/// The `page_limit_max` the pattern fixture advertises, below the client's own bound.
+const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
+
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
         OperationFixture::InvalidPublication => {
@@ -376,6 +379,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::Patterns => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
+            value["bounds"]["page_limit_max"] = serde_json::json!(PATTERN_PAGE_LIMIT_ADVERTISED);
         }
         _ => {}
     })

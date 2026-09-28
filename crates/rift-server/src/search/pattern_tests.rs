@@ -408,7 +408,6 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
             json!({"pattern": "TODO", "rev": "main"}),
             "current tree alone",
         ),
-        (json!({"pattern": "TODO", "scope": "all"}), "`scope`"),
     ];
     for (request, expected) in cases {
         let message = refusal(&service, request.clone())?;
@@ -448,47 +447,66 @@ fn the_pattern_bound_counts_characters_as_the_schema_does() -> TestResult {
     Ok(())
 }
 
-/// `packages` reaches the global API alone and `pattern` reads the project's trigram index
-/// alone, so no scope answers both. The refusal names the first field the request cannot
-/// answer, in the order every search is validated: `packages` beside the `local` scope or
-/// a revision, and `pattern` beside a scope that reaches packages.
+/// A `pattern` reaches packages beside `scope`, which the caller adds: `all` answers the
+/// project's matches as `local` does, and `global` verifies no project file.
 #[test]
-fn a_pattern_beside_packages_refuses_naming_the_field_that_cannot_answer() -> TestResult {
+fn a_package_scope_answers_the_project_side_of_a_pattern() -> TestResult {
+    let (_directory, service) = fixture()?;
+    let search = |scope: &str| -> TestResult<SearchResult> {
+        let request = params(json!({"pattern": "TODO", "target": "all", "scope": scope}))?;
+        Ok(service.search(&request, &StoreAnswer::identifier_only())?)
+    };
+    let local = search("local")?;
+    assert!(!local.results.is_empty(), "{local:#?}");
+    assert_eq!(search("all")?.results, local.results);
+    let global = search("global")?;
+    assert!(global.results.is_empty(), "{global:#?}");
+    assert_eq!(global.pagination.total_pages, 0);
+    Ok(())
+}
+
+/// `packages` travels to the global API beside a package-scoped `pattern`, so the project
+/// side of `all` and `global` answers as it does without the argument. The search refuses
+/// naming `packages` where the argument has nothing to change: beside the `local` scope and
+/// beside a revision, which every search checks before `pattern`.
+#[test]
+fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> TestResult {
     let (_directory, service) = fixture()?;
     let packages = json!([{"manager": "cargo", "name": "serde"}]);
-    let cases = [
+    let refused = [
         (
             json!({"pattern": "TODO", "packages": packages}),
-            "packages",
             "the local scope reads the project alone",
         ),
         (
-            json!({"pattern": "TODO", "scope": "all", "packages": packages}),
-            "pattern",
-            "`scope`",
-        ),
-        (
-            json!({"pattern": "TODO", "scope": "global", "packages": packages}),
-            "pattern",
-            "`scope`",
-        ),
-        (
             json!({"pattern": "TODO", "scope": "all", "rev": "main", "packages": packages}),
-            "packages",
             "current tree alone",
         ),
     ];
-    for (request, expected_field, expected) in cases {
+    for (request, expected) in refused {
         let error = service
             .search(&params(request.clone())?, &StoreAnswer::identifier_only())
-            .expect_err("no scope answers both fields");
+            .expect_err("the argument has nothing to change");
         let ReadFault::Invalid { field, .. } = error.fault() else {
             return Err(format!("expected invalid_request, found {error}").into());
         };
-        assert_eq!(*field, expected_field, "{request}: {error}");
+        assert_eq!(*field, "packages", "{request}: {error}");
         let message = error.to_string();
         assert!(message.contains(expected), "{request}: {message}");
     }
+    let search = |scope: &str| -> TestResult<SearchResult> {
+        let request = params(
+            json!({"pattern": "TODO", "target": "all", "scope": scope, "packages": packages}),
+        )?;
+        Ok(service.search(&request, &StoreAnswer::identifier_only())?)
+    };
+    let local = service.search(
+        &params(json!({"pattern": "TODO", "target": "all"}))?,
+        &StoreAnswer::identifier_only(),
+    )?;
+    assert!(!local.results.is_empty(), "{local:#?}");
+    assert_eq!(search("all")?.results, local.results);
+    assert!(search("global")?.results.is_empty());
     Ok(())
 }
 

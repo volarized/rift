@@ -69,7 +69,7 @@ pub use generated::{
 };
 pub mod domain;
 pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
-pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
+pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
 
 /// Most bytes one encoded request body carries.

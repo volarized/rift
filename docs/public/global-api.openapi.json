@@ -1141,7 +1141,7 @@
       "post": {
         "operationId": "searchPackagePatterns",
         "summary": "Search package source for a pattern.",
-        "description": "Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped.",
+        "description": "Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.",
         "security": [
           {},
           {
@@ -1210,6 +1210,7 @@
                             "end": 32
                           },
                           "line": 3,
+                          "size": 88,
                           "declaration": {
                             "symbol": {
                               "id": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve",
@@ -1230,7 +1231,8 @@
                               "start": 20,
                               "end": 87
                             },
-                            "line": 3
+                            "line": 3,
+                            "source": "pub fn serve(port: u16) -> std::io::Result<()> {\n    listen(port)\n}"
                           },
                           "source": "pub fn serve(port: u16) -> std::io::Result<()> {"
                         }
@@ -3085,6 +3087,11 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 9007199254740991
+          },
+          "source": {
+            "description": "The declaration's source, when the request includes `source`.",
+            "type": "string",
+            "maxLength": 1048576
           }
         },
         "required": [
@@ -3113,6 +3120,12 @@
             "minimum": 1,
             "maximum": 9007199254740991
           },
+          "size": {
+            "description": "Size in bytes of the file holding the match.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
           "declaration": {
             "$ref": "#/components/schemas/PackagePatternDeclaration"
           },
@@ -3126,13 +3139,14 @@
           "package",
           "unit",
           "range",
-          "line"
+          "line",
+          "size"
         ],
         "type": "object"
       },
       "PackagePatternPage": {
         "additionalProperties": true,
-        "description": "One page of pattern matches. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would, and the page carries the matches that fit, `next_cursor` at the first match left out, and a `result_truncated` warning.",
+        "description": "One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.",
         "properties": {
           "items": {
             "description": "Matches in package, file path, and offset order.",

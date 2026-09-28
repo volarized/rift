@@ -1209,6 +1209,8 @@ pub struct PackagePatternDeclaration {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
+    /// The declaration's source, when the request includes `source`.
+    pub source: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1232,6 +1234,8 @@ pub struct PackagePatternHit {
     pub range: TextRange,
     /// One-based source line where the match begins.
     pub line: i64,
+    /// Size in bytes of the file holding the match.
+    pub size: i64,
     /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
     pub declaration: Option<PackagePatternDeclaration>,
     /// The line where the match begins, without its line ending, when the request includes `source`.
@@ -1240,7 +1244,7 @@ pub struct PackagePatternHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One page of pattern matches. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would, and the page carries the matches that fit, `next_cursor` at the first match left out, and a `result_truncated` warning.
+/// One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternPage {
     /// Matches in package, file path, and offset order.
@@ -2520,7 +2524,7 @@ pub struct SearchPackagePatternsRequestQuery {
     #[validate(length(max = 4_096u64))]
     pub cursor: Option<String>,
 }
-/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped.
+/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct SearchPackagePatternsRequest {
     #[validate(nested)]

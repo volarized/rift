@@ -10,10 +10,13 @@ const UNIT: &str = "rift://source/cargo/demo@1.0.0/src/first.rs";
 /// One edit to a pattern page fixture, beside the field the client names when it refuses it.
 type PageEdit = (&'static str, fn(&mut Value));
 
+/// Size of the file every fixture match sits in.
+const FILE_SIZE: u64 = 64;
+
 fn pattern_hit_json(unit: &str, start: u64) -> Value {
     json!({
         "package": package_json("demo"), "unit": unit,
-        "range": {"start": start, "end": start + 4}, "line": 2,
+        "range": {"start": start, "end": start + 4}, "line": 2, "size": FILE_SIZE,
         "declaration": {"symbol": symbol_json("demo", "first"), "range": {"start": 0, "end": 40}, "line": 1}
     })
 }
@@ -106,6 +109,21 @@ async fn test_fixture_pattern_pages_carry_matches_and_follow_the_callers_cursor(
     assert_eq!(
         server.state.last_query.lock().await.as_deref(),
         Some("limit=20&cursor=next")
+    );
+}
+
+/// A pattern page is asked for at the smaller of the caller's limit and the advertised
+/// `page_limit_max`, as the paged reads are.
+#[tokio::test]
+async fn test_fixture_pattern_pages_ask_for_the_advertised_page_limit() {
+    let (server, client) = operation_client(OperationFixture::Patterns).await;
+    let page = client
+        .search_package_patterns(&pattern_request(), PAGE_LIMIT_MAX, None)
+        .await;
+    assert!(page.is_ok(), "{page:?}");
+    assert_eq!(
+        server.state.last_query.lock().await.as_deref(),
+        Some("limit=200")
     );
 }
 
@@ -217,7 +235,7 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
         Ok(())
     );
 
-    let mutations: [PageEdit; 8] = [
+    let mutations: [PageEdit; 10] = [
         ("package", |page| {
             page["items"][0]["package"]["name"] = json!("other");
         }),
@@ -226,6 +244,12 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
         }),
         ("location", |page| {
             page["items"][0]["range"] = json!({"start": 9, "end": 8});
+        }),
+        ("location", |page| {
+            page["items"][0]["size"] = json!(13);
+        }),
+        ("source", |page| {
+            page["items"][0]["declaration"]["source"] = json!("fn demo");
         }),
         ("source", |page| {
             page["items"][0]["source"] = json!("fn demo");
@@ -261,12 +285,19 @@ fn test_pattern_pages_refuse_past_their_bounds() {
     request.include = Some(vec!["source".to_owned()]);
     let mut sourced = pattern_page_json(None);
     sourced["items"][0]["source"] = json!("fn demo");
+    sourced["items"][0]["declaration"]["source"] = json!("pub fn demo");
     assert_eq!(
         check(&request, &capabilities, sourced.clone(), None),
         Ok(())
     );
     let mut tight = capabilities.clone();
     tight.bounds.source_bytes_max = 3;
+    assert_eq!(
+        check(&request, &tight, sourced.clone(), None),
+        Err(ClientError::InvalidResponseField { field: "source" })
+    );
+    // The declaration's source is bounded apart from the matched line's.
+    tight.bounds.source_bytes_max = 8;
     assert_eq!(
         check(&request, &tight, sourced, None),
         Err(ClientError::InvalidResponseField { field: "source" })
@@ -321,6 +352,73 @@ fn test_pattern_pages_refuse_past_their_bounds() {
         check(&request, &capabilities, stalled, Some("next")),
         Err(ClientError::InvalidResponseField {
             field: "cursor_progress"
+        })
+    );
+}
+
+/// A match converts into the local read model: a file hit addressed by `unit` with the file's
+/// size, and a symbol hit for the declaration holding it, both tagged `content`.
+#[test]
+fn test_a_pattern_match_converts_into_a_file_hit_and_its_declaration() {
+    let mut value = pattern_hit_json(UNIT, 10);
+    value["source"] = json!("fn demo");
+    let hit: PackagePatternHit = serde_json::from_value(value).expect("pattern hit fixture");
+    let matched = PackagePatternMatch::try_from(&hit).expect("a valid match converts");
+    assert_eq!(matched.package.name, "demo");
+    let file = &matched.file;
+    assert_eq!(
+        file.hit,
+        rift_protocol::read::SearchHitTarget::File {
+            size: FILE_SIZE,
+            languages: Vec::new(),
+        }
+    );
+    assert_eq!(file.unit.as_ref().map(|unit| unit.0.as_str()), Some(UNIT));
+    assert_eq!(file.path, None);
+    assert_eq!(file.source.as_deref(), Some("fn demo"));
+    assert_eq!(
+        file.range,
+        Some(rift_protocol::read::TextRange { start: 10, end: 14 })
+    );
+    assert_eq!(file.line, Some(2));
+    assert_eq!(
+        file.matched_by,
+        [rift_protocol::read::MatchedField::Content]
+    );
+    let declaration = matched
+        .declaration
+        .expect("the match names its declaration");
+    let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &declaration.hit else {
+        panic!("a declaration answers a symbol hit: {declaration:?}");
+    };
+    assert_eq!(symbol.name, "demo");
+    assert_eq!(
+        declaration.range,
+        Some(rift_protocol::read::TextRange { start: 0, end: 40 })
+    );
+    assert_eq!(
+        declaration.unit.as_ref().map(|unit| unit.0.as_str()),
+        Some(UNIT)
+    );
+
+    let mut outside = hit.clone();
+    outside.size = 13;
+    assert_eq!(
+        PackagePatternMatch::try_from(&outside),
+        Err(ClientError::InvalidResponseField { field: "location" })
+    );
+    let mut negative = hit.clone();
+    negative.size = -1;
+    assert_eq!(
+        PackagePatternMatch::try_from(&negative),
+        Err(ClientError::InvalidResponseField { field: "location" })
+    );
+    let mut foreign = hit;
+    foreign.unit = "rift://source/cargo/other@1.0.0/src/first.rs".to_owned();
+    assert_eq!(
+        PackagePatternMatch::try_from(&foreign),
+        Err(ClientError::InvalidResponseField {
+            field: "source_identity"
         })
     );
 }

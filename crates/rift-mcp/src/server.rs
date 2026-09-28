@@ -51,7 +51,7 @@ use tracing::Instrument as _;
 use crate::failure::WireFailure;
 use crate::global::{
     GlobalRoute, GlobalState, GlobalSymbolCandidates, local_search_page, local_symbol_page,
-    merge_search, merge_symbols, package_search, package_symbols,
+    merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1692,10 +1692,11 @@ impl RiftMcp {
     /// of `query` and `traversal`. `rev` searches a version-control revision instead of the
     /// current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
     /// reaches past the project tree: `global` answers `query` from the public declarations
-    /// the global index holds for the workspace's dependencies alone, `all` from both,
-    /// ordered together. `packages` names package versions `query` searches beside the
-    /// workspace's own, such as an upgrade target or a package the project does not use yet.
-    /// Use `get_symbol` when the declaration name is known.
+    /// the global index holds for the workspace's dependencies alone and `pattern` from their
+    /// source, `all` from both, ordered together. `packages` names package versions `query`
+    /// and `pattern` search beside the workspace's own, such as an upgrade target or a
+    /// package the project does not use yet. Use `get_symbol` when the declaration name is
+    /// known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1854,6 +1855,11 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let references = Arc::new(references);
+        if params.pattern.is_some() && params.scope != SearchScope::Local {
+            return self
+                .route_pattern_search(resolved, params, answer, warnings, references, deadline)
+                .await;
+        }
         let parsed = params
             .query
             .as_deref()
@@ -1906,6 +1912,44 @@ impl RiftMcp {
                 local_search_page(&params, local)
             }
         };
+        answer.warnings.extend(route.warnings());
+        Ok(Json(answer))
+    }
+
+    /// Routes one current-tree `pattern` search whose `scope` reaches packages: the
+    /// project's matches come from the published snapshot, `global` verifying no project
+    /// file, and the package matches from one page of the global API's pattern search. The
+    /// project side reads first, so a pattern the server refuses spends no global request.
+    async fn route_pattern_search(
+        &self,
+        resolved: ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        warnings: Vec<ReadWarning>,
+        references: Arc<EngineReferences>,
+        deadline: RequestDeadline,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        let mut collected = params.clone();
+        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page_index = 0;
+        let mut local = self
+            .current_tree_search_selected(&resolved, collected, answer, references)
+            .await?
+            .0;
+        local.warnings.extend(warnings);
+        let context = resolved
+            .published
+            .reads
+            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let configuration = resolved.published.configuration.global_configuration();
+        let requested = &params;
+        let (route, remote) = self
+            .global_read(deadline, &configuration, &context, |client, packages| async move {
+                package_patterns(&client, requested, &packages).await
+            })
+            .await;
+        let mut answer = merge_patterns(&params, local, remote);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
@@ -2121,14 +2165,19 @@ impl RiftMcp {
     /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
     /// batches: the rows the trigram index lacks ride the selection, and the read path
     /// verifies them, or answers from the rows the index holds and warns
-    /// `pattern_index_preparing`.
+    /// `pattern_index_preparing`. A `global` scope verifies no project file, so the store
+    /// is not read.
     async fn pattern_ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
     ) -> Result<SearchRanking, ErrorData> {
         let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
-        let Some(index) = self.search_index.as_ref() else {
+        let Some(index) = self
+            .search_index
+            .as_ref()
+            .filter(|_| params.scope != SearchScope::Global)
+        else {
             return Ok(SearchRanking::unranked(answer));
         };
         let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds) else {

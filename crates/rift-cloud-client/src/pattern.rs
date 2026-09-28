@@ -7,10 +7,10 @@ use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use crate::{
     Capabilities, ClientError, GlobalClient, HitLocation, PackagePatternHit, PackagePatternPage,
     PackagePatternRequest, PageMetadata, SOURCE_BYTES_MAX, SearchPackagePatternsRequestQuery,
-    active_response_body_bytes_max, bounded_nonempty, contract, includes_source, package_key,
-    package_source_path, response, serialize_body, smaller_bound, supports_feature,
-    validate_body_for_capabilities, validate_hit_common, validate_packages, validate_page,
-    validate_read_bounds,
+    active_response_body_bytes_max, advertised_page_limit, bounded_nonempty, contract,
+    includes_source, package_key, package_source_path, response, serialize_body, smaller_bound,
+    supports_feature, validate_body_for_capabilities, validate_hit_common, validate_packages,
+    validate_page, validate_read_bounds,
 };
 
 /// Most distinct files one pattern page holds matches from. The server verifies candidate files
@@ -21,10 +21,12 @@ pub const PATTERN_PAGE_FILES_MAX: usize = 500;
 const PATTERN_FEATURE: &str = "patterns";
 
 impl GlobalClient {
-    /// Reads one page of pattern matches over the selected exact package versions.
+    /// Reads one page of pattern matches over the selected exact package versions, asking for
+    /// the smaller of `limit` and the advertised `page_limit_max`.
     ///
-    /// The page stops at `limit` matches, at [`PATTERN_PAGE_FILES_MAX`] files, or at the text
-    /// bound the server verifies per page, and the caller decides whether to follow
+    /// The page stops at that many matches, at [`PATTERN_PAGE_FILES_MAX`] files, or at the text
+    /// bound the server verifies per page, and a page that stopped before the last match
+    /// carries a `result_truncated` warning; the caller decides whether to follow
     /// `next_cursor`.
     ///
     /// # Errors
@@ -48,6 +50,7 @@ impl GlobalClient {
         validate_pattern_request(request)?;
         validate_page(limit, cursor)?;
         let capabilities = self.get_capabilities().await?;
+        let limit = advertised_page_limit(limit, &capabilities);
         validate_pattern_request_for_capabilities(request, limit, cursor, &capabilities)?;
         let body = serialize_body(request)?;
         validate_body_for_capabilities(&body, &capabilities)?;
@@ -153,8 +156,8 @@ impl PatternPageCheck<'_> {
         Ok(())
     }
 
-    /// Checks one match: a file of a requested package, a well-formed location, source only when
-    /// asked for, and a declaration, when named, that holds the match.
+    /// Checks one match: a file of a requested package, a well-formed location inside the file,
+    /// source only when asked for, and a declaration, when named, that holds the match.
     fn validate_hit(
         &self,
         hit: &PackagePatternHit,
@@ -163,7 +166,8 @@ impl PatternPageCheck<'_> {
         if !packages.contains(&package_key(&hit.package)) {
             return Err(ClientError::InvalidResponseField { field: "package" });
         }
-        if hit.line < 1 || hit.range.end < hit.range.start {
+        let inside_the_file = u64::try_from(hit.size).is_ok_and(|size| hit.range.end <= size);
+        if hit.line < 1 || hit.range.end < hit.range.start || !inside_the_file {
             return Err(ClientError::InvalidResponseField { field: "location" });
         }
         let source_bytes_max =
@@ -180,11 +184,14 @@ impl PatternPageCheck<'_> {
         let Some(declaration) = &hit.declaration else {
             return Ok(());
         };
+        if declaration.source.is_some() && !source_allowed {
+            return Err(ClientError::InvalidResponseField { field: "source" });
+        }
         let location = HitLocation {
             unit: &hit.unit,
             range: &declaration.range,
             line: declaration.line,
-            source: None,
+            source: declaration.source.as_deref(),
         };
         validate_hit_common(
             &hit.package,
