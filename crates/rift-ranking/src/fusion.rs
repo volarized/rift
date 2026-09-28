@@ -22,9 +22,10 @@
 //! resolves identities after ranking, which is what lets the global route order
 //! package hits beside project hits through this same code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
-use crate::document::{DocumentIdentity, FieldSet};
+use crate::document::{DocumentIdentity, FieldSet, SearchableField};
 use crate::error::{RankingError, RankingFault, RankingViolation};
 use crate::query::QueryPhase;
 
@@ -114,18 +115,38 @@ impl FromIterator<RankingInputKind> for RankingInputSet {
     }
 }
 
-/// One identity an input ranked, and the fields that placed it.
+/// One identity an input ranked, the fields that placed it, and, for a row holding
+/// file text, which bytes of its file that row holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedIdentity {
     identity: DocumentIdentity,
     fields: FieldSet,
+    file_range: Option<Range<u64>>,
 }
 
 impl RankedIdentity {
     /// Names one ranked identity and the fields that matched.
     #[must_use]
     pub const fn new(identity: DocumentIdentity, fields: FieldSet) -> Self {
-        Self { identity, fields }
+        Self {
+            identity,
+            fields,
+            file_range: None,
+        }
+    }
+
+    /// The same identity, holding the bytes `file_range` of its file: the whole file, or
+    /// the one chunk of a large file this row stores.
+    #[must_use]
+    pub fn with_file_range(mut self, file_range: Range<u64>) -> Self {
+        self.file_range = Some(file_range);
+        self
+    }
+
+    /// The bytes of its file this row holds, or `None` for a row holding no file text.
+    #[must_use]
+    pub const fn file_range(&self) -> Option<&Range<u64>> {
+        self.file_range.as_ref()
     }
 
     /// The ranked identity.
@@ -277,6 +298,7 @@ pub struct FusedCandidate {
     inputs: RankingInputSet,
     fields: FieldSet,
     phase: QueryPhase,
+    file_range: Option<Range<u64>>,
 }
 
 impl FusedCandidate {
@@ -313,6 +335,38 @@ impl FusedCandidate {
     pub const fn phase(&self) -> QueryPhase {
         self.phase
     }
+
+    /// The bytes of its file this candidate's row holds, as the input that ranked it
+    /// stated them; `None` for a candidate holding no file text.
+    #[must_use]
+    pub const fn file_range(&self) -> Option<&Range<u64>> {
+        self.file_range.as_ref()
+    }
+
+    /// A declaration a body match placed: found inside `row`'s text, so it answers with
+    /// the fields and the phase that placed that row.
+    fn body_match(identity: DocumentIdentity, row: &Self) -> Self {
+        Self {
+            identity,
+            fused: row.fused,
+            score: 0.0,
+            inputs: row.inputs,
+            fields: FieldSet::of(SearchableField::FileContent),
+            phase: row.phase,
+            file_range: None,
+        }
+    }
+}
+
+/// Whether an answer keeps its file rows beside the declarations a body match placed
+/// from them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileRowAnswer {
+    /// The answer names files too, so every file row keeps its place.
+    Kept,
+    /// The answer names declarations alone, so a file row answers only through the
+    /// declarations found inside it.
+    Dropped,
 }
 
 /// One phase's fused answer, and whether the bound cut it.
@@ -389,6 +443,55 @@ impl RankedCandidates {
         }
         score_by_order(&mut self.candidates);
     }
+
+    /// Places declarations found inside file rows at the first file row's place, best
+    /// first.
+    ///
+    /// `body_matches` is the pool a body match scored together, best first. Every
+    /// candidate before the first file row keeps its place; the pool follows it, then that
+    /// file row when `file_rows` keeps it, then every later candidate in its own order. A
+    /// declaration keeps the first place it reaches, so a pooled declaration the answer
+    /// already held earlier stays there, and a later direct match of a pooled
+    /// declaration moves up to the pool's place. The joined answer is cut to `keep_max`,
+    /// and its scores are derived again over the joined order.
+    #[must_use]
+    pub fn with_body_matches(
+        self,
+        body_matches: Vec<DocumentIdentity>,
+        is_file_row: impl Fn(&FusedCandidate) -> bool,
+        file_rows: FileRowAnswer,
+        keep_max: usize,
+    ) -> Self {
+        let mut placed: BTreeSet<DocumentIdentity> = BTreeSet::new();
+        let mut candidates = Vec::with_capacity(self.candidates.len() + body_matches.len());
+        let mut pool = Some(body_matches);
+        for candidate in self.candidates {
+            if !is_file_row(&candidate) {
+                if placed.insert(candidate.identity.clone()) {
+                    candidates.push(candidate);
+                }
+                continue;
+            }
+            for identity in pool.take().into_iter().flatten() {
+                if placed.insert(identity.clone()) {
+                    candidates.push(FusedCandidate::body_match(identity, &candidate));
+                }
+            }
+            if file_rows == FileRowAnswer::Kept {
+                candidates.push(candidate);
+            }
+        }
+        let mut truncated_at = self.truncated_at;
+        if candidates.len() > keep_max {
+            candidates.truncate(keep_max);
+            truncated_at = Some(keep_max);
+        }
+        score_by_order(&mut candidates);
+        Self {
+            candidates,
+            truncated_at,
+        }
+    }
 }
 
 /// Fuses `inputs` by weighted reciprocal rank.
@@ -448,6 +551,7 @@ pub fn fuse(
             inputs: held.inputs,
             fields: held.fields,
             phase,
+            file_range: held.file_range,
         })
         .collect();
     candidates.sort_by(|left, right| {
@@ -466,11 +570,12 @@ pub fn fuse(
 }
 
 /// What one identity accumulated across the inputs that ranked it.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Accumulated {
     value: f64,
     inputs: RankingInputSet,
     fields: FieldSet,
+    file_range: Option<Range<u64>>,
 }
 
 /// Adds one input's contribution to every identity it ranked.
@@ -490,6 +595,9 @@ fn accumulate<'a>(
         let held = accumulated.entry(entry.identity()).or_default();
         held.inputs = held.inputs.with(input.kind());
         held.fields = held.fields.union(entry.fields());
+        if held.file_range.is_none() {
+            held.file_range = entry.file_range().cloned();
+        }
         if ranked.contains(&entry.identity()) {
             continue;
         }
@@ -545,8 +653,8 @@ fn as_count(value: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FUSION_K_MAX, FusedCandidate, RankedCandidates, RankedIdentity, RankingInput,
-        RankingInputKind, RankingInputSet, RankingWeights, fuse,
+        FUSION_K_MAX, FileRowAnswer, FusedCandidate, RankedCandidates, RankedIdentity,
+        RankingInput, RankingInputKind, RankingInputSet, RankingWeights, fuse,
     };
     use crate::document::{DocumentIdentity, FieldSet, SearchableField};
     use crate::error::RankingViolation;
@@ -565,6 +673,101 @@ mod tests {
 
     fn weights() -> RankingWeights {
         RankingWeights::new(0.35, 0.35, 0.30, 60).expect("weights must be accepted")
+    }
+
+    /// One lexical answer in exactly `values`' order, the file rows holding `0..64` of
+    /// their file.
+    fn lexical_answer(values: &[&str]) -> RankedCandidates {
+        let order = values
+            .iter()
+            .map(|value| {
+                let ranked =
+                    RankedIdentity::new(identity(value), FieldSet::of(SearchableField::Name));
+                if value.starts_with("file") {
+                    ranked.with_file_range(0..64)
+                } else {
+                    ranked
+                }
+            })
+            .collect();
+        fuse(
+            &[RankingInput::new(RankingInputKind::Lexical, order)],
+            weights(),
+            QueryPhase::Broad,
+            100,
+        )
+    }
+
+    fn is_file_row(candidate: &FusedCandidate) -> bool {
+        candidate.file_range().is_some()
+    }
+
+    /// The pool takes the first file row's place, best first: a direct match placed
+    /// before that row keeps its own place, a later direct match of a pooled declaration
+    /// moves up to the pool's place, and a declaration-only answer drops every file row.
+    #[test]
+    fn test_body_matches_take_the_first_file_row_place() {
+        let answer = lexical_answer(&["alpha", "file:a.rs", "beta", "file:b.rs", "gamma"]);
+        let pooled = vec![identity("delta"), identity("gamma"), identity("alpha")];
+        let placed = answer.clone().with_body_matches(
+            pooled.clone(),
+            is_file_row,
+            FileRowAnswer::Dropped,
+            100,
+        );
+        assert_eq!(identities(&placed), ["alpha", "delta", "gamma", "beta"]);
+        let delta = &placed.candidates()[1];
+        assert!(delta.fields().holds(SearchableField::FileContent));
+        assert_eq!(delta.phase(), QueryPhase::Broad);
+        assert_eq!(delta.file_range(), None);
+        assert!(delta.inputs().holds(RankingInputKind::Lexical));
+        let scores: Vec<f64> = placed
+            .candidates()
+            .iter()
+            .map(FusedCandidate::score)
+            .collect();
+        assert!(
+            scores.windows(2).all(|pair| pair[0] > pair[1]),
+            "{scores:?}"
+        );
+
+        let kept = answer.with_body_matches(pooled, is_file_row, FileRowAnswer::Kept, 100);
+        assert_eq!(
+            identities(&kept),
+            ["alpha", "delta", "gamma", "file:a.rs", "beta", "file:b.rs"]
+        );
+    }
+
+    /// An answer with no file row places nothing, and one past `keep_max` is cut and says
+    /// so.
+    #[test]
+    fn test_body_matches_without_a_file_row_place_nothing_and_the_bound_cuts() {
+        let answer = lexical_answer(&["alpha", "beta"]);
+        let unchanged = answer.clone().with_body_matches(
+            vec![identity("delta")],
+            is_file_row,
+            FileRowAnswer::Dropped,
+            100,
+        );
+        assert_eq!(identities(&unchanged), ["alpha", "beta"]);
+        assert_eq!(unchanged.truncated_at(), None);
+
+        let answer = lexical_answer(&["file:a.rs", "alpha"]);
+        let cut = answer.with_body_matches(
+            vec![identity("delta"), identity("epsilon")],
+            is_file_row,
+            FileRowAnswer::Kept,
+            3,
+        );
+        assert_eq!(identities(&cut), ["delta", "epsilon", "file:a.rs"]);
+        assert_eq!(cut.truncated_at(), Some(3));
+    }
+
+    #[test]
+    fn test_fusion_keeps_the_file_range_an_input_stated() {
+        let answer = lexical_answer(&["file:a.rs", "alpha"]);
+        assert_eq!(answer.candidates()[0].file_range(), Some(&(0..64)));
+        assert_eq!(answer.candidates()[1].file_range(), None);
     }
 
     /// Whether two scores agree within the last bits a literal can carry.
@@ -748,7 +951,7 @@ mod tests {
         );
         let vector = RankingInput::new(
             RankingInputKind::Vector,
-            order(&["c"], SearchableField::DeclarationSource),
+            order(&["c"], SearchableField::FileContent),
         );
         let weights = RankingWeights::new(0.1, 0.1, 0.8, 1).expect("weights must be accepted");
         let without = fuse(

@@ -3,9 +3,13 @@
 //! from `read` so that module stays below its size bound. The bounded relationship `traversal`
 //! lane lives in the sibling `traversal` module.
 
+mod body;
+#[cfg(test)]
+mod body_tests;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;
+use body::BodyMatching;
 use documentation::SearchDocumentation;
 
 use std::cmp::Ordering;
@@ -25,9 +29,9 @@ use rift_protocol::read::{
     SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
-    DocumentIdentity, DocumentKind, DocumentLocation, FusedCandidate, IdentifierMatchClass,
-    IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QueryPhase,
-    RankedCandidates, RankingInput, RankingWeights, SearchableField, fuse,
+    DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
+    IdentifierMatchClass, IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery,
+    QueryPhase, RankedCandidates, RankingInput, RankingWeights, SearchableField, fuse,
 };
 use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
@@ -56,6 +60,7 @@ pub struct StoreAnswer {
     precise: Vec<RankingInput>,
     broad: Vec<RankingInput>,
     weights: RankingWeights,
+    file_rows: Option<FileRowFrequencies>,
 }
 
 impl StoreAnswer {
@@ -70,7 +75,17 @@ impl StoreAnswer {
             precise,
             broad,
             weights,
+            file_rows: None,
         }
+    }
+
+    /// The same answer, carrying the document frequencies of the query's terms over the
+    /// store's file rows that a body match scores declarations with; `None` leaves body
+    /// matching out of the answer.
+    #[must_use]
+    pub fn with_file_rows(mut self, file_rows: Option<FileRowFrequencies>) -> Self {
+        self.file_rows = file_rows;
+        self
     }
 
     /// No store answer, under the operator's own shares: the shares stay what
@@ -81,6 +96,7 @@ impl StoreAnswer {
             precise: Vec::new(),
             broad: Vec::new(),
             weights,
+            file_rows: None,
         }
     }
 
@@ -92,6 +108,7 @@ impl StoreAnswer {
             precise: Vec::new(),
             broad: Vec::new(),
             weights: RankingWeights::identifier_only(),
+            file_rows: None,
         }
     }
 
@@ -111,6 +128,13 @@ impl StoreAnswer {
     #[must_use]
     pub const fn weights(&self) -> RankingWeights {
         self.weights
+    }
+
+    /// The document frequencies a body match scores declarations with, when the store
+    /// read them beside its ranking.
+    #[must_use]
+    pub const fn file_rows(&self) -> Option<&FileRowFrequencies> {
+        self.file_rows.as_ref()
     }
 }
 
@@ -426,6 +450,7 @@ impl ReadService {
         if let Some(documentation) = &documentation {
             warnings.extend(documentation.warnings().iter().cloned());
         }
+        let body = BodyMatching::for_request(criteria.target, store, query);
         let screen = CandidateScreen {
             index,
             matcher,
@@ -433,6 +458,7 @@ impl ReadService {
             target: criteria.target,
             resolution,
             documentation: documentation.as_ref(),
+            body: body.as_ref(),
         };
         let mut inputs = vec![rift_core::traced!(
             component = "search",
@@ -459,6 +485,7 @@ impl ReadService {
             );
             ranked.append_phase(broad, fetch_limit);
         }
+        let ranked = screen.with_body_matches(ranked, fetch_limit);
         rift_core::traced!(component = "search", operation = "search.hit_resolution", {
             resolve_ranked_hits(
                 index,
@@ -512,9 +539,10 @@ impl ReadService {
     /// it has no entry and the two slices are never parallel. Each pair is built from one
     /// document's own resolution, so a document can never pick up another's declaration.
     ///
-    /// The declaration's signature, its attached documentation, and its own source all
-    /// travel with the pair, because the published document already holds each of them in
-    /// its own field and the embedding text reads all three.
+    /// The declaration's signature and its attached documentation travel from the
+    /// published document, which holds each in its own field; its own source comes from
+    /// the file the snapshot holds, a range of the text the file's own document stores.
+    /// The embedding text reads all three.
     ///
     /// The walk runs over `documents`, whose length this snapshot's own file and symbol
     /// bounds already fixed, and each symbol document costs one scan of the file it names,
@@ -543,7 +571,7 @@ impl ReadService {
         let DocumentLocation::Project(path) = unit.location() else {
             return None;
         };
-        let (_, symbol) = resolve_symbol(self.index(), path, unit.identity().as_str())?;
+        let (file, symbol) = resolve_symbol(self.index(), path, unit.identity().as_str())?;
         let fields = unit.fields();
         let declaration = Declaration::new(symbol.kind, &symbol.qualified_name)
             .signature(fields.get(SearchableField::Signature).unwrap_or_default())
@@ -552,13 +580,20 @@ impl ReadService {
                     .get(SearchableField::Documentation)
                     .unwrap_or_default(),
             )
-            .source(
-                fields
-                    .get(SearchableField::DeclarationSource)
-                    .unwrap_or_default(),
-            );
+            .source(declaration_text(file, symbol));
         Some(DescribedUnit::new(unit, declaration))
     }
+}
+
+/// The text `symbol`'s complete span holds in `file`, or nothing for a span the file's
+/// bytes cannot hold.
+fn declaration_text<'a>(file: &'a IndexedFile, symbol: &SyntaxSymbol) -> &'a str {
+    let start = usize::try_from(symbol.range.start).ok();
+    let end = usize::try_from(symbol.range.end).ok();
+    start
+        .zip(end)
+        .and_then(|(start, end)| file.source().get(start..end))
+        .unwrap_or_default()
 }
 
 /// Whether the request's `paths` selector names any `force_include` glob.
@@ -850,6 +885,9 @@ struct CandidateScreen<'a> {
     target: SearchParamsTarget,
     resolution: Resolution<'a>,
     documentation: Option<&'a SearchDocumentation<'a>>,
+    /// Body matching for this request, when a file row can answer through the
+    /// declarations inside it.
+    body: Option<&'a BodyMatching<'a>>,
 }
 
 impl CandidateScreen<'_> {
@@ -900,7 +938,8 @@ impl CandidateScreen<'_> {
 
     /// Whether this request answers `identity`. It does not when no selected index holds
     /// it, when the `paths` selector excludes the path it names, or when `target`
-    /// excludes the kind it names.
+    /// excludes the kind it names. A file row stays under a `target` naming declarations
+    /// alone while body matching can answer through the declarations inside it.
     fn admits(&self, identity: &DocumentIdentity) -> bool {
         if let Some(admitted) = self
             .documentation
@@ -909,8 +948,19 @@ impl CandidateScreen<'_> {
             return admitted;
         }
         resolve_candidate(self.index, self.resolution, identity).is_some_and(|resolved| {
-            resolved.reaches(self.index, self.matcher, self.root) && resolved.answers(self.target)
+            let carries_body_matches = self.body.is_some() && resolved.answered_path().is_some();
+            resolved.reaches(self.index, self.matcher, self.root)
+                && (resolved.answers(self.target) || carries_body_matches)
         })
+    }
+
+    /// `ranked` with the declarations its first file rows hold placed at the first file
+    /// row's place, when this request matches bodies; `ranked` unchanged otherwise.
+    fn with_body_matches(&self, ranked: RankedCandidates, keep_max: usize) -> RankedCandidates {
+        match self.body {
+            Some(body) => body.placed(self.index, ranked, keep_max),
+            None => ranked,
+        }
     }
 }
 
@@ -1062,9 +1112,7 @@ fn matched_fields(candidate: &FusedCandidate) -> Vec<MatchedField> {
             | SearchableField::IdentifierTerms => MatchedField::Name,
             SearchableField::Signature => MatchedField::Signature,
             SearchableField::Documentation => MatchedField::Documentation,
-            SearchableField::DeclarationSource | SearchableField::FileContent => {
-                MatchedField::Content
-            }
+            SearchableField::FileContent => MatchedField::Content,
         };
         if !fields.contains(&wire) {
             fields.push(wire);
@@ -1494,7 +1542,8 @@ mod tests {
 
     use super::{
         ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadFault, ReadService,
-        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
+        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer, declaration_text,
+        resolve_symbol,
     };
     use crate::read::tests::project_fixture;
 
@@ -1540,7 +1589,12 @@ mod tests {
         } else {
             Vec::new()
         };
-        Ok(StoreAnswer::new(precise, broad, configured_weights()))
+        let terms = rift_ranking::BodyTerms::of(&parsed);
+        let file_rows = match store.file_row_frequencies(revision, &terms).await? {
+            RevisionScoped::Matched(frequencies) => Some(frequencies),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+        };
+        Ok(StoreAnswer::new(precise, broad, configured_weights()).with_file_rows(file_rows))
     }
 
     /// The inputs one phase produced, refusing a store stamped with another revision.
@@ -1584,6 +1638,7 @@ mod tests {
             target: criteria.target,
             resolution,
             documentation: None,
+            body: None,
         };
         let ranked = fuse(
             &screen.screened(inputs),
@@ -3739,9 +3794,16 @@ impl Tower {
             );
             let identity = one.unit().identity();
             let text = rift_search::document(one.declaration()).into_text();
+            let path = one
+                .unit()
+                .project_path()
+                .ok_or("a symbol document has a path")?;
+            let (file, symbol) = resolve_symbol(service.index(), path, identity.as_str())
+                .ok_or("every described unit resolves")?;
+            let source = declaration_text(file, symbol);
             assert!(
-                text.contains(one.unit().content()),
-                "each description must carry its own document's declaration: {identity} {text}"
+                !source.is_empty() && text.contains(source),
+                "each description must carry its own declaration's source: {identity} {text}"
             );
         }
         Ok(())
@@ -3895,7 +3957,7 @@ impl Tower {
     }
 
     /// `matched_by` names the columns that placed a candidate: the three name columns
-    /// collapse to one member, the two content columns to another, and a candidate no
+    /// collapse to one member, the content column is another, and a candidate no
     /// column placed - one the vector ranking alone reached - answers `ranked`.
     #[test]
     fn matched_by_names_the_columns_that_placed_a_candidate() -> TestResult {
@@ -3911,7 +3973,7 @@ impl Tower {
                 .with(SearchableField::IdentifierTerms)
                 .with(SearchableField::Signature)
                 .with(SearchableField::Documentation)
-                .with(SearchableField::DeclarationSource),
+                .with(SearchableField::FileContent),
         )]);
         let declarations = SearchCriteria {
             query: &ParsedQuery::parse("Beacon")?,
@@ -3960,7 +4022,7 @@ impl Tower {
     }
 
     /// One declaration both the identifier ranking and the store's full-text ranking
-    /// placed answers once, carrying every column that placed it.
+    /// placed answers once, carrying the column that placed it.
     #[tokio::test]
     async fn search_matched_by_carries_the_identifier_and_the_full_text_columns() -> TestResult {
         let (directory, service) = fixture()?;
@@ -3981,11 +4043,11 @@ impl Tower {
             "two inputs placing one identity answer once: {answer:#?}"
         );
         let beacon = declarations[0];
-        assert!(
-            beacon.matched_by.contains(&MatchedField::Name)
-                && beacon.matched_by.contains(&MatchedField::Content),
-            "the identifier ranking's name column and the store's source column both \
-             placed it: {beacon:#?}"
+        assert_eq!(
+            beacon.matched_by,
+            [MatchedField::Name],
+            "the identifier ranking and the store's name column both placed it, and no \
+             symbol row stores the declaration's source: {beacon:#?}"
         );
 
         let readme = answer

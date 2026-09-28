@@ -28,8 +28,8 @@ use rift_index::{
     StoredVector, VectorStore,
 };
 use rift_ranking::{
-    DocumentIdentity, DocumentLocation, FieldSet, IndexDocument, ParsedQuery, QueryPhase,
-    RankedIdentity, RankingInput, RankingInputKind, SearchableField,
+    BodyTerms, DocumentIdentity, DocumentLocation, FieldSet, FileRowFrequencies, IndexDocument,
+    ParsedQuery, QueryPhase, RankedIdentity, RankingInput, RankingInputKind, SearchableField,
 };
 
 use crate::acquisition::{AcquisitionLimits, ModelSource, acquire};
@@ -864,6 +864,28 @@ impl SearchIndex {
         *self.pass.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// How many file rows the lexical tier holds for `tree_revision`, and how many of them
+    /// hold each of `terms`: the document frequencies a body match scores declarations
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// Returns `store_failed` when the lexical store refuses.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the store reads in one read-only transaction.
+    pub async fn file_row_frequencies(
+        &self,
+        tree_revision: &str,
+        terms: &BodyTerms,
+    ) -> Result<RevisionScoped<FileRowFrequencies>, SearchError> {
+        self.lexical
+            .file_row_frequencies(tree_revision, terms)
+            .await
+            .map_err(store_failed)
+    }
+
     /// The tree revision the lexical tier is stamped with.
     ///
     /// # Errors
@@ -1060,7 +1082,7 @@ impl SearchIndex {
                 .map(|address| {
                     RankedIdentity::new(
                         address.identity,
-                        FieldSet::of(SearchableField::DeclarationSource),
+                        FieldSet::of(SearchableField::FileContent),
                     )
                 })
                 .collect(),
@@ -1595,16 +1617,16 @@ mod store_failure_tests {
         LexicalIndexLimits::new(1, 1 << 20, 32, 4, 1_000)
     }
 
-    /// One symbol document, named and carrying its own declaration source.
+    /// One symbol document, named and carrying its signature.
     fn symbol(
         identity: &str,
         path: &str,
         name: &str,
-        declaration_source: &str,
+        signature: &str,
     ) -> Result<IndexDocument, Box<dyn std::error::Error>> {
         let fields = DocumentFields::empty()
             .with(SearchableField::Name, name)
-            .with(SearchableField::DeclarationSource, declaration_source);
+            .with(SearchableField::Signature, signature);
         let digest = fields.digest();
         Ok(IndexDocument::new(
             DocumentIdentity::new(identity)?,

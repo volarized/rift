@@ -3444,19 +3444,6 @@ fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClas
     )
 }
 
-/// The declaration's exact source text, clamped to `file`'s bounds the same way the read
-/// service excerpts a symbol's source.
-fn declaration_source(file: &IndexedFile, range: rift_syntax::ByteRange) -> &str {
-    let source = file.source();
-    let start = usize::try_from(range.start)
-        .unwrap_or(source.len())
-        .min(source.len());
-    let end = usize::try_from(range.end)
-        .unwrap_or(source.len())
-        .min(source.len());
-    source.get(start..end).unwrap_or_default()
-}
-
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
 /// ranked identity and a read address are one value.
 #[must_use]
@@ -3476,8 +3463,9 @@ pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
 /// `SymbolId`, so a lexical hit's identity equals the id `get_symbol` returns for it.
 ///
 /// Every field a provider published lands in its own column. A provider that publishes
-/// no signature leaves that field absent rather than filling it with the declaration's
-/// source, so the two are weighed apart.
+/// no signature leaves that field absent. The declaration's source stays out: it is a
+/// range of its file's text, which the file's own document stores and indexes once, and
+/// a query word only its body holds reaches it through that file row.
 fn symbol_document(
     file: &IndexedFile,
     symbol: &SyntaxSymbol,
@@ -3492,7 +3480,7 @@ fn symbol_document(
         identity,
         file.path(),
         DocumentKind::Symbol,
-        declaration_fields(file, symbol),
+        declaration_fields(symbol),
         left_out,
     )
 }
@@ -3500,8 +3488,7 @@ fn symbol_document(
 /// The searchable fields one declaration fills: equal bytes produce equal fields and one
 /// digest.
 #[must_use]
-pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> DocumentFields {
-    let source = declaration_source(file, symbol.range);
+pub(crate) fn declaration_fields(symbol: &SyntaxSymbol) -> DocumentFields {
     let containers = symbol.container.iter().map(String::as_str);
     let terms = identifier_terms(
         [symbol.name.as_str(), symbol.qualified_name.as_str()]
@@ -3521,7 +3508,6 @@ pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> D
             SearchableField::Documentation,
             attached_documentation(symbol),
         )
-        .with(SearchableField::DeclarationSource, source)
 }
 
 /// The declaration's rendered signatures, one per line.
@@ -3679,7 +3665,9 @@ fn checked_chunk_bytes_max(chunk_bytes_max: u64) -> usize {
 
 /// Appends one text file's documents to `documents`: one whole document within
 /// `chunk_bytes_max`, one per chunk otherwise, every chunk sharing the file's real path
-/// and its file name so a hit still maps back to the file it came from.
+/// and its file name so a hit still maps back to the file it came from. Each document
+/// records where its text starts in the file, so a position inside a chunk maps back to
+/// the file without chunking it again.
 fn push_text_documents(
     documents: &mut Vec<IndexDocument>,
     file: &TextSourceFile,
@@ -3688,13 +3676,16 @@ fn push_text_documents(
 ) {
     let name = file_name(file.path());
     if !exceeds_chunk_bound(file.content().len(), chunk_bytes_max) {
-        documents.extend(text_document(
-            file.path().as_str().to_owned(),
-            file,
-            name.as_deref(),
-            file.content(),
-            left_out,
-        ));
+        documents.extend(
+            text_document(
+                file.path().as_str().to_owned(),
+                file,
+                name.as_deref(),
+                file.content(),
+                left_out,
+            )
+            .map(|document| document.at_byte_offset(0)),
+        );
         return;
     }
     let chunks = text_chunks(file.content(), checked_chunk_bytes_max(chunk_bytes_max));
@@ -3710,13 +3701,10 @@ fn push_text_documents(
         }
         previous_offset = Some(chunk.byte_offset());
         let identity = format!("{}#{index}", file.path().as_str());
-        documents.extend(text_document(
-            identity,
-            file,
-            name.as_deref(),
-            chunk.content(),
-            left_out,
-        ));
+        documents.extend(
+            text_document(identity, file, name.as_deref(), chunk.content(), left_out)
+                .map(|document| document.at_byte_offset(chunk.byte_offset())),
+        );
     }
 }
 
@@ -7075,9 +7063,11 @@ mod tests {
         );
         assert_eq!(document_path(update).as_str(), "src/lib.rs");
         assert_eq!(
-            update.fields().get(SearchableField::DeclarationSource),
-            Some("pub fn update() {}")
+            update.content(),
+            "",
+            "a declaration's source stays in its file's document"
         );
+        assert_eq!(update.byte_offset(), None);
     }
 
     #[test]
@@ -7748,6 +7738,36 @@ mod tests {
         assert_ne!(second.fingerprint(), first.fingerprint());
         let (fresh, _) = captured_after(root, &LastCapture::default());
         assert_eq!(second.fingerprint(), fresh.fingerprint());
+    }
+
+    /// A text file past the chunk bound publishes each chunk at its start in the file, and a
+    /// file within the bound publishes itself at offset zero.
+    #[test]
+    fn test_text_rows_record_where_their_text_starts_in_the_file() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let text = "one line of chunked text\n".repeat(120);
+        fs::write(directory.path().join("big.txt"), &text).expect("big text");
+        fs::write(directory.path().join("small.txt"), "small\n").expect("small text");
+        let index = indexed(
+            directory.path(),
+            &TextFileInclusion::new(vec!["**".to_owned()], 1_024),
+        );
+        let documents = index.index_documents();
+        let small = documents
+            .iter()
+            .find(|document| document.identity().as_str() == "small.txt")
+            .expect("the small file publishes one row");
+        assert_eq!(small.byte_offset(), Some(0));
+        let chunks: Vec<&IndexDocument> = documents
+            .iter()
+            .filter(|document| document.identity().as_str().starts_with("big.txt#"))
+            .collect();
+        assert!(chunks.len() > 2, "the big file splits: {}", chunks.len());
+        for chunk in chunks {
+            let start = usize::try_from(chunk.byte_offset().expect("a chunk records its start"))
+                .expect("offset fits");
+            assert_eq!(&text[start..start + chunk.content().len()], chunk.content());
+        }
     }
 
     #[test]

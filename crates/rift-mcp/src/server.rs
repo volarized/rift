@@ -24,7 +24,9 @@ use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
     WorkspaceResourcePage, WorkspaceSourceUnit,
 };
-use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
+use rift_ranking::{
+    BodyTerms, FileRowFrequencies, ParsedQuery, QueryPhase, RankingInput, RankingWeights,
+};
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
     RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
@@ -958,6 +960,9 @@ struct PhasedRanking {
     broad: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
     readiness: VectorReadiness,
+    /// The document frequencies a body match scores declarations with, read beside the
+    /// ranking; absent for a query carrying no term.
+    file_rows: Option<FileRowFrequencies>,
 }
 
 /// The ranking one search request merges, and what the search index's own state adds to
@@ -1017,7 +1022,8 @@ fn ranking_of(
             let mut warnings = readiness_warnings(phased.readiness, files);
             warnings.extend(phased.lexical_truncated_at.map(lexical_truncated));
             Some(SearchRanking {
-                answer: StoreAnswer::new(phased.precise, phased.broad, weights),
+                answer: StoreAnswer::new(phased.precise, phased.broad, weights)
+                    .with_file_rows(phased.file_rows),
                 warnings,
             })
         }
@@ -2141,12 +2147,37 @@ impl RiftMcp {
         } else {
             Vec::new()
         };
+        let file_rows = self.file_rows(index, tree_revision, query).await?;
         Ok(RevisionScoped::Matched(PhasedRanking {
             lexical_truncated_at: precise.lexical_truncated_at(),
             readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
+            file_rows,
         }))
+    }
+
+    /// The document frequencies of `query`'s terms over the store's file rows, or nothing
+    /// for a query carrying no term, or a store that moved past `tree_revision` between
+    /// the ranking and this read.
+    async fn file_rows(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+    ) -> Result<Option<FileRowFrequencies>, ErrorData> {
+        let terms = BodyTerms::of(query);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let read = index
+            .file_row_frequencies(tree_revision, &terms)
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        Ok(match read {
+            RevisionScoped::Matched(frequencies) => Some(frequencies),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+        })
     }
 
     /// One phase of the store's ranking for `tree_revision`.
@@ -3937,19 +3968,16 @@ mod tests {
         assert_eq!(file_hit["matched_by"], json!(["content"]));
 
         // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
-        // documentation column is what carried the query into this declaration. The
-        // declaration's own span is extended over its attached doc comment, so the
-        // declaration-source column holds the same bytes and rides along as `content`.
+        // documentation column is what carried the query into this declaration. Its source
+        // is stored once, in `lib.rs`'s file row, and a body match never adds a column to a
+        // declaration already placed, so `content` does not ride along.
         let symbol_hit = results
             .iter()
             .find(|hit| {
                 hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
             })
             .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
-        assert_eq!(
-            symbol_hit["matched_by"],
-            json!(["documentation", "content"])
-        );
+        assert_eq!(symbol_hit["matched_by"], json!(["documentation"]));
 
         // The declaration's own name places the same declaration under a name hit.
         let named = search_until_hit(client.peer(), "scale_value", "lib.rs").await?;
@@ -5847,12 +5875,15 @@ mod tests {
         Ok(())
     }
 
-    /// One declaration's content past the lexical unit bound leaves the lexical index
-    /// alone: the publication lands, the sibling answers `search`, the declaration still
-    /// answers `get_symbol`, and the record names the file. The lexical commit runs on
-    /// the building task, so the thread-local subscriber sees it.
+    /// A file row past the lexical unit bound leaves the lexical index alone: the
+    /// publication lands, the sibling answers `search`, the declaration inside the file
+    /// still answers `search` by name, since its own row holds no source, and
+    /// `get_symbol`, and the record names the file. A `[search.text] max_chunk` above the
+    /// unit bound is what lets one row grow past it. The lexical commit runs on the
+    /// building task, so the thread-local subscriber sees it.
     #[tokio::test]
-    async fn an_oversized_declaration_is_left_out_of_search_and_the_rest_serves() -> TestResult {
+    async fn an_oversized_file_row_is_left_out_of_search_and_its_declaration_serves() -> TestResult
+    {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir()?;
@@ -5865,7 +5896,7 @@ mod tests {
             "b".repeat(unit_bytes_max)
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
-        super::hermetic_workspace(directory.path(), "")?;
+        super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
         let (sink, mut drain) = crate::logs::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
 
@@ -5873,6 +5904,14 @@ mod tests {
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
+        let named = serde_json::to_value(run_search(&server, "BLOB").await?)?;
+        let named_hits = named["results"].as_array().ok_or("results are an array")?;
+        assert_eq!(named_hits.len(), 1, "{named:#}");
+        assert_eq!(
+            named_hits[0]["hit"]["symbol"]["name"],
+            json!("BLOB"),
+            "{named:#}"
+        );
         let symbol = get_symbol(&server, "BLOB").await?;
         assert_eq!(
             symbol.hits.len(),
@@ -6301,6 +6340,7 @@ mod tests {
             broad: Vec::new(),
             lexical_truncated_at: None,
             readiness,
+            file_rows: None,
         }
     }
 

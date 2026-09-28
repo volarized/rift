@@ -10,6 +10,7 @@
 //! The boundary is deliberate. Resolving an identity to a declaration needs the
 //! store that published it; deciding which identities win does not.
 
+mod body;
 mod document;
 mod error;
 mod fusion;
@@ -18,6 +19,7 @@ mod query;
 mod reader;
 mod tokenizer;
 
+pub use body::{BODY_MATCH_FILE_ROWS_MAX, BodyMatchPool, BodyTerms, FileRowFrequencies};
 pub use document::{
     CORPUS_TOKENIZER, CorpusRevision, DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity,
     DocumentKind, DocumentLocation, FieldSet, IDENTIFIER_TERMS_BYTES_MAX, IDENTITY_BYTES_MAX,
@@ -25,8 +27,8 @@ pub use document::{
 };
 pub use error::{RankingError, RankingFault, RankingViolation};
 pub use fusion::{
-    FUSION_K_MAX, FUSION_K_MIN, FusedCandidate, RankedCandidates, RankedIdentity, RankingInput,
-    RankingInputKind, RankingInputSet, RankingWeights, fuse,
+    FUSION_K_MAX, FUSION_K_MIN, FileRowAnswer, FusedCandidate, RankedCandidates, RankedIdentity,
+    RankingInput, RankingInputKind, RankingInputSet, RankingWeights, fuse,
 };
 pub use identifier::{
     IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatchClass, IdentifierRanking,

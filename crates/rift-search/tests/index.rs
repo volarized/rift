@@ -322,16 +322,11 @@ fn project_document(
     )?)
 }
 
-/// One symbol document carrying a declaration name and its own source.
-fn symbol(
-    identity: &str,
-    path: &str,
-    name: &str,
-    declaration_source: &str,
-) -> Fallible<IndexDocument> {
+/// One symbol document carrying a declaration name and its signature.
+fn symbol(identity: &str, path: &str, name: &str, signature: &str) -> Fallible<IndexDocument> {
     let fields = DocumentFields::empty()
         .with(SearchableField::Name, name)
-        .with(SearchableField::DeclarationSource, declaration_source);
+        .with(SearchableField::Signature, signature);
     project_document(identity, path, DocumentKind::Symbol, fields)
 }
 
@@ -993,7 +988,7 @@ async fn a_disabled_tier_answers_in_the_full_text_order_alone() -> TestResult {
     );
     assert_eq!(
         fields_of(carried, "one")?,
-        FieldSet::of(SearchableField::DeclarationSource)
+        FieldSet::of(SearchableField::Signature)
     );
     assert!(
         !input(&ranking, RankingInputKind::Vector)?.answered(),
@@ -1675,7 +1670,7 @@ async fn the_full_text_input_names_the_column_that_carried_the_term() -> TestRes
                 SearchableField::Documentation,
                 "forwards every beacon it receives",
             )
-            .with(SearchableField::DeclarationSource, "pub fn relay() {}"),
+            .with(SearchableField::Signature, "pub fn relay()"),
     )?;
     let noted = text_document("docs/notes.md", "the beacon reports nightly")?;
     index

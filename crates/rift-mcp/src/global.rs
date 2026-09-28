@@ -607,7 +607,7 @@ fn candidate_fields(hit: &SearchHit) -> FieldSet {
             rift_protocol::read::MatchedField::Documentation => {
                 Some(SearchableField::Documentation)
             }
-            rift_protocol::read::MatchedField::Content => Some(SearchableField::DeclarationSource),
+            rift_protocol::read::MatchedField::Content => Some(SearchableField::FileContent),
             _ => None,
         })
         .collect();

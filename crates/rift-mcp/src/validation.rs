@@ -5274,19 +5274,20 @@ pub(crate) mod tests {
         Ok(SearchIndex::open(database, limits).await?)
     }
 
-    /// One symbol document whose declaration source is `bytes` long, for the bound cases.
+    /// One file document whose text is `bytes` long, for the bound cases: the content
+    /// bound applies to file text, the one content a document stores.
     fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<IndexDocument> {
         let fields = DocumentFields::empty()
             .with(SearchableField::Name, identity)
-            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+            .with(SearchableField::FileContent, "x".repeat(bytes));
         let document = IndexDocument::new(
             DocumentIdentity::new(identity)?,
             DocumentLocation::Project(rift_core::ProjectPath::new(path)?),
-            DocumentKind::Symbol,
+            DocumentKind::TextFile,
             fields.digest(),
             fields,
         )?;
-        Ok(document)
+        Ok(document.at_byte_offset(0))
     }
 
     /// Whether `document` addresses the chunked guide the text-file cases write.
@@ -5354,10 +5355,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The lane commits the rest of the set when one declaration exceeds the store's
-    /// unit bound, stamps the revision, and records the unit it left out. The store's own
-    /// refusal is what this replaces: `lexical.rs` still refuses such a unit handed to it
-    /// directly.
+    /// The lane commits the rest of the set when one file row exceeds the store's unit
+    /// bound, stamps the revision, and records the unit it left out. The declaration
+    /// inside that file keeps its own row, which holds no source. The store's own refusal
+    /// is what this replaces: `lexical.rs` still refuses such a unit handed to it directly.
     #[tokio::test]
     async fn a_commit_leaves_out_an_oversized_unit_records_it_and_publishes_the_rest() -> TestResult
     {
@@ -5397,7 +5398,13 @@ pub(crate) mod tests {
             "the sibling declaration stays searchable"
         );
         let blob = ranked_at(&index, published.reads.tree_revision(), "BLOB", 8).await?;
-        assert!(blob.is_empty(), "the oversized unit is absent: {blob:?}");
+        assert_eq!(
+            blob.iter()
+                .map(DocumentIdentity::as_str)
+                .collect::<Vec<_>>(),
+            ["rift://symbol/rust/blob.rs/BLOB"],
+            "the oversized file row is absent and its declaration's row stays"
+        );
         let recorded = queued_records(&mut drain);
         let left_out = recorded
             .iter()

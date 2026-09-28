@@ -42,10 +42,7 @@ fn document(index: usize) -> Result<IndexDocument, Box<dyn std::error::Error>> {
     let fields = DocumentFields::empty()
         .with(SearchableField::Name, name.clone())
         .with(SearchableField::QualifiedName, format!("crate::{name}"))
-        .with(
-            SearchableField::DeclarationSource,
-            format!("fn {name}() -> u32 {{ {index} }}"),
-        );
+        .with(SearchableField::Signature, format!("fn {name}() -> u32"));
     let digest = fields.digest();
     Ok(IndexDocument::new(
         DocumentIdentity::new(format!("rift://symbol/rust/unit_{index}.rs/declaration"))?,

@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use rift_core::{
@@ -36,10 +37,11 @@ use rift_protocol::configuration::{
     LEXICAL_TRANSACTION_BYTES_DEFAULT, LEXICAL_TRANSACTION_UNITS_DEFAULT, LEXICAL_UNITS_MAX_DEFAULT,
 };
 use rift_ranking::{
-    CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet,
-    IndexCapabilities, IndexDocument, IndexReader, ParsedQuery, PublicationFormat, QueryPhase,
-    RankRequest, RankedIdentity, RankingError, RankingFault, RankingInput, RankingInputKind,
-    RankingInputSet, RankingViolation, ReaderFuture, SearchableField,
+    BodyTerms, CorpusRevision, DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation,
+    FieldSet, FileRowFrequencies, IndexCapabilities, IndexDocument, IndexReader, ParsedQuery,
+    PublicationFormat, QueryPhase, RankRequest, RankedIdentity, RankingError, RankingFault,
+    RankingInput, RankingInputKind, RankingInputSet, RankingViolation, ReaderFuture,
+    SearchableField,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -217,6 +219,43 @@ CREATE INDEX documentation_references_target ON documentation_references(target)
 -- #[toasty::breakpoint]
 CREATE INDEX documentation_references_source ON documentation_references(source)",
     ),
+    MigrationFile::new(
+        9,
+        "lexical_one_copy",
+        "DROP TABLE lexical_documents_fts
+-- #[toasty::breakpoint]
+DROP TABLE lexical_documents
+-- #[toasty::breakpoint]
+DELETE FROM lexical_files
+-- #[toasty::breakpoint]
+DELETE FROM lexical_index_state
+-- #[toasty::breakpoint]
+CREATE TABLE lexical_documents(
+        id INTEGER PRIMARY KEY,
+        identity TEXT NOT NULL UNIQUE,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        byte_length BIGINT NOT NULL,
+        byte_offset BIGINT,
+        name TEXT,
+        qualified_name TEXT,
+        identifier_terms TEXT,
+        signature TEXT,
+        documentation TEXT,
+        file_content TEXT
+    )
+-- #[toasty::breakpoint]
+CREATE INDEX lexical_documents_path ON lexical_documents(path)
+-- #[toasty::breakpoint]
+CREATE INDEX lexical_documents_file_rows ON lexical_documents(id) WHERE file_content IS NOT NULL
+-- #[toasty::breakpoint]
+CREATE VIRTUAL TABLE lexical_documents_fts USING fts5(name, qualified_name, identifier_terms, \
+signature, documentation, file_content, content='lexical_documents', content_rowid='id', \
+tokenize='unicode61 remove_diacritics 0')
+-- #[toasty::breakpoint]
+CREATE VIRTUAL TABLE lexical_documents_vocabulary USING fts5vocab('lexical_documents_fts', 'col')",
+    ),
 ];
 pub(crate) const MIGRATIONS: MigrationSet = MigrationSet::new(MIGRATION_FILES);
 
@@ -288,7 +327,13 @@ impl LexicalRanking {
             RankingInputKind::Lexical,
             self.matches
                 .into_iter()
-                .map(|matched| RankedIdentity::new(matched.identity, matched.fields))
+                .map(|matched| {
+                    let ranked = RankedIdentity::new(matched.identity, matched.fields);
+                    match matched.file_range {
+                        Some(file_range) => ranked.with_file_range(file_range),
+                        None => ranked,
+                    }
+                })
                 .collect(),
         )
     }
@@ -311,6 +356,7 @@ pub struct LexicalMatch {
     kind: DocumentKind,
     rank: f64,
     fields: FieldSet,
+    file_range: Option<Range<u64>>,
 }
 
 impl LexicalMatch {
@@ -332,7 +378,22 @@ impl LexicalMatch {
             kind,
             rank,
             fields,
+            file_range: None,
         }
+    }
+
+    /// The same match, its row holding the bytes `file_range` of its file.
+    #[must_use]
+    pub fn with_file_range(mut self, file_range: Range<u64>) -> Self {
+        self.file_range = Some(file_range);
+        self
+    }
+
+    /// The bytes of its file the matched row holds - the whole file, or one chunk of a
+    /// large one - or `None` for a row holding no file text.
+    #[must_use]
+    pub const fn file_range(&self) -> Option<&Range<u64>> {
+        self.file_range.as_ref()
     }
 
     /// Returns the matched document's stable identity.
@@ -825,12 +886,12 @@ pub(crate) struct LexicalDocumentRecord {
     kind: String,
     digest: String,
     byte_length: i64,
+    byte_offset: Option<i64>,
     name: Option<String>,
     qualified_name: Option<String>,
     identifier_terms: Option<String>,
     signature: Option<String>,
     documentation: Option<String>,
-    declaration_source: Option<String>,
     file_content: Option<String>,
 }
 
@@ -864,6 +925,24 @@ fn checked_byte_length(bytes: usize) -> i64 {
         unreachable!(
             "content byte length must fit i64 once bounded by unit_bytes_max: bytes={bytes}"
         )
+    })
+}
+
+/// Converts a row's offset in its file, bounded by the index's per-file byte bound, into
+/// the integer `lexical_documents.byte_offset` stores.
+fn checked_byte_offset(offset: u64) -> i64 {
+    i64::try_from(offset).unwrap_or_else(|_| {
+        unreachable!("a file offset must fit i64 once bounded by file_bytes_max: offset={offset}")
+    })
+}
+
+/// Reads a stored row offset back, refusing a negative value no write produces.
+fn stored_byte_offset(offset: i64) -> Result<u64, LexicalIndexError> {
+    u64::try_from(offset).map_err(|_| {
+        lexical_error(LexicalIndexViolation::Storage).with_context(ErrorContext::new(
+            "byte offset",
+            format!("a stored row offset is negative: offset={offset}"),
+        ))
     })
 }
 
@@ -1021,6 +1100,42 @@ async fn indexed_unit_count(executor: &mut dyn Executor) -> Result<usize, Lexica
     Ok(usize::try_from(counted).unwrap_or(usize::MAX))
 }
 
+/// How many typed rows hold file text: whole files and the chunks of large ones. A
+/// partial index over those rows alone answers the count without reading a symbol row.
+async fn file_row_count(executor: &mut dyn Executor) -> Result<u64, LexicalIndexError> {
+    let counted = single_i64(
+        executor,
+        "SELECT count(*) FROM lexical_documents WHERE file_content IS NOT NULL",
+        "file rows",
+    )
+    .await?;
+    Ok(u64::try_from(counted).unwrap_or(0))
+}
+
+/// How many file rows hold `term`, read from the word index's own `file_content` column
+/// through its `fts5vocab` table: one term lookup, never a scan of the rows.
+async fn file_rows_holding(
+    executor: &mut dyn Executor,
+    term: &str,
+) -> Result<u64, LexicalIndexError> {
+    let rows = toasty::sql::query(
+        "SELECT doc FROM lexical_documents_vocabulary \
+         WHERE term = ?1 AND col = 'file_content'",
+    )
+    .bind(term.to_owned())
+    .column_types([Type::I64])
+    .exec(executor)
+    .await
+    .map_err(storage_error)?;
+    Ok(match rows.as_slice() {
+        [Value::Record(record)] => match record.as_slice() {
+            [Value::I64(holding)] => u64::try_from(*holding).unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    })
+}
+
 /// The highest typed-row id right now, or zero in an empty table.
 ///
 /// An `INTEGER PRIMARY KEY` row inserted without an id takes one past the highest id the
@@ -1101,12 +1216,12 @@ async fn insert_document(
         kind: document.kind().stored_value().to_owned(),
         digest: document.digest().to_owned(),
         byte_length: checked_byte_length(content.len()),
+        byte_offset: document.byte_offset().map(checked_byte_offset),
         name: field(SearchableField::Name),
         qualified_name: field(SearchableField::QualifiedName),
         identifier_terms: field(SearchableField::IdentifierTerms),
         signature: field(SearchableField::Signature),
         documentation: field(SearchableField::Documentation),
-        declaration_source: field(SearchableField::DeclarationSource),
         file_content: field(SearchableField::FileContent),
     })
     .exec(executor)
@@ -1173,10 +1288,6 @@ fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, Lexic
         (SearchableField::IdentifierTerms, record.identifier_terms),
         (SearchableField::Signature, record.signature),
         (SearchableField::Documentation, record.documentation),
-        (
-            SearchableField::DeclarationSource,
-            record.declaration_source,
-        ),
         (SearchableField::FileContent, record.file_content),
     ];
     let fields = stored
@@ -1184,7 +1295,7 @@ fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, Lexic
         .fold(DocumentFields::empty(), |held, (field, value)| {
             held.with_optional(field, value)
         });
-    IndexDocument::new(
+    let document = IndexDocument::new(
         identity,
         DocumentLocation::Project(path),
         kind,
@@ -1193,6 +1304,10 @@ fn decode_document(record: LexicalDocumentRecord) -> Result<IndexDocument, Lexic
     )
     .map_err(|source| {
         lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
+    })?;
+    Ok(match record.byte_offset {
+        Some(offset) => document.at_byte_offset(stored_byte_offset(offset)?),
+        None => document,
     })
 }
 
@@ -1209,6 +1324,8 @@ fn decode_lexical_match(row: &Value) -> Result<LexicalMatch, LexicalIndexError> 
         Value::String(identity),
         Value::String(path),
         Value::String(kind),
+        byte_offset,
+        Value::I64(byte_length),
         Value::F64(rank),
         isolated @ ..,
     ] = record.as_slice()
@@ -1225,13 +1342,26 @@ fn decode_lexical_match(row: &Value) -> Result<LexicalMatch, LexicalIndexError> 
     let identity = DocumentIdentity::new(identity.clone()).map_err(|source| {
         lexical_error_caused_by(LexicalIndexViolation::StoredKindInvalid, None, source)
     })?;
+    let file_range = match byte_offset {
+        Value::I64(offset) => Some(stored_file_range(*offset, *byte_length)?),
+        _ => None,
+    };
     Ok(LexicalMatch {
         identity,
         path,
         kind,
         rank: *rank,
         fields: matched_fields(isolated),
+        file_range,
     })
+}
+
+/// The bytes of its file one stored row holds: its offset, and the length of the text
+/// it stores.
+fn stored_file_range(offset: i64, length: i64) -> Result<Range<u64>, LexicalIndexError> {
+    let start = stored_byte_offset(offset)?;
+    let length = stored_byte_offset(length)?;
+    Ok(start..start.saturating_add(length))
 }
 
 /// The columns that carried a query member.
@@ -1311,7 +1441,8 @@ fn lexical_search_sql() -> String {
     }
     format!(
         "SELECT lexical_documents.identity, lexical_documents.path, \
-         lexical_documents.kind, \
+         lexical_documents.kind, lexical_documents.byte_offset, \
+         lexical_documents.byte_length, \
          bm25(lexical_documents_fts, {ranked}) AS rank{isolated} \
          FROM lexical_documents_fts \
          JOIN lexical_documents \
@@ -1323,7 +1454,14 @@ fn lexical_search_sql() -> String {
 
 /// The declared result types of [`lexical_search_sql`], in column order.
 fn lexical_search_column_types() -> Vec<Type> {
-    let mut types = vec![Type::String, Type::String, Type::String, Type::F64];
+    let mut types = vec![
+        Type::String,
+        Type::String,
+        Type::String,
+        Type::I64,
+        Type::I64,
+        Type::F64,
+    ];
     types.extend(SearchableField::ALL.map(|_| Type::F64));
     types
 }
@@ -1974,6 +2112,42 @@ impl LexicalSearchIndex {
         .await
     }
 
+    /// How many file rows the store holds for `tree_revision`, and how many of them hold
+    /// each of `terms`: the document frequencies a body match scores declarations with.
+    ///
+    /// Both reads run in one transaction beside the stamp, so the counts answer for the
+    /// same rows the ranking of that tree read. The work is one indexed count and one
+    /// `fts5vocab` lookup per term.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] on storage failure.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancellation performs no writes; the transaction is read-only.
+    pub async fn file_row_frequencies(
+        &self,
+        tree_revision: &str,
+        terms: &BodyTerms,
+    ) -> Result<RevisionScoped<FileRowFrequencies>, LexicalIndexError> {
+        let mut connection = self.database.connection().await?;
+        let mut transaction = connection.transaction().await.map_err(storage_error)?;
+        let stored = stored_stamp(&mut transaction).await?;
+        if let Some(scoped) = stamp_scope(stored, tree_revision) {
+            return Ok(scoped);
+        }
+        let rows = file_row_count(&mut transaction).await?;
+        let mut by_term = Vec::new();
+        for term in terms.iter() {
+            let holding = file_rows_holding(&mut transaction, term).await?;
+            by_term.push((term.to_owned(), holding));
+        }
+        Ok(RevisionScoped::Matched(FileRowFrequencies::new(
+            rows, by_term,
+        )))
+    }
+
     /// Runs the full-text ranking as one fusion input, best first.
     ///
     /// The input carries the identities in rank order together with the
@@ -2005,10 +2179,11 @@ impl LexicalSearchIndex {
     }
 
     /// Returns one document's indexed content by its identity, or `None` when
-    /// no document with that identity is indexed.
+    /// no document with that identity holds any.
     ///
-    /// The content is the declaration source of a symbol document and the
-    /// text of a file document: the one field a reader excerpts from.
+    /// The content is a file document's text, or the one chunk of a large file
+    /// its row stores: the one field a reader excerpts from. A symbol document
+    /// holds none, since its declaration's source is a range of that text.
     ///
     /// # Errors
     ///
@@ -2027,7 +2202,7 @@ impl LexicalSearchIndex {
             .exec(&mut connection)
             .await
             .map_err(storage_error)?;
-        Ok(record.and_then(|record| record.declaration_source.or(record.file_content)))
+        Ok(record.and_then(|record| record.file_content))
     }
 
     /// Reads one document back by its stable identity, or `None` when this store
@@ -2193,20 +2368,21 @@ mod tests {
         )
     }
 
-    /// One unit filed under `path`, carrying `bytes` of declaration source.
+    /// One unit filed under `path`, carrying `bytes` of file text.
     fn unit_under(path: &str, name: &str, bytes: usize) -> IndexDocument {
         let fields = DocumentFields::empty()
             .with(SearchableField::Name, name)
-            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+            .with(SearchableField::FileContent, "x".repeat(bytes));
         let digest = fields.digest();
         IndexDocument::new(
             identity(&format!("{path}#{name}")),
             DocumentLocation::Project(ProjectPath::new(path).expect("fixture path must be valid")),
-            DocumentKind::Symbol,
+            DocumentKind::TextFile,
             digest,
             fields,
         )
         .expect("fixture document must construct")
+        .at_byte_offset(0)
     }
 
     fn fixture_change(paths: &[(&str, usize)], unit_bytes: usize) -> LexicalChange {
@@ -2244,17 +2420,17 @@ mod tests {
             .collect()
     }
 
-    fn symbol_document(name: &str, source: &str) -> IndexDocument {
+    /// One file document under `src/a.rs` whose text is `content`.
+    fn file_document(name: &str, content: &str) -> IndexDocument {
         let path = ProjectPath::new("src/a.rs").expect("fixture path must be valid");
         let fields = DocumentFields::empty()
             .with(SearchableField::Name, name)
-            .with(SearchableField::QualifiedName, format!("crate::{name}"))
-            .with(SearchableField::DeclarationSource, source);
+            .with(SearchableField::FileContent, content);
         let digest = fields.digest();
         IndexDocument::new(
-            identity(&format!("crate::{name}")),
+            identity(&format!("src/a.rs#{name}")),
             DocumentLocation::Project(path),
-            DocumentKind::Symbol,
+            DocumentKind::TextFile,
             digest,
             fields,
         )
@@ -2346,7 +2522,7 @@ mod tests {
 
     #[test]
     fn test_a_content_field_at_the_configured_bound_passes() {
-        let document = symbol_document("a", "12345678");
+        let document = file_document("a", "12345678");
         let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
         validate_lexical_batch(&[document], limits)
             .expect("content at the exact bound must not refuse");
@@ -2354,7 +2530,7 @@ mod tests {
 
     #[test]
     fn test_a_content_field_over_the_configured_bound_refuses_naming_the_column() {
-        let document = symbol_document("a", "way too much body content");
+        let document = file_document("a", "way too much body content");
         let limits = LexicalIndexLimits::new(100, 8, 100, 4, 1_000);
         let error = validate_lexical_batch(&[document], limits)
             .expect_err("content one over the bound must refuse");
@@ -2367,13 +2543,13 @@ mod tests {
             .iter()
             .find(|entry| entry.key() == "field")
             .map(rift_core::ErrorContext::value);
-        assert_eq!(field, Some("declaration_source"));
+        assert_eq!(field, Some("file_content"));
         assert_eq!(error.fault().path(), Some(std::path::Path::new("src/a.rs")));
     }
 
     #[test]
     fn test_a_batch_repeating_one_identity_refuses() {
-        let documents = vec![symbol_document("a", "body"), symbol_document("a", "other")];
+        let documents = vec![file_document("a", "body"), file_document("a", "other")];
         let error = validate_lexical_batch(&documents, LexicalIndexLimits::default())
             .expect_err("a repeated identity must refuse");
         assert_eq!(
@@ -2405,7 +2581,7 @@ mod tests {
 
     #[test]
     fn test_unit_limit_exposes_typed_limit_evidence() {
-        let documents = vec![symbol_document("a", "body"), symbol_document("b", "body")];
+        let documents = vec![file_document("a", "body"), file_document("b", "body")];
         let limits = LexicalIndexLimits::new(1, 1_048_576, 1_000, 4, 1_000);
         let error = validate_lexical_batch(&documents, limits)
             .expect_err("a batch over units_max must refuse");
@@ -2506,13 +2682,21 @@ mod tests {
             );
         }
         assert!(typed.contains("id INTEGER PRIMARY KEY"));
+        assert!(
+            typed.contains("byte_offset BIGINT"),
+            "a row records where its text starts in its file: {typed}"
+        );
+        assert!(
+            !typed.contains("declaration_source"),
+            "no row stores a declaration's source beside its file's text: {typed}"
+        );
     }
 
-    /// The migration that declares the rowid-addressed corpus, as one line.
+    /// The migration that declares the current rowid-addressed corpus, as one line.
     fn rows_migration_sql() -> String {
         MIGRATION_FILES
             .iter()
-            .find(|file| file.name() == "lexical_rows")
+            .find(|file| file.name() == "lexical_one_copy")
             .expect("the corpus migration must exist")
             .sql()
             .replace('\n', " ")
@@ -2530,7 +2714,7 @@ mod tests {
     #[test]
     fn test_isolated_weights_raise_exactly_one_column() {
         let rendered = isolated_weights(SearchableField::Documentation);
-        assert_eq!(rendered, "0, 0, 0, 0, 1, 0, 0");
+        assert_eq!(rendered, "0, 0, 0, 0, 1, 0");
     }
 
     #[test]
@@ -2542,8 +2726,9 @@ mod tests {
             SearchableField::ALL.len() + 1,
             "one alias ranks the row and one more isolates each column"
         );
-        // Three plain columns precede the aliases: identity, path, and kind.
-        assert_eq!(lexical_search_column_types().len(), aliased + 3);
+        // Five plain columns precede the aliases: identity, path, kind, and the bytes of
+        // its file the row holds.
+        assert_eq!(lexical_search_column_types().len(), aliased + 5);
         for field in SearchableField::ALL {
             assert!(
                 sql.contains(&format!("AS {}_hit", field.column())),
@@ -2604,12 +2789,12 @@ mod tests {
             kind: "symbol".to_owned(),
             digest: "0f1e2d3c".to_owned(),
             byte_length: 4,
+            byte_offset: None,
             name: Some("a".to_owned()),
             qualified_name: Some("crate::a".to_owned()),
             identifier_terms: None,
-            signature: None,
+            signature: Some("fn a()".to_owned()),
             documentation: None,
-            declaration_source: Some("body".to_owned()),
             file_content: None,
         };
         let formatted = format!("{record:?}");

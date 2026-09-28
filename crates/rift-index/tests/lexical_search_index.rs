@@ -124,12 +124,12 @@ fn text_document(path: &str, content: &str) -> Result<IndexDocument, Box<dyn std
 }
 
 /// Builds one symbol document carrying a declaration name, that name's split words, and
-/// its declaration source.
+/// its signature.
 fn symbol_document(
     identity: &str,
     path: &str,
     name: &str,
-    declaration_source: &str,
+    signature: &str,
 ) -> Result<IndexDocument, Box<dyn std::error::Error>> {
     let fields = DocumentFields::empty()
         .with(SearchableField::Name, name)
@@ -137,7 +137,7 @@ fn symbol_document(
             SearchableField::IdentifierTerms,
             identifier_terms([name], IDENTIFIER_TERMS_BYTES_MAX),
         )
-        .with(SearchableField::DeclarationSource, declaration_source);
+        .with(SearchableField::Signature, signature);
     document(identity, path, DocumentKind::Symbol, fields)
 }
 
@@ -243,9 +243,7 @@ async fn test_lexical_search_index_search_names_the_column_that_carried_the_term
         "crate::beacon",
         "src/beacon.rs",
         DocumentKind::Symbol,
-        DocumentFields::empty()
-            .with(SearchableField::Name, "beacon")
-            .with(SearchableField::DeclarationSource, "pub fn declare() {}"),
+        DocumentFields::empty().with(SearchableField::Name, "beacon"),
     )?;
     let documented = document(
         "crate::relay",
@@ -256,8 +254,7 @@ async fn test_lexical_search_index_search_names_the_column_that_carried_the_term
             .with(
                 SearchableField::Documentation,
                 "forwards every beacon it receives",
-            )
-            .with(SearchableField::DeclarationSource, "pub fn relay() {}"),
+            ),
     )?;
     index
         .replace_all(&[named, documented], "revision-1")
@@ -300,8 +297,7 @@ async fn test_lexical_search_index_search_reaches_a_document_through_any_one_fie
                 .with(
                     SearchableField::Signature,
                     "fn dispatch(payload: Envelope) -> Receipt",
-                )
-                .with(SearchableField::DeclarationSource, "pub fn dispatch() {}"),
+                ),
         )?,
         document(
             "crate::collect",
@@ -312,18 +308,6 @@ async fn test_lexical_search_index_search_reaches_a_document_through_any_one_fie
                 .with(
                     SearchableField::Documentation,
                     "drains the mailbox before it returns",
-                )
-                .with(SearchableField::DeclarationSource, "pub fn collect() {}"),
-        )?,
-        document(
-            "crate::render",
-            "src/render.rs",
-            DocumentKind::Symbol,
-            DocumentFields::empty()
-                .with(SearchableField::Name, "render")
-                .with(
-                    SearchableField::DeclarationSource,
-                    "pub fn render() { paint_surface() }",
                 ),
         )?,
         text_document("docs/notes.md", "the quarterly retrospective lives here")?,
@@ -333,11 +317,6 @@ async fn test_lexical_search_index_search_reaches_a_document_through_any_one_fie
     for (query, expected, field) in [
         ("envelope", "crate::dispatch", SearchableField::Signature),
         ("mailbox", "crate::collect", SearchableField::Documentation),
-        (
-            "paint_surface",
-            "crate::render",
-            SearchableField::DeclarationSource,
-        ),
         (
             "retrospective",
             "docs/notes.md",
@@ -705,8 +684,8 @@ async fn test_lexical_search_index_content_returns_each_kind_s_own_field_and_non
     );
     assert_eq!(
         index.content(&identity("crate::beacon")?).await?,
-        Some("pub fn beacon() {}".to_owned()),
-        "a symbol document answers with its declaration source"
+        None,
+        "a symbol document stores no source: its declaration is a range of its file row"
     );
     assert_eq!(index.content(&identity("docs/missing.md")?).await?, None);
     Ok(())
@@ -770,7 +749,7 @@ async fn test_lexical_search_index_symbol_and_text_file_documents_coexist() -> T
     assert_eq!(symbol_hits[0].path().as_str(), "src/widgets.rs");
     assert_eq!(
         symbol_hits[0].fields(),
-        FieldSet::of(SearchableField::DeclarationSource)
+        FieldSet::of(SearchableField::Signature)
     );
 
     let text_hits = search_matches(&index, "revision-1", "prose", 10).await?;
@@ -792,8 +771,7 @@ async fn test_lexical_search_index_symbol_and_text_file_documents_coexist() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_declaration_source_hit()
--> TestResult {
+async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_signature_hit() -> TestResult {
     let directory = TempDir::new()?;
     let path = database_path(&directory);
     let index = LexicalSearchIndex::attached(
@@ -808,8 +786,8 @@ async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_declaration_s
         DocumentFields::empty()
             .with(SearchableField::Name, "SearchHit")
             .with(
-                SearchableField::DeclarationSource,
-                "fn locate() { finds nothing relevant here }",
+                SearchableField::Signature,
+                "fn locate() -> finds nothing relevant here",
             ),
     )?;
     let bodied = document(
@@ -819,8 +797,8 @@ async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_declaration_s
         DocumentFields::empty()
             .with(SearchableField::Name, "Unrelated")
             .with(
-                SearchableField::DeclarationSource,
-                "this function will search the entire tree",
+                SearchableField::Signature,
+                "fn unrelated(search: the entire tree)",
             ),
     )?;
     index.replace_all(&[named, bodied], "revision-1").await?;
@@ -829,18 +807,15 @@ async fn test_lexical_search_index_search_ranks_a_name_hit_above_a_declaration_s
     assert_eq!(
         hits.len(),
         2,
-        "both the name hit and the declaration-source hit must be found"
+        "both the name hit and the signature hit must be found"
     );
     assert_eq!(
         hits[0].identity().as_str(),
         "crate::index::SearchHit",
-        "the declared bm25 weights rank a name hit above a declaration-source hit"
+        "the declared bm25 weights rank a name hit above a signature hit"
     );
     assert_eq!(hits[0].fields(), FieldSet::of(SearchableField::Name));
-    assert_eq!(
-        hits[1].fields(),
-        FieldSet::of(SearchableField::DeclarationSource)
-    );
+    assert_eq!(hits[1].fields(), FieldSet::of(SearchableField::Signature));
     assert!(
         hits[0].rank() < hits[1].rank(),
         "rank is ascending, so the name hit carries the lower value"
@@ -889,12 +864,12 @@ struct ConcurrentDocumentRecord {
     kind: String,
     digest: String,
     byte_length: i64,
+    byte_offset: Option<i64>,
     name: Option<String>,
     qualified_name: Option<String>,
     identifier_terms: Option<String>,
     signature: Option<String>,
     documentation: Option<String>,
-    declaration_source: Option<String>,
     file_content: Option<String>,
 }
 
@@ -937,12 +912,12 @@ async fn test_lexical_search_index_content_sees_only_committed_writes_during_con
         kind: "text_file",
         digest: "0f1e2d3c",
         byte_length: 5,
+        byte_offset: Some(0),
         name: Some("b.md".to_owned()),
         qualified_name: None,
         identifier_terms: None,
         signature: None,
         documentation: None,
-        declaration_source: None,
         file_content: Some("bravo".to_owned()),
     })
     .exec(&mut probe_transaction)
@@ -978,12 +953,12 @@ async fn insert_corrupt_lexical_row(
         kind: kind.to_owned(),
         digest: "0f1e2d3c".to_owned(),
         byte_length: i64::try_from(content.len())?,
+        byte_offset: Some(0),
         name: None,
         qualified_name: None,
         identifier_terms: None,
         signature: None,
         documentation: None,
-        declaration_source: None,
         file_content: Some(content.to_owned()),
     })
     .exec(&mut probe_connection)
@@ -1815,6 +1790,230 @@ async fn test_lexical_search_index_keeps_the_full_text_index_in_step_with_the_ro
             .len(),
         1,
         "a change applied twice leaves one indexed row, never two"
+    );
+    Ok(())
+}
+
+/// Each fixture file's path and its whole text.
+type FixtureFiles = Vec<(&'static str, String)>;
+
+/// A workspace whose text files, past a 1kb chunk bound, split into chunk rows: a CRLF
+/// file, a file of multibyte lines, and a plain one, each holding `marker` on every line.
+fn chunked_workspace() -> Result<(TempDir, FixtureFiles), Box<dyn std::error::Error>> {
+    let tree = TempDir::new()?;
+    let files = vec![
+        (
+            "crlf.txt",
+            "alpha line one\r\nbeta marker two\r\n".repeat(120),
+        ),
+        (
+            "multibyte.txt",
+            "gr\u{fc}\u{df}e \u{65e5}\u{672c}\u{8a9e} beta marker\n".repeat(120),
+        ),
+        ("plain.txt", "gamma plain words beta marker\n".repeat(120)),
+    ];
+    for (name, text) in &files {
+        std::fs::write(tree.path().join(name), text)?;
+    }
+    Ok((tree, files))
+}
+
+/// The index of `root` with every visible file as text, chunked at the smallest bound.
+fn chunked_index(root: &Path) -> Result<rift_index::WorkspaceIndex, Box<dyn std::error::Error>> {
+    Ok(rift_index::WorkspaceIndex::build_with_languages(
+        root,
+        rift_index::WorkspaceIndexLimits::default(),
+        &rift_core::SourceVisibility::default(),
+        &rift_core::TextFileInclusion::new(vec!["**".to_owned()], 1_024),
+        &rift_core::LanguageFileSelections::default(),
+    )?)
+}
+
+/// A file past `max_chunk` is stored as `path#N` rows, and each row carries its chunk's
+/// start in the file, so a position inside a chunk maps back to the file without chunking
+/// again: over CRLF text, multibyte text, and plain text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_chunk_rows_carry_their_offset_in_the_file() -> TestResult {
+    let (tree, files) = chunked_workspace()?;
+    let workspace = chunked_index(tree.path())?;
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    index
+        .replace_all(&workspace.index_documents(), "revision-1")
+        .await?;
+    for (name, text) in &files {
+        let mut chunks = 0;
+        while let Some(row) = index
+            .document(&identity(&format!("{name}#{chunks}"))?)
+            .await?
+        {
+            let offset =
+                usize::try_from(row.byte_offset().ok_or("a chunk row carries its offset")?)?;
+            let content = row.content();
+            assert_eq!(
+                &text[offset..offset + content.len()],
+                content,
+                "{name}#{chunks}"
+            );
+            let at = content.find("marker").ok_or("every chunk holds the term")?;
+            assert_eq!(&text[offset + at..offset + at + "marker".len()], "marker");
+            chunks += 1;
+        }
+        assert!(chunks > 2, "{name} must split into chunks: {chunks}");
+    }
+    Ok(())
+}
+
+/// A ranked file row states the bytes of its file it holds, the same bytes the typed row
+/// stores, and a symbol row states none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_ranked_file_row_states_the_bytes_of_its_file_it_holds() -> TestResult {
+    let (tree, files) = chunked_workspace()?;
+    let workspace = chunked_index(tree.path())?;
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let mut documents = workspace.index_documents();
+    documents.push(symbol_document(
+        "rift://symbol/rust/marker.rs/marker",
+        "marker.rs",
+        "marker",
+        "fn marker()",
+    )?);
+    index.replace_all(&documents, "revision-1").await?;
+    let matches = search_matches(&index, "revision-1", "marker", 1_000).await?;
+    let mut file_rows = 0;
+    for matched in &matches {
+        let Some(range) = matched.file_range() else {
+            assert_eq!(matched.kind(), DocumentKind::Symbol, "{matched:?}");
+            continue;
+        };
+        file_rows += 1;
+        let (_, text) = files
+            .iter()
+            .find(|(name, _)| *name == matched.path().as_str())
+            .ok_or("a file row names one of the files")?;
+        let stored = index
+            .content(matched.identity())
+            .await?
+            .ok_or("a file row stores its text")?;
+        let start = usize::try_from(range.start)?;
+        let end = usize::try_from(range.end)?;
+        assert_eq!(&text[start..end], stored, "{}", matched.identity());
+    }
+    assert!(
+        file_rows > 6,
+        "every chunk of the three files ranks: {file_rows}"
+    );
+    let input = search_ranking(&index, "revision-1", "marker", 1_000)
+        .await?
+        .into_input();
+    assert!(
+        input
+            .order()
+            .iter()
+            .any(|ranked| ranked.file_range().is_some()),
+        "the fusion input keeps each file row's range"
+    );
+    Ok(())
+}
+
+/// The document frequencies a body match reads count the rows holding file text alone:
+/// a symbol row holding the same word in its name counts toward neither the row total
+/// nor the term's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_file_row_frequencies_count_file_rows_holding_each_term() -> TestResult {
+    let directory = TempDir::new()?;
+    let index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&database_path(&directory), database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let documents = [
+        text_document("docs/a.md", "beacon lantern beacon")?,
+        text_chunk("docs/b.md#0", "docs/b.md", "one beacon")?,
+        text_chunk("docs/b.md#1", "docs/b.md", "two harbor")?,
+        symbol_document(
+            "rift://symbol/rust/beacon.rs/beacon",
+            "beacon.rs",
+            "beacon",
+            "fn beacon()",
+        )?,
+    ];
+    index.replace_all(&documents, "revision-1").await?;
+    let terms = rift_ranking::BodyTerms::of(&ParsedQuery::parse("Beacon lantern absent")?);
+    let RevisionScoped::Matched(frequencies) =
+        index.file_row_frequencies("revision-1", &terms).await?
+    else {
+        return Err("the store holds revision-1".into());
+    };
+    assert_eq!(frequencies.rows(), 3, "three rows hold file text");
+    assert_eq!(frequencies.rows_holding("beacon"), 2);
+    assert_eq!(frequencies.rows_holding("lantern"), 1);
+    assert_eq!(frequencies.rows_holding("absent"), 0);
+    assert_eq!(
+        index.file_row_frequencies("revision-0", &terms).await?,
+        RevisionScoped::OtherRevision("revision-1".to_owned())
+    );
+    Ok(())
+}
+
+/// The typed table stores no declaration source beside the file text, and the word index
+/// covers the file text once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_the_store_holds_one_copy_of_the_text() -> TestResult {
+    let directory = TempDir::new()?;
+    let path = database_path(&directory);
+    let _index = LexicalSearchIndex::attached(
+        WorkspaceDatabase::open(&path, database_pool()).await?,
+        LexicalIndexLimits::default(),
+    );
+    let probe = open_concurrent_probe(&path).await?;
+    let mut connection = probe.connection().await?;
+    let columns = |table: &'static str| {
+        toasty::sql::query(format!("SELECT name FROM pragma_table_info('{table}')"))
+            .column_types([Type::String])
+    };
+    let typed: Vec<String> = columns("lexical_documents")
+        .exec(&mut connection)
+        .await?
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    assert!(
+        typed.iter().any(|column| column.contains("byte_offset")),
+        "{typed:?}"
+    );
+    assert!(
+        typed.iter().any(|column| column.contains("file_content")),
+        "{typed:?}"
+    );
+    assert!(
+        !typed
+            .iter()
+            .any(|column| column.contains("declaration_source")),
+        "{typed:?}"
+    );
+    let indexed: Vec<String> = columns("lexical_documents_fts")
+        .exec(&mut connection)
+        .await?
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    assert_eq!(
+        indexed.len(),
+        SearchableField::ALL.len(),
+        "one word-index column per searchable field: {indexed:?}"
+    );
+    assert!(
+        !indexed
+            .iter()
+            .any(|column| column.contains("declaration_source")),
+        "{indexed:?}"
     );
     Ok(())
 }
