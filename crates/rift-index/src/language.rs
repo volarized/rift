@@ -274,7 +274,7 @@ impl WorkspaceLanguagePolicy {
     ///
     /// The index still reads such a file and records its digests, so an edit to it moves
     /// the workspace and the dependency context reads it again, but no syntax provider
-    /// parses it and it stores no row. [`Self::classifies`] still answers for it, so
+    /// parses it and it stores no row. `Self::classifies` still answers for it, so
     /// `paths.force_include` reaches it for one request.
     #[must_use]
     pub fn excludes_lockfile(&self, path: &Path) -> bool {
