@@ -469,4 +469,27 @@ mod tests {
             "the glob compiler's refusal is the cause"
         );
     }
+
+    /// Wildcards one glob may carry and still parse, past what the matcher they compile
+    /// to fits in: globset caps the compiled matcher at 10 MiB, and each `?` compiles to
+    /// its own byte class.
+    const OVERSIZED_GLOB_WILDCARDS: usize = 1_000_000;
+
+    /// Each pattern parses, and the list refuses only when it compiles as a whole, so the
+    /// refusal names no single pattern and keeps the compiler's cause.
+    #[test]
+    fn test_a_glob_list_past_the_compiled_size_limit_refuses_naming_no_pattern() {
+        use std::error::Error as _;
+
+        let root = Path::new("/workspace");
+        let oversized = "?".repeat(OVERSIZED_GLOB_WILDCARDS);
+        let error = PathMatcher::build(root, &[oversized], &[])
+            .expect_err("a matcher past the compiled size limit must be refused");
+        assert_eq!(error.fault().pattern(), None);
+        assert!(error.context().is_empty());
+        assert!(
+            error.source().is_some(),
+            "the glob compiler's refusal is the cause"
+        );
+    }
 }
