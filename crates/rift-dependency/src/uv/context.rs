@@ -144,15 +144,18 @@ fn pin_lockfile(
         if let Some(site_packages) = &site_packages {
             answer.install_folders.extend(
                 site_packages
-                    .import_folders(&name, &version, inputs)
+                    .import_roots(&name, &version, inputs)
                     .into_iter()
-                    .map(|folder| InstallFolder {
+                    .map(|root| InstallFolder {
                         package: PackageIdentity {
                             manager: PYPI_MANAGER.to_owned(),
                             name: name.clone(),
                             version: version.clone(),
                         },
-                        location: InstallLocation::Path(folder),
+                        location: InstallLocation::ImportRoot {
+                            site_packages: site_packages.directory().to_path_buf(),
+                            root,
+                        },
                     }),
             );
         }
@@ -1052,7 +1055,7 @@ plugin = { workspace = true }
     }
 
     #[test]
-    fn test_a_pinned_distribution_records_the_import_folders_its_record_lists() {
+    fn test_a_pinned_distribution_records_the_import_roots_its_record_lists() {
         let site_packages = format!("{ROOT}/.venv/lib/python3.12/site-packages");
         let mut inspector = RecordedInspector::default()
             .with_file(format!("{ROOT}/uv.lock"), LOCKFILE)
@@ -1082,7 +1085,10 @@ typing_extensions-4.15.0.dist-info/RECORD,,
                 )
             })
             .collect();
-        let at = |path: &str| InstallLocation::Path(Path::new(&site_packages).join(path));
+        let at = |root: &str| InstallLocation::ImportRoot {
+            site_packages: std::path::PathBuf::from(&site_packages),
+            root: root.to_owned(),
+        };
         assert_eq!(
             folders,
             [

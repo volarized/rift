@@ -95,8 +95,9 @@ impl StandardLibrary {
         }
     }
 
-    /// The entry name under [`STANDARD_LIBRARY_MANAGER`].
-    const fn name(self) -> &'static str {
+    /// The entry name under [`STANDARD_LIBRARY_MANAGER`], such as `python`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::Node => "node",

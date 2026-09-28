@@ -88,37 +88,35 @@ impl SitePackages {
         })
     }
 
-    /// The absolute import folders and single-file modules the distribution `normalized`
-    /// at `version` installed, in path order. Empty when its metadata directory is not
-    /// listed or its `RECORD` is absent, over its bound, or names no module.
+    /// The `site-packages` folder this listing read.
+    pub(super) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The import folders and single-file modules the distribution `normalized` at
+    /// `version` installed, relative to [`Self::directory`] with forward slashes, in path
+    /// order. Empty when its metadata directory is not listed or its `RECORD` is absent,
+    /// over its bound, or names no module.
     ///
     /// The metadata directory matches without regard to case, since a wheel keeps the
     /// project's own spelling (`PyYAML-6.0.3.dist-info`). The work is one read of at most
     /// `RECORD_BYTES_MAX` bytes and one pass over its lines.
-    pub(super) fn import_folders(
+    pub(super) fn import_roots(
         &self,
         normalized: &str,
         version: &str,
         inputs: &mut dyn StaticInputs,
-    ) -> Vec<PathBuf> {
+    ) -> BTreeSet<String> {
         let wanted = dist_info_name(normalized, version).to_ascii_lowercase();
         let Some(dist_info) = self.by_lowercase.get(&wanted) else {
-            return Vec::new();
+            return BTreeSet::new();
         };
         let record = self.directory.join(dist_info).join(RECORD_FILE_NAME);
         let text = match inputs.read_file(&record, RECORD_BYTES_MAX) {
             FileObservation::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            FileObservation::Absent | FileObservation::OverBound { .. } => return Vec::new(),
+            FileObservation::Absent | FileObservation::OverBound { .. } => return BTreeSet::new(),
         };
         record_import_roots(&text, dist_info)
-            .into_iter()
-            .map(|root| {
-                root.split(RECORD_PATH_SEPARATOR)
-                    .fold(self.directory.clone(), |folder, segment| {
-                        folder.join(segment)
-                    })
-            })
-            .collect()
     }
 }
 
@@ -267,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_folders_match_the_metadata_directory_without_regard_to_case() {
+    fn test_import_roots_match_the_metadata_directory_without_regard_to_case() {
         let mut inputs = RecordedInspector::default()
             .with_directory(format!("{SITE_PACKAGES}/PyJWT-2.10.1.dist-info"))
             .with_file(
@@ -279,14 +277,15 @@ mod tests {
         let site_packages =
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the POSIX layout");
 
+        assert_eq!(site_packages.directory(), Path::new(SITE_PACKAGES));
         assert_eq!(
-            site_packages.import_folders("pyjwt", "2.10.1", &mut inputs),
-            [PathBuf::from(format!("{SITE_PACKAGES}/jwt"))],
+            Vec::from_iter(site_packages.import_roots("pyjwt", "2.10.1", &mut inputs)),
+            ["jwt"],
             "PyJWT installs as `jwt`, a name the distribution name does not spell"
         );
         assert!(
             site_packages
-                .import_folders("pyjwt", "2.9.0", &mut inputs)
+                .import_roots("pyjwt", "2.9.0", &mut inputs)
                 .is_empty(),
             "another version is not installed here"
         );
@@ -301,9 +300,10 @@ mod tests {
         );
         let site_packages =
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the Windows layout");
+        assert_eq!(site_packages.directory(), Path::new(&windows));
         assert_eq!(
-            site_packages.import_folders("six", "1.17.0", &mut inputs),
-            [PathBuf::from(format!("{windows}/six.py"))]
+            Vec::from_iter(site_packages.import_roots("six", "1.17.0", &mut inputs)),
+            ["six.py"]
         );
 
         let mut empty = RecordedInspector::default().with_directory(ROOT);
@@ -321,7 +321,7 @@ mod tests {
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the POSIX layout");
         assert!(
             site_packages
-                .import_folders("big", "1.0.0", &mut inputs)
+                .import_roots("big", "1.0.0", &mut inputs)
                 .is_empty()
         );
     }

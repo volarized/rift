@@ -83,10 +83,20 @@ pub struct InstallFolder {
 /// Where one installed package's files stand.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum InstallLocation {
-    /// An absolute folder or single-file module: an npm package's `node_modules/<name>`
-    /// folder, nested copies included, a Python import folder or module the
-    /// distribution's `RECORD` lists, or the Rust standard library below the sysroot.
+    /// An absolute folder a package's files take their path below: an npm package's
+    /// `node_modules/<name>` folder, nested copies included, resolved through any link the
+    /// install made, or the Rust standard library below the sysroot.
     Path(PathBuf),
+    /// One import folder or single-file module a Python distribution's `RECORD` lists,
+    /// such as `jwt` or `six.py`. A file below it takes that path, then its own path below
+    /// the folder, as its path in the package, so `site-packages/jwt/api_jwt.py` is
+    /// `jwt/api_jwt.py` of `PyJWT`.
+    ImportRoot {
+        /// The absolute `site-packages` folder the distribution installed into.
+        site_packages: PathBuf,
+        /// The import root below `site_packages`, with forward slashes.
+        root: String,
+    },
     /// The `<name>-<version>` folder Cargo unpacks a registry package into, below each
     /// registry source folder, `~/.cargo/registry/src/<index>/`. Cargo names the index
     /// folder by a hash of the registry's URL, so the pass mints the folder name from the
