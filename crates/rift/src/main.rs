@@ -197,7 +197,7 @@ fn initialize_tracing(
             tracing_subscriber::fmt::layer()
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
                 .with_writer(writer)
-                .with_filter(reevaluated(
+                .with_filter(stderr_filter(
                     EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
                 )),
@@ -206,6 +206,15 @@ fn initialize_tracing(
         .with(otlp_layer)
         .init();
     (drain, otlp_export)
+}
+
+/// The stderr filter: `operator` plus the OTLP export's own reports.
+///
+/// `operator` is `RUST_LOG` or the default targets, and rarely names the OpenTelemetry SDK's
+/// target, through which the export reports what it drops; `otlp::sdk_reports` rides beside
+/// it so those reports reach stderr either way.
+fn stderr_filter<S>(operator: EnvFilter) -> impl Filter<S> {
+    reevaluated(operator.or(otlp::sdk_reports()))
 }
 
 /// Wraps a per-layer filter so the subscriber asks it at every span and event.
