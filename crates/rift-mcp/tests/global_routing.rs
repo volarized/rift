@@ -630,6 +630,42 @@ async fn pattern_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRe
         .collect()
 }
 
+/// What a `global` search for `fn helper_\w+` with `target: "all"` and `source` answers: the
+/// collected declaration holding the match, then the match itself, both addressed by `unit`.
+fn helper_beacon_pattern_hits() -> Value {
+    json!([
+        {
+            "hit": {
+                "target": "symbol",
+                "symbol": {
+                    "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                    "language": "rust",
+                    "name": "helper_beacon",
+                    "kind": "function",
+                    "origin": {
+                        "location": "dependency",
+                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
+                        "source_kind": "authored"
+                    }
+                }
+            },
+            "matched_by": ["content"],
+            "source": "pub fn helper_beacon() {}",
+            "range": {"start": 0, "end": 25},
+            "line": 1,
+            "unit": COLLECTED_UNIT
+        },
+        {
+            "hit": {"target": "file", "size": 45},
+            "matched_by": ["content"],
+            "source": "pub fn helper_beacon() {}",
+            "range": {"start": 4, "end": 20},
+            "line": 1,
+            "unit": COLLECTED_UNIT
+        }
+    ])
+}
+
 /// A `pattern` whose `scope` reaches packages answers the package matches from one page of
 /// the global API's pattern search: `global` alone, `all` after the project's own. A package
 /// match answers a file hit addressed by `unit` and a symbol hit for the declaration holding
@@ -658,37 +694,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     .await?;
     assert_eq!(
         global["results"],
-        json!([
-            {
-                "hit": {
-                    "target": "symbol",
-                    "symbol": {
-                        "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
-                        "language": "rust",
-                        "name": "helper_beacon",
-                        "kind": "function",
-                        "origin": {
-                            "location": "dependency",
-                            "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
-                            "source_kind": "authored"
-                        }
-                    }
-                },
-                "matched_by": ["content"],
-                "source": "pub fn helper_beacon() {}",
-                "range": {"start": 0, "end": 25},
-                "line": 1,
-                "unit": COLLECTED_UNIT
-            },
-            {
-                "hit": {"target": "file", "size": 45},
-                "matched_by": ["content"],
-                "source": "pub fn helper_beacon() {}",
-                "range": {"start": 4, "end": 20},
-                "line": 1,
-                "unit": COLLECTED_UNIT
-            }
-        ]),
+        helper_beacon_pattern_hits(),
         "{global:#}"
     );
 

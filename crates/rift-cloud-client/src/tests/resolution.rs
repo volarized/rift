@@ -329,6 +329,10 @@ impl PackageFields {
     }
 }
 
+/// One field lengthened past its bound: the field the resolution request names, the field the
+/// package identity names, and the edit.
+type FieldPastItsBound = (&'static str, &'static str, fn(&mut PackageFields));
+
 /// One character past a package field's bound is refused before transport, however few
 /// bytes it takes: the bounds count characters.
 #[test]
@@ -340,13 +344,15 @@ fn test_package_fields_past_their_character_bound_are_refused() {
     assert_eq!(validate_resolution_request(&request), Ok(()));
     assert_eq!(validate_packages(&[at_bound.identity()]), Ok(()));
 
-    let past: [(&str, &str, fn(&mut PackageFields)); 3] = [
+    let past: [FieldPastItsBound; 3] = [
         ("manager", "package_manager", |fields| {
-            fields.manager.push('m')
+            fields.manager.push('m');
         }),
-        ("name", "package_name", |fields| fields.name.push('\u{e9}')),
+        ("name", "package_name", |fields| {
+            fields.name.push('\u{e9}');
+        }),
         ("selector", "package_version", |fields| {
-            fields.version.push('v')
+            fields.version.push('v');
         }),
     ];
     for (entry_field, package_field, lengthen) in past {
