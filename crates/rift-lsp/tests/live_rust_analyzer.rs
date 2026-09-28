@@ -8,7 +8,7 @@
 //! live rust-analyzer answer first, then pinned.
 //!
 //! The suite checks capabilities, project-load progress, cross-file references,
-//! and clean shutdown.
+//! call hierarchy, and clean shutdown.
 
 #![cfg(unix)]
 
@@ -16,20 +16,24 @@ mod engine_fixture;
 mod live_engine_gate;
 mod rust_engine;
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
-use rift_lsp::session::{EngineLaunch, EngineSession};
+use rift_lsp::session::{EngineLaunch, EngineReadiness, EngineSession};
 use rust_engine::require_rust_analyzer;
 
-/// The cargo project fixture: a manifest, a crate root, a module, and the
-/// module's cross-file reference.
+/// The cargo project fixture: a manifest, a crate root, a module, the
+/// module's cross-file reference, and a function whose callees reach into
+/// the project and `std` beside a struct.
 const MANIFEST: &str = include_str!("fixtures/rust/Cargo.toml");
 const CRATE_ROOT: &str = include_str!("fixtures/rust/lib.rs");
 const HUB: &str = include_str!("fixtures/rust/hub.rs");
 const CALLER: &str = include_str!("fixtures/rust/caller.rs");
+const WALK: &str = include_str!("fixtures/rust/walk.rs");
 
 /// The live launch, built from the shared fixture's rust-analyzer data.
 fn launch() -> EngineLaunch {
@@ -44,6 +48,7 @@ fn cargo_project() -> tempfile::TempDir {
         ("lib.rs", CRATE_ROOT),
         ("hub.rs", HUB),
         ("caller.rs", CALLER),
+        ("walk.rs", WALK),
     ] {
         std::fs::write(workspace.path().join(name), source).expect("fixture writes");
     }
@@ -160,6 +165,119 @@ async fn work_done_progress_marks_the_project_load() {
             "the reference in {path} must resolve: {locations:?}"
         );
     }
+    session.shutdown().await;
+}
+
+/// Most time a walk waits for rust-analyzer to read ready: past it the test
+/// fails instead of hanging.
+const WALK_READY_LIMIT: Duration = Duration::from_mins(1);
+
+/// A rust-analyzer session over `workspace` that reads ready for a walk:
+/// every load token but the `cargo check` flycheck ones ended, then
+/// `settle_delay` of quiet, read through [`EngineSession::read_output`] as a
+/// walk's wait reads it. Before that, rust-analyzer answers an empty prepare.
+async fn walk_ready_session(workspace: &Path) -> EngineSession {
+    let mut session = EngineSession::start(launch(), workspace)
+        .await
+        .expect("rust-analyzer starts");
+    let started = Instant::now();
+    session
+        .read_output(tokio::time::Instant::now() + WALK_READY_LIMIT, |session| {
+            session.walk_readiness() == EngineReadiness::Ready
+        })
+        .await
+        .expect("the engine's output reads");
+    assert_eq!(
+        session.walk_readiness(),
+        EngineReadiness::Ready,
+        "rust-analyzer must read ready for a walk inside {WALK_READY_LIMIT:?}"
+    );
+    eprintln!(
+        "rust-analyzer read ready for a walk after {:?}, session readiness {:?}",
+        started.elapsed(),
+        session.readiness()
+    );
+    session
+}
+
+/// Once rust-analyzer reads ready for a walk, prepare at a function answers
+/// one item and outgoing calls name its callees: one in the project and two
+/// in `std`. `vec!` is a macro, so it is no callee.
+#[tokio::test]
+async fn rust_analyzer_names_the_callees_of_a_prepared_function() {
+    if !engine_live() {
+        return;
+    }
+    let workspace = cargo_project();
+    require_rust_analyzer(workspace.path());
+    let mut session = walk_ready_session(workspace.path()).await;
+    let document = ProjectPath::new("walk.rs").expect("fixture path is valid");
+    session
+        .open(&document, "rust", WALK.to_owned())
+        .await
+        .expect("didOpen is sent");
+    let asked = Instant::now();
+    let items = session
+        .prepare_call_hierarchy(&document, lsp_types::Position::new(6, 7))
+        .await
+        .expect("prepare answers");
+    let [item] = items.as_slice() else {
+        panic!("one item at `larger`: {items:?}");
+    };
+    assert_eq!(item.name, "larger");
+    let calls = session
+        .outgoing_calls(item.clone())
+        .await
+        .expect("outgoing calls answer");
+    eprintln!(
+        "prepare and outgoing calls answered in {:?}",
+        asked.elapsed()
+    );
+    let callees: BTreeSet<&str> = calls.iter().map(|call| call.to.name.as_str()).collect();
+    assert_eq!(
+        callees,
+        BTreeSet::from(["beacon", "len", "max"]),
+        "{calls:#?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.to.name == "beacon" && call.to.uri.path().as_str().ends_with("hub.rs")),
+        "the project callee answers its own file: {calls:#?}"
+    );
+    session.shutdown().await;
+}
+
+/// Once rust-analyzer reads ready for a walk, prepare at a struct answers
+/// no item, the empty prepare that refuses the seed; prepare at a function
+/// in the same file still answers one.
+#[tokio::test]
+async fn rust_analyzer_prepares_no_call_hierarchy_item_at_a_struct() {
+    if !engine_live() {
+        return;
+    }
+    let workspace = cargo_project();
+    require_rust_analyzer(workspace.path());
+    let mut session = walk_ready_session(workspace.path()).await;
+    let document = ProjectPath::new("walk.rs").expect("fixture path is valid");
+    session
+        .open(&document, "rust", WALK.to_owned())
+        .await
+        .expect("didOpen is sent");
+    let at_struct = session
+        .prepare_call_hierarchy(&document, lsp_types::Position::new(2, 11))
+        .await
+        .expect("prepare answers");
+    assert!(at_struct.is_empty(), "no item at `Beacon`: {at_struct:?}");
+    let at_function = session
+        .prepare_call_hierarchy(&document, lsp_types::Position::new(6, 7))
+        .await
+        .expect("prepare answers");
+    assert_eq!(
+        at_function.len(),
+        1,
+        "the engine prepares a function in the same file: {at_function:?}"
+    );
     session.shutdown().await;
 }
 
