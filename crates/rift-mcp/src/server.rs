@@ -33,8 +33,8 @@ use rift_search::{
     StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault, ReadService, StoreAnswer,
-    resolve_engine_references, uses_engine_references, wire_digest,
+    EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault, ReadService,
+    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -994,8 +994,13 @@ impl SearchRanking {
 
     /// No store ranking and no reason to report: the request never consulted the store.
     fn without_store(weights: RankingWeights) -> Self {
+        Self::unranked(StoreAnswer::without_store(weights))
+    }
+
+    /// `answer` as it stands, with nothing about the store to report.
+    const fn unranked(answer: StoreAnswer) -> Self {
         Self {
-            answer: StoreAnswer::without_store(weights),
+            answer,
             warnings: Vec::new(),
         }
     }
@@ -1285,6 +1290,8 @@ pub struct RiftMcp {
     /// The shares the identifier, full-text, and vector rankings fuse under, as
     /// `[search.ranking]` set them.
     ranking_weights: RankingWeights,
+    /// The bounds one `pattern` search runs under, as the `[search]` table set them.
+    pattern_bounds: PatternBounds,
     /// Lazy global package client, replaced when accepted settings or credentials change.
     global: Arc<GlobalState>,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
@@ -1313,6 +1320,7 @@ struct SearchTier {
     acquisition: Option<EmbeddingSelection>,
     search_index: Option<Arc<SearchIndex>>,
     ranking_weights: RankingWeights,
+    pattern_bounds: PatternBounds,
     lexical: Option<LexicalLane>,
     population: Option<PopulationLane>,
 }
@@ -1434,6 +1442,7 @@ impl RiftMcp {
             acquisition,
             search_index,
             ranking_weights,
+            pattern_bounds,
             lexical,
             population,
         } = Self::open_search_tier(
@@ -1488,6 +1497,7 @@ impl RiftMcp {
             blocking,
             search_index,
             ranking_weights,
+            pattern_bounds,
             global: Arc::new(GlobalState::default()),
             lexical,
             logs,
@@ -1570,6 +1580,7 @@ impl RiftMcp {
             acquisition,
             search_index,
             ranking_weights: ranking_weights(&search_configuration),
+            pattern_bounds: PatternBounds::from(&search_configuration),
             lexical,
             population,
         }
@@ -2071,6 +2082,9 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
+        if params.pattern.is_some() {
+            return self.pattern_ranking(params, published).await.map(Some);
+        }
         // A global scope never consults the project store: the project answers no hit,
         // and the package hits come from the global index.
         if params.scope == SearchScope::Global {
@@ -2108,6 +2122,46 @@ impl RiftMcp {
             commit_state,
             self.ranking_weights,
         ))
+    }
+
+    /// The files the trigram index selects for one `pattern` request against `published`,
+    /// under the `[search]` pattern bounds.
+    ///
+    /// The publication holds the text the matcher verifies, so the store only narrows
+    /// which files are read: a pattern the read path refuses, one with no prefilter, a
+    /// store that could not open, and a store that does not hold the captured tree all
+    /// leave the read path to verify every held file, and the answer is complete either
+    /// way. Nothing waits for a lexical commit in flight, and nothing is warned.
+    async fn pattern_ranking(
+        &self,
+        params: &SearchParams,
+        published: &PublishedWorkspace,
+    ) -> Result<SearchRanking, ErrorData> {
+        let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
+        let Some(index) = self.search_index.as_ref() else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds) else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Some(prefilter) = pattern.prefilter().cloned() else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let line_bound = pattern.is_line_bound();
+        let tree_revision = published.reads.tree_revision();
+        let rows_max = self.pattern_bounds.candidate_rows_max();
+        let scoped =
+            rift_core::traced_async!(component = "search", operation = "search.pattern", {
+                index
+                    .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
+                    .await
+            })
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        Ok(SearchRanking::unranked(match scoped {
+            RevisionScoped::Matched(candidates) => answer.with_pattern_candidates(candidates),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => answer,
+        }))
     }
 
     /// The store's answer for `tree_revision` in both query phases, read as deep as
@@ -5249,6 +5303,56 @@ mod tests {
     /// The publication `server` currently answers from.
     async fn current_publication(server: &RiftMcp) -> Arc<PublishedWorkspace> {
         Arc::clone(&server.published.read().await.current)
+    }
+
+    /// A `pattern` request answers from every held file while the store has not committed
+    /// the captured tree, with nothing about the store to warn, then reads the trigram
+    /// index once the commit lands; both answers carry the same verified hit.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_reads_the_trigram_candidates_of_the_captured_tree() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let located = |answer: &SearchResult| {
+            answer
+                .results
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.path.as_ref().map(|path| path.0.clone()),
+                        hit.line,
+                        hit.range.as_ref().map(|range| (range.start, range.end)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = [(Some("lib.rs".to_owned()), Some(1), Some((4, 14)))];
+
+        let before = server.search(Parameters(params.clone())).await?.0;
+        assert_eq!(located(&before), expected);
+        assert!(before.warnings.is_empty(), "{:?}", before.warnings);
+
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        let published = current_publication(&server).await;
+        let budget = server.readiness_timeout().await;
+        let ranking = server
+            .ranking(&params, &published, RequestDeadline::starting(budget))
+            .await?
+            .ok_or("a pattern always ranks")?;
+        let candidates = ranking
+            .answer
+            .pattern_candidates()
+            .ok_or("the trigram index answered the prefilter")?;
+        assert_eq!(
+            candidates.candidates().len(),
+            1,
+            "lib.rs alone holds `fn bea`"
+        );
+        let after = server.search(Parameters(params)).await?.0;
+        assert_eq!(located(&after), expected);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

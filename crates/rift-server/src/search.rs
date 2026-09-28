@@ -9,8 +9,12 @@ mod body_tests;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;
+mod pattern;
+#[cfg(test)]
+mod pattern_tests;
 use body::BodyMatching;
 use documentation::SearchDocumentation;
+pub use pattern::{PatternBounds, accepted_pattern};
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -19,8 +23,8 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
 use rift_index::{
-    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, SymbolMatch,
-    TextSourceFile, WorkspaceIndex,
+    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates,
+    SymbolMatch, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
@@ -61,12 +65,14 @@ pub struct StoreAnswer {
     broad: Vec<RankingInput>,
     weights: RankingWeights,
     file_rows: Option<FileRowFrequencies>,
+    pattern_bounds: PatternBounds,
+    pattern_candidates: Option<PatternCandidates>,
 }
 
 impl StoreAnswer {
     /// Names what the store answered for each phase, and the configured shares.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         precise: Vec<RankingInput>,
         broad: Vec<RankingInput>,
         weights: RankingWeights,
@@ -76,6 +82,8 @@ impl StoreAnswer {
             broad,
             weights,
             file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
     }
 
@@ -91,12 +99,14 @@ impl StoreAnswer {
     /// No store answer, under the operator's own shares: the shares stay what
     /// `[search.ranking]` states rather than collapsing onto identifier matching.
     #[must_use]
-    pub const fn without_store(weights: RankingWeights) -> Self {
+    pub fn without_store(weights: RankingWeights) -> Self {
         Self {
             precise: Vec::new(),
             broad: Vec::new(),
             weights,
             file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
     }
 
@@ -109,6 +119,8 @@ impl StoreAnswer {
             broad: Vec::new(),
             weights: RankingWeights::identifier_only(),
             file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
     }
 
@@ -135,6 +147,33 @@ impl StoreAnswer {
     #[must_use]
     pub const fn file_rows(&self) -> Option<&FileRowFrequencies> {
         self.file_rows.as_ref()
+    }
+
+    /// The same answer under the `[search]` bounds a `pattern` search runs under.
+    #[must_use]
+    pub const fn with_pattern_bounds(mut self, bounds: PatternBounds) -> Self {
+        self.pattern_bounds = bounds;
+        self
+    }
+
+    /// The same answer, carrying the files the trigram index selected for a `pattern`.
+    #[must_use]
+    pub fn with_pattern_candidates(mut self, candidates: PatternCandidates) -> Self {
+        self.pattern_candidates = Some(candidates);
+        self
+    }
+
+    /// The `[search]` bounds a `pattern` search runs under.
+    #[must_use]
+    pub const fn pattern_bounds(&self) -> PatternBounds {
+        self.pattern_bounds
+    }
+
+    /// The files the trigram index selected for a `pattern`, absent when the store was not
+    /// asked or did not answer for the tree the request captured.
+    #[must_use]
+    pub const fn pattern_candidates(&self) -> Option<&PatternCandidates> {
+        self.pattern_candidates.as_ref()
     }
 }
 
@@ -198,10 +237,9 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
-        rift_core::traced!(component = "search", operation = "search.validate", {
-            references.validate_revision(self)?;
-            validate_search(params)
-        })?;
+        if let Some(pattern) = self.validated_pattern(params, store, references)? {
+            return self.search_pattern(params, &pattern, store);
+        }
         if params.change.is_some() {
             // One snapshot holds one tree; a comparison needs two, and reaches its own
             // through `search_change`.
@@ -290,6 +328,21 @@ impl ReadService {
             pagination,
             warnings: Self::search_warnings(warnings, traversal_report, results_max_reached),
         })
+    }
+
+    /// Validates one search against this snapshot, and compiles the `pattern` it names,
+    /// if any, under the answer's `[search]` bounds.
+    fn validated_pattern(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+    ) -> Result<Option<rift_ranking::Pattern>, ReadError> {
+        rift_core::traced!(component = "search", operation = "search.validate", {
+            references.validate_revision(self)?;
+            validate_search(params)
+        })?;
+        accepted_pattern(params, store.pattern_bounds())
     }
 
     fn initial_search_warnings(
@@ -726,6 +779,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
+    if let Some(conflict) = pattern::pattern_conflict(params) {
+        return Err(conflict);
+    }
     if let Some(change) = params.change.as_ref() {
         validate_change(change, params)?;
     }
@@ -809,10 +865,11 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
 }
 
 /// The lexical `query` the request carries, if any: refused when the request carries
-/// none of `query`, `traversal`, and `change`, and when the query is empty.
+/// none of `query`, `pattern`, `traversal`, and `change`, and when the query is empty.
 fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
     let query = params.query.as_deref();
-    if query.is_none() && params.traversal.is_none() && params.change.is_none() {
+    let selects = params.pattern.is_some() || params.traversal.is_some() || params.change.is_some();
+    if query.is_none() && !selects {
         return Err(ReadFault::invalid("query", "missing"));
     }
     if query.is_some_and(str::is_empty) {

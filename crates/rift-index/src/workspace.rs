@@ -1371,6 +1371,10 @@ pub struct WorkspaceIndex {
     /// The documentation layer over `documentation`, built by the first read that projects
     /// onto it; the next publication is a new index and builds its own.
     documentation_layer: OnceLock<Result<DocumentationLayer<'static>, DocumentationError>>,
+    /// The held text files holding a line longer than `[search.text] max_chunk`, found by
+    /// the first pattern search that asks; the next publication is a new index and finds
+    /// its own.
+    split_line_files: OnceLock<BTreeSet<ProjectPath>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
 }
@@ -1516,6 +1520,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1588,6 +1593,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1681,6 +1687,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -2125,6 +2132,31 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn text_file(&self, path: &ProjectPath) -> Option<&TextSourceFile> {
         self.text_files.get(path).map(AsRef::as_ref)
+    }
+
+    /// Every held file whose text a `pattern` search reads, parsed or text alone, in
+    /// project-path order.
+    pub fn searched_text_files(&self) -> impl Iterator<Item = &TextSourceFile> {
+        self.text_files()
+    }
+
+    /// The searched files a `pattern` search verifies whole whatever the trigram index
+    /// selects, in project-path order: a notebook, whose rows hold its cells rather than
+    /// its bytes, and a file holding a line longer than `[search.text] max_chunk`, which
+    /// chunking cut mid-line so that no one row holds the whole line.
+    ///
+    /// The long lines are found once per index: only a file past the chunk bound can hold
+    /// one, and each such file is read once, by the first search that asks.
+    pub fn whole_file_candidates(&self) -> impl Iterator<Item = &TextSourceFile> {
+        let split = self.split_line_files.get_or_init(|| {
+            let chunk_bytes_max = self.text_chunk_bytes_max_usize();
+            self.searched_text_files()
+                .filter(|file| holds_line_past(file.content(), chunk_bytes_max))
+                .map(|file| file.path().clone())
+                .collect()
+        });
+        self.searched_text_files()
+            .filter(move |file| is_notebook_path(file.path()) || split.contains(file.path()))
     }
 
     /// Chunk bound applied to baseline text when lexical units are derived.
@@ -3738,6 +3770,14 @@ fn is_notebook_path(path: &ProjectPath) -> bool {
 /// whole.
 fn exceeds_chunk_bound(content_bytes: usize, chunk_bytes_max: u64) -> bool {
     u64::try_from(content_bytes).unwrap_or(u64::MAX) > chunk_bytes_max
+}
+
+/// Whether `content` holds a line, its ending included, longer than `chunk_bytes_max`: the
+/// line the chunking kernel cuts at a character boundary rather than keeping whole. A
+/// shorter text holds no such line, so only a text past the bound is read.
+fn holds_line_past(content: &str, chunk_bytes_max: usize) -> bool {
+    content.len() > chunk_bytes_max
+        && rift_core::line::lines_inclusive(content).any(|line| line.len() > chunk_bytes_max)
 }
 
 /// Widens an already-accepted `[search.text].max_chunk` bound (1kb to 16mb) into the `usize`

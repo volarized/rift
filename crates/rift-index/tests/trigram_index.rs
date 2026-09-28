@@ -467,3 +467,37 @@ async fn the_trigram_index_matches_its_rows_after_every_replace_and_apply() -> T
     );
     Ok(())
 }
+
+/// A pattern search verifies whole the files the trigram index cannot rule out: a
+/// notebook, whose rows hold its cells, and a file holding a line past the chunk bound,
+/// which chunking cut mid-line. A line exactly at the bound, its ending included, stays
+/// whole and needs no such reading.
+#[test]
+fn whole_file_candidates_name_notebooks_and_files_holding_a_cut_line() -> TestResult {
+    let chunk = usize::try_from(CHUNK_BYTES_MAX)?;
+    let at_bound = format!("{}\n", "a".repeat(chunk - 1));
+    let past_bound = format!("{}\n", "b".repeat(chunk));
+    let (_tree, workspace) = chunked_tree(&[
+        ("fits.txt", at_bound.repeat(3)),
+        ("cut.txt", format!("head\n{past_bound}tail\n")),
+        (
+            "notes.ipynb",
+            r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#.to_owned(),
+        ),
+        ("small.txt", "x\n".to_owned()),
+    ])?;
+    let whole: Vec<&str> = workspace
+        .whole_file_candidates()
+        .map(|file| file.path().as_str())
+        .collect();
+    assert_eq!(whole, ["cut.txt", "notes.ipynb"]);
+    let searched: Vec<&str> = workspace
+        .searched_text_files()
+        .map(|file| file.path().as_str())
+        .collect();
+    assert_eq!(
+        searched,
+        ["cut.txt", "fits.txt", "notes.ipynb", "small.txt"]
+    );
+    Ok(())
+}
