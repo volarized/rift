@@ -1735,9 +1735,12 @@ async fn test_fixture_page_rejects_repeated_cursor_and_partial_failure() {
         Err(ClientError::Http { meta, .. }) if meta.status == 503
     ));
     let requests = server.state.requests.load(Ordering::SeqCst);
-    assert_eq!(
-        client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::Connection)
+    assert!(
+        matches!(
+            client.search_packages_pages(&search_request(), 20).await,
+            Err(ClientError::Http { meta, .. }) if meta.status == 503
+        ),
+        "a later request answers the failure that marked the endpoint unavailable"
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), requests);
 }

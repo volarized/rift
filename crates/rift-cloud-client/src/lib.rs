@@ -392,7 +392,7 @@ struct Inner {
     capabilities_flight: Mutex<()>,
     resolutions: RwLock<HashMap<Vec<u8>, CachedResolution>>,
     resolutions_flight: Mutex<()>,
-    unavailable_until: RwLock<Option<Instant>>,
+    failure: RwLock<Option<CachedFailure>>,
 }
 
 #[derive(Clone)]
@@ -405,6 +405,13 @@ struct CachedCapabilities {
 #[derive(Clone)]
 struct CachedResolution {
     value: PackageResolutionResponse,
+    expires: Instant,
+}
+
+/// The failure that marked the endpoint unavailable, which every request answers until
+/// `expires`, so a later read reports the class the first one met.
+struct CachedFailure {
+    error: ClientError,
     expires: Instant,
 }
 
@@ -505,7 +512,7 @@ impl GlobalClient {
                 capabilities_flight: Mutex::new(()),
                 resolutions: RwLock::new(HashMap::new()),
                 resolutions_flight: Mutex::new(()),
-                unavailable_until: RwLock::new(None),
+                failure: RwLock::new(None),
                 config,
             }),
         })
@@ -526,8 +533,8 @@ impl GlobalClient {
         if !self.inner.enabled {
             return Err(ClientError::Disabled);
         }
-        if self.is_unavailable().await {
-            return Err(ClientError::Connection);
+        if let Some(failure) = self.recorded_failure().await {
+            return Err(failure);
         }
         let _flight = self.inner.capabilities_flight.lock().await;
         if let Some(cached) = self.inner.capabilities.read().await.as_ref()
@@ -574,17 +581,14 @@ impl GlobalClient {
                         expires: Instant::now() + ttl,
                     };
                     *self.inner.capabilities.write().await = Some(cached);
-                    *self.inner.unavailable_until.write().await = None;
+                    *self.inner.failure.write().await = None;
                     Ok(value)
                 }
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
         };
-        if result.is_err() {
-            self.record_failure().await;
-        }
-        result
+        self.observed(result).await
     }
 
     /// Resolves one canonical dependency context into exact package identities.
@@ -628,20 +632,17 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value, meta } = match response::resolution(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_resolution_response(request, &value) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
         self.inner.resolutions.write().await.insert(
@@ -690,20 +691,17 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value: page, .. } = match response::search(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_search_page(request, &capabilities, &page, cursor) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         Ok(page)
     }
@@ -744,20 +742,17 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value: page, .. } = match response::symbols(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_symbol_page(request, &capabilities, &page, cursor) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         Ok(page)
     }
@@ -799,18 +794,18 @@ impl GlobalClient {
                 &page.corpus_revision,
                 page.documentation_revision.as_deref(),
             ) {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
             let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
                 let identity = search_hit_identity(&hit)?;
                 if !seen_identities.insert(identity) {
-                    self.record_failure().await;
-                    return Err(ClientError::InvalidResponseField {
-                        field: "duplicate_item",
-                    });
+                    return self
+                        .observed(Err(ClientError::InvalidResponseField {
+                            field: "duplicate_item",
+                        }))
+                        .await;
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
@@ -824,10 +819,11 @@ impl GlobalClient {
                 return Ok(search_pages(hits, warnings, revisions, Some(next)));
             }
             if !seen_cursors.insert(next.clone()) {
-                self.record_failure().await;
-                return Err(ClientError::InvalidResponseField {
-                    field: "cursor_progress",
-                });
+                return self
+                    .observed(Err(ClientError::InvalidResponseField {
+                        field: "cursor_progress",
+                    }))
+                    .await;
             }
             cursor = Some(next);
         }
@@ -869,8 +865,7 @@ impl GlobalClient {
                 &page.corpus_revision,
                 page.documentation_revision.as_deref(),
             ) {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
             let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
@@ -880,10 +875,11 @@ impl GlobalClient {
                     .iter()
                     .any(|item: &PackageSymbol| symbol_hit_identity(item) == identity)
                 {
-                    self.record_failure().await;
-                    return Err(ClientError::InvalidResponseField {
-                        field: "duplicate_item",
-                    });
+                    return self
+                        .observed(Err(ClientError::InvalidResponseField {
+                            field: "duplicate_item",
+                        }))
+                        .await;
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
@@ -897,10 +893,11 @@ impl GlobalClient {
                 return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
             }
             if !seen_cursors.insert(next.clone()) {
-                self.record_failure().await;
-                return Err(ClientError::InvalidResponseField {
-                    field: "cursor_progress",
-                });
+                return self
+                    .observed(Err(ClientError::InvalidResponseField {
+                        field: "cursor_progress",
+                    }))
+                    .await;
             }
             cursor = Some(next);
         }
@@ -1113,24 +1110,27 @@ impl GlobalClient {
         })
     }
 
-    /// Hands `result` back, recording an unavailable state first when it failed.
+    /// Hands `result` back, first recording its failure as the one every request answers
+    /// for `failure_ttl`.
     async fn observed<T>(&self, result: Result<T, ClientError>) -> Result<T, ClientError> {
-        if result.is_err() {
-            self.record_failure().await;
+        if let Err(error) = &result {
+            *self.inner.failure.write().await = Some(CachedFailure {
+                error: error.clone(),
+                expires: Instant::now() + self.inner.config.failure_ttl,
+            });
         }
         result
     }
 
-    async fn is_unavailable(&self) -> bool {
+    /// The failure the endpoint answers while it is marked unavailable.
+    async fn recorded_failure(&self) -> Option<ClientError> {
         self.inner
-            .unavailable_until
+            .failure
             .read()
             .await
-            .is_some_and(|until| until > Instant::now())
-    }
-    async fn record_failure(&self) {
-        *self.inner.unavailable_until.write().await =
-            Some(Instant::now() + self.inner.config.failure_ttl);
+            .as_ref()
+            .filter(|failure| failure.expires > Instant::now())
+            .map(|failure| failure.error.clone())
     }
 }
 

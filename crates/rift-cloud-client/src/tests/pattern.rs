@@ -170,8 +170,8 @@ async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
         client
             .search_package_patterns(&pattern_request(), 20, None)
             .await,
-        Err(ClientError::Connection),
-        "a refused page marks the endpoint unavailable"
+        Err(ClientError::InvalidResponseField { field: "package" }),
+        "a refused page marks the endpoint unavailable, and a later request answers its failure"
     );
 }
 

@@ -126,7 +126,10 @@ async fn test_fixture_declaration_refusal_marks_the_endpoint_unavailable() {
         client
             .find_package_declarations(&declaration_request())
             .await,
-        Err(ClientError::Connection)
+        Err(ClientError::InvalidResponseField {
+            field: "position_accounting"
+        }),
+        "a later request answers the failure that marked the endpoint unavailable"
     );
 }
 

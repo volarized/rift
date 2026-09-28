@@ -904,6 +904,61 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     Ok(())
 }
 
+/// A failed global read marks the global API unavailable for `failure_ttl`, and a later
+/// read inside it answers from that failure: it carries the same typed warning and class
+/// the first read met, and sends the global API nothing.
+#[tokio::test]
+async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\nfailure_ttl = \"1h\"\n\n\
+         {DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let expected = json!({"code": "global_response_invalid", "failure_class": "invalid_response"});
+    let global_warnings = |answer: &Value| -> Vec<Value> {
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| {
+                warning["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("global_"))
+            })
+            .cloned()
+            .collect()
+    };
+
+    let first = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    assert_eq!(
+        global_warnings(&first),
+        std::slice::from_ref(&expected),
+        "{first:#}"
+    );
+    let sent = fixture.requests().await.len();
+
+    let later = call_tool(
+        &client,
+        "search",
+        json!({"query": "beacon", "scope": "all", "target": "symbol"}),
+    )
+    .await?;
+    assert_eq!(global_warnings(&later), [expected], "{later:#}");
+    assert_eq!(
+        fixture.requests().await.len(),
+        sent,
+        "a read inside failure_ttl sends the global API nothing"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// Package facts are served for the current tree alone, so a `scope` past `local` beside
 /// `rev` refuses naming `scope`.
 #[tokio::test]
