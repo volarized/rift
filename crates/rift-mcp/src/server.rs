@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    DependencyIndexLimits, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests,
-    WorkspaceIndexLimits, capture_digests_with_languages,
+    LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
+    capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -31,8 +31,8 @@ use rift_search::{
     StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, PackageBranch, ReadError, ReadFault, ReadService,
-    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault, ReadService, StoreAnswer,
+    resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -48,8 +48,8 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
-    package_symbols,
+    GlobalRoute, GlobalSearchCandidates, GlobalState, local_search_page, local_symbol_page,
+    merge_search, merge_symbols, package_search, package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -626,45 +626,6 @@ impl ReadAnswer for NodesResult {
     }
 }
 
-/// Replaces the local package branch's legacy global warning with routed client state.
-fn apply_global_warnings(warnings: &mut Vec<ReadWarning>, route: &GlobalRoute) {
-    let fallback_indexed = warnings
-        .iter()
-        .find_map(|warning| match warning {
-            ReadWarning::GlobalIndexUnavailable { indexed, .. } => Some(*indexed),
-            _ => None,
-        })
-        .unwrap_or(0);
-    *warnings = warnings
-        .drain(..)
-        .filter_map(|warning| match warning {
-            ReadWarning::GlobalIndexUnavailable { .. } => None,
-            ReadWarning::PackageSkipped { package, reason } => {
-                Some(ReadWarning::PackageUnavailable { package, reason })
-            }
-            warning => Some(warning),
-        })
-        .collect();
-    route.record_fallback(fallback_indexed);
-    if let Some(warning) = route.fallback_warning(fallback_indexed) {
-        warnings.push(warning);
-    }
-    let package_warnings = warnings
-        .iter()
-        .filter(|warning| {
-            matches!(
-                warning,
-                ReadWarning::PackageUnavailable { .. } | ReadWarning::PackageContextDegraded { .. }
-            )
-        })
-        .count();
-    warnings.extend(
-        route
-            .missing_warnings()
-            .take(rift_protocol::read::DEPENDENCY_WARNINGS_MAX.saturating_sub(package_warnings)),
-    );
-}
-
 /// Most bytes one read warning's `detail` carries: the bound the served schema advertises
 /// for it, applied to a failure's rendering before it reaches the wire.
 const WARNING_DETAIL_BYTES_MAX: usize = 4096;
@@ -1239,23 +1200,27 @@ fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
     }
 }
 
-/// The `[search.vector]` table every unit-test fixture in this crate declares.
+/// The `[search.vector]` and `[dependencies]` tables every unit-test fixture in this crate
+/// declares.
 ///
 /// Rift ships the vector ranking on, so a fixture carrying no `rift.toml` would acquire the
 /// default model from the hub. A hermetic suite must not write into the developer's own
 /// Hugging Face cache, and on a runner with no network a default-on tier would spend its
-/// whole retry budget inside a detached task nobody waits on. The integration suites
-/// declare the same table from `tests/hermetic_search.rs`: a unit test and an integration
-/// test are two crates, and one value shared between them would have to leave the
-/// library's public surface.
+/// whole retry budget inside a detached task nobody waits on. The standard library version
+/// probes run by default too, and answer from the machine's own `rustc` and `node`, so
+/// `resolution = "static"` keeps a fixture's package context on its pins alone. The
+/// integration suites declare the same tables from `tests/hermetic_search.rs`: a unit test
+/// and an integration test are two crates, and one value shared between them would have to
+/// leave the library's public surface.
 ///
 /// Three fixtures do not use it. Two drive `[search.vector]` themselves and neither
 /// reaches a network. The third serves a `rift.toml` acceptance refuses, where
 /// [`RiftMcp::build`]'s own gate is what holds the acquisition back.
 #[cfg(test)]
-pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
+pub(crate) const HERMETIC_TABLES: &str =
+    "[search.vector]\ndisabled = true\n\n[dependencies]\nresolution = \"static\"\n";
 
-/// Writes `root`'s `rift.toml`: the disabling table, then `configuration`.
+/// Writes `root`'s `rift.toml`: the hermetic tables, then `configuration`.
 ///
 /// A table header ends where the next one begins, so a fixture's own table follows
 /// unchanged and still proves whatever it carries.
@@ -1265,7 +1230,7 @@ pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 /// Returns the write's own failure.
 #[cfg(test)]
 pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::Result<()> {
-    let contents = format!("{VECTOR_DISABLED}{configuration}");
+    let contents = format!("{HERMETIC_TABLES}{configuration}");
     std::fs::write(root.join("rift.toml"), contents)
 }
 
@@ -1299,10 +1264,6 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
-    /// The package branch every published snapshot answers a `global` or `all` lookup
-    /// from. The first such read fills it.
-    #[cfg(test)]
-    dependencies: Arc<PackageBranch>,
     /// The workspace's recorded diagnostics, absent when the store could not be
     /// opened at startup; `rift://logs` then answers with that reason rather
     /// than refusing. The handle is the read side alone: the drain task that
@@ -1434,9 +1395,8 @@ impl RiftMcp {
         let (validation, invalidations) =
             IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
         let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
-        let packages = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
         let (published, lexical_write) =
-            initial_workspace(&root, limits, &validation, &blocking, &packages).await?;
+            initial_workspace(&root, limits, &validation, &blocking).await?;
         // Direct construction delays the database open until the initial scan proves the
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
@@ -1474,7 +1434,6 @@ impl RiftMcp {
             blocking: blocking.clone(),
             population: population.clone(),
             lexical: lexical.clone(),
-            dependencies: Arc::clone(&packages),
         };
         if let (Some(index), Some(lane), Some(acquisition)) =
             (search_index.as_ref(), population.as_ref(), acquisition)
@@ -1502,8 +1461,6 @@ impl RiftMcp {
             ranking_weights,
             global: Arc::new(GlobalState::default()),
             lexical,
-            #[cfg(test)]
-            dependencies: packages,
             logs,
             engines,
             #[cfg(test)]
@@ -1617,9 +1574,9 @@ impl RiftMcp {
     /// `source`. `include: ["history"]` adds each hit's version-control timeline,
     /// walked from the served revision. `rev` serves the lookup from a
     /// version-control revision instead of the current tree. `scope` reaches
-    /// past the project tree: `global` answers from the public declarations of
-    /// the cataloged packages alone, `all` from both, project hits first. Use
-    /// `search` when the name is not exactly known.
+    /// past the project tree: `global` answers from the public declarations the
+    /// global index holds for the workspace's dependencies alone, `all` from both,
+    /// project hits first. Use `search` when the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -1633,7 +1590,10 @@ impl RiftMcp {
             .await
     }
 
-    /// Routes one current-tree package lookup through global data and selected local fallback.
+    /// Routes one current-tree lookup whose `scope` reaches packages: the project hits
+    /// come from the published snapshot, the package hits from the global index. A route
+    /// the global API did not answer, or a remote read that failed, leaves the project
+    /// hits alone with the typed global warning.
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
@@ -1667,11 +1627,11 @@ impl RiftMcp {
                         remote.items
                     }
                     Ok(Err(error)) => {
-                        route.discard_remote(&context, &error);
+                        route.discard_remote(&error);
                         Vec::new()
                     }
                     Err(_) => {
-                        route.discard_remote(&context, &rift_cloud_client::ClientError::Deadline);
+                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
                         Vec::new()
                     }
                 }
@@ -1681,31 +1641,21 @@ impl RiftMcp {
         let mut collected = params.clone();
         collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
         collected.page_index = 0;
-        let fallback_context = Arc::clone(&route.fallback_context);
-        let answer = self
-            .current_tree_read(&resolved, move |reads| {
-                reads.get_symbol_with_dependency_context(&collected, &fallback_context)
-            })
-            .await?;
-        let mut answer = match merge_symbols(&params, answer.0, remote) {
+        let local = self
+            .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
+            .await?
+            .0;
+        let mut answer = match merge_symbols(&params, local.clone(), remote) {
             Ok(mut answer) => {
                 answer.warnings.append(&mut remote_warnings);
                 answer
             }
             Err(error) => {
-                route.discard_remote(&context, &error);
-                let mut collected = params.clone();
-                collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
-                collected.page_index = 0;
-                let fallback_context = Arc::clone(&route.fallback_context);
-                self.current_tree_read(&resolved, move |reads| {
-                    reads.get_symbol_with_dependency_context(&collected, &fallback_context)
-                })
-                .await?
-                .0
+                route.discard_remote(&error);
+                local_symbol_page(&params, local)
             }
         };
-        apply_global_warnings(&mut answer.warnings, &route);
+        answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
 
@@ -1715,9 +1665,9 @@ impl RiftMcp {
     /// declarations two committed revisions hold differently, in place of `query` and
     /// `traversal`. `rev` searches a version-control revision instead of the current tree,
     /// and never combines with `traversal` or `change`. `scope` reaches past the project
-    /// tree: `global` answers `query` from the public declarations of the cataloged
-    /// packages alone, `all` from both, ordered together. Use `get_symbol` when the
-    /// declaration name is known.
+    /// tree: `global` answers `query` from the public declarations the global index holds
+    /// for the workspace's dependencies alone, `all` from both, ordered together. Use
+    /// `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1861,7 +1811,10 @@ impl RiftMcp {
             .await
     }
 
-    /// Routes one current-tree search through global data and selected local fallback.
+    /// Routes one current-tree search: the project hits come from the published snapshot,
+    /// and a `query` whose `scope` reaches packages adds the global index's package hits,
+    /// ordered together. A route the global API did not answer, or a remote read that
+    /// failed, leaves the project hits alone with the typed global warning.
     async fn route_current_tree_search(
         &self,
         resolved: ResolvedWorkspace,
@@ -1871,22 +1824,7 @@ impl RiftMcp {
         references: EngineReferences,
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        if params.scope == SearchScope::Local {
-            let mut answer = self
-                .current_tree_search_selected(
-                    &resolved,
-                    params,
-                    answer,
-                    Arc::new(references),
-                    Arc::clone(resolved.published.reads.dependency_context()),
-                )
-                .await?;
-            answer.0.warnings.extend(warnings);
-            return Ok(answer);
-        }
-
         let references = Arc::new(references);
-        let context = Arc::clone(resolved.published.reads.dependency_context());
         let parsed = params
             .query
             .as_deref()
@@ -1894,19 +1832,15 @@ impl RiftMcp {
         let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
             .then_some(parsed)
             .flatten();
-        let Some(parsed) = remote_query else {
-            let selected = Arc::new(context.filter_entries(|_| false));
+        let (Some(parsed), false) = (remote_query, params.scope == SearchScope::Local) else {
             let mut answer = self
-                .current_tree_search_selected(&resolved, params, answer, references, selected)
+                .current_tree_search_selected(&resolved, params, answer, references)
                 .await?;
-            answer
-                .0
-                .warnings
-                .retain(|warning| !matches!(warning, ReadWarning::GlobalIndexUnavailable { .. }));
             answer.0.warnings.extend(warnings);
             return Ok(answer);
         };
 
+        let context = Arc::clone(resolved.published.reads.dependency_context());
         let configuration = resolved.published.configuration.global_configuration();
         let (mut route, mut remote) = self
             .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
@@ -1916,36 +1850,21 @@ impl RiftMcp {
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
         let mut local = self
-            .current_tree_search_selected(
-                &resolved,
-                collected.clone(),
-                answer.clone(),
-                Arc::clone(&references),
-                Arc::clone(&route.fallback_context),
-            )
-            .await?;
-        local.0.warnings.extend(warnings.clone());
-        let mut answer = match merge_search(&params, local.0, remote) {
+            .current_tree_search_selected(&resolved, collected, answer, references)
+            .await?
+            .0;
+        local.warnings.extend(warnings);
+        let mut answer = match merge_search(&params, local.clone(), remote) {
             Ok(mut answer) => {
                 answer.warnings.extend(remote_warnings);
                 answer
             }
             Err(error) => {
-                route.discard_remote(&context, &error);
-                let mut fallback = self
-                    .current_tree_search_selected(
-                        &resolved,
-                        collected,
-                        answer,
-                        references,
-                        Arc::clone(&route.fallback_context),
-                    )
-                    .await?;
-                fallback.0.warnings.extend(warnings);
-                fallback.0
+                route.discard_remote(&error);
+                local_search_page(&params, local)
             }
         };
-        apply_global_warnings(&mut answer.warnings, &route);
+        answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
 
@@ -1982,11 +1901,11 @@ impl RiftMcp {
                 {
                     Ok(Ok(remote)) => remote,
                     Ok(Err(error)) => {
-                        route.discard_remote(context, &error);
+                        route.discard_remote(&error);
                         GlobalSearchCandidates::default()
                     }
                     Err(_) => {
-                        route.discard_remote(context, &rift_cloud_client::ClientError::Deadline);
+                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
                         GlobalSearchCandidates::default()
                     }
                 }
@@ -1996,23 +1915,17 @@ impl RiftMcp {
         (route, remote)
     }
 
-    /// Executes one search with package work limited to `dependency_context`.
+    /// Executes one search against the published snapshot `resolved` captured.
     async fn current_tree_search_selected(
         &self,
         resolved: &ResolvedWorkspace,
         params: SearchParams,
         answer: StoreAnswer,
         references: Arc<EngineReferences>,
-        dependency_context: Arc<rift_dependency::DependencyContext>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         rift_core::traced_async!(component = "search", operation = "search.read", {
             self.current_tree_read(resolved, move |reads| {
-                reads.search_with_references_and_dependency_context(
-                    &params,
-                    &answer,
-                    &references,
-                    &dependency_context,
-                )
+                reads.search_with_references(&params, &answer, &references)
             })
             .await
         })
@@ -2103,9 +2016,9 @@ impl RiftMcp {
     /// lexical lane is still committing this tree into once `deadline` passed, and one
     /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
     /// search to answer alone. A query-term limit the index refuses surfaces as this
-    /// request's own `limit_exceeded` error, never a silent degrade. A `dependencies`
-    /// scope never consults the index: the ranked lane serves the project alone, so
-    /// nothing about it rides that answer.
+    /// request's own `limit_exceeded` error, never a silent degrade. A `global` scope
+    /// never consults the index: the ranked lane serves the project alone, so nothing
+    /// about it rides that answer.
     async fn ranking(
         &self,
         params: &SearchParams,
@@ -3292,7 +3205,6 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use crate::validation::RebuildRequest;
-    use crate::validation::tests::empty_package_branch;
 
     use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
     use crate::validation::lexical_double::StoreDouble;
@@ -3345,7 +3257,6 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
-            &empty_package_branch(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -4711,7 +4622,7 @@ mod tests {
         stale_index_of(&run_search(server, "beacon").await?.warnings)?;
 
         let request = server.validation.take_pending();
-        let capture = workspace_capture(&assembled.context.dependencies);
+        let capture = workspace_capture();
         let outcome = rebuild_workspace(&assembled.context, request, capture).await?;
         assert_eq!(outcome, RebuildOutcome::Published);
 
@@ -4901,13 +4812,12 @@ mod tests {
     async fn supersede_rebuild(assembled: &UnsupervisedServer, next_source: String) -> TestResult {
         let server = &assembled.server;
         let validation = Arc::clone(&server.validation);
-        let dependencies = Arc::clone(&server.dependencies);
         let path = CoreProjectPath::new("lib.rs")?;
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
             move |root: &std::path::Path, limits, request: &RebuildRequest| {
-                let candidate = build_workspace_candidate(root, limits, request, &dependencies)?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
                 assert!(matches!(candidate, WorkspaceCandidate::Stable { .. }));
                 fs::write(root.join("lib.rs"), &next_source)
                     .expect("the later source edit must land");
@@ -5024,7 +4934,7 @@ mod tests {
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
-            workspace_capture(&server.dependencies),
+            workspace_capture(),
         )
         .await?;
         assert_eq!(outcome, RebuildOutcome::Published);
@@ -5053,7 +4963,7 @@ mod tests {
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
-            workspace_capture(&server.dependencies),
+            workspace_capture(),
         )
         .await?;
         assert_eq!(outcome, RebuildOutcome::Published);

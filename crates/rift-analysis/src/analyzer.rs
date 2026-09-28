@@ -3,8 +3,7 @@
 //! [`PackageAnalyzer`] holds no I/O. It takes the bytes a caller already read, parses
 //! them with the shipped syntax providers, places each file under the package's own
 //! identity, assembles the declarations through [`WorkspaceSemantics`], and renders the
-//! result as a [`PackagePublication`]. The local package index consumes that publication,
-//! and a later global ingestion consumes the same shape, so one extraction serves both.
+//! result as a [`PackagePublication`], the shape global ingestion consumes.
 //!
 //! Every record carries the digest of its own canonical content, and the publication as a
 //! whole renders as RFC 8785 canonical JSON, so two runs over the same bytes under the
@@ -200,8 +199,8 @@ impl AnalyzedFile {
 /// same pass built it from.
 ///
 /// The publication is the artifact a consumer stores and compares. The parsed files and
-/// the assembled graph are the same pass's working values, handed on so the local package
-/// index answers reads without parsing the package a second time.
+/// the assembled graph are the same pass's working values, handed on so a consumer reads
+/// them without parsing the package a second time.
 #[derive(Debug)]
 pub struct PackageAnalysis {
     publication: PackagePublication,
@@ -1255,7 +1254,7 @@ fn identifier_terms(names: &[&str]) -> Vec<String> {
     terms
 }
 
-/// The origin every declaration of one cataloged package carries.
+/// The origin every declaration of one analyzed package carries.
 fn symbol_origin(
     package: &PackageIdentity,
     origin: &ContributionOrigin,
@@ -2053,8 +2052,8 @@ mod tests {
         assert!(rendered.contains("src/lib.rs"));
     }
 
-    /// The analysis hands back the parsed files beside the publication, so the local
-    /// package index reads what the publication was built from rather than parsing again.
+    /// The analysis hands back the parsed files beside the publication, so a consumer
+    /// reads what the publication was built from rather than parsing again.
     #[test]
     fn test_analysis_carries_the_parsed_files_beside_the_publication() {
         let analysis = analysis(

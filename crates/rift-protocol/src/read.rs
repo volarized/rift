@@ -881,14 +881,10 @@ pub struct ProjectPath(
     pub String,
 );
 
-/// Most package and dependency-context warnings one answer carries together. Local reads
-/// order skipped packages, then degraded resolvers, then unavailable packages. Routed global
-/// reads order unavailable packages and degraded resolvers before packages absent from the
-/// global publication.
+/// Most package and dependency-context warnings one answer carries together: degraded
+/// resolvers, then entries no public registry serves, then packages absent from the global
+/// publication.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
-
-/// Maximum package count carried by one global fallback summary.
-pub const GLOBAL_FALLBACK_PACKAGES_MAX: u64 = crate::dependencies::DEPENDENCIES_PACKAGES_MAX as u64;
 
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
 /// in project-path order; when more files are left out, one more warning follows them and
@@ -1062,60 +1058,25 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// No global package index answered this read, so the package facts came from the
-    /// packages this machine indexed. Rides every answer whose `scope` reaches packages,
-    /// and states what the local fallback produced.
-    GlobalIndexUnavailable {
-        /// Packages the local fallback indexed for this answer.
-        indexed: u64,
-        /// Why no global index answered, and what the fallback did instead - prose for a
-        /// reader; nothing keys on it.
-        #[schemars(length(max = 4096))]
-        detail: String,
-    },
-    /// Global access was disabled, so every selected package used the local index.
-    GlobalAccessDisabled {
-        /// Packages the local fallback indexed for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_indexed: u64,
-        /// Packages the local fallback could not resolve for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_unresolved: u64,
-    },
-    /// The global API could not answer, so the affected packages used the local index.
+    /// Global access is disabled under `[global] enabled = false`, so the answer carries no
+    /// package facts.
+    GlobalAccessDisabled,
+    /// The global API could not answer, so the answer carries no package facts.
     GlobalApiUnavailable {
         /// Bounded class of the global API failure.
         failure_class: GlobalFailureClass,
-        /// Packages the local fallback indexed for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_indexed: u64,
-        /// Packages the local fallback could not resolve for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_unresolved: u64,
     },
-    /// The global API advertised a publication the client cannot read, so the affected
-    /// packages used the local index.
+    /// The global API advertised a publication the client cannot read, so the answer
+    /// carries no package facts.
     GlobalPublicationIncompatible {
         /// Bounded class of the incompatible publication.
         failure_class: GlobalFailureClass,
-        /// Packages the local fallback indexed for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_indexed: u64,
-        /// Packages the local fallback could not resolve for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_unresolved: u64,
     },
-    /// The global API returned an invalid or truncated response, so the affected packages
-    /// used the local index.
+    /// The global API returned an invalid or truncated response, so the answer carries no
+    /// package facts.
     GlobalResponseInvalid {
         /// Bounded class of the invalid response.
         failure_class: GlobalFailureClass,
-        /// Packages the local fallback indexed for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_indexed: u64,
-        /// Packages the local fallback could not resolve for this answer.
-        #[schemars(range(min = 0_u64, max = GLOBAL_FALLBACK_PACKAGES_MAX))]
-        fallback_unresolved: u64,
     },
     /// The global package page carried a bounded condition while its items remained valid.
     /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
@@ -1127,47 +1088,41 @@ pub enum ReadWarning {
         #[schemars(length(max = 1024))]
         detail: Option<String>,
     },
-    /// A valid global resolution named no remote package, so the package used local indexing.
-    /// At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer.
+    /// The global publication holds no release of an exact package the dependency
+    /// context names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package
+    /// and dependency-context warnings ride one answer.
     PackageAbsent {
         /// The exact package absent from the global publication.
         package: PackageIdentity,
     },
-    /// A valid global resolution could not resolve a declared requirement, so the entry used
-    /// local indexing. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
-    /// ride one answer.
+    /// The global publication holds no release a declared requirement admits, so nothing
+    /// answers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
+    /// warnings ride one answer.
     PackageRequirementAbsent {
         /// The declared requirement absent from the global publication.
         entry: crate::dependencies::PackageContextEntry,
     },
-    /// A package remained unavailable after local fallback. At most `DEPENDENCY_WARNINGS_MAX`
-    /// package and dependency-context warnings ride one answer.
+    /// The dependency context names a package no public registry serves: a path outside
+    /// the workspace, a git repository, a private registry, or a URL. No global package
+    /// index answers for it, and `reason` names the capability Rift does not have yet. At
+    /// most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one
+    /// answer.
     PackageUnavailable {
-        /// The package the local fallback could not serve.
-        package: PackageIdentity,
-        /// Why local fallback could not serve the package.
+        /// The dependency context entry, as the workspace's manifests and lockfiles state
+        /// it; its `availability` names the kind.
+        entry: crate::dependencies::PackageContextEntry,
+        /// Why no global package index answers for the entry, for a reader.
         #[schemars(length(max = 4096))]
         reason: String,
     },
-    /// The local package index refused one package, so none of its declarations answers.
-    /// Rides only an answer whose `scope` reaches packages; at most
-    /// `DEPENDENCY_WARNINGS_MAX` of this warning, `package_context_degraded`, and
-    /// `package_unavailable` together ride one answer, this one first, in package identity
-    /// order.
-    PackageSkipped {
-        /// The package the index refused.
-        package: PackageIdentity,
-        /// Why the index refused it - prose for a reader; nothing keys on it.
-        #[schemars(length(max = 4096))]
-        reason: String,
-    },
-    /// One resolver read less than its manifests and lockfiles state, so the dependency
-    /// context may miss packages and the packages it misses answer nothing. Rides only an
-    /// answer whose `scope` reaches packages; at most `DEPENDENCY_WARNINGS_MAX` of this
-    /// warning and `package_skipped` together ride one answer, this one after every
-    /// skipped package, in resolver order.
+    /// One resolver or standard library probe read less than the workspace states, so the
+    /// dependency context may miss packages or name a standard library by its static
+    /// reading. Rides only an answer whose `scope` reaches packages; at most
+    /// `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer,
+    /// this one first, in resolver order.
     PackageContextDegraded {
-        /// The resolver that degraded, by its manager name: `cargo`, `uv`, `npm`, or `bun`.
+        /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`,
+        /// or a standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`.
         #[schemars(length(max = 128))]
         resolver: String,
         /// What the resolver could not do - prose for a reader; nothing keys on it.
@@ -1588,9 +1543,11 @@ pub enum SourceLocation {
 pub enum SourceLocationKind {
     /// Owned by the current workspace.
     Project,
-    /// Owned by one resolved dependency.
+    /// Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong
+    /// to the npm `typescript` package, whose `lib.*.d.ts` files declare them.
     Dependency,
-    /// Installed with the language toolchain.
+    /// Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or
+    /// `stdlib/python`.
     Stdlib,
     /// Outside the project, dependency graph, and standard library.
     External,
@@ -1988,11 +1945,10 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, FileId, GLOBAL_FALLBACK_PACKAGES_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
-        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
-        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
-        RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
+        Digest, Duration, FileId, GetSymbolParams, GlobalFailureClass, GlobalPageWarningCode,
+        IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
+        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
+        RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2405,67 +2361,34 @@ mod tests {
     fn every_package_warning_round_trips_under_its_code_tag() {
         let cases = [
             (
-                ReadWarning::GlobalIndexUnavailable {
-                    indexed: 3,
-                    detail: "no global package index is configured; 3 packages were indexed \
-                             on this machine"
-                        .to_owned(),
-                },
-                json!({
-                    "code": "global_index_unavailable",
-                    "indexed": 3,
-                    "detail": "no global package index is configured; 3 packages were indexed \
-                               on this machine",
-                }),
-            ),
-            (
-                ReadWarning::GlobalAccessDisabled {
-                    fallback_indexed: 3,
-                    fallback_unresolved: 1,
-                },
-                json!({
-                    "code": "global_access_disabled",
-                    "fallback_indexed": 3,
-                    "fallback_unresolved": 1,
-                }),
+                ReadWarning::GlobalAccessDisabled,
+                json!({ "code": "global_access_disabled" }),
             ),
             (
                 ReadWarning::GlobalApiUnavailable {
                     failure_class: GlobalFailureClass::RetryExhausted,
-                    fallback_indexed: 3,
-                    fallback_unresolved: 1,
                 },
                 json!({
                     "code": "global_api_unavailable",
                     "failure_class": "retry_exhausted",
-                    "fallback_indexed": 3,
-                    "fallback_unresolved": 1,
                 }),
             ),
             (
                 ReadWarning::GlobalPublicationIncompatible {
                     failure_class: GlobalFailureClass::PublicationFormat,
-                    fallback_indexed: 3,
-                    fallback_unresolved: 1,
                 },
                 json!({
                     "code": "global_publication_incompatible",
                     "failure_class": "publication_format",
-                    "fallback_indexed": 3,
-                    "fallback_unresolved": 1,
                 }),
             ),
             (
                 ReadWarning::GlobalResponseInvalid {
                     failure_class: GlobalFailureClass::ResponseTruncated,
-                    fallback_indexed: 3,
-                    fallback_unresolved: 1,
                 },
                 json!({
                     "code": "global_response_invalid",
                     "failure_class": "response_truncated",
-                    "fallback_indexed": 3,
-                    "fallback_unresolved": 1,
                 }),
             ),
             (
@@ -2517,36 +2440,23 @@ mod tests {
             ),
             (
                 ReadWarning::PackageUnavailable {
-                    package: PackageIdentity {
-                        manager: "cargo".to_owned(),
-                        name: "unavailable-helper".to_owned(),
-                        version: "0.1.0".to_owned(),
-                    },
-                    reason: "source was not available to local fallback".to_owned(),
+                    entry: PackageContextEntry::new(
+                        "cargo",
+                        "helper",
+                        PackageSelector::Requirement("^0.1".to_owned()),
+                        PackageAvailability::Git,
+                    ),
+                    reason: crate::dependencies::GIT_UNAVAILABLE_REASON.to_owned(),
                 },
                 json!({
                     "code": "package_unavailable",
-                    "package": {
+                    "entry": {
                         "manager": "cargo",
-                        "name": "unavailable-helper",
-                        "version": "0.1.0",
+                        "name": "helper",
+                        "requirement": "^0.1",
+                        "availability": "git",
                     },
-                    "reason": "source was not available to local fallback",
-                }),
-            ),
-            (
-                ReadWarning::PackageSkipped {
-                    package: PackageIdentity {
-                        manager: "cargo".to_owned(),
-                        name: "helper".to_owned(),
-                        version: "0.1.0".to_owned(),
-                    },
-                    reason: "cargo/helper@0.1.0 exceeds package_bytes_max".to_owned(),
-                },
-                json!({
-                    "code": "package_skipped",
-                    "package": { "manager": "cargo", "name": "helper", "version": "0.1.0" },
-                    "reason": "cargo/helper@0.1.0 exceeds package_bytes_max",
+                    "reason": crate::dependencies::GIT_UNAVAILABLE_REASON,
                 }),
             ),
             (
@@ -2651,7 +2561,6 @@ mod tests {
             "results_truncated",
             "source_unavailable",
             "symbol_disagreement",
-            "global_index_unavailable",
             "global_access_disabled",
             "global_api_unavailable",
             "global_publication_incompatible",
@@ -2660,7 +2569,6 @@ mod tests {
             "package_absent",
             "package_requirement_absent",
             "package_unavailable",
-            "package_skipped",
             "package_context_degraded",
             "relationship_coverage_missing",
         ] {
@@ -2669,10 +2577,16 @@ mod tests {
                 "the schema must advertise {code}: {codes:?}"
             );
         }
+        for removed in ["global_index_unavailable", "package_skipped"] {
+            assert!(
+                !codes.contains(&json!({ "const": removed, "type": "string" })),
+                "no local package index emits {removed}: {codes:?}"
+            );
+        }
     }
 
     #[test]
-    fn global_warning_schema_bounds_failure_class_and_fallback_counts() {
+    fn global_warning_schema_bounds_failure_class_and_carries_no_counts() {
         let warning_schema = serde_json::to_value(schema_for!(ReadWarning)).expect("schema");
         let arms = warning_schema["oneOf"]
             .as_array()
@@ -2687,13 +2601,17 @@ mod tests {
                     })
             })
             .expect("global API warning schema");
+        // A set: the member order follows whether a workspace build enables serde_json's
+        // `preserve_order`, which the schema never promises.
+        let properties: std::collections::BTreeSet<&str> = arm["properties"]
+            .as_object()
+            .expect("an arm names its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
-            arm["properties"]["fallback_indexed"]["maximum"],
-            json!(GLOBAL_FALLBACK_PACKAGES_MAX)
-        );
-        assert_eq!(
-            arm["properties"]["fallback_unresolved"]["maximum"],
-            json!(GLOBAL_FALLBACK_PACKAGES_MAX)
+            properties,
+            std::collections::BTreeSet::from(["code", "failure_class"])
         );
 
         let failure_schema =

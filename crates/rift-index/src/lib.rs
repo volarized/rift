@@ -3,7 +3,6 @@
 mod change_set;
 mod chunk;
 mod database;
-mod dependency;
 mod documentation;
 mod documentation_store;
 mod glob;
@@ -19,13 +18,6 @@ mod workspace;
 
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
 pub use database::{DatabasePool, WorkspaceDatabase};
-pub use dependency::{
-    AnalyzedFile, DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits,
-    DependencySymbolMatch, ManifestError, PackageAnalysis, PackageAnalyzer, PackageFiles,
-    PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation, SkippedPackage,
-    WALK_ENTRIES_MAX_DEFAULT, analyzer_manifest_path, analyzer_revision, package_files,
-    render_analyzer_manifest,
-};
 pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{

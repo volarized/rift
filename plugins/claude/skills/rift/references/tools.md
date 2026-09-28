@@ -9,9 +9,9 @@ carries the declaration and its source excerpt unless `include` omits
 `source`. `include: ["history"]` adds each hit's version-control timeline,
 walked from the served revision. `rev` serves the lookup from a
 version-control revision instead of the current tree. `scope` reaches
-past the project tree: `global` answers from the public declarations of
-the cataloged packages alone, `all` from both, project hits first. Use
-`search` when the name is not exactly known.
+past the project tree: `global` answers from the public declarations the
+global index holds for the workspace's dependencies alone, `all` from both,
+project hits first. Use `search` when the name is not exactly known.
 
 Parameters:
 
@@ -46,9 +46,9 @@ bounded relationship `traversal` from one seed symbol. `change` answers the
 declarations two committed revisions hold differently, in place of `query` and
 `traversal`. `rev` searches a version-control revision instead of the current tree,
 and never combines with `traversal` or `change`. `scope` reaches past the project
-tree: `global` answers `query` from the public declarations of the cataloged
-packages alone, `all` from both, ordered together. Use `get_symbol` when the
-declaration name is known.
+tree: `global` answers `query` from the public declarations the global index holds
+for the workspace's dependencies alone, `all` from both, ordered together. Use
+`get_symbol` when the declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions

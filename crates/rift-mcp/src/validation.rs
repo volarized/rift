@@ -32,8 +32,8 @@ use rift_protocol::source::SourceConfiguration;
 use rift_ranking::IndexDocument;
 use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, PackageBranch, ReadError,
-    ReadFault, ReadService, load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
+    ReadService, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -328,8 +328,6 @@ pub(crate) struct IndexSupervisorContext {
     /// exactly when the population lane is: with no index open there is no store to
     /// commit to, and `search` reports the tier unavailable for the life of this server.
     pub(crate) lexical: Option<LexicalLane>,
-    /// The package branch every candidate's read service answers a package read from.
-    pub(crate) dependencies: Arc<PackageBranch>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -446,9 +444,8 @@ impl ConfigurationState {
 
     /// Whether index-owned configuration differs from another acceptance.
     ///
-    /// The `[dependencies]` table counts as index-owned: the read service resolves its
-    /// catalog under the table's resolution policy and gates dependency-scoped lookups on
-    /// its switch.
+    /// The `[dependencies]` table counts as index-owned: the read service reads its
+    /// dependency context under the table's packages and resolution policy.
     ///
     /// `[providers.syntax]` counts too: its bounds decide which declarations a file's parse
     /// keeps, so a publication built under other bounds holds other units.
@@ -1159,10 +1156,8 @@ pub(crate) async fn initial_workspace(
     limits: WorkspaceIndexLimits,
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
-    dependencies: &Arc<PackageBranch>,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    let capture = workspace_capture(dependencies);
-    initial_workspace_with(root, limits, validation, blocking, capture).await
+    initial_workspace_with(root, limits, validation, blocking, workspace_capture()).await
 }
 
 /// One candidate capture: the whole-workspace scan, or a test's stand-in for it.
@@ -1177,14 +1172,9 @@ impl<Capture> CaptureWorkspace for Capture where
 {
 }
 
-/// The capture production runs: the whole-workspace scan over the dependency index.
-pub(crate) fn workspace_capture(
-    dependencies: &Arc<PackageBranch>,
-) -> impl CaptureWorkspace + Clone + Send + 'static {
-    let dependencies = Arc::clone(dependencies);
-    move |root: &Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
-        build_workspace_candidate(root, limits, request, &dependencies)
-    }
+/// The capture production runs: the whole-workspace scan.
+pub(crate) fn workspace_capture() -> impl CaptureWorkspace + Clone + Send + 'static {
+    build_workspace_candidate
 }
 
 /// What one startup attempt's scan folded, kept so the next attempt compares content
@@ -1365,13 +1355,11 @@ pub(crate) enum WorkspaceCandidate {
 /// file, its `[source]` policy, and its acceptance with the publication it was resolved
 /// against; a full request scans the workspace. Either way the acceptance is verified
 /// against `rift.toml` after the read, so a candidate built under configuration that moved
-/// underneath it is reported as changed rather than published. Either way the candidate's
-/// read service answers a `global` or `all` lookup from `dependencies`, the package branch.
+/// underneath it is reported as changed rather than published.
 pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
-    dependencies: &Arc<PackageBranch>,
 ) -> Result<WorkspaceCandidate, ReadError> {
     tracing::debug!(
         component = "index",
@@ -1389,14 +1377,7 @@ pub(crate) fn build_workspace_candidate(
                     .configuration
                     .index_configuration_differs(&configuration)
             });
-            whole_workspace_candidate(
-                root,
-                limits,
-                configuration,
-                request.epoch,
-                dependencies,
-                sharing,
-            )?
+            whole_workspace_candidate(root, limits, configuration, request.epoch, sharing)?
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1446,7 +1427,6 @@ fn whole_workspace_candidate(
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
-    dependencies: &Arc<PackageBranch>,
     sharing: Option<&PublishedWorkspace>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
@@ -1469,8 +1449,7 @@ fn whole_workspace_candidate(
             configuration.history_configuration(),
             dependencies_configuration,
         )?,
-    }
-    .with_packages(Arc::clone(dependencies));
+    };
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     });
@@ -2517,8 +2496,8 @@ pub(crate) enum RebuildOutcome {
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
 ///
-/// A published rebuild hands its catalog to the dependency lane and its snapshot to the
-/// population lane, then moves on to the next batch. The supervisor awaiting a pass itself
+/// A published rebuild hands its snapshot to the population lane, then moves on to the
+/// next batch. The supervisor awaiting a pass itself
 /// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
 /// does not stop moving meanwhile.
 pub(crate) async fn run_index_supervisor(
@@ -2526,7 +2505,7 @@ pub(crate) async fn run_index_supervisor(
     invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
 ) {
-    let capture = workspace_capture(&context.dependencies);
+    let capture = workspace_capture();
     run_index_supervisor_with(watcher, invalidations, context, capture).await;
 }
 
@@ -3328,14 +3307,6 @@ impl ConfigurationState {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// A package branch holding nothing, for a test that publishes a workspace without
-    /// asking for a package read.
-    pub(crate) fn empty_package_branch() -> std::sync::Arc<rift_server::PackageBranch> {
-        std::sync::Arc::new(rift_server::PackageBranch::new(
-            rift_index::DependencyIndexLimits::default(),
-        ))
-    }
-
     use super::ConfigurationState;
     use rift_core::SourceVisibility;
     use rift_server::LspProcessKey;
@@ -3464,12 +3435,7 @@ pub(crate) mod tests {
         epoch: u64,
         limits: WorkspaceIndexLimits,
     ) -> TestResult<Arc<PublishedWorkspace>> {
-        match build_workspace_candidate(
-            root,
-            limits,
-            &RebuildRequest::initial(epoch),
-            &empty_package_branch(),
-        )? {
+        match build_workspace_candidate(root, limits, &RebuildRequest::initial(epoch))? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
                 Err("fixture configuration must remain stable".into())
@@ -4089,7 +4055,6 @@ pub(crate) mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &super::RebuildRequest::initial(0),
-            &empty_package_branch(),
         )?;
         let WorkspaceCandidate::Stable { published, .. } = candidate else {
             return Err("the fixture capture must be stable".into());
@@ -4352,7 +4317,7 @@ pub(crate) mod tests {
             &state,
             &validation,
             request,
-            super::workspace_capture(&empty_package_branch()),
+            super::workspace_capture(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
@@ -4378,14 +4343,13 @@ pub(crate) mod tests {
         fs::create_dir_all(directory.path().join("fresh"))?;
         fs::write(directory.path().join("fresh/mod.rs"), "pub fn fresh() {}\n")?;
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let rebuild = |epoch: u64| -> TestResult<Arc<PublishedWorkspace>> {
             let request = super::RebuildRequest {
                 epoch,
                 work: super::PendingWork::whole_workspace(),
                 previous: Some(Arc::clone(&previous)),
             };
-            match build_workspace_candidate(directory.path(), limits, &request, &store)? {
+            match build_workspace_candidate(directory.path(), limits, &request)? {
                 WorkspaceCandidate::Stable {
                     published,
                     change_set,
@@ -4437,11 +4401,10 @@ pub(crate) mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -4470,11 +4433,10 @@ pub(crate) mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -4511,7 +4473,6 @@ pub(crate) mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4559,7 +4520,6 @@ pub(crate) mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4698,7 +4658,7 @@ pub(crate) mod tests {
             &state,
             &validation,
             RebuildRequest::initial(7),
-            super::workspace_capture(&empty_package_branch()),
+            super::workspace_capture(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert!(
@@ -4754,7 +4714,6 @@ pub(crate) mod tests {
         let watcher = unwatched()?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
-        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4767,7 +4726,6 @@ pub(crate) mod tests {
                 blocking,
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4814,7 +4772,6 @@ pub(crate) mod tests {
             failure: None,
         }));
         let watcher = unwatched()?;
-        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4827,7 +4784,6 @@ pub(crate) mod tests {
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4874,7 +4830,7 @@ pub(crate) mod tests {
                 // Every capture observes one more filesystem event, so no attempt ever
                 // sees a stable epoch, and none of those events changes a byte.
                 moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, request, &empty_package_branch())
+                super::build_workspace_candidate(root, limits, request)
             },
         )
         .await?;
@@ -4917,12 +4873,7 @@ pub(crate) mod tests {
             &validation,
             &blocking,
             move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(
-                    root,
-                    limits,
-                    request,
-                    &empty_package_branch(),
-                )?;
+                let candidate = super::build_workspace_candidate(root, limits, request)?;
                 let mut seen = seen.lock().expect("the fixture lock is clean");
                 if let WorkspaceCandidate::Stable { published, .. } = &candidate {
                     seen.push(published.reads.tree_revision().to_owned());
@@ -5004,12 +4955,7 @@ pub(crate) mod tests {
             &validation,
             &blocking,
             move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(
-                    root,
-                    limits,
-                    request,
-                    &empty_package_branch(),
-                )?;
+                let candidate = super::build_workspace_candidate(root, limits, request)?;
                 // The next scan reads bytes this one never held.
                 fs::write(
                     written.join("lib.rs"),
@@ -5127,7 +5073,6 @@ pub(crate) mod tests {
         lexical: Option<LexicalLane>,
     ) -> Result<RebuildOutcome, rift_server::ReadError> {
         let request = validation.take_pending();
-        let dependencies = empty_package_branch();
         let context = super::IndexSupervisorContext {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
@@ -5137,9 +5082,8 @@ pub(crate) mod tests {
             blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
             population: None,
             lexical,
-            dependencies: Arc::clone(&dependencies),
         };
-        let capture = super::workspace_capture(&dependencies);
+        let capture = super::workspace_capture();
         super::rebuild_workspace(&context, request, capture).await
     }
 
@@ -5509,11 +5453,10 @@ pub(crate) mod tests {
             previous: Some(Arc::clone(&first)),
         };
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: second,
             change_set,
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -7031,7 +6974,6 @@ pub(crate) mod tests {
             .await
             .expect("held placeholder must occupy the one blocking slot");
 
-        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -7044,7 +6986,6 @@ pub(crate) mod tests {
                 blocking: blocking.clone(),
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
 
@@ -7110,7 +7051,6 @@ pub(crate) mod tests {
         validation: &Arc<IndexValidation>,
         published: &Arc<RwLock<IndexState>>,
         blocking: &BlockingExecutor,
-        dependencies: &Arc<super::PackageBranch>,
     ) -> super::IndexSupervisorContext {
         super::IndexSupervisorContext {
             root: root.to_path_buf(),
@@ -7121,7 +7061,6 @@ pub(crate) mod tests {
             blocking: blocking.clone(),
             population: None,
             lexical: None,
-            dependencies: Arc::clone(dependencies),
         }
     }
 
@@ -7130,9 +7069,7 @@ pub(crate) mod tests {
     ///
     /// The release is a rendezvous: it succeeds only while the capture still waits in
     /// it, so a successful release proves the capture was blocking at that moment.
-    fn held_capture(
-        dependencies: &Arc<super::PackageBranch>,
-    ) -> (
+    fn held_capture() -> (
         impl super::CaptureWorkspace + Clone + Send + 'static,
         tokio::sync::mpsc::UnboundedReceiver<()>,
         std::sync::mpsc::SyncSender<()>,
@@ -7140,7 +7077,7 @@ pub(crate) mod tests {
         let (started, started_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
         let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
-        let scan = super::workspace_capture(dependencies);
+        let scan = super::workspace_capture();
         let capture = move |root: &std::path::Path,
                             limits: WorkspaceIndexLimits,
                             request: &RebuildRequest| {
@@ -7166,15 +7103,8 @@ pub(crate) mod tests {
             failure: None,
         }));
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_package_branch();
-        let context = cancellation_context(
-            directory.path(),
-            &validation,
-            &published,
-            &blocking,
-            &dependencies,
-        );
-        let (capture, mut started, release) = held_capture(&dependencies);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let (capture, mut started, release) = held_capture();
         validation.observe_whole_workspace()?;
         let request = validation.take_pending();
 
@@ -7227,15 +7157,8 @@ pub(crate) mod tests {
         }));
         let watcher = unwatched()?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_package_branch();
-        let context = cancellation_context(
-            directory.path(),
-            &validation,
-            &published,
-            &blocking,
-            &dependencies,
-        );
-        let (capture, mut started, release) = held_capture(&dependencies);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let (capture, mut started, release) = held_capture();
         let supervisor = tokio::spawn(super::run_index_supervisor_with(
             watcher,
             invalidations,
@@ -7320,7 +7243,7 @@ pub(crate) mod tests {
             request,
             move |root, limits, request| {
                 cancelling.cancellation.cancel();
-                build_workspace_candidate(root, limits, request, &empty_package_branch())
+                build_workspace_candidate(root, limits, request)
             },
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Cancelled));

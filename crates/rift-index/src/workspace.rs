@@ -2269,20 +2269,6 @@ pub fn symbol_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
-    symbol_matches_where(files, query, limit, |_, _| true)
-}
-
-/// The ranking kernel behind [`symbol_matches`], over the declarations `included` accepts.
-///
-/// The predicate runs before ranking and truncation, so a filtered answer fills
-/// `limit` from what it includes; the dependency index passes its public-declaration
-/// rule here.
-pub(crate) fn symbol_matches_where<'a>(
-    files: impl IntoIterator<Item = &'a IndexedFile>,
-    query: &str,
-    limit: usize,
-    included: impl Fn(&IndexedFile, &SyntaxSymbol) -> bool,
-) -> Vec<SymbolMatch<'a>> {
     let query = query.to_lowercase();
     let mut matches = files
         .into_iter()
@@ -2292,7 +2278,6 @@ pub(crate) fn symbol_matches_where<'a>(
                 .iter()
                 .map(move |symbol| (file, symbol))
         })
-        .filter(|(file, symbol)| included(file, symbol))
         .filter_map(|(file, symbol)| {
             Some(SymbolMatch {
                 file,

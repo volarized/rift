@@ -1,6 +1,5 @@
 //! Global package routing for current-tree reads.
 
-use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -28,11 +27,6 @@ use rift_ranking::{
 };
 use tokio::sync::Mutex;
 
-/// Most package-manager summaries one read emits. Remaining managers are not logged.
-const FALLBACK_LOG_MANAGERS_MAX: usize = 8;
-/// Maximum UTF-8 bytes retained for one package-manager log label.
-const FALLBACK_LOG_MANAGER_BYTES_MAX: usize = 64;
-
 /// One client shared by reads under the same accepted configuration and credential value.
 #[derive(Default)]
 pub(crate) struct GlobalState {
@@ -54,18 +48,22 @@ struct ClientSlot {
     client: GlobalClient,
 }
 
-/// Global selection made before one local package read.
+/// What the global API resolved for one read: the packages it serves, the context
+/// entries it holds no release for, and the service state the read met.
+///
+/// A read whose route answers no client carries project hits alone, with the typed
+/// global warning naming why.
 pub(crate) struct GlobalRoute {
     pub(crate) client: Option<GlobalClient>,
     pub(crate) remote_packages: Vec<WirePackageIdentity>,
-    pub(crate) fallback_context: Arc<DependencyContext>,
+    context: Arc<DependencyContext>,
     pub(crate) missing_exact: Vec<PackageIdentity>,
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
     pub(crate) state: RouteState,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 }
 
-/// Why one read selected its local package fallback.
+/// The global service state one read met.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
     Disabled,
@@ -92,7 +90,7 @@ enum ServiceState {
 }
 
 impl GlobalState {
-    /// Resolves canonical package entries and selects entries requiring local fallback.
+    /// Resolves the context's canonical entries through the global API.
     pub(crate) async fn route(
         &self,
         configuration: &GlobalConfiguration,
@@ -103,9 +101,10 @@ impl GlobalState {
         route
     }
 
-    /// Selects local fallback when the enclosing MCP request deadline expires.
+    /// The route of a read whose enclosing MCP request deadline expired before the
+    /// global API answered.
     pub(crate) fn deadline_exceeded(&self, context: &Arc<DependencyContext>) -> GlobalRoute {
-        let route = GlobalRoute::fallback(
+        let route = GlobalRoute::unanswered(
             context,
             failure_state(&ClientError::Deadline),
             Arc::clone(&self.observation),
@@ -120,7 +119,7 @@ impl GlobalState {
         context: &Arc<DependencyContext>,
     ) -> GlobalRoute {
         if !configuration.enabled {
-            return GlobalRoute::fallback(
+            return GlobalRoute::unanswered(
                 context,
                 RouteState::Disabled,
                 Arc::clone(&self.observation),
@@ -128,24 +127,16 @@ impl GlobalState {
         }
         let request = resolution_request(context);
         if request.entries.is_empty() {
-            return GlobalRoute {
-                client: None,
-                remote_packages: Vec::new(),
-                fallback_context: Arc::new(
-                    context.filter_entries(|entry| {
-                        entry.availability == PackageAvailability::LocalOnly
-                    }),
-                ),
-                missing_exact: Vec::new(),
-                missing_requirements: Vec::new(),
-                state: RouteState::Available,
-                observation: Arc::clone(&self.observation),
-            };
+            return GlobalRoute::unanswered(
+                context,
+                RouteState::Available,
+                Arc::clone(&self.observation),
+            );
         }
         let client = match self.client(configuration).await {
             Ok(client) => client,
             Err(error) => {
-                return GlobalRoute::fallback(
+                return GlobalRoute::unanswered(
                     context,
                     failure_state(&ClientError::Config(error)),
                     Arc::clone(&self.observation),
@@ -156,7 +147,7 @@ impl GlobalState {
             Ok(resolution) => {
                 resolved_route(context, client, resolution, Arc::clone(&self.observation))
             }
-            Err(error) => GlobalRoute::fallback(
+            Err(error) => GlobalRoute::unanswered(
                 context,
                 failure_state(&error),
                 Arc::clone(&self.observation),
@@ -574,6 +565,38 @@ pub(crate) fn merge_search(
     })
 }
 
+/// One page of the project's own symbol hits, for a read whose remote lane failed: the
+/// hits keep the order the snapshot ranked them in.
+pub(crate) fn local_symbol_page(
+    params: &GetSymbolParams,
+    local: GetSymbolResult,
+) -> GetSymbolResult {
+    let limit = usize::try_from(params.limit).unwrap_or(usize::MAX);
+    let (hits, pagination) = page_window(local.hits, params.page_index, limit);
+    GetSymbolResult {
+        hits,
+        pagination,
+        warnings: local.warnings,
+    }
+}
+
+/// One page of the project's own search hits, for a read whose remote lane failed: the
+/// hits keep the order the snapshot answered them in under `params.order`.
+pub(crate) fn local_search_page(params: &SearchParams, local: SearchResult) -> SearchResult {
+    let limit = usize::try_from(
+        params
+            .limit
+            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
+    )
+    .unwrap_or(usize::MAX);
+    let (results, pagination) = page_window(local.results, params.page_index, limit);
+    SearchResult {
+        results,
+        pagination,
+        warnings: local.warnings,
+    }
+}
+
 fn candidate_fields(hit: &SearchHit) -> FieldSet {
     let fields: FieldSet = hit
         .matched_by
@@ -698,51 +721,39 @@ fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagi
 }
 
 impl GlobalRoute {
-    /// Discards a failed remote lane and selects the complete dependency context locally.
-    pub(crate) fn discard_remote(&mut self, context: &Arc<DependencyContext>, error: &ClientError) {
+    /// Discards a remote lane that failed after the resolution: the read answers project
+    /// hits alone, with the typed global warning naming the failure.
+    pub(crate) fn discard_remote(&mut self, error: &ClientError) {
         self.client = None;
         self.remote_packages.clear();
-        self.fallback_context = Arc::clone(context);
         self.missing_exact.clear();
         self.missing_requirements.clear();
         self.state = failure_state(error);
         self.record_observation();
     }
 
-    /// Typed warning for this route's local fallback, when global access did not answer.
-    pub(crate) fn fallback_warning(&self, fallback_indexed: u64) -> Option<ReadWarning> {
-        let selected = bounded_count(self.fallback_context.entries().len());
-        let fallback_indexed = fallback_indexed.min(selected);
-        let fallback_unresolved = selected.saturating_sub(fallback_indexed);
-        match self.state {
-            RouteState::Disabled => Some(ReadWarning::GlobalAccessDisabled {
-                fallback_indexed,
-                fallback_unresolved,
-            }),
-            RouteState::Available => None,
-            RouteState::Unavailable { kind, class } => Some(match kind {
-                FailureKind::Api => ReadWarning::GlobalApiUnavailable {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-                FailureKind::Publication => ReadWarning::GlobalPublicationIncompatible {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-                FailureKind::Response => ReadWarning::GlobalResponseInvalid {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-            }),
-        }
-    }
-
-    /// Packages a valid global resolution selected for local fallback.
-    pub(crate) fn missing_warnings(&self) -> impl Iterator<Item = ReadWarning> + '_ {
-        self.missing_exact
+    /// The warnings a read whose `scope` reaches packages carries: the typed global
+    /// warning when the global API did not answer, then at most `DEPENDENCY_WARNINGS_MAX`
+    /// package and dependency-context warnings together. Those name each degraded
+    /// resolver in resolver order, each context entry no public registry serves with the
+    /// missing capability its kind names, and each entry the global publication holds no
+    /// release for, in that order.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        let degraded = self.context.degradations().iter().map(|degradation| {
+            ReadWarning::PackageContextDegraded {
+                resolver: degradation.resolver.as_str().to_owned(),
+                reason: degradation.reason.clone(),
+            }
+        });
+        let unavailable = self.context.unavailable_entries().filter_map(|entry| {
+            let reason = entry.availability.unavailable_reason()?;
+            Some(ReadWarning::PackageUnavailable {
+                entry: entry.clone(),
+                reason: reason.to_owned(),
+            })
+        });
+        let absent = self
+            .missing_exact
             .iter()
             .cloned()
             .map(|package| ReadWarning::PackageAbsent { package })
@@ -751,11 +762,39 @@ impl GlobalRoute {
                     .iter()
                     .cloned()
                     .map(|entry| ReadWarning::PackageRequirementAbsent { entry }),
+            );
+        self.state_warning()
+            .into_iter()
+            .chain(
+                degraded
+                    .chain(unavailable)
+                    .chain(absent)
+                    .take(DEPENDENCY_WARNINGS_MAX),
             )
-            .take(DEPENDENCY_WARNINGS_MAX)
+            .collect()
     }
 
-    fn fallback(
+    /// The typed warning naming why the global API did not answer, absent when it did.
+    fn state_warning(&self) -> Option<ReadWarning> {
+        match self.state {
+            RouteState::Disabled => Some(ReadWarning::GlobalAccessDisabled),
+            RouteState::Available => None,
+            RouteState::Unavailable { kind, class } => Some(match kind {
+                FailureKind::Api => ReadWarning::GlobalApiUnavailable {
+                    failure_class: class,
+                },
+                FailureKind::Publication => ReadWarning::GlobalPublicationIncompatible {
+                    failure_class: class,
+                },
+                FailureKind::Response => ReadWarning::GlobalResponseInvalid {
+                    failure_class: class,
+                },
+            }),
+        }
+    }
+
+    /// A route no resolution answered: no client, and no package facts.
+    fn unanswered(
         context: &Arc<DependencyContext>,
         state: RouteState,
         observation: Arc<StdMutex<Option<ServiceState>>>,
@@ -763,7 +802,7 @@ impl GlobalRoute {
         Self {
             client: None,
             remote_packages: Vec::new(),
-            fallback_context: Arc::clone(context),
+            context: Arc::clone(context),
             missing_exact: Vec::new(),
             missing_requirements: Vec::new(),
             state,
@@ -788,11 +827,6 @@ impl GlobalRoute {
         if transitioned {
             log_service_transition(self.state);
         }
-    }
-
-    /// Records the result of one selected local fallback.
-    pub(crate) fn record_fallback(&self, fallback_indexed: u64) {
-        log_fallback_summary(self, fallback_indexed);
     }
 }
 
@@ -828,140 +862,6 @@ fn log_service_transition(state: RouteState) {
             "global service state changed"
         ),
     }
-}
-
-fn log_fallback_summary(route: &GlobalRoute, fallback_indexed: u64) {
-    if route.fallback_context.entries().is_empty() {
-        return;
-    }
-    let selected_count = bounded_count(route.fallback_context.entries().len());
-    let fallback_indexed = fallback_indexed.min(selected_count);
-    let fallback_unresolved = selected_count.saturating_sub(fallback_indexed);
-    let mut counts = BTreeMap::<&str, u64>::new();
-    for entry in route.fallback_context.entries() {
-        let count = counts.entry(entry.manager.as_str()).or_default();
-        *count = count.saturating_add(1);
-    }
-    let manager_count = u64::try_from(counts.len()).unwrap_or(u64::MAX);
-    let omitted_count = manager_count.saturating_sub(FALLBACK_LOG_MANAGERS_MAX as u64);
-    let missing_count = bounded_count(
-        route
-            .missing_exact
-            .len()
-            .saturating_add(route.missing_requirements.len()),
-    );
-    for (manager, count) in counts.into_iter().take(FALLBACK_LOG_MANAGERS_MAX) {
-        log_fallback_manager(
-            route.state,
-            bounded_manager(manager),
-            FallbackLogCounts {
-                selected: count.min(global_fallback_packages_max()),
-                missing: missing_count,
-                indexed: fallback_indexed,
-                unresolved: fallback_unresolved,
-                managers: manager_count.min(global_fallback_packages_max()),
-                omitted: omitted_count.min(global_fallback_packages_max()),
-            },
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FallbackLogCounts {
-    selected: u64,
-    missing: u64,
-    indexed: u64,
-    unresolved: u64,
-    managers: u64,
-    omitted: u64,
-}
-
-fn log_fallback_manager(state: RouteState, manager: &str, counts: FallbackLogCounts) {
-    let FallbackLogCounts {
-        selected,
-        missing,
-        indexed,
-        unresolved,
-        managers,
-        omitted,
-    } = counts;
-    let fallback_outcome = fallback_outcome(indexed, unresolved);
-    match state {
-        RouteState::Disabled => tracing::info!(
-            component = "global",
-            operation = "global.fallback",
-            state = "not_configured",
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-        RouteState::Available => tracing::info!(
-            component = "global",
-            operation = "global.fallback",
-            state = "available",
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-        RouteState::Unavailable { class, .. } => tracing::warn!(
-            component = "global",
-            operation = "global.fallback",
-            state = "unavailable",
-            failure_class = failure_class_label(class),
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-    }
-}
-
-const fn fallback_outcome(fallback_indexed: u64, fallback_unresolved: u64) -> &'static str {
-    if fallback_unresolved == 0 {
-        "complete"
-    } else if fallback_indexed == 0 {
-        "unavailable"
-    } else {
-        "partial"
-    }
-}
-
-fn bounded_count(count: usize) -> u64 {
-    u64::try_from(count)
-        .unwrap_or(u64::MAX)
-        .min(global_fallback_packages_max())
-}
-
-fn global_fallback_packages_max() -> u64 {
-    rift_protocol::read::GLOBAL_FALLBACK_PACKAGES_MAX
-}
-
-fn bounded_manager(manager: &str) -> &str {
-    if manager.len() <= FALLBACK_LOG_MANAGER_BYTES_MAX {
-        return manager;
-    }
-    let end = manager
-        .char_indices()
-        .find(|(index, _)| *index >= FALLBACK_LOG_MANAGER_BYTES_MAX)
-        .map_or(manager.len(), |(index, _)| index);
-    &manager[..end]
 }
 
 fn failure_class_label(class: GlobalFailureClass) -> &'static str {
@@ -1001,16 +901,16 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     }
 }
 
+/// One missing requirement the resolution named, as a context entry. The client sends
+/// canonical entries alone and refuses a missing requirement that is not one, so the
+/// entry is canonical.
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
         name: entry.name,
         version: entry.version,
         requirement: entry.requirement,
-        availability: match entry.availability {
-            WireAvailability::Canonical => PackageAvailability::Canonical,
-            WireAvailability::LocalOnly => PackageAvailability::LocalOnly,
-        },
+        availability: PackageAvailability::Canonical,
     }
 }
 
@@ -1020,18 +920,11 @@ fn resolved_route(
     resolution: rift_cloud_client::PackageResolutionResponse,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 ) -> GlobalRoute {
-    let mut served = HashSet::new();
     let mut remote_packages = Vec::new();
     for package in resolution.available_exact {
-        served.insert(EntryKey::exact(
-            &package.manager,
-            &package.name,
-            &package.version,
-        ));
         push_distinct_package(&mut remote_packages, package);
     }
     for resolved in resolution.resolved_requirements {
-        served.insert(EntryKey::from_wire(&resolved.entry));
         push_distinct_package(&mut remote_packages, resolved.package);
     }
     let missing_exact = resolution
@@ -1047,10 +940,7 @@ fn resolved_route(
     GlobalRoute {
         client: Some(client),
         remote_packages,
-        fallback_context: Arc::new(context.filter_entries(|entry| {
-            entry.availability == PackageAvailability::LocalOnly
-                || !served.contains(&EntryKey::from_protocol(entry))
-        })),
+        context: Arc::clone(context),
         missing_exact,
         missing_requirements,
         state: RouteState::Available,
@@ -1074,54 +964,6 @@ fn protocol_package_identity(package: WirePackageIdentity) -> PackageIdentity {
         manager: package.manager,
         name: package.name,
         version: package.version,
-    }
-}
-
-#[derive(Hash, Eq, PartialEq)]
-struct EntryKey {
-    manager: String,
-    name: String,
-    selector: String,
-    exact: bool,
-}
-
-impl EntryKey {
-    fn from_protocol(entry: &PackageContextEntry) -> Self {
-        match (&entry.version, &entry.requirement) {
-            (Some(version), None) => Self::exact(&entry.manager, &entry.name, version),
-            (None, Some(requirement)) => {
-                Self::requirement(&entry.manager, &entry.name, requirement)
-            }
-            _ => unreachable!("accepted dependency context carries exactly one selector"),
-        }
-    }
-
-    fn from_wire(entry: &WireContextEntry) -> Self {
-        match (&entry.version, &entry.requirement) {
-            (Some(version), None) => Self::exact(&entry.manager, &entry.name, version),
-            (None, Some(requirement)) => {
-                Self::requirement(&entry.manager, &entry.name, requirement)
-            }
-            _ => unreachable!("validated global response carries exactly one selector"),
-        }
-    }
-
-    fn exact(manager: &str, name: &str, version: &str) -> Self {
-        Self {
-            manager: manager.to_owned(),
-            name: name.to_owned(),
-            selector: version.to_owned(),
-            exact: true,
-        }
-    }
-
-    fn requirement(manager: &str, name: &str, requirement: &str) -> Self {
-        Self {
-            manager: manager.to_owned(),
-            name: name.to_owned(),
-            selector: requirement.to_owned(),
-            exact: false,
-        }
     }
 }
 
@@ -1182,8 +1024,8 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        FailureKind, FallbackLogCounts, GlobalRoute, RouteState, ServiceState, failure_state,
-        log_fallback_manager, page_window, search_request,
+        FailureKind, GlobalRoute, RouteState, ServiceState, failure_state, page_window,
+        search_request,
     };
     use rift_cloud_client::{ClientError, ResponseMeta};
     use rift_dependency::DependencyContext;
@@ -1359,7 +1201,7 @@ mod tests {
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let observation = Arc::new(Mutex::new(None::<ServiceState>));
-        let route = GlobalRoute::fallback(
+        let route = GlobalRoute::unanswered(
             &Arc::new(DependencyContext::default()),
             RouteState::Unavailable {
                 kind: FailureKind::Api,
@@ -1383,41 +1225,237 @@ mod tests {
         assert!(!records[0].fields().contains("private-package"));
     }
 
+    /// Inputs holding no file and running no program: every probe fails.
+    struct NothingInputs;
+
+    impl rift_dependency::StaticInputs for NothingInputs {
+        fn read_file(
+            &mut self,
+            _path: &std::path::Path,
+            _bytes_max: u64,
+        ) -> rift_dependency::FileObservation {
+            rift_dependency::FileObservation::Absent
+        }
+    }
+
+    impl rift_dependency::ContextInputs for NothingInputs {
+        fn run(
+            &mut self,
+            command: &rift_dependency::ToolchainCommand,
+        ) -> Result<rift_dependency::CommandOutput, rift_dependency::CommandFailure> {
+            Err(rift_dependency::CommandFailure {
+                program: command.program.to_owned(),
+                reason: "not on PATH".to_owned(),
+            })
+        }
+    }
+
     #[test]
-    fn fallback_summary_is_bounded_and_uses_manager_only() {
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let manager = "cargo";
+    fn resolution_request_carries_one_standard_library_entry_per_package() {
+        use rift_dependency::{StandardLibrary, StandardLibraryRequest, standard_library_answer};
+        use rift_protocol::dependencies::ConfiguredPackage;
 
-        tracing::subscriber::with_default(subscriber, || {
-            log_fallback_manager(
-                RouteState::Unavailable {
-                    kind: FailureKind::Api,
-                    class: GlobalFailureClass::RetryExhausted,
-                },
-                manager,
-                FallbackLogCounts {
-                    selected: 3,
-                    missing: 1,
-                    indexed: 2,
-                    unresolved: 1,
-                    managers: 1,
-                    omitted: 0,
-                },
-            );
-        });
+        // The operator's list stands in for a lockfile pinning `typescript`.
+        let configured = [ConfiguredPackage {
+            manager: "npm".to_owned(),
+            name: "typescript".to_owned(),
+            version: Some("5.9.3".to_owned()),
+            requirement: None,
+        }];
+        let mut context = rift_dependency::resolve_context(
+            std::path::Path::new("/workspace"),
+            &[],
+            &[],
+            &mut NothingInputs,
+            &configured,
+        );
+        let answer = standard_library_answer(
+            &StandardLibraryRequest {
+                root: std::path::Path::new("/workspace"),
+                libraries: &[StandardLibrary::Rust, StandardLibrary::Node],
+                execution: true,
+            },
+            &mut NothingInputs,
+        );
+        context.add_standard_libraries(answer);
 
-        let record = drain
-            .try_recv_record()
-            .expect("fallback summary is recorded");
-        assert_eq!(record.operation(), "global.fallback");
-        assert!(record.fields().contains("retry_exhausted"));
-        assert!(record.fields().contains("selected_count"));
-        assert!(record.fields().contains("fallback_indexed"));
-        assert!(record.fields().contains("fallback_unresolved"));
-        assert!(record.fields().contains("partial"));
-        assert!(record.fields().contains("fallback_outcome"));
-        assert!(record.fields().contains(manager));
-        assert!(!record.fields().contains("private-package"));
+        let request = super::resolution_request(&context);
+
+        let sent: Vec<(String, String, Option<String>, Option<String>)> = request
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.manager.clone(),
+                    entry.name.clone(),
+                    entry.version.clone(),
+                    entry.requirement.clone(),
+                )
+            })
+            .collect();
+        let any = Some(">=0".to_owned());
+        assert_eq!(
+            sent,
+            [
+                (
+                    "npm".to_owned(),
+                    "typescript".to_owned(),
+                    Some("5.9.3".to_owned()),
+                    None
+                ),
+                ("stdlib".to_owned(), "node".to_owned(), None, any.clone()),
+                ("stdlib".to_owned(), "rust".to_owned(), None, any),
+            ]
+        );
+        let degraded: Vec<&str> = context
+            .degradations()
+            .iter()
+            .map(|degradation| degradation.resolver.as_str())
+            .collect();
+        assert_eq!(degraded, ["stdlib/rust", "stdlib/node"]);
+    }
+
+    /// Inputs holding `files`, each under its absolute path, and running no program.
+    struct RecordedFiles(Vec<(std::path::PathBuf, String)>);
+
+    impl rift_dependency::StaticInputs for RecordedFiles {
+        fn read_file(
+            &mut self,
+            path: &std::path::Path,
+            _bytes_max: u64,
+        ) -> rift_dependency::FileObservation {
+            self.0.iter().find(|(held, _)| held == path).map_or(
+                rift_dependency::FileObservation::Absent,
+                |(_, content)| {
+                    rift_dependency::FileObservation::Bytes(content.clone().into_bytes())
+                },
+            )
+        }
+    }
+
+    /// A context whose manifest depends on `count` crates by paths outside the workspace,
+    /// and whose Rust standard library probe fails.
+    fn context_with_path_dependencies(count: usize) -> Arc<DependencyContext> {
+        use std::fmt::Write as _;
+
+        use rift_dependency::{StandardLibrary, StandardLibraryRequest, standard_library_answer};
+
+        let root = std::path::Path::new("/workspace");
+        let mut manifest =
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\n[dependencies]\n".to_owned();
+        let mut lockfile =
+            "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+        for index in 0..count {
+            writeln!(
+                manifest,
+                "outside{index:02} = {{ path = \"../outside{index:02}\" }}"
+            )
+            .expect("a String takes every write");
+            write!(
+                lockfile,
+                "\n[[package]]\nname = \"outside{index:02}\"\nversion = \"0.1.0\"\n"
+            )
+            .expect("a String takes every write");
+        }
+        let mut inputs = RecordedFiles(vec![
+            (root.join("Cargo.toml"), manifest),
+            (root.join("Cargo.lock"), lockfile),
+        ]);
+        let visible = [
+            rift_protocol::read::ProjectPath("Cargo.lock".to_owned()),
+            rift_protocol::read::ProjectPath("Cargo.toml".to_owned()),
+        ];
+        let mut context = rift_dependency::resolve_context(
+            root,
+            &visible,
+            rift_dependency::resolvers(),
+            &mut inputs,
+            &[],
+        );
+        context.add_standard_libraries(standard_library_answer(
+            &StandardLibraryRequest {
+                root,
+                libraries: &[StandardLibrary::Rust],
+                execution: true,
+            },
+            &mut NothingInputs,
+        ));
+        Arc::new(context)
+    }
+
+    fn warning_codes(route: &GlobalRoute) -> Vec<String> {
+        route
+            .warnings()
+            .iter()
+            .map(|warning| {
+                serde_json::to_value(warning).expect("a warning serializes")["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The global warning opens the list, then the degraded probe, each entry no public
+    /// registry serves, and each package the publication lacks, in that order.
+    #[test]
+    fn route_warnings_order_the_global_state_then_degraded_unavailable_and_absent() {
+        let context = context_with_path_dependencies(2);
+        let mut route =
+            GlobalRoute::unanswered(&context, RouteState::Disabled, Arc::new(Mutex::new(None)));
+        route
+            .missing_exact
+            .push(rift_protocol::read::PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "absent".to_owned(),
+                version: "1.0.0".to_owned(),
+            });
+
+        assert_eq!(
+            warning_codes(&route),
+            [
+                "global_access_disabled",
+                "package_context_degraded",
+                "package_unavailable",
+                "package_unavailable",
+                "package_absent",
+            ]
+        );
+        let warnings = route.warnings();
+        let rift_protocol::read::ReadWarning::PackageUnavailable { entry, reason } = &warnings[2]
+        else {
+            panic!("the third warning names an unserved entry: {warnings:#?}");
+        };
+        assert_eq!(entry.name, "outside00");
+        assert_eq!(
+            Some(reason.as_str()),
+            rift_protocol::dependencies::PackageAvailability::Path.unavailable_reason()
+        );
+    }
+
+    /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides
+    /// beside them and is never the one cut.
+    #[test]
+    fn route_warnings_stop_at_the_dependency_warnings_bound() {
+        let bound = rift_protocol::read::DEPENDENCY_WARNINGS_MAX;
+        let context = context_with_path_dependencies(bound + 2);
+        let answered =
+            GlobalRoute::unanswered(&context, RouteState::Available, Arc::new(Mutex::new(None)));
+        let refused = GlobalRoute::unanswered(
+            &context,
+            RouteState::Unavailable {
+                kind: FailureKind::Api,
+                class: GlobalFailureClass::Connection,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+
+        let answered_codes = warning_codes(&answered);
+        assert_eq!(answered_codes.len(), bound, "{answered_codes:?}");
+        assert_eq!(answered_codes[0], "package_context_degraded");
+        let refused_codes = warning_codes(&refused);
+        assert_eq!(refused_codes.len(), bound + 1, "{refused_codes:?}");
+        assert_eq!(refused_codes[0], "global_api_unavailable");
+        assert_eq!(refused_codes[1..], answered_codes[..]);
     }
 }

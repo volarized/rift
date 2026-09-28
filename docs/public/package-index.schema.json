@@ -1591,12 +1591,12 @@
         },
         {
           "const": "dependency",
-          "description": "Owned by one resolved dependency.",
+          "description": "Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong\nto the npm `typescript` package, whose `lib.*.d.ts` files declare them.",
           "type": "string"
         },
         {
           "const": "stdlib",
-          "description": "Installed with the language toolchain.",
+          "description": "Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
           "type": "string"
         },
         {
