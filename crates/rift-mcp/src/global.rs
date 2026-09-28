@@ -1762,6 +1762,85 @@ mod tests {
         assert_eq!(warning_codes(&route), ["global_api_unavailable"]);
     }
 
+    /// A package declaration holding two matches answers once, at its first, and `target`
+    /// selects the file hits, the declaration hits, or both. The package matches follow the
+    /// project's, the page warnings follow the project's warnings, and the merged set pages
+    /// under the request's `limit`.
+    #[test]
+    fn merged_patterns_answer_each_package_declaration_once_after_the_project() {
+        use rift_protocol::read::{Pagination, ReadWarning, SearchHit, SearchParams, SearchResult};
+        use serde_json::json;
+
+        let unit = "rift://source/cargo/demo@1.0.0/src/lib.rs";
+        let package = json!({"manager": "cargo", "name": "demo", "version": "1.0.0"});
+        let hit = |value: serde_json::Value| -> SearchHit {
+            serde_json::from_value(value).expect("search hit fixture")
+        };
+        let file = |start: u64| {
+            hit(json!({
+                "hit": {"target": "file", "size": 45}, "matched_by": ["content"],
+                "range": {"start": start, "end": start + 4}, "line": 1, "unit": unit
+            }))
+        };
+        let declaration = hit(json!({
+            "hit": {"target": "symbol", "symbol": {
+                "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                "language": "rust", "name": "helper_beacon", "kind": "function",
+                "origin": {"location": "dependency", "package": package, "source_kind": "authored"}
+            }},
+            "matched_by": ["content"], "range": {"start": 0, "end": 25}, "line": 1, "unit": unit
+        }));
+        let project = hit(json!({
+            "hit": {"target": "file", "size": 10}, "matched_by": ["content"],
+            "range": {"start": 0, "end": 4}, "line": 1, "path": "src/lib.rs"
+        }));
+        let matched = |start: u64| rift_cloud_client::PackagePatternMatch {
+            package: rift_protocol::read::PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "demo".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            file: file(start),
+            declaration: Some(declaration.clone()),
+        };
+        let merged = |request: serde_json::Value| {
+            let params: SearchParams = serde_json::from_value(request).expect("search request");
+            let local = SearchResult {
+                results: vec![project.clone()],
+                pagination: Pagination {
+                    page_index: 0,
+                    total_pages: 1,
+                },
+                warnings: vec![ReadWarning::GlobalAccessDisabled],
+            };
+            let remote = super::GlobalPatternMatches {
+                matches: vec![matched(4), matched(14)],
+                warnings: vec![ReadWarning::GlobalPageWarning {
+                    warning_code: rift_protocol::read::GlobalPageWarningCode::ResultTruncated,
+                    detail: None,
+                }],
+            };
+            super::merge_patterns(&params, local, remote)
+        };
+
+        let all = merged(json!({"pattern": "beacon", "scope": "all", "target": "all"}));
+        assert_eq!(
+            all.results,
+            [project.clone(), declaration.clone(), file(4), file(14)]
+        );
+        assert_eq!(all.warnings.len(), 2, "{:?}", all.warnings);
+        assert_eq!(all.warnings[0], ReadWarning::GlobalAccessDisabled);
+        let symbols = merged(json!({"pattern": "beacon", "scope": "all", "target": "symbol"}));
+        assert_eq!(symbols.results, [project.clone(), declaration.clone()]);
+        let files = merged(json!({"pattern": "beacon", "scope": "all", "target": "file"}));
+        assert_eq!(files.results, [project.clone(), file(4), file(14)]);
+        let second_page = merged(json!({
+            "pattern": "beacon", "scope": "all", "target": "all", "limit": 2, "page_index": 1
+        }));
+        assert_eq!(second_page.results, [file(4), file(14)]);
+        assert_eq!(second_page.pagination.total_pages, 2);
+    }
+
     /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides
     /// beside them and is never the one cut.
     #[test]
