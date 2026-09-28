@@ -178,17 +178,38 @@ Git supplies committed source along a file's first-parent history. Rift parses p
 the same syntax provider it uses for the working tree, allowing a declaration in the current code
 to be traced through its earlier states.
 
+<VersionBadge version="v0.0.46" inline /> Walking git on every read gets slower as history grows,
+so the local server analyzes past revisions ahead of time, in the background, into a history
+store. There is one store per repository, and every worktree of that repository reads it. The
+[`[providers.history]`](/docs/developer/configuration#providers) strategy decides which revisions
+the store holds:
+
+- `everything` - the newest first-parent commits of every worktree, 100 by default
+- `selective` - the releases you name by tag, such as `v1.*`, in version order
+
+The store fills at a bounded share of one core, and no request waits for it: while it fills, a
+read answers from what the store already holds.
+
 #### Symbol history
 
-A [symbol lookup with history](/docs/mcp#tool-get_symbol) follows a declaration's current path and
-compares its state across adjacent revisions, stopping at the configured revision bound. It can
-show changes to the declaration's body, signature, or decorators, as well as its introduction or
-removal.
+<VersionBadge
+  version="v0.0.46"
+  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
+/>
 
-For a comparison between two committed revisions, Rift parses the files on each side and matches
-their declarations. A [change comparison](/docs/mcp#search-change) names the declarations that
-changed, where `git diff` names changed lines. [History reads](/docs/developer/architecture#history)
-describe both operations in more detail.
+A [symbol lookup with history](/docs/mcp#tool-get_symbol) follows a declaration through the
+revisions the history store holds, newest first. It shows changes to the declaration's body,
+signature, or decorators, as well as its introduction, removal, or move, and each version names
+the commit's author. A file renamed without a changed byte keeps its timeline, and so does a
+declaration moved unchanged into another file; a move that also edits the declaration ends it.
+
+A [change comparison](/docs/mcp#search-change) compares a committed revision with another
+revision, or with the working tree and its uncommitted edits. Rift parses the files on each side
+and names the declarations that changed, where `git diff` names changed lines.
+
+The history store also keeps each commit's message, so the agent can
+[search commit messages](/docs/mcp#search-commits) for the commit that introduced a change.
+[History reads](/docs/developer/architecture#history) describe these operations in more detail.
 
 ### Origin
 

@@ -523,20 +523,43 @@ disable them:
 ```toml
 [providers.history]
 enabled = true
-max_revisions = 500
+strategy = "everything"
+max_revisions = 100
+batch_commits = 25
+batch_size = "1000000b"
+cpu_share = 0.25
 ```
 
 `enabled = false` turns the history provider off: the server refuses a revision-addressed read -
-`rev` on [`get_symbol`](/docs/mcp#tool-get_symbol), `search`, or `nodes` - with
-`capability_unavailable`. A workspace without version control cannot serve those reads whatever
-this table says.
+`rev` on [`get_symbol`](/docs/mcp#tool-get_symbol), `search`, or `nodes` - a
+[change comparison](/docs/mcp#search-change), and a [commit search](/docs/mcp#search-commits)
+with `capability_unavailable`. A workspace without version control cannot serve those reads
+whatever this table says.
 
-<VersionBadge version="v0.0.13" />
+<VersionBadge version="v0.0.46" />
 
-`max_revisions` bounds the timeline walk from the served revision, 1 to 100000, because the
-walk's cost scales with how far back it reaches. The history provider computes a
-[`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory) timeline inside that depth; a
-revision beyond it contributes no version.
+The history provider fills the [history store](/docs/developer/architecture#history) in the
+background, and the configuration allows you to describe:
+
+- `strategy` - which revisions the store holds: `everything`, the newest first-parent commits of
+  every live worktree, or `selective`, the releases `releases` names
+- `releases` - tag names or tag patterns such as `v1.*`, at most 64, which `selective` requires and
+  no other strategy accepts
+- `max_revisions` - how many revisions the store holds, 1 to 100000: commits under `everything`,
+  releases under `selective`
+- `batch_commits` - how many commits one store write holds, 1 to 10000
+- `batch_size` - how many parsed bytes one store write holds past its first commit, 1kb to 1gb
+- `cpu_share` - the share of one core the fill parses at, above 0.0 up to 1.0
+
+`selective` orders the releases by the version each tag name spells once the pattern's literal
+text up to its first digit or wildcard is stripped: `1.*` reads `1.80.0` whole, and `v0.0.*`
+strips the `v`. A matched tag whose rest is no semantic version, such as `0.10`, is left out, and
+the server records it under `rift server logs --component history`.
+
+A fill waits a bounded time for the server to run no request before each batch, then parses at
+`cpu_share`, pausing after each commit. The server reads this table at startup, so a change applies
+on the next start. The store keeps one file per server build and strategy, so changing `strategy`
+or `releases` fills a new store file.
 
 <VersionBadge version="v0.0.44" />
 

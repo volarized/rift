@@ -297,6 +297,32 @@ matching, and [`[search.vector]`](/docs/developer/configuration#search) adds the
 below. All three fuse by weighted reciprocal rank, under the shares
 [`[search.ranking]`](/docs/developer/configuration#search) sets.
 
+## History store
+
+<VersionBadge version="v0.0.46" />
+
+The history store is a second SQLite database, apart from `.rift/db`, so lexical and log writes
+never wait on a fill. It sits in a `rift/` folder of the common git directory, one file per
+derivation revision: the executable digest, the corpus revision, the index-owned tables, and the
+`[providers.history]` strategy and releases. Two builds sharing a repository each fill and read
+their own file, and a server deletes a file no live server holds.
+
+`rift-history-store` opens the file through [rusqlite](https://github.com/rusqlite/rusqlite) in
+WAL mode, where a writer never blocks a reader. One filler writes a store at a time: the history
+task holds an exclusive std file lock beside it, and every server holds a shared lock on the
+revision it reads. Each batch commits in one `BEGIN IMMEDIATE` transaction after its parses finish.
+
+Commit messages sit in an FTS5 table with external content over the commit rows, under the corpus
+tokenizer the lexical store uses. Deleting a commit issues FTS5's `'delete'` command while the row
+still holds the message the entry was indexed from.
+
+The history task runs on the runtime's blocking threads, outside the `[server] num_workers` pool.
+With the `otlp` feature, its spans time each wait for an idle server (`history.idle_wait`), each
+batch (`history.batch`, `history.analyze`, `history.write`), each plan (`history.plan`), and the
+rename and move pairing (`history.renames`, `history.moves`). A comparison's spans time the
+changed-path listing and each side's index (`search.change_paths`, `search.change_base`,
+`search.change_head`).
+
 ## Server logs
 
 The server records diagnostics beside the index in `.rift/db`. `rift server logs` prints them
