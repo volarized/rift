@@ -1845,7 +1845,8 @@ fn test_symbol_lookup_refuses_unknown_match_class() {
 
 /// Package analysis mints a package declaration's identity over its unit's resolver and key, so
 /// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/demo@1.0.0/src/first.rs`; the package-relative spelling is accepted too.
+/// `rift://source/cargo/demo@1.0.0/src/first.rs`. The package-relative spelling names a
+/// project file, and no producer mints it for a package declaration, so it is refused.
 #[test]
 fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     let hit = |id: &str| {
@@ -1853,15 +1854,11 @@ fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         value["symbol"]["id"] = serde_json::json!(id);
         serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
     };
-    let accepted = [
-        rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/first.rs", "demo"),
-        rift_core::symbol_identity("rust", "src/first.rs", "demo"),
-    ];
-    for id in accepted {
-        let candidate = PackageSearchCandidate::try_from(&hit(&id));
-        assert!(candidate.is_ok(), "{id}: {candidate:?}");
-    }
+    let minted = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/first.rs", "demo");
+    let candidate = PackageSearchCandidate::try_from(&hit(&minted));
+    assert!(candidate.is_ok(), "{minted}: {candidate:?}");
     let refused = [
+        "rift://symbol/rust/src/first.rs/demo",
         "rift://symbol/rust/cargo/demo@2.0.0/src/first.rs/demo",
         "rift://symbol/rust/npm/demo@1.0.0/src/first.rs/demo",
         "rift://symbol/rust/cargo/demo@1.0.0/src/second.rs/demo",

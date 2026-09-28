@@ -230,14 +230,33 @@ fn test_declaration_responses_account_for_every_position() {
             })
         );
     }
-    let invalid = json!({"results": [
-        {"position": position_json(3), "declaration": "rift://symbol/rust/src/../first.rs/demo"},
-        {"position": position_json(0)}
-    ]});
+    let answer = |declaration: &str| {
+        decoded(json!({"results": [
+            {"position": position_json(3), "declaration": declaration},
+            {"position": position_json(0)}
+        ]}))
+    };
+    let refused = [
+        "rift://symbol/rust/src/../first.rs/demo",
+        "rift://symbol/rust/src/first.rs/demo",
+        "rift://symbol/rust/cargo/other@1.0.0/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo@2.0.0/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo@1.0.0/demo",
+    ];
+    for declaration in refused {
+        assert_eq!(
+            validate_declaration_response(&request, &answer(declaration)),
+            Err(ClientError::InvalidResponseField {
+                field: "declaration"
+            }),
+            "{declaration}"
+        );
+    }
+    // A stub's position answers the module declaration it pairs with, in another file of
+    // the same package.
+    let module = "rift://symbol/rust/cargo/demo@1.0.0/src/second.rs/demo";
     assert_eq!(
-        validate_declaration_response(&request, &decoded(invalid)),
-        Err(ClientError::InvalidResponseField {
-            field: "declaration"
-        })
+        validate_declaration_response(&request, &answer(module)),
+        Ok(())
     );
 }

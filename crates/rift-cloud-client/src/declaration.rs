@@ -130,8 +130,8 @@ pub(crate) fn validate_declaration_request_for_capabilities(
     Ok(())
 }
 
-/// Checks that the answer names every submitted position exactly once, each beside a
-/// canonical symbol identity or none.
+/// Checks that the answer names every submitted position exactly once, each beside the
+/// identity of a declaration in the position's package or none.
 pub(crate) fn validate_declaration_response(
     request: &PackageDeclarationRequest,
     response: &PackageDeclarationResponse,
@@ -148,7 +148,7 @@ pub(crate) fn validate_declaration_response(
         if result
             .declaration
             .as_deref()
-            .is_some_and(|id| rift_core::parse_symbol_identity(id).is_err())
+            .is_some_and(|id| !names_a_declaration_in(id, &result.position.package))
         {
             return Err(ClientError::InvalidResponseField {
                 field: "declaration",
@@ -161,6 +161,21 @@ pub(crate) fn validate_declaration_response(
         });
     }
     Ok(())
+}
+
+/// Whether `id` is a canonical symbol identity package analysis mints in `package`, over
+/// one of its unit keys, `<manager>/<name>@<version>/<path>`. The path can name another file
+/// of the package than the position's: a stub's position answers the module declaration the
+/// stub pairs with.
+fn names_a_declaration_in(id: &str, package: &crate::PackageIdentity) -> bool {
+    let Ok(parsed) = rift_core::parse_symbol_identity(id) else {
+        return false;
+    };
+    let prefix = format!("{}/{}@{}/", package.manager, package.name, package.version);
+    parsed
+        .path()
+        .strip_prefix(&prefix)
+        .is_some_and(|path| !path.is_empty())
 }
 
 fn position_key(position: &PackagePosition) -> PositionKey<'_> {

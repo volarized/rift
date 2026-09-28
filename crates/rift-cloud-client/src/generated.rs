@@ -1301,7 +1301,7 @@ pub struct PackagePosition {
     #[validate(range(min = 0i64, max = 2_147_483_647i64))]
     pub character: i64,
 }
-/// One submitted position and the declaration holding it.
+/// One submitted position and the declaration holding it, named by the identity package analysis mints in the position's package: `rift://symbol/<language>/<manager>/<name>@<version>/<path>/<qualified name>`.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageDeclarationResult {
     /// One position in one file of an exact package version.

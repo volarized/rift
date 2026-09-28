@@ -1991,13 +1991,14 @@ fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, 
         .ok_or(invalid)
 }
 
-/// Checks that a package hit's symbol identity is one its unit mints, and returns its qualified
-/// name.
+/// Checks that a package hit's symbol identity is the one its unit mints, and returns its
+/// qualified name.
 ///
 /// Package analysis mints a package declaration's identity over its unit's resolver and key,
 /// `<manager>/<name>@<version>/<path>`, as `rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve`
-/// for `rift://source/cargo/beacon@1.0.0/src/lib.rs`. The spelling over the package-relative
-/// path alone, `rift://symbol/rust/src/lib.rs/serve`, is accepted as well.
+/// for `rift://source/cargo/beacon@1.0.0/src/lib.rs`. No producer mints the spelling over the
+/// package-relative path alone, `rift://symbol/rust/src/lib.rs/serve`, for a package
+/// declaration: it names a project file, and the client refuses it.
 fn validate_symbol_identity(
     symbol: &Symbol,
     package: &PackageIdentity,
@@ -2047,9 +2048,7 @@ fn validate_symbol_identity(
         "{}/{}@{}/{source_path}",
         package.manager, package.name, package.version
     );
-    let minted = [unit_path.as_str(), source_path]
-        .into_iter()
-        .any(|path| rift_core::symbol_identity(language, path, &qualified_name) == id);
+    let minted = rift_core::symbol_identity(language, &unit_path, &qualified_name) == id;
     if qualified_name.is_empty() || !minted {
         return Err(ClientError::InvalidResponseField {
             field: "symbol_identity",

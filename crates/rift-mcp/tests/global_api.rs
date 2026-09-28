@@ -342,7 +342,8 @@ const fn class_wire(class: IdentifierMatchClass) -> (&'static str, &'static str)
 }
 
 /// One collected declaration as a page item, located in [`COLLECTED_SOURCE`], before
-/// its match class.
+/// its match class. Its symbol identity is the one package analysis mints over the unit,
+/// `rift://symbol/rust/cargo/demo@1.0.0/<path>/<qualified name>`.
 fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
     let file = match fixture {
         SymbolFixture::Valid => "src/lib.rs",
@@ -353,11 +354,12 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
         .find(&format!("pub fn {declaration}("))
         .expect("every declaration sits in the collected source");
     let line = COLLECTED_SOURCE[..start].matches('\n').count() + 1;
-    let package = json!({"manager": COLLECTED.0, "name": COLLECTED.1, "version": COLLECTED.2});
+    let (manager, name, version) = COLLECTED;
+    let package = json!({"manager": manager, "name": name, "version": version});
     let mut hit = json!({
         "package": package,
         "symbol": {
-            "id": format!("rift://symbol/rust/{file}/{declaration}"),
+            "id": format!("rift://symbol/rust/{manager}/{name}@{version}/{file}/{declaration}"),
             "kind": "function",
             "language": "rust",
             "name": declaration,

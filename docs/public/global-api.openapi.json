@@ -3244,7 +3244,7 @@
       },
       "PackageDeclarationResult": {
         "additionalProperties": true,
-        "description": "One submitted position and the declaration holding it.",
+        "description": "One submitted position and the declaration holding it, named by the identity package analysis mints in the position's package: `rift://symbol/<language>/<manager>/<name>@<version>/<path>/<qualified name>`.",
         "properties": {
           "position": {
             "$ref": "#/components/schemas/PackagePosition"
