@@ -754,6 +754,8 @@ fn pulled_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use ruff_db::system::System as _;
+
     use super::*;
 
     fn empty_documents() -> DocumentStore {
@@ -803,6 +805,173 @@ mod tests {
             .and_then(|environment| environment.python)
             .expect("the options name a Python environment");
         assert_eq!(python.path(), root.join(".venv").as_path());
+    }
+
+    /// A module importing `inside`, which a tree's own `.venv` installs, and `outside`,
+    /// which only the environment `VIRTUAL_ENV` names installs.
+    const IMPORTS: &str = "import inside\nimport outside\n";
+
+    /// The `site-packages` directory below a virtual environment, in ty's layout for
+    /// this host.
+    const SITE_PACKAGES: &str = if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.12/site-packages"
+    };
+
+    /// Writes a virtual environment at `environment` holding the one package `package`.
+    fn installed_environment(environment: &Path, package: &str) {
+        let module = environment.join(SITE_PACKAGES).join(package);
+        std::fs::create_dir_all(&module).expect("site-packages directory");
+        std::fs::write(
+            module.join("__init__.py"),
+            "def greet() -> str:\n    return \"\"\n",
+        )
+        .expect("package module");
+        std::fs::write(
+            environment.join(PROJECT_ENVIRONMENT_MARKER),
+            format!("home = {}\nversion_info = 3.12.4\n", environment.display()),
+        )
+        .expect("environment marker");
+    }
+
+    /// A tree holding `app.py` with [`IMPORTS`], at its canonical path.
+    fn importing_tree() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("app.py"), IMPORTS).expect("fixture module");
+        let root = directory.path().canonicalize().expect("canonical root");
+        (directory, root)
+    }
+
+    /// The `unresolved-import` messages among `diagnostics`.
+    fn unresolved_imports<'item>(
+        diagnostics: impl IntoIterator<Item = (&'item str, &'item str)>,
+    ) -> Vec<&'item str> {
+        diagnostics
+            .into_iter()
+            .filter(|(code, _)| *code == "unresolved-import")
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// Whether one of `messages` names the module `module`.
+    fn names_module(messages: &[&str], module: &str) -> bool {
+        let quoted = format!("`{module}`");
+        messages.iter().any(|message| message.contains(&quoted))
+    }
+
+    /// The engine's `unresolved-import` messages for the tree's `app.py`, as the
+    /// diagnostic pull answers them.
+    fn engine_unresolved_imports(root: &Path) -> Vec<String> {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": uri_of(&root.join("app.py")) } },
+        });
+        let Handled::Reply(reply) = handle_message(&message, root, &empty_documents()) else {
+            panic!("the pull must reply");
+        };
+        let items = reply["result"]["items"].as_array().expect("items");
+        let pairs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item["code"].as_str().unwrap_or_default(),
+                    item["message"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        unresolved_imports(pairs)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Runs in a child process whose `VIRTUAL_ENV` names an environment installing
+    /// `outside`. A database on the OS system, as ty builds one by default, resolves
+    /// `outside` through it, so the variable names a live environment; the engine
+    /// resolves no import through it, and a tree whose `.venv` installs `inside`
+    /// resolves that one alone.
+    #[test]
+    #[ignore = "probe run by test_another_environment_named_by_virtual_env_stays_unread in a child process"]
+    fn test_another_environment_named_by_virtual_env_stays_unread_probe() {
+        let named = std::env::var("VIRTUAL_ENV").expect("the parent names an environment");
+        let (_bare, bare_root) = importing_tree();
+        let system_root =
+            SystemPathBuf::from_path_buf(bare_root.clone()).expect("a UTF-8 temporary root");
+
+        let default = ProjectDatabase::fallible(
+            ProjectMetadata::new("bare", system_root.clone()),
+            ruff_db::system::OsSystem::new(&system_root),
+        )
+        .expect("a default database");
+        let app = system_path_to_file(&default, system_root.join("app.py")).expect("app.py");
+        let findings: Vec<(String, String)> = default
+            .check_file(app)
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.id().to_string(),
+                    diagnostic.concise_message().to_string(),
+                )
+            })
+            .collect();
+        let default_unresolved = unresolved_imports(
+            findings
+                .iter()
+                .map(|(code, message)| (code.as_str(), message.as_str())),
+        );
+        assert!(
+            !names_module(&default_unresolved, "outside"),
+            "ty's own discovery reads `{named}`: {default_unresolved:?}"
+        );
+        assert_eq!(
+            HermeticSystem::new(&system_root).env_var("VIRTUAL_ENV"),
+            Err(std::env::VarError::NotPresent)
+        );
+
+        let bare = engine_unresolved_imports(&bare_root);
+        let bare: Vec<&str> = bare.iter().map(String::as_str).collect();
+        assert!(names_module(&bare, "inside"), "{bare:?}");
+        assert!(
+            names_module(&bare, "outside"),
+            "no import resolves through `{named}`: {bare:?}"
+        );
+
+        let (_installed, installed_root) = importing_tree();
+        installed_environment(
+            &installed_root.join(PROJECT_ENVIRONMENT_DIRECTORY),
+            "inside",
+        );
+        let installed = engine_unresolved_imports(&installed_root);
+        let installed: Vec<&str> = installed.iter().map(String::as_str).collect();
+        assert!(
+            !names_module(&installed, "inside"),
+            "the tree's `.venv` resolves `inside`: {installed:?}"
+        );
+        assert!(names_module(&installed, "outside"), "{installed:?}");
+    }
+
+    #[test]
+    fn test_another_environment_named_by_virtual_env_stays_unread() {
+        let environment = tempfile::tempdir().expect("environment directory");
+        installed_environment(environment.path(), "outside");
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "embedded::tests::test_another_environment_named_by_virtual_env_stays_unread_probe",
+                "--ignored",
+            ])
+            .env("VIRTUAL_ENV", environment.path())
+            .output()
+            .expect("the probe runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "probe must pass: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
