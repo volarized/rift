@@ -4631,6 +4631,7 @@ dependencies = [
  "rift-protocol",
  "rift-ranking",
  "rusqlite",
+ "same-file",
  "serde_json",
  "tempfile",
 ]
