@@ -2174,7 +2174,8 @@ impl RiftMcp {
     ///
     /// The publication holds the text the matcher verifies, so the store only narrows
     /// which files are read: a pattern the read path refuses, one with no prefilter, a
-    /// store that could not open, and a store that does not hold the captured tree all
+    /// store that could not open or handed the read no pooled connection within
+    /// `[search] busy_timeout`, and a store that does not hold the captured tree all
     /// leave the read path to verify every held file, and the answer is complete either
     /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
     /// batches: the rows the trigram index lacks ride the selection, and the read path
@@ -2204,11 +2205,16 @@ impl RiftMcp {
                     .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
                     .await
             })
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        Ok(SearchRanking::unranked(match scoped {
-            RevisionScoped::Matched(candidates) => answer.with_pattern_candidates(candidates),
-            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => answer,
+            .await;
+        let selected = match scoped.map_err(StoreReadFailure::from) {
+            Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
+            Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
+            | Err(StoreReadFailure::ConnectionUnavailable) => None,
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
+        Ok(SearchRanking::unranked(match selected {
+            Some(candidates) => answer.with_pattern_candidates(candidates),
+            None => answer,
         }))
     }
 
@@ -5462,6 +5468,39 @@ mod tests {
             .ok_or("the answer warns that the full-text ranking was unavailable")?;
         assert!(detail.contains("pool_slots"), "{detail}");
         assert!(detail.contains("busy_timeout"), "{detail}");
+        Ok(())
+    }
+
+    /// A `pattern` search whose trigram read meets a pool with no free connection answers
+    /// from every held file, as it does when the store could not open, instead of refusing
+    /// the request.
+    #[tokio::test]
+    async fn a_pattern_search_with_no_pooled_connection_verifies_every_held_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params)))
+            .await
+            .map_err(|_elapsed| "the pattern search waited past its bound for the held connection")?
+            .map_err(|refusal| {
+                format!("the pattern search must answer without the store: {refusal:?}")
+            })?
+            .0;
+        drop(held);
+
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 14)))],
+            "every held file is verified while the store is out of reach"
+        );
+        assert!(
+            answer.warnings.is_empty(),
+            "a complete answer warns nothing: {:?}",
+            answer.warnings
+        );
         Ok(())
     }
 
