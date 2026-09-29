@@ -26,8 +26,8 @@ mod fixture;
 pub use bun::BunResolver;
 pub use cargo::CargoResolver;
 pub use context::{
-    ContextAnswer, Degradation, Degraded, DependencyContext, InstallFolder, InstallLocation,
-    resolve_context,
+    ContextAnswer, Degradation, Degraded, DependencyContext, EnvironmentObservation, InstallFolder,
+    InstallLocation, resolve_context,
 };
 pub use npm::NpmResolver;
 pub use resolver::{
@@ -40,4 +40,4 @@ pub use stdlib::{
     STANDARD_LIBRARY_MANAGER, StandardLibrary, StandardLibraryAnswer, StandardLibraryRequest,
     standard_library_answer,
 };
-pub use uv::UvResolver;
+pub use uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages, UvResolver};

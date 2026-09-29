@@ -57,11 +57,11 @@ const BODY_FIELD: &str = "body";
 /// Grammar field holding an assignment's target.
 const LEFT_FIELD: &str = "left";
 
-/// The kind word behind the wire kind `python.function`.
+/// The kind word a Python function carries on the wire.
 const FUNCTION_KIND_WORD: &str = "function";
-/// The kind word behind the wire kind `python.class`.
+/// The kind word a Python class carries on the wire.
 const CLASS_KIND_WORD: &str = "class";
-/// The kind word behind the wire kind `python.variable`.
+/// The kind word a Python variable carries on the wire.
 const VARIABLE_KIND_WORD: &str = "variable";
 
 /// The separator Python qualified names join scopes with.

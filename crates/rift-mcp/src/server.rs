@@ -2812,7 +2812,7 @@ impl RiftMcp {
                 rift_core::traced!(component = "index", operation = "fingerprint.fold", {
                     digests.fingerprint() == current.fingerprint
                 }) && configuration_matches;
-            if tree_matches {
+            if tree_matches && !self.project_environment_moved(&current, phase).await? {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
@@ -2882,6 +2882,34 @@ impl RiftMcp {
             "workspace changed across bounded reconciliation attempts",
         )
         .tool_error(phase))
+    }
+
+    /// Whether a project environment `current`'s dependency context listed lists
+    /// differently now, observed on the worker pool.
+    ///
+    /// A `uv sync` that installs from an unchanged lockfile moves no visible path, so the
+    /// capture cannot see it; this observation is what asks for the rebuild that reads the
+    /// context again. A context that listed no environment answers `false` without
+    /// entering the pool.
+    async fn project_environment_moved(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<bool, ErrorData> {
+        if !current.reads.observes_project_environment() {
+            return Ok(false);
+        }
+        let reads = Arc::clone(&current.reads);
+        self.blocking
+            .run("project environment", move || {
+                Ok(rift_core::traced!(
+                    component = "index",
+                    operation = "fingerprint.environment",
+                    { reads.project_environment_moved() }
+                ))
+            })
+            .await
+            .map_err(|error| error.tool_error(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
@@ -6738,6 +6766,80 @@ done
                 && text.contains("src/deep.rs")
                 && text.contains("too_deep"),
             "the logs must name the left-out file and its bound: {text}"
+        );
+        Ok(())
+    }
+
+    /// A file past `[providers.syntax] max_file` stays in the index as text under the
+    /// default `[search.text] large_files = "split"`, so its one record says it is held
+    /// unparsed, with the fields a left-out file's record carries, and no record calls it
+    /// left out.
+    #[tokio::test]
+    async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let wide = format!("pub fn wide() {{}}\n{}", "// wide_marker\n".repeat(8));
+        fs::write(directory.path().join("src/wide.rs"), wide)?;
+        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"64b\"\n")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)?;
+
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server =
+            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
+                .await?;
+
+        let held = serde_json::to_value(run_search(&server, "wide_marker").await?)?;
+        assert!(
+            hit_paths(&held).contains(&"src/wide.rs"),
+            "the held file's text answers search: {held:#}"
+        );
+
+        cancellation.cancel();
+        drain_task.await?;
+        let logs = server.read_logs("rift://logs/component/index").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        let page: serde_json::Value = serde_json::from_str(text)?;
+        let named: Vec<&serde_json::Value> = page["records"]
+            .as_array()
+            .ok_or("a log page carries records")?
+            .iter()
+            .filter(|record| record["fields"]["path"] == "src/wide.rs")
+            .collect();
+        let [record] = named.as_slice() else {
+            return Err(format!("one record must name the held file: {text}").into());
+        };
+        assert_eq!(
+            record["message"], "file held unparsed in the index",
+            "{record:#}"
+        );
+        assert_eq!(record["level"], "warn", "{record:#}");
+        assert_eq!(record["operation"], "index.build", "{record:#}");
+        let reason = record["fields"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
+            "the record names the bound the file crossed: {record:#}"
+        );
+        assert!(
+            !text.contains("file left out of the index"),
+            "no file in this workspace is left out: {text}"
         );
         Ok(())
     }

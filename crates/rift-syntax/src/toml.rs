@@ -92,9 +92,9 @@ const LOCAL_DATE_TIME_KIND: &str = "local_date_time";
 /// Grammar spelling of an offset RFC 3339 timestamp, `offset_date_time`.
 const OFFSET_DATE_TIME_KIND: &str = "offset_date_time";
 
-/// The one TOML kind word behind the wire kind `toml.member`.
+/// The kind word a TOML member carries on the wire.
 const MEMBER_KIND_WORD: &str = "member";
-/// The one TOML kind word behind the wire kind `toml.table`.
+/// The kind word a TOML table carries on the wire.
 const TABLE_KIND_WORD: &str = "table";
 
 /// The separator TOML qualified names join key segments and containers

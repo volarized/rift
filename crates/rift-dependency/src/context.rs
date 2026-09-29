@@ -20,6 +20,7 @@ use crate::resolver::{
     ContextRequest, DependencyResolver, PACKAGES_MAX, ResolverName, StaticInputs,
 };
 use crate::stdlib::{StandardLibrary, StandardLibraryAnswer};
+use crate::uv::SitePackages;
 
 /// One thing a resolver or a standard library probe could not read, or the entries of
 /// one package manager a read left out past its entry bound.
@@ -118,6 +119,40 @@ pub struct ContextAnswer {
     pub inputs: Vec<ProjectPath>,
     /// Everything the resolver could not read, in the order it met each.
     pub degradations: Vec<String>,
+    /// The project environments the resolver listed for installed packages, one per
+    /// lockfile, as they stood when it read them.
+    pub environments: Vec<EnvironmentObservation>,
+}
+
+/// One project environment as a resolver listed it: the folder holding the lockfile, and
+/// what [`SitePackages::observe`] answered beside it.
+///
+/// The environment sits outside every visible path, `.venv` holding its own `.gitignore`,
+/// so no changed path reports a distribution `uv sync` installs from an unchanged
+/// lockfile. Observing the same folder again and comparing is what reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentObservation {
+    /// The folder holding the lockfile the environment sits beside.
+    pub directory: PathBuf,
+    /// The environment's `site-packages` and its listing; `None` when no layout stood.
+    pub site_packages: Option<SitePackages>,
+}
+
+impl EnvironmentObservation {
+    /// The project environment beside `directory`, observed through `inputs`.
+    #[must_use]
+    pub fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            site_packages: SitePackages::observe(directory, inputs),
+        }
+    }
+
+    /// Whether the environment lists differently now than when this observation was made.
+    #[must_use]
+    pub fn moved(&self, inputs: &mut dyn StaticInputs) -> bool {
+        SitePackages::observe(&self.directory, inputs) != self.site_packages
+    }
 }
 
 /// The packages one workspace depends on, as its manifests, lockfiles, the `[dependencies]`
@@ -135,6 +170,7 @@ pub struct DependencyContext {
     inputs: BTreeSet<ProjectPath>,
     degradations: Vec<Degradation>,
     libraries: BTreeSet<StandardLibrary>,
+    environments: Vec<EnvironmentObservation>,
 }
 
 impl DependencyContext {
@@ -175,6 +211,26 @@ impl DependencyContext {
     #[must_use]
     pub fn depends_on(&self, path: &ProjectPath) -> bool {
         self.inputs.contains(path)
+    }
+
+    /// Whether the context listed a project environment when it was read, which only a
+    /// resolver that read a lockfile does.
+    #[must_use]
+    pub fn observes_project_environment(&self) -> bool {
+        !self.environments.is_empty()
+    }
+
+    /// Whether some project environment the context listed lists differently now, which
+    /// makes the context stale although no input path changed.
+    ///
+    /// The work is one [`SitePackages::observe`] per lockfile the context read, at most
+    /// [`MANIFESTS_MAX`](crate::MANIFESTS_MAX) of them, and none for a context that
+    /// observes no environment.
+    #[must_use]
+    pub fn project_environment_moved(&self, inputs: &mut dyn StaticInputs) -> bool {
+        self.environments
+            .iter()
+            .any(|observation| observation.moved(inputs))
     }
 
     /// The standard libraries the workspace's languages named when the context was
@@ -252,6 +308,7 @@ impl DependencyContext {
             inputs: self.inputs.clone(),
             degradations,
             libraries: self.libraries.clone(),
+            environments: self.environments.clone(),
         }
     }
 
@@ -418,6 +475,7 @@ struct ContextMerge {
     install_folders: Vec<InstallFolder>,
     inputs: BTreeSet<ProjectPath>,
     degradations: Vec<Degradation>,
+    environments: Vec<EnvironmentObservation>,
 }
 
 impl ContextMerge {
@@ -453,6 +511,7 @@ impl ContextMerge {
         }
         self.install_folders.extend(answer.install_folders);
         self.inputs.extend(answer.inputs);
+        self.environments.extend(answer.environments);
         self.degradations
             .extend(answer.degradations.into_iter().map(|reason| Degradation {
                 resolver: resolver.into(),
@@ -511,6 +570,7 @@ impl ContextMerge {
             inputs: self.inputs,
             degradations: self.degradations,
             libraries: BTreeSet::new(),
+            environments: self.environments,
         };
         context.locate(self.install_folders);
         context
@@ -600,6 +660,7 @@ mod tests {
                     .collect(),
                 inputs: request.manifests.to_vec(),
                 degradations: self.degradations.clone(),
+                environments: Vec::new(),
             }
         }
     }

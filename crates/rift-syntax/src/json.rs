@@ -54,7 +54,7 @@ const KEY_FIELD: &str = "key";
 /// Grammar field holding a pair's value.
 const VALUE_FIELD: &str = "value";
 
-/// The one JSON kind word behind the wire kind `json.member`.
+/// The kind word a JSON member carries on the wire.
 const MEMBER_KIND_WORD: &str = "member";
 
 /// The separator JSON qualified names join nested member keys with.

@@ -14,23 +14,27 @@
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
 //! advertises.
 //!
-//! ty analyzes the tree on disk: the database is rooted at the workspace,
-//! discovery stays inside it (`discover_without_uv` only when the tree
-//! carries a `pyproject.toml` or `ty.toml` marker), and a document open
-//! feeds the database the file's current on-disk state. The session hands
-//! indexed source that the server has already witnessed against disk, so
-//! the two views agree by the time an exchange runs.
+//! ty analyzes the tree on disk: project discovery runs only when the tree
+//! carries a `pyproject.toml` or `ty.toml` marker, and a document open feeds the
+//! database the file's current on-disk state. The session hands indexed source
+//! that the server has already witnessed against disk, so the two views agree by
+//! the time an exchange runs. The Python environment comes from the tree alone:
+//! the one its ty configuration names, else its `.venv`, else none.
+
+mod hermetic;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
+use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
 use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncoding};
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_text_size::{TextRange, TextSize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +42,9 @@ use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::watch::{ChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as _, ProjectDatabase, ProjectMetadata, SemanticDb as _};
+
+use crate::dependency::{FilesystemInputs, ResolutionPolicy};
+use hermetic::HermeticSystem;
 
 /// Bytes the in-memory transport buffers per direction before a writer waits.
 const DUPLEX_BYTES: usize = 256 * 1024;
@@ -50,13 +57,6 @@ const PAYLOAD_BYTES_MAX: usize = 8 * 1024 * 1024;
 /// The scheme and empty authority ty's `VendoredPath` display puts before a vendored
 /// stub's path.
 const VENDORED_URI_PREFIX: &str = "vendored://";
-
-/// The virtual environment directory `uv sync` creates beside a project's manifest, where
-/// the dependency resolver reads a tree's installed packages.
-const TREE_ENVIRONMENT_DIRECTORY: &str = ".venv";
-
-/// The file every virtual environment holds at its root, PEP 405's `pyvenv.cfg`.
-const VIRTUAL_ENVIRONMENT_MARKER: &str = "pyvenv.cfg";
 
 /// JSON-RPC error code for a method this engine does not serve.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -323,17 +323,30 @@ fn initialize_result() -> Value {
     })
 }
 
+/// One tree's database and the project environment it was built under.
+struct TreeDatabase {
+    database: ProjectDatabase,
+    environment: TreeEnvironment,
+}
+
 /// The process-wide database cache, keyed by canonical tree root: one
 /// workspace server serves one tree, and a replaced session reuses the
 /// database its predecessor built.
-fn databases() -> &'static Mutex<HashMap<PathBuf, ProjectDatabase>> {
-    static DATABASES: OnceLock<Mutex<HashMap<PathBuf, ProjectDatabase>>> = OnceLock::new();
+fn databases() -> &'static Mutex<HashMap<PathBuf, TreeDatabase>> {
+    static DATABASES: OnceLock<Mutex<HashMap<PathBuf, TreeDatabase>>> = OnceLock::new();
     DATABASES.get_or_init(Mutex::default)
 }
 
 /// Runs `answer` against the tree's database, building it on first use.
 /// The lock is held for the whole call, which serializes semantic work per
 /// process; every answer extracts owned data before returning.
+///
+/// Each call observes the tree's project environment once and rebuilds the
+/// database when the observation differs from the one it was built under, so
+/// a `.venv` created, removed, or recreated after the first request, and a
+/// distribution installed into it, takes effect on the next one. A failed
+/// rebuild keeps the previous database and refuses the call; the next call
+/// tries again.
 fn with_database<T>(
     tree_root: &Path,
     answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, AnswerRefusal>,
@@ -344,64 +357,107 @@ fn with_database<T>(
     let mut databases = databases().lock().map_err(|_| {
         AnswerRefusal::Invalid("the embedded ty database cache is poisoned".to_owned())
     })?;
-    let database = match databases.entry(root.clone()) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => {
-            entry.insert(built_database(&root).map_err(AnswerRefusal::Invalid)?)
+    let environment = TreeEnvironment::observe(&root);
+    let tree = match databases.entry(root.clone()) {
+        Entry::Occupied(entry) if entry.get().environment == environment => entry.into_mut(),
+        Entry::Occupied(mut entry) => {
+            entry.insert(TreeDatabase::built(&root, environment)?);
+            entry.into_mut()
         }
+        Entry::Vacant(entry) => entry.insert(TreeDatabase::built(&root, environment)?),
     };
-    answer(database, &root)
+    answer(&mut tree.database, &root)
 }
 
-/// Builds a project database rooted exactly at `root`.
-///
-/// Discovery is hermetic: `discover_without_uv` runs only when the tree
-/// carries its own project marker, so semantic answers never leak past the
-/// served directory; a markerless tree gets default metadata pinned at its
-/// root. A tree holding a virtual environment in `.venv` resolves imports
-/// through it, as [`tree_environment`] states.
-fn built_database(root: &Path) -> Result<ProjectDatabase, String> {
-    let has_marker = root.join("pyproject.toml").is_file() || root.join("ty.toml").is_file();
-    let system_root = SystemPathBuf::from_path_buf(root.to_path_buf())
-        .map_err(|path| format!("tree root is not UTF-8: {}", path.display()))?;
-    let system = OsSystem::new(&system_root);
-    let mut metadata = if has_marker {
-        ProjectMetadata::discover_without_uv(&system_root, &system)
-            .map_err(|error| format!("ty project discovery: {error}"))?
-    } else {
-        ProjectMetadata::new(
-            system_root.file_name().unwrap_or("tree"),
-            system_root.clone(),
-        )
-    };
-    if let Some(environment) = tree_environment(&system_root) {
-        metadata.apply_fallback_options(environment);
+impl TreeDatabase {
+    /// Builds a project database for the tree at `root` under `environment`.
+    ///
+    /// The database runs on a [`HermeticSystem`], so the process's variables,
+    /// programs, and user configuration never reach it, and ty's project
+    /// discovery reads the tree's own `pyproject.toml` or `ty.toml` and nothing
+    /// above the root: the project is the served tree. Imports resolve through
+    /// the Python environment the tree's ty configuration names, else through
+    /// the tree's `.venv` when it holds a virtual environment, as
+    /// [`TreeEnvironment::options`] states, else through none: the project's own
+    /// modules and the vendored typeshed standard library. ty's look for an
+    /// environment around its own executable finds none, since the Rift binary
+    /// is named neither `ty` nor a Python interpreter.
+    fn built(root: &Path, environment: TreeEnvironment) -> Result<Self, AnswerRefusal> {
+        let system_root = SystemPathBuf::from_path_buf(root.to_path_buf()).map_err(|path| {
+            AnswerRefusal::Invalid(format!("tree root is not UTF-8: {}", path.display()))
+        })?;
+        let system = HermeticSystem::new(&system_root);
+        let mut metadata = ProjectMetadata::discover_without_uv(&system_root, &system)
+            .map_err(|error| AnswerRefusal::Invalid(format!("ty project discovery: {error}")))?;
+        if let Some(options) = environment.options(&system_root) {
+            metadata.apply_fallback_options(options);
+        }
+        let database = ProjectDatabase::fallible(metadata, system)
+            .map_err(|error| AnswerRefusal::Invalid(format!("ty database: {error}")))?;
+        Ok(Self {
+            database,
+            environment,
+        })
     }
-    ProjectDatabase::fallible(metadata, system).map_err(|error| format!("ty database: {error}"))
 }
 
-/// Options naming the tree's own virtual environment as ty's Python environment, when
-/// `.venv` holds one; `None` otherwise.
+/// The tree's project environment as one request observed it.
 ///
-/// ty takes the environment `VIRTUAL_ENV` names ahead of the tree's `.venv`, and `uv run`
-/// sets that variable to whichever project it ran in. The dependency resolver reads the
-/// tree's installed packages from `.venv`, so an engine resolving imports through another
-/// environment names callees in files no package the resolver found holds. The options
-/// sit below the project's own ty configuration, which still names another environment
-/// when it sets one.
-fn tree_environment(root: &SystemPath) -> Option<Options> {
-    let environment = root.join(TREE_ENVIRONMENT_DIRECTORY);
-    let marked = environment
-        .join(VIRTUAL_ENVIRONMENT_MARKER)
-        .as_std_path()
-        .is_file();
-    marked.then(|| Options {
-        environment: Some(EnvironmentOptions {
-            python: Some(RelativePathBuf::cli(environment)),
-            ..EnvironmentOptions::default()
-        }),
-        ..Options::default()
-    })
+/// The dependency resolver reads the tree's installed packages from its project
+/// environment, `.venv`, and the interpreter version from that environment's
+/// `pyvenv.cfg`, so an engine resolving imports through another environment names callees
+/// in files no package the resolver found holds. A `.venv` without `pyvenv.cfg` holds no
+/// virtual environment and names none. A marked environment is observed the way the
+/// resolver observes it, through [`SitePackages::observe`], so a distribution `uv sync`
+/// installs, removes, or upgrades changes the observation as it changes the resolver's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TreeEnvironment {
+    /// No `pyvenv.cfg` stands in the tree's `.venv`.
+    Absent,
+    /// `.venv/pyvenv.cfg` stands.
+    Marked {
+        /// When the marker was last modified, as the filesystem reports it; `None` on a
+        /// filesystem that reports none.
+        marker_modified: Option<SystemTime>,
+        /// The environment's `site-packages` and its listing; `None` when neither layout
+        /// stands.
+        site_packages: Option<SitePackages>,
+    },
+}
+
+impl TreeEnvironment {
+    /// Observes the tree's `.venv`: one metadata read of its marker and, when it is
+    /// marked, the resolver's `site-packages` listing.
+    fn observe(root: &Path) -> Self {
+        let marker = root
+            .join(PROJECT_ENVIRONMENT_DIRECTORY)
+            .join(PROJECT_ENVIRONMENT_MARKER);
+        match std::fs::metadata(marker) {
+            Ok(metadata) if metadata.is_file() => Self::Marked {
+                marker_modified: metadata.modified().ok(),
+                site_packages: SitePackages::observe(
+                    root,
+                    &mut FilesystemInputs::new(ResolutionPolicy::default()),
+                ),
+            },
+            Ok(_) | Err(_) => Self::Absent,
+        }
+    }
+
+    /// Options naming the tree's `.venv` as ty's Python environment when it is marked;
+    /// `None` otherwise. The options sit below the project's own ty configuration, which
+    /// still names another environment when it sets one.
+    fn options(&self, root: &SystemPath) -> Option<Options> {
+        (*self != Self::Absent).then(|| Options {
+            environment: Some(EnvironmentOptions {
+                python: Some(RelativePathBuf::cli(
+                    root.join(PROJECT_ENVIRONMENT_DIRECTORY),
+                )),
+                ..EnvironmentOptions::default()
+            }),
+            ..Options::default()
+        })
+    }
 }
 
 /// Feeds the database one opened document's on-disk state, so an answer
@@ -424,7 +480,7 @@ fn opened_document(root: &Path, params: &Value) {
     let Ok(mut databases) = databases().lock() else {
         return;
     };
-    let Some(database) = databases.get_mut(&root) else {
+    let Some(TreeDatabase { database, .. }) = databases.get_mut(&root) else {
         return;
     };
     let event = if !path.exists() {
@@ -749,6 +805,8 @@ fn pulled_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use ruff_db::system::System as _;
+
     use super::*;
 
     fn empty_documents() -> DocumentStore {
@@ -776,14 +834,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture directory");
         let root = SystemPathBuf::from_path_buf(directory.path().to_path_buf())
             .expect("a UTF-8 temporary root");
+        let observed = || TreeEnvironment::observe(directory.path());
+        assert_eq!(observed(), TreeEnvironment::Absent);
         assert!(
-            tree_environment(&root).is_none(),
-            "a tree without `.venv` leaves discovery to ty"
+            observed().options(&root).is_none(),
+            "a tree without `.venv` names no environment"
         );
 
         std::fs::create_dir(directory.path().join(".venv")).expect("environment directory");
-        assert!(
-            tree_environment(&root).is_none(),
+        assert_eq!(
+            observed(),
+            TreeEnvironment::Absent,
             "a `.venv` without `pyvenv.cfg` is no virtual environment"
         );
 
@@ -792,12 +853,299 @@ mod tests {
             "home = /usr/bin\n",
         )
         .expect("environment marker");
-        let options = tree_environment(&root).expect("a marked `.venv` names the environment");
+        let marked = observed();
+        assert!(
+            matches!(marked, TreeEnvironment::Marked { .. }),
+            "{marked:?}"
+        );
+        let options = marked
+            .options(&root)
+            .expect("a marked `.venv` names the environment");
         let python = options
             .environment
             .and_then(|environment| environment.python)
             .expect("the options name a Python environment");
         assert_eq!(python.path(), root.join(".venv").as_path());
+    }
+
+    /// A module importing `inside`, which a tree's own `.venv` installs, and `outside`,
+    /// which only the environment `VIRTUAL_ENV` names installs.
+    const IMPORTS: &str = "import inside\nimport outside\n";
+
+    /// The `site-packages` directory below a virtual environment, in ty's layout for
+    /// this host.
+    const SITE_PACKAGES: &str = if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.12/site-packages"
+    };
+
+    /// Installs `package` 1.0.0 into the environment at `environment` as `uv sync` lays
+    /// one out: its module folder and its `.dist-info` with a `RECORD`.
+    fn installed_package(environment: &Path, package: &str) {
+        let site_packages = environment.join(SITE_PACKAGES);
+        let module = site_packages.join(package);
+        std::fs::create_dir_all(&module).expect("site-packages directory");
+        std::fs::write(
+            module.join("__init__.py"),
+            "def greet() -> str:\n    return \"\"\n",
+        )
+        .expect("package module");
+        let dist_info = site_packages.join(format!("{package}-1.0.0.dist-info"));
+        std::fs::create_dir_all(&dist_info).expect("metadata directory");
+        std::fs::write(
+            dist_info.join("RECORD"),
+            format!("{package}/__init__.py,,\n{package}-1.0.0.dist-info/RECORD,,\n"),
+        )
+        .expect("package record");
+    }
+
+    /// Writes a virtual environment at `environment` holding the one package `package`.
+    fn installed_environment(environment: &Path, package: &str) {
+        installed_package(environment, package);
+        std::fs::write(
+            environment.join(PROJECT_ENVIRONMENT_MARKER),
+            format!("home = {}\nversion_info = 3.12.4\n", environment.display()),
+        )
+        .expect("environment marker");
+    }
+
+    /// A tree holding `app.py` with [`IMPORTS`], at its canonical path.
+    fn importing_tree() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(directory.path().join("app.py"), IMPORTS).expect("fixture module");
+        let root = directory.path().canonicalize().expect("canonical root");
+        (directory, root)
+    }
+
+    /// The `unresolved-import` messages among `diagnostics`.
+    fn unresolved_imports<'item>(
+        diagnostics: impl IntoIterator<Item = (&'item str, &'item str)>,
+    ) -> Vec<&'item str> {
+        diagnostics
+            .into_iter()
+            .filter(|(code, _)| *code == "unresolved-import")
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// Whether one of `messages` names the module `module`.
+    fn names_module(messages: &[impl AsRef<str>], module: &str) -> bool {
+        let quoted = format!("`{module}`");
+        messages
+            .iter()
+            .any(|message| message.as_ref().contains(&quoted))
+    }
+
+    /// The `unresolved-import` messages for `app.py` from a database ty builds by
+    /// default for the tree at `root`: its own discovery on the OS system.
+    fn default_unresolved_imports(root: &Path) -> Vec<String> {
+        let system_root =
+            SystemPathBuf::from_path_buf(root.to_path_buf()).expect("a UTF-8 temporary root");
+        let system = ruff_db::system::OsSystem::new(&system_root);
+        let metadata =
+            ProjectMetadata::discover_without_uv(&system_root, &system).expect("ty's discovery");
+        let database = ProjectDatabase::fallible(metadata, system).expect("a default database");
+        let app = system_path_to_file(&database, system_root.join("app.py")).expect("app.py");
+        let findings: Vec<(String, String)> = database
+            .check_file(app)
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.id().to_string(),
+                    diagnostic.concise_message().to_string(),
+                )
+            })
+            .collect();
+        unresolved_imports(
+            findings
+                .iter()
+                .map(|(code, message)| (code.as_str(), message.as_str())),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// The engine's `unresolved-import` messages for the tree's `app.py`, as the
+    /// diagnostic pull answers them.
+    fn engine_unresolved_imports(root: &Path) -> Vec<String> {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": uri_of(&root.join("app.py")) } },
+        });
+        let Handled::Reply(reply) = handle_message(&message, root, &empty_documents()) else {
+            panic!("the pull must reply");
+        };
+        let items = reply["result"]["items"].as_array().expect("items");
+        let pairs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item["code"].as_str().unwrap_or_default(),
+                    item["message"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        unresolved_imports(pairs)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Runs in a child process whose `VIRTUAL_ENV` names an environment installing
+    /// `outside`. A database on the OS system, as ty builds one by default, resolves
+    /// `outside` through it, so the variable names a live environment; the engine
+    /// resolves no import through it, and a tree whose `.venv` installs `inside`
+    /// resolves that one alone.
+    #[test]
+    #[ignore = "probe run by test_another_environment_named_by_virtual_env_stays_unread in a child process"]
+    fn test_another_environment_named_by_virtual_env_stays_unread_probe() {
+        let named = std::env::var("VIRTUAL_ENV").expect("the parent names an environment");
+        let (_bare, bare_root) = importing_tree();
+        let default_unresolved = default_unresolved_imports(&bare_root);
+        assert!(
+            !names_module(&default_unresolved, "outside"),
+            "ty's own discovery reads `{named}`: {default_unresolved:?}"
+        );
+        let system_root =
+            SystemPathBuf::from_path_buf(bare_root.clone()).expect("a UTF-8 temporary root");
+        assert_eq!(
+            HermeticSystem::new(&system_root).env_var("VIRTUAL_ENV"),
+            Err(std::env::VarError::NotPresent)
+        );
+
+        let bare = engine_unresolved_imports(&bare_root);
+        assert!(names_module(&bare, "inside"), "{bare:?}");
+        assert!(
+            names_module(&bare, "outside"),
+            "no import resolves through `{named}`: {bare:?}"
+        );
+
+        let (_installed, installed_root) = importing_tree();
+        installed_environment(
+            &installed_root.join(PROJECT_ENVIRONMENT_DIRECTORY),
+            "inside",
+        );
+        let installed = engine_unresolved_imports(&installed_root);
+        assert!(
+            !names_module(&installed, "inside"),
+            "the tree's `.venv` resolves `inside`: {installed:?}"
+        );
+        assert!(names_module(&installed, "outside"), "{installed:?}");
+    }
+
+    /// A `.venv` created after the first request takes effect on the next one, and so
+    /// does its removal.
+    #[test]
+    fn test_a_tree_environment_created_or_removed_after_a_request_takes_effect() {
+        let (_tree, root) = importing_tree();
+        let environment = root.join(PROJECT_ENVIRONMENT_DIRECTORY);
+        let before = engine_unresolved_imports(&root);
+        assert!(names_module(&before, "inside"), "{before:?}");
+
+        installed_environment(&environment, "inside");
+        let created = engine_unresolved_imports(&root);
+        assert!(
+            !names_module(&created, "inside"),
+            "the new `.venv` resolves `inside`: {created:?}"
+        );
+
+        std::fs::remove_dir_all(&environment).expect("environment removal");
+        let removed = engine_unresolved_imports(&root);
+        assert!(
+            names_module(&removed, "inside"),
+            "the removed `.venv` resolves nothing: {removed:?}"
+        );
+    }
+
+    /// A distribution installed into the tree's existing `.venv` after the first request
+    /// resolves on the next one, though the environment's `pyvenv.cfg` stays untouched.
+    #[test]
+    fn test_a_package_installed_into_the_tree_environment_resolves_on_the_next_request() {
+        let (_tree, root) = importing_tree();
+        let environment = root.join(PROJECT_ENVIRONMENT_DIRECTORY);
+        installed_environment(&environment, "inside");
+        let marker_modified = || {
+            std::fs::metadata(environment.join(PROJECT_ENVIRONMENT_MARKER))
+                .and_then(|metadata| metadata.modified())
+                .expect("marker time")
+        };
+        let marker = marker_modified();
+        let before = engine_unresolved_imports(&root);
+        assert!(!names_module(&before, "inside"), "{before:?}");
+        assert!(names_module(&before, "outside"), "{before:?}");
+
+        installed_package(&environment, "outside");
+        assert_eq!(
+            marker_modified(),
+            marker,
+            "installing leaves `pyvenv.cfg` alone"
+        );
+        let after = engine_unresolved_imports(&root);
+        assert!(
+            !names_module(&after, "outside"),
+            "the installed `outside` resolves: {after:?}"
+        );
+    }
+
+    /// An ancestor's `ty.toml` never reaches the engine. ty's own discovery roots the
+    /// project at the ancestor and resolves `outside` through its `extra-paths`; the
+    /// engine's project stays the served tree, whose plain `pyproject.toml` names none.
+    #[test]
+    fn test_an_ancestor_ty_configuration_stays_unread() {
+        let parent = tempfile::tempdir().expect("fixture directory");
+        let parent_root = parent.path().canonicalize().expect("canonical parent");
+        std::fs::write(
+            parent_root.join("ty.toml"),
+            "[environment]\nextra-paths = [\"extra\"]\n",
+        )
+        .expect("ancestor configuration");
+        let outside = parent_root.join("extra/outside");
+        std::fs::create_dir_all(&outside).expect("extra path");
+        std::fs::write(outside.join("__init__.py"), "value = 1\n").expect("extra module");
+        let root = parent_root.join("tree");
+        std::fs::create_dir(&root).expect("tree directory");
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"tree\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("tree marker");
+        std::fs::write(root.join("app.py"), IMPORTS).expect("fixture module");
+
+        let default_unresolved = default_unresolved_imports(&root);
+        assert!(
+            !names_module(&default_unresolved, "outside"),
+            "ty's own discovery reads the ancestor's `ty.toml`: {default_unresolved:?}"
+        );
+        let engine = engine_unresolved_imports(&root);
+        assert!(
+            names_module(&engine, "outside"),
+            "the engine reads no configuration above the tree: {engine:?}"
+        );
+    }
+
+    #[test]
+    fn test_another_environment_named_by_virtual_env_stays_unread() {
+        let environment = tempfile::tempdir().expect("environment directory");
+        installed_environment(environment.path(), "outside");
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "embedded::tests::test_another_environment_named_by_virtual_env_stays_unread_probe",
+                "--ignored",
+            ])
+            .env("VIRTUAL_ENV", environment.path())
+            .output()
+            .expect("the probe runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "probe must pass: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1124,10 +1472,10 @@ mod tests {
         served.await.expect("the loop ends on unreadable bytes");
     }
 
-    /// A project marker routes database construction through hermetic
+    /// A project marker routes database construction through project
     /// discovery, and the pull still answers findings from that tree.
     #[test]
-    fn test_a_pyproject_marker_routes_through_hermetic_discovery() {
+    fn test_a_pyproject_marker_routes_through_project_discovery() {
         let directory = tempfile::tempdir().expect("fixture directory");
         std::fs::write(
             directory.path().join("pyproject.toml"),

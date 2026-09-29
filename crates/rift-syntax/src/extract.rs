@@ -147,7 +147,7 @@ pub(crate) trait GrammarRules {
 pub(crate) struct Declaration {
     /// Declared short name.
     pub(crate) name: String,
-    /// The provider's kind word behind the wire kind `{language}.{kind}`.
+    /// The provider's kind word, carried on the wire unchanged.
     pub(crate) kind: &'static str,
     /// Portable categories, in the grammar's declared order.
     pub(crate) facets: Vec<SymbolFacet>,

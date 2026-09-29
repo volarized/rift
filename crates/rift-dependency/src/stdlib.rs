@@ -24,6 +24,7 @@ use crate::context::{InstallFolder, InstallLocation, is_whole_version};
 use crate::resolver::{
     CommandOutput, ContextInputs, FileObservation, ResolverName, StaticInputs, ToolchainCommand,
 };
+use crate::uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER};
 
 /// The manager every standard library entry names, as local reads minted it.
 pub const STANDARD_LIBRARY_MANAGER: &str = "stdlib";
@@ -53,8 +54,6 @@ const NPM_MANAGER: &str = "npm";
 
 /// The Rust toolchain files rustup reads, in the order it prefers them.
 const RUST_TOOLCHAIN_FILES: [&str; 2] = ["rust-toolchain.toml", "rust-toolchain"];
-/// The Python environment file `uv venv` and `python3 -m venv` write.
-const PYVENV_FILE: &str = ".venv/pyvenv.cfg";
 /// The `pyvenv.cfg` keys naming the interpreter version: uv's, then `venv`'s.
 const PYVENV_VERSION_KEYS: [&str; 2] = ["version_info", "version"];
 /// The Python pin pyenv and uv read.
@@ -539,10 +538,12 @@ fn python_version(
     inputs: &mut dyn StaticInputs,
     read: &mut Vec<ProjectPath>,
 ) -> VersionOutcome {
+    let pyvenv_file = format!("{PROJECT_ENVIRONMENT_DIRECTORY}/{PROJECT_ENVIRONMENT_MARKER}");
     read.extend(
-        [PYVENV_FILE, PYTHON_VERSION_FILE, PYPROJECT_FILE].map(|file| ProjectPath(file.to_owned())),
+        [pyvenv_file.as_str(), PYTHON_VERSION_FILE, PYPROJECT_FILE]
+            .map(|file| ProjectPath(file.to_owned())),
     );
-    let pin = pin_text(inputs, &root.join(PYVENV_FILE))
+    let pin = pin_text(inputs, &root.join(&pyvenv_file))
         .and_then(|text| pyvenv_version(&text))
         .or_else(|| {
             pin_text(inputs, &root.join(PYTHON_VERSION_FILE))

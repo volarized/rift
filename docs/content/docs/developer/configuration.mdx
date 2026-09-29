@@ -420,6 +420,18 @@ and `embedded` is present, and an embedded engine takes no `environment` and no
 `initialization_options`: both configure a spawned process, so a table naming them beside
 `embedded` is refused rather than silently ignored.
 
+The embedded engine reads ty's configuration from the served tree alone: the root's own `ty.toml`,
+or the `[tool.ty]` table in its `pyproject.toml`. A `ty.toml` or `pyproject.toml` in a directory
+above the root is never read, so the project the engine analyzes is the served tree.
+
+Its Python environment is the one that configuration names, else the project environment in
+`.venv` when its `pyvenv.cfg` stands, else none, which leaves the tree's own modules and the
+typeshed stubs the engine ships. The server's `VIRTUAL_ENV`, `CONDA_PREFIX`, `PYTHONPATH`, and
+`PATH` never reach it, so the engine reads the same `.venv` the uv resolver reads beside a
+`uv.lock` at the tree's root. Creating, removing, or recreating `.venv`, and each distribution
+`uv sync` installs, removes, or upgrades in it, takes effect on the engine's next request, with no
+server restart.
+
 `command` accepts a program string without whitespace or a nonempty list holding the program and
 its literal arguments. The list holds one program and at most 64 arguments; each argument holds
 at most 4096 bytes. Rift starts the command directly without a shell. Absolute programs are
