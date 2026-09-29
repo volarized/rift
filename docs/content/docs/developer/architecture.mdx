@@ -76,8 +76,9 @@ onward, so a `rift mcp` or `rift server start` that arrives while it is still in
 for its file instead of starting another server.
 
 The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
-SHA-256 match its own identity. A mismatch is stale state, even when the recorded process and port
-are live, so requests never cross between binaries or tool schemas that interpret them differently.
+SHA-256 match its own identity. A mismatch refuses each request, even when the recorded process and
+port are live, so requests never cross between binaries or tool schemas that interpret them
+differently; stopping the running server lets the next request start one that matches.
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next

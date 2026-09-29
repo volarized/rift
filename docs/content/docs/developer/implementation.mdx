@@ -50,8 +50,10 @@ shared lock can outlive the probe for a moment - the starter starts another with
 30-second window.
 
 Before it adopts a live server, the proxy compares package version, executable SHA-256, and
-canonical MCP schema SHA-256 from the lock with its own identity. A mismatch starts a matching server rather than forwarding across different binaries or
-tool documents.
+canonical MCP schema SHA-256 from the lock with its own identity. A mismatch refuses the request:
+the caller receives a JSON-RPC internal error naming both identities and asking for
+`rift server stop`, and once the operator stops the running server, the next request starts one
+that matches.
 
 ### rift server
 
