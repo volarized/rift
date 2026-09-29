@@ -361,19 +361,34 @@ struct SlotState {
     restarts: RestartBudget,
 }
 
-/// Keeps a session reusable only after its exchange finishes.
+/// Decides, under the slot lock, whether a session outlives an exchange dropped midway.
 ///
-/// Cancellation can skip asynchronous document closes. Dropping this guard then drops
-/// the session under the slot lock, so the next request starts with no open documents.
+/// A dropped exchange can skip its asynchronous document close, leave a request
+/// pending, or cut a frame part-written. The session records the first and discards the
+/// answer to the second at its next exchange, so it survives both: it stays in the slot
+/// while it reads intact ([`EngineSession::is_intact`]), and the next exchange closes
+/// the documents the dropped one left open before anything else. A cut frame, an ended
+/// engine, or a drop while the slot hands the session its owed changes drops the session
+/// under the slot lock instead, so the next request starts a replacement. Owed changes
+/// left the slot's record when the hand-over began, so a session that missed part of
+/// them would answer about files it was never told had moved.
 struct RequestSessionGuard<'slot> {
     state: &'slot mut SlotState,
     reported_state: &'slot watch::Sender<LspState>,
     finished: bool,
+    sending_owed_changes: bool,
 }
 
 impl Drop for RequestSessionGuard<'_> {
     fn drop(&mut self) {
-        if !self.finished {
+        let survives = self.finished
+            || (!self.sending_owed_changes
+                && self
+                    .state
+                    .session
+                    .as_ref()
+                    .is_some_and(EngineSession::is_intact));
+        if !survives {
             drop(self.state.session.take());
             self.reported_state.send_replace(LspState::Failed);
         }
@@ -626,6 +641,20 @@ impl<T> Transient<T> {
     }
 }
 
+/// Closes the documents the slot's live session holds open, before an exchange begins.
+///
+/// An exchange's `finish` closes what its `begin` opened, so a document still open here
+/// was left by an exchange dropped midway. A failed close ends the session inside the
+/// notification, and the failure comes back as the one the slot reports if no
+/// replacement can start.
+async fn close_left_open(state: &mut SlotState) -> Option<EngineError> {
+    let running = state
+        .session
+        .as_mut()
+        .filter(|running| !running.is_ended())?;
+    running.close_open_documents().await.err()
+}
+
 /// How one attempt of an exchange ended.
 enum AttemptEnd<T> {
     /// The operation returned: the engine answered or refused, or the exchange broke.
@@ -644,10 +673,11 @@ enum AttemptEnd<T> {
 /// exchange that is no walk. A retry belongs to the readiness wait: the wait before it
 /// already ends before the deadline, and a retry started just before the deadline would
 /// otherwise hold the walk a whole round trip past it, and the request past its own
-/// deadline, which drops the session. Dropping an engine operation leaves its request
-/// pending, and the session discards the engine's late answer at its next exchange, so
-/// the session stays live. A retry that completes hands `retrying` back unchanged, so a
-/// rerun on a replacement session stays bounded by the same deadline.
+/// deadline, which refuses the request in place of the walk's warning. Dropping an
+/// engine operation leaves its request pending, and the session discards the engine's
+/// late answer at its next exchange, so the session stays live. A retry that completes
+/// hands `retrying` back unchanged, so a rerun on a replacement session stays bounded by
+/// the same deadline.
 async fn attempt_within<T>(
     retrying: &mut Option<(Instant, Transient<T>)>,
     operation: impl Future<Output = Result<T, EngineError>>,
@@ -777,8 +807,11 @@ impl EngineSlot {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future discards its session. The next request starts a replacement
-    /// within the configured restart budget.
+    /// Dropping the future keeps the session while it reads intact
+    /// ([`EngineSession::is_intact`]): its pending request's late answer is discarded at
+    /// the next exchange. A session with a frame cut part-written, or one dropped while
+    /// the slot hands it its owed changes, is discarded, and the next request starts a
+    /// replacement within the configured restart budget.
     pub async fn request<T>(
         &self,
         operation: impl for<'session> FnMut(
@@ -819,8 +852,11 @@ impl EngineSlot {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future can skip `finish`, so its session is discarded. The next
-    /// request starts a replacement within the configured restart budget.
+    /// Dropping the future can skip `finish`. The session stays while it reads intact
+    /// ([`EngineSession::is_intact`]), and the next exchange closes the documents this
+    /// one left open before its own `begin`. A session with a frame cut part-written,
+    /// or one dropped while the slot hands it its owed changes, is discarded, and the
+    /// next request starts a replacement within the configured restart budget.
     pub async fn request_exchange<T>(
         &self,
         begin: impl for<'session> FnMut(
@@ -894,8 +930,11 @@ impl EngineSlot {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future can skip `finish`, so its session is discarded. The next
-    /// request starts a replacement within the configured restart budget.
+    /// Dropping the future can skip `finish`. The session stays while it reads intact
+    /// ([`EngineSession::is_intact`]), and the next exchange closes the documents this
+    /// one left open before its own `begin`. A session with a frame cut part-written,
+    /// or one dropped while the slot hands it its owed changes, is discarded, and the
+    /// next request starts a replacement within the configured restart budget.
     pub async fn request_settled<T: PartialEq>(
         &self,
         begin: impl for<'session> FnMut(
@@ -973,7 +1012,7 @@ impl EngineSlot {
     /// retry table and continue past its attempt bound up to `deadline`, so a
     /// spent wait ends inside the loop: `finish` runs, the session stays
     /// live, and the answer is `OutgoingAnswer::Unsettled` instead of a
-    /// dropped request that discards the session. A retry still in flight at
+    /// dropped request that refuses the caller. A retry still in flight at
     /// `deadline` is abandoned there and ends the walk the same way.
     ///
     /// # Errors
@@ -983,8 +1022,11 @@ impl EngineSlot {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future can skip `finish`, so its session is discarded. The next
-    /// request starts a replacement within the configured restart budget.
+    /// Dropping the future can skip `finish`. The session stays while it reads intact
+    /// ([`EngineSession::is_intact`]), and the next exchange closes the documents this
+    /// one left open before its own `begin`. A session with a frame cut part-written,
+    /// or one dropped while the slot hands it its owed changes, is discarded, and the
+    /// next request starts a replacement within the configured restart budget.
     pub async fn request_outgoing<T>(
         &self,
         begin: impl for<'session> FnMut(
@@ -1041,8 +1083,10 @@ impl EngineSlot {
     /// still in flight when it passes ends the loop on the condition that
     /// retry was sent for ([`attempt_within`]).
     ///
-    /// A canceled request discards its session before releasing the slot lock. A later
-    /// request spends the configured restart budget to start without open documents.
+    /// A live session first closes the documents an earlier, dropped exchange left
+    /// open, then receives its owed changes, and only then does `begin` run.
+    /// [`RequestSessionGuard`] decides whether a session survives this exchange
+    /// being dropped.
     async fn request_deciding<T>(
         &self,
         mut begin: impl for<'session> FnMut(
@@ -1063,35 +1107,33 @@ impl EngineSlot {
             state: &mut held,
             reported_state: &self.reported_state,
             finished: false,
+            sending_owed_changes: false,
         };
         let mut attempt: u64 = 1;
         let mut retrying: Option<(Instant, Transient<T>)> = None;
-        let mut reported: Option<EngineError> = None;
         let mut exchange_started = false;
         let mut session_generation = 0_u64;
+        let mut reported = Box::pin(close_left_open(&mut *guarded.state)).await;
         loop {
             let state = &mut *guarded.state;
             let owed = self.take_owed();
             let session = match state.session.take() {
                 Some(running) if !running.is_ended() && !owed.overflowed => {
                     let running = state.session.insert(running);
-                    if let Err(error) = owed.send(running).await {
+                    guarded.sending_owed_changes = true;
+                    let sent = owed.send(running).await;
+                    guarded.sending_owed_changes = false;
+                    if let Err(error) = sent {
                         reported = Some(error);
                         continue;
                     }
                     running
                 }
                 dead => {
-                    if let Some(dead) = dead {
-                        self.reap(dead).await;
-                    }
                     // A replacement opens nothing on its own, so `begin` runs on it
                     // again, even when the session it replaces was still live.
                     exchange_started = false;
-                    let started = self
-                        .start_within_budget(&mut state.restarts, reported.take())
-                        .await?;
-                    state.session.insert(started)
+                    Box::pin(self.start_replacement(state, dead, reported.take())).await?
                 }
             };
             if !exchange_started {
@@ -1367,6 +1409,26 @@ impl EngineSlot {
         }
     }
 
+    /// Reaps `replaced`, if any, and starts the session that takes its place in `state`
+    /// within the restart budget, surfacing `reported` when the budget is spent.
+    ///
+    /// The exchange loop awaits this boxed: a start holds a whole session and its
+    /// handshake, which would otherwise size every exchange's future.
+    async fn start_replacement<'state>(
+        &self,
+        state: &'state mut SlotState,
+        replaced: Option<EngineSession>,
+        reported: Option<EngineError>,
+    ) -> Result<&'state mut EngineSession, EngineError> {
+        if let Some(replaced) = replaced {
+            self.reap(replaced).await;
+        }
+        let started = self
+            .start_within_budget(&mut state.restarts, reported)
+            .await?;
+        Ok(state.session.insert(started))
+    }
+
     /// Reaps one session the slot replaces, and keeps an ended engine's
     /// captured standard error visible in the log.
     ///
@@ -1572,41 +1634,108 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn canceled_open_document_discards_session_and_preserves_restart_budget() {
-        let directory = tempfile::tempdir().expect("workspace");
-        std::fs::write(directory.path().join("a.py"), "def beacon(): return 1\n").expect("source");
+    /// A `sh` engine that appends what it reads to the file its first argument names:
+    /// `start` once, `open <file>` and `close <file>` per document notification, and
+    /// each request's method. It answers every request with one location, and once it
+    /// has answered `deaf_after` requests, `initialize` included, it stops reading its
+    /// input, as a hung engine does; `0` keeps it reading. With `watching`, it
+    /// registers one `**/*.rs` file watcher once initialized.
+    #[cfg(unix)]
+    fn logging_slot(directory: &Path, watching: bool, deaf_after: u32) -> EnginePool {
+        const SCRIPT: &str = r#"log="$1"
+echo start >> "$log"
+answered=0
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+answer() {
+  frame "$1"
+  answered=$((answered + 1))
+  if [ "$answered" -eq DEAF_AFTER ]; then exec sleep 60; fi
+}
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  file=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | sed 's|.*/||; s|"$||')
+  case "$body" in
+    *'"method":"initialize"'*)
+      answer "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
+    *'"method":"initialized"'*)
+      REGISTER ;;
+    *'"method":"textDocument/didOpen"'*)
+      echo "open $file" >> "$log" ;;
+    *'"method":"textDocument/didClose"'*)
+      echo "close $file" >> "$log" ;;
+    *'"method":"shutdown"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      printf '%s\n' "$body" | grep -o '"method":"[^"]*"' | head -1 | sed 's/"method":"//; s/"$//' >> "$log"
+      answer "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"file:///lib.rs\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}}]}" ;;
+  esac
+done
+"#;
+        const REGISTER: &str = r#"frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}'"#;
+        let script = directory.join("engine.sh");
         std::fs::write(
-            directory.path().join("b.py"),
-            "from a import beacon\nvalue = beacon()\n",
+            &script,
+            SCRIPT
+                .replace("DEAF_AFTER", &deaf_after.to_string())
+                .replace("REGISTER", if watching { REGISTER } else { ":" }),
         )
-        .expect("caller");
-        let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
-            "embedded": "ty", "restart": { "attempts": 1 }
-        }))
-        .expect("embedded configuration");
-        let key = LspProcessKey::named("python");
-        let pool = EnginePool::new(
-            directory.path(),
+        .expect("engine script");
+        let mut configuration = table("sh");
+        configuration.command = Some(CommandInput::ProgramAndArguments(vec![
+            "sh".to_owned(),
+            script.display().to_string(),
+            directory.join("engine.log").display().to_string(),
+        ]));
+        configuration.initialization_options = None;
+        let key = LspProcessKey::named("rust");
+        EnginePool::new(
+            directory,
             BTreeMap::from([(key.clone(), configuration)]),
-            BTreeMap::from([("python".to_owned(), key.clone())]),
-        );
+            BTreeMap::from([("rust".to_owned(), key)]),
+        )
+    }
+
+    /// The `finish` step of an exchange about `lib.rs`: closes it.
+    #[cfg(unix)]
+    fn close_lib(session: &mut EngineSession) -> SessionFuture<'_, ()> {
+        Box::pin(async move {
+            let _closed = session
+                .close(&rift_core::ProjectPath::new("lib.rs").expect("path"))
+                .await;
+        })
+    }
+
+    /// The lines the `logging_slot` engine appended.
+    #[cfg(unix)]
+    fn engine_log(directory: &Path) -> Vec<String> {
+        std::fs::read_to_string(directory.join("engine.log"))
+            .expect("the engine records what it reads")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An exchange dropped while its request waits for the engine keeps the session:
+    /// nothing was cut part-written, so the slot keeps it live and spends no restart,
+    /// and the next exchange sends `didClose` for the document the dropped one left
+    /// open before its own `didOpen`, on the same engine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_exchange_keeps_its_session_and_the_next_one_closes_its_document() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = logging_slot(directory.path(), false, 0);
+        let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
-        let opened = Arc::new(tokio::sync::Notify::new());
+        let asked = Arc::new(tokio::sync::Notify::new());
         {
-            let operation_started = Arc::clone(&opened);
+            let operation_started = Arc::clone(&asked);
             let exchange = slot.request_exchange(
-                |session| {
-                    Box::pin(async move {
-                        session
-                            .open(
-                                &rift_core::ProjectPath::new("a.py").expect("path"),
-                                "python",
-                                "def beacon(): return 1\n".to_owned(),
-                            )
-                            .await
-                    })
-                },
+                open_lib,
                 move |_session| {
                     let started = Arc::clone(&operation_started);
                     Box::pin(async move {
@@ -1614,51 +1743,177 @@ mod tests {
                         std::future::pending::<Result<(), EngineError>>().await
                     })
                 },
-                |session| {
-                    Box::pin(async move {
-                        let _ = session
-                            .close(&rift_core::ProjectPath::new("a.py").expect("path"))
-                            .await;
-                    })
-                },
+                close_lib,
             );
             tokio::pin!(exchange);
             tokio::select! {
-                result = &mut exchange => panic!("operation must wait: {result:?}"),
-                () = opened.notified() => {},
+                result = &mut exchange => panic!("the operation must wait: {result:?}"),
+                () = asked.notified() => {},
             }
+        }
+        let state = slot.state.lock().await;
+        assert!(
+            state.session.as_ref().is_some_and(EngineSession::is_intact),
+            "the dropped exchange cut no frame, so its session stays"
+        );
+        assert!(state.restarts.spent.is_empty(), "no restart was spent");
+        drop(state);
+        assert_ne!(pool.state_for_key(&key), Some(LspState::Failed));
+
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let answered = slot
+            .request_exchange(open_lib, counted_references(&attempts), close_lib)
+            .await
+            .expect("the kept session serves the next exchange");
+        assert_eq!(answered, Some(1));
+        pool.shutdown().await;
+        assert_eq!(
+            engine_log(directory.path()),
+            [
+                "start",
+                "open lib.rs",
+                "close lib.rs",
+                "open lib.rs",
+                "textDocument/references",
+                "close lib.rs",
+            ],
+            "one engine, and the left-open document closed before it opens again"
+        );
+    }
+
+    /// Polls `exchange` until `reached` holds, as a barrier that proves where the
+    /// exchange waits before the test drops it. Each poll runs the exchange to its next
+    /// wait, and an engine that stopped reading holds a large write there, so the first
+    /// poll normally reaches it; the bound turns a wait elsewhere into a failure.
+    #[cfg(unix)]
+    async fn poll_until<T: std::fmt::Debug>(
+        exchange: &mut std::pin::Pin<&mut impl Future<Output = Result<T, EngineError>>>,
+        reached: impl Fn() -> bool,
+    ) {
+        const POLLS_MAX: usize = 64;
+        for _poll in 0..POLLS_MAX {
+            tokio::select! {
+                biased;
+                result = exchange.as_mut() => panic!("the exchange must wait: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+            if reached() {
+                return;
+            }
+        }
+        panic!("the exchange never reached the wait under test in {POLLS_MAX} polls");
+    }
+
+    /// An exchange dropped while its `didOpen` frame is part-written to an engine that
+    /// stopped reading discards the session, and the next request starts a replacement
+    /// within the restart budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exchange_dropped_mid_frame_discards_its_session() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = logging_slot(directory.path(), false, 1);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        fn version(session: &mut EngineSession) -> SessionFuture<'_, Result<i32, EngineError>> {
+            Box::pin(async move { Ok(session.document_version()) })
+        }
+        slot.request(version)
+            .await
+            .expect("the engine answers initialize before it stops reading");
+        let opening = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let began = Arc::clone(&opening);
+            let exchange = slot.request_exchange(
+                move |session| {
+                    began.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async move {
+                        session
+                            .open(
+                                &rift_core::ProjectPath::new("lib.rs").expect("path"),
+                                "rust",
+                                "x".repeat(1 << 20),
+                            )
+                            .await
+                    })
+                },
+                |_session| Box::pin(async { Ok(()) }),
+                close_lib,
+            );
+            tokio::pin!(exchange);
+            poll_until(&mut exchange, || {
+                opening.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .await;
         }
         assert!(
             slot.state.lock().await.session.is_none(),
-            "cancellation must drop open documents"
+            "a didOpen frame cut part-written discards the session"
         );
         assert_eq!(pool.state_for_key(&key), Some(LspState::Failed));
-        std::fs::write(directory.path().join("a.py"), "\ndef beacon(): return 2\n")
-            .expect("changed source");
-        let version = slot
-            .request(|session| {
-                Box::pin(async move {
-                    session
-                        .open(
-                            &rift_core::ProjectPath::new("b.py").expect("path"),
-                            "python",
-                            "from a import beacon\nvalue = beacon()\n".to_owned(),
-                        )
-                        .await?;
-                    Ok(session.document_version())
-                })
-            })
+
+        let reopened = slot
+            .request(version)
             .await
-            .expect("remaining restart starts a clean session");
-        assert_eq!(version, 1, "the other document opens in a new session");
-        let state = slot.state.lock().await;
+            .expect("a replacement starts within the restart budget");
+        assert_eq!(reopened, 0, "the replacement opened nothing");
         assert_eq!(
-            state.restarts.spent.len(),
+            slot.state.lock().await.restarts.spent.len(),
             1,
-            "cancellation spends the existing restart budget"
+            "the replacement spent one restart"
         );
-        drop(state);
-        pool.shutdown().await;
+        assert_eq!(
+            engine_log(directory.path()),
+            ["start", "start"],
+            "the cut didOpen never reached the engine whole"
+        );
+    }
+
+    /// An exchange dropped while the slot hands its live session the owed changes
+    /// discards the session: the changes already left the slot's record, so the
+    /// session would answer about files it was never told had moved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exchange_dropped_while_sending_owed_changes_discards_its_session() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = logging_slot(directory.path(), true, 2);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        slot.request_exchange(open_lib, counted_references(&attempts), close_lib)
+            .await
+            .expect("the engine registers its watcher and answers before it stops reading");
+        let changed = rift_index::FileRecord::Digest(rift_core::FileDigest::of(b"changed"));
+        let many = PathChanges::resolve(
+            (0..4_096).map(|index| {
+                let path = ProjectPath::new(format!("f{index}.rs")).expect("path");
+                (path, Some(changed.clone()))
+            }),
+            |_path| None,
+        );
+        pool.owe_changed_paths(&many);
+        {
+            let exchange =
+                slot.request_exchange(open_lib, counted_references(&attempts), close_lib);
+            tokio::pin!(exchange);
+            poll_until(&mut exchange, || {
+                slot.owed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .paths
+                    .is_empty()
+            })
+            .await;
+        }
+        assert!(
+            slot.state.lock().await.session.is_none(),
+            "a drop while sending owed changes discards the session"
+        );
+        assert_eq!(pool.state_for_key(&key), Some(LspState::Failed));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the dropped exchange never reached its own request"
+        );
     }
 
     fn table(program: &str) -> LspConfiguration {

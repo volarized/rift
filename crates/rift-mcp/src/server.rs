@@ -1069,8 +1069,8 @@ fn ranking_of(
 /// A walk stops waiting for engine readiness, and abandons a retry still in flight, this
 /// share of the request budget before the request's deadline, a tenth, so closing the
 /// walk's document, checking the tree again, and the answer with its warning still fit
-/// inside the budget, and a spent wait never reaches the request timeout, which drops the
-/// engine session.
+/// inside the budget, and a spent wait never reaches the request timeout, which refuses
+/// the request in place of the warning.
 const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 
 /// The instant every wait inside one request must end by.
@@ -2115,8 +2115,10 @@ impl RiftMcp {
     ///
     /// A walk, in either direction, stops waiting for engine readiness, and abandons a
     /// retry still in flight, a tenth of the budget before `deadline`, so a spent wait
-    /// answers with its warning and keeps the engine session instead of reaching the
-    /// request's own timeout, which drops the session.
+    /// answers with its warning instead of reaching the request's own timeout, which
+    /// refuses the request. A request refused there keeps the engine session while it
+    /// reads intact, and the next walk first closes the document the refused one left
+    /// open.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,

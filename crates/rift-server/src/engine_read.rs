@@ -315,8 +315,9 @@ fn reference_source<'source>(
 ///
 /// # Cancel safety
 ///
-/// Dropping the future discards the selected session and its open documents.
-/// No source file is written.
+/// Dropping the future keeps the selected session while it reads intact, and the next
+/// exchange on it closes the document this walk left open; a session with a frame cut
+/// part-written is discarded. No source file is written.
 pub async fn resolve_engine_references(
     reads: &ReadService,
     engines: &EnginePool,
