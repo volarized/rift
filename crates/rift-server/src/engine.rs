@@ -2132,6 +2132,29 @@ done
         })
     }
 
+    /// Starts `slot`'s engine with one walk whose deadline has already passed.
+    ///
+    /// A walk's first attempt is bounded by no deadline, so this walk waits out
+    /// the engine's start, makes that one attempt, and ends with the session
+    /// kept. A walk after it takes its deadline on a running engine, and the
+    /// start's cost never decides whether that walk reaches a second attempt.
+    #[cfg(unix)]
+    async fn start_engine(slot: &EngineSlot) {
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = slot
+            .request_outgoing(
+                begin_immediately,
+                counted_references(&attempts),
+                finish_immediately,
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            slot.state.lock().await.session.is_some(),
+            "the engine runs once its first walk ends: {started:?}"
+        );
+    }
+
     /// An exchange that is no walk ends at the retry table's 8th attempt,
     /// 9.75 s of waits in, while the engine reads analyzing until its 9th
     /// request: an engine whose load outlasts the retry table answers such a
@@ -2345,7 +2368,8 @@ done
     ///
     /// The deadline bounds the waits between attempts and the retries they
     /// lead to: the second attempt starts under it and is held past it, and
-    /// the walk abandons that attempt at the deadline and still answers.
+    /// the walk abandons that attempt at the deadline and still answers. The
+    /// engine starts before the deadline is taken ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_spent_walk_wait_answers_unsettled_and_keeps_the_session() {
@@ -2353,6 +2377,7 @@ done
         let pool = analyzing_slot(directory.path(), 50);
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Instant::now();
@@ -2481,7 +2506,8 @@ done
     /// spent answers like analyzing: an outgoing walk answers `Unsettled`
     /// and an incoming one [`EngineFault::Analyzing`], both with the session
     /// kept. A refusal that is the engine's verdict on the request stays the
-    /// walk's error once the walk's wait is spent.
+    /// walk's error once the walk's wait is spent. The retryable engine starts
+    /// before the outgoing walk's deadline is taken ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_retryable_refusal_at_a_spent_walk_wait_answers_unsettled() {
@@ -2492,6 +2518,7 @@ done
         let directory = tempfile::tempdir().expect("workspace");
         let pool = refusing_slot(directory.path(), CONTENT_MODIFIED);
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let started = Instant::now();
         let answer = slot
@@ -2739,7 +2766,8 @@ done
     /// An incoming report that never settles - a ready engine answering no reference
     /// beyond the seed's own - keeps the walk waiting until its deadline, and the spent
     /// wait answers [`EngineFault::Analyzing`] with the session kept, as a wait spent on
-    /// an engine still analyzing does.
+    /// an engine still analyzing does. The engine starts before the deadline is taken
+    /// ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incoming_report_that_never_settles_ends_at_the_spent_wait_with_the_session_kept() {
@@ -2747,6 +2775,7 @@ done
         let pool = fed_slot(directory.path(), false);
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deadline = Instant::now() + Duration::from_secs(1);
