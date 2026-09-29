@@ -196,13 +196,36 @@ fn observed_digests(
 ) -> Option<Vec<(ProjectPath, Option<FileDigest>)>> {
     let mut observed = Vec::with_capacity(paths.len());
     for path in paths {
-        let absolute = root.join(path.as_str());
-        match policy.visible_digest(&absolute) {
+        match observed_digest(policy, &root.join(path.as_str())) {
             Ok(digest) => observed.push((path.clone(), digest)),
             Err(_) => return None,
         }
     }
     Some(observed)
+}
+
+/// One observed path's digest under `policy`: none for a path the policy excludes, one gone
+/// from the disk, or a directory, because none of them holds a file.
+///
+/// A directory reaches here as a path a modify event named, which Windows reports for a
+/// directory whenever an entry inside it changes. Reading it as a file fails, and that
+/// failure would otherwise ask for the whole workspace; the disk probe runs only once the
+/// read has failed.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when the read fails on anything but a directory.
+fn observed_digest(
+    policy: &WorkspaceSourcePolicy,
+    absolute: &Path,
+) -> Result<Option<FileDigest>, WorkspaceIndexError> {
+    policy.visible_digest(absolute).or_else(|error| {
+        if absolute.is_dir() {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 /// Read index and configuration policy published as one immutable value.
@@ -243,7 +266,7 @@ impl PublishedWorkspace {
     fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
         let mut observed = Vec::with_capacity(paths.len());
         for path in paths {
-            let digest = match self.source_policy.visible_digest(&root.join(path.as_str())) {
+            let digest = match observed_digest(&self.source_policy, &root.join(path.as_str())) {
                 Ok(digest) => digest,
                 Err(error) if self.left_out_as_recorded(path, &error) => None,
                 Err(_) => return false,
@@ -1174,6 +1197,12 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 /// extensionless temporary file beside its target and rename it over the target; the
 /// publication holds nothing under that staging name, so its name event takes the
 /// per-path route a file event takes.
+///
+/// A modify event on a directory adds nothing: Windows reports a directory's last-write
+/// time moving whenever an entry inside it is added or removed, and the entries report
+/// their own events. One the publication holds files below is known a directory without a
+/// disk probe and has no impact; any other directory reaches the rebuild as a path, where
+/// [`observed_digest`] reads it as holding no file.
 pub(crate) fn watch_path_impact(
     roots: &WatchRoots,
     validation: &IndexValidation,
@@ -1208,6 +1237,15 @@ pub(crate) fn watch_path_impact(
         } else {
             WatchImpact::None
         };
+    }
+    let folder_modified = matches!(
+        kind,
+        EventKind::Modify(
+            ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other,
+        )
+    ) && validation.published_holds_files_below(path);
+    if folder_modified {
+        return WatchImpact::None;
     }
     let reshapes_tree = match kind {
         EventKind::Create(CreateKind::File)
@@ -4052,13 +4090,18 @@ pub(crate) mod tests {
             "new bounded source must supersede the old omission"
         );
         fs::remove_file(&absolute)?;
-        fs::create_dir(&absolute)?;
-        assert!(published.source_policy.visible_digest(&absolute).is_err());
-        assert_eq!(
-            publish_rebuild(directory.path(), &state, &validation, &published),
-            RebuildOutcome::Superseded,
-            "an I/O failure must not be accepted as the earlier file bound"
-        );
+        // A link to itself fails every read with a loop error: an I/O failure that is
+        // neither a missing file nor a directory, which both hold no file.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&absolute, &absolute)?;
+            assert!(published.source_policy.visible_digest(&absolute).is_err());
+            assert_eq!(
+                publish_rebuild(directory.path(), &state, &validation, &published),
+                RebuildOutcome::Superseded,
+                "an I/O failure must not be accepted as the earlier file bound"
+            );
+        }
         Ok(())
     }
 
