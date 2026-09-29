@@ -5,7 +5,8 @@
 //! with them is quadratic in the sibling count. Each test analyzes one such shape at two sizes
 //! [`GROWTH_FACTOR`] apart: a linear analysis takes about [`GROWTH_FACTOR`] times as long on
 //! the larger file, a quadratic one about its square. Both sizes run on the same machine, so
-//! the ratio between them does not depend on how fast that machine is.
+//! the ratio between them does not depend on how fast that machine is, and
+//! `.config/nextest.toml` runs this suite alone, so no other test's load lands between them.
 //!
 //! The loops walk [`registry::providers`], so a provider registered later joins these proofs
 //! once [`wide_line`] and [`attached_run`] name its language.

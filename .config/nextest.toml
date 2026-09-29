@@ -24,6 +24,14 @@ test-group = 'live'
 filter = 'binary(=server_cli) or binary(=mcp_proxy) or binary(=end_to_end) or binary(=logs_resource)'
 test-group = 'election'
 
+# This suite times each syntax shape at two sizes and compares the two times, a
+# comparison that holds only while both sizes meet the same machine load. Tests on
+# the other slots start and end between the two measurements, so the suite reserves
+# every slot and runs alone.
+[[profile.default.overrides]]
+filter = 'binary(=wide_node_extraction)'
+threads-required = "num-test-threads"
+
 # The two suites that read the model hub wait out a download, and each names the
 # budget it will wait. Those budgets run to six minutes, so the default
 # one-minute deadline ends the test first: nextest reports a timeout and the
