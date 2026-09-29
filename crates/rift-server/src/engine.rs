@@ -1083,14 +1083,18 @@ impl EngineSlot {
                 }
                 dead => {
                     if let Some(dead) = dead {
-                        self.reap(dead).await;
+                        // Boxed: a reap awaits the session's shutdown request, which
+                        // would otherwise size every exchange's future.
+                        Box::pin(self.reap(dead)).await;
                     }
                     // A replacement opens nothing on its own, so `begin` runs on it
                     // again, even when the session it replaces was still live.
                     exchange_started = false;
-                    let started = self
-                        .start_within_budget(&mut state.restarts, reported.take())
-                        .await?;
+                    // Boxed: a start holds a whole session and its handshake, which
+                    // would otherwise size every exchange's future.
+                    let started =
+                        Box::pin(self.start_within_budget(&mut state.restarts, reported.take()))
+                            .await?;
                     state.session.insert(started)
                 }
             };
@@ -1153,7 +1157,9 @@ impl EngineSlot {
                 return self.exhausted(absorbed, attempt, deadline.is_some());
             };
             retrying = deadline.map(|deadline| (deadline, absorbed));
-            let waited = session.read_output(now + wait, &wake).await;
+            // Boxed: the wait reads engine frames, which would otherwise size every
+            // exchange's future.
+            let waited = Box::pin(session.read_output(now + wait, &wake)).await;
             if let Err(error) = waited {
                 exchange_started = false;
                 reported = Some(error);
