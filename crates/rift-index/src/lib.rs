@@ -15,7 +15,9 @@ mod revision;
 mod vector;
 mod workspace;
 
-pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
+pub use change_set::{
+    ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
+};
 pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{

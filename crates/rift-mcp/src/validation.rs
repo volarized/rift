@@ -17,7 +17,7 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileDigest, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
+    ChangeSet, FileRecord, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
     WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
@@ -153,8 +153,8 @@ impl RebuildRequest {
     /// Changed source, language, or text-search configuration reads the whole workspace.
     /// Other accepted configuration carries forward the same source files under an empty
     /// incremental change. A path whose bytes cannot be read for any reason other than its
-    /// absence asks for a whole scan, because that scan decides whether the path is a
-    /// refusal or a removal.
+    /// absence, a directory, or the per-file byte bound asks for a whole scan, because that
+    /// scan decides whether the path is a refusal or a removal.
     fn change_set(&self, root: &Path, configuration: &ConfigurationState) -> ChangeSet {
         let Some(previous) = self.previous.as_ref() else {
             return ChangeSet::Full;
@@ -174,39 +174,43 @@ impl RebuildRequest {
         if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
             return ChangeSet::Full;
         }
-        let Some(observed) = observed_digests(root, &self.work.paths, &previous.source_policy)
+        let Some(observed) = observed_records(root, &self.work.paths, &previous.source_policy)
         else {
             return ChangeSet::Full;
         };
         ChangeSet::Incremental(PathChanges::resolve(observed, |path| {
-            previous.reads.file_digest(path)
+            previous.reads.file_record(path)
         }))
     }
 }
 
-/// Reads each observed path's current bytes into the digest one change set compares
-/// against, or nothing when a read failed for a reason other than the path being gone.
+/// Reads each observed path's current bytes into the record one change set compares
+/// against, or nothing when a read failed for a reason other than the path being gone, a
+/// directory, or past the per-file byte bound.
 ///
 /// A path the workspace's policy no longer includes reads as absent, so an excluded file
 /// leaves the index exactly as a deleted one does.
-fn observed_digests(
+fn observed_records(
     root: &Path,
     paths: &BTreeSet<ProjectPath>,
     policy: &WorkspaceSourcePolicy,
-) -> Option<Vec<(ProjectPath, Option<FileDigest>)>> {
+) -> Option<Vec<(ProjectPath, Option<FileRecord>)>> {
     let mut observed = Vec::with_capacity(paths.len());
     for path in paths {
-        match observed_digest(policy, &root.join(path.as_str())) {
-            Ok(digest) => observed.push((path.clone(), digest)),
+        match observed_record(policy, root, path) {
+            Ok(record) => observed.push((path.clone(), record)),
             Err(_) => return None,
         }
     }
     Some(observed)
 }
 
-/// One observed path's digest under `policy`: none for a path the policy excludes, one gone
-/// from the disk, or a directory, because none of them holds a file.
+/// One observed path's record under `policy`: the digest of its bytes, the warning of a
+/// file past the per-file byte bound, or none for a path the policy excludes, one gone from
+/// the disk, or a directory, because none of them holds a file.
 ///
+/// A file past the bound is still on disk, and its warning is what a publication that left
+/// it out records too, so the two compare equal while a deleted one compares as removed.
 /// A directory reaches here as a path a modify event named, which Windows reports for a
 /// directory whenever an entry inside it changes. Reading it as a file fails, and that
 /// failure would otherwise ask for the whole workspace; the disk probe runs only once the
@@ -214,18 +218,21 @@ fn observed_digests(
 ///
 /// # Errors
 ///
-/// Returns [`WorkspaceIndexError`] when the read fails on anything but a directory.
-fn observed_digest(
+/// Returns [`WorkspaceIndexError`] when the read fails for any other reason.
+fn observed_record(
     policy: &WorkspaceSourcePolicy,
-    absolute: &Path,
-) -> Result<Option<FileDigest>, WorkspaceIndexError> {
-    policy.visible_digest(absolute).or_else(|error| {
-        if absolute.is_dir() {
-            Ok(None)
-        } else {
-            Err(error)
-        }
-    })
+    root: &Path,
+    path: &ProjectPath,
+) -> Result<Option<FileRecord>, WorkspaceIndexError> {
+    let absolute = root.join(path.as_str());
+    match policy.visible_digest(&absolute) {
+        Ok(digest) => Ok(digest.map(FileRecord::Digest)),
+        Err(_) if absolute.is_dir() => Ok(None),
+        Err(error) => match error.fault().left_out_file(path.clone()) {
+            Some(warning) => Ok(Some(FileRecord::LeftOut(warning))),
+            None => Err(error),
+        },
+    }
 }
 
 /// Read index and configuration policy published as one immutable value.
@@ -261,19 +268,12 @@ impl PublishedWorkspace {
     /// Whether this publication already holds what every one of `paths` holds on disk,
     /// read under its own policy, which reads a path it excludes as absent.
     ///
-    /// A bounded read that left a file out matches only a publication that left it out
-    /// the same way; another omission or an I/O error does not match.
+    /// A file left out under the per-file byte bound matches only a publication that left
+    /// it out the same way; an I/O error matches nothing.
     fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
-        let mut observed = Vec::with_capacity(paths.len());
-        for path in paths {
-            let digest = match observed_digest(&self.source_policy, &root.join(path.as_str())) {
-                Ok(digest) => digest,
-                Err(error) if self.left_out_as_recorded(path, &error) => None,
-                Err(_) => return false,
-            };
-            observed.push((path.clone(), digest));
-        }
-        PathChanges::resolve(observed, |path| self.reads.file_digest(path)).is_empty()
+        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
+            PathChanges::resolve(observed, |path| self.reads.file_record(path)).is_empty()
+        })
     }
 
     /// Whether this publication holds files below one of `paths` that is no longer a
@@ -288,16 +288,6 @@ impl PublishedWorkspace {
         paths
             .iter()
             .any(|path| self.reads.holds_files_below(path) && !root.join(path.as_str()).is_dir())
-    }
-
-    /// Whether `error` refuses `path` exactly as this publication recorded leaving it out:
-    /// no digest, and the same recorded warning.
-    fn left_out_as_recorded(&self, path: &ProjectPath, error: &WorkspaceIndexError) -> bool {
-        self.reads.file_digest(path).is_none()
-            && error
-                .fault()
-                .left_out_file(path.clone())
-                .is_some_and(|warning| self.reads.file_warning(path) == Some(&warning))
     }
 }
 
@@ -1202,7 +1192,7 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 /// time moving whenever an entry inside it is added or removed, and the entries report
 /// their own events. One the publication holds files below is known a directory without a
 /// disk probe and has no impact; any other directory reaches the rebuild as a path, where
-/// [`observed_digest`] reads it as holding no file.
+/// [`observed_record`] reads it as holding no file.
 pub(crate) fn watch_path_impact(
     roots: &WatchRoots,
     validation: &IndexValidation,

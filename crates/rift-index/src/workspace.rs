@@ -47,7 +47,7 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
+use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::documentation::NotebookFiles;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
@@ -1803,6 +1803,22 @@ impl WorkspaceIndex {
             .map(|file| file.digest())
             .or_else(|| self.text_files.get(path).map(|file| file.digest()))
             .or_else(|| self.left_out.get(path).map(|state| state.content))
+    }
+
+    /// What this index records at `path`: the digest of the bytes it read there, the
+    /// files it left out after reading them included, or the warning naming a file it left
+    /// out before reading a digest.
+    ///
+    /// Warnings sit in project-path order, so the lookup is one binary search after the
+    /// map probes [`Self::digest`] makes.
+    #[must_use]
+    pub fn record(&self, path: &ProjectPath) -> Option<FileRecord> {
+        self.digest(path).map(FileRecord::Digest).or_else(|| {
+            self.warnings
+                .binary_search_by(|warning| warning.path().cmp(path))
+                .ok()
+                .map(|position| FileRecord::LeftOut(self.warnings[position].clone()))
+        })
     }
 
     /// Whether this index holds at least one file below `directory`, the files it left
@@ -3819,10 +3835,10 @@ mod tests {
             let path = ProjectPath::new(*name).expect("fixture path must be valid");
             let digest = fs::read(root.join(name))
                 .ok()
-                .map(|bytes| FileDigest::of(&bytes));
+                .map(|bytes| FileRecord::Digest(FileDigest::of(&bytes)));
             (path, digest)
         });
-        PathChanges::resolve(observed, |path| index.digest(path))
+        PathChanges::resolve(observed, |path| index.record(path))
     }
 
     #[test]
@@ -6626,8 +6642,8 @@ mod tests {
         let changes = PathChanges::resolve(
             observed
                 .iter()
-                .map(|(path, digest)| (path.clone(), Some(digest))),
-            |path| index.digests().get(path),
+                .map(|(path, digest)| (path.clone(), Some(FileRecord::Digest(digest)))),
+            |path| index.digests().get(path).map(FileRecord::Digest),
         );
         let rebuilt = index.rebuilt(&changes).expect("metadata rebuild");
         assert!(

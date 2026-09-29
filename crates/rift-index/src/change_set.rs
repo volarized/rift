@@ -12,6 +12,24 @@ pub use rift_analysis::FileDigest;
 use rift_core::ProjectPath;
 use sha2::{Digest as _, Sha256};
 
+use crate::WorkspaceIndexWarning;
+
+/// What one path holds, as a change set compares an observation with a publication: the
+/// digest of the bytes read there, or the warning naming a file left out before its bytes
+/// were digested.
+///
+/// A file past the per-file byte bound, not UTF-8, or holding a NUL byte has no digest, and
+/// neither has a path that holds no file. The warning is what tells the two apart, so a
+/// left-out file that is deleted is a removal and one still on disk is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRecord {
+    /// The bytes read at the path, as their digest.
+    Digest(FileDigest),
+    /// A file at the path left out of the index before its bytes were digested, and the
+    /// warning naming why.
+    LeftOut(WorkspaceIndexWarning),
+}
+
 /// How one observed path differs from the publication it was compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathChange {
@@ -76,20 +94,21 @@ impl PathChanges {
             .map(|(path, _)| path)
     }
 
-    /// Classifies `observed` against the digests `published` answers with.
+    /// Classifies `observed` against the records `published` answers with.
     ///
-    /// Each observation carries the path's current digest, or nothing when the path holds
+    /// Each observation carries the path's current record, or nothing when the path holds
     /// no file the workspace includes - a deleted file and one the policy stopped
-    /// including are the same removal to the index. An observation whose digest equals the
+    /// including are the same removal to the index. An observation whose record equals the
     /// published one is dropped: an editor writing through a temporary file and renaming
     /// it, and a `touch`, both report paths whose bytes did not change, and neither is
-    /// worth a reparse.
+    /// worth a reparse. A file left out under the same warning on both sides is dropped
+    /// too, and a left-out file that is gone is removed, which is what drops its warning.
     ///
     /// Work is one lookup per observation, so the caller's own bound on how many paths it
     /// retains bounds this.
     pub fn resolve(
-        observed: impl IntoIterator<Item = (ProjectPath, Option<FileDigest>)>,
-        published: impl Fn(&ProjectPath) -> Option<FileDigest>,
+        observed: impl IntoIterator<Item = (ProjectPath, Option<FileRecord>)>,
+        published: impl Fn(&ProjectPath) -> Option<FileRecord>,
     ) -> Self {
         let mut changes = Self::default();
         for (path, current) in observed {
@@ -111,14 +130,14 @@ impl PathChanges {
     pub fn between(published: &WorkspaceDigests, captured: &WorkspaceDigests) -> Self {
         let observed = captured
             .iter()
-            .map(|(path, digest)| (path.clone(), Some(digest)))
+            .map(|(path, digest)| (path.clone(), Some(FileRecord::Digest(digest))))
             .chain(
                 published
                     .iter()
                     .filter(|(path, _)| captured.get(path).is_none())
                     .map(|(path, _)| (path.clone(), None)),
             );
-        Self::resolve(observed, |path| published.get(path))
+        Self::resolve(observed, |path| published.get(path).map(FileRecord::Digest))
     }
 
     /// Records one classification, keeping the first one a path received.
@@ -253,9 +272,9 @@ impl ChangeSet {
     }
 }
 
-/// How one path's published digest and its current one compare, or nothing when the
+/// How one path's published record and its current one compare, or nothing when the
 /// rebuild has no work for it.
-fn classify(published: Option<FileDigest>, current: Option<FileDigest>) -> Option<PathChange> {
+fn classify(published: Option<FileRecord>, current: Option<FileRecord>) -> Option<PathChange> {
     match (published, current) {
         (None, Some(_)) => Some(PathChange::Added),
         (Some(_), None) => Some(PathChange::Removed),
@@ -270,7 +289,7 @@ mod tests {
 
     use rift_core::ProjectPath;
 
-    use super::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
+    use super::{ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -278,11 +297,16 @@ mod tests {
         Ok(ProjectPath::new(value)?)
     }
 
-    fn published(entries: &[(&str, &str)]) -> TestResult<BTreeMap<ProjectPath, FileDigest>> {
+    fn published(entries: &[(&str, &str)]) -> TestResult<BTreeMap<ProjectPath, FileRecord>> {
         entries
             .iter()
-            .map(|(name, bytes)| Ok((path(name)?, FileDigest::of(bytes.as_bytes()))))
+            .map(|(name, bytes)| Ok((path(name)?, record(bytes.as_bytes()))))
             .collect()
+    }
+
+    /// The record of a file read with `bytes`.
+    fn record(bytes: &[u8]) -> FileRecord {
+        FileRecord::Digest(FileDigest::of(bytes))
     }
 
     fn classified(changes: &PathChanges) -> Vec<(String, PathChange)> {
@@ -296,11 +320,11 @@ mod tests {
     fn test_resolve_classifies_added_modified_and_removed_paths() -> TestResult {
         let published = published(&[("src/kept.rs", "kept"), ("src/gone.rs", "gone")])?;
         let observed = vec![
-            (path("src/new.rs")?, Some(FileDigest::of(b"new"))),
-            (path("src/kept.rs")?, Some(FileDigest::of(b"edited"))),
+            (path("src/new.rs")?, Some(record(b"new"))),
+            (path("src/kept.rs")?, Some(record(b"edited"))),
             (path("src/gone.rs")?, None),
         ];
-        let resolved = PathChanges::resolve(observed, |path| published.get(path).copied());
+        let resolved = PathChanges::resolve(observed, |path| published.get(path).cloned());
         assert_eq!(
             classified(&resolved),
             vec![
@@ -315,8 +339,8 @@ mod tests {
     #[test]
     fn test_resolve_drops_a_path_whose_bytes_did_not_change() -> TestResult {
         let published = published(&[("src/lib.rs", "same")])?;
-        let observed = vec![(path("src/lib.rs")?, Some(FileDigest::of(b"same")))];
-        let resolved = PathChanges::resolve(observed, |path| published.get(path).copied());
+        let observed = vec![(path("src/lib.rs")?, Some(record(b"same")))];
+        let resolved = PathChanges::resolve(observed, |path| published.get(path).cloned());
         assert!(
             resolved.is_empty(),
             "an unchanged path leaves nothing to rebuild"
@@ -336,10 +360,10 @@ mod tests {
     fn test_resolve_keeps_one_classification_per_repeated_path() -> TestResult {
         let published = published(&[("src/lib.rs", "before")])?;
         let observed = vec![
-            (path("src/lib.rs")?, Some(FileDigest::of(b"after"))),
+            (path("src/lib.rs")?, Some(record(b"after"))),
             (path("src/lib.rs")?, None),
         ];
-        let resolved = PathChanges::resolve(observed, |path| published.get(path).copied());
+        let resolved = PathChanges::resolve(observed, |path| published.get(path).cloned());
         assert_eq!(
             classified(&resolved),
             vec![("src/lib.rs".to_owned(), PathChange::Modified)]
@@ -351,11 +375,11 @@ mod tests {
     fn test_indexed_paths_are_the_read_half_of_every_replaced_path() -> TestResult {
         let published = published(&[("a.md", "a"), ("b.md", "b")])?;
         let observed = vec![
-            (path("a.md")?, Some(FileDigest::of(b"a2"))),
+            (path("a.md")?, Some(record(b"a2"))),
             (path("b.md")?, None),
-            (path("c.md")?, Some(FileDigest::of(b"c"))),
+            (path("c.md")?, Some(record(b"c"))),
         ];
-        let resolved = PathChanges::resolve(observed, |path| published.get(path).copied());
+        let resolved = PathChanges::resolve(observed, |path| published.get(path).cloned());
         let changes = &resolved;
         let indexed: Vec<_> = changes.indexed().map(ProjectPath::as_str).collect();
         let replaced: Vec<_> = changes.paths().map(ProjectPath::as_str).collect();
