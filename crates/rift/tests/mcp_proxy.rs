@@ -43,7 +43,9 @@ use harness::{
     proxied_call, proxied_engine_call, proxy_client, relayed_proxy_client, require_success,
     run_rift, rust_engine_workspace, within, workspace,
 };
-use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
+use rift_mcp::{
+    BuildCheckout, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe,
+};
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
@@ -51,7 +53,6 @@ use rift_protocol::lock::{
 use rift_protocol::retry::RetryPolicy;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 
 /// The tools the workspace server advertises, in served order.
 const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
@@ -70,16 +71,15 @@ fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
     assert!(PROXIED_ENGINE_CALL_MAX > required);
 }
 
+/// The identity the `rift` binary under test publishes. The package's build script hands
+/// this suite the same checkout it hands the binary, and a dirty build reads the binary's
+/// own metadata.
 fn rift_binary_identity() -> TestResult<ProductIdentity> {
-    let executable = fs::read(harness::rift_binary())?;
-    Ok(ProductIdentity {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        executable_digest: format!("{:x}", Sha256::digest(executable)),
-        schema_digest: format!(
-            "{:x}",
-            Sha256::digest(rift_mcp::schema::schema_document().as_bytes())
-        ),
-    })
+    let checkout = BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
+    Ok(rift_mcp::product_identity_of(
+        checkout,
+        &harness::rift_binary(),
+    )?)
 }
 
 /// Poll attempts while waiting on a server to disappear: 10 seconds at

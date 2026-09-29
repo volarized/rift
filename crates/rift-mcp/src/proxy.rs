@@ -31,6 +31,7 @@ use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
 use crate::http::MCP_PATH;
+use crate::identity::BuildCheckout;
 use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
     StartSpawns, StartupCapture,
@@ -90,7 +91,7 @@ impl Fault for ProxyFault {
 }
 
 /// Serves agents over stdio MCP, forwarding every request to the
-/// workspace's elected server.
+/// workspace's elected server, as the build `checkout` describes.
 ///
 /// Serving starts immediately: a background warmup attempts the first
 /// upstream connect - starting a server when the workspace has none - and
@@ -106,9 +107,9 @@ impl Fault for ProxyFault {
 ///
 /// Dropping this future closes the owned MCP service and the upstream
 /// connection; the detached server keeps serving the workspace.
-pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
+pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), ProxyServeError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
-    let identity = crate::identity::product_identity()
+    let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
     let proxy = RiftProxy::new(root, identity);
@@ -681,20 +682,18 @@ async fn adopt_presence(
     }
 }
 
-/// Refuses a serving process whose executable or served tools differ.
+/// Refuses a serving process whose build or served tools differ.
 fn require_identity_match(expected: &ProductIdentity, lock: &ServerLock) -> Result<(), ErrorData> {
     if lock.identity == *expected {
         return Ok(());
     }
     Err(ErrorData::internal_error(
         format!(
-            "workspace server identity differs from this rift process: server pid {}, version {}, executable digest {}, schema digest {}; this process version {}, executable digest {}, schema digest {}; run rift server stop, then retry",
+            "workspace server identity differs from this rift process: server pid {}, version {}, schema digest {}; this process version {}, schema digest {}; run rift server stop, then retry",
             lock.pid,
             lock.identity.version,
-            lock.identity.executable_digest,
             lock.identity.schema_digest,
             expected.version,
-            expected.executable_digest,
             expected.schema_digest,
         ),
         None,
@@ -908,25 +907,23 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    const EXECUTABLE_DIGEST_A: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const EXECUTABLE_DIGEST_B: &str =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// One build of 0.0.11, and another build of the same version.
+    const BUILD_A: &str = "0.0.11+b006b8433ba06679f06a3c7f0743d65634d32c34";
+    const BUILD_B: &str = "0.0.11+71ea9ed284538bd4b5429df592afd7424e2bad13";
     const SCHEMA_DIGEST_A: &str =
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const SCHEMA_DIGEST_B: &str =
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    fn identity(version: &str, executable_digest: &str, schema_digest: &str) -> ProductIdentity {
+    fn identity(version: &str, schema_digest: &str) -> ProductIdentity {
         ProductIdentity {
             version: version.to_owned(),
-            executable_digest: executable_digest.to_owned(),
             schema_digest: schema_digest.to_owned(),
         }
     }
 
     fn test_identity() -> ProductIdentity {
-        identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A)
+        identity(BUILD_A, SCHEMA_DIGEST_A)
     }
 
     fn transport_send_failure() -> ServiceError {
@@ -942,7 +939,7 @@ mod tests {
             port,
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            identity: identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A),
+            identity: identity(BUILD_A, SCHEMA_DIGEST_A),
         }
     }
 
@@ -1065,19 +1062,19 @@ mod tests {
 
     #[test]
     fn matching_product_identities_are_accepted() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
+        let expected = identity(BUILD_A, SCHEMA_DIGEST_A);
         let lock = recorded_lock(12_345);
         assert_eq!(require_identity_match(&expected, &lock), Ok(()));
     }
 
     #[test]
-    fn same_version_with_a_different_executable_digest_is_refused() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_B, SCHEMA_DIGEST_A);
+    fn same_version_from_another_build_is_refused() {
+        let expected = identity(BUILD_B, SCHEMA_DIGEST_A);
         let lock = recorded_lock(12_345);
         let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another executable at the same version must be refused");
-        assert!(refusal.message.contains(EXECUTABLE_DIGEST_A));
-        assert!(refusal.message.contains(EXECUTABLE_DIGEST_B));
+            .expect_err("another build at the same version must be refused");
+        assert!(refusal.message.contains(BUILD_A));
+        assert!(refusal.message.contains(BUILD_B));
         assert!(refusal.message.contains("pid 4242"), "{}", refusal.message);
         assert!(
             refusal.message.contains("rift server stop"),
@@ -1088,7 +1085,7 @@ mod tests {
 
     #[test]
     fn a_different_schema_digest_is_refused() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_B);
+        let expected = identity(BUILD_A, SCHEMA_DIGEST_B);
         let lock = recorded_lock(12_345);
         let refusal = require_identity_match(&expected, &lock)
             .expect_err("another served tool schema must be refused");
@@ -1098,11 +1095,11 @@ mod tests {
 
     #[test]
     fn a_different_package_version_is_refused() {
-        let expected = identity("0.0.12", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
+        let expected = identity("0.0.12", SCHEMA_DIGEST_A);
         let lock = recorded_lock(12_345);
         let refusal = require_identity_match(&expected, &lock)
             .expect_err("another package version must be refused");
-        assert!(refusal.message.contains("0.0.11"));
+        assert!(refusal.message.contains(BUILD_A));
         assert!(refusal.message.contains("0.0.12"));
     }
 

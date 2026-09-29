@@ -22,6 +22,7 @@ pub use election::{
     document_path, probe, read_serving, serve_elected, serve_elected_with_storage,
 };
 pub use http::{HttpServeError, HttpServeFault, HttpServer, TokenCheck, serve_http};
+pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::{
     LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
     PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,

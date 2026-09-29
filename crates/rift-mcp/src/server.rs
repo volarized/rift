@@ -51,6 +51,7 @@ use crate::global::{
     GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
     package_symbols,
 };
+use crate::identity::BuildCheckout;
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -1362,17 +1363,28 @@ impl RiftMcp {
     ///
     /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
+    ///
+    /// The server names itself as [`BuildCheckout::Unversioned`]: no binary's
+    /// build script recorded a checkout for a server built in-process.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        Self::build_at(absolute_root(root)?, limits, None).await
+        Self::build_at(
+            absolute_root(root)?,
+            limits,
+            None,
+            BuildCheckout::Unversioned,
+        )
+        .await
     }
 
-    /// Builds against storage already opened by the serving process.
+    /// Builds against storage already opened by the serving process, naming
+    /// the build `checkout` describes.
     pub(crate) async fn build_with_storage(
         root: &Path,
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
+        checkout: BuildCheckout,
     ) -> Result<Self, ReadError> {
-        Self::build_at(absolute_root(root)?, limits, Some(storage)).await
+        Self::build_at(absolute_root(root)?, limits, Some(storage), checkout).await
     }
 
     async fn resolve_storage(root: &Path, storage: Option<WorkspaceStorage>) -> WorkspaceStorage {
@@ -1395,15 +1407,24 @@ impl RiftMcp {
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        checkout: BuildCheckout,
     ) -> Result<Self, ReadError> {
-        let assembled =
-            Self::assemble(root, limits, storage, workspace_watcher, LexicalLane::spawn).await?;
+        let assembled = Self::assemble(
+            root,
+            limits,
+            storage,
+            checkout,
+            workspace_watcher,
+            LexicalLane::spawn,
+        )
+        .await?;
         Ok(assembled.supervised().await)
     }
 
     /// Builds every part of one server except its index supervisor task, with the watcher
     /// `watch` starts over the root and the lexical lane `spawn_lexical` opens over the
-    /// search index.
+    /// search index. The server names the build `checkout` describes, and the lexical lane
+    /// keys the rows it derives on that build's product version.
     ///
     /// [`AssembledServer::supervised`] starts the supervisor. A test that drives the
     /// published state itself holds the parts instead and watches no path, and one that
@@ -1412,6 +1433,7 @@ impl RiftMcp {
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        checkout: BuildCheckout,
         watch: impl WatchWorkspace,
         spawn_lexical: impl FnOnce(
             Arc<SearchIndex>,
@@ -1420,10 +1442,10 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
     ) -> Result<AssembledServer, ReadError> {
-        let identity = crate::identity::product_identity()
+        let identity = crate::identity::product_identity(checkout)
             .await
             .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
-        let executable_digest: Arc<str> = Arc::from(identity.executable_digest.as_str());
+        let product_version: Arc<str> = Arc::from(identity.version.as_str());
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
@@ -1450,7 +1472,7 @@ impl RiftMcp {
             &published,
             lexical_write,
             |index, cancellation| {
-                spawn_lexical(index, blocking.clone(), cancellation, executable_digest)
+                spawn_lexical(index, blocking.clone(), cancellation, product_version)
             },
         );
         // The log store shares the database owner without depending on index readiness. Its
@@ -4256,6 +4278,7 @@ mod tests {
             WorkspaceIndexLimits::default(),
             None,
             unwatched,
+            crate::identity::BuildCheckout::Unversioned,
             LexicalLane::spawn,
         )
         .await?;
@@ -5176,14 +5199,15 @@ mod tests {
             WorkspaceIndexLimits::default(),
             None,
             super::workspace_watcher,
-            move |index, blocking, cancellation, executable_digest| {
+            crate::identity::BuildCheckout::Unversioned,
+            move |index, blocking, cancellation, product_version| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
                     gate,
                     crate::validation::lexical_double::UNBOUNDED,
                     blocking,
                     cancellation,
-                    executable_digest,
+                    product_version,
                 )
             },
         )
@@ -5229,14 +5253,15 @@ mod tests {
             WorkspaceIndexLimits::default(),
             Some(storage),
             super::workspace_watcher,
-            move |index, blocking, cancellation, executable_digest| {
+            crate::identity::BuildCheckout::Unversioned,
+            move |index, blocking, cancellation, product_version| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
                     gate,
                     crate::validation::lexical_double::UNBOUNDED,
                     blocking,
                     cancellation,
-                    executable_digest,
+                    product_version,
                 )
             },
         )
@@ -5776,9 +5801,13 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
@@ -5839,9 +5868,13 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
         let (_other_sink, _other_drain) = crate::logs::log_capture();
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
@@ -5891,9 +5924,13 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
 
         let _answered = run_search(&server, SECRET_TERM).await?;
         let logs = server.read_logs("rift://logs/component/search").await?;

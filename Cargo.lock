@@ -4562,6 +4562,7 @@ version = "0.0.45"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

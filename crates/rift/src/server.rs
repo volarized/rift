@@ -821,7 +821,15 @@ async fn serve_foreground(
         ))),
         _ => None,
     };
-    let server = match serve_elected_with_storage(root, shutdown.clone(), storage, check).await {
+    let server = match serve_elected_with_storage(
+        root,
+        shutdown.clone(),
+        storage,
+        check,
+        crate::BUILD_CHECKOUT,
+    )
+    .await
+    {
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
@@ -1301,7 +1309,6 @@ mod tests {
             pid: 4_242,
             identity: ProductIdentity {
                 version: "0.0.11".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         }

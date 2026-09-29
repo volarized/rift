@@ -26,6 +26,10 @@ SUPPORTED_TARGETS: Final = (
 WINDOWS_TARGETS: Final = frozenset(
     {"aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"}
 )
+# `rift --version` names the package version with the git commit the binary was built
+# from as semantic-versioning build metadata. A release builds a clean checkout of its tag,
+# so its binary names a bare commit and never the mark of uncommitted changes.
+RELEASE_BUILD_PATTERN: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SOURCE_DATE_EPOCH: Final = 0
 ZIP_DATE: Final = (1980, 1, 1, 0, 0, 0)
 
@@ -95,7 +99,11 @@ def binary_name(target: str) -> str:
 
 
 def verify_binary_version(binary: Path, tag: str) -> None:
-    """Require built binary version and help surface to match release."""
+    """Require built binary version and help surface to match release.
+
+    The binary prints `rift <version>+<commit>`: the version must be the tag's, and the
+    build metadata must be one bare commit, since a release builds a clean checkout.
+    """
     expected = f"rift {release_version(tag)}"
     if not binary.is_file():
         raise ValueError(f"release binary missing: {binary}")
@@ -103,8 +111,14 @@ def verify_binary_version(binary: Path, tag: str) -> None:
         [str(binary), "--version"], capture_output=True, check=False, text=True
     )
     actual = process.stdout.strip()
-    if process.returncode != 0 or actual != expected:
+    version, _, build = actual.partition("+")
+    if process.returncode != 0 or version != expected:
         raise ValueError(f"release binary version must be {expected!r}: {actual!r}")
+    if not RELEASE_BUILD_PATTERN.fullmatch(build):
+        raise ValueError(
+            f"release binary must name the one commit it was built from, such as "
+            f"{expected!r} followed by '+' and a 40-character commit: {actual!r}"
+        )
 
     help_process = subprocess.run(
         [str(binary), "--help"], capture_output=True, check=False, text=True

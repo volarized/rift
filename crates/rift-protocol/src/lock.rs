@@ -26,20 +26,25 @@ pub const SERVER_TOKEN_LENGTH: usize = 43;
 /// The spelling a minted bearer token must match.
 pub const SERVER_TOKEN_PATTERN: &str = "^[A-Za-z0-9_-]{43}$";
 /// The spelling a lock's `version` must match: `MAJOR.MINOR.PATCH` in
-/// decimal without leading zeros.
-pub const SERVER_VERSION_PATTERN: &str =
-    "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$";
+/// decimal without leading zeros, optionally followed by `+` and dot-separated
+/// build metadata identifiers of ASCII letters, digits, and hyphens.
+pub const SERVER_VERSION_PATTERN: &str = "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$";
 
 /// Exact Rift process and MCP tool identity.
+///
+/// A reader ignores identity members it does not know, so a lock written by a
+/// release that recorded other members still names the version it served.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProductIdentity {
-    /// Package version as `MAJOR.MINOR.PATCH`.
-    #[schemars(regex(pattern = "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$"))]
+    /// Package version as `MAJOR.MINOR.PATCH`, followed by the build the executable
+    /// came from as semantic-versioning build metadata: `+` and the git commit, then
+    /// `.dirty.` with the executable's size in bytes and modification time in
+    /// nanoseconds since the Unix epoch when the working tree held uncommitted
+    /// changes. A build with no git carries the package version alone.
+    #[schemars(regex(
+        pattern = "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    ))]
     pub version: String,
-    /// SHA-256 digest of the running executable.
-    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
-    pub executable_digest: String,
     /// SHA-256 digest of the canonical served tool document.
     #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
     pub schema_digest: String,
@@ -95,11 +100,6 @@ impl ServerLock {
                     version: lock.identity.version.clone(),
                 })
             }
-            lock if !digest_well_formed(&lock.identity.executable_digest) => {
-                Some(ServerLockViolation::ExecutableDigestMalformed {
-                    digest: lock.identity.executable_digest.clone(),
-                })
-            }
             lock if !digest_well_formed(&lock.identity.schema_digest) => {
                 Some(ServerLockViolation::SchemaDigestMalformed {
                     digest: lock.identity.schema_digest.clone(),
@@ -120,14 +120,17 @@ fn token_well_formed(token: &str) -> bool {
 }
 
 /// Whether a version spells `MAJOR.MINOR.PATCH` in decimal without leading
-/// zeros.
+/// zeros, with optional build metadata and no pre-release.
+///
+/// `semver` parses the version; a trailing `+` with no identifier after it
+/// names no build and is refused with the rest.
 fn version_well_formed(version: &str) -> bool {
-    let mut components = 0_usize;
-    let every_component_decimal = version.split('.').all(|component| {
-        components += 1;
-        decimal_component(component)
-    });
-    every_component_decimal && components == 3
+    let parsed = semver::Version::parse(version);
+    let without_prerelease = parsed.as_ref().is_ok_and(|parsed| parsed.pre.is_empty());
+    let names_its_build = parsed
+        .as_ref()
+        .is_ok_and(|parsed| !parsed.build.is_empty() || !version.contains('+'));
+    without_prerelease && names_its_build
 }
 
 /// Whether a digest spells one SHA-256 value as lowercase hex.
@@ -136,15 +139,6 @@ fn digest_well_formed(digest: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// Whether one version component is a decimal integer without leading zeros.
-fn decimal_component(component: &str) -> bool {
-    match component.as_bytes() {
-        [b'0'] => true,
-        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
-        _ => false,
-    }
 }
 
 /// First contract a lock file breaks. A reader treats any violation as
@@ -165,15 +159,10 @@ pub enum ServerLockViolation {
     TokenMalformed,
     /// Recorded process id is zero, which no process holds.
     ProcessIdZero,
-    /// Version does not spell `MAJOR.MINOR.PATCH`.
+    /// Version does not spell `MAJOR.MINOR.PATCH` with optional build metadata.
     VersionMalformed {
         /// Rejected version.
         version: String,
-    },
-    /// Executable digest does not spell lowercase SHA-256.
-    ExecutableDigestMalformed {
-        /// Rejected digest.
-        digest: String,
     },
     /// Schema digest does not spell lowercase SHA-256.
     SchemaDigestMalformed {
@@ -197,9 +186,6 @@ impl ServerLockViolation {
             )],
             Self::ProcessIdZero => vec![("pid", "0".to_owned())],
             Self::VersionMalformed { version } => vec![("version", version.clone())],
-            Self::ExecutableDigestMalformed { digest } => {
-                vec![("executable_digest", digest.clone())]
-            }
             Self::SchemaDigestMalformed { digest } => vec![("schema_digest", digest.clone())],
         }
     }
@@ -218,7 +204,6 @@ mod tests {
     fn valid_identity() -> ProductIdentity {
         ProductIdentity {
             version: "0.0.11".to_owned(),
-            executable_digest: "a".repeat(64),
             schema_digest: "b".repeat(64),
         }
     }
@@ -296,7 +281,18 @@ mod tests {
 
     #[test]
     fn malformed_versions_are_refused() {
-        for version in ["", "0.0", "v0.0.11", "00.1.2", "0.0.11-rc1", "0.0.11.4"] {
+        for version in [
+            "",
+            "0.0",
+            "v0.0.11",
+            "00.1.2",
+            "0.0.11-rc1",
+            "0.0.11.4",
+            "0.0.11+",
+            "0.0.11+abc..dirty",
+            "0.0.11+abc_def",
+            "0.0.11 ",
+        ] {
             let mut lock = valid_lock();
             lock.identity.version = version.to_owned();
             assert_eq!(
@@ -309,9 +305,45 @@ mod tests {
         }
     }
 
+    /// The advertised pattern and the classifier `validate` runs agree on every
+    /// version the two tests above name.
+    #[test]
+    fn the_version_pattern_matches_what_validation_accepts() {
+        let pattern = jsonschema::validator_for(&json!({
+            "type": "string",
+            "pattern": SERVER_VERSION_PATTERN,
+        }))
+        .expect("the version pattern compiles");
+        for version in [
+            "",
+            "v0.0.11",
+            "00.1.2",
+            "0.0.11-rc1",
+            "0.0.11+",
+            "0.0.11+abc..dirty",
+            "0.0.11+abc_def",
+            "0.0.11",
+            "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789",
+        ] {
+            let mut lock = valid_lock();
+            lock.identity.version = version.to_owned();
+            assert_eq!(
+                pattern.is_valid(&json!(version)),
+                lock.validate().is_ok(),
+                "pattern and validation disagree on {version:?}"
+            );
+        }
+    }
+
     #[test]
     fn workspace_versions_are_accepted() {
-        for version in ["0.0.11", "1.0.0", "10.20.30"] {
+        for version in [
+            "0.0.11",
+            "1.0.0",
+            "10.20.30",
+            "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34",
+            "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789",
+        ] {
             let mut lock = valid_lock();
             lock.identity.version = version.to_owned();
             assert_eq!(
@@ -324,13 +356,6 @@ mod tests {
 
     #[test]
     fn malformed_digests_are_refused() {
-        let mut executable = valid_lock();
-        executable.identity.executable_digest = "A".repeat(64);
-        assert!(matches!(
-            executable.validate(),
-            Err(ServerLockViolation::ExecutableDigestMalformed { .. })
-        ));
-
         let mut schema = valid_lock();
         schema.identity.schema_digest = "a".repeat(63);
         assert!(matches!(
@@ -385,6 +410,27 @@ mod tests {
         assert!(serde_json::from_value::<ServerLock>(missing).is_err());
     }
 
+    /// A lock an earlier release wrote records the executable's digest beside the
+    /// version. The reader keeps the version and ignores the digest, so a proxy can
+    /// still weigh that server's version against its own.
+    #[test]
+    fn a_lock_that_records_an_executable_digest_still_names_its_version() {
+        let recorded = json!({
+            "port": 12_345,
+            "token": "a".repeat(SERVER_TOKEN_LENGTH),
+            "pid": 4_242,
+            "identity": {
+                "version": "0.0.45",
+                "executable_digest": "e".repeat(64),
+                "schema_digest": "b".repeat(64),
+            },
+        });
+        let lock: ServerLock = serde_json::from_value(recorded).expect("the lock must parse");
+        assert_eq!(lock.validate(), Ok(()));
+        assert_eq!(lock.identity.version, "0.0.45");
+        assert_eq!(lock.identity.schema_digest, "b".repeat(64));
+    }
+
     #[test]
     fn schema_advertises_the_enforced_bounds() {
         let schema = serde_json::to_value(schema_for!(ServerLock)).expect("schema serializes");
@@ -405,10 +451,6 @@ mod tests {
         assert_eq!(
             identity_properties["version"]["pattern"],
             json!(SERVER_VERSION_PATTERN)
-        );
-        assert_eq!(
-            identity_properties["executable_digest"]["pattern"],
-            json!("^[0-9a-f]{64}$")
         );
         assert_eq!(
             identity_properties["schema_digest"]["pattern"],

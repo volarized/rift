@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::RiftMcp;
+use crate::identity::BuildCheckout;
 use crate::server::EngineHold;
 use crate::storage::WorkspaceStorage;
 use crate::validation::IndexSupervisor;
@@ -177,6 +178,9 @@ impl TokenCheck {
 /// scan still finishes in the bounded blocking executor. A returned
 /// [`HttpServer`] owns the serving tasks and is driven through
 /// [`HttpServer::stopped`].
+///
+/// The server names itself as [`BuildCheckout::Unversioned`], as
+/// [`RiftMcp::build`] does.
 pub async fn serve_http(
     root: &Path,
     shutdown: CancellationToken,
@@ -189,21 +193,24 @@ pub async fn serve_http(
         storage,
         WorkspaceIndexLimits::default(),
         check,
+        BuildCheckout::Unversioned,
     )
     .await
 }
 
 /// Serves HTTP through storage already opened by the serving process, under
-/// explicit index bounds and one token policy.
+/// explicit index bounds and one token policy, naming the build `checkout`
+/// describes.
 pub(crate) async fn serve_http_with_storage(
     root: &Path,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
+    checkout: BuildCheckout,
 ) -> Result<HttpServer, HttpServeError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
-    let server = RiftMcp::build_with_storage(root, limits, storage)
+    let server = RiftMcp::build_with_storage(root, limits, storage, checkout)
         .await
         .map_err(HttpServeFault::workspace)?;
     let identity = server.product_identity().clone();
@@ -769,7 +776,6 @@ mod tests {
             pid: 1,
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         };
@@ -921,7 +927,6 @@ mod tests {
                 token: mint_token().expect("token must mint"),
                 identity: ProductIdentity {
                     version: "0.0.9".to_owned(),
-                    executable_digest: "a".repeat(64),
                     schema_digest: "b".repeat(64),
                 },
                 stop: CancellationToken::new(),
@@ -987,7 +992,6 @@ mod tests {
             token: mint_token().expect("token must mint"),
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
             stop: CancellationToken::new(),
@@ -1036,7 +1040,6 @@ mod tests {
             token: mint_token().expect("token must mint"),
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
             stop: stop.clone(),
