@@ -1263,6 +1263,108 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
     Ok(())
 }
 
+/// A `sh` engine that reads analyzing on every attempt, as [`ANALYZING_ENGINE`] does, and
+/// holds its answer to the first request after its first `didOpen` for 1.2 s: past a 1 s
+/// `[server] readiness_timeout` for the walk that sent it, and over before the next walk
+/// needs an answer. It appends `start` at each start, `open` and `close` per document
+/// notification, and `late` when it reads the held request, to the file its first
+/// argument names.
+#[cfg(unix)]
+const LATE_FIRST_ANSWER_ENGINE: &str = r#"echo start >> "$1"
+opens=0
+asked=0
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"textDocument/didOpen"'*)
+      opens=$((opens + 1))
+      echo open >> "$1" ;;
+    *'"method":"textDocument/didClose"'*)
+      echo close >> "$1" ;;
+    *'"id":'*)
+      asked=$((asked + 1))
+      if [ "$opens" -eq 1 ] && [ "$asked" -eq 1 ]; then
+        echo late >> "$1"
+        sleep 1.2
+      fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+/// A walk whose engine answers only after the request deadline is refused as before,
+/// `temporarily_unavailable` with `retry: same_request`, and keeps its engine session:
+/// the next walk is served by the same engine process, which reads `didClose` for the
+/// document the refused walk left open before it reads that document's next `didOpen`,
+/// and the refused walk's late answer is discarded on the way.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> TestResult {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, LATE_FIRST_ANSWER_ENGINE)?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"1s\"\n\n\
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+        script.display(),
+        log.display()
+    );
+    let (_directory, client, _server_task) = served_workspace(
+        &[(
+            "lib.rs",
+            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+        )],
+        Some(configuration),
+    )
+    .await?;
+    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    let walk = tool_request(
+        "search",
+        &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+    );
+
+    let Err(rmcp::ServiceError::McpError(refused)) = client.call_tool(walk.clone()).await else {
+        return Err("the walk past the request deadline must be refused".into());
+    };
+    let data = refused.data.clone().unwrap_or(Value::Null);
+    assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
+    assert_eq!(data["retry"], json!("same_request"), "{data}");
+    assert!(
+        refused.message.contains("request deadline exceeded"),
+        "{}",
+        refused.message
+    );
+
+    let structured = call_retrying_acceptance(&client, walk).await?;
+    assert_eq!(
+        structured["warnings"][0]["code"],
+        json!("engine_analysis_unavailable"),
+        "{structured}"
+    );
+    client.cancel().await?;
+    let recorded = std::fs::read_to_string(&log)?;
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(
+        lines.iter().filter(|line| **line == "start").count(),
+        1,
+        "both walks meet the one engine process: {lines:?}"
+    );
+    assert_eq!(
+        lines.get(1..5),
+        Some(&["open", "late", "close", "open"][..]),
+        "the next walk closes the refused walk's document before it opens it again"
+    );
+    Ok(())
+}
+
 /// A `sh` engine serving references and call hierarchy that announces work it never
 /// ends; each start appends one line to the file its first argument names.
 #[cfg(unix)]
