@@ -391,7 +391,7 @@ mod tests {
                 },
                 symbol,
                 symbol,
-                ExactKind("rust.struct".to_owned()),
+                ExactKind("struct".to_owned()),
             ),
             ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
         )

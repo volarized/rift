@@ -345,7 +345,7 @@ mod tests {
             },
             "Beacon",
             "generated::Beacon",
-            ExactKind("rust.struct".to_owned()),
+            ExactKind("struct".to_owned()),
         );
         let target = ContributionReference::new(
             ProviderId::new("syntax").expect("target provider"),

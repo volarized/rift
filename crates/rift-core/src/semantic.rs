@@ -1119,7 +1119,7 @@ mod tests {
             },
             "Beacon",
             "Beacon",
-            ExactKind("rust.struct".to_owned()),
+            ExactKind("struct".to_owned()),
         )
         .facets(vec![SymbolFacet::Type, SymbolFacet::Public])
         .visibility("pub")
@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(facts.language().name, "rust");
         assert_eq!(facts.name(), "Beacon");
         assert_eq!(facts.qualified_name(), "Beacon");
-        assert_eq!(facts.kind().0, "rust.struct");
+        assert_eq!(facts.kind().0, "struct");
         assert_eq!(
             facts.symbol_facets(),
             &[SymbolFacet::Type, SymbolFacet::Public]
@@ -1342,7 +1342,7 @@ mod tests {
                     },
                     "",
                     "Beacon",
-                    ExactKind("rust.struct".to_owned()),
+                    ExactKind("struct".to_owned()),
                 ),
                 ContributionViolation::InvalidName,
             ),
@@ -1354,7 +1354,7 @@ mod tests {
                     },
                     "Beacon",
                     "Beacon",
-                    ExactKind("rust.struct".to_owned()),
+                    ExactKind("struct".to_owned()),
                 ),
                 ContributionViolation::InvalidLanguage,
             ),
@@ -1366,7 +1366,7 @@ mod tests {
                     },
                     "Beacon",
                     "Beacon",
-                    ExactKind("rust.struct".to_owned()),
+                    ExactKind("struct".to_owned()),
                 ),
                 ContributionViolation::InvalidLanguage,
             ),

@@ -173,7 +173,7 @@ mod tests {
                 },
                 "item",
                 "item",
-                ExactKind("rust.function".to_owned()),
+                ExactKind("function".to_owned()),
             ),
             ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
         )
