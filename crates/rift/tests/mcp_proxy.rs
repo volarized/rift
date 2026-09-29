@@ -19,8 +19,10 @@
 //! to it with [`proxy_client`], drive it with [`proxied_call`], and gate
 //! the test behind `live_engine_gate::engine_live` when it needs a real
 //! engine. `proxy_client` is the one entry point that spawns the real
-//! `rift mcp` binary; every case shares it, and no case may spawn a
-//! process of its own to stand in for the server or the engine.
+//! `rift mcp` binary - `relayed_proxy_client` when a case asserts on the
+//! proxy's stderr - and every case shares it: both relay that stderr onto
+//! the test's own, so a failed or timed-out case prints it, and no case may
+//! spawn a process of its own to stand in for the server or the engine.
 //!
 //! Every entry point named above lives in `harness.rs`, shared with
 //! `end_to_end.rs`; this file's own tests prove election, adoption,
@@ -34,13 +36,12 @@ mod rust_engine;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use harness::{
     LIBRARY, PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, laid_out_workspace,
-    proxied_call, proxied_engine_call, proxy_client, proxy_command, require_success, run_rift,
-    rust_engine_workspace, within, workspace,
+    proxied_call, proxied_engine_call, proxy_client, relayed_proxy_client, require_success,
+    run_rift, rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
 use rift_protocol::lock::{
@@ -48,11 +49,9 @@ use rift_protocol::lock::{
     ServerLock,
 };
 use rift_protocol::retry::RetryPolicy;
-use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncReadExt as _;
 
 /// The tools the workspace server advertises, in served order.
 const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
@@ -284,14 +283,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         identity: rift_binary_identity()?,
     })?;
 
-    let (transport, stderr) = proxy_command(root).stderr(Stdio::piped()).spawn()?;
-    let mut stderr = stderr.ok_or("proxy stderr missing")?;
-    let stderr_task = tokio::spawn(async move {
-        let mut output = String::new();
-        stderr.read_to_string(&mut output).await?;
-        Ok::<_, std::io::Error>(output)
-    });
-    let client = ().serve(transport).await?;
+    let (client, stderr) = relayed_proxy_client(root).await?;
 
     let refusal = within(
         "the unserved workspace's refusal",
@@ -322,7 +314,7 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     );
 
     client.cancel().await?;
-    let stderr = stderr_task.await??;
+    let stderr = stderr.text().await?;
     assert!(
         stderr.contains("recorded server did not answer"),
         "the stale server must be diagnosed: {stderr}"
@@ -389,22 +381,14 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
-    let (transport, stderr) = proxy_command(root).stderr(Stdio::piped()).spawn()?;
-    let mut stderr = stderr.ok_or("proxy stderr missing")?;
-    let stderr_task = tokio::spawn(async move {
-        let mut output = String::new();
-        stderr.read_to_string(&mut output).await?;
-        Ok::<_, std::io::Error>(output)
-    });
-
-    let client = ().serve(transport).await?;
+    let (client, stderr) = relayed_proxy_client(root).await?;
     assert_beacon(&beacon_lookup(&client).await?);
     let token = serving_document(root)
         .ok_or("the elected server must serve")?
         .token;
     client.cancel().await?;
 
-    let stderr = stderr_task.await??;
+    let stderr = stderr.text().await?;
     assert!(stderr.contains("MCP proxy starting"), "{stderr}");
     assert!(stderr.contains("MCP proxy ready"), "{stderr}");
     assert!(stderr.contains("MCP proxy stopped"), "{stderr}");
