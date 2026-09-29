@@ -1,7 +1,8 @@
-//! The ty system the embedded engine runs on: the OS filesystem, and none of the process's
-//! own state.
+//! The ty system the embedded engine runs on: the OS filesystem below the served tree's
+//! configuration boundary, and none of the process's own state.
 
 use std::any::Any;
+use std::io;
 
 use ruff_db::system::walk_directory::WalkDirectoryBuilder;
 use ruff_db::system::{
@@ -10,32 +11,66 @@ use ruff_db::system::{
 };
 use ruff_notebook::{Notebook, NotebookError};
 
+/// The files ty's project discovery reads configuration from, in the directory it starts
+/// at and in every ancestor of it.
+const PROJECT_CONFIGURATION_FILES: [&str; 2] = ["pyproject.toml", "ty.toml"];
+
 /// A ty [`System`] over the OS filesystem that answers no environment variable, finds no
-/// program, runs no command, and names no user configuration directory.
+/// program, runs no command, names no user configuration directory, and holds no project
+/// configuration above the served tree.
 ///
 /// ty looks for a Python environment in the process when its options name none: the
 /// environment `VIRTUAL_ENV` or `CONDA_PREFIX` names, then a `python3` or `python` on
 /// `PATH`. It also adds every `PYTHONPATH` entry to its search paths and, on a
 /// configuration reload, applies the user's own `ty.toml`. Each of those reads goes
 /// through the system, so on this one ty's own discovery finds the tree's `.venv` or
-/// nothing, and an answer depends on the served tree alone. File reads, metadata,
-/// directory walks, and writes go to [`OsSystem`].
+/// nothing, and an answer depends on the served tree alone.
+///
+/// ty's project discovery walks from the tree root through every ancestor and settles on
+/// the first `ty.toml` or `[tool.ty]` table it meets, on the first discovery and on every
+/// reload alike. The system answers a `pyproject.toml` or `ty.toml` above the root as
+/// absent, so the walk ends at the root, the boundary every other Rift read keeps. Every
+/// other file read, metadata, directory walk, and write goes to [`OsSystem`].
 #[derive(Debug, Clone)]
 pub(super) struct HermeticSystem {
     os: OsSystem,
 }
 
 impl HermeticSystem {
-    /// A system whose current directory is `root`, which must be absolute.
+    /// A system for the tree at `root`, which must be absolute; it is the system's
+    /// current directory too.
     pub(super) fn new(root: &SystemPath) -> Self {
         Self {
             os: OsSystem::new(root),
         }
     }
+
+    /// Whether `path` is a project configuration file in a directory above the root.
+    fn is_configuration_above_the_root(&self, path: &SystemPath) -> bool {
+        let root = self.os.current_directory();
+        let configuration = path
+            .file_name()
+            .is_some_and(|name| PROJECT_CONFIGURATION_FILES.contains(&name));
+        let above = path
+            .parent()
+            .is_some_and(|directory| directory != root && root.starts_with(directory));
+        configuration && above
+    }
+}
+
+/// The refusal a configuration file above the root reads as: the file is not there.
+fn absent(path: &SystemPath) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{path} lies above the served tree"),
+    )
 }
 
 impl System for HermeticSystem {
     fn path_metadata(&self, path: &SystemPath) -> Result<Metadata> {
+        if self.is_configuration_above_the_root(path) {
+            return Err(absent(path));
+        }
         self.os.path_metadata(path)
     }
 
@@ -53,6 +88,9 @@ impl System for HermeticSystem {
     }
 
     fn read_to_string(&self, path: &SystemPath) -> Result<String> {
+        if self.is_configuration_above_the_root(path) {
+            return Err(absent(path));
+        }
         self.os.read_to_string(path)
     }
 
@@ -231,6 +269,37 @@ mod tests {
         assert!(hermetic.read_virtual_path_to_notebook(untitled).is_err());
         assert_eq!(hermetic.cache_dir(), OsSystem::new(&root).cache_dir());
         assert!(hermetic.as_writable().is_some());
+    }
+
+    /// A project configuration file above the root reads as absent, while the root's own
+    /// and any other file above it read through.
+    #[test]
+    fn test_project_configuration_above_the_root_reads_as_absent() {
+        let (directory, parent) = fixture();
+        for name in PROJECT_CONFIGURATION_FILES {
+            std::fs::write(directory.path().join(name), "\n").expect("outer configuration");
+        }
+        std::fs::write(directory.path().join("notes.txt"), "outer\n").expect("outer file");
+        std::fs::create_dir(directory.path().join("tree")).expect("tree directory");
+        std::fs::write(directory.path().join("tree/ty.toml"), "\n").expect("tree configuration");
+        let root = parent.join("tree");
+        let os = OsSystem::new(&root);
+        let hermetic = HermeticSystem::new(&root);
+
+        for name in PROJECT_CONFIGURATION_FILES {
+            let above = parent.join(name);
+            assert!(os.read_to_string(&above).is_ok(), "{above} stands on disk");
+            assert_eq!(
+                hermetic
+                    .read_to_string(&above)
+                    .map_err(|error| error.kind()),
+                Err(io::ErrorKind::NotFound)
+            );
+            assert!(!hermetic.is_file(&above), "{above} reads as absent");
+        }
+        assert!(hermetic.read_to_string(&parent.join("notes.txt")).is_ok());
+        assert!(hermetic.read_to_string(&root.join("ty.toml")).is_ok());
+        assert!(hermetic.is_file(&root.join("ty.toml")));
     }
 
     #[test]
