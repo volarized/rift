@@ -4652,6 +4652,7 @@ dependencies = [
  "rift-search",
  "rift-syntax",
  "ruff_db",
+ "ruff_notebook",
  "ruff_text_size",
  "schemars 1.2.2",
  "serde_json",
