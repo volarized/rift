@@ -16,7 +16,7 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::lock::ProductIdentity;
+use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -551,6 +551,54 @@ fn origin_is_loopback(origin: &str) -> bool {
 async fn stop_server(State(stop): State<CancellationToken>) -> StatusCode {
     stop.cancel();
     StatusCode::ACCEPTED
+}
+
+/// Bound on one stop request: connect, send, and read the answer.
+pub const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a stop request did not reach a server that accepted it.
+#[derive(Debug)]
+pub enum StopRequestFailure {
+    /// The request could not be built or sent, or its answer could not be read.
+    Failed(reqwest::Error),
+    /// The server answered with something other than acceptance.
+    Refused(reqwest::StatusCode),
+}
+
+/// Asks the server `lock` records to stop, through its authorized `POST /api/stop`.
+///
+/// The server answers `202 Accepted` and starts the same shutdown an interrupt does; a
+/// repeated request answers the same way. A refused connect counts as accepted: nothing
+/// listens on the recorded port, so the server has already left. The request carries the
+/// token `lock` records, so it stops that one server and no other: a server started after
+/// it mints another token and refuses this one.
+///
+/// # Errors
+///
+/// Returns [`StopRequestFailure::Refused`] for any answer but acceptance, and
+/// [`StopRequestFailure::Failed`] when the request outlives [`STOP_REQUEST_TIMEOUT`] or
+/// fails for any other reason than a refused connect.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the request; a request the server already received still
+/// stops it.
+pub async fn request_stop(lock: &ServerLock) -> Result<(), StopRequestFailure> {
+    let client = reqwest::Client::builder()
+        .timeout(STOP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(StopRequestFailure::Failed)?;
+    let answer = client
+        .post(format!("http://127.0.0.1:{}{STOP_PATH}", lock.port))
+        .bearer_auth(&lock.token)
+        .send()
+        .await;
+    match answer {
+        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => Ok(()),
+        Ok(response) => Err(StopRequestFailure::Refused(response.status())),
+        Err(error) if error.is_connect() => Ok(()),
+        Err(error) => Err(StopRequestFailure::Failed(error)),
+    }
 }
 
 /// Per-request policy shared by every route: the token requests must

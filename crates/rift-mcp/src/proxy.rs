@@ -7,6 +7,7 @@
 //! single-flight, one retry per request - when the server it held goes
 //! away, so an agent session survives server restarts.
 
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,10 +28,11 @@ use rmcp::service::{
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
+use semver::Version;
 
 use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
-use crate::http::MCP_PATH;
+use crate::http::{MCP_PATH, request_stop};
 use crate::identity::BuildCheckout;
 use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
@@ -520,15 +522,22 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// all, and any other exit refuses with the server's captured stderr.
 /// Exhaustion refuses with the operator's next step.
 ///
+/// A recorded server of another identity is weighed by [`ServerStanding`].
+/// One this process replaces is asked to stop first, and the spawn waits
+/// until that server has released the election, so the new server never
+/// opens the workspace beside the one leaving it.
+///
 /// # Cancel safety
 ///
 /// Dropping this future abandons the connect; a spawned server keeps
-/// serving and the next attempt adopts it.
+/// serving and the next attempt adopts it. A server already asked to stop
+/// stops.
 async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
-    if let Some(running) = adopt_serving(root, identity).await? {
+    let mut replacement = Replacement::default();
+    if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
         return Ok(running);
     }
     // A server another starter elected is still building: a spawn now would
@@ -539,14 +548,21 @@ async fn connect_upstream(
     // spawn that cannot launch at all is reported, and the poll still gives
     // a concurrently started server its chance.
     let mut spawns = StartSpawns::<StartupCapture>::default();
-    if !matches!(probe(root), ServerPresence::Starting) {
+    let mut awaiting_release = replacement.is_asked();
+    if !awaiting_release && !matches!(probe(root), ServerPresence::Starting) {
         spawns.spawn_captured(root);
     }
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
         let presence = probe(root);
         let election_held = presence.election_held();
-        let adopted = adopt_presence(presence, identity).await?;
+        let adopted = adopt_presence(presence, identity, &mut replacement).await?;
+        // The replaced server released the election, and no other starter
+        // took it: this process starts the server it replaces it with.
+        if awaiting_release && !election_held {
+            awaiting_release = false;
+            spawns.spawn_captured(root);
+        }
         match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
             SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
@@ -628,12 +644,14 @@ impl Fault for SpawnFault {
 ///
 /// A probe that names no serving server, and a recorded server that
 /// refuses the connect or initialize, both answer `None`: the recorded
-/// state is stale and the caller elects afresh.
+/// state is stale and the caller elects afresh. A server of another
+/// identity answers as [`ServerStanding`] decides.
 async fn adopt_serving(
     root: &Path,
     identity: &ProductIdentity,
+    replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    adopt_presence(probe(root), identity).await
+    adopt_presence(probe(root), identity, replacement).await
 }
 
 /// The serving server one probe found, as a live connection, under the
@@ -644,6 +662,7 @@ async fn adopt_serving(
 async fn adopt_presence(
     presence: ServerPresence,
     identity: &ProductIdentity,
+    replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
     let lock = match presence {
         ServerPresence::Serving(lock) => lock,
@@ -659,7 +678,14 @@ async fn adopt_presence(
             return Ok(None);
         }
     };
-    require_identity_match(identity, &lock)?;
+    match ServerStanding::of(identity, &lock.identity) {
+        ServerStanding::Adopt => {}
+        ServerStanding::Replace => {
+            replacement.replace(&lock, identity).await?;
+            return Ok(None);
+        }
+        ServerStanding::Refuse => return Err(identity_refusal(identity, &lock)),
+    }
     match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
         Ok(running) => {
             tracing::info!(
@@ -682,12 +708,116 @@ async fn adopt_presence(
     }
 }
 
-/// Refuses a serving process whose build or served tools differ.
-fn require_identity_match(expected: &ProductIdentity, lock: &ServerLock) -> Result<(), ErrorData> {
-    if lock.identity == *expected {
-        return Ok(());
+/// What a proxy does with a recorded server, by the two product identities.
+///
+/// Versions order by semantic-versioning precedence, which leaves build
+/// metadata aside, so two builds of one version stand level. Every release
+/// bumps the version, so a proxy of a new release replaces the server of the
+/// one before it, while two development builds of one version never replace
+/// each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerStanding {
+    /// The identities are equal: the proxy forwards to the server.
+    Adopt,
+    /// The server's version strictly precedes this process's: the proxy asks
+    /// it to stop and starts its own.
+    Replace,
+    /// The server's version equals this process's from another build, or
+    /// follows it: the proxy refuses, so a server is only ever displaced by
+    /// a newer release.
+    Refuse,
+}
+
+impl ServerStanding {
+    /// How the server recording `theirs` stands against `ours`. A version
+    /// either side cannot parse orders nothing, and the proxy refuses.
+    fn of(ours: &ProductIdentity, theirs: &ProductIdentity) -> Self {
+        if ours == theirs {
+            return Self::Adopt;
+        }
+        let (Ok(ours), Ok(theirs)) = (
+            Version::parse(&ours.version),
+            Version::parse(&theirs.version),
+        ) else {
+            return Self::Refuse;
+        };
+        match theirs.cmp_precedence(&ours) {
+            Ordering::Less => Self::Replace,
+            Ordering::Equal | Ordering::Greater => Self::Refuse,
+        }
     }
-    Err(ErrorData::internal_error(
+}
+
+/// The one server a connect asked to stop, by the pid and token its lock
+/// records.
+///
+/// A server mints its token when it starts, so the pair names one server:
+/// a later probe that reads it again sees that server leaving, and one that
+/// reads another pair sees a server started after it.
+#[derive(Debug, Default)]
+struct Replacement {
+    asked: Option<(u32, String)>,
+}
+
+impl Replacement {
+    /// Whether this connect asked a server to stop.
+    const fn is_asked(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    /// Asks the server `lock` records to stop so this process can serve the
+    /// workspace, once per connect.
+    ///
+    /// The server this connect already asked answers `Ok` while it leaves.
+    /// A second older server is refused rather than stopped: another process
+    /// of an older release started it after the replaced one left, and
+    /// stopping it in turn would only race that process for the election.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity refusal for a second server, and for a server
+    /// that did not accept the stop request.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future abandons the request; a request the server
+    /// already received still stops it.
+    async fn replace(
+        &mut self,
+        lock: &ServerLock,
+        identity: &ProductIdentity,
+    ) -> Result<(), ErrorData> {
+        match &self.asked {
+            Some((pid, token)) if *pid == lock.pid && *token == lock.token => return Ok(()),
+            Some(_) => return Err(identity_refusal(identity, lock)),
+            None => {}
+        }
+        if let Err(failure) = request_stop(lock).await {
+            tracing::warn!(
+                component = "mcp",
+                pid = lock.pid,
+                failure = ?failure,
+                "the workspace server did not accept the stop request"
+            );
+            return Err(identity_refusal(identity, lock));
+        }
+        let server_version = lock.identity.version.as_str();
+        tracing::info!(
+            component = "mcp",
+            pid = lock.pid,
+            server_version,
+            version = identity.version.as_str(),
+            "asked the workspace server to stop so this rift process can serve the workspace"
+        );
+        self.asked = Some((lock.pid, lock.token.clone()));
+        Ok(())
+    }
+}
+
+/// The refusal for a serving process whose build or served tools differ
+/// and that this process does not replace.
+fn identity_refusal(expected: &ProductIdentity, lock: &ServerLock) -> ErrorData {
+    ErrorData::internal_error(
         format!(
             "workspace server identity differs from this rift process: server pid {}, version {}, schema digest {}; this process version {}, schema digest {}; run rift server stop, then retry",
             lock.pid,
@@ -697,7 +827,7 @@ fn require_identity_match(expected: &ProductIdentity, lock: &ServerLock) -> Resu
             expected.schema_digest,
         ),
         None,
-    ))
+    )
 }
 
 /// Why one bounded connect attempt produced no live connection.
@@ -887,6 +1017,8 @@ impl ServerHandler for RiftProxy {
 mod tests {
     use std::any::TypeId;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use rift_protocol::lock::{ProductIdentity, SERVER_TOKEN_LENGTH, ServerLock};
@@ -897,10 +1029,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, UpstreamSlot, adopt_serving,
-        connect_recorded, connect_upstream, fallback_info, forwarded_error, mirrored_info,
-        quit_reason_result, require_identity_match, reuse_current, serve_connection,
-        server_start_failed, transport_failed, upstream_unavailable,
+        ConnectAttemptFailure, ProxyFault, Replacement, RiftProxy, ServerStanding, Upstream,
+        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
+        forwarded_error, identity_refusal, mirrored_info, quit_reason_result, reuse_current,
+        serve_connection, server_start_failed, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
@@ -1061,46 +1193,218 @@ mod tests {
     }
 
     #[test]
-    fn matching_product_identities_are_accepted() {
-        let expected = identity(BUILD_A, SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        assert_eq!(require_identity_match(&expected, &lock), Ok(()));
+    fn an_equal_identity_is_adopted() {
+        assert_eq!(
+            ServerStanding::of(
+                &identity(BUILD_A, SCHEMA_DIGEST_A),
+                &identity(BUILD_A, SCHEMA_DIGEST_A)
+            ),
+            ServerStanding::Adopt
+        );
     }
 
     #[test]
-    fn same_version_from_another_build_is_refused() {
-        let expected = identity(BUILD_B, SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another build at the same version must be refused");
-        assert!(refusal.message.contains(BUILD_A));
-        assert!(refusal.message.contains(BUILD_B));
-        assert!(refusal.message.contains("pid 4242"), "{}", refusal.message);
+    fn an_older_version_is_replaced() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity("0.0.10", SCHEMA_DIGEST_A),
+            identity(
+                "0.0.10+b006b8433ba06679f06a3c7f0743d65634d32c34",
+                SCHEMA_DIGEST_A,
+            ),
+            identity(
+                "0.0.10+71ea9ed284538bd4b5429df592afd7424e2bad13.dirty.78008464.1790239195123456789",
+                SCHEMA_DIGEST_B,
+            ),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Replace,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    /// Two builds of one version stand level whatever their commits, dirty
+    /// stamps, or tool schemas, so neither replaces the other.
+    #[test]
+    fn another_build_of_this_version_is_refused() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity(BUILD_B, SCHEMA_DIGEST_A),
+            identity("0.0.11", SCHEMA_DIGEST_A),
+            identity(
+                "0.0.11+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789",
+                SCHEMA_DIGEST_A,
+            ),
+            identity(BUILD_A, SCHEMA_DIGEST_B),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Refuse,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_version_and_an_unordered_one_are_refused() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity("0.0.12", SCHEMA_DIGEST_A),
+            identity(
+                "0.1.0+71ea9ed284538bd4b5429df592afd7424e2bad13",
+                SCHEMA_DIGEST_A,
+            ),
+            identity("1.0.0", SCHEMA_DIGEST_A),
+            identity("v0.0.12", SCHEMA_DIGEST_A),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Refuse,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_refusal_names_both_identities_and_the_operator_step() {
+        let expected = identity(BUILD_B, SCHEMA_DIGEST_B);
+        let refusal = identity_refusal(&expected, &recorded_lock(12_345));
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        for named in [
+            BUILD_A,
+            BUILD_B,
+            SCHEMA_DIGEST_A,
+            SCHEMA_DIGEST_B,
+            "pid 4242",
+            "rift server stop",
+        ] {
+            assert!(refusal.message.contains(named), "{}", refusal.message);
+        }
+    }
+
+    /// A recorded server answering an authorized `POST /api/stop` the way a
+    /// server does, and counting the requests it accepted. Any other token is
+    /// refused with `401`.
+    async fn stop_counting_server(
+        token: &str,
+    ) -> TestResult<(u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let expected = format!("Bearer {token}");
+        let counted = Arc::clone(&accepted);
+        let router = axum::Router::new().route(
+            crate::http::STOP_PATH,
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let counted = Arc::clone(&counted);
+                let expected = expected.clone();
+                async move {
+                    let authorized = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .is_some_and(|value| value.as_bytes() == expected.as_bytes());
+                    if !authorized {
+                        return axum::http::StatusCode::UNAUTHORIZED;
+                    }
+                    counted.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let served = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok((port, accepted, served))
+    }
+
+    /// A connect asks the server it replaces to stop once. Reading that server
+    /// again while it leaves sends nothing, and a second server of another
+    /// identity is refused rather than stopped in turn.
+    #[tokio::test]
+    async fn a_replacement_asks_one_server_once_and_refuses_the_next() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"a".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let newer = identity("0.0.12", SCHEMA_DIGEST_A);
+        let mut lock = recorded_lock(port);
+        let mut replacement = Replacement::default();
+        replacement.replace(&lock, &newer).await?;
+        assert!(replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+
+        replacement.replace(&lock, &newer).await?;
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            1,
+            "the server already asked is leaving"
+        );
+
+        lock.pid = 4_243;
+        lock.token = "b".repeat(SERVER_TOKEN_LENGTH);
+        let refusal = replacement
+            .replace(&lock, &newer)
+            .await
+            .expect_err("a second server of another identity must be refused");
         assert!(
             refusal.message.contains("rift server stop"),
             "{}",
             refusal.message
         );
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        served.abort();
+        Ok(())
     }
 
-    #[test]
-    fn a_different_schema_digest_is_refused() {
-        let expected = identity(BUILD_A, SCHEMA_DIGEST_B);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another served tool schema must be refused");
-        assert!(refusal.message.contains(SCHEMA_DIGEST_A));
-        assert!(refusal.message.contains(SCHEMA_DIGEST_B));
+    #[tokio::test]
+    async fn a_server_that_refuses_the_stop_request_is_refused() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"b".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let mut replacement = Replacement::default();
+        let refusal = replacement
+            .replace(&recorded_lock(port), &identity("0.0.12", SCHEMA_DIGEST_A))
+            .await
+            .expect_err("a server that refused the stop keeps serving");
+        assert!(
+            refusal.message.contains("rift server stop"),
+            "{}",
+            refusal.message
+        );
+        assert!(!replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 0);
+        served.abort();
+        Ok(())
     }
 
-    #[test]
-    fn a_different_package_version_is_refused() {
-        let expected = identity("0.0.12", SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another package version must be refused");
-        assert!(refusal.message.contains(BUILD_A));
-        assert!(refusal.message.contains("0.0.12"));
+    /// Adoption asks an older recorded server to stop and answers nothing to
+    /// adopt, and refuses a newer one without asking it anything.
+    #[tokio::test]
+    async fn adopt_replaces_an_older_server_and_refuses_a_newer_one() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"a".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        guard.publish(&recorded_lock(port))?;
+
+        let newer_proxy = identity("0.0.12", SCHEMA_DIGEST_A);
+        let mut replacement = Replacement::default();
+        let adopted = adopt_serving(directory.path(), &newer_proxy, &mut replacement).await?;
+        assert!(adopted.is_none(), "a replaced server is never adopted");
+        assert!(replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+
+        let older_proxy = identity("0.0.10", SCHEMA_DIGEST_A);
+        let refusal = adopt_serving(directory.path(), &older_proxy, &mut Replacement::default())
+            .await
+            .expect_err("a newer server must be refused");
+        assert!(refusal.message.contains(BUILD_A), "{}", refusal.message);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            1,
+            "a newer server is never asked to stop"
+        );
+        served.abort();
+        drop(guard);
+        Ok(())
     }
 
     #[test]
@@ -1354,9 +1658,13 @@ mod tests {
         };
         guard.publish(&recorded_lock(port))?;
         assert!(
-            adopt_serving(directory.path(), &test_identity())
-                .await?
-                .is_none(),
+            adopt_serving(
+                directory.path(),
+                &test_identity(),
+                &mut Replacement::default()
+            )
+            .await?
+            .is_none(),
             "a recorded server that answers nothing must be treated as stale"
         );
         Ok(())
