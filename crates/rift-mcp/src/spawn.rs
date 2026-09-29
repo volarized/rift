@@ -8,15 +8,16 @@
 //! of "the server came up in time".
 
 use std::ffi::OsStr;
+use std::fmt::Debug;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek as _, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_core::{CapturedStream, CliCode, ErrorName, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
@@ -46,6 +47,19 @@ pub const PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const START_WAIT_MAX: Duration = Duration::from_secs(30);
 /// Probe attempts one start waits: [`START_WAIT_MAX`] over the interval.
 pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
+/// Most detached servers one start spawns.
+///
+/// A spawned server loses the start election whenever its claim meets any
+/// lock on the election file, a probe's shared lock included: Windows
+/// releases a closed handle's locks lazily, so a probe that already let go
+/// can still hold one. A loss that leaves the election unheld is that case,
+/// and the start spawns again. The count bounds the spawns when something
+/// keeps such a lock for longer; the rest of the start window then passes
+/// as a wait.
+pub const START_SPAWN_COUNT_MAX: u32 = 4;
+/// Bytes at the end of a detached server's stderr file read to classify its
+/// exit: the refusal a server exits on is the last thing it writes there.
+const EXIT_STDERR_TAIL_BYTES: u64 = 8 << 10;
 
 /// Keeps a detached child completely off this process's terminal and
 /// process group (unix half).
@@ -134,9 +148,11 @@ fn detached_command_for(
 /// a start.
 pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
     let mut command = detached_command(root)?;
-    command.stderr(stderr_destination(root));
+    let destination = stderr_destination(root);
+    let stderr = destination.is_some().then(|| stderr_file_path(root));
+    command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
     let child = command.spawn()?;
-    Ok(SpawnedServer { child })
+    Ok(SpawnedServer { child, stderr })
 }
 
 /// The path of the detached server's standard error file below `root`.
@@ -148,9 +164,9 @@ pub fn stderr_file_path(root: &Path) -> PathBuf {
 
 /// Where a detached server's standard error goes: the workspace's stderr
 /// file, truncated for this start, or nowhere when it cannot be created.
-fn stderr_destination(root: &Path) -> Stdio {
+fn stderr_destination(root: &Path) -> Option<File> {
     match stderr_file(root) {
-        Ok(file) => Stdio::from(file),
+        Ok(file) => Some(file),
         Err(error) => {
             tracing::warn!(
                 component = "mcp",
@@ -159,7 +175,7 @@ fn stderr_destination(root: &Path) -> Stdio {
                 "the server stderr file could not be created; the detached server's stderr is \
                  discarded"
             );
-            Stdio::null()
+            None
         }
     }
 }
@@ -175,6 +191,8 @@ fn stderr_file(root: &Path) -> io::Result<File> {
 #[must_use = "a spawned server is watched through `is_running`"]
 pub struct SpawnedServer {
     child: Child,
+    /// The stderr file this start truncated for the child, when it could.
+    stderr: Option<PathBuf>,
 }
 
 impl SpawnedServer {
@@ -359,37 +377,314 @@ fn drain_until_closed(mut stream: impl Read, capture_bytes: usize) -> CapturedSt
     }
 }
 
+/// How one spawned server's start ended, once it exited.
+#[derive(Debug)]
+pub enum StartExit<Failure> {
+    /// Its claim met a lock on the election file and it exited on its own,
+    /// printing the `server_already_serving` refusal; carries what it printed.
+    LostElection {
+        /// The server's stderr, as far as the caller kept it.
+        stderr: String,
+    },
+    /// It exited for any other reason; carries what the caller reports.
+    Failed(Failure),
+}
+
+impl<Failure> StartExit<Failure> {
+    /// The exit `stderr` names: a lost start election when it carries the
+    /// `server_already_serving` refusal, and `failure` otherwise.
+    fn classified(stderr: String, failure: Failure) -> Self {
+        if lost_start_election(&stderr) {
+            Self::LostElection { stderr }
+        } else {
+            Self::Failed(failure)
+        }
+    }
+}
+
+/// Whether a spawned server's stderr names a lost start election: its claim
+/// met a lock on the election file - a concurrent starter's, or a probe's the
+/// operating system has not released yet - and it exited on its own, printing
+/// the same `server_already_serving` refusal an operator sees from `rift
+/// server start --foreground`. The marker is built from the CLI registry so
+/// the match cannot drift from the code the binary actually prints.
+fn lost_start_election(stderr: &str) -> bool {
+    let marker = format!(
+        "error[{code}]",
+        code = ErrorName::Cli(CliCode::ServerAlreadyServing).code()
+    );
+    stderr.contains(&marker)
+}
+
+/// A server one start spawned, watched until it exits.
+pub trait StartedServer {
+    /// What a failed start carries for the caller's report.
+    type Failure: Debug;
+
+    /// How the start ended once the server exited, and `None` while it runs.
+    ///
+    /// Never blocks, and answers an exit once: the caller keeps what it
+    /// returned.
+    fn observed_exit(&mut self) -> Option<StartExit<Self::Failure>>;
+}
+
+impl StartedServer for StartupCapture {
+    type Failure = CapturedStream;
+
+    /// The capture's end-of-file is the exit: the server closed its stderr.
+    fn observed_exit(&mut self) -> Option<StartExit<CapturedStream>> {
+        let capture = self.exited()?;
+        Some(StartExit::classified(capture.text.clone(), capture))
+    }
+}
+
+impl StartedServer for SpawnedServer {
+    /// The exited child's pid.
+    type Failure = u32;
+
+    /// The child's exit status is the exit, and the tail of the stderr file
+    /// this start truncated for it names the cause.
+    fn observed_exit(&mut self) -> Option<StartExit<u32>> {
+        if self.is_running() {
+            return None;
+        }
+        let stderr = self.stderr.as_deref().map(stderr_tail).unwrap_or_default();
+        Some(StartExit::classified(stderr, self.pid()))
+    }
+}
+
+/// The last [`EXIT_STDERR_TAIL_BYTES`] of the stderr file at `path`, or
+/// nothing when the file cannot be read.
+fn stderr_tail(path: &Path) -> String {
+    let read = |path: &Path| -> io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let start = file
+            .metadata()?
+            .len()
+            .saturating_sub(EXIT_STDERR_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        file.take(EXIT_STDERR_TAIL_BYTES).read_to_end(&mut tail)?;
+        Ok(tail)
+    };
+    read(path)
+        .map(|tail| String::from_utf8_lossy(&tail).into_owned())
+        .unwrap_or_default()
+}
+
+/// The detached servers one start spawned, and the latest one as the poll
+/// last saw it.
+///
+/// `rift server start` and the stdio proxy start a workspace's server
+/// through this one state: each spawns, then polls, and each poll weighs the
+/// latest spawn's exit against the election a probe read after that exit.
+#[derive(Debug)]
+pub struct StartSpawns<Spawned: StartedServer> {
+    latest: SpawnWatch<Spawned>,
+    spawn_count: u32,
+}
+
+impl<Spawned: StartedServer> Default for StartSpawns<Spawned> {
+    fn default() -> Self {
+        Self {
+            latest: SpawnWatch::Idle,
+            spawn_count: 0,
+        }
+    }
+}
+
+/// The latest server one start spawned, as its poll last saw it.
+#[derive(Debug)]
+enum SpawnWatch<Spawned: StartedServer> {
+    /// No spawned server is outstanding: none was spawned, the spawn could
+    /// not launch, or the spawn count is spent.
+    Idle,
+    /// The spawned server has not exited yet, as far as the poll saw.
+    Running(Spawned),
+    /// The spawned server exited; a later poll weighs how.
+    Exited(StartExit<Spawned::Failure>),
+}
+
+/// One poll iteration's outcome against a possibly still-spawning server.
+#[derive(Debug)]
+pub enum SpawnPollOutcome<Adopted, Failure> {
+    /// The workspace's server answered.
+    Ready(Adopted),
+    /// The spawned server exited before it started serving, for a reason
+    /// other than a lost election, and no process holds the election.
+    Failed(Failure),
+    /// The spawned server lost the start election, no process holds it, and
+    /// the spawn count is not spent: nothing is left to publish, and the
+    /// caller spawns again.
+    ElectionUnheld,
+    /// Nothing decided yet: the spawned server is still starting, or it
+    /// exited while another process holds the election and may still
+    /// publish.
+    Waiting,
+}
+
+impl<Spawned: StartedServer> StartSpawns<Spawned> {
+    /// Spawns one more server through `launch`, unless
+    /// [`START_SPAWN_COUNT_MAX`] spawns already ran; a spent count spawns
+    /// nothing, and the caller's poll waits out its window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `launch`'s failure; the attempt still counts.
+    pub fn spawn(&mut self, launch: impl FnOnce() -> io::Result<Spawned>) -> io::Result<()> {
+        if self.is_spent() {
+            self.latest = SpawnWatch::Idle;
+            return Ok(());
+        }
+        self.spawn_count += 1;
+        match launch() {
+            Ok(spawned) => {
+                self.latest = SpawnWatch::Running(spawned);
+                Ok(())
+            }
+            Err(error) => {
+                self.latest = SpawnWatch::Idle;
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether [`START_SPAWN_COUNT_MAX`] spawns already ran.
+    fn is_spent(&self) -> bool {
+        self.spawn_count >= START_SPAWN_COUNT_MAX
+    }
+
+    /// The latest spawn, while the poll has not seen it exit.
+    pub fn running(&mut self) -> Option<&mut Spawned> {
+        match &mut self.latest {
+            SpawnWatch::Running(spawned) => Some(spawned),
+            SpawnWatch::Idle | SpawnWatch::Exited(_) => None,
+        }
+    }
+
+    /// Classifies one poll iteration: an adopted server wins outright;
+    /// otherwise the latest spawn's exit, weighed against the election,
+    /// decides.
+    ///
+    /// `election_held` is what this iteration's probe found. It decides only
+    /// for an exit an earlier iteration observed, so the probe that ends the
+    /// wait or sends the caller to spawn again was read after the server
+    /// exited.
+    pub fn poll<Adopted>(
+        &mut self,
+        adopted: Option<Adopted>,
+        election_held: bool,
+    ) -> SpawnPollOutcome<Adopted, Spawned::Failure> {
+        if let Some(adopted) = adopted {
+            return SpawnPollOutcome::Ready(adopted);
+        }
+        match std::mem::replace(&mut self.latest, SpawnWatch::Idle) {
+            SpawnWatch::Running(mut spawned) => {
+                self.latest = match spawned.observed_exit() {
+                    Some(exit) => SpawnWatch::observed(exit),
+                    None => SpawnWatch::Running(spawned),
+                };
+                SpawnPollOutcome::Waiting
+            }
+            SpawnWatch::Exited(exit) if election_held => {
+                self.latest = SpawnWatch::Exited(exit);
+                SpawnPollOutcome::Waiting
+            }
+            SpawnWatch::Exited(StartExit::LostElection { .. }) if self.is_spent() => {
+                let spawn_count = self.spawn_count;
+                tracing::warn!(
+                    component = "mcp",
+                    spawn_count,
+                    "the spawn count is spent; the start window passes as a wait"
+                );
+                SpawnPollOutcome::Waiting
+            }
+            SpawnWatch::Exited(StartExit::LostElection { .. }) => {
+                tracing::info!(
+                    component = "mcp",
+                    "no process holds the election the spawned server lost; spawning again"
+                );
+                SpawnPollOutcome::ElectionUnheld
+            }
+            SpawnWatch::Exited(StartExit::Failed(failure)) => SpawnPollOutcome::Failed(failure),
+            SpawnWatch::Idle => SpawnPollOutcome::Waiting,
+        }
+    }
+}
+
+impl<Spawned: StartedServer> SpawnWatch<Spawned> {
+    /// Records an observed exit, naming a lost election with what the server
+    /// printed.
+    fn observed(exit: StartExit<Spawned::Failure>) -> Self {
+        if let StartExit::LostElection { stderr } = &exit {
+            tracing::info!(
+                component = "mcp",
+                stderr = %stderr,
+                "the spawned server lost the start election"
+            );
+        }
+        Self::Exited(exit)
+    }
+}
+
+impl StartSpawns<StartupCapture> {
+    /// Spawns one more detached server with its stderr captured, reporting a
+    /// spawn that cannot launch: the poll still gives a concurrently started
+    /// server its chance.
+    pub(crate) fn spawn_captured(&mut self, root: &Path) {
+        if let Err(error) = self.spawn(|| spawn_detached_server_with_captured_stderr(root)) {
+            tracing::warn!(component = "mcp", %error, "detached server spawn failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    #[cfg(unix)]
+    use std::process::Stdio;
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::time::Duration;
 
     use super::{
-        BoundedWriter, CapturedStream, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BOUND_NOTICE,
-        SERVER_STDERR_BYTES_MAX, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX,
-        STARTUP_STDERR_CAPTURE_BYTES, StartupCapture, stderr_file_path,
+        BoundedWriter, CapturedStream, EXIT_STDERR_TAIL_BYTES, PRESENCE_POLL_INTERVAL,
+        SERVER_STDERR_BOUND_NOTICE, SERVER_STDERR_BYTES_MAX, START_POLL_ATTEMPT_COUNT,
+        START_SPAWN_COUNT_MAX, START_WAIT_MAX, STARTUP_STDERR_CAPTURE_BYTES, SpawnPollOutcome,
+        SpawnWatch, StartExit, StartSpawns, StartupCapture, lost_start_election, stderr_file_path,
+        stderr_tail,
     };
+    #[cfg(unix)]
+    use super::{SpawnedServer, StartedServer};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Poll attempts while waiting on a spawned child to exit: 10 seconds.
     const EXIT_POLL_ATTEMPT_COUNT: u32 = 100;
 
-    /// Spawns `sh -c script` in the detached shape with its stderr on the
-    /// workspace's stderr file, and waits for it to exit.
+    /// Spawns `sh -c script` in the detached shape, the way
+    /// `spawn_detached_server` spawns a server, with its stderr on the
+    /// workspace's stderr file.
     #[cfg(unix)]
-    fn run_detached_script(root: &std::path::Path, script: &str) -> TestResult {
+    fn spawn_detached_script(root: &std::path::Path, script: &str) -> TestResult<SpawnedServer> {
         let mut command = super::detached_command_for("sh", ["-c", script], root);
-        command.stderr(super::stderr_destination(root));
-        let mut spawned = super::SpawnedServer {
+        let destination = super::stderr_destination(root);
+        let stderr = destination.is_some().then(|| stderr_file_path(root));
+        command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
+        Ok(SpawnedServer {
             child: command.spawn()?,
-        };
+            stderr,
+        })
+    }
+
+    /// Runs `script` as [`spawn_detached_script`] does and waits for it to exit.
+    #[cfg(unix)]
+    fn run_detached_script(root: &std::path::Path, script: &str) -> TestResult<SpawnedServer> {
+        let mut spawned = spawn_detached_script(root, script)?;
         assert!(spawned.pid() > 0);
         for _ in 0..EXIT_POLL_ATTEMPT_COUNT {
             if !spawned.is_running() {
-                return Ok(());
+                return Ok(spawned);
             }
             std::thread::sleep(PRESENCE_POLL_INTERVAL);
         }
@@ -400,13 +695,13 @@ mod tests {
     #[test]
     fn a_detached_child_writes_its_stderr_to_the_workspace_file() -> TestResult {
         let directory = tempfile::tempdir()?;
-        run_detached_script(directory.path(), "echo first start >&2")?;
+        let _first = run_detached_script(directory.path(), "echo first start >&2")?;
         assert_eq!(
             std::fs::read_to_string(stderr_file_path(directory.path()))?,
             "first start\n"
         );
 
-        run_detached_script(directory.path(), "echo second start >&2")?;
+        let _second = run_detached_script(directory.path(), "echo second start >&2")?;
         assert_eq!(
             std::fs::read_to_string(stderr_file_path(directory.path()))?,
             "second start\n",
@@ -420,8 +715,12 @@ mod tests {
     fn an_unwritable_state_directory_discards_the_child_stderr_and_still_spawns() -> TestResult {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join(".rift"), b"a file in the way")?;
-        run_detached_script(directory.path(), "echo lost >&2")?;
+        let mut discarded = run_detached_script(directory.path(), "echo lost >&2")?;
         assert!(!stderr_file_path(directory.path()).exists());
+        assert!(
+            matches!(discarded.observed_exit(), Some(StartExit::Failed(_))),
+            "an exit with no stderr file to read is a failure, never a lost election"
+        );
         Ok(())
     }
 
@@ -565,5 +864,261 @@ mod tests {
             None,
             "a capture already taken must not be reported twice"
         );
+    }
+
+    /// The refusal a spawned server prints when it loses the start election.
+    const LOST_ELECTION_STDERR: &[u8] = b"rift: error[server_already_serving]: another rift \
+        server already serves this workspace; connect to the listed server, or run `rift server \
+        stop` before serving again";
+
+    /// Spawns watched through `stream` alone: one spawn ran, and its stderr is still draining.
+    fn watching(stream: BlockingChannelStream) -> StartSpawns<StartupCapture> {
+        StartSpawns {
+            latest: SpawnWatch::Running(StartupCapture::spawn(stream)),
+            spawn_count: 1,
+        }
+    }
+
+    /// Spawns watched through a stream that already carried `stderr` and closed.
+    fn exited_with(stderr: &[u8]) -> StartSpawns<StartupCapture> {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let spawns = watching(BlockingChannelStream::new(receiver));
+        sender.send(stderr.to_vec()).expect("receiver still open");
+        drop(sender);
+        spawns
+    }
+
+    /// Polls `spawns` with no adoption until the latest spawn's exit is observed, asserting
+    /// every poll before it waited; bounded so a defect in the drain fails instead of hanging.
+    fn poll_until_exit_observed(spawns: &mut StartSpawns<StartupCapture>, election_held: bool) {
+        for _ in 0..1_000 {
+            if spawns.running().is_none() {
+                return;
+            }
+            let outcome = spawns.poll::<u32>(None, election_held);
+            assert!(
+                matches!(outcome, SpawnPollOutcome::Waiting),
+                "a poll that observes the exit waits"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the background drain must finish once the stream closes");
+    }
+
+    #[test]
+    fn spawn_poll_prefers_adoption_over_a_finished_capture() {
+        let mut spawns = exited_with(b"");
+        // The capture has finished (the stream closed), and adoption also
+        // succeeded on this same iteration: adoption must win, and the
+        // capture must never be consulted.
+        let startup = spawns.running().expect("the capture must still be present");
+        let _ = wait_for_exit(startup);
+        let outcome = spawns.poll(Some(7_u32), false);
+        assert!(
+            matches!(outcome, SpawnPollOutcome::Ready(7)),
+            "adoption must win over a finished capture"
+        );
+    }
+
+    #[test]
+    fn spawn_poll_waits_while_the_capture_is_still_open() {
+        let (_sender, receiver) = mpsc::channel::<Vec<u8>>();
+        let mut spawns = watching(BlockingChannelStream::new(receiver));
+        let outcome = spawns.poll::<u32>(None, false);
+        assert!(matches!(outcome, SpawnPollOutcome::Waiting));
+    }
+
+    /// A spawned server that exited for another reason fails the poll once a probe read
+    /// after the exit finds the election unheld, with what the server printed.
+    #[test]
+    fn spawn_poll_fails_once_the_spawned_server_exited_and_nobody_holds() {
+        let mut spawns = exited_with(b"listener bind failed: address in use");
+        poll_until_exit_observed(&mut spawns, false);
+        let SpawnPollOutcome::Failed(capture) = spawns.poll::<u32>(None, false) else {
+            panic!("an exited spawn under a free election must fail the poll");
+        };
+        assert_eq!(capture.text, "listener bind failed: address in use");
+    }
+
+    /// A failed spawn under another holder's election waits for that holder, which may
+    /// still publish; the failure stands once the election is free.
+    #[test]
+    fn spawn_poll_waits_for_a_holder_after_a_failed_exit() {
+        let mut spawns = exited_with(b"listener bind failed: address in use");
+        poll_until_exit_observed(&mut spawns, true);
+        assert!(
+            matches!(spawns.poll::<u32>(None, true), SpawnPollOutcome::Waiting),
+            "a held election waits for its holder"
+        );
+        assert!(
+            matches!(spawns.poll::<u32>(None, false), SpawnPollOutcome::Failed(_)),
+            "the failure stands once the election is free"
+        );
+    }
+
+    /// A lost election never fails the poll: while another process holds the
+    /// election, the winner may still be binding, and the poll keeps waiting
+    /// for it.
+    #[test]
+    fn spawn_poll_keeps_waiting_while_the_election_the_spawned_server_lost_is_held() {
+        let mut spawns = exited_with(LOST_ELECTION_STDERR);
+        poll_until_exit_observed(&mut spawns, true);
+        for _ in 0..200 {
+            let outcome = spawns.poll::<u32>(None, true);
+            assert!(
+                matches!(outcome, SpawnPollOutcome::Waiting),
+                "a spawned server that lost the election to a live holder must keep the poll \
+                 waiting for the winner, not fail it"
+            );
+        }
+    }
+
+    /// A lost election that leaves the election unheld has no winner to wait
+    /// for, and the poll says so - but only on a probe read after the loss
+    /// was observed, since the probe of the observing iteration may predate
+    /// the losing server's exit.
+    #[test]
+    fn spawn_poll_names_an_unheld_election_only_after_the_loss_was_observed() {
+        let mut spawns = exited_with(LOST_ELECTION_STDERR);
+        poll_until_exit_observed(&mut spawns, false);
+        assert!(
+            matches!(
+                spawns.latest,
+                SpawnWatch::Exited(StartExit::LostElection { .. })
+            ),
+            "the observed loss is recorded"
+        );
+        assert!(
+            matches!(
+                spawns.poll::<u32>(None, false),
+                SpawnPollOutcome::ElectionUnheld
+            ),
+            "a later probe that finds the election unheld must send the start to spawn again"
+        );
+    }
+
+    /// Below the bound a spawn counts even when it cannot launch; at the bound
+    /// nothing launches, and the poll waits out the window.
+    #[test]
+    fn the_spawn_count_bounds_the_spawns_one_start_makes() {
+        let mut spawns = StartSpawns::<StartupCapture> {
+            latest: SpawnWatch::Exited(StartExit::LostElection {
+                stderr: String::new(),
+            }),
+            spawn_count: START_SPAWN_COUNT_MAX - 1,
+        };
+        let refused = spawns.spawn(|| Err(std::io::Error::other("no such program")));
+        assert!(refused.is_err(), "a launch failure reaches the caller");
+        assert_eq!(spawns.spawn_count, START_SPAWN_COUNT_MAX);
+        assert!(
+            spawns.running().is_none(),
+            "a spawn that cannot launch leaves nothing to watch"
+        );
+
+        let spent = spawns.spawn(|| panic!("a spent count must not launch"));
+        assert!(spent.is_ok(), "a spent count is no failure of its own");
+        assert_eq!(spawns.spawn_count, START_SPAWN_COUNT_MAX);
+        assert!(
+            matches!(spawns.poll::<u32>(None, false), SpawnPollOutcome::Waiting),
+            "with the count spent the poll only waits"
+        );
+    }
+
+    /// The poll that finds an unheld election with the spawn count spent says the count is
+    /// spent and waits; it neither asks for another spawn nor announces one.
+    #[test]
+    fn a_spent_spawn_count_waits_without_announcing_another_spawn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let mut spawns = StartSpawns::<StartupCapture> {
+            latest: SpawnWatch::Exited(StartExit::LostElection {
+                stderr: String::new(),
+            }),
+            spawn_count: START_SPAWN_COUNT_MAX,
+        };
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let outcome =
+            tracing::subscriber::with_default(subscriber, || spawns.poll::<u32>(None, false));
+
+        assert!(
+            matches!(outcome, SpawnPollOutcome::Waiting),
+            "a spent count asks for no spawn: {outcome:?}"
+        );
+        let mut messages = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            messages.push(record.message().to_owned());
+        }
+        assert_eq!(
+            messages,
+            ["the spawn count is spent; the start window passes as a wait"],
+            "the spent poll names the count once and announces no spawn"
+        );
+    }
+
+    #[test]
+    fn lost_start_election_recognizes_the_server_already_serving_marker() {
+        assert!(lost_start_election(&String::from_utf8_lossy(
+            LOST_ELECTION_STDERR
+        )));
+    }
+
+    #[test]
+    fn lost_start_election_rejects_an_unrelated_startup_failure() {
+        assert!(!lost_start_election("listener bind failed: address in use"));
+    }
+
+    /// A detached server's exit is read from its status, and the stderr file this start
+    /// truncated for it names why: the refusal it exits on is the last thing it writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_exit_is_classified_from_the_tail_of_its_stderr_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let lost = format!(
+            "printf 'starting\\n{}\\n' >&2",
+            String::from_utf8_lossy(LOST_ELECTION_STDERR)
+        );
+        let mut loser = run_detached_script(directory.path(), &lost)?;
+        let Some(StartExit::LostElection { stderr }) = loser.observed_exit() else {
+            panic!("the refusal in the stderr file names a lost election");
+        };
+        assert!(stderr.contains("server_already_serving"), "{stderr}");
+
+        let mut failed = run_detached_script(directory.path(), "echo bind failed >&2; exit 1")?;
+        let pid = failed.pid();
+        assert!(
+            matches!(failed.observed_exit(), Some(StartExit::Failed(exited)) if exited == pid),
+            "any other exit fails with the child's pid"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_detached_server_has_no_exit_yet() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut running = spawn_detached_script(directory.path(), "sleep 30")?;
+        let observed = running.observed_exit();
+        running.child.kill()?;
+        running.child.wait()?;
+        assert!(
+            observed.is_none(),
+            "a running child has no exit to classify"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_the_last_bytes_and_reads_nothing_from_a_missing_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("server.stderr");
+        assert_eq!(stderr_tail(&path), "", "a missing file reads as nothing");
+
+        let head = "a".repeat(usize::try_from(EXIT_STDERR_TAIL_BYTES)?);
+        std::fs::write(&path, format!("{head}the last line\n"))?;
+        let tail = stderr_tail(&path);
+        assert_eq!(tail.len(), usize::try_from(EXIT_STDERR_TAIL_BYTES)?);
+        assert!(tail.ends_with("the last line\n"), "{tail:?}");
+        Ok(())
     }
 }

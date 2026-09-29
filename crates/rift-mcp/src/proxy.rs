@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rift_core::{CapturedStream, CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
@@ -31,12 +32,16 @@ use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
 use crate::http::MCP_PATH;
 use crate::spawn::{
-    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, StartupCapture,
-    spawn_detached_server_with_captured_stderr,
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
+    StartSpawns, StartupCapture,
 };
+use crate::validation::ConfigurationState;
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Allowance past the server's own request bounds for its answer to be
+/// rendered and to travel back to the proxy.
+const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 
 /// Failure while starting or running the stdio MCP proxy.
 pub type ProxyServeError = Error<ProxyFault>;
@@ -108,7 +113,7 @@ pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
         .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
     let proxy = RiftProxy::new(root, identity);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
-    let outcome = serve_connection(proxy, crate::transport::guarded_stdio()).await;
+    let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
     outcome
 }
@@ -186,6 +191,8 @@ struct RiftProxy {
     identity: Arc<ProductIdentity>,
     upstream: Arc<tokio::sync::Mutex<UpstreamSlot>>,
     advertised: Arc<std::sync::Mutex<Option<ServerConfig>>>,
+    /// How long one forwarded request may go unanswered: see [`forward_budget`].
+    forward_budget: Duration,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -273,12 +280,16 @@ struct Upstream {
 }
 
 impl RiftProxy {
+    /// A proxy for the workspace at `root`, bounding its forwards by the
+    /// `[server]` table the workspace accepts when the proxy starts.
     fn new(root: &Path, identity: ProductIdentity) -> Self {
+        let server = ConfigurationState::accept(root).server_configuration();
         Self {
             root: Arc::from(root),
             identity: Arc::new(identity),
             upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot::empty())),
             advertised: Arc::new(std::sync::Mutex::new(None)),
+            forward_budget: forward_budget(&server),
         }
     }
 
@@ -350,7 +361,9 @@ impl RiftProxy {
     ///
     /// A transport-shaped failure marks the held connection dead and
     /// retries exactly once on a freshly leased connection; every other
-    /// failure maps straight through [`forwarded_error`].
+    /// failure maps straight through [`forwarded_error`]. Each send is
+    /// bounded by the proxy's forward budget, and a send that outlives it
+    /// refuses as [`ForwardFault::Unanswered`].
     ///
     /// # Cancel safety
     ///
@@ -367,7 +380,7 @@ impl RiftProxy {
         Fut: Future<Output = Result<Value, ServiceError>>,
     {
         let (peer, generation) = self.leased_peer(None).await?;
-        let failure = match send(peer, request.clone()).await {
+        let failure = match self.answered(send(peer, request.clone())).await? {
             Ok(value) => return Ok(value),
             Err(error) if transport_failed(&error) => error,
             Err(error) => return Err(forwarded_error(error)),
@@ -378,7 +391,33 @@ impl RiftProxy {
             "upstream connection lost; reconnecting"
         );
         let (peer, _generation) = self.leased_peer(Some(generation)).await?;
-        send(peer, request).await.map_err(forwarded_error)
+        self.answered(send(peer, request))
+            .await?
+            .map_err(forwarded_error)
+    }
+
+    /// What one send answered, or the refusal for a server that did not
+    /// answer it within the forward budget.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future drops the send; the request stays with the
+    /// server, which answers it into a dropped channel.
+    async fn answered<Value>(
+        &self,
+        send: impl Future<Output = Result<Value, ServiceError>>,
+    ) -> Result<Result<Value, ServiceError>, ErrorData> {
+        tokio::time::timeout(self.forward_budget, send)
+            .await
+            .map_err(|_elapsed| {
+                let budget = self.forward_budget;
+                tracing::warn!(
+                    component = "mcp",
+                    budget = ?budget,
+                    "the workspace server did not answer a forwarded request within its budget"
+                );
+                Error::new(ForwardFault::Unanswered { budget }).tool_error(wire::ErrorPhase::Read)
+            })
     }
 
     /// The info advertised downstream: the upstream's mirrored
@@ -408,6 +447,49 @@ impl RiftProxy {
     }
 }
 
+/// Bound on one forwarded request: the two waits the server bounds one
+/// request by - `[server] readiness_timeout` for the workspace to be ready,
+/// `[server] worker_queue_timeout` for a free worker - and
+/// [`FORWARD_ANSWER_GRACE`] for the answer.
+///
+/// A server that has not answered within it has stopped answering, and the
+/// caller gets a refusal it can retry instead of a request that never ends.
+fn forward_budget(server: &ServerConfiguration) -> Duration {
+    Duration::from_millis(server.readiness_timeout.milliseconds())
+        .saturating_add(Duration::from_millis(
+            server.worker_queue_timeout.milliseconds(),
+        ))
+        .saturating_add(FORWARD_ANSWER_GRACE)
+}
+
+/// Why a forwarded request produced no answer from the upstream.
+#[derive(Debug)]
+enum ForwardFault {
+    /// The workspace server did not answer within the forward budget.
+    Unanswered {
+        /// The budget the forward waited out.
+        budget: Duration,
+    },
+}
+
+impl Fault for ForwardFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Unanswered { budget } => vec![
+                ErrorContext::new(
+                    "detail",
+                    "the workspace's rift server did not answer the forwarded request",
+                ),
+                ErrorContext::new("waited", format!("{budget:?}")),
+            ],
+        }
+    }
+}
+
 /// Whether a request may reuse the slot's current upstream instead of
 /// reconnecting.
 ///
@@ -423,16 +505,19 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// Connects to the workspace's serving server, electing one when needed.
 ///
 /// One adoption attempt against the recorded server first; a workspace
-/// without a live server gets one detached spawn, its startup stderr
+/// without a live server gets a detached spawn, its startup stderr
 /// captured, then a poll of at most [`START_POLL_ATTEMPT_COUNT`] probes at
 /// [`PRESENCE_POLL_INTERVAL`], each adoption bounded by
 /// [`UPSTREAM_CONNECT_TIMEOUT`]. The poll also stops at the
 /// [`START_WAIT_MAX`] deadline, so slow connect attempts shorten the
 /// attempt count instead of stretching the window. Connect failures inside
-/// the window keep polling; a spawned server that exits before the window
-/// closes refuses with its captured stderr, unless it lost the
-/// concurrent-start election - that case keeps polling for the winner, who
-/// may still be binding; exhaustion refuses with the operator's next step.
+/// the window keep polling. A spawned server that exits before the window
+/// closes is weighed by [`StartSpawns::poll`]: while another process holds
+/// the election the poll waits for that holder; once none does, a lost
+/// election spawns again, at most
+/// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
+/// all, and any other exit refuses with the server's captured stderr.
+/// Exhaustion refuses with the operator's next step.
 ///
 /// # Cancel safety
 ///
@@ -452,22 +537,19 @@ async fn connect_upstream(
     // on its own, and the poll adopts the winner once it finishes binding. A
     // spawn that cannot launch at all is reported, and the poll still gives
     // a concurrently started server its chance.
-    let mut startup = if matches!(probe(root), ServerPresence::Starting) {
-        None
-    } else {
-        match spawn_detached_server_with_captured_stderr(root) {
-            Ok(startup) => Some(startup),
-            Err(error) => {
-                tracing::warn!(component = "mcp", %error, "detached server spawn failed");
-                None
-            }
-        }
-    };
+    let mut spawns = StartSpawns::<StartupCapture>::default();
+    if !matches!(probe(root), ServerPresence::Starting) {
+        spawns.spawn_captured(root);
+    }
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        match spawn_poll_outcome(adopt_serving(root, identity).await?, &mut startup) {
+        let presence = probe(root);
+        let election_held = presence.election_held();
+        let adopted = adopt_presence(presence, identity).await?;
+        match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
-            SpawnPollOutcome::Failed(refusal) => return Err(refusal),
+            SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
+            SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
             SpawnPollOutcome::Waiting => {}
         }
         if tokio::time::Instant::now() >= deadline {
@@ -476,57 +558,6 @@ async fn connect_upstream(
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
     Err(upstream_unavailable())
-}
-
-/// One poll iteration's outcome against a possibly still-spawning server.
-enum SpawnPollOutcome<Adopted> {
-    /// The workspace's server answered; `startup`'s capture is never
-    /// consulted, so the daemon's stderr keeps draining on its own.
-    Ready(Adopted),
-    /// The spawned server exited before it started serving, for a reason
-    /// adoption cannot resolve.
-    Failed(ErrorData),
-    /// Neither has happened yet, or the spawned server exited only because
-    /// it lost the concurrent-start election - the winner may still be
-    /// binding, and the next adoption attempt can still find it.
-    Waiting,
-}
-
-/// Classifies one poll iteration: an adopted connection wins outright;
-/// otherwise a `startup` capture that has finished and names a lost
-/// concurrent-start election keeps the caller waiting for the winner;
-/// otherwise a finished capture names why the spawn failed; otherwise the
-/// caller keeps waiting.
-///
-/// Split from [`connect_upstream`] so the ordering - success checked
-/// before the spawned server's exit - is testable without a real process
-/// or a real upstream connection.
-fn spawn_poll_outcome<Adopted>(
-    adopted: Option<Adopted>,
-    startup: &mut Option<StartupCapture>,
-) -> SpawnPollOutcome<Adopted> {
-    if let Some(running) = adopted {
-        return SpawnPollOutcome::Ready(running);
-    }
-    match startup.as_mut().and_then(StartupCapture::exited) {
-        Some(capture) if lost_start_election(&capture) => SpawnPollOutcome::Waiting,
-        Some(capture) => SpawnPollOutcome::Failed(server_start_failed(&capture)),
-        None => SpawnPollOutcome::Waiting,
-    }
-}
-
-/// Whether a spawned server's captured stderr names the benign
-/// concurrent-start election loss: this process's own spawn found the
-/// workspace already served and exited on its own, printing the same
-/// `server_already_serving` refusal an operator sees from `rift server
-/// start --foreground`. The marker is built from the CLI registry so the
-/// match cannot drift from the code the binary actually prints.
-fn lost_start_election(capture: &CapturedStream) -> bool {
-    let marker = format!(
-        "error[{code}]",
-        code = ErrorName::Cli(CliCode::ServerAlreadyServing).code()
-    );
-    capture.text.contains(&marker)
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -601,7 +632,19 @@ async fn adopt_serving(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    let lock = match probe(root) {
+    adopt_presence(probe(root), identity).await
+}
+
+/// The serving server one probe found, as a live connection, under the
+/// same rules as [`adopt_serving`].
+///
+/// Split from it so a caller that also weighs the probe's election state
+/// reads both from one probe.
+async fn adopt_presence(
+    presence: ServerPresence,
+    identity: &ProductIdentity,
+) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+    let lock = match presence {
         ServerPresence::Serving(lock) => lock,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
             tracing::info!(
@@ -855,11 +898,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, RiftProxy, SpawnPollOutcome, StartupCapture, Upstream,
-        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
-        forwarded_error, lost_start_election, mirrored_info, quit_reason_result,
-        require_identity_match, reuse_current, serve_connection, server_start_failed,
-        spawn_poll_outcome, transport_failed, upstream_unavailable,
+        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, UpstreamSlot, adopt_serving,
+        connect_recorded, connect_upstream, fallback_info, forwarded_error, mirrored_info,
+        quit_reason_result, require_identity_match, reuse_current, serve_connection,
+        server_start_failed, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
     use rift_core::{CapturedStream, Error};
@@ -1081,154 +1123,6 @@ mod tests {
         );
     }
 
-    /// A test double whose reads block on a channel, so a test controls
-    /// exactly when the simulated pipe closes. A sent message larger than
-    /// one read buffer is retained across calls, the same way a real
-    /// pipe's bytes are.
-    struct BlockingChannelStream {
-        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
-        pending: Vec<u8>,
-    }
-
-    impl BlockingChannelStream {
-        fn new(receiver: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
-            Self {
-                receiver,
-                pending: Vec::new(),
-            }
-        }
-    }
-
-    impl std::io::Read for BlockingChannelStream {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.pending.is_empty() {
-                match self.receiver.recv() {
-                    Ok(bytes) => self.pending = bytes,
-                    Err(_closed) => return Ok(0),
-                }
-            }
-            let taken = self.pending.len().min(buffer.len());
-            buffer[..taken].copy_from_slice(&self.pending[..taken]);
-            self.pending.drain(..taken);
-            Ok(taken)
-        }
-    }
-
-    /// Polls `startup` until its capture is taken, bounded so a defect in
-    /// the background drain fails the test instead of hanging it.
-    fn wait_for_exit(startup: &mut StartupCapture) -> CapturedStream {
-        for _ in 0..1_000 {
-            if let Some(captured) = startup.exited() {
-                return captured;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the background drain must finish once the stream closes");
-    }
-
-    #[test]
-    fn spawn_poll_outcome_prefers_adoption_over_a_finished_capture() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
-        drop(sender);
-        // The capture has finished (the stream closed), and adoption also
-        // succeeded on this same iteration: adoption must win, and the
-        // capture must never be consulted.
-        let _ = wait_for_exit(startup.as_mut().expect("capture must still be present"));
-        let outcome = spawn_poll_outcome(Some(7_u32), &mut startup);
-        assert!(
-            matches!(outcome, SpawnPollOutcome::Ready(7)),
-            "adoption must win over a finished capture"
-        );
-    }
-
-    #[test]
-    fn spawn_poll_outcome_waits_while_the_capture_is_still_open() {
-        let (_sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
-        let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
-        assert!(matches!(outcome, SpawnPollOutcome::Waiting));
-    }
-
-    #[test]
-    fn spawn_poll_outcome_fails_once_the_spawned_server_exited() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
-        sender
-            .send(b"listener bind failed: address in use".to_vec())
-            .expect("receiver still open");
-        drop(sender);
-        let outcome = loop {
-            let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
-            if !matches!(outcome, SpawnPollOutcome::Waiting) {
-                break outcome;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let SpawnPollOutcome::Failed(refusal) = outcome else {
-            panic!("an exited spawn must fail the poll");
-        };
-        assert!(
-            refusal.message.contains("listener bind failed"),
-            "{}",
-            refusal.message
-        );
-    }
-
-    /// Before the fix, any captured exit - including a lost election -
-    /// failed the poll outright. Runs the poll repeatedly across the
-    /// capture's background drain finishing, and asserts the outcome never
-    /// becomes `Failed`: the proxy keeps waiting for the winner instead of
-    /// hard-refusing while it is still binding.
-    #[test]
-    fn spawn_poll_outcome_keeps_waiting_when_the_spawned_server_lost_the_election() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut startup = Some(StartupCapture::spawn(BlockingChannelStream::new(receiver)));
-        sender
-            .send(
-                b"rift: error[server_already_serving]: another rift server already serves \
-                  this workspace; connect to the listed server, or run `rift server stop` \
-                  before serving again"
-                    .to_vec(),
-            )
-            .expect("receiver still open");
-        drop(sender);
-        for _ in 0..200 {
-            let outcome = spawn_poll_outcome::<u32>(None, &mut startup);
-            assert!(
-                matches!(outcome, SpawnPollOutcome::Waiting),
-                "a spawned server that lost the concurrent-start election must keep the poll \
-                 waiting for the winner, not fail it"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    #[test]
-    fn lost_start_election_recognizes_the_server_already_serving_marker() {
-        let capture = CapturedStream {
-            text: "rift: error[server_already_serving]: another rift server already serves \
-                   this workspace; connect to the listed server, or run `rift server stop` \
-                   before serving again"
-                .to_owned(),
-            captured_bytes: 0,
-            total_bytes: 0,
-            truncated: false,
-        };
-        assert!(lost_start_election(&capture));
-    }
-
-    #[test]
-    fn lost_start_election_rejects_an_unrelated_startup_failure() {
-        let capture = CapturedStream {
-            text: "listener bind failed: address in use".to_owned(),
-            captured_bytes: 0,
-            total_bytes: 0,
-            truncated: false,
-        };
-        assert!(!lost_start_election(&capture));
-    }
-
     #[test]
     fn server_start_failed_names_no_output_when_stderr_was_empty() {
         let refusal = server_start_failed(&CapturedStream::default());
@@ -1362,6 +1256,58 @@ mod tests {
         );
     }
 
+    /// Bound on a stalled forward in the unanswered-server case, far past the budget the
+    /// workspace below gives it: a forward still waiting here has no bound of its own.
+    const STALLED_FORWARD_MAX: Duration = Duration::from_secs(600);
+
+    /// A server that accepted the connection and then stopped answering: the forward
+    /// refuses once the budget the workspace's `[server]` table sets passes, and the
+    /// refusal is one the caller can retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_the_server_never_answers_refuses_at_its_budget() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
+        )?;
+        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let (running, _upstream_silent) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+
+        let started = tokio::time::Instant::now();
+        let forward = proxy.forward(None, |peer, request| async move {
+            peer.list_tools(request).await
+        });
+        let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
+            .await
+            .map_err(|_elapsed| "the forward kept waiting for a silent server past its budget")?;
+        let waited = started.elapsed();
+        let refusal = answered.expect_err("a silent server must refuse the forward");
+
+        assert_eq!(
+            waited,
+            Duration::from_secs(2) + super::FORWARD_ANSWER_GRACE,
+            "the forward waits out the two request bounds and the grace, then refuses"
+        );
+        let data = refusal
+            .data
+            .ok_or("the refusal carries its classification")?;
+        assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
+        assert!(
+            refusal.message.contains("did not answer"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn mirror_skips_an_upstream_without_negotiated_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1476,10 +1422,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (server_transport, client_transport) = tokio::io::duplex(1024);
         drop(client_transport);
-        let error = serve_connection(
+        let error = Box::pin(serve_connection(
             RiftProxy::new(directory.path(), test_identity()),
             server_transport,
-        )
+        ))
         .await
         .expect_err("a closed transport must fail initialization");
         assert!(matches!(error.fault(), ProxyFault::Initialize(_)));

@@ -677,6 +677,18 @@ impl LexicalIndexFault {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    /// Whether the operation got no pooled connection: every slot stayed
+    /// checked out past the pool's busy-wait budget, or a new connection could
+    /// not be opened. The store itself answered nothing, so a caller with
+    /// another way to answer can use it.
+    #[must_use]
+    pub fn is_connection_unavailable(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<toasty::Error>())
+            .is_some_and(toasty::Error::is_connection_pool)
+    }
 }
 
 impl Fault for LexicalIndexFault {
