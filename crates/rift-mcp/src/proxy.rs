@@ -552,12 +552,12 @@ async fn connect_upstream(
     // a concurrently started server its chance.
     let mut spawns = StartSpawns::<StartupCapture>::default();
     let mut awaiting_release = replacement.is_asked();
-    if !awaiting_release && !matches!(probe(root), ServerPresence::Starting) {
+    if !awaiting_release && !matches!(probed(root).await, ServerPresence::Starting) {
         spawns.spawn_captured(root);
     }
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        let presence = probe(root);
+        let presence = probed(root).await;
         let election_held = presence.election_held();
         let adopted = adopt_presence(presence, identity, &mut replacement).await?;
         // The replaced server released the election, and no other starter
@@ -654,7 +654,35 @@ async fn adopt_serving(
     identity: &ProductIdentity,
     replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    adopt_presence(probe(root), identity, replacement).await
+    adopt_presence(probed(root).await, identity, replacement).await
+}
+
+/// One presence probe, off the async runtime.
+///
+/// A probe connects to the recorded port and can spend its whole connect
+/// bound doing it: on Windows a connect to a port nothing listens on keeps
+/// retrying until that bound passes. The probe therefore runs on the
+/// blocking pool, so the start poll never holds a runtime worker for it. A
+/// probe that panicked answers that the election's state could not be
+/// observed.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the answer; the probe itself finishes on
+/// the blocking pool and changes nothing.
+async fn probed(root: &Path) -> ServerPresence {
+    probed_with(root, probe).await
+}
+
+/// [`probed`] over any probe, so a test can hold one probe open.
+async fn probed_with(
+    root: &Path,
+    probe: impl FnOnce(&Path) -> ServerPresence + Send + 'static,
+) -> ServerPresence {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || probe(&root))
+        .await
+        .unwrap_or(ServerPresence::Stale(StaleReason::ElectionUnobservable))
 }
 
 /// The serving server one probe found, as a live connection, under the
@@ -1037,7 +1065,7 @@ mod tests {
         forwarded_error, identity_refusal, mirrored_info, quit_reason_result, reuse_current,
         serve_connection, server_start_failed, transport_failed, upstream_unavailable,
     };
-    use crate::election::claim;
+    use crate::election::{ServerPresence, StaleReason, claim};
     use rift_core::{CapturedStream, Error};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1649,6 +1677,28 @@ mod tests {
             proxy.advertised_info().instructions.as_deref(),
             Some("recovered")
         );
+    }
+
+    /// The probe runs on the blocking pool: on a single-threaded runtime,
+    /// another task completes while a probe still blocks, and that task is
+    /// what releases the probe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_probe_that_blocks_leaves_the_runtime_free() -> TestResult {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let probing = super::probed_with(std::path::Path::new("."), move |_root| {
+            match released.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => ServerPresence::Absent,
+                Err(_) => ServerPresence::Stale(StaleReason::DocumentUnreadable),
+            }
+        });
+        let releasing = async { release.send(()) };
+        let (presence, sent) = tokio::join!(probing, releasing);
+        sent?;
+        assert!(
+            matches!(presence, ServerPresence::Absent),
+            "the runtime released the probe while it blocked: {presence:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
