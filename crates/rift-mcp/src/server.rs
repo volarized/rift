@@ -57,8 +57,8 @@ use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
-    LexicalWrite, PopulationLane, PublishedWorkspace, configuration_fingerprint, initial_workspace,
-    run_index_supervisor, workspace_watcher,
+    LexicalWrite, PopulationLane, PublishedWorkspace, WatchWorkspace, configuration_fingerprint,
+    initial_workspace, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -1364,20 +1364,23 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
     ) -> Result<Self, ReadError> {
-        let assembled = Self::assemble(root, limits, storage, LexicalLane::spawn).await?;
+        let assembled =
+            Self::assemble(root, limits, storage, workspace_watcher, LexicalLane::spawn).await?;
         Ok(assembled.supervised().await)
     }
 
-    /// Builds every part of one server except its index supervisor task, with the lexical
-    /// lane `spawn_lexical` opens over the search index.
+    /// Builds every part of one server except its index supervisor task, with the watcher
+    /// `watch` starts over the root and the lexical lane `spawn_lexical` opens over the
+    /// search index.
     ///
     /// [`AssembledServer::supervised`] starts the supervisor. A test that drives the
-    /// published state itself holds the parts instead, and one that gates the lexical
-    /// store spawns the lane over that store.
+    /// published state itself holds the parts instead and watches no path, and one that
+    /// gates the lexical store spawns the lane over that store.
     async fn assemble(
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        watch: impl WatchWorkspace,
         spawn_lexical: impl FnOnce(
             Arc<SearchIndex>,
             BlockingExecutor,
@@ -1394,7 +1397,7 @@ impl RiftMcp {
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) =
             IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
-        let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
+        let watcher = Self::start_watcher(&root, &validation, &blocking, watch).await?;
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking).await?;
         // Direct construction delays the database open until the initial scan proves the
@@ -1475,17 +1478,18 @@ impl RiftMcp {
         })
     }
 
-    /// Starts the filesystem watcher over `root` on the worker pool.
+    /// Starts the filesystem watcher `watch` creates over `root`, on the worker pool.
     async fn start_watcher(
         root: &Path,
         validation: &Arc<IndexValidation>,
         blocking: &BlockingExecutor,
+        watch: impl WatchWorkspace,
     ) -> Result<notify::RecommendedWatcher, ReadError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
         blocking
             .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_validation)
+                watch(&watch_root, &watch_validation)
             })
             .instrument(tracing::info_span!(
                 "index.watch",
@@ -3224,7 +3228,7 @@ mod tests {
     use crate::validation::{
         LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
         RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, rebuild_workspace,
-        record_rebuild_failure, workspace_capture,
+        record_rebuild_failure, unwatched, workspace_capture,
     };
     use rift_core::ProjectPath as CoreProjectPath;
 
@@ -4191,8 +4195,8 @@ mod tests {
     /// budget a waiting read spends is far longer.
     const UNWAITED_READ_MAX: Duration = Duration::from_secs(5);
 
-    /// A server whose index supervisor is not running and whose watcher is gone, so the
-    /// observations and the failure a test records are the only ones the published state
+    /// A server whose index supervisor is not running and whose watcher watches no path, so
+    /// the observations and the failure a test records are the only ones the published state
     /// sees. The invalidation receiver stays open so an observation still lands.
     struct UnsupervisedServer {
         server: RiftMcp,
@@ -4208,21 +4212,25 @@ mod tests {
         Ok((directory, assembled))
     }
 
-    /// Assembles a server over `root` and drops its watcher.
+    /// Assembles a server over `root` with a watcher on no path.
+    ///
+    /// A native watcher dropped after assembly would still have watched the initial build,
+    /// and on Windows its drop only asks the watch thread to stop, so a report of the
+    /// fixture's own writes could land in either window.
     async fn unsupervised_server(root: &std::path::Path) -> TestResult<UnsupervisedServer> {
         let super::AssembledServer {
             server,
-            watcher,
+            watcher: _,
             invalidations,
             context,
         } = RiftMcp::assemble(
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            unwatched,
             LexicalLane::spawn,
         )
         .await?;
-        drop(watcher);
         Ok(UnsupervisedServer {
             server,
             context,
@@ -5139,6 +5147,7 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            super::workspace_watcher,
             move |index, blocking, cancellation, executable_digest| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
@@ -5433,11 +5442,16 @@ mod tests {
         Ok(())
     }
 
+    /// The server watches no path, so the epoch the detail names is the one the initial
+    /// build published.
     #[tokio::test]
     async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
-        let (_directory, server) = fixture().await?;
+        let (_directory, assembled) = unsupervised_fixture().await?;
 
-        let detail = server.readiness_stall(Duration::from_millis(25)).await;
+        let detail = assembled
+            .server
+            .readiness_stall(Duration::from_millis(25))
+            .await;
 
         assert!(detail.contains("the index settled at epoch 0"), "{detail}");
         assert!(
