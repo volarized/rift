@@ -373,6 +373,11 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_its_captured_st
         data.message
     );
     assert!(
+        !data.message.contains('\u{1b}'),
+        "a server whose stderr is a pipe writes no terminal escape codes into it: {}",
+        data.message
+    );
+    assert!(
         !data.message.contains("server_already_serving"),
         "a genuine bind failure must not be mistaken for a lost election: {}",
         data.message
