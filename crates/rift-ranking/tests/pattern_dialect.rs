@@ -31,9 +31,9 @@ const DIALECT_PATTERNS: [&str; 11] = [
     r"\r$",
 ];
 
-/// Line-anchored patterns every revision of this repository matches: a `use` line, a
-/// statement end, a closing brace alone, and a comment line. A whole-file reading of `^`
-/// and `$` finds almost none of them.
+/// Line-anchored patterns every revision of this repository matches once its lines end
+/// `\n`: a `use` line, a statement end, a closing brace alone, and a comment line. A
+/// whole-file reading of `^` and `$` finds almost none of them.
 const ANCHORED_IN_THIS_REPOSITORY: [&str; 4] = ["^use ", ";$", r"^\}$", r"^\s*//"];
 
 /// A CRLF file, its LF twin, a brace alone on the line after `)`, and a whitespace run
@@ -147,6 +147,18 @@ fn repository_files(root: &Path) -> TestResult<Vec<(PathBuf, String)>> {
     Ok(files)
 }
 
+/// `text` with every line ending `\n`, and the same lines each ending `\r\n`.
+///
+/// A checkout's line endings follow its host's git configuration: a Windows runner
+/// converts every line to `\r\n`, where `;$` and `^\}$` match nothing, as ripgrep's
+/// own reading of that file finds nothing. Reading both forms of each file keeps the
+/// comparison the same on every host.
+fn line_ending_forms(text: &str) -> [String; 2] {
+    let lf = text.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    [lf, crlf]
+}
+
 #[test]
 fn this_repository_answers_ripgrep_offsets_line_by_line() -> TestResult {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
@@ -160,23 +172,33 @@ fn this_repository_answers_ripgrep_offsets_line_by_line() -> TestResult {
         "the walk reaches the repository: {} files",
         files.len()
     );
+    let forms: Vec<(&PathBuf, [String; 2])> = files
+        .iter()
+        .map(|(path, text)| (path, line_ending_forms(text)))
+        .collect();
     for source in DIALECT_PATTERNS {
         let pattern = pattern(source)?;
         let oracle = regex::Regex::new(source)?;
-        let mut matched_files = 0_usize;
-        for (path, text) in &files {
-            let found = whole_file(&pattern, text);
+        let mut matched_lf_files = 0_usize;
+        for (path, [lf, crlf]) in &forms {
+            let found = whole_file(&pattern, lf);
             assert_eq!(
                 found,
-                line_by_line(&oracle, text),
-                "pattern {source:?} over {}",
+                line_by_line(&oracle, lf),
+                "pattern {source:?} over {} with LF line ends",
                 path.display()
             );
-            matched_files += usize::from(!found.is_empty());
+            assert_eq!(
+                whole_file(&pattern, crlf),
+                line_by_line(&oracle, crlf),
+                "pattern {source:?} over {} with CRLF line ends",
+                path.display()
+            );
+            matched_lf_files += usize::from(!found.is_empty());
         }
         if ANCHORED_IN_THIS_REPOSITORY.contains(&source) {
             assert!(
-                matched_files > 0,
+                matched_lf_files > 0,
                 "pattern {source:?} matches a line of this repository"
             );
         }
