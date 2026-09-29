@@ -4201,6 +4201,18 @@ pub(crate) mod tests {
                 super::WatchImpact::WholeWorkspace,
                 "a directory renamed into place holds files no event named",
             ),
+            (
+                renamed,
+                "src/departed",
+                super::WatchImpact::WholeWorkspace,
+                "a path renamed away may be a directory the startup scan read files below",
+            ),
+            (
+                renamed,
+                "src/departed.rs",
+                named("src/departed.rs")?,
+                "a file renamed away names itself",
+            ),
         ];
         for (kind, path, expected, reason) in expectations {
             assert_eq!(
@@ -5180,20 +5192,19 @@ pub(crate) mod tests {
         Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(path.into())
     }
 
-    /// A capture that scans as production does and, on its first scan only, then writes
-    /// `bytes` to `path` and reports the write to `validation` the way the watcher does,
-    /// before that scan publishes. Answers the capture and the count of scans it ran.
-    fn written_during_first_scan(
+    /// A capture that scans as production does and, on its first scan only, then runs
+    /// `change` under the canonical root and reports the event it answers to `validation`
+    /// the way the watcher does, before that scan publishes. Answers the capture and the
+    /// count of scans it ran.
+    fn changed_during_first_scan(
         root: &std::path::Path,
         validation: &Arc<IndexValidation>,
-        path: &str,
-        bytes: &'static str,
+        change: impl Fn(&std::path::Path) -> Event + Clone + Send + 'static,
     ) -> TestResult<(
         impl super::CaptureWorkspace + Clone + Send + 'static,
         Arc<std::sync::atomic::AtomicU64>,
     )> {
         let roots = super::WatchRoots::resolve(root)?;
-        let written = roots.canonical().join(path);
         let watching = Arc::clone(validation);
         let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counted = Arc::clone(&scans);
@@ -5203,12 +5214,30 @@ pub(crate) mod tests {
               -> Result<WorkspaceCandidate, rift_server::ReadError> {
             let candidate = build_workspace_candidate(root, limits, request)?;
             if counted.fetch_add(1, Ordering::Relaxed) == 0 {
-                fs::write(&written, bytes).expect("the fixture write lands");
-                super::report_watch_outcome(&roots, &watching, Ok(file_written(&written)));
+                let event = change(roots.canonical());
+                super::report_watch_outcome(&roots, &watching, Ok(event));
             }
             Ok(candidate)
         };
         Ok((capture, scans))
+    }
+
+    /// A capture that writes `bytes` to `path` after its first scan, as
+    /// [`changed_during_first_scan`] runs a change.
+    fn written_during_first_scan(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        path: &'static str,
+        bytes: &'static str,
+    ) -> TestResult<(
+        impl super::CaptureWorkspace + Clone + Send + 'static,
+        Arc<std::sync::atomic::AtomicU64>,
+    )> {
+        changed_during_first_scan(root, validation, move |root| {
+            let written = root.join(path);
+            fs::write(&written, bytes).expect("the fixture write lands");
+            file_written(&written)
+        })
     }
 
     /// Polls `published` until its snapshot answers `epoch`, and answers that snapshot.
@@ -5404,6 +5433,51 @@ pub(crate) mod tests {
             published.reads.file_digest(&other).is_none(),
             "the written policy excludes other.rs"
         );
+        Ok(())
+    }
+
+    /// A directory renamed out of the workspace while the startup scan runs leaves one name
+    /// event and no file event for what it held, and before the first publication nothing
+    /// says the scan read files below it: startup captures the workspace again, and the
+    /// publication holds none of them.
+    #[tokio::test]
+    async fn a_directory_renamed_away_during_the_startup_scan_captures_the_workspace_again()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::create_dir_all(directory.path().join("pkg"))?;
+        fs::write(
+            directory.path().join("pkg/mod.rs"),
+            "pub fn departed() {}\n",
+        )?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let destination = elsewhere.path().join("pkg");
+        let rename_away = move |root: &std::path::Path| {
+            fs::rename(root.join("pkg"), &destination).expect("the fixture rename lands");
+            name_event(root, "pkg")
+        };
+        let (capture, scans) =
+            changed_during_first_scan(directory.path(), &validation, rename_away)?;
+        let limits = WorkspaceIndexLimits::default();
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            2,
+            "the first scan read files below the directory that left"
+        );
+        assert_eq!(declarations_named(&published, "departed")?, 0);
+        assert_eq!(declarations_named(&published, "beacon")?, 1);
         Ok(())
     }
 
