@@ -49,11 +49,31 @@ meets any other lock. When that leaves no process holding the election - on Wind
 shared lock can outlive the probe for a moment - the starter starts another within the same
 30-second window.
 
-Before it adopts a live server, the proxy compares package version, executable SHA-256, and
-canonical MCP schema SHA-256 from the lock with its own identity. A mismatch refuses the request:
-the caller receives a JSON-RPC internal error naming both identities and asking for
-`rift server stop`, and once the operator stops the running server, the next request starts one
-that matches.
+Before it adopts a live server, the proxy compares the product identity from the lock with its
+own: the version and the canonical MCP schema SHA-256. The version is the package version with the
+git commit the binary was built from as semantic-versioning build metadata, the version
+`rift --version` prints, such as `0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34`.
+
+A build script in the `rift` crate asks `git` for the commit at build time, and `rift` hands it to
+`rift-mcp` when it serves, so no start reads the executable's bytes. A build from a working tree
+with uncommitted changes adds `.dirty.` with the executable's size in bytes and modification time
+in nanoseconds, read from file metadata, so a rebuilt development binary never matches a server
+the earlier build started. A build with no git carries the package version alone.
+
+When the identities differ, the proxy orders the two versions by semantic-versioning precedence,
+which leaves build metadata aside, so two builds of `0.0.45` stand level whatever their commits:
+
+- A server whose version strictly precedes the proxy's receives the authorized stop request
+  `rift server stop` sends. The proxy waits for that server to release its election and then
+  starts one from its own binary; a request the server already holds finishes first.
+- A server whose version equals the proxy's from another build, or follows it, is refused: the
+  caller receives a JSON-RPC internal error naming both identities and asking for
+  `rift server stop`.
+
+The stop request carries the token the lock records, and every server mints its own, so it stops
+the one server the proxy read and never a server another proxy started after it. A proxy stops at
+most one server per connect: when another older server takes the election after the first one
+left, the proxy refuses rather than race the process that started it.
 
 ### rift server
 
@@ -189,13 +209,13 @@ that moved, removing a source's row and its reverse references together, so an e
 documented file writes that file's row rather than the whole collection.
 
 The store records, beside each file's rows, the digest of the bytes they were derived from, and
-its stamp names what else derived them: the executable, the corpus shape, and the index-owned
-configuration. Every write compares before it writes. A rebuild that named the files it read
+its stamp names what else derived them: the build, by the product version the server publishes in
+its lock, the corpus shape, and the index-owned configuration. Every write compares before it writes. A rebuild that named the files it read
 deletes those paths' rows and inserts their new ones. A rebuild that read the whole workspace,
 startup included, compares every file it holds with the recorded digests and writes only the
 files whose bytes moved or that one side lacks, so a restart over an unchanged tree writes the
-stamp and nothing else. A store stamped by another executable or configuration keeps nothing: the
-write clears it first.
+stamp and nothing else. A store stamped by another build or configuration keeps nothing: the write
+clears it first, so a new release or commit derives the rows once.
 
 The write runs behind the publication: the rebuilt index becomes current first, and the lexical
 lane runs the writes it was handed in publication order, one at a time. The lane holds one write
