@@ -880,15 +880,29 @@ mod tests {
         "lib/python3.12/site-packages"
     };
 
-    /// Writes a virtual environment at `environment` holding the one package `package`.
-    fn installed_environment(environment: &Path, package: &str) {
-        let module = environment.join(SITE_PACKAGES).join(package);
+    /// Installs `package` 1.0.0 into the environment at `environment` as `uv sync` lays
+    /// one out: its module folder and its `.dist-info` with a `RECORD`.
+    fn installed_package(environment: &Path, package: &str) {
+        let site_packages = environment.join(SITE_PACKAGES);
+        let module = site_packages.join(package);
         std::fs::create_dir_all(&module).expect("site-packages directory");
         std::fs::write(
             module.join("__init__.py"),
             "def greet() -> str:\n    return \"\"\n",
         )
         .expect("package module");
+        let dist_info = site_packages.join(format!("{package}-1.0.0.dist-info"));
+        std::fs::create_dir_all(&dist_info).expect("metadata directory");
+        std::fs::write(
+            dist_info.join("RECORD"),
+            format!("{package}/__init__.py,,\n{package}-1.0.0.dist-info/RECORD,,\n"),
+        )
+        .expect("package record");
+    }
+
+    /// Writes a virtual environment at `environment` holding the one package `package`.
+    fn installed_environment(environment: &Path, package: &str) {
+        installed_package(environment, package);
         std::fs::write(
             environment.join(PROJECT_ENVIRONMENT_MARKER),
             format!("home = {}\nversion_info = 3.12.4\n", environment.display()),
@@ -1044,6 +1058,36 @@ mod tests {
         assert!(
             names_module(&removed, "inside"),
             "the removed `.venv` resolves nothing: {removed:?}"
+        );
+    }
+
+    /// A distribution installed into the tree's existing `.venv` after the first request
+    /// resolves on the next one, though the environment's `pyvenv.cfg` stays untouched.
+    #[test]
+    fn test_a_package_installed_into_the_tree_environment_resolves_on_the_next_request() {
+        let (_tree, root) = importing_tree();
+        let environment = root.join(PROJECT_ENVIRONMENT_DIRECTORY);
+        installed_environment(&environment, "inside");
+        let marker_modified = || {
+            std::fs::metadata(environment.join(PROJECT_ENVIRONMENT_MARKER))
+                .and_then(|metadata| metadata.modified())
+                .expect("marker time")
+        };
+        let marker = marker_modified();
+        let before = engine_unresolved_imports(&root);
+        assert!(!names_module(&before, "inside"), "{before:?}");
+        assert!(names_module(&before, "outside"), "{before:?}");
+
+        installed_package(&environment, "outside");
+        assert_eq!(
+            marker_modified(),
+            marker,
+            "installing leaves `pyvenv.cfg` alone"
+        );
+        let after = engine_unresolved_imports(&root);
+        assert!(
+            !names_module(&after, "outside"),
+            "the installed `outside` resolves: {after:?}"
         );
     }
 
