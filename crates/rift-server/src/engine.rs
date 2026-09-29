@@ -601,6 +601,29 @@ impl<T> Transient<T> {
             Self::AnsweredNothing(_) => false,
         }
     }
+
+    /// The wait before the attempt that follows this condition, decided at
+    /// `now`, absent once the request's attempts end.
+    ///
+    /// Without `deadline`, the retry table's attempt bound ends the attempts;
+    /// with it, [`walk_wait`] does while the condition can mean the engine is
+    /// still loading ([`Transient::is_loading`]), and the retry table's bound
+    /// or `deadline`, whichever comes first, does otherwise.
+    fn wait_after(
+        &self,
+        retry: &RetryPolicy,
+        attempt: u64,
+        now: Instant,
+        deadline: Option<Instant>,
+    ) -> Option<Duration> {
+        match deadline {
+            Some(deadline) if self.is_loading() => walk_wait(retry, attempt, now, deadline),
+            Some(deadline) => retry
+                .delay_after(attempt)
+                .filter(|wait| now + *wait < deadline),
+            None => retry.delay_after(attempt),
+        }
+    }
 }
 
 /// What the retry loop does with one answer.
@@ -970,11 +993,8 @@ impl EngineSlot {
 
     /// Shared bounded request loop.
     ///
-    /// Without `deadline`, the retry table's attempt bound ends the loop; with
-    /// it, [`walk_wait`] does while the absorbed condition can mean the engine
-    /// is still loading ([`Transient::is_loading`]), and the retry table's
-    /// bound or `deadline`, whichever comes first, does otherwise. The wait
-    /// between two attempts reads engine output
+    /// The absorbed condition decides the wait between two attempts and when
+    /// the loop ends ([`Transient::wait_after`]). The wait reads engine output
     /// ([`EngineSession::read_output`]), so progress is stamped when it
     /// arrives; the wait also ends once `wake` holds.
     ///
@@ -1073,21 +1093,15 @@ impl EngineSlot {
                     return Err(error);
                 }
             };
-            let wait = match deadline {
-                Some(deadline) if absorbed.is_loading() => {
-                    walk_wait(&retry, attempt, Instant::now(), deadline)
-                }
-                Some(deadline) => retry
-                    .delay_after(attempt)
-                    .filter(|wait| Instant::now() + *wait < deadline),
-                None => retry.delay_after(attempt),
-            };
-            let Some(wait) = wait else {
+            // One clock read decides the wait and schedules its end, so the end
+            // checked against the deadline is the end the wait keeps.
+            let now = Instant::now();
+            let Some(wait) = absorbed.wait_after(&retry, attempt, now, deadline) else {
                 finish(session).await;
                 guarded.finished = true;
                 return self.exhausted(absorbed, attempt, deadline.is_some());
             };
-            let waited = session.read_output(Instant::now() + wait, &wake).await;
+            let waited = session.read_output(now + wait, &wake).await;
             if let Err(error) = waited {
                 exchange_started = false;
                 reported = Some(error);
@@ -1929,6 +1943,41 @@ mod tests {
             RETRY_ATTEMPTS_MAX,
             "the attempt bound still holds a far deadline"
         );
+    }
+
+    /// A loading condition waits the walk's waits under the deadline, past the
+    /// retry table's attempt bound; any other condition waits the retry
+    /// table's under it; without a deadline both wait the retry table's alone.
+    #[test]
+    fn the_absorbed_condition_decides_the_wait_after_an_attempt() {
+        let retry = RetryPolicy::default();
+        let first = retry
+            .delay_after(1)
+            .expect("the table waits after the first attempt");
+        let limit = Duration::from_millis(retry.delay_limit.milliseconds());
+        let past_the_table = retry.attempts;
+        let now = Instant::now();
+        let far = Some(now + Duration::from_secs(60));
+        let near = Some(now + first / 2);
+        let loading = Transient::<()>::Analyzing;
+        let answered_nothing = Transient::AnsweredNothing(());
+        for (transient, attempt, deadline, expected) in [
+            (&loading, 1, far, Some(first)),
+            (&loading, 1, near, None),
+            (&loading, past_the_table, far, Some(limit)),
+            (&loading, past_the_table, None, None),
+            (&answered_nothing, 1, far, Some(first)),
+            (&answered_nothing, 1, near, None),
+            (&answered_nothing, 1, None, Some(first)),
+            (&answered_nothing, past_the_table, far, None),
+        ] {
+            assert_eq!(
+                transient.wait_after(&retry, attempt, now, deadline),
+                expected,
+                "{transient:?} after attempt {attempt} with deadline {:?}",
+                deadline.map(|deadline| deadline - now)
+            );
+        }
     }
 
     /// A `sh` engine that answers `initialize` and then announces work, answers
