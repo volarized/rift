@@ -16,14 +16,17 @@ from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_patte
 from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
+    HELD_UNPARSED_RECORD,
     PROBE_PATH,
     PROBE_SOURCE,
     TEXT_CHUNK_BYTES,
     active_operation,
     active_stdout,
+    build_records,
     chunked_answer,
     exact_degradation,
     language_counts,
+    last_line_pattern,
     lexical_breach,
     lexical_content,
     map_paths,
@@ -83,7 +86,10 @@ class Measurements(unittest.TestCase):
                 'commit = "744846f844374847c902b5e7fd59b4342a51ef99"', 'commit = "main"'
             ),
             original.replace("files = 19743", "files = true"),
+            original.replace("unparsed_bytes = 9040049", "unparsed_bytes = -1"),
+            original.replace("unparsed_bytes = 9040049", "unparsed_bytes = true"),
         ]
+        self.assertTrue(all(variant != original for variant in variants))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pins.toml"
             for variant in variants:
@@ -125,6 +131,16 @@ class Measurements(unittest.TestCase):
                 dataclasses.replace(oversized, oversized_bytes=16),
             ):
                 with self.assertRaisesRegex(RuntimeError, "oversized path"):
+                    changed.verify(root)
+            unparsed = dataclasses.replace(
+                pin, unparsed_path="source.rs", unparsed_bytes=15
+            )
+            self.assertEqual(unparsed.verify(root), measured)
+            for changed in (
+                dataclasses.replace(unparsed, unparsed_path="missing.rs"),
+                dataclasses.replace(unparsed, unparsed_bytes=16),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unparsed path"):
                     changed.verify(root)
             wrong = dataclasses.replace(
                 pin, measurement=dataclasses.replace(measured, bytes=0)
@@ -563,7 +579,7 @@ class OversizedFile(unittest.TestCase):
         with self.assertRaises(UnicodeDecodeError):
             named_paths({"code": "large_file_unparsed", "files": ["rift://file/a%ff"]})
 
-    def test_a_chunked_answer_holds_the_file_whole_and_hits_past_the_chunk(
+    def test_a_chunked_answer_holds_the_file_whole_and_returns_its_warnings(
         self,
     ) -> None:
         path = "src/sqlite3.c"
@@ -572,11 +588,23 @@ class OversizedFile(unittest.TestCase):
             "files": ["rift://file/test/huge.js"],
             "detail": "1 files are past [providers.syntax] max_file",
         }
-        chunked_answer(
-            chunk_answer(path, 9_508_000, 1_048_655, other), path, 9_508_000, 1_048_655
+        answer = chunk_answer(path, 9_508_000, 1_048_655, other)
+        self.assertEqual(chunked_answer(answer, path, 9_508_000, 1_048_655), [])
+        naming: JsonObject = {
+            "code": "large_file_unparsed",
+            "files": ["rift://file/test/huge.js", f"rift://file/{path}"],
+        }
+        missing: JsonObject = {
+            "code": "source_unavailable",
+            "unit": f"rift://file/{path}",
+        }
+        answer = chunk_answer(path, 9_508_000, 1_048_655, naming, missing)
+        self.assertEqual(
+            chunked_answer(answer, path, 9_508_000, 1_048_655),
+            ["large_file_unparsed", "source_unavailable"],
         )
         refused: list[tuple[JsonObject, str]] = [
-            ({"results": [], "warnings": []}, "no pattern hit"),
+            ({"results": [], "warnings": []}, "no pattern hit at byte 1048655"),
             (chunk_answer("src/other.c", 9_508_000, 1_048_655), "expected a file hit"),
             (chunk_answer(path, 1_048_576, 1_048_655), "expected a file hit"),
             (chunk_answer(path, 9_508_000, 12), "first hit at byte 12"),
@@ -588,24 +616,6 @@ class OversizedFile(unittest.TestCase):
                     {"code": "large_file_skipped", "skipped": 1, "detail": "skip"},
                 ),
                 "skipped a large file",
-            ),
-            (
-                chunk_answer(
-                    path,
-                    9_508_000,
-                    1_048_655,
-                    {"code": "source_unavailable", "unit": f"rift://file/{path}"},
-                ),
-                "named by source_unavailable",
-            ),
-            (
-                chunk_answer(
-                    path,
-                    9_508_000,
-                    1_048_655,
-                    {"code": "large_file_unparsed", "files": [f"rift://file/{path}"]},
-                ),
-                "named by large_file_unparsed",
             ),
         ]
         for answer, message in refused:
@@ -686,6 +696,14 @@ class OversizedFile(unittest.TestCase):
             self.assertEqual(
                 object_value(corpus.actions[-1], "action")["action"], "oversized"
             )
+            client.call.return_value = chunk_answer(
+                path,
+                len(data),
+                offset,
+                {"code": "source_unavailable", "unit": f"rift://file/{path}"},
+            )
+            with self.assertRaisesRegex(AssertionError, "named by"):
+                asyncio.run(corpus.oversized(cast(Client, client)))
             (root / path).write_bytes(data + b"\n")
             with self.assertRaisesRegex(AssertionError, "pinned byte count changed"):
                 asyncio.run(corpus.oversized(cast(Client, client)))
@@ -694,6 +712,153 @@ class OversizedFile(unittest.TestCase):
             unpinned = Corpus(empty, root / "rift", root / "report.json")
             asyncio.run(unpinned.oversized(cast(Client, client)))
             client.call.assert_not_awaited()
+
+
+def build_record(path: str, message: str) -> JsonObject:
+    """One index-build record naming `path`, as `rift://logs` answers it."""
+    return {
+        "level": "warn",
+        "component": "index",
+        "operation": "index.build",
+        "message": message,
+        "fields": {"path": path, "reason": "exceeds a syntax bound (source_too_large)"},
+    }
+
+
+class UnparsedFile(unittest.TestCase):
+    """The pinned file past `max_file` answers search as text, named `large_file_unparsed`."""
+
+    def test_the_last_line_pattern_escapes_every_reserved_character(self) -> None:
+        line = b"console.log(counter); a-b~c#d&e [1]{2}^$|\\ <x> f*g+h?"
+        data = b"first\r\n" + line + b"\n" + line + b"\n\n  \n"
+        pattern, offset = last_line_pattern(data)
+        self.assertEqual(offset, 7)
+        self.assertEqual(
+            pattern,
+            "console\\.log\\(counter\\); a\\-b\\~c\\#d\\&e "
+            "\\[1\\]\\{2\\}\\^\\$\\|\\\\ <x> f\\*g\\+h\\?",
+        )
+        self.assertEqual(last_line_pattern(b"only line"), ("only line", 0))
+
+    def test_a_blank_file_or_a_line_past_the_pattern_bound_is_refused(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "no nonblank line"):
+            last_line_pattern(b"\n \n\t\n")
+        with self.assertRaisesRegex(AssertionError, "past 1024"):
+            last_line_pattern(b"x" * 1_025)
+        with self.assertRaisesRegex(AssertionError, "1026 characters"):
+            last_line_pattern(b"x" * 1_022 + b"..")
+        self.assertEqual(len(last_line_pattern(b"x" * 1_024)[0]), 1_024)
+
+    def test_build_records_keep_the_index_build_messages_naming_the_path(self) -> None:
+        path = "test/fixtures/lots.js"
+        found = [
+            build_record(path, HELD_UNPARSED_RECORD),
+            build_record("other.js", "file left out of the index"),
+            {
+                **build_record(path, "index rebuild failed"),
+                "operation": "index.rebuild",
+            },
+            build_record(path, "file left out of the index"),
+        ]
+        self.assertEqual(
+            build_records(found, path),
+            [HELD_UNPARSED_RECORD, "file left out of the index"],
+        )
+        self.assertEqual(build_records([], path), [])
+
+    def test_the_pinned_file_answers_as_text_and_is_recorded_held_unparsed(
+        self,
+    ) -> None:
+        path = "test/fixtures/lots.js"
+        data = b"let counter = 0;\n" + b"for (;;) break;\n" * 8 + b"log(counter);\n"
+        offset = data.find(b"log(counter);")
+        unparsed: JsonObject = {
+            "code": "large_file_unparsed",
+            "files": [f"rift://file/{path}"],
+            "detail": "1 files are past [providers.syntax] max_file",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / path).parent.mkdir(parents=True)
+            (root / path).write_bytes(data)
+            pin = dataclasses.replace(
+                pins()["bun"], unparsed_path=path, unparsed_bytes=len(data)
+            )
+            corpus = Corpus(pin, root / "rift", root / "report.json")
+            corpus.root = root
+            client = AsyncMock(spec=Client)
+            client.call.return_value = chunk_answer(path, len(data), offset, unparsed)
+            held = build_record(path, HELD_UNPARSED_RECORD)
+            client.resource.return_value = {"records": [held, held]}
+            asyncio.run(corpus.unparsed(cast(Client, client)))
+            client.call.assert_awaited_once_with(
+                "search",
+                {
+                    "pattern": "log\\(counter\\);",
+                    "target": "file",
+                    "paths": {"include": [path]},
+                    "limit": 1,
+                },
+            )
+            client.resource.assert_awaited_with("rift://logs/component/index")
+            self.assertEqual(
+                object_value(corpus.actions[-1], "action")["action"], "unparsed"
+            )
+            left_out = build_record(path, "file left out of the index")
+            refusals: list[tuple[JsonObject, JsonObject, str]] = [
+                (
+                    chunk_answer(path, len(data), offset),
+                    {"records": [held]},
+                    r"named by \[\], expected large_file_unparsed",
+                ),
+                (
+                    chunk_answer(
+                        path,
+                        len(data),
+                        offset,
+                        unparsed,
+                        {"code": "source_unavailable", "unit": f"rift://file/{path}"},
+                    ),
+                    {"records": [held]},
+                    "named by \\['large_file_unparsed', 'source_unavailable'\\]",
+                ),
+                (
+                    chunk_answer(path, len(data), offset, unparsed),
+                    {"records": [held, left_out]},
+                    "expected 'file held unparsed in the index' alone",
+                ),
+                (
+                    chunk_answer(path, len(data), offset, unparsed),
+                    {"records": [left_out]},
+                    "expected 'file held unparsed in the index' alone",
+                ),
+            ]
+            for answer, page, message in refusals:
+                client.call.return_value = answer
+                client.resource.return_value = page
+                with (
+                    self.subTest(message=message),
+                    self.assertRaisesRegex(AssertionError, message),
+                ):
+                    asyncio.run(corpus.unparsed(cast(Client, client)))
+            (root / path).write_bytes(data + b"\n")
+            with self.assertRaisesRegex(AssertionError, "pinned byte count changed"):
+                asyncio.run(corpus.unparsed(cast(Client, client)))
+            client.call.reset_mock()
+            unpinned = Corpus(pins()["nextjs"], root / "rift", root / "report.json")
+            asyncio.run(unpinned.unparsed(cast(Client, client)))
+            client.call.assert_not_awaited()
+
+    def test_only_bun_pins_an_unparsed_file_and_the_cache_checks_it(self) -> None:
+        loaded = pins()
+        self.assertEqual(
+            (loaded["bun"].unparsed_path, loaded["bun"].unparsed_bytes),
+            ("test/bundler/transpiler/fixtures/lots-of-for-loop.js", 9_040_049),
+        )
+        for name in ("nextjs", "fastapi"):
+            self.assertEqual(
+                (loaded[name].unparsed_path, loaded[name].unparsed_bytes), ("", 0)
+            )
 
 
 # The document table as `rift-index/src/lexical.rs` creates it, with the ranking columns
