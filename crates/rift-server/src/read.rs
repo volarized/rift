@@ -4103,6 +4103,30 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// A revision snapshot has no filesystem tree to read changed paths from, so an
+    /// incremental rebuild refuses before it reads one, naming the operation.
+    #[test]
+    fn a_revision_snapshot_refuses_an_incremental_rebuild() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let edited = rift_index::FileDigest::of(b"pub fn beacon() -> u8 {\n    7\n}\n");
+        let before = rift_index::WorkspaceDigests::new([]);
+        let after = rift_index::WorkspaceDigests::new([(path, edited)]);
+
+        let error = service
+            .rebuilt(&rift_index::PathChanges::between(&before, &after))
+            .expect_err("a revision snapshot has no filesystem tree to rebuild from");
+
+        let context = rift_core::Fault::context(error.fault());
+        assert_eq!(error.descriptor().code(), "internal_error");
+        assert_eq!(
+            context[0],
+            rift_core::ErrorContext::new("operation", "incremental rebuild")
+        );
+        Ok(())
+    }
+
     #[test]
     fn revision_nodes_on_an_unparsed_path_names_the_extension_without_a_policy() -> TestResult {
         let directory = committed_fixture()?;
