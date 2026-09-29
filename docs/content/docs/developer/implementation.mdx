@@ -215,8 +215,11 @@ start's comparison writes only the files the stopped write did not reach.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
-pooled connection when every one of the `search.pool_slots` is checked out: past it the read or
-write refuses with `storage_failure`.
+pooled connection when every one of the `search.pool_slots` is checked out.
+
+Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
+`lexical_ranking_unavailable`, with a `detail` naming the slot wait. Every other checkout refuses,
+a [`rift://logs`](/docs/mcp#resource-logs) read and a write among them.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.
