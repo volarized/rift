@@ -4277,8 +4277,8 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
-            unwatched,
             crate::identity::BuildCheckout::Unversioned,
+            unwatched,
             LexicalLane::spawn,
         )
         .await?;
@@ -5198,8 +5198,8 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
-            super::workspace_watcher,
             crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
             move |index, blocking, cancellation, product_version| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
@@ -5252,8 +5252,8 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             Some(storage),
-            super::workspace_watcher,
             crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
             move |index, blocking, cancellation, product_version| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
