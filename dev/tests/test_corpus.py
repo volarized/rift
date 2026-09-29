@@ -20,7 +20,6 @@ from rift_dev.corpus_assertions import (
     PROBE_PATH,
     PROBE_SOURCE,
     TEXT_CHUNK_BYTES,
-    active_operation,
     active_stdout,
     build_records,
     chunked_answer,
@@ -445,45 +444,6 @@ class Decisions(unittest.TestCase):
         ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "history", None)
-
-    def test_stop_requires_started_work_and_rejects_completed_history(self) -> None:
-        start: JsonObject = {
-            "identity": 2,
-            "operation": "get_symbol",
-            "fields": {"phase": "start"},
-        }
-        closed: JsonObject = {
-            "identity": 3,
-            "operation": "get_symbol",
-            "fields": {"span": "closed"},
-        }
-        self.assertEqual(active_operation([start], "history", 1, True), 2)
-        for found, pending in (
-            ([start], False),
-            ([start, closed], True),
-            ([start], True),
-        ):
-            after = 2 if found == [start] and pending else 1
-            with self.assertRaises(AssertionError):
-                active_operation(found, "history", after, pending)
-
-    def test_stop_rebuild_allows_answered_stale_read_but_refuses_matching_close(
-        self,
-    ) -> None:
-        start: JsonObject = {
-            "identity": 2,
-            "operation": "index.build",
-            "fields": {"phase": "start", "epoch": "7"},
-        }
-        closed: JsonObject = {
-            "identity": 3,
-            "operation": "",
-            "message": "index.build",
-            "fields": {"span": "closed", "epoch": "7"},
-        }
-        self.assertEqual(active_operation([start], "rebuild", 1, False), 2)
-        with self.assertRaises(AssertionError):
-            active_operation([start, closed], "rebuild", 1, True)
 
     def test_log_page_refuses_missing_store_and_truncation(self) -> None:
         answers: list[JsonObject] = [

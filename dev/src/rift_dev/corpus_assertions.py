@@ -356,41 +356,6 @@ def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
     )
 
 
-def active_operation(
-    found: list[JsonObject], operation: str, after: int, pending: bool
-) -> int:
-    """Require entered work without a later matching completion record."""
-    wanted = "index.build" if operation == "rebuild" else "get_symbol"
-    started = [
-        row
-        for row in found
-        if row.get("operation") == wanted
-        and fields(row).get("phase") == "start"
-        and number(row.get("identity"), "record identity") > after
-    ]
-    require(bool(started), f"{operation}: no start record after the request")
-    start = max(started, key=lambda row: number(row.get("identity"), "record identity"))
-    identity = number(start.get("identity"), "record identity")
-    for row in found:
-        if number(row.get("identity"), "record identity") <= identity:
-            continue
-        if operation == "rebuild":
-            same_epoch = fields(row).get("epoch") == fields(start).get("epoch")
-            closed = (
-                same_epoch
-                and row.get("message") == "index.build"
-                and fields(row).get("span") == "closed"
-            )
-            completed = closed or row.get("operation") == "index.publish"
-        else:
-            completed = (
-                row.get("operation") == wanted and fields(row).get("span") == "closed"
-            )
-        require(not completed, f"{operation} completed before stop: {row}")
-    require(operation == "rebuild" or pending, "history request completed before stop")
-    return identity
-
-
 def active_stdout(output: str, operation: str, epoch: str | None) -> str:
     """Require synchronous start without a later matching completion record."""
     require(
