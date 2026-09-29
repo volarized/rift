@@ -368,26 +368,29 @@ done
 
 /// An incoming walk whose engine still reads analyzing when its wait is
 /// spent answers with `engine_analysis_unavailable` and keeps the session, as an outgoing
-/// walk does: the second walk meets the same engine process instead of starting a
+/// walk does: every later walk meets the same engine process instead of starting a
 /// replacement.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_past_the_readiness_timeout_warns_and_keeps_the_engine() -> TestResult {
-    incoming_walks_past_the_readiness_timeout(ANALYZING_ENGINE)
+    incoming_walks_past_the_readiness_timeout(ANALYZING_ENGINE, "")
         .await
         .map(drop)
 }
 
-/// A `sh` engine that reads analyzing on every attempt, as [`ANALYZING_ENGINE`] does, and
-/// holds its answer to the second request after the first document it opens for 0.8 s,
-/// appending `held` to the file its first argument names: a first walk under a 1 s
-/// `[server] readiness_timeout` sends that request as its retry, and the answer arrives
-/// past the request's deadline, yet before the next walk needs one. Each start appends
-/// `start` to the same file.
+/// A `sh` engine that reads analyzing on every attempt, as [`ANALYZING_ENGINE`] does,
+/// answers the first request after each document it opens at once, and holds its answer to
+/// the next one until the walk closes that document. It appends `held` to the file its
+/// first argument names when it holds a request, `released` when it answers the held one,
+/// and `start` when it starts.
+///
+/// A walk's retry therefore gets no answer while the walk waits for one: the walk ends it
+/// only by abandoning it at its deadline, and the engine answers it after the walk has
+/// closed its document, so the next exchange on the session reads that late answer.
 #[cfg(unix)]
 const HELD_RETRY_ENGINE: &str = r#"echo start >> "$1"
-opens=0
 asked=0
+held=
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
@@ -399,47 +402,70 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
     *'"method":"textDocument/didOpen"'*)
-      opens=$((opens + 1))
       asked=0 ;;
+    *'"method":"textDocument/didClose"'*)
+      asked=0
+      if [ -n "$held" ]; then
+        echo released >> "$1"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":$held,\"result\":[]}"
+        held=
+      fi ;;
     *'"id":'*)
       asked=$((asked + 1))
-      if [ "$opens" -eq 1 ] && [ "$asked" -eq 2 ]; then
+      if [ "$asked" -eq 2 ]; then
         echo held >> "$1"
-        sleep 0.8
-      fi
-      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+        held=$id
+      else
+        frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}"
+      fi ;;
   esac
 done
 "#;
 
+/// The retry table the held-retry suite gives its engine: the wait after an answer is
+/// 1 ms, so a walk sends its retry as soon as the running engine answers its first
+/// attempt, and no longer wait decides whether that retry still fits before the walk's
+/// deadline.
+#[cfg(unix)]
+const IMMEDIATE_RETRY: &str = "retry = { delay = \"1ms\", delay_limit = \"1ms\" }\n";
+
 /// A retry still in flight when an incoming walk's wait is spent is abandoned there: the
 /// walk answers `engine_analysis_unavailable` inside `[server] readiness_timeout` instead
 /// of holding the request past its deadline, and the next walk meets the same engine
-/// process, which discards the held answer arriving during it.
+/// process, which discards the held answer it reads first.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout() -> TestResult {
-    let log = incoming_walks_past_the_readiness_timeout(HELD_RETRY_ENGINE).await?;
-    assert_eq!(
-        log.lines().filter(|line| *line == "held").count(),
-        1,
-        "the first walk sends its retry to the held answer: {log}"
+    let log = incoming_walks_past_the_readiness_timeout(HELD_RETRY_ENGINE, IMMEDIATE_RETRY).await?;
+    assert!(
+        log.lines().any(|line| line == "released"),
+        "a walk after the first sends its retry to the held answer, and the engine answers it \
+         once the walk has closed its document: {log}"
     );
     Ok(())
 }
 
-/// Runs two incoming walks under a 1 s `[server] readiness_timeout` over the `sh` engine
-/// `script_source`, asserts each answers `engine_analysis_unavailable` inside 2 s and
-/// that both meet the one engine process, and returns the log the engine appended to.
+/// Runs three incoming walks under a 1 s `[server] readiness_timeout` over the `sh` engine
+/// `script_source`, whose `[languages.rust.lsp]` table also holds `lsp_keys`, asserts each
+/// answers `engine_analysis_unavailable` inside 2 s and that all three meet the one engine
+/// process, and returns the log the engine appended to by the end of the third walk.
+///
+/// The first walk starts the engine, so whatever that start costs falls on it alone: the
+/// walks after it spend their wait on a running engine. The second walk's closing
+/// notification reaches the engine before the third walk's first request, so its lines
+/// are in the returned log.
 #[cfg(unix)]
-async fn incoming_walks_past_the_readiness_timeout(script_source: &str) -> TestResult<String> {
+async fn incoming_walks_past_the_readiness_timeout(
+    script_source: &str,
+    lsp_keys: &str,
+) -> TestResult<String> {
     let engine = tempfile::tempdir()?;
     let script = engine.path().join("engine.sh");
     let log = engine.path().join("engine.log");
     std::fs::write(&script, script_source)?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
-         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
+         [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n{lsp_keys}",
         script.display(),
         log.display()
     );
@@ -458,7 +484,7 @@ async fn incoming_walks_past_the_readiness_timeout(script_source: &str) -> TestR
         })
     };
     let mut starts_after = Vec::new();
-    for _walk in 0..2 {
+    for _walk in 0..3 {
         let started = std::time::Instant::now();
         let structured = call_retrying_acceptance(
             &client,
@@ -486,15 +512,16 @@ async fn incoming_walks_past_the_readiness_timeout(script_source: &str) -> TestR
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
         starts_after.push(started_lines());
     }
-    eprintln!("incoming: engine starts after each walk={starts_after:?}");
+    let log = std::fs::read_to_string(&log)?;
+    eprintln!("incoming: engine starts after each walk={starts_after:?} log={log:?}");
     assert_eq!(
         starts_after,
-        [1, 1],
-        "both walks meet the one engine process"
+        [1, 1, 1],
+        "every walk meets the one engine process"
     );
 
     client.cancel().await?;
-    Ok(std::fs::read_to_string(&log)?)
+    Ok(log)
 }
 
 /// A fake engine that registers one `**/*.rs` file watcher once initialized and appends
@@ -575,7 +602,7 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
         ("added_marker", true),
         ("gone_marker", false),
     ] {
-        published_holds(&client, name, present).await?;
+        published_holds(&client, name, present, edited).await?;
     }
     let published = edited.elapsed();
     walk().await?;
@@ -739,7 +766,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     )?;
     let edited = std::time::Instant::now();
     for (name, present) in [("beacon2", true), ("again", true), ("beacon", false)] {
-        published_holds(&client, name, present).await?;
+        published_holds(&client, name, present, edited).await?;
     }
     eprintln!("live: published after {:?}", edited.elapsed());
     let (outgoing, _) =
@@ -881,26 +908,45 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     Ok(())
 }
 
-/// Waits until the current publication holds `name` as a symbol, or no longer does.
+/// Waits until the current publication holds `name` as a symbol, or no longer does,
+/// searching again [`PUBLICATION_POLL`] after each answer until [`PUBLICATION_WAIT`] has
+/// passed since `edited`, the instant the files were written.
+///
+/// The wait is bounded by elapsed time, not by a count of searches: a search takes longer
+/// on a slower runner, and a count of them could outlast the harness's deadline before
+/// this message prints.
 async fn published_holds(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &str,
     present: bool,
+    edited: std::time::Instant,
 ) -> TestResult {
-    for _attempt in 0..PUBLICATION_ATTEMPTS_MAX {
+    let mut searches = 0_u32;
+    loop {
         let structured =
             call_retrying_acceptance(client, tool_request("search", &json!({"query": name})))
                 .await?;
+        searches += 1;
         if symbol_names(&structured).iter().any(|held| held == name) == present {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if edited.elapsed() >= PUBLICATION_WAIT {
+            return Err(format!(
+                "the publication did not settle on {name} present={present} within \
+                 {PUBLICATION_WAIT:?} of the edit, after {searches} searches"
+            )
+            .into());
+        }
+        tokio::time::sleep(PUBLICATION_POLL).await;
     }
-    Err(format!("the publication never settled on {name} present={present}").into())
 }
 
-/// Searches one edit may take before its publication is current: 10 s at 50 ms apart.
-const PUBLICATION_ATTEMPTS_MAX: usize = 200;
+/// How long an edit's publication may take to become current, from the edit: a fifth of
+/// nextest's 60 s deadline, so a publication that never lands fails with its own message.
+const PUBLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause between two searches while [`published_holds`] waits.
+const PUBLICATION_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The embedded `ty` engine under the default retry table and `settle_delay`: it declares
 /// itself ready at its start, so a walk takes its first answer.

@@ -35,6 +35,17 @@ test-group = 'election'
 filter = 'binary(=live_vector_search) or binary(=live_model_sources)'
 slow-timeout = { period = "420s", terminate-after = 1, grace-period = "30s" }
 
+# The live proxied engine case reads through the real proxy while rust-analyzer
+# starts, and the harness bounds that engine call by `PROXIED_ENGINE_CALL_MAX`:
+# two runs of the fixture's engine retry policy and a start window, past the
+# one-minute default. Under that default nextest ends the case before its own
+# bound can fail it with the engine's answer. The deadline here is above that
+# bound and the proxied call the case makes first, and
+# `dev/tests/test_delivery.py` keeps it there.
+[[profile.default.overrides]]
+filter = 'binary(=mcp_proxy) & test(=live_proxied_read_resolves_incoming_references)'
+slow-timeout = { period = "180s", terminate-after = 1, grace-period = "10s" }
+
 [profile.ci]
 default-filter = "not binary(/^live_/) and not binary(/^corpus_/) and not test(/^live_/)"
 global-timeout = "480s"
