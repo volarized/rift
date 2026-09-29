@@ -4778,6 +4778,116 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A per-file byte bound small enough that [`LEFT_OUT_FILES`]'s oversized file passes it.
+    const SMALL_MAX_FILE: &str = "[providers.syntax]\nmax_file = \"60b\"\n";
+
+    /// Files the catalog leaves out before digesting their bytes: one past
+    /// [`SMALL_MAX_FILE`], and one holding a NUL byte.
+    const LEFT_OUT_FILES: [(&str, &[u8]); 2] = [
+        (
+            "oversized.rs",
+            b"// oversized source past the sixty byte bound of this workspace\n",
+        ),
+        ("binary.rs", b"source\0bytes\n"),
+    ];
+
+    /// A publication over a workspace holding `lib.rs` and the left-out file `name`,
+    /// under [`SMALL_MAX_FILE`].
+    fn left_out_publication(
+        root: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> TestResult<Arc<PublishedWorkspace>> {
+        fs::write(root.join("rift.toml"), SMALL_MAX_FILE)?;
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join(name), bytes)?;
+        let previous = stable_candidate(root, 0)?;
+        let path = rift_core::ProjectPath::new(name)?;
+        assert!(
+            previous.reads.file_digest(&path).is_none()
+                && previous.reads.file_warning(&path).is_some(),
+            "{name} is left out with a warning and no digest"
+        );
+        Ok(previous)
+    }
+
+    /// The candidate one rebuild naming `path` builds over `previous`, with its change set.
+    fn rebuilt_naming(
+        root: &std::path::Path,
+        previous: &Arc<PublishedWorkspace>,
+        path: &rift_core::ProjectPath,
+    ) -> TestResult<(Arc<PublishedWorkspace>, ChangeSet)> {
+        let request = RebuildRequest {
+            epoch: previous.epoch + 1,
+            work: super::PendingWork::naming([path.clone()]),
+            previous: Some(Arc::clone(previous)),
+        };
+        match build_workspace_candidate(root, WorkspaceIndexLimits::default(), &request)? {
+            WorkspaceCandidate::Stable {
+                published,
+                change_set,
+            } => Ok((published, change_set)),
+            WorkspaceCandidate::ConfigurationChanged => {
+                Err("fixture configuration must remain stable".into())
+            }
+        }
+    }
+
+    /// A file left out before its bytes were digested has no digest, and a deleted path
+    /// has none either. The warning the publication records tells them apart, so the
+    /// rebuild that observes the deletion removes the path and its warning with it.
+    #[test]
+    fn a_deleted_left_out_file_leaves_no_warning_behind() -> TestResult {
+        for (name, bytes) in LEFT_OUT_FILES {
+            let directory = tempfile::tempdir()?;
+            let previous = left_out_publication(directory.path(), name, bytes)?;
+            let path = rift_core::ProjectPath::new(name)?;
+            fs::remove_file(directory.path().join(name))?;
+            let (published, change_set) = rebuilt_naming(directory.path(), &previous, &path)?;
+
+            assert_eq!(
+                changed_paths(&change_set),
+                Some(vec![name.to_owned()]),
+                "{name}: the deletion is a change"
+            );
+            assert_eq!(
+                published.reads.file_warning(&path),
+                None,
+                "{name}: the deleted file's warning leaves the index"
+            );
+        }
+        Ok(())
+    }
+
+    /// A left-out file written again with the same bytes is still on disk and still left
+    /// out, so it keeps its warning. A file past the byte bound records that warning on both
+    /// sides and changes nothing; one holding a NUL byte has no recorded digest to compare,
+    /// so the rebuild reads it again and leaves it out again.
+    #[test]
+    fn a_left_out_file_written_with_the_same_bytes_keeps_its_warning() -> TestResult {
+        for (name, bytes) in LEFT_OUT_FILES {
+            let directory = tempfile::tempdir()?;
+            let previous = left_out_publication(directory.path(), name, bytes)?;
+            let path = rift_core::ProjectPath::new(name)?;
+            fs::write(directory.path().join(name), bytes)?;
+            let (published, change_set) = rebuilt_naming(directory.path(), &previous, &path)?;
+
+            let expected = previous.reads.file_warning(&path).cloned();
+            assert_eq!(
+                published.reads.file_warning(&path).cloned(),
+                expected,
+                "{name}: the warning stays"
+            );
+            let read_again = if name == "binary.rs" {
+                vec![name.to_owned()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(changed_paths(&change_set), Some(read_again), "{name}");
+        }
+        Ok(())
+    }
+
     /// A path observed before a publication held files below it can name a directory that
     /// has left the disk since. Reading the path finds nothing, so the change set reads the
     /// whole workspace instead of keeping the files the publication holds below it.

@@ -290,6 +290,7 @@ mod tests {
     use rift_core::ProjectPath;
 
     use super::{ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests};
+    use crate::WorkspaceIndexWarning;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -353,6 +354,48 @@ mod tests {
         let observed = vec![(path("src/never.rs")?, None)];
         let resolved = PathChanges::resolve(observed, |_| None);
         assert!(resolved.is_empty(), "a path neither side holds is no work");
+        Ok(())
+    }
+
+    /// A left-out file has no digest, and neither has a path with no file. The warning
+    /// tells them apart: the same warning on both sides is no change, a left-out file gone
+    /// from the disk is removed, and one left out for another reason, or readable now, is
+    /// modified.
+    #[test]
+    fn test_resolve_tells_a_left_out_file_on_disk_from_one_gone() -> TestResult {
+        let too_large = |name: &str| -> TestResult<FileRecord> {
+            Ok(FileRecord::LeftOut(WorkspaceIndexWarning::FileTooLarge(
+                path(name)?,
+            )))
+        };
+        let binary = |name: &str| -> TestResult<FileRecord> {
+            Ok(FileRecord::LeftOut(WorkspaceIndexWarning::BinarySource(
+                path(name)?,
+            )))
+        };
+        let published: BTreeMap<ProjectPath, FileRecord> = [
+            (path("kept.rs")?, too_large("kept.rs")?),
+            (path("gone.rs")?, binary("gone.rs")?),
+            (path("grown.rs")?, binary("grown.rs")?),
+            (path("fixed.rs")?, too_large("fixed.rs")?),
+        ]
+        .into_iter()
+        .collect();
+        let observed = vec![
+            (path("kept.rs")?, Some(too_large("kept.rs")?)),
+            (path("gone.rs")?, None),
+            (path("grown.rs")?, Some(too_large("grown.rs")?)),
+            (path("fixed.rs")?, Some(record(b"pub fn fixed() {}"))),
+        ];
+        let resolved = PathChanges::resolve(observed, |path| published.get(path).cloned());
+        assert_eq!(
+            classified(&resolved),
+            vec![
+                ("fixed.rs".to_owned(), PathChange::Modified),
+                ("gone.rs".to_owned(), PathChange::Removed),
+                ("grown.rs".to_owned(), PathChange::Modified),
+            ]
+        );
         Ok(())
     }
 
