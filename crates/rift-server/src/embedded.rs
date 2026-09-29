@@ -45,6 +45,10 @@ const DUPLEX_BYTES: usize = 256 * 1024;
 /// source the Python provider accepts.
 const PAYLOAD_BYTES_MAX: usize = 8 * 1024 * 1024;
 
+/// The scheme and empty authority ty's `VendoredPath` display puts before a vendored
+/// stub's path.
+const VENDORED_URI_PREFIX: &str = "vendored://";
+
 /// JSON-RPC error code for a method this engine does not serve.
 const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC error code for a request this engine could not complete.
@@ -616,7 +620,7 @@ fn hierarchy_item(
     let text = source_text(database, item.file);
     let (uri, range) = match item.file.path(database).as_vendored_path() {
         Some(vendored) => (
-            vendored.to_string(),
+            vendored_uri(vendored),
             range_at(text.as_str(), item.full_range)?,
         ),
         None => match target_location(database, exchange, item.file, item.full_range)? {
@@ -632,6 +636,19 @@ fn hierarchy_item(
         "range": range,
         "selectionRange": range_at(text.as_str(), item.selection_range)?,
     })))
+}
+
+/// A vendored stub's URI, its path segments joined with `/`.
+///
+/// ty joins a vendored path with the host's separator, so on Windows the stub reads
+/// `stdlib\builtins.pyi`, and a URI spelled from it the way `VendoredPath` displays it
+/// is refused by every URI parser the answer meets.
+fn vendored_uri(path: &ruff_db::vendored::VendoredPath) -> String {
+    let segments: Vec<&str> = path
+        .components()
+        .map(|component| component.as_str())
+        .collect();
+    format!("{VENDORED_URI_PREFIX}{}", segments.join("/"))
 }
 
 /// The LSP symbol kind for a `ty_ide` one, as `ty_server` maps it.
@@ -704,6 +721,17 @@ mod tests {
     /// The URI an absolute path spells in this module's tests.
     fn uri_of(path: &Path) -> String {
         path_to_uri(path).expect("an absolute path spells a file URI")
+    }
+
+    /// ty joins a vendored stub's path with the host's separator, as `join` does here, and
+    /// the URI joins its segments with `/` on every host.
+    #[test]
+    fn test_a_vendored_stub_uri_joins_its_segments_with_a_slash() {
+        let stub = ruff_db::vendored::VendoredPath::new("stdlib").join("builtins.pyi");
+        assert_eq!(
+            vendored_uri(stub.as_path()),
+            "vendored://stdlib/builtins.pyi"
+        );
     }
 
     #[test]
