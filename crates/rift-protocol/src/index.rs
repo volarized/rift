@@ -122,7 +122,8 @@ pub struct PackageSymbol {
     pub name: String,
     /// The container-qualified name, unique within the unit's symbol space.
     pub qualified_name: String,
-    /// The provider's own kind word, composed as `{language}.{kind}`.
+    /// What the declaration is in the provider's vocabulary, such as `function` or
+    /// `class`. The language rides beside it in `presentation.language`.
     pub kind: ExactKind,
     /// The declaration's byte range inside its unit.
     pub range: TextRange,

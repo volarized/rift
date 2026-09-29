@@ -3770,7 +3770,7 @@ pub fn compute() -> i32 {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, an id escaping the heading text,
+    /// provider's kind word, empty facets, an id escaping the heading text,
     /// and the whole section as the source excerpt.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
@@ -3875,7 +3875,7 @@ pub fn compute() -> i32 {
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, an id escaping the key, and the
+    /// provider's kind word, empty facets, an id escaping the key, and the
     /// whole pair as the source excerpt.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
