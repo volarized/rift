@@ -6109,6 +6109,18 @@ mod tests {
         build && closed && !supervisor && !incremental
     }
 
+    /// Stops the index supervisor and waits until every blocking operation has returned its
+    /// worker permit. Cancelling the supervisor leaves a scan already on the pool running to
+    /// its end, so only the returned permits say that no scan can still write a record.
+    async fn stop_index_work(server: &RiftMcp) -> TestResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        server.index_supervisor().shutdown(deadline).await?;
+        let workers = u32::try_from(server.server_configuration().await.num_workers)?;
+        let permits = server.blocking.operations.acquire_many(workers);
+        drop(tokio::time::timeout_at(deadline, permits).await??);
+        Ok(())
+    }
+
     /// A file past `[providers.syntax] max_file` stays in the index as text under the
     /// default `[search.text] large_files = "split"`, so every record naming it says it is
     /// held unparsed, with the fields a left-out file's record carries, and no record calls
@@ -6117,7 +6129,8 @@ mod tests {
     /// Each whole scan of the tree records the file once. A filesystem event that lands
     /// during the startup scan supersedes it and startup scans again, and a later event that
     /// asks for the whole workspace rescans it, so the page holds one such record per whole
-    /// scan it closed.
+    /// scan. The index work stops before the drain does, so a rescan still running then
+    /// closes first and the page holds both of its records.
     #[tokio::test]
     async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -6150,6 +6163,7 @@ mod tests {
             "the held file's text answers search: {held:#}"
         );
 
+        stop_index_work(&server).await?;
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs/component/index").await?;
