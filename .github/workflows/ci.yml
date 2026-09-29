@@ -274,9 +274,12 @@ jobs:
 
       # `rustup help toolchain install` documents a comma-separated component
       # list. Install every CI component from the pinned release in one step.
+      # The minimal profile carries no `rust-src`, and the const-trait blanking
+      # test in `rift-syntax` walks the standard library's sources: without
+      # them it finds nothing to read and passes having checked nothing.
       - run: >-
           rustup toolchain install 1.98 --profile minimal
-          --component rustfmt,clippy,llvm-tools-preview
+          --component rustfmt,clippy,llvm-tools-preview,rust-src
 
       # Test binaries come from this revision's build archive.
       - run: just test target/fast.tar.zst
