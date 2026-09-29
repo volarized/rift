@@ -66,10 +66,9 @@ const CALIBRATION_DOUBLINGS_MAX: usize = 4;
 
 /// Lines in the smallest calibrated wide-node file, each one more child of the same node.
 ///
-/// Reading each child with `Node::child` measured 59.4 to 62.2 at this count. The markdown and
-/// TOML grammars gather these lines under hidden repeat nodes such as `document_repeat1`, and
-/// `Node::child` steps over a hidden node by its child count, so those two files measured 9.1
-/// and 8.7 under the same walk and check linear growth alone.
+/// Reading each child with `Node::child` measured 59.4 to 62.2 at this count for every
+/// language whose grammar keeps the lines as direct children of one node; [`wide_line`] names
+/// the two whose grammars do not.
 const WIDE_NODE_LINES_MIN: usize = 1_000;
 
 /// Doc comment lines in front of the one declaration in the smallest calibrated
@@ -91,11 +90,23 @@ const HEADINGS_MIN: usize = 4_000;
 /// this count. Its larger file of 240,002 nodes is the largest round count the default syntax
 /// node bound admits, and under the scan the test already runs 44 of the 60 seconds nextest
 /// allows it.
+///
+/// Against [`ratio_max`], 22.63, that scan clears the bound by 4 to 6 percent, so this test
+/// catches it with little margin to spare. A linear analysis keeps its full factor of 2.8 below
+/// the bound, so the thin margin weakens detection and never fails a linear run.
 const REFERENCE_DEFINITIONS_MIN: usize = 10_000;
 
 /// One line of the wide-node file for `language`: a construct the grammar places as one more
 /// child of the same node. Panics when a registered provider names a language this table has
 /// no entry for, which tells the next implementer to add one.
+///
+/// The markdown and TOML grammars place no run of lines directly under one node. TOML ends
+/// every line with a newline its rules collect in a `repeat`, and markdown builds blocks, list
+/// items, and table rows from `repeat` rules too. Tree-sitter nests each repetition in hidden
+/// repeat nodes such as `document_repeat1`, and `Node::child` steps over a hidden node by its
+/// child count. Every spelling tried in those two languages, comments and values inside a TOML
+/// array, markdown list items and table rows among them, measured 8.5 to 9.1 under that walk,
+/// so for them this shape checks linear extraction only.
 fn wide_line(language: &Language) -> &'static str {
     match language.name.as_str() {
         "rust" | "javascript" | "typescript" | "json" => "// wide node comment line\n",
