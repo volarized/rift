@@ -3395,7 +3395,7 @@ mod tests {
 
     /// A fake engine that registers one `**/*.rs` file watcher once initialized and
     /// appends every `workspace/didChangeWatchedFiles` body it receives to the log named
-    /// by `$1`. It answers every request with an empty list.
+    /// by `$1`. It answers every request with an empty list and ends on `exit`.
     ///
     /// It handles one message at a time, in the order they arrive, so the answer to a
     /// request follows everything the engine did for the messages sent before it.
@@ -3414,6 +3414,8 @@ while IFS= read -r header; do
       frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}' ;;
     *'"method":"workspace/didChangeWatchedFiles"'*)
       printf '%s\n' "$body" >> "$log" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
     *'"id":'[0-9]*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
   esac
