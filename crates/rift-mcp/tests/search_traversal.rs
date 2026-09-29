@@ -602,7 +602,7 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
         ("added_marker", true),
         ("gone_marker", false),
     ] {
-        published_holds(&client, name, present).await?;
+        published_holds(&client, name, present, edited).await?;
     }
     let published = edited.elapsed();
     walk().await?;
@@ -766,7 +766,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     )?;
     let edited = std::time::Instant::now();
     for (name, present) in [("beacon2", true), ("again", true), ("beacon", false)] {
-        published_holds(&client, name, present).await?;
+        published_holds(&client, name, present, edited).await?;
     }
     eprintln!("live: published after {:?}", edited.elapsed());
     let (outgoing, _) =
@@ -908,26 +908,45 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     Ok(())
 }
 
-/// Waits until the current publication holds `name` as a symbol, or no longer does.
+/// Waits until the current publication holds `name` as a symbol, or no longer does,
+/// searching again [`PUBLICATION_POLL`] after each answer until [`PUBLICATION_WAIT`] has
+/// passed since `edited`, the instant the files were written.
+///
+/// The wait is bounded by elapsed time, not by a count of searches: a search takes longer
+/// on a slower runner, and a count of them could outlast the harness's deadline before
+/// this message prints.
 async fn published_holds(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &str,
     present: bool,
+    edited: std::time::Instant,
 ) -> TestResult {
-    for _attempt in 0..PUBLICATION_ATTEMPTS_MAX {
+    let mut searches = 0_u32;
+    loop {
         let structured =
             call_retrying_acceptance(client, tool_request("search", &json!({"query": name})))
                 .await?;
+        searches += 1;
         if symbol_names(&structured).iter().any(|held| held == name) == present {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if edited.elapsed() >= PUBLICATION_WAIT {
+            return Err(format!(
+                "the publication did not settle on {name} present={present} within \
+                 {PUBLICATION_WAIT:?} of the edit, after {searches} searches"
+            )
+            .into());
+        }
+        tokio::time::sleep(PUBLICATION_POLL).await;
     }
-    Err(format!("the publication never settled on {name} present={present}").into())
 }
 
-/// Searches one edit may take before its publication is current: 10 s at 50 ms apart.
-const PUBLICATION_ATTEMPTS_MAX: usize = 200;
+/// How long an edit's publication may take to become current, from the edit: a fifth of
+/// nextest's 60 s deadline, so a publication that never lands fails with its own message.
+const PUBLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pause between two searches while [`published_holds`] waits.
+const PUBLICATION_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The embedded `ty` engine under the default retry table and `settle_delay`: it declares
 /// itself ready at its start, so a walk takes its first answer.
