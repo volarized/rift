@@ -2053,12 +2053,42 @@ done
         pool.shutdown().await;
     }
 
+    /// One references request against the analyzing engine, stamped with the
+    /// instant it starts.
+    #[cfg(unix)]
+    fn stamped_references(
+        stamps: &Arc<std::sync::Mutex<Vec<Instant>>>,
+    ) -> impl for<'session> FnMut(
+        &'session mut EngineSession,
+    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+        let stamps = Arc::clone(stamps);
+        move |session: &mut EngineSession| {
+            stamps.lock().expect("attempt stamps").push(Instant::now());
+            Box::pin(async move {
+                let path = rift_core::ProjectPath::new("lib.rs").expect("path");
+                let position = lsp_types::Position {
+                    line: 0,
+                    character: 3,
+                };
+                session
+                    .references(&path, position)
+                    .await
+                    .map(|locations| Some(locations.len()))
+            })
+        }
+    }
+
     /// A walk waits under the deadline, past the retry table's attempt
-    /// bound, and reads ready one `settle_delay` after the attempt
-    /// that read the engine's end: this engine sends its end with an answer,
-    /// about 13.75 s in at attempt 10, and the wait that follows reads the
-    /// engine quiet 0.5 s later and ends there, so attempt 11 settles. The
-    /// engine's whole-second clock can end its work one attempt early.
+    /// bound, and reads ready one `settle_delay` after the attempt that read
+    /// the engine's end: this engine sends its end with an answer at attempt
+    /// 10, 13.75 s of waits in, and the wait that follows reads the engine
+    /// quiet 0.5 s later and ends there, so attempt 11 settles. The engine's
+    /// whole-second clock can end its work one attempt early, at attempt 9.
+    ///
+    /// The assertions read the gaps between attempt starts, so the time each
+    /// request takes cannot move them: every wait before the end ran its
+    /// scheduled length, and the last one ended between `settle_delay` and
+    /// its own scheduled length.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_walk_waits_under_the_deadline_until_the_engine_reads_ready() {
@@ -2067,22 +2097,59 @@ done
         let slot = pool
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
-        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stamps = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Instant::now();
+        let deadline = started + Duration::from_secs(30);
         let answer = slot
             .request_outgoing(
                 open_lib,
-                counted_references(&attempts),
+                stamped_references(&stamps),
                 finish_immediately,
-                started + Duration::from_secs(30),
+                deadline,
             )
             .await
             .expect("the walk settles");
-        let elapsed = started.elapsed();
-        eprintln!("walk: attempts={attempts:?} elapsed={elapsed:?} answer={answer:?}");
+        let stamps = stamps.lock().expect("attempt stamps").clone();
+        eprintln!(
+            "walk: attempts={} elapsed={:?} answer={answer:?}",
+            stamps.len(),
+            started.elapsed()
+        );
         assert_eq!(answer, OutgoingAnswer::Ready(0));
-        assert!((10..=11).contains(&attempts.load(std::sync::atomic::Ordering::SeqCst)));
-        assert!(elapsed > Duration::from_secs(13) && elapsed < Duration::from_secs(20));
+        assert!(
+            (10..=11).contains(&stamps.len()),
+            "the end arrives at attempt 9 or 10: {} attempts",
+            stamps.len()
+        );
+
+        // The analyzing engine keeps this table's retry schedule and settle_delay.
+        let configuration = table("sh");
+        let retry = configuration.retry;
+        let settle = Duration::from_millis(configuration.settle_delay.milliseconds());
+        let scheduled = |attempt: usize, start: Instant| {
+            let attempt = u64::try_from(attempt).expect("an attempt number");
+            walk_wait(&retry, attempt, start, deadline).expect("a wait under the deadline")
+        };
+        let gaps: Vec<(Instant, Instant)> =
+            stamps.windows(2).map(|pair| (pair[0], pair[1])).collect();
+        let Some(((end_read, settled), earlier)) = gaps.split_last() else {
+            panic!("the walk made more than one attempt: {stamps:?}");
+        };
+        for (index, (start, next)) in earlier.iter().enumerate() {
+            let attempt = index + 1;
+            let wait = scheduled(attempt, *start);
+            assert!(
+                *next - *start >= wait,
+                "the wait after attempt {attempt} ran its {wait:?}: {:?}",
+                *next - *start
+            );
+        }
+        let last_wait = scheduled(earlier.len() + 1, *end_read);
+        let gap = *settled - *end_read;
+        assert!(
+            gap >= settle && gap < last_wait,
+            "the last wait ends one settle_delay after the end, before its {last_wait:?}: {gap:?}"
+        );
         pool.shutdown().await;
     }
 
