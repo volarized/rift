@@ -18,7 +18,7 @@ use rift_core::constants::{
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
     ChangeSet, FileDigest, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
-    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
@@ -231,6 +231,34 @@ impl PublishedWorkspace {
             epoch,
         }
     }
+
+    /// Whether this publication already holds what every one of `paths` holds on disk,
+    /// read under its own policy, which reads a path it excludes as absent.
+    ///
+    /// A bounded read that left a file out matches only a publication that left it out
+    /// the same way; another omission or an I/O error does not match.
+    fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        let mut observed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let digest = match self.source_policy.visible_digest(&root.join(path.as_str())) {
+                Ok(digest) => digest,
+                Err(error) if self.left_out_as_recorded(path, &error) => None,
+                Err(_) => return false,
+            };
+            observed.push((path.clone(), digest));
+        }
+        PathChanges::resolve(observed, |path| self.reads.file_digest(path)).is_empty()
+    }
+
+    /// Whether `error` refuses `path` exactly as this publication recorded leaving it out:
+    /// no digest, and the same recorded warning.
+    fn left_out_as_recorded(&self, path: &ProjectPath, error: &WorkspaceIndexError) -> bool {
+        self.reads.file_digest(path).is_none()
+            && error
+                .fault()
+                .left_out_file(path.clone())
+                .is_some_and(|warning| self.reads.file_warning(path) == Some(&warning))
+    }
 }
 
 /// Published workspace plus failure for latest observed epoch.
@@ -293,7 +321,8 @@ pub(crate) struct IndexValidation {
 
     /// The current publication as event classification sees it: the inclusion policy
     /// the index was built under, and the index itself for what it holds. Absent before
-    /// the first publication, when every event asks for the whole workspace anyway.
+    /// the first publication, when an event names its path by its spelling below the root
+    /// and the startup candidate's own policy decides what that path holds.
     pub(crate) published: SyncRwLock<Option<Arc<PublishedWorkspace>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: AsyncMutex<Option<JoinHandle<()>>>,
@@ -751,11 +780,15 @@ impl IndexValidation {
     }
 
     /// The project path one event path names, under the current inclusion policy.
-    fn source_project_path(&self, path: &Path) -> Option<ProjectPath> {
-        self.current_publication()
-            .as_ref()?
-            .source_policy
-            .project_path(path)
+    ///
+    /// Before the first publication there is no policy to ask, so the path's spelling below
+    /// the canonical root names it. The startup candidate digests that path under its own
+    /// policy before it publishes, which reads a path the policy excludes as absent.
+    fn source_project_path(&self, roots: &WatchRoots, path: &Path) -> Option<ProjectPath> {
+        self.current_publication().as_ref().map_or_else(
+            || roots.project_path(path),
+            |published| published.source_policy.project_path(path),
+        )
     }
 
     /// Returns whether current policy includes one source event path.
@@ -904,6 +937,12 @@ impl WatchRoots {
         path.strip_prefix(&self.canonical)
             .or_else(|_| path.strip_prefix(&self.watched))
             .ok()
+    }
+
+    /// The project path `path` spells below either root spelling, or nothing when it lies
+    /// under neither or spells no valid project path.
+    fn project_path(&self, path: &Path) -> Option<ProjectPath> {
+        rift_index::relative_path(self.relative(path)?).ok()
     }
 
     /// `path` under the canonical root, or nothing when it lies under neither spelling.
@@ -1103,7 +1142,9 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 ///
 /// A policy file rewrites what the workspace includes and a directory event can add or
 /// drop many files at once, so both ask for the whole workspace. Only a path that is
-/// itself a visible file narrows the next rebuild to that file.
+/// itself a visible file narrows the next rebuild to that file. Before the first
+/// publication no policy decides visibility yet, so every such path names itself, and the
+/// startup candidate's own policy decides what it holds.
 ///
 /// A name event on an extensionless path asks for the whole workspace only when the
 /// path names a directory the index can hold files under: one on disk right now, or one
@@ -1162,7 +1203,7 @@ pub(crate) fn watch_path_impact(
         return WatchImpact::None;
     }
     validation
-        .source_project_path(path)
+        .source_project_path(roots, path)
         .map_or(WatchImpact::WholeWorkspace, |path| {
             WatchImpact::Paths(vec![path])
         })
@@ -1265,11 +1306,13 @@ impl ScannedTree {
 /// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, under one `rift.toml`
 /// state - publish, whatever the counter reads and whatever the pending work escalated to.
 ///
-/// [`answered_candidate`] keeps its branch for the case it covers, but it cannot be the
-/// startup answer: [`IndexValidation::source_project_path`] returns `None` while no
-/// publication is installed, so before the first one every non-floored event classifies
-/// [`WatchImpact::WholeWorkspace`], and `answered_candidate` refuses a candidate whose
-/// pending work covers the whole workspace.
+/// A change observed while an attempt scans is taken the way a change after the first
+/// publication is. Before that publication an event names its own path, and
+/// [`CandidateAnswer::published_at_startup`] publishes the candidate and leaves every path it
+/// does not hold to the supervisor's first rebuild. Only an observation that asks for the
+/// whole workspace - a written `.gitignore`, a directory event, more paths than the
+/// workspace may hold files - or a `rift.toml` that moved under the candidate captures the
+/// workspace again, within [`INDEX_CAPTURE_ATTEMPTS_MAX`] attempts.
 ///
 /// A capture that comes back [`WorkspaceCandidate::ConfigurationChanged`] folds no tree at
 /// all, so it contributes no scan to compare; the span records it and the refusal names it
@@ -1344,16 +1387,18 @@ pub(crate) async fn initial_workspace_with(
                 ))
             } else {
                 answered_candidate(root, &built, &publication, observed_epoch)
+                    .published_at_startup(&built)
             };
             if let Some(answering) = answering {
                 validation.replace_publication_locked(&answering);
                 drop(publication);
                 recorded.record("outcome", "published");
+                let published_epoch = answering.epoch;
                 tracing::info!(
                     component = "index",
                     operation = "index.publish",
                     trigger = "startup",
-                    epoch = observed_epoch,
+                    epoch = published_epoch,
                     "index snapshot published"
                 );
                 return Ok((answering, write));
@@ -2943,7 +2988,8 @@ pub(crate) fn publish_rebuild_after(
 ) -> RebuildOutcome {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    let candidate = answered_candidate(root, candidate, &publication, observed_epoch);
+    let candidate =
+        answered_candidate(root, candidate, &publication, observed_epoch).into_current();
     let mut state = published.blocking_write();
     after_state_lock();
     if validation.cancellation.is_cancelled() {
@@ -2975,65 +3021,85 @@ pub(crate) fn publish_rebuild_after(
     }
 }
 
-/// The candidate to publish under `observed_epoch`, or nothing when the observation
-/// genuinely moved past it.
+/// Where one captured candidate stands against the observation made since its capture.
+#[derive(Debug)]
+enum CandidateAnswer {
+    /// The candidate answers the observed epoch: as itself when nothing was observed since
+    /// its capture, or as its twin under that epoch when it already holds what every
+    /// observed path holds.
+    Current(Arc<PublishedWorkspace>),
+    /// The observation names a path whose bytes the candidate does not hold, or could not
+    /// read under its own policy; a rebuild reading the named paths answers it.
+    Behind,
+    /// The observation asks for the whole workspace, or `rift.toml` moved since the
+    /// candidate accepted it; only a capture of the whole workspace answers it.
+    Rescan,
+}
+
+impl CandidateAnswer {
+    /// The publication a running supervisor makes: the candidate answers the observation,
+    /// or it is superseded.
+    fn into_current(self) -> Option<Arc<PublishedWorkspace>> {
+        match self {
+            Self::Current(answering) => Some(answering),
+            Self::Behind | Self::Rescan => None,
+        }
+    }
+
+    /// The publication startup makes, or nothing when the workspace has to be captured
+    /// again.
+    ///
+    /// A candidate behind the observation still publishes, under the epoch its own capture
+    /// took. The paths it does not hold stay the publication lane's pending work, so the
+    /// supervisor's first rebuild reads them as an incremental change, through the same
+    /// lexical lane and epoch sequence as every later change, and a read meets the startup
+    /// snapshot first and that change right after.
+    fn published_at_startup(
+        self,
+        candidate: &Arc<PublishedWorkspace>,
+    ) -> Option<Arc<PublishedWorkspace>> {
+        match self {
+            Self::Current(answering) => Some(answering),
+            Self::Behind => Some(Arc::clone(candidate)),
+            Self::Rescan => None,
+        }
+    }
+}
+
+/// Where `candidate` stands against the observation `pending` holds under
+/// `observed_epoch`.
 ///
 /// A candidate answers the epoch its capture took. When the observation moved while the
 /// capture ran, the paths that moved are still the lane's pending work, so the same
 /// comparison a rebuild makes - [`PathChanges::resolve`] against the candidate's own
 /// digests - says whether the candidate already holds what they name. A candidate that
-/// holds all of them answers the later observation too and publishes as its twin under
-/// that epoch: a change's own write reaches the watcher after the change captured it,
-/// and reading the same bytes a second time is the work this drops. An observation that
-/// names a path the candidate does not hold, one that asks for the whole workspace, or
-/// one made while `rift.toml` moved, supersedes the candidate.
+/// holds all of them answers the later observation too, as its twin under that epoch: a
+/// change's own write reaches the watcher after the change captured it, and reading the
+/// same bytes a second time is the work this drops. An observation that names a path the
+/// candidate does not hold leaves it behind; one that asks for the whole workspace, or one
+/// made while `rift.toml` moved, asks for a rescan.
 ///
 /// Work is one digest per observed path, bounded by how many paths one observation
-/// retains, and it runs under the publication lane alone. A bounded read that left a file
-/// out answers only a candidate with no digest and the same recorded warning; another
-/// omission or an I/O error still supersedes it.
+/// retains, and it runs under the publication lane alone.
 fn answered_candidate(
     root: &Path,
     candidate: &Arc<PublishedWorkspace>,
     pending: &PendingWork,
     observed_epoch: u64,
-) -> Option<Arc<PublishedWorkspace>> {
+) -> CandidateAnswer {
     if candidate.epoch == observed_epoch {
-        return Some(Arc::clone(candidate));
+        return CandidateAnswer::Current(Arc::clone(candidate));
     }
     if pending.covers_whole_workspace()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
     {
-        return None;
+        return CandidateAnswer::Rescan;
     }
-    let mut observed = Vec::with_capacity(pending.paths.len());
-    for path in &pending.paths {
-        let digest = match candidate
-            .source_policy
-            .visible_digest(&root.join(path.as_str()))
-        {
-            Ok(digest) => digest,
-            Err(error)
-                if candidate.reads.file_digest(path).is_none()
-                    && error
-                        .fault()
-                        .left_out_file(path.clone())
-                        .is_some_and(|warning| {
-                            candidate.reads.file_warning(path) == Some(&warning)
-                        }) =>
-            {
-                None
-            }
-            Err(_) => return None,
-        };
-        observed.push((path.clone(), digest));
-    }
-    let changes = PathChanges::resolve(observed, |path| candidate.reads.file_digest(path));
-    if !changes.is_empty() {
-        return None;
+    if !candidate.holds_observed(root, &pending.paths) {
+        return CandidateAnswer::Behind;
     }
     let twin = candidate.under(candidate.configuration.clone(), observed_epoch);
-    Some(Arc::new(twin))
+    CandidateAnswer::Current(Arc::new(twin))
 }
 
 /// Records failure under same observation linearization as publication.
@@ -4112,12 +4178,12 @@ pub(crate) mod tests {
     /// A server does not observe its own state either, under any spelling of its root.
     ///
     /// No publication is installed, which is the startup window the initial build runs
-    /// in: `source_path_is_relevant` is wide open there and `source_project_path` answers
-    /// nothing, so every path the floor admits escalates to the whole workspace. The
-    /// floor is the only guard left, and it places the event path against both spellings
-    /// before reading it, so the database writes that run for the life of the server move
-    /// no filesystem epoch. The last assertion is what makes dropping an unplaceable path
-    /// safe: a source write under the symlinked spelling is still observed.
+    /// in: `source_path_is_relevant` is wide open there, so every path the floor admits
+    /// names itself. The floor is the only guard left, and it places the event path
+    /// against both spellings before reading it, so the database writes that run for the
+    /// life of the server move no filesystem epoch. The last assertion is what makes
+    /// dropping an unplaceable path safe: a source write under the symlinked spelling is
+    /// still observed, under the path the index keys it by.
     #[test]
     fn a_state_file_event_reaches_no_impact_under_every_root_spelling() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4161,7 +4227,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 super::watch_event_impact(&roots, &validation, &written(&linked.join("lib.rs"))),
-                super::WatchImpact::WholeWorkspace,
+                super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("lib.rs")?]),
                 "a source write through a symlinked root is still observed, which is what \
                  makes dropping an unplaceable path safe"
             );

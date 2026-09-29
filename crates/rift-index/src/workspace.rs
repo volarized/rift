@@ -3398,7 +3398,14 @@ fn project_path_below(root: &Path, absolute: &Path) -> Result<ProjectPath, Works
     relative_path(relative)
 }
 
-pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
+/// The [`ProjectPath`] one path relative to the workspace root spells, its components joined
+/// with `/` on every platform.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when a component is not UTF-8 or the joined spelling is not
+/// a valid project path.
+pub fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
     let value = path
         .components()
         .map(|component| component.as_os_str().to_str())
