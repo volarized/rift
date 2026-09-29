@@ -407,6 +407,10 @@ impl HistoryTask {
     /// Analyzes and writes every pending commit of `plan` in bounded batches,
     /// then trims. Answers the filler back, or `None` when a blocking step
     /// panicked with it.
+    ///
+    /// Each batch records its start with the pending commits the plan has not
+    /// analyzed yet. A span reaches the log only when it closes, so that start
+    /// record is what shows a batch in flight.
     async fn fill_planned(
         &self,
         mut filler: StoreFiller,
@@ -435,6 +439,13 @@ impl HistoryTask {
             let remaining = &mut pending;
             let batch =
                 rift_core::traced_async!(component = "history", operation = "history.batch", {
+                    tracing::debug!(
+                        component = "history",
+                        operation = "history.batch",
+                        phase = "start",
+                        pending = remaining.len(),
+                        "history batch started"
+                    );
                     self.fill_batch(filler, first, remaining, cancellation)
                         .await
                 })

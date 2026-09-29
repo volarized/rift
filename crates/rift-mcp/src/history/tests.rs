@@ -238,6 +238,40 @@ async fn the_fill_runs_a_batch_after_its_bounded_wait_while_requests_overlap() -
 }
 
 #[tokio::test]
+async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> TestResult {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let directory = committed_workspace("")?;
+    let root = directory.path();
+    let head = head_of(root)?;
+    let (sink, mut drain) = crate::logs::log_capture();
+    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
+    let cancellation = CancellationToken::new();
+    let activity = Arc::new(IdleTracker::new());
+
+    let _lane = start(root, "executable-a", activity, &cancellation).await?;
+    wait_until_held(root, "executable-a", &head).await?;
+    cancellation.cancel();
+
+    let mut starts = Vec::new();
+    while let Ok(record) = drain.try_recv_record() {
+        if record.message() == "history batch started" {
+            starts.push(record);
+        }
+    }
+    let first = starts.first().ok_or("no batch start was recorded")?;
+    assert_eq!(first.level(), "debug");
+    assert_eq!(first.component(), "history");
+    assert_eq!(first.operation(), "history.batch");
+    assert_eq!(
+        first.fields(),
+        r#"{"phase":"start","pending":"2"}"#,
+        "the first batch starts with both commits of the fixture pending"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_settled_wait_ends_at_its_bound_or_when_the_last_request_completes() {
     let activity = IdleTracker::new();
     assert!(activity.settled(Duration::from_millis(10)).await);
