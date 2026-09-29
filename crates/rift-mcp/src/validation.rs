@@ -3476,7 +3476,7 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{GlobalConfiguration, ServerConfiguration};
@@ -4136,6 +4136,76 @@ pub(crate) mod tests {
             super::WatchImpact::WholeWorkspace,
             "a directory that disappears takes an unknown set of files with it"
         );
+        Ok(())
+    }
+
+    /// Before the first publication no policy decides what an event path holds, so a file
+    /// event names its own path in the spelling the index keys files by, and the startup
+    /// candidate's policy decides what it holds. An event that rewrites what the workspace
+    /// includes or reshapes the tree asks for the whole workspace, as it does after that
+    /// publication.
+    #[test]
+    fn an_event_before_the_first_publication_names_its_own_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let watched_root = directory.path().join(".");
+        let event_root = directory.path().canonicalize()?;
+        fs::create_dir_all(directory.path().join("src/nested"))?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let roots = super::WatchRoots::resolve(&watched_root)?;
+        let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
+        let named = |path: &str| -> TestResult<super::WatchImpact> {
+            Ok(super::WatchImpact::Paths(vec![
+                rift_core::ProjectPath::new(path)?,
+            ]))
+        };
+        let renamed = EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any));
+        let expectations: Vec<(EventKind, &str, super::WatchImpact, &str)> = vec![
+            (
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                "src/lib.rs",
+                named("src/lib.rs")?,
+                "an edited file names itself",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "src/generated/code.rs",
+                named("src/generated/code.rs")?,
+                "a created file names itself, whatever policy later excludes it",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "rift.toml",
+                named("rift.toml")?,
+                "a written configuration file names itself, and the candidate's acceptance \
+                 decides whether the scan answers it",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                ".gitignore",
+                super::WatchImpact::WholeWorkspace,
+                "the workspace's ignore file decides what is included",
+            ),
+            (
+                EventKind::Create(CreateKind::Folder),
+                "src/fresh",
+                super::WatchImpact::WholeWorkspace,
+                "a directory that appears brings an unknown set of files with it",
+            ),
+            (
+                renamed,
+                "src/nested",
+                super::WatchImpact::WholeWorkspace,
+                "a directory renamed into place holds files no event named",
+            ),
+        ];
+        for (kind, path, expected, reason) in expectations {
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &event(kind, path)),
+                expected,
+                "{path}: {reason}"
+            );
+        }
         Ok(())
     }
 
@@ -5099,6 +5169,238 @@ pub(crate) mod tests {
         .await
         .expect_err("a configuration that keeps moving must exhaust capture attempts");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        Ok(())
+    }
+
+    /// One file event, as the watcher reports a write to `path`.
+    fn file_written(path: &std::path::Path) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(path.into())
+    }
+
+    /// A capture that scans as production does and, on its first scan only, then writes
+    /// `bytes` to `path` and reports the write to `validation` the way the watcher does,
+    /// before that scan publishes. Answers the capture and the count of scans it ran.
+    fn written_during_first_scan(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        path: &str,
+        bytes: &'static str,
+    ) -> TestResult<(
+        impl super::CaptureWorkspace + Clone + Send + 'static,
+        Arc<std::sync::atomic::AtomicU64>,
+    )> {
+        let roots = super::WatchRoots::resolve(root)?;
+        let written = roots.canonical().join(path);
+        let watching = Arc::clone(validation);
+        let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&scans);
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest|
+              -> Result<WorkspaceCandidate, rift_server::ReadError> {
+            let candidate = build_workspace_candidate(root, limits, request)?;
+            if counted.fetch_add(1, Ordering::Relaxed) == 0 {
+                fs::write(&written, bytes).expect("the fixture write lands");
+                super::report_watch_outcome(&roots, &watching, Ok(file_written(&written)));
+            }
+            Ok(candidate)
+        };
+        Ok((capture, scans))
+    }
+
+    /// Polls `published` until its snapshot answers `epoch`, and answers that snapshot.
+    async fn published_within_bound(
+        published: &RwLock<IndexState>,
+        epoch: u64,
+    ) -> TestResult<Arc<PublishedWorkspace>> {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let current = Arc::clone(&published.read().await.current);
+            if current.epoch == epoch {
+                return Ok(current);
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        let reached = published.read().await.current.epoch;
+        Err(format!("the supervisor never published epoch {epoch}, only {reached}").into())
+    }
+
+    /// How many declarations named `name` one snapshot answers.
+    fn declarations_named(published: &PublishedWorkspace, name: &str) -> TestResult<usize> {
+        let params = serde_json::from_value(serde_json::json!({ "name": name }))?;
+        Ok(published.reads.get_symbol(&params)?.hits.len())
+    }
+
+    /// Starts the supervisor over `startup`, handing `lane` its rebuilds, as a served
+    /// workspace does once its startup snapshot published.
+    fn supervised_after_startup(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        invalidations: tokio::sync::mpsc::Receiver<()>,
+        startup: &Arc<PublishedWorkspace>,
+        lane: &LexicalLane,
+    ) -> TestResult<(Arc<RwLock<IndexState>>, tokio::task::JoinHandle<()>)> {
+        let published = Arc::new(RwLock::new(IndexState {
+            current: Arc::clone(startup),
+            failure: None,
+        }));
+        let context = super::IndexSupervisorContext {
+            root: root.to_path_buf(),
+            limits: WorkspaceIndexLimits::default(),
+            published: Arc::clone(&published),
+            validation: Arc::clone(validation),
+            blocking: BlockingExecutor::isolated(2, 60_000),
+            population: None,
+            lexical: Some(lane.clone()),
+        };
+        let supervisor = tokio::spawn(super::run_index_supervisor_with(
+            unwatched(root, validation)?,
+            invalidations,
+            context,
+            super::workspace_capture(),
+        ));
+        Ok((published, supervisor))
+    }
+
+    /// A file edited while the startup scan runs is taken as a change after that scan, as
+    /// one after any publication is: the scan publishes under the epoch its capture took,
+    /// the edited path stays the pending work, and the supervisor's first rebuild reads that
+    /// file alone. The lexical lane meets the startup snapshot's whole write first and a
+    /// change naming the edited file right after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_edited_during_the_startup_scan_is_the_first_incremental_change() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let lib = rift_core::ProjectPath::new("lib.rs")?;
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let (capture, scans) = written_during_first_scan(
+            directory.path(),
+            &validation,
+            "lib.rs",
+            "pub fn edited() {}\n",
+        )?;
+        let limits = WorkspaceIndexLimits::default();
+        let (startup, write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(scans.load(Ordering::Relaxed), 1, "the first scan publishes");
+        assert_eq!(
+            startup.epoch, 0,
+            "the snapshot answers the epoch its capture took"
+        );
+        assert_eq!(validation.observed_epoch(), 1);
+        assert_eq!(declarations_named(&startup, "beacon")?, 1);
+        assert!(matches!(write, LexicalWrite::Whole), "{write:?}");
+        let (whole, named) = {
+            let pending = validation.locked_pending();
+            let named: Vec<_> = pending.paths().cloned().collect();
+            (pending.covers_whole_workspace(), named)
+        };
+        assert!(!whole, "the edit named its own path");
+        assert_eq!(named, vec![lib.clone()]);
+
+        let double = StoreDouble::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            blocking,
+            validation.cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+        lane.request(write, Arc::clone(&startup));
+        double.release_one();
+        let startup_revision = startup.reads.tree_revision();
+        commit_state_within_bound(&lane, startup_revision, LexicalCommitState::Settled).await?;
+        let (published, supervisor) = supervised_after_startup(
+            directory.path(),
+            &validation,
+            invalidations,
+            &startup,
+            &lane,
+        )?;
+        double.release_one();
+        let current = published_within_bound(&published, 1).await?;
+
+        assert_eq!(declarations_named(&current, "edited")?, 1);
+        assert_eq!(declarations_named(&current, "beacon")?, 0);
+        assert_eq!(
+            current.reads.file_digest(&other),
+            startup.reads.file_digest(&other)
+        );
+        let current_revision = current.reads.tree_revision();
+        commit_state_within_bound(&lane, current_revision, LexicalCommitState::Settled).await?;
+        let calls = double.calls();
+        assert_eq!(
+            calls.last(),
+            Some(&("apply", current_revision.to_owned())),
+            "the change commits under the rebuilt tree revision: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|(form, _)| *form == "clear").count(),
+            1,
+            "only the startup snapshot's whole write clears the store: {calls:?}"
+        );
+        assert_eq!(
+            double.applied().last(),
+            Some(&vec![lib]),
+            "the change names the edited file alone"
+        );
+        validation.cancellation.cancel();
+        supervisor.await?;
+        Ok(())
+    }
+
+    /// A `rift.toml` written while the startup scan runs replaces the policy that scan read
+    /// under, so the scan cannot answer it: startup captures the workspace again, and the
+    /// second scan publishes under the configuration now on disk.
+    #[tokio::test]
+    async fn a_configuration_written_during_the_startup_scan_captures_the_workspace_again()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let lib = rift_core::ProjectPath::new("lib.rs")?;
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let excluding = "[source]\nexclude = [\"other.rs\"]\n";
+        let (capture, scans) =
+            written_during_first_scan(directory.path(), &validation, "rift.toml", excluding)?;
+        let limits = WorkspaceIndexLimits::default();
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            2,
+            "the first scan read under the configuration the write replaced"
+        );
+        assert_eq!(published.epoch, validation.observed_epoch());
+        assert_eq!(
+            published.configuration.fingerprint,
+            super::configuration_fingerprint(directory.path())
+        );
+        assert!(published.reads.file_digest(&lib).is_some());
+        assert!(
+            published.reads.file_digest(&other).is_none(),
+            "the written policy excludes other.rs"
+        );
         Ok(())
     }
 
