@@ -1462,7 +1462,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
+                "description": "The full-text tier did not rank this answer, so it came from identifier matching\nalone: a query phrased as prose finds nothing. The tier is still committing the\ncaptured tree, missed a commit, holds no indexed tree, failed to load, got no\ndatabase connection within `[search] busy_timeout`, or still answers for a newer\npublication after the request's capture attempts; `detail` names which, and what\nclears it.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -3933,7 +3933,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
+                "description": "The full-text tier did not rank this answer, so it came from identifier matching\nalone: a query phrased as prose finds nothing. The tier is still committing the\ncaptured tree, missed a commit, holds no indexed tree, failed to load, got no\ndatabase connection within `[search] busy_timeout`, or still answers for a newer\npublication after the request's capture attempts; `detail` names which, and what\nclears it.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
@@ -6670,7 +6670,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The full-text tier is not answering, so the answer came from identifier matching\nalone: a query phrased as prose finds nothing. The tier failed to load or holds no\nindexed tree, and will not answer without operator action.",
+                "description": "The full-text tier did not rank this answer, so it came from identifier matching\nalone: a query phrased as prose finds nothing. The tier is still committing the\ncaptured tree, missed a commit, holds no indexed tree, failed to load, got no\ndatabase connection within `[search] busy_timeout`, or still answers for a newer\npublication after the request's capture attempts; `detail` names which, and what\nclears it.",
                 "properties": {
                   "code": {
                     "const": "lexical_ranking_unavailable",
