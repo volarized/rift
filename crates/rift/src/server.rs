@@ -1369,6 +1369,94 @@ mod tests {
         Ok((listener, port))
     }
 
+    /// Most connections [`unaccepting_port`] makes before one of them waits: well past the
+    /// backlog of 128 that std gives every listener on every platform.
+    const BACKLOG_FILL_MAX: usize = 1_024;
+    /// Bound on one of those connections; the first that outlasts it met a full backlog.
+    const BACKLOG_FILL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Probes the slow-probe cases allow: a one-second window at the poll interval.
+    const SLOW_PROBE_ATTEMPT_COUNT: u32 = 10;
+    /// Least one probe of an [`unaccepting_port`] costs for the slow-probe cases to measure
+    /// anything: most of the probe's connect timeout.
+    const SLOW_PROBE_COST_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// A loopback listener that accepts nothing, the connections holding its backlog full,
+    /// and its port.
+    ///
+    /// A connect to that port neither completes nor is refused at once: the full queue
+    /// leaves the handshake unanswered, so a probe spends its whole connect timeout. That is
+    /// the cost every probe of a refusing port pays on Windows, where a refused connect is
+    /// retried rather than failed.
+    fn unaccepting_port() -> TestResult<(std::net::TcpListener, Vec<std::net::TcpStream>, u16)> {
+        let (listener, port) = answering_port()?;
+        let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut queued = Vec::new();
+        for _ in 0..BACKLOG_FILL_MAX {
+            match std::net::TcpStream::connect_timeout(&address, BACKLOG_FILL_CONNECT_TIMEOUT) {
+                Ok(connection) => queued.push(connection),
+                Err(_full) => return Ok((listener, queued, port)),
+            }
+        }
+        Err(format!("the backlog took {BACKLOG_FILL_MAX} connections without filling").into())
+    }
+
+    /// A held election whose published document names an [`unaccepting_port`], with the
+    /// cost one probe of it takes, checked against [`SLOW_PROBE_COST_MIN`].
+    struct SlowProbeHolder {
+        guard: rift_mcp::ElectionGuard,
+        document: ServerLock,
+        probe_cost: std::time::Duration,
+        _listener: std::net::TcpListener,
+        _queued: Vec<std::net::TcpStream>,
+    }
+
+    impl SlowProbeHolder {
+        fn publish(root: &std::path::Path) -> TestResult<Self> {
+            let (listener, queued, port) = unaccepting_port()?;
+            let guard = rift_mcp::claim(root)?;
+            let document = ServerLock {
+                pid: std::process::id(),
+                ..holder_on(port)
+            };
+            guard.publish(&document)?;
+            let probed = std::time::Instant::now();
+            let presence = rift_mcp::probe(root);
+            let probe_cost = probed.elapsed();
+            assert!(
+                matches!(
+                    presence,
+                    rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { .. })
+                ),
+                "a port that accepts nothing is unreachable: {presence:?}"
+            );
+            assert!(
+                probe_cost >= SLOW_PROBE_COST_MIN,
+                "a probe of a port that accepts nothing spends its connect timeout: \
+                 probe_cost={probe_cost:?}, expected at least {SLOW_PROBE_COST_MIN:?}"
+            );
+            Ok(Self {
+                guard,
+                document,
+                probe_cost,
+                _listener: listener,
+                _queued: queued,
+            })
+        }
+
+        /// Asserts a wait over [`SLOW_PROBE_ATTEMPT_COUNT`] probes ended inside the window
+        /// they span, allowing the probes already under way when it closed.
+        fn assert_within_window(&self, what: &str, waited: std::time::Duration) {
+            let window = PRESENCE_POLL_INTERVAL * SLOW_PROBE_ATTEMPT_COUNT;
+            let allowed = window + self.probe_cost * 3;
+            assert!(
+                waited <= allowed,
+                "{what} must end inside its window however long each probe takes: \
+                 waited={waited:?}, window={window:?}, probe_cost={:?}, allowed={allowed:?}",
+                self.probe_cost
+            );
+        }
+    }
+
     /// A stand-in for the spawned server: running until told otherwise, and
     /// then exited the way `exit` names.
     #[derive(Debug)]
@@ -2204,6 +2292,80 @@ mod tests {
         );
         drop(guard);
         await_election_released(directory.path(), pid, 1).await?;
+        Ok(())
+    }
+
+    /// A stop wait whose every probe spends its connect timeout still ends at its window,
+    /// as it does on Windows, where every probe of the port a stopping server closed pays
+    /// that cost.
+    #[tokio::test]
+    async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let process = ProcessExit::open(holder.document.pid);
+        let started = std::time::Instant::now();
+        let error = await_stopped(
+            directory.path(),
+            holder.document.clone(),
+            process,
+            SLOW_PROBE_ATTEMPT_COUNT,
+        )
+        .await
+        .expect_err("a holder that keeps the election times the stop wait out");
+        holder.assert_within_window("the stop wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::StopTimedOut { .. }),
+            "{error:?}"
+        );
+        drop(holder.guard);
+        Ok(())
+    }
+
+    /// The wait for a holder to release its election ends at its window under slow probes.
+    #[tokio::test]
+    async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let started = std::time::Instant::now();
+        let error = await_election_released(
+            directory.path(),
+            holder.document.pid,
+            SLOW_PROBE_ATTEMPT_COUNT,
+        )
+        .await
+        .expect_err("a holder that keeps the election times the wait out");
+        holder.assert_within_window("the election wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::ElectionUnreleased { .. }),
+            "{error:?}"
+        );
+        drop(holder.guard);
+        Ok(())
+    }
+
+    /// The start wait ends at its window under slow probes, and its closing probe is the
+    /// one probe it adds past the window.
+    #[tokio::test]
+    async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let started = std::time::Instant::now();
+        let error = await_serving(
+            directory.path(),
+            SLOW_PROBE_ATTEMPT_COUNT,
+            None,
+            &mut spawns,
+            no_launch,
+        )
+        .await
+        .expect_err("a holder whose port accepts nothing never serves this start");
+        holder.assert_within_window("the start wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::StartTimedOut),
+            "{error:?}"
+        );
+        drop(holder.guard);
         Ok(())
     }
 
