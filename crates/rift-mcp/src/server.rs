@@ -6311,9 +6311,8 @@ mod tests {
     /// held unparsed, with the fields a left-out file's record carries, and no record calls
     /// it left out.
     ///
-    /// Each whole scan of the tree records the file once. A filesystem event that lands
-    /// during the startup scan supersedes it and startup scans again, and a later event that
-    /// asks for the whole workspace rescans it, so the page holds one such record per whole
+    /// Each whole scan of the tree records the file once, and a filesystem event that asks
+    /// for the whole workspace starts another, so the page holds one such record per whole
     /// scan. The index work stops before the drain does, so a rescan still running then
     /// closes first and the page holds both of its records.
     #[tokio::test]
