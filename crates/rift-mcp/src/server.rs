@@ -6076,6 +6076,7 @@ done
                     executable_digest,
                 )
             },
+            None,
         )
         .await?;
         let server = assembled.supervised().await;
