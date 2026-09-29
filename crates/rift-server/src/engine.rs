@@ -1083,14 +1083,18 @@ impl EngineSlot {
                 }
                 dead => {
                     if let Some(dead) = dead {
-                        self.reap(dead).await;
+                        // Boxed: a reap awaits the session's shutdown request, which
+                        // would otherwise size every exchange's future.
+                        Box::pin(self.reap(dead)).await;
                     }
                     // A replacement opens nothing on its own, so `begin` runs on it
                     // again, even when the session it replaces was still live.
                     exchange_started = false;
-                    let started = self
-                        .start_within_budget(&mut state.restarts, reported.take())
-                        .await?;
+                    // Boxed: a start holds a whole session and its handshake, which
+                    // would otherwise size every exchange's future.
+                    let started =
+                        Box::pin(self.start_within_budget(&mut state.restarts, reported.take()))
+                            .await?;
                     state.session.insert(started)
                 }
             };
@@ -1153,7 +1157,9 @@ impl EngineSlot {
                 return self.exhausted(absorbed, attempt, deadline.is_some());
             };
             retrying = deadline.map(|deadline| (deadline, absorbed));
-            let waited = session.read_output(now + wait, &wake).await;
+            // Boxed: the wait reads engine frames, which would otherwise size every
+            // exchange's future.
+            let waited = Box::pin(session.read_output(now + wait, &wake)).await;
             if let Err(error) = waited {
                 exchange_started = false;
                 reported = Some(error);
@@ -2033,17 +2039,17 @@ mod tests {
     }
 
     /// A `sh` engine that answers `initialize` and then announces work, answers
-    /// each request with no location once it is sent, and ends its work at the
-    /// first request `analyzing_secs` or more whole seconds after its start:
-    /// the `$/progress` end and that request's answer arrive in one read, as
-    /// they would from an engine whose end landed between two requests. It
-    /// leaves on `exit`, so a pool shutdown ends with the engine instead of at
-    /// the shutdown timeout.
+    /// each request with no location once it is sent, and ends its work with its
+    /// answer to request number `analyzing_requests`, counted from the first
+    /// request after `initialize`: the `$/progress` end and that request's
+    /// answer arrive in one read, as they would from an engine whose end landed
+    /// between two requests. Counting requests, not time, fixes the attempt
+    /// that reads the end whatever each request costs. It leaves on `exit`, so
+    /// a pool shutdown ends with the engine instead of at the shutdown timeout.
     #[cfg(unix)]
-    fn analyzing_engine(directory: &Path, analyzing_secs: u64) -> LspConfiguration {
+    fn analyzing_engine(directory: &Path, analyzing_requests: u64) -> LspConfiguration {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
-start=$(date +%s)
-ended=0
+asked=0
 while IFS= read -r header; do
   IFS= read -r blank
   length=$(printf '%s' "$header" | tr -dc 0-9)
@@ -2056,9 +2062,9 @@ while IFS= read -r header; do
     *'"method":"exit"'*)
       exit 0 ;;
     *'"id":'*)
-      if [ "$ended" -eq 0 ] && [ $(( $(date +%s) - start )) -ge ANALYZING_SECS ]; then
+      asked=$((asked + 1))
+      if [ "$asked" -eq ANALYZING_REQUESTS ]; then
         frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
-        ended=1
       fi
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
   esac
@@ -2067,7 +2073,7 @@ done
         let script = directory.join("engine.sh");
         std::fs::write(
             &script,
-            SCRIPT.replace("ANALYZING_SECS", &analyzing_secs.to_string()),
+            SCRIPT.replace("ANALYZING_REQUESTS", &analyzing_requests.to_string()),
         )
         .expect("engine script");
         let mut configuration = table("sh");
@@ -2080,11 +2086,11 @@ done
     }
 
     #[cfg(unix)]
-    fn analyzing_slot(directory: &Path, analyzing_secs: u64) -> EnginePool {
+    fn analyzing_slot(directory: &Path, analyzing_requests: u64) -> EnginePool {
         let key = LspProcessKey::named("rust");
         EnginePool::new(
             directory,
-            BTreeMap::from([(key.clone(), analyzing_engine(directory, analyzing_secs))]),
+            BTreeMap::from([(key.clone(), analyzing_engine(directory, analyzing_requests))]),
             BTreeMap::from([("rust".to_owned(), key)]),
         )
     }
@@ -2126,15 +2132,39 @@ done
         })
     }
 
+    /// Starts `slot`'s engine with one walk whose deadline has already passed.
+    ///
+    /// A walk's first attempt is bounded by no deadline, so this walk waits out
+    /// the engine's start, makes that one attempt, and ends with the session
+    /// kept. A walk after it takes its deadline on a running engine, and the
+    /// start's cost never decides whether that walk reaches a second attempt.
+    #[cfg(unix)]
+    async fn start_engine(slot: &EngineSlot) {
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = slot
+            .request_outgoing(
+                begin_immediately,
+                counted_references(&attempts),
+                finish_immediately,
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            slot.state.lock().await.session.is_some(),
+            "the engine runs once its first walk ends: {started:?}"
+        );
+    }
+
     /// An exchange that is no walk ends at the retry table's 8th attempt,
-    /// 9.75 s of waits in, while the engine reads analyzing until 13 s: an
-    /// engine whose load passes 9.75 s answers such a request with
-    /// [`EngineFault::Analyzing`], well inside the 30 s `readiness_timeout`.
+    /// 9.75 s of waits in, while the engine reads analyzing until its 9th
+    /// request: an engine whose load outlasts the retry table answers such a
+    /// request with [`EngineFault::Analyzing`], inside the default 30 s
+    /// `readiness_timeout`.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_analyzing_engine_spends_the_retry_table_before_the_readiness_timeout() {
         let directory = tempfile::tempdir().expect("workspace");
-        let pool = analyzing_slot(directory.path(), 13);
+        let pool = analyzing_slot(directory.path(), 9);
         let slot = pool
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
@@ -2154,7 +2184,16 @@ done
             EngineFault::Analyzing { attempts: 8 }
         ));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 8);
-        assert!(elapsed >= Duration::from_millis(9_750) && elapsed < Duration::from_secs(13));
+        let readiness_timeout = Duration::from_millis(
+            rift_protocol::configuration::ServerConfiguration::default()
+                .readiness_timeout
+                .milliseconds(),
+        );
+        assert!(
+            elapsed >= Duration::from_millis(9_750) && elapsed < readiness_timeout,
+            "the exchange waits the retry table's 9.75 s and ends inside the default \
+             `readiness_timeout` of {readiness_timeout:?}: {elapsed:?}"
+        );
         pool.shutdown().await;
     }
 
@@ -2251,10 +2290,10 @@ done
 
     /// A walk waits under the deadline, past the retry table's attempt
     /// bound, and reads ready one `settle_delay` after the attempt that read
-    /// the engine's end: this engine sends its end with an answer at attempt
-    /// 10, 13.75 s of waits in, and the wait that follows reads the engine
-    /// quiet 0.5 s later and ends there, so attempt 11 settles. The engine's
-    /// whole-second clock can end its work one attempt early, at attempt 9.
+    /// the engine's end: this engine sends its end with its answer to the
+    /// 10th request, attempt 10, 13.75 s of waits in, and the wait that
+    /// follows reads the engine quiet 0.5 s later and ends there, so attempt
+    /// 11 settles.
     ///
     /// The assertions read the gaps between attempt starts, so the time each
     /// request takes cannot move them: every wait before the end ran its
@@ -2264,7 +2303,7 @@ done
     #[tokio::test]
     async fn a_walk_waits_under_the_deadline_until_the_engine_reads_ready() {
         let directory = tempfile::tempdir().expect("workspace");
-        let pool = analyzing_slot(directory.path(), 13);
+        let pool = analyzing_slot(directory.path(), 10);
         let slot = pool
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
@@ -2287,10 +2326,10 @@ done
             started.elapsed()
         );
         assert_eq!(answer, OutgoingAnswer::Ready(0));
-        assert!(
-            (10..=11).contains(&stamps.len()),
-            "the end arrives at attempt 9 or 10: {} attempts",
-            stamps.len()
+        assert_eq!(
+            stamps.len(),
+            11,
+            "the end arrives with attempt 10, and attempt 11 settles"
         );
 
         // The analyzing engine keeps this table's retry schedule and settle_delay.
@@ -2329,7 +2368,8 @@ done
     ///
     /// The deadline bounds the waits between attempts and the retries they
     /// lead to: the second attempt starts under it and is held past it, and
-    /// the walk abandons that attempt at the deadline and still answers.
+    /// the walk abandons that attempt at the deadline and still answers. The
+    /// engine starts before the deadline is taken ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_spent_walk_wait_answers_unsettled_and_keeps_the_session() {
@@ -2337,6 +2377,7 @@ done
         let pool = analyzing_slot(directory.path(), 50);
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Instant::now();
@@ -2465,7 +2506,8 @@ done
     /// spent answers like analyzing: an outgoing walk answers `Unsettled`
     /// and an incoming one [`EngineFault::Analyzing`], both with the session
     /// kept. A refusal that is the engine's verdict on the request stays the
-    /// walk's error once the walk's wait is spent.
+    /// walk's error once the walk's wait is spent. The retryable engine starts
+    /// before the outgoing walk's deadline is taken ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_retryable_refusal_at_a_spent_walk_wait_answers_unsettled() {
@@ -2476,6 +2518,7 @@ done
         let directory = tempfile::tempdir().expect("workspace");
         let pool = refusing_slot(directory.path(), CONTENT_MODIFIED);
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let started = Instant::now();
         let answer = slot
@@ -2663,6 +2706,12 @@ done
     /// reads unconfirmed, and the incoming read takes its repeated full report
     /// once the session is quiet past the 500 ms `settle_delay`, with the
     /// unconfirmed record, instead of spending the 9.75 s retry table.
+    ///
+    /// The attempt count carries the bound, not the clock: the first attempt
+    /// has no report to repeat, and the wait after the second runs the table's
+    /// 500 ms, one whole `settle_delay`, unless the session reads quiet sooner,
+    /// so the third attempt's answer is read quiet and settles however long
+    /// each request takes.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incoming_read_after_a_feed_settles_once_quiet_past_the_settle_delay() {
@@ -2685,10 +2734,13 @@ done
         assert!(notified.contains("other.rs"), "{notified}");
         assert!(unconfirmed, "the read records the engine unconfirmed");
         assert!(
-            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_500),
-            "{elapsed:?}"
+            elapsed >= Duration::from_millis(500),
+            "the read settles once quiet past the `settle_delay` after the feed: {elapsed:?}"
         );
-        assert!(attempts <= 4, "{attempts}");
+        assert!(
+            (2..=3).contains(&attempts),
+            "the read takes its repeated report on its second or third attempt: {attempts}"
+        );
         pool.shutdown().await;
     }
 
@@ -2723,7 +2775,8 @@ done
     /// An incoming report that never settles - a ready engine answering no reference
     /// beyond the seed's own - keeps the walk waiting until its deadline, and the spent
     /// wait answers [`EngineFault::Analyzing`] with the session kept, as a wait spent on
-    /// an engine still analyzing does.
+    /// an engine still analyzing does. The engine starts before the deadline is taken
+    /// ([`start_engine`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incoming_report_that_never_settles_ends_at_the_spent_wait_with_the_session_kept() {
@@ -2731,6 +2784,7 @@ done
         let pool = fed_slot(directory.path(), false);
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
+        start_engine(slot).await;
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deadline = Instant::now() + Duration::from_secs(1);
