@@ -5698,6 +5698,10 @@ mod tests {
     /// The sink captures under the workspace's own `[logs] capture` default, the filter a
     /// served workspace records under. Without it the lane also takes the storage driver's own
     /// trace records, and the read then waits out its bound behind thousands of them.
+    ///
+    /// A second lane exists in the process before the read, as it does under `cargo test`,
+    /// where every test is a thread of one process and builds its own. The read waits for the
+    /// lane its own thread records into, never the one built last.
     #[tokio::test]
     async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -5721,6 +5725,7 @@ mod tests {
         let server =
             RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
                 .await?;
+        let (_other_sink, _other_drain) = crate::logs::log_capture();
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
