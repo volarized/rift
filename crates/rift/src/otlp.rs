@@ -347,14 +347,16 @@ mod tests {
         assert_eq!(stderr.count("BatchSpanProcessor.SpanDroppingStarted"), 1);
         assert_eq!(stderr.count("BatchSpanProcessor.Shutdown"), 1);
         // The export task takes at most one span off the queue before the stalled export
-        // holds it, and the queue keeps one more.
+        // holds it, and the queue keeps at most one more. The provider hands the processor
+        // its resource through that same queue when it is built, so a queue the export task
+        // has not polled yet still holds the resource and refuses every span.
         let dropped = stderr
             .dropped_spans()
             .expect("the shutdown reports its dropped total");
         let spans = u64::try_from(SPANS).expect("the span count fits in u64");
         assert!(
-            (spans - 2..=spans - 1).contains(&dropped),
-            "a queue of one behind a stalled export drops all but one or two spans: dropped={dropped}, spans={spans}"
+            (spans - 2..=spans).contains(&dropped),
+            "a queue of one behind a stalled export keeps at most two spans: dropped={dropped}, spans={spans}"
         );
     }
 }
