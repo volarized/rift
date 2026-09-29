@@ -453,11 +453,14 @@ impl RiftProxy {
 /// Bound on one forwarded request: the two waits the server bounds one
 /// request by - `[server] readiness_timeout` for the workspace to be ready,
 /// `[server] worker_queue_timeout` for a free worker - and
-/// [`FORWARD_ANSWER_GRACE`] for the answer.
+/// `FORWARD_ANSWER_GRACE` for the answer.
 ///
 /// A server that has not answered within it has stopped answering, and the
 /// caller gets a refusal it can retry instead of a request that never ends.
-fn forward_budget(server: &ServerConfiguration) -> Duration {
+/// A caller that bounds the same request from outside the proxy reads the
+/// budget here, so its own bound can end after the proxy's.
+#[must_use]
+pub fn forward_budget(server: &ServerConfiguration) -> Duration {
     Duration::from_millis(server.readiness_timeout.milliseconds())
         .saturating_add(Duration::from_millis(
             server.worker_queue_timeout.milliseconds(),
