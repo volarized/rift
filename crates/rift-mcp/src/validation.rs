@@ -4512,12 +4512,25 @@ pub(crate) mod tests {
         })))
     }
 
+    /// Folder names a directory event carries: one plain, and one with a dot the way a file
+    /// name's extension has one.
+    const FOLDER_SPELLINGS: [&str; 2] = ["pkg", "pkg.v2"];
+
     /// A directory moved into the workspace reaches the watcher as one `Create(Any)` on
     /// Windows, with no event for the files it carries. It names a directory on disk, so
-    /// the rebuild reads the whole workspace and indexes those files, also under a policy
-    /// whose globs name only the files below it.
+    /// the rebuild reads the whole workspace and indexes those files, whatever the folder's
+    /// name looks like, and also under a policy whose globs name only the files below it.
     #[tokio::test]
     async fn a_directory_moved_in_as_create_any_is_read_whole() -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            moved_in_as_create_any(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Moves `folder` into the workspace, reports it as `Create(Any)`, and proves the
+    /// rebuild indexes the files it carried.
+    async fn moved_in_as_create_any(folder: &str) -> TestResult {
         let directory = tempfile::tempdir()?;
         let elsewhere = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
@@ -4529,57 +4542,70 @@ pub(crate) mod tests {
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let state = installed_state(directory.path(), &validation)?;
-        fs::create_dir_all(elsewhere.path().join("pkg"))?;
-        fs::write(elsewhere.path().join("pkg/mod.rs"), "pub fn arrived() {}\n")?;
-        fs::rename(
-            elsewhere.path().join("pkg"),
-            directory.path().join("src/pkg"),
+        fs::create_dir_all(elsewhere.path().join(folder))?;
+        fs::write(
+            elsewhere.path().join(folder).join("mod.rs"),
+            "pub fn arrived() {}\n",
         )?;
+        let moved_in = directory.path().join("src").join(folder);
+        fs::rename(elsewhere.path().join(folder), &moved_in)?;
         let roots = super::WatchRoots::resolve(directory.path())?;
-        let moved_in = roots.canonical().join("src/pkg");
-        let created = event_at(EventKind::Create(CreateKind::Any), &moved_in);
+        let event_path = roots.canonical().join("src").join(folder);
+        let created = event_at(EventKind::Create(CreateKind::Any), &event_path);
         super::report_watch_outcome(&roots, &validation, Ok(created));
 
         let whole = validation.locked_pending().covers_whole_workspace();
-        assert!(whole, "a directory on disk carries files no event named");
+        assert!(
+            whole,
+            "{folder}: a directory on disk carries files no event named"
+        );
         let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
-        assert_eq!(outcome, RebuildOutcome::Published);
+        assert_eq!(outcome, RebuildOutcome::Published, "{folder}");
         let current = Arc::clone(&state.read().await.current);
-        assert_eq!(declarations_named(&current, "arrived")?, 1);
-        assert_eq!(declarations_named(&current, "beacon")?, 1);
+        assert_eq!(declarations_named(&current, "arrived")?, 1, "{folder}");
+        assert_eq!(declarations_named(&current, "beacon")?, 1, "{folder}");
         Ok(())
     }
 
     /// A directory removed, or moved out, reaches the watcher as one `Remove(Any)` on
     /// Windows when none of its files were reported first. The publication holds files
-    /// below that path, so the rebuild reads the whole workspace and they leave the index.
+    /// below that path, whatever its name looks like, so the rebuild reads the whole
+    /// workspace and they leave the index.
     #[tokio::test]
     async fn a_directory_removed_as_remove_any_is_read_whole() -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            removed_as_remove_any(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes `folder` from the workspace, reports it as `Remove(Any)`, and proves its
+    /// files leave the index.
+    async fn removed_as_remove_any(folder: &str) -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::create_dir_all(directory.path().join("src/pkg"))?;
+        let removed_folder = directory.path().join("src").join(folder);
+        fs::create_dir_all(&removed_folder)?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            directory.path().join("src/pkg/mod.rs"),
-            "pub fn departed() {}\n",
-        )?;
+        fs::write(removed_folder.join("mod.rs"), "pub fn departed() {}\n")?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let state = installed_state(directory.path(), &validation)?;
-        fs::remove_dir_all(directory.path().join("src/pkg"))?;
+        fs::remove_dir_all(&removed_folder)?;
         let roots = super::WatchRoots::resolve(directory.path())?;
-        let removed = event_at(
-            EventKind::Remove(RemoveKind::Any),
-            &roots.canonical().join("src/pkg"),
-        );
+        let event_path = roots.canonical().join("src").join(folder);
+        let removed = event_at(EventKind::Remove(RemoveKind::Any), &event_path);
         super::report_watch_outcome(&roots, &validation, Ok(removed));
 
         let whole = validation.locked_pending().covers_whole_workspace();
-        assert!(whole, "the publication holds files below the removed path");
+        assert!(
+            whole,
+            "{folder}: the publication holds files below the removed path"
+        );
         let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
-        assert_eq!(outcome, RebuildOutcome::Published);
+        assert_eq!(outcome, RebuildOutcome::Published, "{folder}");
         let current = Arc::clone(&state.read().await.current);
-        assert_eq!(declarations_named(&current, "departed")?, 0);
-        assert_eq!(declarations_named(&current, "beacon")?, 1);
+        assert_eq!(declarations_named(&current, "departed")?, 0, "{folder}");
+        assert_eq!(declarations_named(&current, "beacon")?, 1, "{folder}");
         Ok(())
     }
 
@@ -4613,6 +4639,33 @@ pub(crate) mod tests {
                 "{kind:?} {path} names that file alone"
             );
         }
+        Ok(())
+    }
+
+    /// A path observed before a publication held files below it can name a directory that
+    /// has left the disk since. Reading the path finds nothing, so the change set reads the
+    /// whole workspace instead of keeping the files the publication holds below it.
+    #[test]
+    fn a_change_set_naming_a_directory_gone_from_the_disk_reads_whole() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("pkg"))?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("pkg/mod.rs"),
+            "pub fn departed() {}\n",
+        )?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::remove_dir_all(directory.path().join("pkg"))?;
+        let request = RebuildRequest {
+            epoch: 1,
+            work: super::PendingWork::naming([rift_core::ProjectPath::new("pkg")?]),
+            previous: Some(previous),
+        };
+        let configuration = ConfigurationState::accept(directory.path());
+        assert_eq!(
+            request.change_set(directory.path(), &configuration),
+            ChangeSet::Full
+        );
         Ok(())
     }
 
@@ -5595,27 +5648,38 @@ pub(crate) mod tests {
     }
 
     /// A directory renamed out of the workspace while the startup scan runs leaves one name
-    /// event and no file event for what it held, and before the first publication nothing
-    /// says the scan read files below it: startup captures the workspace again, and the
+    /// event and no file event for what it held, whatever its name looks like. Before the
+    /// first publication no index says what the scan read below it, and the scan holds files
+    /// below a path gone from the disk: startup captures the workspace again, and the
     /// publication holds none of them.
     #[tokio::test]
     async fn a_directory_renamed_away_during_the_startup_scan_captures_the_workspace_again()
     -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            renamed_away_during_the_startup_scan(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Renames `folder` out of the workspace during the startup scan, and proves the
+    /// publication that startup makes holds none of its files.
+    async fn renamed_away_during_the_startup_scan(folder: &str) -> TestResult {
         let directory = tempfile::tempdir()?;
         let elsewhere = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::create_dir_all(directory.path().join("pkg"))?;
+        fs::create_dir_all(directory.path().join(folder))?;
         fs::write(
-            directory.path().join("pkg/mod.rs"),
+            directory.path().join(folder).join("mod.rs"),
             "pub fn departed() {}\n",
         )?;
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let blocking = BlockingExecutor::isolated(2, 60_000);
-        let destination = elsewhere.path().join("pkg");
+        let destination = elsewhere.path().join(folder);
+        let renamed = folder.to_owned();
         let rename_away = move |root: &std::path::Path| {
-            fs::rename(root.join("pkg"), &destination).expect("the fixture rename lands");
-            name_event(root, "pkg")
+            fs::rename(root.join(&renamed), &destination).expect("the fixture rename lands");
+            name_event(root, &renamed)
         };
         let (capture, scans) =
             changed_during_first_scan(directory.path(), &validation, rename_away)?;
@@ -5632,10 +5696,10 @@ pub(crate) mod tests {
         assert_eq!(
             scans.load(Ordering::Relaxed),
             2,
-            "the first scan read files below the directory that left"
+            "{folder}: the first scan read files below the directory that left"
         );
-        assert_eq!(declarations_named(&published, "departed")?, 0);
-        assert_eq!(declarations_named(&published, "beacon")?, 1);
+        assert_eq!(declarations_named(&published, "departed")?, 0, "{folder}");
+        assert_eq!(declarations_named(&published, "beacon")?, 1, "{folder}");
         Ok(())
     }
 
