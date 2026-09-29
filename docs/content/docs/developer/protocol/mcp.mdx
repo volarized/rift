@@ -1039,11 +1039,13 @@ The search ranking tiers carry their own warnings:
 - `vector_ranking_unavailable` - the vector ranking will not answer for the life of this
   server: the model weights could not be acquired, or the model failed to load.
 - `lexical_ranking_unavailable` - the full-text tier has not yet committed the captured tree,
-  missed a commit, failed to load, or holds no indexed tree; the `detail` names which, and the
-  tree revision. Ranking falls back to identifier matching, so a query phrased as prose finds
-  nothing; the tier is read under the answer's own tree revision, so one that has moved past it
-  is recaptured rather than warned about, a case a caller cannot otherwise tell apart from a
-  tier that searched and found nothing. A read waits for a commit in flight until its
+  missed a commit, holds no indexed tree, failed to load, got no database connection within
+  `[search] busy_timeout`, or still answers for a newer publication after the request's capture
+  attempts; the `detail` names which, with the tree revision in the first three cases. Ranking
+  falls back to identifier matching, so a query phrased as prose finds nothing; the tier is read
+  under the answer's own tree revision, so one that has moved past it is recaptured, up to those
+  attempts, rather than warned about, a case a caller cannot otherwise tell apart from a tier
+  that searched and found nothing. A read waits for a commit in flight until its
   `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
   budget with everything else the read waits for.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits

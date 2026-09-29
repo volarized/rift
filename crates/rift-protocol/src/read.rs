@@ -1089,9 +1089,12 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// The full-text tier is not answering, so the answer came from identifier matching
-    /// alone: a query phrased as prose finds nothing. The tier failed to load or holds no
-    /// indexed tree, and will not answer without operator action.
+    /// The full-text tier did not rank this answer, so it came from identifier matching
+    /// alone: a query phrased as prose finds nothing. The tier is still committing the
+    /// captured tree, missed a commit, holds no indexed tree, failed to load, got no
+    /// database connection within `[search] busy_timeout`, or still answers for a newer
+    /// publication after the request's capture attempts; `detail` names which, and what
+    /// clears it.
     LexicalRankingUnavailable {
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
