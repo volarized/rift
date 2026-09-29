@@ -191,16 +191,22 @@ fn initialize_tracing(
         StderrPolicy::Unbounded => BoxMakeWriter::new(std::io::stderr),
         StderrPolicy::Bounded => BoxMakeWriter::new(rift_mcp::BoundedStderr::default()),
     };
+    let mut stderr_layer = tracing_subscriber::fmt::layer()
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_writer(writer);
+    // Escape codes color a terminal. A pipe or a file hands them to its reader as bytes:
+    // `rift mcp` keeps a spawned server's first startup lines verbatim, and the codes
+    // nearly double each line.
+    if !std::io::stderr().is_terminal() {
+        stderr_layer.set_ansi(false);
+    }
     let (otlp_layer, otlp_export) = otlp::layer();
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::fmt::layer()
-                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-                .with_writer(writer)
-                .with_filter(stderr_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
-                )),
+            stderr_layer.with_filter(stderr_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_FILTER)),
+            )),
         )
         .with(sink)
         .with(otlp_layer)
