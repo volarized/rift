@@ -493,18 +493,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             .as_array()
             .is_some_and(|include| include.iter().any(|value| value == "score"));
         for hit in results {
-            // A hit is addressed by exactly one of `path` and `unit`; a file hit carries
-            // `unit` only for a package file, which a package scope alone reaches.
-            assert!(
-                hit.get("path").is_some() != hit.get("unit").is_some(),
-                "a search hit carries exactly one of path and unit: {hit:#}"
-            );
-            if hit["hit"]["target"] == json!("file") {
-                assert!(
-                    hit.get("path").is_some() || reaches_dependencies,
-                    "a project-scoped file hit carries its project path: {hit:#}"
-                );
-            }
+            assert_search_hit_address(hit, reaches_dependencies);
             if source_requested {
                 assert!(
                     !hit["source"].is_null(),
@@ -530,6 +519,29 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 );
             }
         }
+    }
+}
+
+/// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
+/// carries `unit` only for a package file, which a package scope alone reaches. A commit
+/// hit carries neither.
+fn assert_search_hit_address(hit: &Value, reaches_dependencies: bool) {
+    if hit["hit"]["target"] == json!("commit") {
+        assert!(
+            hit.get("path").is_none() && hit.get("unit").is_none(),
+            "a commit hit carries neither path nor unit: {hit:#}"
+        );
+        return;
+    }
+    assert!(
+        hit.get("path").is_some() != hit.get("unit").is_some(),
+        "a search hit in a file carries exactly one of path and unit: {hit:#}"
+    );
+    if hit["hit"]["target"] == json!("file") {
+        assert!(
+            hit.get("path").is_some() || reaches_dependencies,
+            "a project-scoped file hit carries its project path: {hit:#}"
+        );
     }
 }
 
@@ -1422,6 +1434,7 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
     };
 
     assert_validates(output_validator, &structured, "commit search result");
+    assert_wire_hygiene("search", &request, &structured);
     let commit = &structured["results"][0]["hit"]["commit"];
     assert_eq!(structured["results"][0]["hit"]["target"], json!("commit"));
     assert_eq!(commit["message"], json!("introduce the change witness\n"));
