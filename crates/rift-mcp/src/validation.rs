@@ -4465,6 +4465,130 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One event whose kind does not say what it names, as notify reports every
+    /// `FILE_ACTION_ADDED` and `FILE_ACTION_REMOVED` on Windows.
+    fn event_at(kind: EventKind, path: &std::path::Path) -> Event {
+        Event::new(kind).add_path(path.to_path_buf())
+    }
+
+    /// One publication over `root`, installed for `validation`'s event classification, and
+    /// the state a rebuild publishes into.
+    fn installed_state(
+        root: &std::path::Path,
+        validation: &IndexValidation,
+    ) -> TestResult<Arc<RwLock<IndexState>>> {
+        let current = stable_candidate(root, 0)?;
+        validation.install_publication(&current);
+        Ok(Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        })))
+    }
+
+    /// A directory moved into the workspace reaches the watcher as one `Create(Any)` on
+    /// Windows, with no event for the files it carries. It names a directory on disk, so
+    /// the rebuild reads the whole workspace and indexes those files, also under a policy
+    /// whose globs name only the files below it.
+    #[tokio::test]
+    async fn a_directory_moved_in_as_create_any_is_read_whole() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\ninclude = [\"src/**/*.rs\"]\n",
+        )?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        fs::create_dir_all(elsewhere.path().join("pkg"))?;
+        fs::write(elsewhere.path().join("pkg/mod.rs"), "pub fn arrived() {}\n")?;
+        fs::rename(
+            elsewhere.path().join("pkg"),
+            directory.path().join("src/pkg"),
+        )?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let moved_in = roots.canonical().join("src/pkg");
+        let created = event_at(EventKind::Create(CreateKind::Any), &moved_in);
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+
+        let whole = validation.locked_pending().covers_whole_workspace();
+        assert!(whole, "a directory on disk carries files no event named");
+        let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let current = Arc::clone(&state.read().await.current);
+        assert_eq!(declarations_named(&current, "arrived")?, 1);
+        assert_eq!(declarations_named(&current, "beacon")?, 1);
+        Ok(())
+    }
+
+    /// A directory removed, or moved out, reaches the watcher as one `Remove(Any)` on
+    /// Windows when none of its files were reported first. The publication holds files
+    /// below that path, so the rebuild reads the whole workspace and they leave the index.
+    #[tokio::test]
+    async fn a_directory_removed_as_remove_any_is_read_whole() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src/pkg"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("src/pkg/mod.rs"),
+            "pub fn departed() {}\n",
+        )?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        fs::remove_dir_all(directory.path().join("src/pkg"))?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let removed = event_at(
+            EventKind::Remove(RemoveKind::Any),
+            &roots.canonical().join("src/pkg"),
+        );
+        super::report_watch_outcome(&roots, &validation, Ok(removed));
+
+        let whole = validation.locked_pending().covers_whole_workspace();
+        assert!(whole, "the publication holds files below the removed path");
+        let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let current = Arc::clone(&state.read().await.current);
+        assert_eq!(declarations_named(&current, "departed")?, 0);
+        assert_eq!(declarations_named(&current, "beacon")?, 1);
+        Ok(())
+    }
+
+    /// A file created or removed with a kind that does not say it is a file is still one
+    /// file: it names no directory on disk and the publication holds nothing below it, so
+    /// the event names that path alone, extensionless or not.
+    #[test]
+    fn a_file_created_or_removed_as_any_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("src/gone.rs"), "pub fn gone() {}\n")?;
+        fs::write(directory.path().join("LICENSE"), "beacon\n")?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::write(directory.path().join("NOTICE"), "beacon\n")?;
+        fs::remove_file(directory.path().join("src/gone.rs"))?;
+        fs::remove_file(directory.path().join("LICENSE"))?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let created = EventKind::Create(CreateKind::Any);
+        let removed = EventKind::Remove(RemoveKind::Any);
+        for (kind, path) in [
+            (created, "src/lib.rs"),
+            (created, "NOTICE"),
+            (removed, "src/gone.rs"),
+            (removed, "LICENSE"),
+        ] {
+            let event = event_at(kind, &roots.canonical().join(path));
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &event),
+                super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(path)?]),
+                "{kind:?} {path} names that file alone"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn retained_paths_past_the_workspace_file_bound_become_a_whole_rebuild() -> TestResult {
         const PATHS_MAX: usize = 2;
