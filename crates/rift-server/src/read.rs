@@ -645,8 +645,11 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when a named path cannot be read or indexed within bounds.
+    /// Returns [`ReadError`] when this is a revision snapshot, which has no filesystem tree
+    /// to read the named paths from, or when a named path cannot be read or indexed within
+    /// bounds.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, ReadError> {
+        let source_policy = self.filesystem_policy("incremental rebuild")?;
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -661,7 +664,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
-        let context = self.context_after(changes, &index)?;
+        let context = self.context_after(source_policy, changes, &index)?;
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -686,12 +689,10 @@ impl ReadService {
     /// no file it still holds is of that language.
     fn context_after(
         &self,
+        source_policy: &WorkspaceSourcePolicy,
         changes: &PathChanges,
         index: &WorkspaceIndex,
     ) -> Result<Arc<DependencyContext>, ReadError> {
-        let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
-            unreachable!("a current-tree read service always compiles its source policy")
-        });
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.context.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
@@ -1903,8 +1904,9 @@ pub(crate) mod tests {
             )
         };
 
-        let kept = service.context_after(&changed("src/lib.rs"), &service.index)?;
-        let reread = service.context_after(&changed("Cargo.toml"), &service.index)?;
+        let policy = service.filesystem_policy("read the dependency context")?;
+        let kept = service.context_after(policy, &changed("src/lib.rs"), &service.index)?;
+        let reread = service.context_after(policy, &changed("Cargo.toml"), &service.index)?;
 
         assert!(
             std::sync::Arc::ptr_eq(&kept, &service.context),
