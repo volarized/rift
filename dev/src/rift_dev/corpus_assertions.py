@@ -346,8 +346,8 @@ def lexical_content(root: Path) -> LexicalContent:
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
         cursor = connection.execute(
-            "SELECT identity,path,kind,digest,byte_length,name,qualified_name,"
-            "identifier_terms,signature,documentation,declaration_source,file_content "
+            "SELECT identity,path,kind,digest,byte_length,byte_offset,name,qualified_name,"
+            "identifier_terms,signature,documentation,file_content "
             "FROM lexical_documents WHERE path != ? ORDER BY identity",
             (PROBE_PATH,),
         )

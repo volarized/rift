@@ -1584,6 +1584,20 @@ mod tests {
         }
     }
 
+    /// The SHA-256 of an executable this test compares.
+    ///
+    /// `sha256` holds its file to `RELEASE_ARCHIVE_BYTES_MAX`, the bound of a downloaded
+    /// archive. The files here are executables, and a dev-profile build, the test binary
+    /// and the CLI the native job hands it alike, outgrows that bound.
+    #[cfg(windows)]
+    fn windows_executable_digest(path: &std::path::Path) -> Result<String, Box<dyn Error>> {
+        use sha2::{Digest as _, Sha256};
+
+        let mut digest = Sha256::new();
+        std::io::copy(&mut fs::File::open(path)?, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
@@ -1596,9 +1610,9 @@ mod tests {
             std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
                 .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?,
         )?;
-        let expected_digest = super::sha256(&candidate)?;
+        let expected_digest = windows_executable_digest(&candidate)?;
         let original = std::env::current_exe()?;
-        assert_ne!(super::sha256(&original)?, expected_digest);
+        assert_ne!(windows_executable_digest(&original)?, expected_digest);
         let directory = tempfile::tempdir()?;
         let current = directory.path().join("rift.exe");
         let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
@@ -1627,8 +1641,8 @@ mod tests {
         })
         .await??;
         assert!(!prepared.try_exists()?);
-        assert_eq!(super::sha256(&current)?, expected_digest);
-        assert_eq!(super::sha256(&candidate)?, expected_digest);
+        assert_eq!(windows_executable_digest(&current)?, expected_digest);
+        assert_eq!(windows_executable_digest(&candidate)?, expected_digest);
 
         let version_path = directory.path().join("version.txt");
         let mut version = tokio::process::Command::new(&current)

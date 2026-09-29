@@ -30,10 +30,12 @@ use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncodi
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPathBuf};
+use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_text_size::{TextRange, TextSize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ty_project::metadata::options::{EnvironmentOptions, Options};
+use ty_project::metadata::value::RelativePathBuf;
 use ty_project::watch::{ChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as _, ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
@@ -44,6 +46,17 @@ const DUPLEX_BYTES: usize = 256 * 1024;
 /// document open carries the whole file, so the bound tracks the largest
 /// source the Python provider accepts.
 const PAYLOAD_BYTES_MAX: usize = 8 * 1024 * 1024;
+
+/// The scheme and empty authority ty's `VendoredPath` display puts before a vendored
+/// stub's path.
+const VENDORED_URI_PREFIX: &str = "vendored://";
+
+/// The virtual environment directory `uv sync` creates beside a project's manifest, where
+/// the dependency resolver reads a tree's installed packages.
+const TREE_ENVIRONMENT_DIRECTORY: &str = ".venv";
+
+/// The file every virtual environment holds at its root, PEP 405's `pyvenv.cfg`.
+const VIRTUAL_ENVIRONMENT_MARKER: &str = "pyvenv.cfg";
 
 /// JSON-RPC error code for a method this engine does not serve.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -345,13 +358,14 @@ fn with_database<T>(
 /// Discovery is hermetic: `discover_without_uv` runs only when the tree
 /// carries its own project marker, so semantic answers never leak past the
 /// served directory; a markerless tree gets default metadata pinned at its
-/// root.
+/// root. A tree holding a virtual environment in `.venv` resolves imports
+/// through it, as [`tree_environment`] states.
 fn built_database(root: &Path) -> Result<ProjectDatabase, String> {
     let has_marker = root.join("pyproject.toml").is_file() || root.join("ty.toml").is_file();
     let system_root = SystemPathBuf::from_path_buf(root.to_path_buf())
         .map_err(|path| format!("tree root is not UTF-8: {}", path.display()))?;
     let system = OsSystem::new(&system_root);
-    let metadata = if has_marker {
+    let mut metadata = if has_marker {
         ProjectMetadata::discover_without_uv(&system_root, &system)
             .map_err(|error| format!("ty project discovery: {error}"))?
     } else {
@@ -360,7 +374,34 @@ fn built_database(root: &Path) -> Result<ProjectDatabase, String> {
             system_root.clone(),
         )
     };
+    if let Some(environment) = tree_environment(&system_root) {
+        metadata.apply_fallback_options(environment);
+    }
     ProjectDatabase::fallible(metadata, system).map_err(|error| format!("ty database: {error}"))
+}
+
+/// Options naming the tree's own virtual environment as ty's Python environment, when
+/// `.venv` holds one; `None` otherwise.
+///
+/// ty takes the environment `VIRTUAL_ENV` names ahead of the tree's `.venv`, and `uv run`
+/// sets that variable to whichever project it ran in. The dependency resolver reads the
+/// tree's installed packages from `.venv`, so an engine resolving imports through another
+/// environment names callees in files no package the resolver found holds. The options
+/// sit below the project's own ty configuration, which still names another environment
+/// when it sets one.
+fn tree_environment(root: &SystemPath) -> Option<Options> {
+    let environment = root.join(TREE_ENVIRONMENT_DIRECTORY);
+    let marked = environment
+        .join(VIRTUAL_ENVIRONMENT_MARKER)
+        .as_std_path()
+        .is_file();
+    marked.then(|| Options {
+        environment: Some(EnvironmentOptions {
+            python: Some(RelativePathBuf::cli(environment)),
+            ..EnvironmentOptions::default()
+        }),
+        ..Options::default()
+    })
 }
 
 /// Feeds the database one opened document's on-disk state, so an answer
@@ -616,7 +657,7 @@ fn hierarchy_item(
     let text = source_text(database, item.file);
     let (uri, range) = match item.file.path(database).as_vendored_path() {
         Some(vendored) => (
-            vendored.to_string(),
+            vendored_uri(vendored),
             range_at(text.as_str(), item.full_range)?,
         ),
         None => match target_location(database, exchange, item.file, item.full_range)? {
@@ -632,6 +673,19 @@ fn hierarchy_item(
         "range": range,
         "selectionRange": range_at(text.as_str(), item.selection_range)?,
     })))
+}
+
+/// A vendored stub's URI, its path segments joined with `/`.
+///
+/// ty joins a vendored path with the host's separator, so on Windows the stub reads
+/// `stdlib\builtins.pyi`, and a URI spelled from it the way `VendoredPath` displays it
+/// is refused by every URI parser the answer meets.
+fn vendored_uri(path: &ruff_db::vendored::VendoredPath) -> String {
+    let segments: Vec<&str> = path
+        .components()
+        .map(|component| component.as_str())
+        .collect();
+    format!("{VENDORED_URI_PREFIX}{}", segments.join("/"))
 }
 
 /// The LSP symbol kind for a `ty_ide` one, as `ty_server` maps it.
@@ -704,6 +758,46 @@ mod tests {
     /// The URI an absolute path spells in this module's tests.
     fn uri_of(path: &Path) -> String {
         path_to_uri(path).expect("an absolute path spells a file URI")
+    }
+
+    /// ty joins a vendored stub's path with the host's separator, as `join` does here, and
+    /// the URI joins its segments with `/` on every host.
+    #[test]
+    fn test_a_vendored_stub_uri_joins_its_segments_with_a_slash() {
+        let stub = ruff_db::vendored::VendoredPath::new("stdlib").join("builtins.pyi");
+        assert_eq!(
+            vendored_uri(stub.as_path()),
+            "vendored://stdlib/builtins.pyi"
+        );
+    }
+
+    #[test]
+    fn test_a_tree_with_a_virtual_environment_names_it_as_the_python_environment() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let root = SystemPathBuf::from_path_buf(directory.path().to_path_buf())
+            .expect("a UTF-8 temporary root");
+        assert!(
+            tree_environment(&root).is_none(),
+            "a tree without `.venv` leaves discovery to ty"
+        );
+
+        std::fs::create_dir(directory.path().join(".venv")).expect("environment directory");
+        assert!(
+            tree_environment(&root).is_none(),
+            "a `.venv` without `pyvenv.cfg` is no virtual environment"
+        );
+
+        std::fs::write(
+            directory.path().join(".venv/pyvenv.cfg"),
+            "home = /usr/bin\n",
+        )
+        .expect("environment marker");
+        let options = tree_environment(&root).expect("a marked `.venv` names the environment");
+        let python = options
+            .environment
+            .and_then(|environment| environment.python)
+            .expect("the options name a Python environment");
+        assert_eq!(python.path(), root.join(".venv").as_path());
     }
 
     #[test]

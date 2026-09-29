@@ -2544,10 +2544,7 @@ done
 
     /// One embedded walk from `root` in `directory`'s `graph.py`, opened as
     /// it stands on disk: the answer, the attempts it took, and its time.
-    async fn walk_from_root(
-        slot: &EngineSlot,
-        directory: &Path,
-    ) -> (OutgoingAnswer<usize>, u64, Duration) {
+    async fn walk_from_root(slot: &EngineSlot, directory: &Path) -> (OutgoingAnswer<usize>, u64) {
         let source = std::fs::read_to_string(directory.join("graph.py")).expect("source reads");
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counted = Arc::clone(&attempts);
@@ -2581,45 +2578,40 @@ done
             )
             .await
             .expect("the walk settles");
-        (
-            answer,
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            started.elapsed(),
-        )
+        (answer, attempts.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// A pool serving the embedded engine for Python over `directory`, and
     /// the key of its one slot.
-    fn embedded_pool(directory: &Path) -> (EnginePool, LspProcessKey, Duration) {
+    fn embedded_pool(directory: &Path) -> (EnginePool, LspProcessKey) {
         let mut configuration = table("ty");
         configuration.command = None;
         configuration.embedded = Some(EmbeddedEngine::Ty);
         configuration.initialization_options = None;
-        let settle_delay = Duration::from_millis(configuration.settle_delay.milliseconds());
         let key = LspProcessKey::named("python");
         let pool = EnginePool::new(
             directory,
             BTreeMap::from([(key.clone(), configuration)]),
             BTreeMap::from([("python".to_owned(), key.clone())]),
         );
-        (pool, key, settle_delay)
+        (pool, key)
     }
 
     /// The embedded engine declares itself ready at its start, so its
     /// first walk answers `Ready` on the first attempt instead of reading
-    /// unconfirmed until the 500 ms `settle_delay` passes.
+    /// unconfirmed until the 500 ms `settle_delay` passes. `Ready` is the
+    /// settlement of an engine reading ready alone, and one attempt means no
+    /// wait ran before it.
     #[tokio::test]
     async fn the_embedded_engine_walks_ready_on_its_first_attempt() {
         let directory = tempfile::tempdir().expect("workspace");
         let source = "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    return leaf()\n";
         std::fs::write(directory.path().join("graph.py"), source).expect("source");
-        let (pool, key, settle_delay) = embedded_pool(directory.path());
+        let (pool, key) = embedded_pool(directory.path());
         let slot = pool.engine_by_key(&key).expect("slot");
-        let (answer, attempts, elapsed) = walk_from_root(slot, directory.path()).await;
-        eprintln!("embedded first walk: elapsed={elapsed:?} answer={answer:?}");
+        let (answer, attempts) = walk_from_root(slot, directory.path()).await;
         assert_eq!(answer, OutgoingAnswer::Ready(1), "root calls leaf");
         assert_eq!(attempts, 1);
-        assert!(elapsed < settle_delay, "{elapsed:?}");
         assert_eq!(pool.state_for_key(&key), Some(LspState::Ready));
         pool.shutdown().await;
     }
@@ -2637,9 +2629,9 @@ done
             "def leaf() -> int:\n    return 1\n\ndef root() -> int:\n    return leaf()\n",
         )
         .expect("source");
-        let (pool, key, settle_delay) = embedded_pool(directory.path());
+        let (pool, key) = embedded_pool(directory.path());
         let slot = pool.engine_by_key(&key).expect("slot");
-        let (before, _, _) = walk_from_root(slot, directory.path()).await;
+        let (before, _) = walk_from_root(slot, directory.path()).await;
         assert_eq!(before, OutgoingAnswer::Ready(1), "root calls leaf");
 
         std::fs::write(
@@ -2665,11 +2657,9 @@ done
             "the declaration survives the change"
         );
 
-        let (after, attempts, elapsed) = walk_from_root(slot, directory.path()).await;
-        eprintln!("embedded walk after an edit: elapsed={elapsed:?} answer={after:?}");
+        let (after, attempts) = walk_from_root(slot, directory.path()).await;
         assert_eq!(after, OutgoingAnswer::Ready(2), "root calls leaf and twig");
         assert_eq!(attempts, 1);
-        assert!(elapsed < settle_delay, "{elapsed:?}");
         assert_eq!(pool.state_for_key(&key), Some(LspState::Ready));
         pool.shutdown().await;
     }

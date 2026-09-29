@@ -492,12 +492,12 @@ class Decisions(unittest.TestCase):
 # `lexical_content` hashes.
 DOCUMENTS_TABLE = (
     "CREATE TABLE lexical_documents(identity TEXT, path TEXT, kind TEXT, digest TEXT, "
-    "byte_length INTEGER, name TEXT, qualified_name TEXT, identifier_terms TEXT, "
-    "signature TEXT, documentation TEXT, declaration_source TEXT, file_content TEXT)"
+    "byte_length INTEGER, byte_offset INTEGER, name TEXT, qualified_name TEXT, "
+    "identifier_terms TEXT, signature TEXT, documentation TEXT, file_content TEXT)"
 )
 BEACON_ROW = (
-    "INSERT INTO lexical_documents VALUES ('id','source.rs','symbol','d1',15,'beacon',"
-    "'beacon','beacon','fn beacon()','','fn beacon() {}','fn beacon() {}')"
+    "INSERT INTO lexical_documents VALUES ('id','source.rs','symbol','d1',15,NULL,"
+    "'beacon','beacon','beacon','fn beacon()','','fn beacon() {}')"
 )
 
 
@@ -546,14 +546,14 @@ class PersistedContent(unittest.TestCase):
                 before = lexical_content(root)
                 connection.execute(
                     "INSERT INTO lexical_documents VALUES ('probe',?,'symbol','d2',24,"
-                    "'corpus_probe','corpus_probe','corpus_probe','fn corpus_probe()','',"
-                    "?,?)",
-                    (PROBE_PATH, PROBE_SOURCE, PROBE_SOURCE),
+                    "NULL,'corpus_probe','corpus_probe','corpus_probe',"
+                    "'fn corpus_probe()','',?)",
+                    (PROBE_PATH, PROBE_SOURCE),
                 )
                 connection.commit()
                 self.assertEqual(lexical_content(root), before)
                 connection.execute(
-                    "UPDATE lexical_documents SET declaration_source='changed' "
+                    "UPDATE lexical_documents SET file_content='changed' "
                     "WHERE identity='id'"
                 )
                 connection.commit()
