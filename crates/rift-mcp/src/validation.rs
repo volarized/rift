@@ -6068,7 +6068,15 @@ pub(crate) mod tests {
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,
@@ -6112,7 +6120,15 @@ pub(crate) mod tests {
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,

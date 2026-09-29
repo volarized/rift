@@ -5161,7 +5161,17 @@ mod tests {
         )
         .await?;
         let server = assembled.supervised().await;
-        double.calls_within_bound(1).await?;
+        // The first write is a whole one, and a store holding nothing it can keep is cleared
+        // before a whole write lands, so the write is held once the apply follows the clear.
+        let revision = current_publication(&server)
+            .await
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![("clear", String::new()), ("apply", revision)]
+        );
         Ok((server, double))
     }
 
