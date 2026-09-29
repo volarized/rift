@@ -260,6 +260,67 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
     Ok(())
 }
 
+/// The zero-byte file under `.rift` a server claims the election on, by
+/// locking it exclusively.
+const ELECTION_FILE_NAME: &str = "server.lock";
+
+/// The record a spawned server writes when its claim meets a lock and it exits.
+const LOST_ELECTION_RECORD: &str =
+    "another rift server already serves this workspace; this process exits";
+
+/// Reads of `rift server logs` while waiting for one record, at
+/// [`PRESENCE_POLL_INTERVAL`] between reads: each read is a process start, so
+/// the wait stays well inside the proxy's start window.
+const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
+
+/// Polls `rift server logs` until it prints `record`, bounded by
+/// [`RECORD_READ_ATTEMPT_COUNT`] reads.
+async fn await_record(root: &Path, record: &str) -> TestResult {
+    for _ in 0..RECORD_READ_ATTEMPT_COUNT {
+        let printed = run_rift(root, &["server", "logs"]).await?;
+        if String::from_utf8_lossy(&printed.stdout).contains(record) {
+            return Ok(());
+        }
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+    }
+    Err(format!("no {record:?} record within {RECORD_READ_ATTEMPT_COUNT} reads").into())
+}
+
+/// A claim that meets any lock on the election file loses the start election,
+/// a shared one included. This test keeps a shared lock on the file the way a
+/// probe's lock outlives the probe on Windows, which releases a closed handle's
+/// locks lazily, so the proxy's first spawned server loses an election no
+/// process holds and exits. Once the lock goes, the proxy spawns again inside
+/// its start window, and the call is served.
+#[tokio::test]
+async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    fs::create_dir_all(root.join(".rift"))?;
+    let lingering = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(".rift").join(ELECTION_FILE_NAME))?;
+    lingering.try_lock_shared()?;
+
+    let client = proxy_client(root).await?;
+    let released = async {
+        let lost = await_record(root, LOST_ELECTION_RECORD).await;
+        lingering.unlock()?;
+        drop(lingering);
+        lost
+    };
+    let (lookup, lost) = tokio::join!(beacon_lookup(&client), released);
+    lost?;
+    assert_beacon(&lookup?);
+    serving_document(root).ok_or("a spawn after the lost election must serve")?;
+    client.cancel().await?;
+    Ok(())
+}
+
 /// The refusal an agent sees when the workspace cannot produce a server.
 ///
 /// The test holds the election itself and records a server that refuses
