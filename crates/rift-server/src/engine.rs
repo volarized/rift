@@ -2706,6 +2706,12 @@ done
     /// reads unconfirmed, and the incoming read takes its repeated full report
     /// once the session is quiet past the 500 ms `settle_delay`, with the
     /// unconfirmed record, instead of spending the 9.75 s retry table.
+    ///
+    /// The attempt count carries the bound, not the clock: the first attempt
+    /// has no report to repeat, and the wait after the second runs the table's
+    /// 500 ms, one whole `settle_delay`, unless the session reads quiet sooner,
+    /// so the third attempt's answer is read quiet and settles however long
+    /// each request takes.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incoming_read_after_a_feed_settles_once_quiet_past_the_settle_delay() {
@@ -2728,10 +2734,13 @@ done
         assert!(notified.contains("other.rs"), "{notified}");
         assert!(unconfirmed, "the read records the engine unconfirmed");
         assert!(
-            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_500),
-            "{elapsed:?}"
+            elapsed >= Duration::from_millis(500),
+            "the read settles once quiet past the `settle_delay` after the feed: {elapsed:?}"
         );
-        assert!(attempts <= 4, "{attempts}");
+        assert!(
+            (2..=3).contains(&attempts),
+            "the read takes its repeated report on its second or third attempt: {attempts}"
+        );
         pool.shutdown().await;
     }
 
