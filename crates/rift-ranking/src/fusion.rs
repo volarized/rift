@@ -228,27 +228,45 @@ impl RankingWeights {
         vector: f64,
         fusion_k: u64,
     ) -> Result<Self, RankingError> {
-        let shares = [identifier, lexical, vector];
-        let bounded = shares
-            .iter()
-            .all(|share| share.is_finite() && (0.0..=1.0).contains(share));
-        if !bounded || shares.iter().sum::<f64>() <= 0.0 {
-            return Err(RankingError::new(
-                RankingFault::new(RankingViolation::RankingWeightsInvalid).about("search.ranking"),
-            ));
-        }
-        if !(FUSION_K_MIN..=FUSION_K_MAX).contains(&fusion_k) {
-            return Err(RankingError::new(
-                RankingFault::new(RankingViolation::FusionConstantInvalid)
-                    .about("search.ranking.fusion_k"),
-            ));
-        }
-        Ok(Self {
+        let Some(violation) = weights_violation(identifier, lexical, vector, fusion_k) else {
+            return Ok(Self {
+                identifier,
+                lexical,
+                vector,
+                fusion_k,
+            });
+        };
+        let subject = match violation {
+            RankingViolation::FusionConstantInvalid => "search.ranking.fusion_k",
+            _ => "search.ranking",
+        };
+        Err(RankingError::new(
+            RankingFault::new(violation).about(subject),
+        ))
+    }
+
+    /// Names shares and a rank constant a caller writes in its own source.
+    ///
+    /// Evaluated in a `const` item, an invalid set fails to compile, so the caller holds
+    /// its weights without a runtime refusal to handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics on the values [`Self::new`] refuses, which in a `const` item is a compile
+    /// error.
+    #[must_use]
+    pub const fn fixed(identifier: f64, lexical: f64, vector: f64, fusion_k: u64) -> Self {
+        assert!(
+            weights_violation(identifier, lexical, vector, fusion_k).is_none(),
+            "fixed ranking weights need shares from 0 to 1 with a positive sum and a rank \
+             constant from FUSION_K_MIN to FUSION_K_MAX"
+        );
+        Self {
             identifier,
             lexical,
             vector,
             fusion_k,
-        })
+        }
     }
 
     /// The share one input carries.
@@ -266,6 +284,32 @@ impl RankingWeights {
     pub const fn fusion_k(&self) -> u64 {
         self.fusion_k
     }
+}
+
+/// The rule a set of shares and a rank constant breaks, if any: every share a finite
+/// number from 0 to 1, their sum positive, and the rank constant from [`FUSION_K_MIN`] to
+/// [`FUSION_K_MAX`]. [`RankingWeights::new`] refuses what this names, and
+/// [`RankingWeights::fixed`] refuses it at compile time.
+const fn weights_violation(
+    identifier: f64,
+    lexical: f64,
+    vector: f64,
+    fusion_k: u64,
+) -> Option<RankingViolation> {
+    let shares_bounded =
+        share_bounded(identifier) && share_bounded(lexical) && share_bounded(vector);
+    let shares_positive = identifier + lexical + vector > 0.0;
+    let constant_bounded = FUSION_K_MIN <= fusion_k && fusion_k <= FUSION_K_MAX;
+    match (shares_bounded && shares_positive, constant_bounded) {
+        (false, _) => Some(RankingViolation::RankingWeightsInvalid),
+        (true, false) => Some(RankingViolation::FusionConstantInvalid),
+        (true, true) => None,
+    }
+}
+
+/// Whether one share is a finite number from 0 to 1.
+const fn share_bounded(share: f64) -> bool {
+    share.is_finite() && 0.0 <= share && share <= 1.0
 }
 
 /// One fused result.
@@ -620,6 +664,22 @@ mod tests {
             RankingViolation::FusionConstantInvalid
         );
         assert!(RankingWeights::new(0.5, 0.5, 0.0, FUSION_K_MAX + 1).is_err());
+    }
+
+    /// A weight set fixed in a `const` item, or at run time, holds the values `new` accepts
+    /// for it.
+    #[test]
+    fn test_fixed_weights_equal_the_accepted_set() {
+        const FIXED: RankingWeights = RankingWeights::fixed(0.35, 0.35, 0.30, 60);
+        assert_eq!(FIXED, weights());
+        assert_eq!(RankingWeights::fixed(0.35, 0.35, 0.30, 60), weights());
+    }
+
+    /// Outside a `const` item, a set `new` refuses panics naming the rule it broke.
+    #[test]
+    #[should_panic(expected = "fixed ranking weights need shares from 0 to 1")]
+    fn test_fixed_weights_refuse_shares_summing_to_zero() {
+        let _ = RankingWeights::fixed(0.0, 0.0, 0.0, 60);
     }
 
     #[test]
