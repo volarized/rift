@@ -4390,6 +4390,7 @@ version = "0.0.45"
 dependencies = [
  "flate2",
  "ignore",
+ "jsonschema",
  "percent-encoding",
  "rayon",
  "rift-core",
