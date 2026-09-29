@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{WorkingForm, blob_id_of_length, pointer_size};
 use crate::Repository;
@@ -27,10 +28,43 @@ fn changed(root: &Path, base: &str, published: &[&str], paths_max: usize) -> (Ve
 
 /// A driver command that leaves a marker file behind whenever git starts it,
 /// so a test proves no read ran it.
-fn marking_driver(root: &Path) -> (std::path::PathBuf, String) {
+fn marking_driver(root: &Path) -> (PathBuf, String) {
     let marker = root.join(".git/driver-ran");
-    let command = format!("sh -c 'touch {}; cat'", marker.display());
+    let command = format!("sh -c 'touch \"{}\"; cat'", shell_path(&marker));
     (marker, command)
+}
+
+/// `path` as the shell git starts a driver through reads it. That shell takes `\` for an
+/// escape character, so a Windows path spells each separator `/`, the form Git for
+/// Windows' shell reads as the same path.
+fn shell_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// Every path below `directory`, relative to it; empty when `directory` does not exist.
+///
+/// A host with git-lfs installed configures its filter for every repository, so the
+/// fixture's own `git add` may already have run it and left `.git/lfs` behind. A read
+/// proves it stores nothing there by leaving this listing as it found it.
+fn listing(directory: &Path) -> BTreeSet<PathBuf> {
+    let mut entries = BTreeSet::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(folder) = pending.pop() {
+        let Ok(children) = fs::read_dir(&folder) else {
+            continue;
+        };
+        for child in children {
+            let path = child.expect("a listed entry").path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            let relative = path
+                .strip_prefix(directory)
+                .expect("below the listed folder");
+            entries.insert(relative.to_path_buf());
+        }
+    }
+    entries
 }
 
 #[test]
@@ -225,6 +259,8 @@ fn a_comparison_over_lfs_paths_starts_no_driver_and_stores_nothing() {
         ],
     );
 
+    let stored = listing(&root.join(".git/lfs"));
+
     let (paths, _) = changed(root, "HEAD", &[], 512);
     let repository = Repository::open(root).expect("repository");
     let head = repository.resolve("HEAD").expect("head");
@@ -251,8 +287,9 @@ fn a_comparison_over_lfs_paths_starts_no_driver_and_stores_nothing() {
 
     assert_eq!(paths, ["edited.bin"]);
     assert!(!marker.exists(), "no read starts the lfs driver");
-    assert!(
-        !root.join(".git/lfs").exists(),
+    assert_eq!(
+        listing(&root.join(".git/lfs")),
+        stored,
         "no read stores an object under .git/lfs"
     );
 }
@@ -263,7 +300,7 @@ fn the_base_side_converts_built_in_filters_and_runs_no_driver() {
     let root = directory.path();
     init(root);
     let marker = root.join(".git/driver-ran");
-    let command = format!("sh -c 'touch {}; tr a-z A-Z'", marker.display());
+    let command = format!("sh -c 'touch \"{}\"; tr a-z A-Z'", shell_path(&marker));
     git(root, &["config", "filter.upper.clean", &command]);
     git(root, &["config", "filter.upper.smudge", &command]);
     write(
