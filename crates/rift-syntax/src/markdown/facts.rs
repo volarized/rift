@@ -478,12 +478,9 @@ pub(crate) fn extract_markdown_facts(
         });
     }
     let error_ranges = sorted_unique_ranges(error_ranges);
+    let errors = ErrorRangeIndex::new(&error_ranges);
     let mut blocks = block_facts.blocks;
-    blocks.retain(|block| {
-        !error_ranges
-            .iter()
-            .any(|error| ranges_overlap(block.range, *error))
-    });
+    blocks.retain(|block| !errors.overlaps(block.range));
     let block_ranges: HashSet<ByteRange> = blocks.iter().map(|block| block.range).collect();
     links.retain(|link| block_ranges.contains(&link.block_range));
     reference_candidates.retain(|candidate| block_ranges.contains(&candidate.block_range));
@@ -1216,10 +1213,74 @@ fn nearest_kept_heading(
     None
 }
 
-fn ranges_overlap(left: ByteRange, right: ByteRange) -> bool {
-    left.start < right.end && right.start < left.end
-        || left.start == left.end && right.start <= left.start && left.start <= right.end
-        || right.start == right.end && left.start <= right.start && right.start <= left.end
+/// The error ranges of one source, prepared so each block's overlap check is a
+/// binary search instead of a scan over every error range.
+///
+/// A non-empty block overlaps a non-empty error range it shares a byte with,
+/// and an empty error range whose position lies within the block, both ends
+/// included: a zero-width missing node at a block's edge still marks it. An
+/// empty block overlaps every error range whose ends enclose its position,
+/// both ends included.
+#[derive(Debug)]
+struct ErrorRangeIndex {
+    /// The non-empty error ranges' starts, ascending, each beside the largest
+    /// end among that range and every range before it.
+    spans: Vec<(u64, u64)>,
+    /// The empty error ranges' positions, ascending.
+    points: Vec<u64>,
+}
+
+impl ErrorRangeIndex {
+    /// Indexes `error_ranges`, sorted by start as `sorted_unique_ranges`
+    /// leaves them.
+    fn new(error_ranges: &[ByteRange]) -> Self {
+        let mut spans = Vec::new();
+        let mut points = Vec::new();
+        let mut end_max = 0;
+        for range in error_ranges {
+            if range.start == range.end {
+                points.push(range.start);
+            } else {
+                end_max = end_max.max(range.end);
+                spans.push((range.start, end_max));
+            }
+        }
+        Self { spans, points }
+    }
+
+    /// Whether `range` overlaps any indexed error range.
+    fn overlaps(&self, range: ByteRange) -> bool {
+        if range.start == range.end {
+            return self.encloses(range.start);
+        }
+        self.span_overlaps(range) || self.point_within(range)
+    }
+
+    /// Whether a non-empty error range starts before `range` ends and ends
+    /// after it starts.
+    fn span_overlaps(&self, range: ByteRange) -> bool {
+        let starting_before_end = self.spans.partition_point(|(start, _)| *start < range.end);
+        starting_before_end
+            .checked_sub(1)
+            .is_some_and(|last| self.spans[last].1 > range.start)
+    }
+
+    /// Whether an empty error range lies within `range`, both ends included.
+    fn point_within(&self, range: ByteRange) -> bool {
+        let first = self.points.partition_point(|point| *point < range.start);
+        self.points
+            .get(first)
+            .is_some_and(|point| *point <= range.end)
+    }
+
+    /// Whether an error range's ends enclose `position`, both ends included.
+    fn encloses(&self, position: u64) -> bool {
+        let starting_by_position = self.spans.partition_point(|(start, _)| *start <= position);
+        let in_span = starting_by_position
+            .checked_sub(1)
+            .is_some_and(|last| self.spans[last].1 >= position);
+        in_span || self.points.binary_search(&position).is_ok()
+    }
 }
 
 fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
@@ -1350,13 +1411,78 @@ mod tests {
         );
     }
 
+    /// The pairwise overlap rule [`ErrorRangeIndex`] answers, checked one error
+    /// range at a time: the oracle the index is compared against.
+    fn ranges_overlap(left: ByteRange, right: ByteRange) -> bool {
+        left.start < right.end && right.start < left.end
+            || left.start == left.end && right.start <= left.start && left.start <= right.end
+            || right.start == right.end && left.start <= right.start && right.start <= left.end
+    }
+
+    fn range(start: u64, end: u64) -> ByteRange {
+        ByteRange { start, end }
+    }
+
+    fn overlaps_indexed(block: ByteRange, errors: &[ByteRange]) -> bool {
+        ErrorRangeIndex::new(&sorted_unique_ranges(errors.to_vec())).overlaps(block)
+    }
+
     #[test]
     fn parser_error_ranges_include_zero_width_missing_nodes() {
-        let containing = ByteRange { start: 1, end: 5 };
-        assert!(ranges_overlap(containing, ByteRange { start: 3, end: 3 }));
-        assert!(ranges_overlap(ByteRange { start: 1, end: 1 }, containing));
-        assert!(!ranges_overlap(containing, ByteRange { start: 6, end: 6 }));
-        assert!(!ranges_overlap(containing, ByteRange { start: 5, end: 8 }));
+        let containing = range(1, 5);
+        assert!(overlaps_indexed(containing, &[range(3, 3)]));
+        assert!(overlaps_indexed(range(1, 1), &[containing]));
+        assert!(!overlaps_indexed(containing, &[range(6, 6)]));
+        assert!(!overlaps_indexed(containing, &[range(5, 8)]));
+    }
+
+    #[test]
+    fn error_range_index_answers_the_pairwise_rule_for_every_small_case() {
+        let ranges: Vec<ByteRange> = (0..=5_u64)
+            .flat_map(|start| (start..=5).map(move |end| range(start, end)))
+            .collect();
+        let count = ranges.len();
+        let error_sets = (0..count).flat_map(|first| {
+            (first..count)
+                .flat_map(move |second| (second..count).map(move |third| [first, second, third]))
+        });
+        for set in error_sets {
+            let errors = set.map(|index| ranges[index]);
+            let index = ErrorRangeIndex::new(&sorted_unique_ranges(errors.to_vec()));
+            for block in &ranges {
+                assert_eq!(
+                    index.overlaps(*block),
+                    errors.iter().any(|error| ranges_overlap(*block, *error)),
+                    "the index must answer the pairwise rule: block={block:?}, errors={errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_error_ranges_drop_exactly_the_blocks_they_touch() {
+        const BLOCKS: u64 = 20_000;
+        let blocks: Vec<ByteRange> = (0..BLOCKS)
+            .map(|index| range(index * 10, index * 10 + 5))
+            .collect();
+        let errors: Vec<ByteRange> = (0..BLOCKS)
+            .filter_map(|index| match index % 4 {
+                0 | 2 => Some(range(index * 10 + 1, index * 10 + 2)),
+                1 => Some(range(index * 10 + 5, index * 10 + 5)),
+                _ => None,
+            })
+            .collect();
+        let index = ErrorRangeIndex::new(&sorted_unique_ranges(errors));
+        let kept: Vec<u64> = blocks
+            .iter()
+            .filter(|block| !index.overlaps(**block))
+            .map(|block| block.start / 10)
+            .collect();
+        let expected: Vec<u64> = (0..BLOCKS).filter(|index| index % 4 == 3).collect();
+        assert_eq!(
+            kept, expected,
+            "a span inside a block and an empty range on its end both drop it; untouched blocks stay"
+        );
     }
 
     #[test]
