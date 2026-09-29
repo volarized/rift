@@ -77,6 +77,15 @@ and not (binary_id(rift::mcp_proxy) & (
 [profile.ci.junit]
 path = "junit.xml"
 
+# The macos-15-intel runner is the slowest leg, and the SHA-256 each server
+# start computes over its own test executable has no hardware path there. Its
+# bound is the suite's 1798.9 s of summed test time, times 1.41 for the slowest
+# such runner measured, over 4 test threads, plus 42 s for `wide_node_extraction`
+# running alone: 676 s, and a third more for the suite to grow.
+[profile.ci-macos-intel]
+inherits = "ci"
+global-timeout = "900s"
+
 [profile.corpus]
 test-threads = 1
 global-timeout = "19m"

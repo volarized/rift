@@ -672,7 +672,7 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
         }
     }
     let expected = expected.ok_or_else(checksum_invalid)?;
-    let actual = sha256(archive)?;
+    let actual = archive_sha256(archive)?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(UpdateError::new(
             ErrorName::Cli(CliCode::UpdateChecksumMismatch),
@@ -684,15 +684,25 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
     Ok(())
 }
 
-fn sha256(path: &Path) -> Result<String, UpdateError> {
+/// The SHA-256 of a downloaded release archive, refusing a file past `RELEASE_ARCHIVE_BYTES_MAX`.
+fn archive_sha256(path: &Path) -> Result<String, UpdateError> {
     require_bounded_file(
         ErrorName::Cli(CliCode::UpdateArchiveInvalid),
         path,
         RELEASE_ARCHIVE_BYTES_MAX,
     )?;
-    let mut file = fs::File::open(path).map_err(checksum_error)?;
+    sha256(path).map_err(checksum_error)
+}
+
+/// The lowercase hex SHA-256 of a file's bytes, streamed from disk.
+///
+/// The work grows with the file's size and nothing here bounds it: the updater
+/// reaches this only through `archive_sha256`, which refuses a file past
+/// `RELEASE_ARCHIVE_BYTES_MAX` first.
+fn sha256(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest).map_err(checksum_error)?;
+    io::copy(&mut file, &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
@@ -1412,6 +1422,39 @@ mod tests {
         Ok(())
     }
 
+    /// The Windows update test digests a debug test binary larger than `RELEASE_ARCHIVE_BYTES_MAX`.
+    #[test]
+    fn sha256_digests_a_file_that_archive_sha256_refuses() -> TestResult {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("rift-test-binary");
+        let length = super::RELEASE_ARCHIVE_BYTES_MAX + 1;
+        fs::File::create(&executable)?.set_len(length)?;
+        let mut expected = Sha256::new();
+        std::io::copy(&mut std::io::repeat(0).take(length), &mut expected)?;
+        assert_eq!(
+            super::sha256(&executable)?,
+            format!("{:x}", expected.finalize())
+        );
+
+        let refused = super::archive_sha256(&executable)
+            .expect_err("a file past RELEASE_ARCHIVE_BYTES_MAX must be refused");
+        assert_eq!(
+            refused.descriptor().code(),
+            "update_archive_invalid",
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("incorrect size of {length} bytes")),
+            "{refused}"
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn release_members(artifact: &ReleaseArtifact) -> Vec<(String, Vec<u8>)> {
         vec![
@@ -1584,20 +1627,6 @@ mod tests {
         }
     }
 
-    /// The SHA-256 of an executable this test compares.
-    ///
-    /// `sha256` holds its file to `RELEASE_ARCHIVE_BYTES_MAX`, the bound of a downloaded
-    /// archive. The files here are executables, and a dev-profile build, the test binary
-    /// and the CLI the native job hands it alike, outgrows that bound.
-    #[cfg(windows)]
-    fn windows_executable_digest(path: &std::path::Path) -> Result<String, Box<dyn Error>> {
-        use sha2::{Digest as _, Sha256};
-
-        let mut digest = Sha256::new();
-        std::io::copy(&mut fs::File::open(path)?, &mut digest)?;
-        Ok(format!("{:x}", digest.finalize()))
-    }
-
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
@@ -1610,9 +1639,9 @@ mod tests {
             std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
                 .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?,
         )?;
-        let expected_digest = windows_executable_digest(&candidate)?;
+        let expected_digest = super::sha256(&candidate)?;
         let original = std::env::current_exe()?;
-        assert_ne!(windows_executable_digest(&original)?, expected_digest);
+        assert_ne!(super::sha256(&original)?, expected_digest);
         let directory = tempfile::tempdir()?;
         let current = directory.path().join("rift.exe");
         let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
@@ -1641,8 +1670,8 @@ mod tests {
         })
         .await??;
         assert!(!prepared.try_exists()?);
-        assert_eq!(windows_executable_digest(&current)?, expected_digest);
-        assert_eq!(windows_executable_digest(&candidate)?, expected_digest);
+        assert_eq!(super::sha256(&current)?, expected_digest);
+        assert_eq!(super::sha256(&candidate)?, expected_digest);
 
         let version_path = directory.path().join("version.txt");
         let mut version = tokio::process::Command::new(&current)

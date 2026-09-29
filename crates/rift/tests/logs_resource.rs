@@ -17,16 +17,34 @@ mod harness;
 #[expect(dead_code, reason = "shared end-to-end helper, used by sibling suites")]
 mod rust_engine;
 
+use std::io::Write as _;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
 use harness::{StopOnDrop, TestResult, proxy_client, require_success, run_rift, within, workspace};
 use rmcp::model::ReadResourceRequestParams;
+use rmcp::service::{RoleClient, RunningService};
 use serde_json::Value;
 
 /// The whole recorded set.
 const LOGS_URI: &str = "rift://logs";
-/// Reads one case spends waiting for the drain to write its first batch.
+/// Longest one case waits for a log read to answer with records, the reads included.
+///
+/// The drain writes every 250 milliseconds, and a read waits at most
+/// [`rift_mcp::LOG_SETTLE_TIMEOUT`] for it, so this covers several of those waits.
+/// With [`REPORT_WAIT_MAX`] and the proxy's [`rift_mcp::START_WAIT_MAX`] before it, the
+/// case stays inside nextest's one-minute deadline, so a server that records nothing,
+/// or stops answering, fails with a report instead of being ended silently.
+const RECORDED_WAIT_MAX: Duration = Duration::from_secs(15);
+/// Polls one case spends waiting for the follower to print a record.
 const RECORD_ATTEMPTS: u32 = 40;
-/// Wall-clock span between two of those reads.
-const RECORD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Wall-clock span between two reads, or two polls of the follower's transcript.
+const RECORD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Longest the failure report waits for `rift server logs`.
+const REPORT_WAIT_MAX: Duration = Duration::from_secs(5);
+/// Records the failure report asks `rift server logs` for.
+const REPORT_TAIL_RECORDS: &str = "40";
 /// The sentence a workspace with no recorded diagnostics prints on stderr.
 const NOTHING_RECORDED: &str = "no server diagnostics recorded for this workspace yet";
 
@@ -39,36 +57,112 @@ fn records(text: &str) -> TestResult<Vec<Value>> {
         .clone())
 }
 
-/// Reads one log URI until it answers with records, or the attempts run out.
+/// How the reads of one log URI went before the case gave up on them.
+#[derive(Debug, Default)]
+struct ReadHistory {
+    /// Reads that answered without a record.
+    answered_empty: u32,
+    /// The longest any of those reads took to answer.
+    longest_read: Duration,
+    /// The last of those answers, as the wire carried it.
+    last_answer: Option<String>,
+    /// Whether the read in flight when the wait ended had not answered.
+    stalled: bool,
+}
+
+/// Reads one log URI until it answers with records, or [`RECORDED_WAIT_MAX`] passes.
 ///
 /// The drain writes in batches, so a read issued the instant a call returns can
-/// legitimately find nothing yet. The bound is the test's: a server that
-/// records nothing fails here rather than hanging.
+/// legitimately find nothing yet. The bound is wall-clock and covers the reads
+/// themselves, since each one can wait for the drain on the server's side: at most
+/// `RECORDED_WAIT_MAX` over [`RECORD_POLL_INTERVAL`] reads run. A server that records
+/// nothing, or stops answering, fails here, and the report written to stderr names
+/// what the reads answered and what the store holds.
 async fn recorded(
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    client: &RunningService<RoleClient, ()>,
+    root: &Path,
     uri: &str,
 ) -> TestResult<Vec<Value>> {
-    for _attempt in 0..RECORD_ATTEMPTS {
-        let text = read_resource(client, uri).await?;
+    let deadline = tokio::time::Instant::now() + RECORDED_WAIT_MAX;
+    let mut history = ReadHistory::default();
+    loop {
+        let started = tokio::time::Instant::now();
+        let Ok(read) = tokio::time::timeout_at(deadline, read_resource(client, uri)).await else {
+            history.stalled = true;
+            break;
+        };
+        let text = read?;
         let found = records(&text)?;
         if !found.is_empty() {
             return Ok(found);
         }
+        history.answered_empty += 1;
+        history.longest_read = history.longest_read.max(started.elapsed());
+        history.last_answer = Some(text);
+        if tokio::time::Instant::now() + RECORD_POLL_INTERVAL >= deadline {
+            break;
+        }
         tokio::time::sleep(RECORD_POLL_INTERVAL).await;
     }
-    Err(format!("no records reached {uri} within the bound").into())
+    let report = unrecorded_report(root, uri, &history).await;
+    let _ = std::io::stderr().write_all(report.as_bytes());
+    Err(format!(
+        "no record reached {uri} within {RECORDED_WAIT_MAX:?}; the report on stderr names what \
+         the reads answered and what the store holds"
+    )
+    .into())
+}
+
+/// The report a case writes when its reads of `uri` ended without a record.
+///
+/// It is written before the case returns, because the teardown after it stops the
+/// server and can itself outlast nextest's deadline, which would drop a report left
+/// for the returned error to carry.
+async fn unrecorded_report(root: &Path, uri: &str, history: &ReadHistory) -> String {
+    let answered = format!(
+        "{} reads answered without a record, the longest after {:?}",
+        history.answered_empty, history.longest_read
+    );
+    let outcome = if history.stalled {
+        format!("a read was still unanswered when the wait ended; {answered}")
+    } else {
+        answered
+    };
+    let last_answer = history.last_answer.as_deref().unwrap_or("none");
+    let stored = stored_records(root).await;
+    format!(
+        "no record reached {uri} within {RECORDED_WAIT_MAX:?}: {outcome}\nlast answer: \
+         {last_answer}\nrift server logs --tail {REPORT_TAIL_RECORDS}:\n{stored}\n"
+    )
+}
+
+/// What `rift server logs` prints for the workspace, bounded by [`REPORT_WAIT_MAX`].
+///
+/// The command reads the store directly, apart from the server's request path, so it
+/// still answers when the server has stopped answering reads.
+async fn stored_records(root: &Path) -> String {
+    let mut command = tokio::process::Command::new(harness::rift_binary());
+    command
+        .args(["server", "logs", "--tail", REPORT_TAIL_RECORDS])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(REPORT_WAIT_MAX, command.output()).await {
+        Ok(Ok(output)) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Ok(Err(error)) => format!("the command did not run: {error}"),
+        Err(_elapsed) => format!("the command printed nothing within {REPORT_WAIT_MAX:?}"),
+    }
 }
 
 /// One resource read through the proxy, returning its single text content.
-async fn read_resource(
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    uri: &str,
-) -> TestResult<String> {
-    let answer = within(
-        "a resource read",
-        client.read_resource(ReadResourceRequestParams::new(uri.to_owned())),
-    )
-    .await??;
+async fn read_resource(client: &RunningService<RoleClient, ()>, uri: &str) -> TestResult<String> {
+    let answer = client
+        .read_resource(ReadResourceRequestParams::new(uri.to_owned()))
+        .await?;
     match answer.contents.first() {
         Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) => Ok(text.clone()),
         other => Err(format!("a log read answers with text, not {other:?}").into()),
@@ -158,7 +252,7 @@ async fn a_served_workspace_records_its_own_startup() -> TestResult {
     // One call proves the server is serving, so the records it wrote exist to be read.
     within("a search", client.list_tools(None)).await??;
 
-    let records = recorded(&client, LOGS_URI).await?;
+    let records = recorded(&client, directory.path(), LOGS_URI).await?;
 
     assert!(
         records
@@ -177,7 +271,7 @@ async fn a_component_read_returns_only_that_component() -> TestResult {
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
 
-    let records = recorded(&client, "rift://logs/component/mcp").await?;
+    let records = recorded(&client, directory.path(), "rift://logs/component/mcp").await?;
 
     for record in &records {
         assert_eq!(record["component"], "mcp", "{records:?}");
@@ -192,7 +286,7 @@ async fn the_logs_command_prints_the_recorded_set_oldest_first() -> TestResult {
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    let seen = recorded(&client, LOGS_URI).await?;
+    let seen = recorded(&client, directory.path(), LOGS_URI).await?;
     let oldest = seen
         .last()
         .and_then(|record| record["message"].as_str())
@@ -233,7 +327,7 @@ async fn the_logs_command_honors_its_tail_and_level() -> TestResult {
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    recorded(&client, LOGS_URI).await?;
+    recorded(&client, directory.path(), LOGS_URI).await?;
 
     let tailed = run_rift(directory.path(), &["server", "logs", "--tail", "1"]).await?;
     let failures = run_rift(directory.path(), &["server", "logs", "--level", "error"]).await?;
@@ -272,7 +366,7 @@ async fn a_followed_read_prints_a_record_the_server_writes_later() -> TestResult
     let _stop = StopOnDrop::new(directory.path());
     let client = proxy_client(directory.path()).await?;
     within("a tool listing", client.list_tools(None)).await??;
-    recorded(&client, LOGS_URI).await?;
+    recorded(&client, directory.path(), LOGS_URI).await?;
     let output = tempfile::tempdir()?;
     let transcript = output.path().join("followed.txt");
     let mut child = std::process::Command::new(harness::rift_binary())
