@@ -274,9 +274,12 @@ jobs:
 
       # `rustup help toolchain install` documents a comma-separated component
       # list. Install every CI component from the pinned release in one step.
+      # The minimal profile carries no `rust-src`, and the const-trait blanking
+      # test in `rift-syntax` walks the standard library's sources: without
+      # them it finds nothing to read and passes having checked nothing.
       - run: >-
           rustup toolchain install 1.98 --profile minimal
-          --component rustfmt,clippy,llvm-tools-preview
+          --component rustfmt,clippy,llvm-tools-preview,rust-src
 
       # Test binaries come from this revision's build archive.
       - run: just test target/fast.tar.zst
@@ -467,9 +470,12 @@ jobs:
       # Each runner builds for its own host, so the build passes no
       # `--target`: with one, cargo keeps RUSTFLAGS from proc-macros and build
       # scripts. The toolchain's host is therefore held to the matrix target.
+      # `rust-src` gives the const-trait blanking test in `rift-syntax` the
+      # standard library's sources to walk, as the `rust` job's install does.
       - name: Install the toolchain for this target
         run: |
           rustup target add "${{ matrix.target }}"
+          rustup component add rust-src
           rustc --print host-tuple | grep -Fx "${{ matrix.target }}"
       # The R2 secrets reach this step alone, and the sccache server it starts
       # holds them for every later compile. The Actions scope holds the write

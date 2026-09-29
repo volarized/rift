@@ -50,9 +50,8 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, local_search_page,
-    local_symbol_page, merge_patterns, merge_search, merge_symbols, package_patterns,
-    package_search, package_symbols,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, merge_patterns, merge_search,
+    merge_symbols, package_patterns, package_search, package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1704,7 +1703,7 @@ impl RiftMcp {
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
-        let (mut route, remote) = self
+        let (route, remote) = self
             .global_read(deadline, &configuration, &read_context, |client, packages| async move {
                 package_symbols(&client, requested, &packages).await
             })
@@ -1713,16 +1712,9 @@ impl RiftMcp {
             items: remote,
             warnings: mut remote_warnings,
         } = remote;
-        let mut answer = match merge_symbols(&params, limit, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.append(&mut remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_symbol_page(&params, limit, local)
-            }
-        };
+        let mut answer = merge_symbols(&params, limit, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
@@ -1924,6 +1916,7 @@ impl RiftMcp {
 
         let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -1942,7 +1935,7 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
-        let (mut route, mut remote) = self
+        let (route, mut remote) = self
             .global_read(
                 deadline,
                 &configuration,
@@ -1953,16 +1946,9 @@ impl RiftMcp {
             )
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
-        let mut answer = match merge_search(&params, limit, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.extend(remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_search_page(&params, limit, local)
-            }
-        };
+        let mut answer = merge_search(&params, limit, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
