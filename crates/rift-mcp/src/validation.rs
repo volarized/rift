@@ -7241,6 +7241,77 @@ pub(crate) mod tests {
     const BUILD_B: &str =
         "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789";
 
+    /// Spawns a lane over `index` deriving under `product_version`, hands it one
+    /// whole write of `published`, and returns the store double once the write settled.
+    async fn whole_write_under(
+        index: &Arc<SearchIndex>,
+        published: &Arc<PublishedWorkspace>,
+        product_version: &str,
+    ) -> TestResult<Arc<StoreDouble>> {
+        let revision = published.reads.tree_revision().to_owned();
+        let store = StoreDouble::new();
+        store.attach(Arc::clone(index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&store),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(product_version),
+        );
+        store.release_one();
+        lane.request(
+            super::lexical_write(published, &ChangeSet::Full),
+            Arc::clone(published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        Ok(store)
+    }
+
+    /// A restart of the same build derives under the same revision, so it keeps every
+    /// stored row. Another build - another commit, or a dirty build's new stamp - names
+    /// another product version: the next start clears the store and derives every file
+    /// again.
+    #[tokio::test]
+    async fn a_restart_keeps_rows_under_one_build_and_rederives_under_another() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = three_file_publication(directory.path())?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+
+        let first = whole_write_under(&index, &published, BUILD_A).await?;
+        let first_written = first.applied().concat();
+        assert_eq!(first_written.len(), 3, "the first start derives every file");
+
+        let restarted = whole_write_under(&index, &published, BUILD_A).await?;
+        assert!(
+            restarted.calls().iter().all(|(form, _)| *form != "clear"),
+            "the same build keeps the store: {:?}",
+            restarted.calls()
+        );
+        assert!(
+            restarted.applied().concat().is_empty(),
+            "no stored row is derived again: {:?}",
+            restarted.applied()
+        );
+
+        let changed = whole_write_under(&index, &published, BUILD_B).await?;
+        assert!(
+            changed.calls().iter().any(|(form, _)| *form == "clear"),
+            "another build clears the store: {:?}",
+            changed.calls()
+        );
+        let mut rederived = changed.applied().concat();
+        rederived.sort();
+        let mut expected = first_written;
+        expected.sort();
+        assert_eq!(
+            rederived, expected,
+            "another build derives every file again"
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_derivation_revision_moves_with_the_build_and_each_index_owned_table() -> TestResult {
         let directory = tempfile::tempdir()?;
