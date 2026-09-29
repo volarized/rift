@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
@@ -34,9 +35,13 @@ use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
     StartSpawns, StartupCapture,
 };
+use crate::validation::ConfigurationState;
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Allowance past the server's own request bounds for its answer to be
+/// rendered and to travel back to the proxy.
+const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 
 /// Failure while starting or running the stdio MCP proxy.
 pub type ProxyServeError = Error<ProxyFault>;
@@ -108,7 +113,7 @@ pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
         .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
     let proxy = RiftProxy::new(root, identity);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
-    let outcome = serve_connection(proxy, crate::transport::guarded_stdio()).await;
+    let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
     outcome
 }
@@ -186,6 +191,8 @@ struct RiftProxy {
     identity: Arc<ProductIdentity>,
     upstream: Arc<tokio::sync::Mutex<UpstreamSlot>>,
     advertised: Arc<std::sync::Mutex<Option<ServerConfig>>>,
+    /// How long one forwarded request may go unanswered: see [`forward_budget`].
+    forward_budget: Duration,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -273,12 +280,16 @@ struct Upstream {
 }
 
 impl RiftProxy {
+    /// A proxy for the workspace at `root`, bounding its forwards by the
+    /// `[server]` table the workspace accepts when the proxy starts.
     fn new(root: &Path, identity: ProductIdentity) -> Self {
+        let server = ConfigurationState::accept(root).server_configuration();
         Self {
             root: Arc::from(root),
             identity: Arc::new(identity),
             upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot::empty())),
             advertised: Arc::new(std::sync::Mutex::new(None)),
+            forward_budget: forward_budget(&server),
         }
     }
 
@@ -350,7 +361,9 @@ impl RiftProxy {
     ///
     /// A transport-shaped failure marks the held connection dead and
     /// retries exactly once on a freshly leased connection; every other
-    /// failure maps straight through [`forwarded_error`].
+    /// failure maps straight through [`forwarded_error`]. Each send is
+    /// bounded by the proxy's forward budget, and a send that outlives it
+    /// refuses as [`ForwardFault::Unanswered`].
     ///
     /// # Cancel safety
     ///
@@ -367,7 +380,7 @@ impl RiftProxy {
         Fut: Future<Output = Result<Value, ServiceError>>,
     {
         let (peer, generation) = self.leased_peer(None).await?;
-        let failure = match send(peer, request.clone()).await {
+        let failure = match self.answered(send(peer, request.clone())).await? {
             Ok(value) => return Ok(value),
             Err(error) if transport_failed(&error) => error,
             Err(error) => return Err(forwarded_error(error)),
@@ -378,7 +391,33 @@ impl RiftProxy {
             "upstream connection lost; reconnecting"
         );
         let (peer, _generation) = self.leased_peer(Some(generation)).await?;
-        send(peer, request).await.map_err(forwarded_error)
+        self.answered(send(peer, request))
+            .await?
+            .map_err(forwarded_error)
+    }
+
+    /// What one send answered, or the refusal for a server that did not
+    /// answer it within the forward budget.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future drops the send; the request stays with the
+    /// server, which answers it into a dropped channel.
+    async fn answered<Value>(
+        &self,
+        send: impl Future<Output = Result<Value, ServiceError>>,
+    ) -> Result<Result<Value, ServiceError>, ErrorData> {
+        tokio::time::timeout(self.forward_budget, send)
+            .await
+            .map_err(|_elapsed| {
+                let budget = self.forward_budget;
+                tracing::warn!(
+                    component = "mcp",
+                    budget = ?budget,
+                    "the workspace server did not answer a forwarded request within its budget"
+                );
+                Error::new(ForwardFault::Unanswered { budget }).tool_error(wire::ErrorPhase::Read)
+            })
     }
 
     /// The info advertised downstream: the upstream's mirrored
@@ -404,6 +443,49 @@ impl RiftProxy {
         match self.advertised.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// Bound on one forwarded request: the two waits the server bounds one
+/// request by - `[server] readiness_timeout` for the workspace to be ready,
+/// `[server] worker_queue_timeout` for a free worker - and
+/// [`FORWARD_ANSWER_GRACE`] for the answer.
+///
+/// A server that has not answered within it has stopped answering, and the
+/// caller gets a refusal it can retry instead of a request that never ends.
+fn forward_budget(server: &ServerConfiguration) -> Duration {
+    Duration::from_millis(server.readiness_timeout.milliseconds())
+        .saturating_add(Duration::from_millis(
+            server.worker_queue_timeout.milliseconds(),
+        ))
+        .saturating_add(FORWARD_ANSWER_GRACE)
+}
+
+/// Why a forwarded request produced no answer from the upstream.
+#[derive(Debug)]
+enum ForwardFault {
+    /// The workspace server did not answer within the forward budget.
+    Unanswered {
+        /// The budget the forward waited out.
+        budget: Duration,
+    },
+}
+
+impl Fault for ForwardFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Unanswered { budget } => vec![
+                ErrorContext::new(
+                    "detail",
+                    "the workspace's rift server did not answer the forwarded request",
+                ),
+                ErrorContext::new("waited", format!("{budget:?}")),
+            ],
         }
     }
 }
@@ -1174,6 +1256,58 @@ mod tests {
         );
     }
 
+    /// Bound on a stalled forward in the unanswered-server case, far past the budget the
+    /// workspace below gives it: a forward still waiting here has no bound of its own.
+    const STALLED_FORWARD_MAX: Duration = Duration::from_secs(600);
+
+    /// A server that accepted the connection and then stopped answering: the forward
+    /// refuses once the budget the workspace's `[server]` table sets passes, and the
+    /// refusal is one the caller can retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_the_server_never_answers_refuses_at_its_budget() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
+        )?;
+        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let (running, _upstream_silent) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+
+        let started = tokio::time::Instant::now();
+        let forward = proxy.forward(None, |peer, request| async move {
+            peer.list_tools(request).await
+        });
+        let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
+            .await
+            .map_err(|_elapsed| "the forward kept waiting for a silent server past its budget")?;
+        let waited = started.elapsed();
+        let refusal = answered.expect_err("a silent server must refuse the forward");
+
+        assert_eq!(
+            waited,
+            Duration::from_secs(2) + super::FORWARD_ANSWER_GRACE,
+            "the forward waits out the two request bounds and the grace, then refuses"
+        );
+        let data = refusal
+            .data
+            .ok_or("the refusal carries its classification")?;
+        assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
+        assert!(
+            refusal.message.contains("did not answer"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn mirror_skips_an_upstream_without_negotiated_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1288,10 +1422,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (server_transport, client_transport) = tokio::io::duplex(1024);
         drop(client_transport);
-        let error = serve_connection(
+        let error = Box::pin(serve_connection(
             RiftProxy::new(directory.path(), test_identity()),
             server_transport,
-        )
+        ))
         .await
         .expect_err("a closed transport must fail initialization");
         assert!(matches!(error.fault(), ProxyFault::Initialize(_)));
