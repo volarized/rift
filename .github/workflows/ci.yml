@@ -470,9 +470,12 @@ jobs:
       # Each runner builds for its own host, so the build passes no
       # `--target`: with one, cargo keeps RUSTFLAGS from proc-macros and build
       # scripts. The toolchain's host is therefore held to the matrix target.
+      # `rust-src` gives the const-trait blanking test in `rift-syntax` the
+      # standard library's sources to walk, as the `rust` job's install does.
       - name: Install the toolchain for this target
         run: |
           rustup target add "${{ matrix.target }}"
+          rustup component add rust-src
           rustc --print host-tuple | grep -Fx "${{ matrix.target }}"
       # The R2 secrets reach this step alone, and the sccache server it starts
       # holds them for every later compile. The Actions scope holds the write
