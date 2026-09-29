@@ -30,8 +30,9 @@ pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
 pub use server::RiftMcp;
 pub use spawn::{
     BoundedStderr, BoundedWriter, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BYTES_MAX,
-    SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnedServer,
-    spawn_detached_server, stderr_file_path,
+    SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT, START_SPAWN_COUNT_MAX, START_WAIT_MAX,
+    SpawnPollOutcome, SpawnedServer, StartExit, StartSpawns, StartedServer, spawn_detached_server,
+    stderr_file_path,
 };
 pub use storage::WorkspaceStorage;
 

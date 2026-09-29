@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rift_core::{CapturedStream, CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
@@ -31,8 +31,8 @@ use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
 use crate::http::MCP_PATH;
 use crate::spawn::{
-    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, StartupCapture,
-    spawn_detached_server_with_captured_stderr,
+    PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
+    StartSpawns, StartupCapture,
 };
 
 /// Bound on one upstream connect-and-initialize attempt.
@@ -429,12 +429,13 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// [`UPSTREAM_CONNECT_TIMEOUT`]. The poll also stops at the
 /// [`START_WAIT_MAX`] deadline, so slow connect attempts shorten the
 /// attempt count instead of stretching the window. Connect failures inside
-/// the window keep polling; a spawned server that exits before the window
-/// closes refuses with its captured stderr, unless it lost the start
-/// election. A lost election keeps polling for the winner, who may still be
-/// binding, and spawns again once a probe finds no process holding the
-/// election, at most [`START_SPAWN_COUNT_MAX`] spawns in all; exhaustion
-/// refuses with the operator's next step.
+/// the window keep polling. A spawned server that exits before the window
+/// closes is weighed by [`StartSpawns::poll`]: while another process holds
+/// the election the poll waits for that holder; once none does, a lost
+/// election spawns again, at most
+/// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
+/// all, and any other exit refuses with the server's captured stderr.
+/// Exhaustion refuses with the operator's next step.
 ///
 /// # Cancel safety
 ///
@@ -454,9 +455,9 @@ async fn connect_upstream(
     // on its own, and the poll adopts the winner once it finishes binding. A
     // spawn that cannot launch at all is reported, and the poll still gives
     // a concurrently started server its chance.
-    let mut spawns = StartSpawns::default();
+    let mut spawns = StartSpawns::<StartupCapture>::default();
     if !matches!(probe(root), ServerPresence::Starting) {
-        spawns.spawn(root);
+        spawns.spawn_captured(root);
     }
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
@@ -465,14 +466,8 @@ async fn connect_upstream(
         let adopted = adopt_presence(presence, identity).await?;
         match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
-            SpawnPollOutcome::Failed(refusal) => return Err(refusal),
-            SpawnPollOutcome::ElectionUnheld => {
-                tracing::info!(
-                    component = "mcp",
-                    "no process holds the election the spawned server lost; spawning again"
-                );
-                spawns.spawn(root);
-            }
+            SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
+            SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
             SpawnPollOutcome::Waiting => {}
         }
         if tokio::time::Instant::now() >= deadline {
@@ -481,142 +476,6 @@ async fn connect_upstream(
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
     Err(upstream_unavailable())
-}
-
-/// Most detached servers one connect spawns.
-///
-/// A spawned server loses the start election whenever its claim meets any
-/// lock on the election file, a probe's shared lock included: Windows
-/// releases a closed handle's locks lazily, so a probe that already let go
-/// can still hold one. A loss that leaves the election unheld is that case,
-/// and the connect spawns again. The count bounds the spawns when something
-/// keeps such a lock for longer; the rest of the start window then passes
-/// as a wait.
-const START_SPAWN_COUNT_MAX: u32 = 4;
-
-/// The detached servers one connect spawned, and the latest one as the
-/// poll last saw it.
-#[derive(Debug, Default)]
-struct StartSpawns {
-    latest: SpawnWatch,
-    spawn_count: u32,
-}
-
-/// The latest server one connect spawned, as its poll last saw it.
-#[derive(Debug, Default)]
-enum SpawnWatch {
-    /// No spawned server is outstanding: none was spawned, the spawn could
-    /// not launch, or the spawn count is spent.
-    #[default]
-    Idle,
-    /// The spawned server has not closed its standard error yet.
-    Running(StartupCapture),
-    /// The spawned server exited after losing the start election.
-    LostElection,
-}
-
-impl StartSpawns {
-    /// Spawns one more detached server, unless [`START_SPAWN_COUNT_MAX`]
-    /// spawns already ran.
-    fn spawn(&mut self, root: &Path) {
-        if self.spawn_count >= START_SPAWN_COUNT_MAX {
-            let spawn_count = self.spawn_count;
-            tracing::warn!(
-                component = "mcp",
-                spawn_count,
-                "the spawn count is spent; the start window passes as a wait"
-            );
-            self.latest = SpawnWatch::Idle;
-            return;
-        }
-        self.spawn_count += 1;
-        self.latest = match spawn_detached_server_with_captured_stderr(root) {
-            Ok(startup) => SpawnWatch::Running(startup),
-            Err(error) => {
-                tracing::warn!(component = "mcp", %error, "detached server spawn failed");
-                SpawnWatch::Idle
-            }
-        };
-    }
-
-    /// Classifies one poll iteration: an adopted connection wins outright;
-    /// otherwise the latest spawn's exit, or the election it lost, decides.
-    ///
-    /// `election_held` is what this iteration's probe found. It decides only
-    /// for a loss an earlier iteration observed, so the probe that sends the
-    /// connect to spawn again was read after the losing server exited.
-    ///
-    /// Split from [`connect_upstream`] so the ordering - success checked
-    /// before the spawned server's exit - is testable without a real process
-    /// or a real upstream connection.
-    fn poll<Adopted>(
-        &mut self,
-        adopted: Option<Adopted>,
-        election_held: bool,
-    ) -> SpawnPollOutcome<Adopted> {
-        if let Some(running) = adopted {
-            return SpawnPollOutcome::Ready(running);
-        }
-        let exited = match &mut self.latest {
-            SpawnWatch::Running(startup) => startup.exited(),
-            SpawnWatch::LostElection if !election_held => return SpawnPollOutcome::ElectionUnheld,
-            SpawnWatch::LostElection | SpawnWatch::Idle => return SpawnPollOutcome::Waiting,
-        };
-        self.latest_exit(exited)
-    }
-
-    /// Classifies the latest spawn's exit: a lost election is recorded for
-    /// the next iteration to weigh, and any other exit fails the connect with
-    /// the server's captured stderr.
-    fn latest_exit<Adopted>(
-        &mut self,
-        exited: Option<CapturedStream>,
-    ) -> SpawnPollOutcome<Adopted> {
-        let Some(capture) = exited else {
-            return SpawnPollOutcome::Waiting;
-        };
-        if !lost_start_election(&capture) {
-            return SpawnPollOutcome::Failed(server_start_failed(&capture));
-        }
-        tracing::info!(
-            component = "mcp",
-            stderr = %capture.text,
-            "the spawned server lost the start election"
-        );
-        self.latest = SpawnWatch::LostElection;
-        SpawnPollOutcome::Waiting
-    }
-}
-
-/// One poll iteration's outcome against a possibly still-spawning server.
-enum SpawnPollOutcome<Adopted> {
-    /// The workspace's server answered; the latest spawn's capture is never
-    /// consulted, so the daemon's stderr keeps draining on its own.
-    Ready(Adopted),
-    /// The spawned server exited before it started serving, for a reason
-    /// adoption cannot resolve.
-    Failed(ErrorData),
-    /// The spawned server lost the start election and no process holds it:
-    /// nothing is left to publish, and the connect spawns again.
-    ElectionUnheld,
-    /// Nothing decided yet: the spawned server is still starting, or it lost
-    /// the start election to a winner that may still be binding.
-    Waiting,
-}
-
-/// Whether a spawned server's captured stderr names a lost start election:
-/// its claim met a lock on the election file - a concurrent starter's, or a
-/// probe's the operating system has not released yet - and it exited on its
-/// own, printing the same `server_already_serving` refusal an operator sees
-/// from `rift server start --foreground`. The marker is built from the CLI
-/// registry so the match cannot drift from the code the binary actually
-/// prints.
-fn lost_start_election(capture: &CapturedStream) -> bool {
-    let marker = format!(
-        "error[{code}]",
-        code = ErrorName::Cli(CliCode::ServerAlreadyServing).code()
-    );
-    capture.text.contains(&marker)
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -957,10 +816,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, RiftProxy, START_SPAWN_COUNT_MAX, SpawnPollOutcome,
-        SpawnWatch, StartSpawns, StartupCapture, Upstream, UpstreamSlot, adopt_serving,
-        connect_recorded, connect_upstream, fallback_info, forwarded_error, lost_start_election,
-        mirrored_info, quit_reason_result, require_identity_match, reuse_current, serve_connection,
+        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, UpstreamSlot, adopt_serving,
+        connect_recorded, connect_upstream, fallback_info, forwarded_error, mirrored_info,
+        quit_reason_result, require_identity_match, reuse_current, serve_connection,
         server_start_failed, transport_failed, upstream_unavailable,
     };
     use crate::election::claim;
@@ -1181,242 +1039,6 @@ mod tests {
             "the caller has no shell to run a command in: {}",
             refusal.message
         );
-    }
-
-    /// A test double whose reads block on a channel, so a test controls
-    /// exactly when the simulated pipe closes. A sent message larger than
-    /// one read buffer is retained across calls, the same way a real
-    /// pipe's bytes are.
-    struct BlockingChannelStream {
-        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
-        pending: Vec<u8>,
-    }
-
-    impl BlockingChannelStream {
-        fn new(receiver: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
-            Self {
-                receiver,
-                pending: Vec::new(),
-            }
-        }
-    }
-
-    impl std::io::Read for BlockingChannelStream {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.pending.is_empty() {
-                match self.receiver.recv() {
-                    Ok(bytes) => self.pending = bytes,
-                    Err(_closed) => return Ok(0),
-                }
-            }
-            let taken = self.pending.len().min(buffer.len());
-            buffer[..taken].copy_from_slice(&self.pending[..taken]);
-            self.pending.drain(..taken);
-            Ok(taken)
-        }
-    }
-
-    /// Polls `startup` until its capture is taken, bounded so a defect in
-    /// the background drain fails the test instead of hanging it.
-    fn wait_for_exit(startup: &mut StartupCapture) -> CapturedStream {
-        for _ in 0..1_000 {
-            if let Some(captured) = startup.exited() {
-                return captured;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the background drain must finish once the stream closes");
-    }
-
-    /// The stderr a spawned server prints when it loses the start election.
-    const LOST_ELECTION_STDERR: &[u8] =
-        b"rift: error[server_already_serving]: another rift server \
-        already serves this workspace; connect to the listed server, or run `rift server stop` \
-        before serving again";
-
-    /// Spawns watched through `stream` alone: one spawn ran, and its stderr is still draining.
-    fn watching(stream: BlockingChannelStream) -> StartSpawns {
-        StartSpawns {
-            latest: SpawnWatch::Running(StartupCapture::spawn(stream)),
-            spawn_count: 1,
-        }
-    }
-
-    /// Polls `spawns` with no adoption until the latest spawn's exit is observed, asserting
-    /// every poll before it waited; bounded so a defect in the drain fails instead of hanging.
-    fn poll_until_exit_observed(spawns: &mut StartSpawns, election_held: bool) {
-        for _ in 0..1_000 {
-            if !matches!(spawns.latest, SpawnWatch::Running(_)) {
-                return;
-            }
-            let outcome = spawns.poll::<u32>(None, election_held);
-            assert!(
-                matches!(outcome, SpawnPollOutcome::Waiting),
-                "a poll that observes the loss waits"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the background drain must finish once the stream closes");
-    }
-
-    #[test]
-    fn spawn_poll_prefers_adoption_over_a_finished_capture() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut spawns = watching(BlockingChannelStream::new(receiver));
-        drop(sender);
-        // The capture has finished (the stream closed), and adoption also
-        // succeeded on this same iteration: adoption must win, and the
-        // capture must never be consulted.
-        let SpawnWatch::Running(startup) = &mut spawns.latest else {
-            panic!("the capture must still be present");
-        };
-        let _ = wait_for_exit(startup);
-        let outcome = spawns.poll(Some(7_u32), false);
-        assert!(
-            matches!(outcome, SpawnPollOutcome::Ready(7)),
-            "adoption must win over a finished capture"
-        );
-    }
-
-    #[test]
-    fn spawn_poll_waits_while_the_capture_is_still_open() {
-        let (_sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut spawns = watching(BlockingChannelStream::new(receiver));
-        let outcome = spawns.poll::<u32>(None, false);
-        assert!(matches!(outcome, SpawnPollOutcome::Waiting));
-    }
-
-    #[test]
-    fn spawn_poll_fails_once_the_spawned_server_exited() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut spawns = watching(BlockingChannelStream::new(receiver));
-        sender
-            .send(b"listener bind failed: address in use".to_vec())
-            .expect("receiver still open");
-        drop(sender);
-        let outcome = loop {
-            let outcome = spawns.poll::<u32>(None, false);
-            if !matches!(outcome, SpawnPollOutcome::Waiting) {
-                break outcome;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let SpawnPollOutcome::Failed(refusal) = outcome else {
-            panic!("an exited spawn must fail the poll");
-        };
-        assert!(
-            refusal.message.contains("listener bind failed"),
-            "{}",
-            refusal.message
-        );
-    }
-
-    /// A lost election never fails the poll: while another process holds the
-    /// election, the winner may still be binding, and the poll keeps waiting
-    /// for it.
-    #[test]
-    fn spawn_poll_keeps_waiting_while_the_election_the_spawned_server_lost_is_held() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut spawns = watching(BlockingChannelStream::new(receiver));
-        sender
-            .send(LOST_ELECTION_STDERR.to_vec())
-            .expect("receiver still open");
-        drop(sender);
-        poll_until_exit_observed(&mut spawns, true);
-        for _ in 0..200 {
-            let outcome = spawns.poll::<u32>(None, true);
-            assert!(
-                matches!(outcome, SpawnPollOutcome::Waiting),
-                "a spawned server that lost the election to a live holder must keep the poll \
-                 waiting for the winner, not fail it"
-            );
-        }
-    }
-
-    /// A lost election that leaves the election unheld has no winner to wait
-    /// for, and the poll says so - but only on a probe read after the loss
-    /// was observed, since the probe of the observing iteration may predate
-    /// the losing server's exit.
-    #[test]
-    fn spawn_poll_names_an_unheld_election_only_after_the_loss_was_observed() {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
-        let mut spawns = watching(BlockingChannelStream::new(receiver));
-        sender
-            .send(LOST_ELECTION_STDERR.to_vec())
-            .expect("receiver still open");
-        drop(sender);
-        poll_until_exit_observed(&mut spawns, false);
-        assert!(
-            matches!(spawns.latest, SpawnWatch::LostElection),
-            "the observed loss is recorded"
-        );
-        assert!(
-            matches!(
-                spawns.poll::<u32>(None, false),
-                SpawnPollOutcome::ElectionUnheld
-            ),
-            "a later probe that finds the election unheld must send the connect to spawn again"
-        );
-        assert!(
-            matches!(spawns.poll::<u32>(None, true), SpawnPollOutcome::Waiting),
-            "a later probe that finds the election held waits for that holder"
-        );
-    }
-
-    /// Below the bound a spawn is counted even when it cannot launch; at the
-    /// bound nothing is spawned, and the poll waits out the window.
-    #[test]
-    fn the_spawn_count_bounds_the_spawns_one_connect_makes() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let missing = directory.path().join("missing");
-        let mut spawns = StartSpawns {
-            latest: SpawnWatch::LostElection,
-            spawn_count: START_SPAWN_COUNT_MAX - 1,
-        };
-        spawns.spawn(&missing);
-        assert_eq!(spawns.spawn_count, START_SPAWN_COUNT_MAX);
-        assert!(
-            matches!(spawns.latest, SpawnWatch::Idle),
-            "a spawn that cannot launch leaves nothing to watch"
-        );
-
-        spawns.latest = SpawnWatch::LostElection;
-        spawns.spawn(&missing);
-        assert_eq!(
-            spawns.spawn_count, START_SPAWN_COUNT_MAX,
-            "a spent count spawns nothing"
-        );
-        assert!(matches!(spawns.latest, SpawnWatch::Idle));
-        assert!(
-            matches!(spawns.poll::<u32>(None, false), SpawnPollOutcome::Waiting),
-            "with the count spent the poll only waits"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn lost_start_election_recognizes_the_server_already_serving_marker() {
-        let capture = CapturedStream {
-            text: "rift: error[server_already_serving]: another rift server already serves \
-                   this workspace; connect to the listed server, or run `rift server stop` \
-                   before serving again"
-                .to_owned(),
-            captured_bytes: 0,
-            total_bytes: 0,
-            truncated: false,
-        };
-        assert!(lost_start_election(&capture));
-    }
-
-    #[test]
-    fn lost_start_election_rejects_an_unrelated_startup_failure() {
-        let capture = CapturedStream {
-            text: "listener bind failed: address in use".to_owned(),
-            captured_bytes: 0,
-            total_bytes: 0,
-            truncated: false,
-        };
-        assert!(!lost_start_election(&capture));
     }
 
     #[test]
