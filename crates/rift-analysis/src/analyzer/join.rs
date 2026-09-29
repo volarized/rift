@@ -323,9 +323,11 @@ pub(super) fn lay_join(
 
 /// Lays the stub's facts over one joined implementation declaration.
 ///
-/// The stub's signatures and types replace the implementation's when the stub renders any;
-/// a stub declaring a name without a signature, such as a `.d.ts` variable over a `.js`
-/// function, leaves the implementation's own. Source, range, and documentation stay the
+/// The stub's signatures replace the implementation's when the stub renders any; a stub
+/// declaring a name without a signature, such as a `.d.ts` variable over a `.js` function,
+/// leaves the implementation's own. The syntax publication the join reads leaves every
+/// declaration's `types` empty, so a stub's types reach the joined declaration through the
+/// `parameters` and `returns` of its signatures. Source, range, and documentation stay the
 /// implementation's.
 fn lay_stub_facts(presentation: &mut Symbol, semantics: &WorkspaceSemantics, forms: &[StubForm]) {
     let stub: Vec<Symbol> = forms
@@ -343,13 +345,6 @@ fn lay_stub_facts(presentation: &mut Symbol, semantics: &WorkspaceSemantics, for
         .collect();
     if !signatures.is_empty() {
         presentation.signatures = signatures;
-    }
-    let types: Vec<_> = stub
-        .iter()
-        .flat_map(|form| form.types.iter().cloned())
-        .collect();
-    if !types.is_empty() {
-        presentation.types = types;
     }
 }
 

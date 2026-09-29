@@ -50,8 +50,8 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalSearchCandidates, GlobalState, local_search_page, local_symbol_page,
-    merge_search, merge_symbols, package_search, package_symbols,
+    GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
+    package_symbols,
 };
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1729,16 +1729,9 @@ impl RiftMcp {
             .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
             .await?
             .0;
-        let mut answer = match merge_symbols(&params, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.append(&mut remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_symbol_page(&params, local)
-            }
-        };
+        let mut answer = merge_symbols(&params, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
@@ -1935,7 +1928,7 @@ impl RiftMcp {
             .read_context(params.scope, params.rev.as_ref(), &params.packages)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
-        let (mut route, mut remote) = self
+        let (route, mut remote) = self
             .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
@@ -1947,16 +1940,9 @@ impl RiftMcp {
             .await?
             .0;
         local.warnings.extend(warnings);
-        let mut answer = match merge_search(&params, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.extend(remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_search_page(&params, local)
-            }
-        };
+        let mut answer = merge_search(&params, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
