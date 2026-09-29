@@ -27,8 +27,8 @@ use rift_protocol::workspace::{
 use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
-    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
-    StoreRanking, VectorReadiness,
+    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchError, SearchIndex,
+    SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
     EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault, ReadService, StoreAnswer,
@@ -1118,6 +1118,38 @@ async fn commit_landed(
     }
 }
 
+/// Why one read of the full-text store produced no ranking.
+#[derive(Debug)]
+enum StoreReadFailure {
+    /// The workspace database handed the read no pooled connection within
+    /// `[search] busy_timeout`, so the store answered nothing and the request
+    /// ranks without it.
+    ConnectionUnavailable,
+    /// The store refused, and the request refuses with it.
+    Refused(ErrorData),
+}
+
+impl From<SearchError> for StoreReadFailure {
+    fn from(error: SearchError) -> Self {
+        if error.fault().is_store_connection_unavailable() {
+            tracing::warn!(
+                component = "search",
+                operation = "search.store",
+                %error,
+                "the full-text store got no pooled connection; the answer ranks without it"
+            );
+            return Self::ConnectionUnavailable;
+        }
+        Self::Refused(error.tool_error(wire::ErrorPhase::Read))
+    }
+}
+
+/// The `lexical_ranking_unavailable` detail for a store read that got no
+/// pooled connection.
+const STORE_CONNECTION_UNAVAILABLE: &str = "the workspace search database handed this request no connection: every one of its \
+     `[search] pool_slots` stayed in use past `[search] busy_timeout`, so the answer was \
+     ranked by identifier matching alone; a resent request reads the store again";
+
 /// The warning a lexical ranking cut at `matches_max` carries: hits past that bound never
 /// reach a page, so the caller narrows `query` rather than paging on.
 fn lexical_truncated(matches_max: u32) -> ReadWarning {
@@ -2067,12 +2099,21 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let (searched, commit_state) =
-            rift_core::traced_async!(component = "search", operation = "search.store", {
-                self.store_answer(index, tree_revision, &parsed, deadline)
-                    .await
-            })
-            .await?;
+        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            self.store_answer(index, tree_revision, &parsed, deadline)
+                .await
+        })
+        .await;
+        let (searched, commit_state) = match stored {
+            Ok(stored) => stored,
+            Err(StoreReadFailure::ConnectionUnavailable) => {
+                return Ok(Some(SearchRanking::unavailable(
+                    STORE_CONNECTION_UNAVAILABLE,
+                    self.ranking_weights,
+                )));
+            }
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
         Ok(ranking_of(
             searched,
             published.reads.file_count(),
@@ -2094,7 +2135,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<RevisionScoped<PhasedRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
         let precise = self
             .run_phase(index, tree_revision, query, QueryPhase::Precise)
             .await?;
@@ -2141,7 +2182,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         phase: QueryPhase,
-    ) -> Result<RevisionScoped<StoreRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
         tracing::debug!(
             component = "search",
             operation = "search.rank",
@@ -2154,7 +2195,7 @@ impl RiftMcp {
         index
             .rank(tree_revision, query, phase, self.fetch_limit())
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(StoreReadFailure::from)
     }
 
     /// The store's answer for `tree_revision` and where that revision stands with the
@@ -2176,7 +2217,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         deadline: RequestDeadline,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
         let searched = self.read_store(index, tree_revision, query).await?;
         let Some(lane) = self.lexical.as_ref() else {
             return Ok((searched, LexicalCommitState::Settled));
@@ -3224,6 +3265,7 @@ mod tests {
     use crate::validation::RebuildRequest;
 
     use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
+    use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
         LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
@@ -5173,6 +5215,85 @@ mod tests {
             vec![("clear", String::new()), ("apply", revision)]
         );
         Ok((server, double))
+    }
+
+    /// A server whose workspace database pools one connection, waiting at most the least
+    /// `[search] busy_timeout` for it, with its lexical lane held at the gate so no write
+    /// takes that connection; returns the database to hold the connection through.
+    async fn server_over_one_slot(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        RiftMcp,
+        Arc<StoreDouble>,
+        Arc<rift_index::WorkspaceDatabase>,
+    )> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            root,
+            "\n[search]\npool_slots = 1\nbusy_timeout = \"100ms\"\n",
+        )?;
+        let storage = WorkspaceStorage::open(root).await;
+        let database = storage
+            .database()
+            .ok_or("the one-slot workspace database must open")?;
+        let double = StoreDouble::new();
+        let gate = Arc::clone(&double);
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(root)?,
+            WorkspaceIndexLimits::default(),
+            Some(storage),
+            super::workspace_watcher,
+            move |index, blocking, cancellation, executable_digest| {
+                gate.attach(index);
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    executable_digest,
+                )
+            },
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        double.calls_within_bound(1).await?;
+        Ok((server, double, database))
+    }
+
+    /// A search whose store read meets a pool with no free connection answers from its
+    /// other rankers, warning that the full-text ranking was unavailable and naming the
+    /// slot wait, instead of refusing the whole request.
+    #[tokio::test]
+    async fn a_search_that_gets_no_pooled_connection_ranks_without_the_store() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(&server, "beacon"))
+            .await
+            .map_err(|_elapsed| "the search waited past its bound for the held connection")?
+            .map_err(|refusal| format!("the search must answer without the store: {refusal:?}"))?;
+        drop(held);
+
+        assert!(
+            answer
+                .results
+                .iter()
+                .any(|hit| format!("{hit:?}").contains("beacon")),
+            "identifier matching answers while the store is out of reach: {:?}",
+            answer.results
+        );
+        let detail = answer
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .ok_or("the answer warns that the full-text ranking was unavailable")?;
+        assert!(detail.contains("pool_slots"), "{detail}");
+        assert!(detail.contains("busy_timeout"), "{detail}");
+        Ok(())
     }
 
     /// The publication `server` currently answers from.

@@ -167,6 +167,27 @@ impl WorkspaceDatabase {
         })
     }
 
+    /// Checks out one pooled connection and keeps its slot from every other
+    /// caller until the returned value drops.
+    ///
+    /// Holding every slot is how a caller proves what it does against a pool
+    /// with none free: its next checkout waits out the busy-wait budget and
+    /// refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when no slot frees within the pool's
+    /// busy-wait budget.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the returned future gives up the wait; no slot is held.
+    pub async fn hold_connection(&self) -> Result<HeldConnection, LexicalIndexError> {
+        Ok(HeldConnection {
+            _connection: self.database.connection().await.map_err(storage_error)?,
+        })
+    }
+
     /// A read-only pooled connection with this file's connection-local pragmas.
     ///
     /// Foreign keys are not configured: no table here carries a foreign-key
@@ -184,6 +205,14 @@ impl WorkspaceDatabase {
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
+}
+
+/// One pooled connection [`WorkspaceDatabase::hold_connection`] checked out; its
+/// slot returns to the pool when this drops.
+#[derive(Debug)]
+#[must_use = "dropping the value returns the slot at once"]
+pub struct HeldConnection {
+    _connection: Connection,
 }
 
 /// The file's write turn, held with the connection that spends it.
@@ -293,6 +322,10 @@ mod tests {
         let error = refused.expect_err("a read that meets a held pool refuses");
 
         assert_eq!(error.descriptor().code(), "storage_failure");
+        assert!(
+            error.fault().is_connection_unavailable(),
+            "the refusal names the missing connection: {error}"
+        );
         let causes = rift_core::causes(&error).join(": ");
         assert!(causes.contains("waiting for a slot"), "{causes}");
         assert!(
@@ -302,6 +335,34 @@ mod tests {
         drop(held);
         let released = logs.recent(&crate::log::LogQuery::newest(1)).await?;
         assert!(released.is_empty(), "a freed slot serves the read again");
+        Ok(())
+    }
+
+    /// A slot held through `hold_connection` blocks the next checkout the same way, and a
+    /// refusal the store itself raised names no missing connection.
+    #[tokio::test]
+    async fn a_held_connection_keeps_its_slot_until_it_drops() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), one_slot).await?;
+        let held = database.hold_connection().await?;
+        let refused = database
+            .hold_connection()
+            .await
+            .expect_err("a second hold meets no free slot");
+        assert!(refused.fault().is_connection_unavailable(), "{refused}");
+        drop(held);
+        let _again = database.hold_connection().await?;
+
+        let unrelated = super::lexical_error_caused_by(
+            crate::lexical::LexicalIndexViolation::Storage,
+            None,
+            std::io::Error::other("disk gone"),
+        );
+        assert!(
+            !unrelated.fault().is_connection_unavailable(),
+            "a store refusal is not a missing connection"
+        );
         Ok(())
     }
 

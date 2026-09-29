@@ -1520,6 +1520,34 @@ async fn a_rank_for_a_tree_the_store_moved_past_names_the_stored_revision() -> T
     Ok(())
 }
 
+/// A rank that meets a pool whose only slot is held refuses naming the missing connection,
+/// so a caller with another ranker can answer without the store.
+#[tokio::test]
+async fn a_rank_that_meets_a_held_pool_names_the_missing_connection() -> TestResult {
+    let root = workspace()?;
+    let one_slot = DatabasePool::new(1, 100);
+    let database = WorkspaceDatabase::open(&database(root.path()), one_slot).await?;
+    let index = SearchIndex::attached(std::sync::Arc::clone(&database), lexical_only_limits())?;
+    let held = database.hold_connection().await?;
+
+    let parsed = ParsedQuery::parse("load config")?;
+    let refused = index
+        .rank(REVISION, &parsed, QueryPhase::Precise, 10)
+        .await
+        .expect_err("a rank that meets no free slot refuses");
+    assert!(
+        refused.fault().is_store_connection_unavailable(),
+        "the refusal names the missing connection: {refused}"
+    );
+
+    drop(held);
+    let answered = index
+        .rank(REVISION, &parsed, QueryPhase::Precise, 10)
+        .await?;
+    assert_eq!(answered, RevisionScoped::NoRevision);
+    Ok(())
+}
+
 /// A store no pass has ever stamped answers for no tree at all, which is not the same as a
 /// store holding another one: nothing has landed in it yet.
 #[tokio::test]
