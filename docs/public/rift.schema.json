@@ -1024,7 +1024,7 @@
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "5s",
-          "description": "Wall-clock budget one connection waits for a database lock held by\nanother process before `SQLITE_BUSY`, 100ms to 30s.",
+          "description": "Wall-clock budget one caller waits for a free pooled connection, and\none connection waits for a database lock held by another process\nbefore `SQLITE_BUSY`, 100ms to 30s.",
           "rift:range": {
             "max": "30s",
             "min": "100ms"

@@ -601,6 +601,29 @@ impl<T> Transient<T> {
             Self::AnsweredNothing(_) => false,
         }
     }
+
+    /// The wait before the attempt that follows this condition, decided at
+    /// `now`, absent once the request's attempts end.
+    ///
+    /// Without `deadline`, the retry table's attempt bound ends the attempts;
+    /// with it, [`walk_wait`] does while the condition can mean the engine is
+    /// still loading ([`Transient::is_loading`]), and the retry table's bound
+    /// or `deadline`, whichever comes first, does otherwise.
+    fn wait_after(
+        &self,
+        retry: &RetryPolicy,
+        attempt: u64,
+        now: Instant,
+        deadline: Option<Instant>,
+    ) -> Option<Duration> {
+        match deadline {
+            Some(deadline) if self.is_loading() => walk_wait(retry, attempt, now, deadline),
+            Some(deadline) => retry
+                .delay_after(attempt)
+                .filter(|wait| now + *wait < deadline),
+            None => retry.delay_after(attempt),
+        }
+    }
 }
 
 /// What the retry loop does with one answer.
@@ -970,11 +993,8 @@ impl EngineSlot {
 
     /// Shared bounded request loop.
     ///
-    /// Without `deadline`, the retry table's attempt bound ends the loop; with
-    /// it, [`walk_wait`] does while the absorbed condition can mean the engine
-    /// is still loading ([`Transient::is_loading`]), and the retry table's
-    /// bound or `deadline`, whichever comes first, does otherwise. The wait
-    /// between two attempts reads engine output
+    /// The absorbed condition decides the wait between two attempts and when
+    /// the loop ends ([`Transient::wait_after`]). The wait reads engine output
     /// ([`EngineSession::read_output`]), so progress is stamped when it
     /// arrives; the wait also ends once `wake` holds.
     ///
@@ -1073,21 +1093,15 @@ impl EngineSlot {
                     return Err(error);
                 }
             };
-            let wait = match deadline {
-                Some(deadline) if absorbed.is_loading() => {
-                    walk_wait(&retry, attempt, Instant::now(), deadline)
-                }
-                Some(deadline) => retry
-                    .delay_after(attempt)
-                    .filter(|wait| Instant::now() + *wait < deadline),
-                None => retry.delay_after(attempt),
-            };
-            let Some(wait) = wait else {
+            // One clock read decides the wait and schedules its end, so the end
+            // checked against the deadline is the end the wait keeps.
+            let now = Instant::now();
+            let Some(wait) = absorbed.wait_after(&retry, attempt, now, deadline) else {
                 finish(session).await;
                 guarded.finished = true;
                 return self.exhausted(absorbed, attempt, deadline.is_some());
             };
-            let waited = session.read_output(Instant::now() + wait, &wake).await;
+            let waited = session.read_output(now + wait, &wake).await;
             if let Err(error) = waited {
                 exchange_started = false;
                 reported = Some(error);
@@ -1931,11 +1945,48 @@ mod tests {
         );
     }
 
+    /// A loading condition waits the walk's waits under the deadline, past the
+    /// retry table's attempt bound; any other condition waits the retry
+    /// table's under it; without a deadline both wait the retry table's alone.
+    #[test]
+    fn the_absorbed_condition_decides_the_wait_after_an_attempt() {
+        let retry = RetryPolicy::default();
+        let first = retry
+            .delay_after(1)
+            .expect("the table waits after the first attempt");
+        let limit = Duration::from_millis(retry.delay_limit.milliseconds());
+        let past_the_table = retry.attempts;
+        let now = Instant::now();
+        let far = Some(now + Duration::from_secs(60));
+        let near = Some(now + first / 2);
+        let loading = Transient::<()>::Analyzing;
+        let answered_nothing = Transient::AnsweredNothing(());
+        for (transient, attempt, deadline, expected) in [
+            (&loading, 1, far, Some(first)),
+            (&loading, 1, near, None),
+            (&loading, past_the_table, far, Some(limit)),
+            (&loading, past_the_table, None, None),
+            (&answered_nothing, 1, far, Some(first)),
+            (&answered_nothing, 1, near, None),
+            (&answered_nothing, 1, None, Some(first)),
+            (&answered_nothing, past_the_table, far, None),
+        ] {
+            assert_eq!(
+                transient.wait_after(&retry, attempt, now, deadline),
+                expected,
+                "{transient:?} after attempt {attempt} with deadline {:?}",
+                deadline.map(|deadline| deadline - now)
+            );
+        }
+    }
+
     /// A `sh` engine that answers `initialize` and then announces work, answers
     /// each request with no location once it is sent, and ends its work at the
     /// first request `analyzing_secs` or more whole seconds after its start:
     /// the `$/progress` end and that request's answer arrive in one read, as
-    /// they would from an engine whose end landed between two requests.
+    /// they would from an engine whose end landed between two requests. It
+    /// leaves on `exit`, so a pool shutdown ends with the engine instead of at
+    /// the shutdown timeout.
     #[cfg(unix)]
     fn analyzing_engine(directory: &Path, analyzing_secs: u64) -> LspConfiguration {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
@@ -1950,6 +2001,8 @@ while IFS= read -r header; do
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
     *'"id":'*)
       if [ "$ended" -eq 0 ] && [ $(( $(date +%s) - start )) -ge ANALYZING_SECS ]; then
         frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
@@ -2078,6 +2131,70 @@ done
         }
     }
 
+    /// `operation`, with each attempt's start and end pushed to `times`.
+    #[cfg(unix)]
+    fn timed<T: Send + 'static>(
+        times: &Arc<std::sync::Mutex<Vec<(Instant, Instant)>>>,
+        mut operation: impl for<'session> FnMut(
+            &'session mut EngineSession,
+        )
+            -> SessionFuture<'session, Result<T, EngineError>>,
+    ) -> impl for<'session> FnMut(
+        &'session mut EngineSession,
+    ) -> SessionFuture<'session, Result<T, EngineError>> {
+        let times = Arc::clone(times);
+        move |session: &mut EngineSession| {
+            let start = Instant::now();
+            let answer = operation(session);
+            let times = Arc::clone(&times);
+            Box::pin(async move {
+                let answer = answer.await;
+                times
+                    .lock()
+                    .expect("attempt times")
+                    .push((start, Instant::now()));
+                answer
+            })
+        }
+    }
+
+    /// Asserts what a walk's deadline bounds, from each attempt's start and
+    /// end and the instant the walk returned: the wait after every attempt
+    /// but the last was scheduled to end before `deadline`, and the wait
+    /// after the last would have passed it. The attempts run unbounded by
+    /// the deadline, so a walk returns past it by what its last attempt takes.
+    ///
+    /// The loop decides a wait after its attempt ends and before the walk
+    /// returns, so a wait [`walk_wait`] allows from the attempt's end was
+    /// allowed, and one it refuses from the return was refused.
+    #[cfg(unix)]
+    fn assert_waits_under_the_deadline(
+        retry: &RetryPolicy,
+        deadline: Instant,
+        times: &[(Instant, Instant)],
+        returned: Instant,
+    ) {
+        let Some((_last, earlier)) = times.split_last() else {
+            panic!("the walk made no attempt");
+        };
+        for (index, (_start, end)) in earlier.iter().enumerate() {
+            let attempt = u64::try_from(index + 1).expect("an attempt number");
+            assert!(
+                walk_wait(retry, attempt, *end, deadline).is_some(),
+                "the wait after attempt {attempt} was scheduled to end before the deadline: \
+                 attempt ended {:?} before it",
+                deadline.saturating_duration_since(*end)
+            );
+        }
+        let attempts = u64::try_from(times.len()).expect("an attempt count");
+        assert!(
+            walk_wait(retry, attempts, returned, deadline).is_none(),
+            "the walk ended once the wait after attempt {attempts} would pass the deadline: \
+             returned {:?} before it",
+            deadline.saturating_duration_since(returned)
+        );
+    }
+
     /// A walk waits under the deadline, past the retry table's attempt
     /// bound, and reads ready one `settle_delay` after the attempt that read
     /// the engine's end: this engine sends its end with an answer at attempt
@@ -2155,6 +2272,9 @@ done
 
     /// A wait spent before the engine reads ready answers `Unsettled` and
     /// keeps the session, where a request dropped at its deadline discards it.
+    ///
+    /// The deadline bounds the waits between attempts alone: the second
+    /// attempt starts under it and is held past it, and the walk still answers.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_spent_walk_wait_answers_unsettled_and_keeps_the_session() {
@@ -2163,25 +2283,44 @@ done
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let mut references = counted_references(&attempts);
+        let counted = Arc::clone(&attempts);
         let answer = slot
             .request_outgoing(
                 open_lib,
-                counted_references(&attempts),
+                timed(&times, move |session: &mut EngineSession| {
+                    let answer = references(session);
+                    let later_attempt = counted.load(std::sync::atomic::Ordering::SeqCst) >= 2;
+                    Box::pin(async move {
+                        let answer = answer.await;
+                        if later_attempt {
+                            tokio::time::sleep_until(deadline).await;
+                        }
+                        answer
+                    })
+                }),
                 finish_immediately,
-                started + Duration::from_secs(1),
+                deadline,
             )
             .await
             .expect("a spent wait is an answer, not a failure");
+        let returned = Instant::now();
+        let times = times.lock().expect("attempt times").clone();
         eprintln!(
-            "spent walk: attempts={attempts:?} elapsed={:?} answer={answer:?}",
-            started.elapsed()
+            "spent walk: attempts={} elapsed={:?} answer={answer:?}",
+            times.len(),
+            returned - started
         );
-        assert!(
-            matches!(answer, OutgoingAnswer::Unsettled { attempts } if (2..=3).contains(&attempts)),
-            "the engine's start shares the first 250 ms: {answer:?}"
+        assert_eq!(
+            answer,
+            OutgoingAnswer::Unsettled { attempts: 2 },
+            "the wait after the first attempt fits the deadline, the held second one ends past it"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(times.len(), 2, "the answer counts every attempt");
+        assert_waits_under_the_deadline(&table("sh").retry, deadline, &times, returned);
         assert!(
             slot.state.lock().await.session.is_some(),
             "the session survives the spent wait"
@@ -2192,7 +2331,8 @@ done
 
     /// A `sh` engine serving references and call hierarchy that refuses every
     /// later request with JSON-RPC error `code`, as rust-analyzer answers
-    /// `-32801` content modified while it loads.
+    /// `-32801` content modified while it loads. It answers `shutdown` and
+    /// leaves on `exit`, so a pool shutdown ends with the engine.
     #[cfg(unix)]
     fn refusing_slot(directory: &Path, code: i64) -> EnginePool {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
@@ -2206,6 +2346,8 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}" ;;
     *'"method":"shutdown"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
     *'"id":'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":REFUSAL_CODE,\"message\":\"refused\"}}" ;;
   esac
@@ -2256,7 +2398,7 @@ done
     /// spent answers like analyzing: an outgoing walk answers `Unsettled`
     /// and an incoming one [`EngineFault::Analyzing`], both with the session
     /// kept. A refusal that is the engine's verdict on the request stays the
-    /// walk's error, inside the walk's deadline.
+    /// walk's error once the walk's wait is spent.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_retryable_refusal_at_a_spent_walk_wait_answers_unsettled() {
@@ -2320,21 +2462,27 @@ done
         let directory = tempfile::tempdir().expect("workspace");
         let pool = refusing_slot(directory.path(), INVALID_REQUEST);
         let slot = pool.engine_by_key(&key).expect("slot");
-        let started = Instant::now();
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deadline = Instant::now() + Duration::from_secs(1);
         let refused = slot
             .request_outgoing(
                 open_lib,
-                counted_prepare(&attempts),
+                timed(&times, counted_prepare(&attempts)),
                 finish_immediately,
-                started + Duration::from_secs(1),
+                deadline,
             )
             .await
             .expect_err("the engine's verdict on the request stays the walk's error");
+        let returned = Instant::now();
+        let times = times.lock().expect("attempt times").clone();
+        let retry = table("sh").retry;
+        let made = u64::try_from(times.len()).expect("an attempt count");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+            made < retry.attempts,
+            "the walk ended inside the retry table, where a verdict waits a walk's waits: \
+             {made} attempts"
         );
+        assert_waits_under_the_deadline(&retry, deadline, &times, returned);
         assert!(
             matches!(
                 refused.fault(),
@@ -2511,28 +2659,28 @@ done
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let started = Instant::now();
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deadline = Instant::now() + Duration::from_secs(1);
         let spent = slot
             .request_settled(
                 open_lib,
-                counted_references(&attempts),
+                timed(&times, counted_references(&attempts)),
                 finish_immediately,
                 |_count| (true, true),
                 |_count| None,
-                started + Duration::from_secs(1),
+                deadline,
             )
             .await
             .expect_err("an empty report from a ready engine never settles inside a second");
+        let returned = Instant::now();
+        let times = times.lock().expect("attempt times").clone();
+        let made = u64::try_from(times.len()).expect("an attempt count");
         assert!(
-            matches!(spent.fault(), EngineFault::Analyzing { attempts } if *attempts >= 2),
-            "{:?}",
+            matches!(spent.fault(), EngineFault::Analyzing { attempts } if *attempts == made && made >= 2),
+            "{made} attempts: {:?}",
             spent.fault()
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_waits_under_the_deadline(&table("sh").retry, deadline, &times, returned);
         assert!(
             slot.state.lock().await.session.is_some(),
             "the session survives the spent wait"
