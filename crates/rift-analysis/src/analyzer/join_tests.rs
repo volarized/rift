@@ -379,7 +379,7 @@ fn test_variants_of_a_public_enum_are_public() {
         .collect();
     assert_eq!(public, ["Shape", "Shape::Circle", "Shape::Square"]);
     let variant = symbol_at(&publication, "src/lib.rs", "Shape::Circle").expect("a variant");
-    assert_eq!(variant.kind.0, "rust.variant");
+    assert_eq!(variant.kind.0, "variant");
 }
 
 /// Global ingestion reads a registry archive, selects its files, and analyzes them; the same

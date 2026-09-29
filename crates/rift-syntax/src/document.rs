@@ -55,8 +55,8 @@ pub struct SyntaxSymbol {
     /// The containing symbol's qualified name; `None` for a declaration at
     /// the top level of the file.
     pub container: Option<String>,
-    /// The provider's kind word, such as `function`; the wire kind composes
-    /// it as `{language}.{kind}`.
+    /// The provider's kind word, such as `function`, carried on the wire
+    /// unchanged.
     pub kind: &'static str,
     /// Portable categories this declaration falls into, in the provider's
     /// declared order.

@@ -65,7 +65,7 @@ const SETEXT_HEADING_KIND: &str = "setext_heading";
 /// with no content.
 const HEADING_CONTENT_FIELD: &str = "heading_content";
 
-/// The one markdown kind word behind the wire kind `markdown.heading`.
+/// The kind word a markdown heading carries on the wire.
 const HEADING_KIND_WORD: &str = "heading";
 
 /// The separator markdown qualified names join nested headings with.
