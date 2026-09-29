@@ -324,9 +324,6 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     Ok(())
 }
 
-/// The record every server that reaches serving writes once, before it answers.
-const SERVER_READY_RECORD: &str = "MCP server ready";
-
 /// A workspace server this test holds in place of a `rift server` of another release.
 ///
 /// It holds the election, publishes its lock document, and answers an authorized
@@ -406,14 +403,6 @@ impl RecordedServer {
         within("the recorded server to release its election", self.served).await???;
         Ok(())
     }
-}
-
-/// How many times `record` appears in the workspace's recorded diagnostics.
-async fn record_count(root: &Path, record: &str) -> TestResult<usize> {
-    let printed = run_rift(root, &["server", "logs"]).await?;
-    Ok(String::from_utf8_lossy(&printed.stdout)
-        .matches(record)
-        .count())
 }
 
 /// A proxy asks the server of an older release to stop, starts one from its own binary
@@ -498,9 +487,10 @@ async fn another_build_of_this_version_is_refused_with_operator_guidance() -> Te
     assert_refused_without_a_stop(&another_build).await
 }
 
-/// Two proxies of one build race to replace the same older server. Both ask it to stop,
-/// both may start a server, and the election keeps exactly one: both requests are
-/// served by it, and only one server ever reached serving.
+/// Two proxies of one build race to replace the same older server. Both may ask it to
+/// stop and both may start a server, and the election keeps exactly one: each proxy
+/// connects to that one server, whose pid the lock records, and both requests are
+/// served by it.
 #[tokio::test]
 async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> TestResult {
     let directory = workspace()?;
@@ -508,26 +498,44 @@ async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> Tes
     let _cleanup = StopOnDrop::new(root);
     let older = RecordedServer::start(root, "0.0.1").await?;
 
-    let (first, second) = tokio::join!(proxy_client(root), proxy_client(root));
-    let (first, second) = (first?, second?);
+    let (first, second) = tokio::join!(relayed_proxy_client(root), relayed_proxy_client(root));
+    let ((first, first_stderr), (second, second_stderr)) = (first?, second?);
     let (first_lookup, second_lookup) = tokio::join!(beacon_lookup(&first), beacon_lookup(&second));
     assert_beacon(&first_lookup?);
     assert_beacon(&second_lookup?);
+    assert!(older.accepted() >= 1, "the older server is asked to stop");
     older.stopped().await?;
 
     let serving = serving_document(root).ok_or("one server of this build must serve")?;
     assert_eq!(serving.identity, rift_binary_identity()?);
-    await_record(root, SERVER_READY_RECORD).await?;
-    assert_eq!(
-        record_count(root, SERVER_READY_RECORD).await?,
-        1,
-        "exactly one server reached serving"
-    );
     first.cancel().await?;
     second.cancel().await?;
     let survivor = serving_document(root).ok_or("the shared server must outlive both")?;
     assert_eq!(survivor.pid, serving.pid);
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop the replacing server")?;
+
+    for stderr in [first_stderr.text().await?, second_stderr.text().await?] {
+        let connected = connected_pids(&stderr);
+        assert_eq!(
+            connected,
+            [serving.pid],
+            "each proxy connects to the one elected server: {stderr}"
+        );
+    }
     Ok(())
+}
+
+/// The pid of every server a proxy's stderr says it connected to, in order.
+fn connected_pids(stderr: &str) -> Vec<u32> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("proxy connected to workspace server"))
+        .filter_map(|line| {
+            let (_, after) = line.split_once(" pid=")?;
+            after.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
 }
 
 /// The refusal an agent sees when the workspace cannot produce a server.
