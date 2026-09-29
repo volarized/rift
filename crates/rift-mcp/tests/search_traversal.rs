@@ -1551,6 +1551,68 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     Ok(())
 }
 
+/// `greeting` 1.0.0 installed into `.venv` after the first walk, as `uv sync` installs
+/// it from the unchanged `uv.lock`: the files `INSTALLED_FILES` holds below
+/// `site-packages`.
+#[cfg(unix)]
+fn installed_after(path: &str) -> bool {
+    path.starts_with(".venv/lib/python3.12/site-packages/greeting")
+}
+
+/// A distribution `uv sync` installs into the existing `.venv` without touching `uv.lock`
+/// reaches the next walk: the engine resolves the import, and the dependency context
+/// locates the package it lands in, so the callee is named rather than dropped.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk() -> TestResult {
+    let fixture = python_global_api().await?;
+    let configuration = format!(
+        "[source]\nexclude = [\".venv/**\"]\n\n{}\n{OUTGOING_ENGINE}",
+        global_table(&fixture.endpoint)
+    );
+    let mut before: Vec<(&str, &str)> = INSTALLED_FILES
+        .iter()
+        .copied()
+        .filter(|(path, _)| !installed_after(path))
+        .collect();
+    before.push((".venv/lib/python3.12/site-packages/_virtualenv.py", ""));
+    let (directory, client, _server_task) = served_workspace(&before, Some(configuration)).await?;
+    let walk = json!({
+        "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+    });
+
+    let first = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    assert!(
+        symbol_names(&first).is_empty(),
+        "nothing installed resolves: {first}"
+    );
+
+    for (path, content) in INSTALLED_FILES
+        .iter()
+        .filter(|(path, _)| installed_after(path))
+    {
+        let file = directory.path().join(path);
+        std::fs::create_dir_all(file.parent().ok_or("an installed file has a folder")?)?;
+        std::fs::write(file, content)?;
+    }
+    let second = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    assert_eq!(symbol_names(&second), ["greet"], "{second}");
+    let greet = callee_hit(&second, "greet")?;
+    assert_eq!(
+        greet["hit"]["symbol"]["id"],
+        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        "{greet}"
+    );
+    assert_eq!(
+        greet["hit"]["symbol"]["origin"]["location"],
+        json!("dependency"),
+        "{greet}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
 /// A global API that refuses the connection names no callee: every package callee drops,
 /// and the answer carries the typed warning naming the failure.
 #[tokio::test]
