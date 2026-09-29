@@ -26,7 +26,7 @@ pub use logs::{
     LOG_QUEUE_RECORDS, LOG_SETTLE_TIMEOUT, LogDrain, LogSettlement, LogSink,
     PANIC_PAYLOAD_BYTES_MAX, install_panic_hook, log_capture, logs_configuration,
 };
-pub use proxy::{ProxyFault, ProxyServeError, serve_proxy};
+pub use proxy::{ProxyFault, ProxyServeError, forward_budget, serve_proxy};
 pub use server::RiftMcp;
 pub use spawn::{
     BoundedStderr, BoundedWriter, PRESENCE_POLL_INTERVAL, SERVER_STDERR_BYTES_MAX,

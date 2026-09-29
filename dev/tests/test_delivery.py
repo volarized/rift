@@ -94,6 +94,14 @@ DECLARED_WAIT = re.compile(r"Duration::from_(millis|secs|mins)\((\d[\d_]*)\)")
 # What one unit is worth in seconds.
 WAIT_SECONDS = {"millis": 0.001, "secs": 1.0, "mins": 60.0}
 
+# The shared end-to-end harness, the helper name a suite includes it by, and the
+# bound it puts on one proxied call.
+HARNESS = "crates/rift/tests/harness.rs"
+HARNESS_HELPER = "harness"
+PROXIED_CALL_BOUND = re.compile(
+    r"const PROXIED_CALL_MAX: Duration =\s*Duration::from_(millis|secs|mins)\((\d[\d_]*)\)"
+)
+
 # A nextest timeout is written as a count and a unit suffix.
 TIMEOUT_PERIOD = re.compile(r"^(\d+)(ms|s|m)$")
 TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
@@ -138,6 +146,25 @@ def declared_waits(path: str) -> float:
         WAIT_SECONDS[unit] * int(count.replace("_", ""))
         for unit, count in DECLARED_WAIT.findall(source)
     )
+
+
+def proxied_call_bound() -> float:
+    """The seconds the harness lets one proxied call run before it fails the case."""
+    source = (REPOSITORY / HARNESS).read_text(encoding="utf-8")
+    matched = PROXIED_CALL_BOUND.search(source)
+    assert matched, f"{HARNESS} declares no PROXIED_CALL_MAX"
+    unit, count = matched.groups()
+    return WAIT_SECONDS[unit] * int(count.replace("_", ""))
+
+
+def suites_including(helper: str) -> set[str]:
+    """Every test binary in `crates/rift/tests` that includes `helper`."""
+    including: set[str] = set()
+    for path in sorted((REPOSITORY / "crates/rift/tests").glob("*.rs")):
+        source = path.read_text(encoding="utf-8")
+        if TEST_ATTRIBUTE.search(source) and helper in INCLUDED_HELPER.findall(source):
+            including.add(path.stem)
+    return including
 
 
 def timeout_seconds(period: str) -> float:
@@ -808,6 +835,29 @@ class HubSuitesOutliveTheWaitsTheyDeclare(unittest.TestCase):
                     declared,
                     f"{binary} can wait {declared}s and is ended at "
                     f"{suite_deadline(binary)}s, so its own failure never prints",
+                )
+
+
+class ProxiedCallsFailInsideTheDeadline(unittest.TestCase):
+    """A proxied call that never answers fails the case naming the call.
+
+    The harness bounds one proxied call, and the proxy's own forward budget
+    ends inside that bound. A bound at or past nextest's deadline never trips:
+    nextest ends the case first, and the report is a timeout carrying nothing
+    about the call that hung.
+    """
+
+    def test_the_proxied_call_bound_ends_inside_every_harness_suite_deadline(self) -> None:
+        bound = proxied_call_bound()
+        including = suites_including(HARNESS_HELPER)
+        self.assertTrue(including, f"no suite includes {HARNESS}")
+        for binary in sorted(including):
+            with self.subTest(binary=binary):
+                self.assertLess(
+                    bound,
+                    suite_deadline(binary),
+                    f"{binary} bounds one proxied call at {bound}s and is ended at "
+                    f"{suite_deadline(binary)}s, so a call that hangs never fails by name",
                 )
 
 

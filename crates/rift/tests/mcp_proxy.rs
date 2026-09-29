@@ -39,11 +39,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use harness::{
-    LIBRARY, PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, laid_out_workspace,
-    proxied_call, proxied_engine_call, proxy_client, relayed_proxy_client, require_success,
-    run_rift, rust_engine_workspace, within, workspace,
+    FIXTURE_READINESS_TIMEOUT, FIXTURE_WORKER_QUEUE_TIMEOUT, LIBRARY, PROXIED_CALL_MAX,
+    PROXIED_ENGINE_CALL_MAX, StopOnDrop, TestResult, arguments, laid_out_workspace, proxied_call,
+    proxied_engine_call, proxy_client, relayed_proxy_client, require_success, run_rift,
+    rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
+use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
     ServerLock,
@@ -68,6 +70,31 @@ fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
     let required = retry_wait * 2 + START_WAIT_MAX;
     assert!(PROXIED_ENGINE_CALL_MAX >= Duration::from_secs(120));
     assert!(PROXIED_ENGINE_CALL_MAX > required);
+}
+
+/// A fixture's `rift.toml`, accepted the way the served configuration is, gives the
+/// proxy a forward budget that ends inside [`PROXIED_CALL_MAX`]: a server that stops
+/// answering is refused by the proxy, naming that budget, before the case gives up on
+/// the call and long before nextest ends the case.
+#[test]
+fn proxied_forward_budget_ends_inside_the_call_bound() -> TestResult {
+    let directory = workspace()?;
+    let document = fs::read_to_string(directory.path().join("rift.toml"))?;
+    let environment = rift_core::acceptance::ConfigurationEnvironment::default();
+    let accepted = rift_core::acceptance::accept_configuration::<WorkspaceConfiguration>(
+        Some(&document),
+        &environment,
+    )?;
+    let server = &accepted.configuration().server;
+    assert_eq!(server.readiness_timeout, FIXTURE_READINESS_TIMEOUT);
+    assert_eq!(server.worker_queue_timeout, FIXTURE_WORKER_QUEUE_TIMEOUT);
+    let budget = rift_mcp::forward_budget(server);
+    assert!(
+        budget < PROXIED_CALL_MAX,
+        "the proxy's forward budget must end inside the harness bound on one call: \
+         forward_budget={budget:?}, PROXIED_CALL_MAX={PROXIED_CALL_MAX:?}"
+    );
+    Ok(())
 }
 
 fn rift_binary_identity() -> TestResult<ProductIdentity> {
@@ -98,15 +125,24 @@ fn serving_document(root: &Path) -> Option<ServerLock> {
 }
 
 /// Polls `condition` every [`PRESENCE_POLL_INTERVAL`] up to `attempts`
-/// times.
+/// times, and for no longer than those attempts span at that interval.
+///
+/// A condition that probes the workspace is not instant: a probe of a port
+/// nothing accepts on spends its whole connect timeout, which on Windows is
+/// every refused port, so counting alone would stretch the wait several times
+/// over.
 async fn wait_for<T>(
     attempts: u32,
     what: &str,
     mut condition: impl FnMut() -> Option<T>,
 ) -> TestResult<T> {
+    let deadline = tokio::time::Instant::now() + PRESENCE_POLL_INTERVAL.saturating_mul(attempts);
     for _ in 0..attempts {
         if let Some(value) = condition() {
             return Ok(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
