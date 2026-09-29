@@ -1149,12 +1149,15 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 /// publication no policy decides visibility yet, so every such path names itself, and the
 /// startup candidate's own policy decides what it holds.
 ///
-/// A name event on an extensionless path asks for the whole workspace only when the
-/// path names a directory the index can hold files under: one on disk right now, or one
-/// the publication holds files below, as a directory renamed away is. External writes can
-/// stage each file as an extensionless temporary file beside its target and
-/// rename it over the target; the publication holds nothing under that staging name, so
-/// its name event takes the per-path route a file event takes.
+/// A name event, and a create or remove event whose kind does not say it names a file,
+/// asks for the whole workspace only when its path names a directory the index can hold
+/// files under: one on disk right now, or one the index may hold files below, as a
+/// directory renamed or removed is. notify reports every create and remove on Windows as
+/// `Create(Any)` and `Remove(Any)`, so a directory moved in or out arrives in that shape,
+/// with no event for the files it carries. External writes can stage each file as an
+/// extensionless temporary file beside its target and rename it over the target; the
+/// publication holds nothing under that staging name, so its name event takes the
+/// per-path route a file event takes.
 pub(crate) fn watch_path_impact(
     roots: &WatchRoots,
     validation: &IndexValidation,
@@ -1191,13 +1194,17 @@ pub(crate) fn watch_path_impact(
         };
     }
     let reshapes_tree = match kind {
-        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            names_a_directory(validation, path)
-        }
+        EventKind::Create(CreateKind::File)
+        | EventKind::Remove(RemoveKind::File)
+        | EventKind::Modify(
+            ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other,
+        )
+        | EventKind::Access(_) => false,
         EventKind::Create(_)
         | EventKind::Remove(_)
-        | EventKind::Modify(_)
-        | EventKind::Access(_) => false,
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Any
+        | EventKind::Other => names_a_directory(validation, path),
     };
     if reshapes_tree {
         return WatchImpact::WholeWorkspace;
