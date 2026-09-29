@@ -694,9 +694,15 @@ async fn served_fixture() -> TestResult<(
     //
     // The package list names the collected release, so the fixture global API serves
     // the package hits every `global` and `all` request in the corpus reaches.
+    //
+    // A commit hit exists only once the background fill has analyzed and written the
+    // fixture's commits. At the default share of one core the history task rests three
+    // times as long as each commit parsed, so the history store fills at the whole core:
+    // the corpus proves the served schemas, and the rest only stretches its wait.
     let configuration = format!(
         "{}\n[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
          [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+         [providers.history]\ncpu_share = 1.0\n\n\
          {ENGINE}",
         hermetic_search::HERMETIC_TABLES,
         global.endpoint
