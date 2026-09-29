@@ -409,11 +409,40 @@ class Decisions(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", None)
 
-    def test_synchronous_history_refuses_finished_or_partial_records(self) -> None:
-        start = 'DEBUG rift_server::history: symbol history started component="index" operation="get_symbol" phase="start"\n'
+    def test_synchronous_history_requires_an_open_batch_with_pending_commits(
+        self,
+    ) -> None:
+        span = 'history.batch{component="history" operation="history.batch"}'
+        start = (
+            f"DEBUG {span}: rift_mcp::history: history batch started "
+            'component="history" operation="history.batch" phase="start" pending=4\n'
+        )
+        close = f"INFO {span}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+        analyzed = (
+            f'INFO {span}:history.analyze{{component="history" operation="history.analyze"}}:'
+            " rift_mcp::history: close time.busy=1s\n"
+        )
+        written = (
+            f'INFO {span}:history.write{{component="history" operation="history.write"}}:'
+            " rift_mcp::history: close time.busy=1ms\n"
+        )
         self.assertEqual(active_stdout(start, "history", None), start.strip())
-        close = 'DEBUG get_symbol{component="index" operation="get_symbol" phase="history"}: rift_server::history: close time.busy=1s\n'
-        for output in (start + close, start.rstrip(), start + close.rstrip()):
+        self.assertEqual(
+            active_stdout(start + analyzed + written, "history", None), start.strip()
+        )
+        self.assertEqual(
+            active_stdout(start + close + start, "history", None), start.strip()
+        )
+        for output in (
+            start + close,
+            start + analyzed + close,
+            start.rstrip(),
+            start + close.rstrip(),
+            start.replace("pending=4", "pending=0"),
+            start.replace(" pending=4", ""),
+            start.replace("history batch started", "history batch opened"),
+            start + close + start.replace("pending=4", "pending=0"),
+        ):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "history", None)
 
