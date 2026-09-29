@@ -53,8 +53,12 @@ const PACKAGE_INIT_FILES: [&str; 2] = ["__init__.py", "__init__.pyi"];
 const MODULE_SEPARATOR: &str = "_";
 
 /// One environment's `site-packages` directory and its listing, read once per lockfile.
-#[derive(Debug)]
-pub(super) struct SitePackages {
+///
+/// Two observations are equal when the same `site-packages` lists the same entries, so a
+/// distribution `uv sync` installs, removes, or upgrades makes the next observation
+/// differ: each one adds or removes its `.dist-info` directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SitePackages {
     directory: PathBuf,
     /// Every entry name by its ASCII-lowercase form, for the metadata directory match.
     by_lowercase: BTreeMap<String, String>,
@@ -63,7 +67,10 @@ pub(super) struct SitePackages {
 impl SitePackages {
     /// The `site-packages` of the environment beside `directory`, the folder holding the
     /// lockfile: below `lib/python<X.Y>`, else below `Lib`. Absent when neither stands.
-    pub(super) fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
+    ///
+    /// The work is at most three listings of [`DIRECTORY_ENTRIES_MAX`] entries each.
+    #[must_use]
+    pub fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
         let environment = directory.join(PROJECT_ENVIRONMENT_DIRECTORY);
         let library = environment.join(LIBRARY_DIRECTORY_NAME);
         let posix = inputs
@@ -92,7 +99,8 @@ impl SitePackages {
     }
 
     /// The `site-packages` folder this listing read.
-    pub(super) fn directory(&self) -> &Path {
+    #[must_use]
+    pub fn directory(&self) -> &Path {
         &self.directory
     }
 
@@ -291,6 +299,35 @@ mod tests {
                 .import_roots("pyjwt", "2.9.0", &mut inputs)
                 .is_empty(),
             "another version is not installed here"
+        );
+    }
+
+    #[test]
+    fn test_an_installed_distribution_makes_the_next_observation_differ() {
+        let listed = |files: &[&str]| {
+            let mut inputs = files
+                .iter()
+                .fold(RecordedInspector::default(), |inputs, file| {
+                    inputs.with_file(format!("{SITE_PACKAGES}/{file}"), "")
+                });
+            SitePackages::observe(Path::new(ROOT), &mut inputs)
+        };
+        let before = listed(&["six.py", "six-1.17.0.dist-info/RECORD"]);
+        assert!(before.is_some(), "the POSIX layout");
+        assert_eq!(
+            before,
+            listed(&["six.py", "six-1.17.0.dist-info/RECORD"]),
+            "the same listing observes equal"
+        );
+        assert_ne!(
+            before,
+            listed(&[
+                "six.py",
+                "six-1.17.0.dist-info/RECORD",
+                "jwt/__init__.py",
+                "PyJWT-2.10.1.dist-info/RECORD",
+            ]),
+            "an installed distribution adds its entries"
         );
     }
 

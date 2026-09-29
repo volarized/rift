@@ -40,4 +40,4 @@ pub use stdlib::{
     STANDARD_LIBRARY_MANAGER, StandardLibrary, StandardLibraryAnswer, StandardLibraryRequest,
     standard_library_answer,
 };
-pub use uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, UvResolver};
+pub use uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages, UvResolver};
