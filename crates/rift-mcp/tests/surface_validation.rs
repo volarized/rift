@@ -318,9 +318,10 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// `search` does consult it, and the search tier is prepared behind the answers, so this
 /// fixture's default `[search.vector]` table legitimately produces
 /// `vector_index_preparing` while the corpus runs. What it must never produce is
-/// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
-/// without operator action, and one that fired in ordinary operation would be one every
-/// caller learned to ignore.
+/// `lexical_ranking_unavailable`: a search waits out a commit in flight within
+/// `[server] readiness_timeout` and a busy connection pool within `[search] busy_timeout`,
+/// so ordinary operation meets none of that warning's causes, and one that fired here
+/// would be one every caller learned to ignore.
 ///
 /// A `get_symbol` or `search` request whose `scope` reaches packages carries the package
 /// warnings and no other: the fixture's path dependency `helper` answers
@@ -375,7 +376,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             assert_ne!(
                 warning["code"],
                 json!("lexical_ranking_unavailable"),
-                "an ordinary search must never spend the operator-action warning: \
+                "an ordinary search must never rank without the full-text tier: \
                  {structured:#}"
             );
         }
