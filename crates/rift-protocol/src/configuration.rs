@@ -1044,8 +1044,9 @@ pub struct SearchConfiguration {
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
-    /// Wall-clock budget one connection waits for a database lock held by
-    /// another process before `SQLITE_BUSY`, 100ms to 30s.
+    /// Wall-clock budget one caller waits for a free pooled connection, and
+    /// one connection waits for a database lock held by another process
+    /// before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
     /// Most bytes the matcher one search `pattern` compiles to may take, 64kb to

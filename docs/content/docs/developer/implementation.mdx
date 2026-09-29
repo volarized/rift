@@ -42,10 +42,18 @@ agent over the stdio transport and forwards each request to the workspace's `rif
 Streamable HTTP; the process holds no state of its own - state lives in the `rift server`. To
 reach the workspace's server it checks the server lock file -
 [`ServerLock`](/docs/developer/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
-server when no live one stands behind it. Before it adopts a live server, the proxy compares
-package version, executable SHA-256, and canonical MCP schema SHA-256 from the lock with its own
-identity. A mismatch starts a matching server rather than forwarding across different binaries or
-tool documents.
+server when no live one stands behind it.
+
+A server that `rift mcp` or `rift server start` starts exits when its claim on `.rift/server.lock`
+meets any other lock. When that leaves no process holding the election - on Windows a probe's
+shared lock can outlive the probe for a moment - the starter starts another within the same
+30-second window.
+
+Before it adopts a live server, the proxy compares package version, executable SHA-256, and
+canonical MCP schema SHA-256 from the lock with its own identity. A mismatch refuses the request:
+the caller receives a JSON-RPC internal error naming both identities and asking for
+`rift server stop`, and once the operator stops the running server, the next request starts one
+that matches.
 
 ### rift server
 
@@ -225,8 +233,11 @@ a write handed meanwhile runs before the next batch. A search never waits for a 
 the rows the index lacks beside the index.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
-snapshots. `search.busy_timeout` bounds a lock wait caused by another process. Every checkout
-sets its pragmas again, `mmap_size` among them, from
+snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
+pooled connection when every one of the `search.pool_slots` is checked out: past it the read or
+write refuses with `storage_failure`.
+
+Every checkout sets its pragmas again, `mmap_size` among them, from
 [`[search.lexical]`](/docs/developer/configuration#search) `mmap_size`, so a pooled connection
 reads the store file through the memory map that key sets.
 

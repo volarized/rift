@@ -19,7 +19,7 @@ mod workspace;
 
 pub use capture::LastCapture;
 pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
-pub use database::{DatabasePool, WorkspaceDatabase};
+pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,

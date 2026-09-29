@@ -930,6 +930,22 @@ impl WatchRoots {
     }
 }
 
+/// One watcher start over a workspace root: the native watcher production runs, or a test's
+/// watcher on no path.
+pub(crate) trait WatchWorkspace:
+    FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+    + Send
+    + 'static
+{
+}
+
+impl<Watch> WatchWorkspace for Watch where
+    Watch: FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+        + Send
+        + 'static
+{
+}
+
 /// Creates one native watcher rooted before the initial index scan.
 pub(crate) fn workspace_watcher(
     root: &Path,
@@ -946,6 +962,25 @@ pub(crate) fn workspace_watcher(
         .watch(roots.canonical(), RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     Ok(watcher)
+}
+
+/// A watcher on no path, for a test that moves the epoch itself.
+///
+/// A native watcher over the test's directory can report a write the test made before the
+/// watcher started: `FSEvents` did on macOS, and Windows detects a last-write change "only
+/// when the file is written to the disk" (`ReadDirectoryChangesW`). Each report moves the
+/// epoch past the one the test asserts.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the platform refuses to create a watcher.
+#[cfg(test)]
+pub(crate) fn unwatched(
+    _root: &Path,
+    _validation: &Arc<IndexValidation>,
+) -> Result<notify::RecommendedWatcher, ReadError> {
+    notify::recommended_watcher(|_: notify::Result<Event>| {})
+        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))
 }
 
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
@@ -3615,7 +3650,7 @@ pub(crate) mod tests {
         LEXICAL_HELD_REVISIONS_MAX, LEXICAL_UNIT_COMMIT_BUDGET, LexicalCommitState, LexicalLane,
         LexicalWrite, PathChanges, PopulationLane, PublishedWorkspace, RebuildOutcome,
         RebuildRequest, WorkspaceCandidate, build_workspace_candidate, commit_deadline,
-        publish_rebuild, publish_rebuild_after, record_rebuild_failure,
+        publish_rebuild, publish_rebuild_after, record_rebuild_failure, unwatched,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -4934,7 +4969,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
         let supervisor = tokio::spawn(super::run_index_supervisor(
@@ -4994,7 +5029,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -6413,7 +6448,15 @@ pub(crate) mod tests {
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,
@@ -6457,7 +6500,15 @@ pub(crate) mod tests {
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,
@@ -7332,7 +7383,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
 
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
         // epoch 1 is forced to queue behind it - a deterministic gate between the
@@ -7414,17 +7465,6 @@ pub(crate) mod tests {
         validation.cancellation.cancel();
         supervisor.await?;
         Ok(())
-    }
-
-    /// A watcher on no path, for a supervisor test that moves the epoch itself.
-    ///
-    /// A watcher on the test's directory can report the file the test wrote just before
-    /// it started - `FSEvents` did on macOS - and that report moves the epoch past the one
-    /// the test observes.
-    fn unwatched() -> TestResult<notify::RecommendedWatcher> {
-        Ok(notify::recommended_watcher(
-            |_: notify::Result<notify::Event>| {},
-        )?)
     }
 
     /// The supervisor context the cancellation tests drive, over `blocking` sized to one
@@ -7538,7 +7578,7 @@ pub(crate) mod tests {
             current: stable_candidate(directory.path(), 0)?,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
         let context = cancellation_context(directory.path(), &validation, &published, &blocking);
         let (capture, mut started, release) = held_capture();

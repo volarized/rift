@@ -1120,6 +1120,78 @@ fn start_reports_a_server_that_exits_before_publishing() -> TestResult {
     Ok(())
 }
 
+/// The zero-byte file under `.rift` a server claims the election on, by
+/// locking it exclusively.
+const ELECTION_FILE_NAME: &str = "server.lock";
+
+/// The record a spawned server writes when its claim meets a lock and it exits.
+const LOST_ELECTION_RECORD: &str =
+    "another rift server already serves this workspace; this process exits";
+
+/// Reads of `rift server logs` while waiting for one record, [`POLL_INTERVAL`]
+/// apart: each read is a process start, so the wait stays well inside the
+/// start's own window.
+const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
+
+/// A claim that meets any lock on the election file loses the start election,
+/// a shared one included. This test keeps a shared lock on the file the way a
+/// probe's lock outlives the probe on Windows, which releases a closed handle's
+/// locks lazily, so the first server `rift server start` spawns loses an
+/// election no process holds and exits. Once the lock goes, the start spawns
+/// again inside its window and reports the server it elected.
+#[test]
+fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    fs::create_dir_all(root.join(".rift"))?;
+    let lingering = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(".rift").join(ELECTION_FILE_NAME))?;
+    lingering.try_lock_shared()?;
+
+    // The start writes into files: on Windows the detached server inherits the
+    // starting process's handles, so a pipe would stay open until it leaves.
+    let output = tempfile::tempdir()?;
+    let stdout_path = output.path().join("start.stdout");
+    let stderr_path = output.path().join("start.stderr");
+    let mut start = Command::new(rift_binary()?)
+        .args(["server", "start"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&stdout_path)?)
+        .stderr(fs::File::create(&stderr_path)?)
+        .spawn()?;
+    let lost = wait_for(
+        RECORD_READ_ATTEMPT_COUNT,
+        "the lost election's record",
+        || {
+            rift(root, &["server", "logs"])
+                .ok()
+                .filter(|printed| stdout_of(printed).contains(LOST_ELECTION_RECORD))
+        },
+    );
+    lingering.unlock()?;
+    drop(lingering);
+    let status = start.wait()?;
+    lost?;
+
+    let stdout = fs::read_to_string(&stdout_path)?;
+    let stderr = fs::read_to_string(&stderr_path)?;
+    assert!(
+        status.success(),
+        "the start must serve once the lock goes: status {status:?}, stdout {stdout:?}, \
+         stderr {stderr:?}"
+    );
+    let (_, pid) = listening_facts(&stdout)?;
+    let serving = serving_document(root).ok_or("the started server must be live")?;
+    assert_eq!(serving.pid, pid);
+    Ok(())
+}
+
 #[test]
 fn status_reports_absent_stale_and_serving_states() -> TestResult {
     let directory = workspace()?;
