@@ -1066,9 +1066,11 @@ fn ranking_of(
     }
 }
 
-/// A walk stops waiting for engine readiness this share of the request budget before
-/// the request's deadline, a tenth, so the answer and its warning still fit inside the
-/// budget and the request timeout never drops the engine session.
+/// A walk stops waiting for engine readiness, and abandons a retry still in flight, this
+/// share of the request budget before the request's deadline, a tenth, so closing the
+/// walk's document, checking the tree again, and the answer with its warning still fit
+/// inside the budget, and a spent wait never reaches the request timeout, which drops the
+/// engine session.
 const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 
 /// The instant every wait inside one request must end by.
@@ -2111,10 +2113,10 @@ impl RiftMcp {
     /// `None` asks the caller to capture a fresh publication after source or configuration
     /// movement. A stale publication uses its index and keeps its existing stale warning.
     ///
-    /// A walk, in either direction, stops waiting for engine readiness a tenth of the
-    /// budget before `deadline`, so a spent wait answers with its warning and keeps the
-    /// engine session instead of reaching the request's own timeout, which drops the
-    /// session.
+    /// A walk, in either direction, stops waiting for engine readiness, and abandons a
+    /// retry still in flight, a tenth of the budget before `deadline`, so a spent wait
+    /// answers with its warning and keeps the engine session instead of reaching the
+    /// request's own timeout, which drops the session.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,

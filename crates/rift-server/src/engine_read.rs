@@ -701,7 +701,8 @@ async fn resolve_symbol_callees(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let (report, unconfirmed) = match callees_on_engine(slot, &target, walk.deadline).await {
+    let answered = Box::pin(callees_on_engine(slot, &target, walk.deadline)).await;
+    let (report, unconfirmed) = match answered {
         Ok(OutgoingAnswer::Ready(report)) => (report, None),
         Ok(OutgoingAnswer::Unconfirmed(report)) => (report, Some(slot.name().to_owned())),
         Ok(OutgoingAnswer::Unprepared) => {
@@ -864,7 +865,8 @@ async fn resolve_symbol_references(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let (report, unconfirmed) = match references_on_engine(slot, &target, deadline).await {
+    let answered = Box::pin(references_on_engine(slot, &target, deadline)).await;
+    let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
         Err(error) if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) => {
             return Ok(SymbolReferences::NotServed);

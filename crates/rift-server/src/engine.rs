@@ -626,6 +626,44 @@ impl<T> Transient<T> {
     }
 }
 
+/// How one attempt of an exchange ended.
+enum AttemptEnd<T> {
+    /// The operation returned: the engine answered or refused, or the exchange broke.
+    Completed(Result<T, EngineError>),
+    /// The walk's wait was spent with this retry in flight; carries the condition the
+    /// retry was sent for.
+    Spent(Transient<T>),
+}
+
+/// Runs one attempt, abandoning a walk's retry still in flight once the walk's deadline
+/// passes.
+///
+/// `retrying` holds the walk's deadline and the condition an earlier attempt answered
+/// with. It holds nothing for a walk's first attempt, which is the request itself and is
+/// bounded by the engine's `request_timeout` as every request is, and nothing for an
+/// exchange that is no walk. A retry belongs to the readiness wait: the wait before it
+/// already ends before the deadline, and a retry started just before the deadline would
+/// otherwise hold the walk a whole round trip past it, and the request past its own
+/// deadline, which drops the session. Dropping an engine operation leaves its request
+/// pending, and the session discards the engine's late answer at its next exchange, so
+/// the session stays live. A retry that completes hands `retrying` back unchanged, so a
+/// rerun on a replacement session stays bounded by the same deadline.
+async fn attempt_within<T>(
+    retrying: &mut Option<(Instant, Transient<T>)>,
+    operation: impl Future<Output = Result<T, EngineError>>,
+) -> AttemptEnd<T> {
+    let Some((deadline, retried)) = retrying.take() else {
+        return AttemptEnd::Completed(operation.await);
+    };
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(outcome) => {
+            *retrying = Some((deadline, retried));
+            AttemptEnd::Completed(outcome)
+        }
+        Err(_elapsed) => AttemptEnd::Spent(retried),
+    }
+}
+
 /// What the retry loop does with one answer.
 enum Answer<T> {
     /// Return this answer.
@@ -823,10 +861,12 @@ impl EngineSlot {
     /// The exchange is an incoming walk's, and waits as an outgoing one does
     /// ([`EngineSlot::request_outgoing`]): past the retry table's attempt
     /// bound, up to `deadline`, so a spent wait ends inside the loop with
-    /// [`EngineFault::Analyzing`] and the session kept. A wait that
-    /// follows an attempt the engine answered while analyzing ends once the
-    /// session no longer reads analyzing, and one that follows an unconfirmed
-    /// attempt read before the quiet ends once the session reads quiet.
+    /// [`EngineFault::Analyzing`] and the session kept. A retry still in
+    /// flight at `deadline` is abandoned there and counts among the attempts
+    /// the walk reports. A wait that follows an attempt the engine answered
+    /// while analyzing ends once the session no longer reads analyzing, and
+    /// one that follows an unconfirmed attempt read before the quiet ends
+    /// once the session reads quiet.
     ///
     /// An unconfirmed engine's repeated full report is taken once the session
     /// is quiet past `settle_delay`, and the answer comes back with `true`, so
@@ -933,7 +973,8 @@ impl EngineSlot {
     /// retry table and continue past its attempt bound up to `deadline`, so a
     /// spent wait ends inside the loop: `finish` runs, the session stays
     /// live, and the answer is `OutgoingAnswer::Unsettled` instead of a
-    /// dropped request that discards the session.
+    /// dropped request that discards the session. A retry still in flight at
+    /// `deadline` is abandoned there and ends the walk the same way.
     ///
     /// # Errors
     ///
@@ -996,7 +1037,9 @@ impl EngineSlot {
     /// The absorbed condition decides the wait between two attempts and when
     /// the loop ends ([`Transient::wait_after`]). The wait reads engine output
     /// ([`EngineSession::read_output`]), so progress is stamped when it
-    /// arrives; the wait also ends once `wake` holds.
+    /// arrives; the wait also ends once `wake` holds. With `deadline`, a retry
+    /// still in flight when it passes ends the loop on the condition that
+    /// retry was sent for ([`attempt_within`]).
     ///
     /// A canceled request discards its session before releasing the slot lock. A later
     /// request spends the configured restart budget to start without open documents.
@@ -1022,6 +1065,7 @@ impl EngineSlot {
             finished: false,
         };
         let mut attempt: u64 = 1;
+        let mut retrying: Option<(Instant, Transient<T>)> = None;
         let mut reported: Option<EngineError> = None;
         let mut exchange_started = false;
         let mut session_generation = 0_u64;
@@ -1064,7 +1108,7 @@ impl EngineSlot {
                 }
             }
             self.report_readiness(session.readiness());
-            let outcome = operation(session).await;
+            let attempted = Box::pin(attempt_within(&mut retrying, operation(session))).await;
             let ended = session.is_ended();
             if ended {
                 self.report_state(LspState::Failed);
@@ -1072,22 +1116,29 @@ impl EngineSlot {
                 self.report_readiness(session.readiness());
             }
             let final_attempt = retry.delay_after(attempt).is_none();
-            let absorbed = match outcome {
-                Ok(answer) => match decide(session, session_generation, answer, final_attempt) {
-                    Answer::Ready(answer) => {
-                        finish(session).await;
-                        guarded.finished = true;
-                        return Ok(answer);
+            let absorbed = match attempted {
+                // A spent retry ends at the walk's deadline, so no wait fits after it and
+                // the loop ends below on the condition the retry was sent for.
+                AttemptEnd::Spent(retried) => retried,
+                AttemptEnd::Completed(Ok(answer)) => {
+                    match decide(session, session_generation, answer, final_attempt) {
+                        Answer::Ready(answer) => {
+                            finish(session).await;
+                            guarded.finished = true;
+                            return Ok(answer);
+                        }
+                        Answer::Retry(absorbed) => absorbed,
                     }
-                    Answer::Retry(absorbed) => absorbed,
-                },
-                Err(error) if ended => {
+                }
+                AttemptEnd::Completed(Err(error)) if ended => {
                     exchange_started = false;
                     reported = Some(error);
                     continue;
                 }
-                Err(error) if error.fault().is_refusal() => Transient::Refused(error),
-                Err(error) => {
+                AttemptEnd::Completed(Err(error)) if error.fault().is_refusal() => {
+                    Transient::Refused(error)
+                }
+                AttemptEnd::Completed(Err(error)) => {
                     finish(session).await;
                     guarded.finished = true;
                     return Err(error);
@@ -1101,6 +1152,7 @@ impl EngineSlot {
                 guarded.finished = true;
                 return self.exhausted(absorbed, attempt, deadline.is_some());
             };
+            retrying = deadline.map(|deadline| (deadline, absorbed));
             let waited = session.read_output(now + wait, &wake).await;
             if let Err(error) = waited {
                 exchange_started = false;
@@ -2158,11 +2210,13 @@ done
         }
     }
 
-    /// Asserts what a walk's deadline bounds, from each attempt's start and
-    /// end and the instant the walk returned: the wait after every attempt
-    /// but the last was scheduled to end before `deadline`, and the wait
-    /// after the last would have passed it. The attempts run unbounded by
-    /// the deadline, so a walk returns past it by what its last attempt takes.
+    /// Asserts what a walk's deadline bounds, from each answered attempt's
+    /// start and end and the instant the walk returned: the wait after every
+    /// attempt but the last was scheduled to end before `deadline`, and the
+    /// wait after the last would have passed it. A walk's first attempt runs
+    /// unbounded by the deadline and a retry still in flight at it is
+    /// abandoned there, so a walk returns past it only by what its first
+    /// attempt takes.
     ///
     /// The loop decides a wait after its attempt ends and before the walk
     /// returns, so a wait [`walk_wait`] allows from the attempt's end was
@@ -2273,8 +2327,9 @@ done
     /// A wait spent before the engine reads ready answers `Unsettled` and
     /// keeps the session, where a request dropped at its deadline discards it.
     ///
-    /// The deadline bounds the waits between attempts alone: the second
-    /// attempt starts under it and is held past it, and the walk still answers.
+    /// The deadline bounds the waits between attempts and the retries they
+    /// lead to: the second attempt starts under it and is held past it, and
+    /// the walk abandons that attempt at the deadline and still answers.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_spent_walk_wait_answers_unsettled_and_keeps_the_session() {
@@ -2286,6 +2341,7 @@ done
         let times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let started = Instant::now();
         let deadline = started + Duration::from_secs(1);
+        let held_until = deadline + Duration::from_secs(5);
         let mut references = counted_references(&attempts);
         let counted = Arc::clone(&attempts);
         let answer = slot
@@ -2297,7 +2353,7 @@ done
                     Box::pin(async move {
                         let answer = answer.await;
                         if later_attempt {
-                            tokio::time::sleep_until(deadline).await;
+                            tokio::time::sleep_until(held_until).await;
                         }
                         answer
                     })
@@ -2310,16 +2366,27 @@ done
         let returned = Instant::now();
         let times = times.lock().expect("attempt times").clone();
         eprintln!(
-            "spent walk: attempts={} elapsed={:?} answer={answer:?}",
+            "spent walk: completed={} elapsed={:?} answer={answer:?}",
             times.len(),
             returned - started
         );
         assert_eq!(
             answer,
             OutgoingAnswer::Unsettled { attempts: 2 },
-            "the wait after the first attempt fits the deadline, the held second one ends past it"
+            "the wait after the first attempt fits the deadline, the held second one is abandoned"
         );
-        assert_eq!(times.len(), 2, "the answer counts every attempt");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the answer counts every attempt the walk sent"
+        );
+        assert_eq!(times.len(), 1, "the held second attempt never completed");
+        assert!(
+            returned >= deadline && returned < held_until,
+            "the walk returns at the deadline, not when the held attempt ends: returned {:?} \
+             past the deadline",
+            returned.saturating_duration_since(deadline)
+        );
         assert_waits_under_the_deadline(&table("sh").retry, deadline, &times, returned);
         assert!(
             slot.state.lock().await.session.is_some(),
@@ -2680,7 +2747,7 @@ done
             .expect_err("an empty report from a ready engine never settles inside a second");
         let returned = Instant::now();
         let times = times.lock().expect("attempt times").clone();
-        let made = u64::try_from(times.len()).expect("an attempt count");
+        let made = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             matches!(spent.fault(), EngineFault::Analyzing { attempts } if *attempts == made && made >= 2),
             "{made} attempts: {:?}",
