@@ -1,15 +1,18 @@
 //! The live and fill locks beside one store file.
 //!
-//! `flock` is advisory, so the operating system never blocks an unlink: a
-//! lock file a sweeper deletes while a server holds it leaves that server
-//! holding a lock on a file no other opener can reach. Every opener therefore
-//! checks after locking that the path still names the file it locked, and
-//! opens the path again when it does not.
+//! A lock never blocks an unlink: `flock` is advisory, and on Windows every
+//! handle the standard library opens shares delete access, so a delete succeeds
+//! while another process holds the file open. A lock file a sweeper deletes
+//! while a server holds it leaves that server holding a lock on a file no other
+//! opener can reach.
+//! Every opener therefore checks after locking that the path still names the
+//! file it locked, and opens the path again when it does not.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use rift_core::Error;
+use same_file::Handle;
 
 use crate::error::{StoreError, StoreFault, folder_error};
 
@@ -62,20 +65,16 @@ pub(crate) fn lock_live_checked(
     }))
 }
 
-/// Whether `path` still names `file`: the same device and inode.
-#[cfg(unix)]
+/// Whether `path` still names `file`: the same file by the identity the
+/// platform keeps, the device and inode on Unix, the volume serial number and
+/// file index on Windows.
+///
+/// Stable std exposes no file identity on Windows, and `same-file` reads it
+/// through `GetFileInformationByHandle` while both handles stay open, as the
+/// comparison requires. A path that names no file, or a file either side cannot
+/// read an identity from, names nothing this opener holds.
 fn names_file(path: &Path, file: &File) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    match (file.metadata(), std::fs::metadata(path)) {
-        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
-        _ => false,
-    }
-}
-
-/// Whether `path` still names `file`. Stable std exposes no file identity
-/// off Unix, so the path existing is the whole check there: a replaced file
-/// passes it.
-#[cfg(not(unix))]
-fn names_file(path: &Path, _file: &File) -> bool {
-    path.exists()
+    let held = file.try_clone().and_then(Handle::from_file);
+    let named = Handle::from_path(path);
+    matches!((held, named), (Ok(held), Ok(named)) if held == named)
 }
