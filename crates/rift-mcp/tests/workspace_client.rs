@@ -181,10 +181,14 @@ const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 /// Calls the tool, retrying the refusal the server advertises as
 /// `retry: same_request`: a write to the served workspace while the server
 /// runs can move the index between one request's snapshot and its acceptance.
+///
+/// A request refused on every attempt fails with the last refusal's message and
+/// data, so the failure names the code and the cause the server kept giving.
 pub(crate) async fn call_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<Value> {
+    let mut refused = None;
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         match client.call_tool(params.clone()).await {
             Ok(result) => {
@@ -196,9 +200,19 @@ pub(crate) async fn call_retrying_acceptance(
                 if error
                     .data
                     .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) =>
+            {
+                refused = Some(error);
+            }
             Err(error) => return Err(error.into()),
         }
     }
-    Err("the server kept refusing a retryable request".into())
+    let last = refused.map_or_else(String::new, |error| {
+        format!("{} {}", error.message, error.data.unwrap_or(Value::Null))
+    });
+    Err(format!(
+        "the server kept refusing a retryable request through {ACCEPTANCE_ATTEMPTS_MAX} \
+         attempts; the last refusal: {last}"
+    )
+    .into())
 }

@@ -51,8 +51,7 @@ use tracing::Instrument as _;
 use crate::failure::WireFailure;
 use crate::global::{
     GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, callee_declarations,
-    local_search_page, local_symbol_page, merge_patterns, merge_search, merge_symbols,
-    package_patterns, package_search, package_symbols,
+    merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
 };
 use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
@@ -1069,9 +1068,11 @@ fn ranking_of(
     }
 }
 
-/// A walk stops waiting for engine readiness this share of the request budget before
-/// the request's deadline, a tenth, so the answer and its warning still fit inside the
-/// budget and the request timeout never drops the engine session.
+/// A walk stops waiting for engine readiness, and abandons a retry still in flight, this
+/// share of the request budget before the request's deadline, a tenth, so closing the
+/// walk's document, checking the tree again, and the answer with its warning still fit
+/// inside the budget, and a spent wait never reaches the request timeout, which drops the
+/// engine session.
 const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 
 /// The instant every wait inside one request must end by.
@@ -1758,7 +1759,7 @@ impl RiftMcp {
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
-        let (mut route, remote) = self
+        let (route, remote) = self
             .global_read(deadline, &configuration, &read_context, |client, packages| async move {
                 package_symbols(&client, requested, &packages).await
             })
@@ -1767,16 +1768,9 @@ impl RiftMcp {
             items: remote,
             warnings: mut remote_warnings,
         } = remote;
-        let mut answer = match merge_symbols(&params, limit, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.append(&mut remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_symbol_page(&params, limit, local)
-            }
-        };
+        let mut answer = merge_symbols(&params, limit, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
@@ -2022,6 +2016,7 @@ impl RiftMcp {
 
         let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -2040,7 +2035,7 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
-        let (mut route, mut remote) = self
+        let (route, mut remote) = self
             .global_read(
                 deadline,
                 &configuration,
@@ -2051,16 +2046,9 @@ impl RiftMcp {
             )
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
-        let mut answer = match merge_search(&params, limit, local.clone(), remote) {
-            Ok(mut answer) => {
-                answer.warnings.extend(remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&error);
-                local_search_page(&params, limit, local)
-            }
-        };
+        let mut answer = merge_search(&params, limit, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
@@ -2209,10 +2197,10 @@ impl RiftMcp {
     /// `None` asks the caller to capture a fresh publication after source or configuration
     /// movement. A stale publication uses its index and keeps its existing stale warning.
     ///
-    /// A walk, in either direction, stops waiting for engine readiness a tenth of the
-    /// budget before `deadline`, so a spent wait answers with its warning and keeps the
-    /// engine session instead of reaching the request's own timeout, which drops the
-    /// session.
+    /// A walk, in either direction, stops waiting for engine readiness, and abandons a
+    /// retry still in flight, a tenth of the budget before `deadline`, so a spent wait
+    /// answers with its warning and keeps the engine session instead of reaching the
+    /// request's own timeout, which drops the session.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,

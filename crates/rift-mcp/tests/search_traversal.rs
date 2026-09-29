@@ -373,15 +373,75 @@ done
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_past_the_readiness_timeout_warns_and_keeps_the_engine() -> TestResult {
+    incoming_walks_past_the_readiness_timeout(ANALYZING_ENGINE)
+        .await
+        .map(drop)
+}
+
+/// A `sh` engine that reads analyzing on every attempt, as [`ANALYZING_ENGINE`] does, and
+/// holds its answer to the second request after the first document it opens for 0.8 s,
+/// appending `held` to the file its first argument names: a first walk under a 1 s
+/// `[server] readiness_timeout` sends that request as its retry, and the answer arrives
+/// past the request's deadline, yet before the next walk needs one. Each start appends
+/// `start` to the same file.
+#[cfg(unix)]
+const HELD_RETRY_ENGINE: &str = r#"echo start >> "$1"
+opens=0
+asked=0
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"textDocument/didOpen"'*)
+      opens=$((opens + 1))
+      asked=0 ;;
+    *'"id":'*)
+      asked=$((asked + 1))
+      if [ "$opens" -eq 1 ] && [ "$asked" -eq 2 ]; then
+        echo held >> "$1"
+        sleep 0.8
+      fi
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+/// A retry still in flight when an incoming walk's wait is spent is abandoned there: the
+/// walk answers `engine_analysis_unavailable` inside `[server] readiness_timeout` instead
+/// of holding the request past its deadline, and the next walk meets the same engine
+/// process, which discards the held answer arriving during it.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout() -> TestResult {
+    let log = incoming_walks_past_the_readiness_timeout(HELD_RETRY_ENGINE).await?;
+    assert_eq!(
+        log.lines().filter(|line| *line == "held").count(),
+        1,
+        "the first walk sends its retry to the held answer: {log}"
+    );
+    Ok(())
+}
+
+/// Runs two incoming walks under a 1 s `[server] readiness_timeout` over the `sh` engine
+/// `script_source`, asserts each answers `engine_analysis_unavailable` inside 2 s and
+/// that both meet the one engine process, and returns the log the engine appended to.
+#[cfg(unix)]
+async fn incoming_walks_past_the_readiness_timeout(script_source: &str) -> TestResult<String> {
     let engine = tempfile::tempdir()?;
     let script = engine.path().join("engine.sh");
-    let starts = engine.path().join("starts.log");
-    std::fs::write(&script, ANALYZING_ENGINE)?;
+    let log = engine.path().join("engine.log");
+    std::fs::write(&script, script_source)?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"1s\"\n\n\
          [languages.rust.lsp]\ncommand = [\"sh\", \"{}\", \"{}\"]\n",
         script.display(),
-        starts.display()
+        log.display()
     );
     let (_directory, client, _server_task) = served_workspace(
         &[(
@@ -392,7 +452,11 @@ async fn search_traversal_past_the_readiness_timeout_warns_and_keeps_the_engine(
     )
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
-    let started_lines = || std::fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
+    let started_lines = || {
+        std::fs::read_to_string(&log).map_or(0, |text| {
+            text.lines().filter(|line| *line == "start").count()
+        })
+    };
     let mut starts_after = Vec::new();
     for _walk in 0..2 {
         let started = std::time::Instant::now();
@@ -430,7 +494,7 @@ async fn search_traversal_past_the_readiness_timeout_warns_and_keeps_the_engine(
     );
 
     client.cancel().await?;
-    Ok(())
+    Ok(std::fs::read_to_string(&log)?)
 }
 
 /// A fake engine that registers one `**/*.rs` file watcher once initialized and appends

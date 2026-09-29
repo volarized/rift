@@ -495,10 +495,11 @@ fn engine_analysis_warning(language: Language, detail: impl Into<String>) -> Rea
 /// The engine's edges are missing from the answer, and the session stays live
 /// and keeps loading, so a resend meets an engine further along.
 fn walk_unsettled_warning(language: Language, attempts: u64) -> ReadWarning {
+    let noun = if attempts == 1 { "attempt" } else { "attempts" };
     engine_analysis_warning(
         language,
         format!(
-            "the language engine was still analyzing after {attempts} attempts when \
+            "the language engine was still analyzing after {attempts} {noun} when \
              `[server] readiness_timeout` was spent, so this walk carries none of its \
              edges; resend the request once the engine reads ready"
         ),
@@ -701,7 +702,8 @@ async fn resolve_symbol_callees(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let (report, unconfirmed) = match callees_on_engine(slot, &target, walk.deadline).await {
+    let answered = Box::pin(callees_on_engine(slot, &target, walk.deadline)).await;
+    let (report, unconfirmed) = match answered {
         Ok(OutgoingAnswer::Ready(report)) => (report, None),
         Ok(OutgoingAnswer::Unconfirmed(report)) => (report, Some(slot.name().to_owned())),
         Ok(OutgoingAnswer::Unprepared) => {
@@ -864,7 +866,8 @@ async fn resolve_symbol_references(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let (report, unconfirmed) = match references_on_engine(slot, &target, deadline).await {
+    let answered = Box::pin(references_on_engine(slot, &target, deadline)).await;
+    let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
         Err(error) if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) => {
             return Ok(SymbolReferences::NotServed);
@@ -1282,6 +1285,32 @@ mod tests {
                 .is_some_and(|detail| detail.contains("readiness_timeout")),
             "{wire}"
         );
+    }
+
+    /// The detail counts one attempt in the singular and any other count in the plural.
+    #[test]
+    fn a_spent_walk_wait_counts_its_attempts_in_the_detail() {
+        let detail = |attempts| {
+            let warning = super::walk_unsettled_warning(
+                rift_protocol::read::Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                attempts,
+            );
+            serde_json::to_value(&warning).expect("warning serializes")["detail"]
+                .as_str()
+                .expect("the warning carries a detail")
+                .to_owned()
+        };
+        for (attempts, counted) in [
+            (1, "after 1 attempt when"),
+            (2, "after 2 attempts when"),
+            (18, "after 18 attempts when"),
+        ] {
+            let detail = detail(attempts);
+            assert!(detail.contains(counted), "{detail}");
+        }
     }
 
     /// One call hierarchy item naming `name` at `location`.
