@@ -1,5 +1,6 @@
 //! Global package routing for current-tree reads.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
@@ -16,6 +17,7 @@ use rift_cloud_client::{
     PackageSearchRequestTarget, PackageSymbolCandidate, PackageSymbolRequest,
     PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
 };
+use rift_core::{ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
@@ -32,6 +34,7 @@ use rift_ranking::{
 use rift_server::{
     CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadError, ReadService,
 };
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
@@ -684,25 +687,95 @@ fn search_request(
     }
 }
 
+/// The shares a merge fuses the project's own order and the global index's candidates
+/// under: equal parts for the two, no vector share, and the rank constant the
+/// reciprocal-rank fusion paper uses.
+const MERGE_WEIGHTS: RankingWeights = RankingWeights::fixed(0.5, 0.5, 0.0, 60);
+
+/// Why a merge with package hits could not place one project hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectHitViolation {
+    /// The hit carries no identity: a symbol without `id`, or a file without `path`.
+    IdentityMissing,
+    /// The symbol address's final segment is not a percent-encoded UTF-8 name.
+    IdentityUndecodable,
+    /// The requested name matches neither the symbol's name nor its qualified name.
+    NameUnmatched,
+    /// The hit's `unit` is not a source unit address.
+    UnitInvalid,
+    /// The ranking refuses the hit's identity: empty, or past its byte bound.
+    IdentityRefused,
+}
+
+impl ProjectHitViolation {
+    /// The refusal naming `hit`, the project hit this violation was found on.
+    fn at(self, hit: &str) -> ProjectHitError {
+        rift_core::Error::new(ProjectHitFault {
+            hit: hit.to_owned(),
+            violation: self,
+        })
+    }
+}
+
+impl From<rift_ranking::RankingError> for ProjectHitViolation {
+    fn from(_: rift_ranking::RankingError) -> Self {
+        Self::IdentityRefused
+    }
+}
+
+/// A project hit a merge with package hits could not place, named by its wire identity or,
+/// lacking one, by its name, or by its kind when it carries no name either.
+///
+/// The project read builds every hit it answers with the identity the merge keys it by
+/// and a name the request matched, so this fault is a broken invariant in that read and
+/// classifies as the server's own internal error.
+#[derive(Debug)]
+pub(crate) struct ProjectHitFault {
+    hit: String,
+    violation: ProjectHitViolation,
+}
+
+impl Fault for ProjectHitFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InternalError)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        vec![
+            ErrorContext::new("hit", self.hit.clone()),
+            ErrorContext::new("violation", fault_label(&self.violation)),
+        ]
+    }
+}
+
+/// A merge's refusal of one project hit.
+pub(crate) type ProjectHitError = rift_core::Error<ProjectHitFault>;
+
 /// Merges local and remote symbol hits, then pages them at `limit`, the request's accepted
 /// page size.
+///
+/// # Errors
+///
+/// Returns [`ProjectHitError`] naming a project hit that carries no identity, whose
+/// identity does not decode to a qualified name, or that the requested name does not
+/// match. The project read answers none of these, so each is a broken invariant in that
+/// read.
 pub(crate) fn merge_symbols(
     params: &GetSymbolParams,
     limit: usize,
     mut local: GetSymbolResult,
     remote: Vec<PackageSymbolCandidate>,
-) -> Result<GetSymbolResult, ClientError> {
+) -> Result<GetSymbolResult, ProjectHitError> {
     let mut entries = Vec::with_capacity(local.hits.len() + remote.len());
     for hit in local.hits.drain(..) {
         let symbol_id = hit
             .symbol
             .id
             .clone()
-            .ok_or(ClientError::InvalidResponseField {
-                field: "symbol_identity",
-            })?;
+            .ok_or_else(|| ProjectHitViolation::IdentityMissing.at(&hit.symbol.name))?;
         let package = hit.symbol.origin.package.clone();
-        let class = local_match_class(&params.name, &hit)?;
+        let class = local_match_class(&params.name, &hit, &symbol_id)?;
         entries.push(SymbolEntry {
             hit,
             symbol_id,
@@ -741,31 +814,32 @@ struct SymbolEntry {
     remote: bool,
 }
 
+/// How `query` matches one project hit, read from the hit's name and the qualified name
+/// its identity encodes.
 fn local_match_class(
     query: &str,
     hit: &rift_protocol::read::GetSymbolHit,
-) -> Result<rift_ranking::IdentifierMatchClass, ClientError> {
-    let qualified_name = hit
-        .symbol
-        .id
-        .as_ref()
-        .and_then(|id| id.0.rsplit('/').next())
-        .ok_or(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
-    let qualified_name = percent_decode_str(qualified_name)
-        .decode_utf8()
-        .map_err(|_| ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
+    identity: &SymbolId,
+) -> Result<rift_ranking::IdentifierMatchClass, ProjectHitError> {
+    let qualified_name =
+        encoded_qualified_name(identity).map_err(|violation| violation.at(&identity.0))?;
     match_class(
         &query.to_lowercase(),
         &hit.symbol.name.to_lowercase(),
         &qualified_name.to_lowercase(),
     )
-    .ok_or(ClientError::InvalidResponseField {
-        field: "symbol_match",
-    })
+    .ok_or_else(|| ProjectHitViolation::NameUnmatched.at(&identity.0))
+}
+
+/// The qualified name a symbol address carries, percent-encoded, in its final segment.
+fn encoded_qualified_name(identity: &SymbolId) -> Result<Cow<'_, str>, ProjectHitViolation> {
+    let encoded = identity
+        .0
+        .rsplit_once('/')
+        .map_or(identity.0.as_str(), |(_, name)| name);
+    percent_decode_str(encoded)
+        .decode_utf8()
+        .map_err(|_| ProjectHitViolation::IdentityUndecodable)
 }
 
 fn symbol_order(left: &SymbolEntry, right: &SymbolEntry, scope: SearchScope) -> std::cmp::Ordering {
@@ -797,12 +871,18 @@ fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
 
 /// Merges package candidates into local search hits while retaining traversal-only hits,
 /// then pages them at `limit`, the request's accepted page size.
+///
+/// # Errors
+///
+/// Returns [`ProjectHitError`] naming a project hit that carries no identity, names a
+/// source unit that does not parse, or whose identity the ranking refuses. The project
+/// read answers none of these, so each is a broken invariant in that read.
 pub(crate) fn merge_search(
     params: &SearchParams,
     limit: usize,
     mut local: SearchResult,
     remote: GlobalSearchCandidates,
-) -> Result<SearchResult, ClientError> {
+) -> Result<SearchResult, ProjectHitError> {
     let mut payloads = std::collections::BTreeMap::new();
     let mut local_order = Vec::new();
     for hit in local.results.drain(..) {
@@ -840,14 +920,10 @@ pub(crate) fn merge_search(
             })
             .collect(),
     );
-    let weights =
-        RankingWeights::new(0.5, 0.5, 0.0, 60).map_err(|_| ClientError::InvalidResponseField {
-            field: "ranking_weights",
-        })?;
     let keep_max = payloads.len().max(1);
     let mut ranked = fuse(
         &[local_input, remote_input],
-        weights,
+        MERGE_WEIGHTS,
         QueryPhase::Precise,
         keep_max,
     );
@@ -864,7 +940,7 @@ pub(crate) fn merge_search(
                 })
                 .collect(),
         );
-        let broad_ranked = fuse(&[broad_input], weights, QueryPhase::Broad, keep_max);
+        let broad_ranked = fuse(&[broad_input], MERGE_WEIGHTS, QueryPhase::Broad, keep_max);
         ranked.append_phase(broad_ranked, keep_max);
     }
     let include_score = params
@@ -928,36 +1004,6 @@ pub(crate) fn merge_patterns(
     }
 }
 
-/// One page of the project's own symbol hits at `limit`, for a read whose remote lane
-/// failed: the hits keep the order the snapshot ranked them in.
-pub(crate) fn local_symbol_page(
-    params: &GetSymbolParams,
-    limit: usize,
-    local: GetSymbolResult,
-) -> GetSymbolResult {
-    let (hits, pagination) = page_window(local.hits, params.page_index, limit);
-    GetSymbolResult {
-        hits,
-        pagination,
-        warnings: local.warnings,
-    }
-}
-
-/// One page of the project's own search hits at `limit`, for a read whose remote lane
-/// failed: the hits keep the order the snapshot answered them in under `params.order`.
-pub(crate) fn local_search_page(
-    params: &SearchParams,
-    limit: usize,
-    local: SearchResult,
-) -> SearchResult {
-    let (results, pagination) = page_window(local.results, params.page_index, limit);
-    SearchResult {
-        results,
-        pagination,
-        warnings: local.warnings,
-    }
-}
-
 fn candidate_fields(hit: &SearchHit) -> FieldSet {
     let fields: FieldSet = hit
         .matched_by
@@ -979,57 +1025,52 @@ fn candidate_fields(hit: &SearchHit) -> FieldSet {
     }
 }
 
-fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ClientError> {
-    let identity =
-        match &hit.hit {
-            SearchHitTarget::Symbol { symbol } => {
-                let symbol_id = symbol
-                    .id
-                    .as_ref()
-                    .ok_or(ClientError::InvalidResponseField {
-                        field: "symbol_identity",
-                    })?;
-                if let Some(unit) = hit.unit.as_ref() {
-                    let encoded = symbol_id.0.rsplit('/').next().ok_or(
-                        ClientError::InvalidResponseField {
-                            field: "symbol_identity",
-                        },
-                    )?;
-                    let qualified_name =
-                        percent_decode_str(encoded).decode_utf8().map_err(|_| {
-                            ClientError::InvalidResponseField {
-                                field: "symbol_identity",
-                            }
-                        })?;
-                    DocumentIdentity::for_unit(
-                        &rift_core::SourceUnitId::parse(&unit.0).map_err(|_| {
-                            ClientError::InvalidResponseField {
-                                field: "source_identity",
-                            }
-                        })?,
-                        &qualified_name,
-                    )
-                } else {
-                    DocumentIdentity::new(symbol_id.0.clone())
-                }
-            }
-            SearchHitTarget::File { .. } => DocumentIdentity::new(
-                hit.path
-                    .as_ref()
-                    .ok_or(ClientError::InvalidResponseField {
-                        field: "file_identity",
-                    })?
-                    .0
-                    .clone(),
-            ),
-            SearchHitTarget::Node { node } => DocumentIdentity::new(node.0.clone()),
-            SearchHitTarget::Documentation { documentation } => {
-                DocumentIdentity::for_documentation_block(&documentation.block.identity.0)
-            }
-        };
-    identity.map_err(|_| ClientError::InvalidResponseField {
-        field: "search_identity",
+/// The ranking identity one project search hit is fused under, or the refusal naming the
+/// hit by its wire identity, or by its kind when it carries none.
+fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitError> {
+    ranking_identity(hit).map_err(|violation| match search_hit_key(hit) {
+        "" => violation.at("file"),
+        key => violation.at(key),
     })
+}
+
+/// The identity a project search hit ranks under: its symbol address, or the source unit
+/// and qualified name for a hit that names a unit, its path for a file, its address for a
+/// node, and its block for documentation.
+fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitViolation> {
+    let identity = match (&hit.hit, hit.unit.as_ref(), hit.path.as_ref()) {
+        (SearchHitTarget::Symbol { symbol }, unit, _) => {
+            let symbol_id = symbol
+                .id
+                .as_ref()
+                .ok_or(ProjectHitViolation::IdentityMissing)?;
+            match unit {
+                Some(unit) => unit_identity(unit, symbol_id)?,
+                None => DocumentIdentity::new(symbol_id.0.clone())?,
+            }
+        }
+        (SearchHitTarget::File { .. }, _, path) => {
+            let path = path.ok_or(ProjectHitViolation::IdentityMissing)?;
+            DocumentIdentity::new(path.0.clone())?
+        }
+        (SearchHitTarget::Node { node }, ..) => DocumentIdentity::new(node.0.clone())?,
+        (SearchHitTarget::Documentation { documentation }, ..) => {
+            DocumentIdentity::for_documentation_block(&documentation.block.identity.0)?
+        }
+    };
+    Ok(identity)
+}
+
+/// A unit-addressed symbol hit's identity: its source unit and the qualified name its
+/// symbol address encodes.
+fn unit_identity(
+    unit: &rift_protocol::read::SourceUnitId,
+    symbol_id: &SymbolId,
+) -> Result<DocumentIdentity, ProjectHitViolation> {
+    let unit =
+        rift_core::SourceUnitId::parse(&unit.0).map_err(|_| ProjectHitViolation::UnitInvalid)?;
+    let qualified_name = encoded_qualified_name(symbol_id)?;
+    Ok(DocumentIdentity::for_unit(&unit, &qualified_name)?)
 }
 
 fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
@@ -1445,8 +1486,8 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        FailureKind, GlobalRoute, RouteState, ServiceState, failure_state, page_window,
-        search_request,
+        DocumentIdentity, FailureKind, GlobalRoute, RouteState, SearchHit, SearchHitTarget,
+        ServiceState, failure_state, page_window, search_hit_key, search_request,
     };
     use rift_cloud_client::{ClientError, ResponseMeta};
     use rift_dependency::DependencyContext;
@@ -1574,8 +1615,9 @@ mod tests {
         assert_eq!(candidates, super::GlobalSearchCandidates::default());
     }
 
-    #[test]
-    fn documentation_order_uses_block_identity() {
+    /// One documentation search hit per block a two-paragraph `guide.txt` holds, in block
+    /// order.
+    fn documentation_hits() -> Vec<SearchHit> {
         let directory = tempfile::tempdir().expect("workspace");
         std::fs::write(directory.path().join("guide.txt"), "First.\n\nSecond.\n")
             .expect("documentation source");
@@ -1587,7 +1629,7 @@ mod tests {
         )
         .expect("workspace index");
         let metadata = index.documentation().index();
-        let mut hits = metadata
+        metadata
             .blocks
             .iter()
             .map(|block| {
@@ -1600,13 +1642,17 @@ mod tests {
                 }))
                 .expect("documentation hit")
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[test]
+    fn documentation_order_uses_block_identity() {
+        let mut hits = documentation_hits();
         assert_eq!(hits.len(), 2);
-        let mut expected = metadata
-            .blocks
+        let mut expected: Vec<String> = hits
             .iter()
-            .map(|block| block.identity.0.as_str())
-            .collect::<Vec<_>>();
+            .map(|hit| super::search_hit_key(hit).to_owned())
+            .collect();
         expected.sort_unstable();
         for order in [super::ResultOrder::Identity, super::ResultOrder::Path] {
             hits.reverse();
@@ -1629,70 +1675,203 @@ mod tests {
         serde_json::from_value(example).expect("the example is a value of the model")
     }
 
-    /// A read whose remote lane failed pages the project's own hits in the order the
-    /// snapshot ranked them, and keeps the snapshot's warnings.
-    #[test]
-    fn a_local_symbol_page_keeps_the_snapshot_order_and_its_warnings() {
-        use rift_protocol::read::{GetSymbolParams, GetSymbolResult, ReadWarning};
-
-        let example: GetSymbolResult = authored_example();
-        let hits = ["first", "second", "third"].map(|name| {
-            let mut hit = example.hits[0].clone();
-            hit.symbol.name = name.to_owned();
-            hit
-        });
-        let local = GetSymbolResult {
-            hits: hits.to_vec(),
-            pagination: example.pagination,
-            warnings: vec![ReadWarning::GlobalAccessDisabled],
-        };
-        let request = serde_json::json!({"name": "load_config", "limit": 2, "page_index": 1});
-        let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
-
-        let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
-        let page = super::local_symbol_page(&params, limit, local);
-
-        let names: Vec<&str> = page
-            .hits
-            .iter()
-            .map(|hit| hit.symbol.name.as_str())
-            .collect();
-        assert_eq!(names, ["third"]);
-        assert_eq!(page.pagination.page_index, 1);
-        assert_eq!(page.pagination.total_pages, 2);
-        assert_eq!(page.warnings, [ReadWarning::GlobalAccessDisabled]);
+    /// The context a merge's refusal carries: the hit it names and the rule it broke.
+    fn refusal_context(hit: &str, violation: &str) -> [rift_core::ErrorContext; 2] {
+        [
+            rift_core::ErrorContext::new("hit", hit),
+            rift_core::ErrorContext::new("violation", violation),
+        ]
     }
 
-    /// The search counterpart pages under the request's `limit`, or the default one when
-    /// the request names none.
+    /// `hit` with its symbol address replaced; a hit of another kind comes back unchanged.
+    fn with_symbol_id(hit: &SearchHit, identity: Option<&str>) -> SearchHit {
+        let mut hit = hit.clone();
+        if let SearchHitTarget::Symbol { symbol } = &mut hit.hit {
+            symbol.id = identity.map(|identity| rift_protocol::read::SymbolId(identity.to_owned()));
+        }
+        hit
+    }
+
+    /// A project hit the lookup ranked merges beside no package hit into one page of its own.
     #[test]
-    fn a_local_search_page_keeps_the_snapshot_order_and_its_warnings() {
-        use rift_protocol::read::{ReadWarning, SearchParams, SearchResult};
+    fn merge_symbols_pages_the_project_hits_it_can_place() {
+        use rift_protocol::read::{GetSymbolParams, GetSymbolResult};
+
+        let example: GetSymbolResult = authored_example();
+        let request = serde_json::json!({"name": "load_config"});
+        let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+        let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
+
+        let merged = super::merge_symbols(&params, limit, example.clone(), Vec::new())
+            .expect("the project hit carries its identity and matches the name");
+
+        assert_eq!(merged.hits, example.hits);
+        assert_eq!(merged.pagination.total_pages, 1);
+    }
+
+    /// A project hit the merge cannot key or order refuses the lookup as the server's own
+    /// internal error, naming the hit and the rule it broke.
+    #[test]
+    fn merge_symbols_refuses_a_project_hit_it_cannot_place() {
+        use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SymbolId};
+
+        let example: GetSymbolResult = authored_example();
+        let placed = "rift://symbol/rust/src/config.rs/load_config";
+        let undecodable = "rift://symbol/rust/src/config.rs/%FF";
+        let cases = [
+            ("load_config", None, "load_config", "identity_missing"),
+            (
+                "load_config",
+                Some(undecodable),
+                undecodable,
+                "identity_undecodable",
+            ),
+            ("parse_manifest", Some(placed), placed, "name_unmatched"),
+        ];
+        for (name, identity, hit, violation) in cases {
+            let request = serde_json::json!({"name": name});
+            let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+            let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
+            let mut local = example.clone();
+            local.hits[0].symbol.id = identity.map(|identity| SymbolId(identity.to_owned()));
+
+            let error = super::merge_symbols(&params, limit, local, Vec::new())
+                .expect_err("the merge cannot place the project hit");
+
+            assert_eq!(error.descriptor().code(), "internal_error");
+            let context = rift_core::Fault::context(error.fault());
+            assert_eq!(context, refusal_context(hit, violation));
+        }
+    }
+
+    /// Each kind of project hit ranks under the identity the fusion keys it by, and a merge
+    /// beside no package candidate answers every one of them.
+    #[test]
+    fn merge_search_ranks_every_kind_of_project_hit() {
+        use rift_protocol::read::{SearchParams, SearchResult, SourceUnitId};
 
         let example: SearchResult = authored_example();
-        let paths: Vec<_> = example.results.iter().map(|hit| hit.path.clone()).collect();
-        let local = |results| SearchResult {
-            results,
-            pagination: example.pagination.clone(),
-            warnings: vec![ReadWarning::GlobalAccessDisabled],
-        };
+        let unit = "rift://source/rift.sources.project/src/lib.rs";
+        let mut unit_hit = example.results[0].clone();
+        unit_hit.path = None;
+        unit_hit.unit = Some(SourceUnitId(unit.to_owned()));
+        let node_hit: SearchHit = serde_json::from_value(serde_json::json!({
+            "hit": {"target": "node", "node": "rift://node/rust/src/lib.rs@0-10#dcbef6dd"},
+            "path": "src/lib.rs"
+        }))
+        .expect("a node hit");
+        let documentation_hit = documentation_hits().remove(0);
+        let block = search_hit_key(&documentation_hit).to_owned();
+        let parsed_unit = rift_core::SourceUnitId::parse(unit).expect("a source unit");
+        let unit_identity =
+            DocumentIdentity::for_unit(&parsed_unit, "load_config").expect("a unit identity");
+        let block_identity =
+            DocumentIdentity::for_documentation_block(&block).expect("a block identity");
+        let hits = [
+            example.results[0].clone(),
+            unit_hit,
+            example.results[1].clone(),
+            node_hit,
+            documentation_hit,
+        ];
+        let expected = [
+            "rift://symbol/rust/src/config.rs/load_config",
+            unit_identity.as_str(),
+            "src/lib.rs",
+            "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
+            block_identity.as_str(),
+        ];
 
-        let request = serde_json::json!({"query": "load_config", "limit": 1, "page_index": 1});
+        for (hit, expected) in hits.iter().zip(expected) {
+            let identity = super::search_identity(hit).expect("a project hit ranks");
+            assert_eq!(identity.as_str(), expected);
+        }
+        let request = serde_json::json!({"query": "load_config", "limit": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
-        let page = super::local_search_page(&params, limit, local(example.results.clone()));
-        let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
-        assert_eq!(paged, paths[1..]);
-        assert_eq!(page.pagination.total_pages, 2);
-        assert_eq!(page.warnings, [ReadWarning::GlobalAccessDisabled]);
+        let local = SearchResult {
+            results: hits.to_vec(),
+            pagination: example.pagination.clone(),
+            warnings: Vec::new(),
+        };
+        let merged = super::merge_search(
+            &params,
+            limit,
+            local,
+            super::GlobalSearchCandidates::default(),
+        )
+        .expect("every project hit ranks");
+        assert_eq!(merged.results.len(), hits.len());
+    }
 
+    /// A project search hit the merge cannot rank refuses the search as the server's own
+    /// internal error, naming the hit, or its kind when it carries no identity.
+    #[test]
+    fn merge_search_refuses_a_project_hit_it_cannot_place() {
+        use rift_protocol::read::{SearchParams, SearchResult, SourceUnitId};
+
+        let example: SearchResult = authored_example();
+        let symbol = &example.results[0];
+        let undecodable = "rift://symbol/rust/src/config.rs/%FF";
+        let oversized = format!(
+            "rift://symbol/rust/src/config.rs/{}",
+            "a".repeat(rift_ranking::IDENTITY_BYTES_MAX)
+        );
+        let placed = "rift://symbol/rust/src/config.rs/load_config";
+        let with_unit = |hit: SearchHit, unit: &str| SearchHit {
+            unit: Some(SourceUnitId(unit.to_owned())),
+            ..hit
+        };
+        let mut pathless = example.results[1].clone();
+        pathless.path = None;
+        let cases = [
+            (
+                with_symbol_id(symbol, None),
+                "load_config",
+                "identity_missing",
+            ),
+            (pathless, "file", "identity_missing"),
+            (
+                with_unit(symbol.clone(), "not-a-rift-source-uri"),
+                placed,
+                "unit_invalid",
+            ),
+            (
+                with_unit(
+                    with_symbol_id(symbol, Some(undecodable)),
+                    "rift://source/rift.sources.project/src/lib.rs",
+                ),
+                undecodable,
+                "identity_undecodable",
+            ),
+            (
+                with_symbol_id(symbol, Some(oversized.as_str())),
+                oversized.as_str(),
+                "identity_refused",
+            ),
+        ];
         let request = serde_json::json!({"query": "load_config"});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
-        let page = super::local_search_page(&params, limit, local(example.results.clone()));
-        let paged: Vec<_> = page.results.iter().map(|hit| hit.path.clone()).collect();
-        assert_eq!(paged, paths);
-        assert_eq!(page.pagination.total_pages, 1);
+        for (hit, label, violation) in cases {
+            let local = SearchResult {
+                results: vec![hit],
+                pagination: example.pagination.clone(),
+                warnings: Vec::new(),
+            };
+
+            let error = super::merge_search(
+                &params,
+                limit,
+                local,
+                super::GlobalSearchCandidates::default(),
+            )
+            .expect_err("the merge cannot place the project hit");
+
+            assert_eq!(error.descriptor().code(), "internal_error");
+            let context = rift_core::Fault::context(error.fault());
+            assert_eq!(context, refusal_context(label, violation));
+        }
     }
 
     /// A read that sends `context` as it stands, requesting no packages.
