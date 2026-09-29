@@ -21,6 +21,7 @@ from rift_dev.corpus_assertions import (
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
+    chunked_answer,
     churn_answer,
     database_bytes,
     exact_degradation,
@@ -34,6 +35,7 @@ from rift_dev.corpus_assertions import (
     probe_units,
     records,
     sample_symbols,
+    token_past_chunk,
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
@@ -265,9 +267,9 @@ class Corpus:
                         any(package.get("manager") == "pypi" for package in packages),
                         "uv.lock produced no pypi packages",
                     )
-                await self.left_out(client)
                 await self.symbols(client, candidates)
                 await self.lexical_persistence(client)
+                await self.oversized(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -353,26 +355,32 @@ class Corpus:
             for path in candidates
         )
 
-    async def left_out(self, client: Client) -> None:
+    async def oversized(self, client: Client) -> None:
+        """Search the pinned oversized file past its first chunk under the default `split`.
+
+        The file is past `[search.text] max_chunk`, so the index holds its text as chunks.
+        A token that first occurs past the first chunk answers only from a later one.
+        """
         if not self.pin.oversized_path:
             return
         path = self.pin.oversized_path
+        data = (self.root / path).read_bytes()
         require(
-            (self.root / path).stat().st_size == self.pin.oversized_bytes,
-            f"{path}: pinned byte count changed",
+            len(data) == self.pin.oversized_bytes, f"{path}: pinned byte count changed"
         )
-        found = await observed(
+        token, offset = token_past_chunk(data)
+        answer = await settled_pattern(
             client,
-            "rift://logs/component/index",
-            lambda rows: any(fields(row).get("path") == path for row in rows),
+            {
+                "pattern": token,
+                "target": "file",
+                "paths": {"include": [path]},
+                "limit": 1,
+            },
         )
-        matching = [row for row in found if fields(row).get("path") == path]
-        require(
-            any("left out" in str(row.get("message")) for row in matching),
-            f"{path}: missing left-out reason",
-        )
+        chunked_answer(answer, path, len(data), offset)
         self.record(
-            "left_out", path=path, bytes=self.pin.oversized_bytes, records=matching
+            "oversized", path=path, bytes=len(data), pattern=token, offset=offset
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
@@ -867,6 +875,29 @@ async def observed_output(server: Server, offset: int, message: str) -> str:
                 return output
             await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"required record never reached server output: {message}")
+
+
+async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
+    """Resend a `pattern` search until the trigram index covers every stored row.
+
+    An answer warning `pattern_index_preparing` covers only the rows the trigram index
+    holds, and the warning asks the caller to resend once the index catches up. The
+    deadline alone bounds the loop, as in `Corpus.await_probe`.
+    """
+    deadline = time.monotonic() + OBSERVATION_SECONDS
+    while time.monotonic() < deadline:
+        answer = await client.call("search", request)
+        preparing = [
+            warning
+            for warning in warnings(answer)
+            if warning.get("code") == "pattern_index_preparing"
+        ]
+        if not preparing:
+            return answer
+        await asyncio.sleep(POLL_SECONDS)
+    raise AssertionError(
+        f"the trigram index never covered every stored row within {OBSERVATION_SECONDS}s"
+    )
 
 
 def objects(answer: JsonObject, key: str) -> list[JsonObject]:

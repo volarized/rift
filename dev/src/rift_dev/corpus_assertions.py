@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from rift_dev.rift_test_client import (
+    Json,
     JsonObject,
     array_value,
     object_value,
@@ -33,6 +34,13 @@ MAP_MODULES_MAX = 100_000
 # unread input is reported under.
 CONTEXT_SPAN = "dependency.context"
 CONTEXT_DEGRADED = "dependency context degraded"
+# `[search.text] max_chunk` at its default. The corpus writes no `[search.text]` table, so
+# `large_files` stays `split`: a file past this many bytes is indexed as whole-line chunks
+# of at most this size, and its text past the first chunk still answers search.
+TEXT_CHUNK_BYTES = 1 << 20
+FILE_PREFIX = "rift://file/"
+# A run of identifier bytes, which a `pattern` matches literally with no escaping.
+PATTERN_TOKEN = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{7,63}")
 
 
 def map_paths(answer: JsonObject) -> set[str]:
@@ -196,6 +204,63 @@ def warnings(answer: JsonObject) -> list[JsonObject]:
         f"source warning summary must follow {SOURCE_WARNINGS_MAX} named entries: {source}",
     )
     return found
+
+
+def token_past_chunk(data: bytes) -> tuple[str, int]:
+    """The first token that occurs nowhere in the file's first chunk, and its first offset.
+
+    A `pattern` search for it can only match text the index holds past that chunk, so its
+    first hit lands exactly at the returned offset. Each candidate costs one scan of the
+    first chunk, so the file's token count bounds the work.
+    """
+    require(
+        len(data) > TEXT_CHUNK_BYTES,
+        f"the file holds {len(data)} bytes, within one {TEXT_CHUNK_BYTES}-byte chunk",
+    )
+    for found in PATTERN_TOKEN.finditer(data, TEXT_CHUNK_BYTES):
+        token = found.group()
+        # An occurrence starting inside the first chunk may run past its end.
+        if data.find(token, 0, TEXT_CHUNK_BYTES - 1 + len(token)) == -1:
+            return token.decode("ascii"), data.find(token, TEXT_CHUNK_BYTES)
+    raise AssertionError(f"no token first occurs past byte {TEXT_CHUNK_BYTES}")
+
+
+def named_paths(warning: JsonObject) -> set[str]:
+    """The project paths one warning names through its `unit` or `files`."""
+    identities: list[Json] = [warning["unit"]] if "unit" in warning else []
+    identities.extend(array_value(warning.get("files", []), "warning files"))
+    found: set[str] = set()
+    for value in identities:
+        identity = string_value(value, "warning file")
+        require(identity.startswith(FILE_PREFIX), f"invalid file identity: {identity}")
+        found.add(unquote(identity.removeprefix(FILE_PREFIX), errors="strict"))
+    return found
+
+
+def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> None:
+    """Require a `pattern` answer to hit `path` past its first chunk, held at full size.
+
+    Under the default `large_files = "split"` the file is neither left out nor skipped, so
+    no warning may name it or count it as skipped.
+    """
+    hits = array_value(answer.get("results"), "pattern hits")
+    require(
+        bool(hits), f"{path}: no pattern hit past byte {TEXT_CHUNK_BYTES}: {answer}"
+    )
+    first = object_value(hits[0], "pattern hit")
+    target = object_value(first.get("hit"), "pattern hit target")
+    span = object_value(first.get("range"), "pattern hit range")
+    observed = (first.get("path"), target.get("target"), target.get("size"))
+    require(
+        observed == (path, "file", size),
+        f"expected a file hit on {path} holding {size} bytes, received {observed}",
+    )
+    start = number(span.get("start"), "pattern hit start")
+    require(start == offset, f"{path}: first hit at byte {start}, expected {offset}")
+    for warning in warnings(answer):
+        code = warning.get("code")
+        require(code != "large_file_skipped", f"split skipped a large file: {warning}")
+        require(path not in named_paths(warning), f"{path} named by {code}: {warning}")
 
 
 def lexical_breach(answer: JsonObject, maximum: int) -> int:
