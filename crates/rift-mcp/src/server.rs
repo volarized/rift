@@ -29,8 +29,8 @@ use rift_ranking::{
 };
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
-    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
-    StoreRanking, VectorReadiness,
+    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchError, SearchIndex,
+    SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
     EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault, ReadService,
@@ -60,8 +60,8 @@ use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
-    LexicalWrite, PopulationLane, PublishedWorkspace, configuration_fingerprint, initial_workspace,
-    run_index_supervisor, workspace_watcher,
+    LexicalWrite, PopulationLane, PublishedWorkspace, WatchWorkspace, configuration_fingerprint,
+    initial_workspace, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -1150,6 +1150,38 @@ async fn commit_landed(
     }
 }
 
+/// Why one read of the full-text store produced no ranking.
+#[derive(Debug)]
+enum StoreReadFailure {
+    /// The workspace database handed the read no pooled connection within
+    /// `[search] busy_timeout`, so the store answered nothing and the request
+    /// ranks without it.
+    ConnectionUnavailable,
+    /// The store refused, and the request refuses with it.
+    Refused(ErrorData),
+}
+
+impl From<SearchError> for StoreReadFailure {
+    fn from(error: SearchError) -> Self {
+        if error.fault().is_store_connection_unavailable() {
+            tracing::warn!(
+                component = "search",
+                operation = "search.store",
+                %error,
+                "the full-text store got no pooled connection; the answer ranks without it"
+            );
+            return Self::ConnectionUnavailable;
+        }
+        Self::Refused(error.tool_error(wire::ErrorPhase::Read))
+    }
+}
+
+/// The `lexical_ranking_unavailable` detail for a store read that got no
+/// pooled connection.
+const STORE_CONNECTION_UNAVAILABLE: &str = "the workspace search database handed this request no connection: every one of its \
+     `[search] pool_slots` stayed in use past `[search] busy_timeout`, so the answer was \
+     ranked by identifier matching alone; a resent request reads the store again";
+
 /// The warning a lexical ranking cut at `matches_max` carries: hits past that bound never
 /// reach a page, so the caller narrows `query` rather than paging on.
 fn lexical_truncated(matches_max: u32) -> ReadWarning {
@@ -1402,20 +1434,23 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
     ) -> Result<Self, ReadError> {
-        let assembled = Self::assemble(root, limits, storage, LexicalLane::spawn).await?;
+        let assembled =
+            Self::assemble(root, limits, storage, workspace_watcher, LexicalLane::spawn).await?;
         Ok(assembled.supervised().await)
     }
 
-    /// Builds every part of one server except its index supervisor task, with the lexical
-    /// lane `spawn_lexical` opens over the search index.
+    /// Builds every part of one server except its index supervisor task, with the watcher
+    /// `watch` starts over the root and the lexical lane `spawn_lexical` opens over the
+    /// search index.
     ///
     /// [`AssembledServer::supervised`] starts the supervisor. A test that drives the
-    /// published state itself holds the parts instead, and one that gates the lexical
-    /// store spawns the lane over that store.
+    /// published state itself holds the parts instead and watches no path, and one that
+    /// gates the lexical store spawns the lane over that store.
     async fn assemble(
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        watch: impl WatchWorkspace,
         spawn_lexical: impl FnOnce(
             Arc<SearchIndex>,
             BlockingExecutor,
@@ -1432,7 +1467,7 @@ impl RiftMcp {
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) =
             IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
-        let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
+        let watcher = Self::start_watcher(&root, &validation, &blocking, watch).await?;
         let (published, lexical_write) =
             initial_workspace(&root, limits, &validation, &blocking).await?;
         // Direct construction delays the database open until the initial scan proves the
@@ -1516,17 +1551,18 @@ impl RiftMcp {
         })
     }
 
-    /// Starts the filesystem watcher over `root` on the worker pool.
+    /// Starts the filesystem watcher `watch` creates over `root`, on the worker pool.
     async fn start_watcher(
         root: &Path,
         validation: &Arc<IndexValidation>,
         blocking: &BlockingExecutor,
+        watch: impl WatchWorkspace,
     ) -> Result<notify::RecommendedWatcher, ReadError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
         blocking
             .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_validation)
+                watch(&watch_root, &watch_validation)
             })
             .instrument(tracing::info_span!(
                 "index.watch",
@@ -2160,12 +2196,21 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let (searched, commit_state) =
-            rift_core::traced_async!(component = "search", operation = "search.store", {
-                self.store_answer(index, tree_revision, &parsed, deadline)
-                    .await
-            })
-            .await?;
+        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            self.store_answer(index, tree_revision, &parsed, deadline)
+                .await
+        })
+        .await;
+        let (searched, commit_state) = match stored {
+            Ok(stored) => stored,
+            Err(StoreReadFailure::ConnectionUnavailable) => {
+                return Ok(Some(SearchRanking::unavailable(
+                    STORE_CONNECTION_UNAVAILABLE,
+                    self.ranking_weights,
+                )));
+            }
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
         Ok(ranking_of(
             searched,
             published.reads.file_count(),
@@ -2180,7 +2225,8 @@ impl RiftMcp {
     ///
     /// The publication holds the text the matcher verifies, so the store only narrows
     /// which files are read: a pattern the read path refuses, one with no prefilter, a
-    /// store that could not open, and a store that does not hold the captured tree all
+    /// store that could not open or handed the read no pooled connection within
+    /// `[search] busy_timeout`, and a store that does not hold the captured tree all
     /// leave the read path to verify every held file, and the answer is complete either
     /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
     /// batches: the rows the trigram index lacks ride the selection, and the read path
@@ -2215,11 +2261,16 @@ impl RiftMcp {
                     .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
                     .await
             })
-            .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        Ok(SearchRanking::unranked(match scoped {
-            RevisionScoped::Matched(candidates) => answer.with_pattern_candidates(candidates),
-            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => answer,
+            .await;
+        let selected = match scoped.map_err(StoreReadFailure::from) {
+            Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
+            Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
+            | Err(StoreReadFailure::ConnectionUnavailable) => None,
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
+        Ok(SearchRanking::unranked(match selected {
+            Some(candidates) => answer.with_pattern_candidates(candidates),
+            None => answer,
         }))
     }
 
@@ -2235,7 +2286,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<RevisionScoped<PhasedRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
         let precise = self
             .run_phase(index, tree_revision, query, QueryPhase::Precise)
             .await?;
@@ -2280,7 +2331,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<Option<FileRowFrequencies>, ErrorData> {
+    ) -> Result<Option<FileRowFrequencies>, StoreReadFailure> {
         let terms = BodyTerms::of(query);
         if terms.is_empty() {
             return Ok(None);
@@ -2288,7 +2339,7 @@ impl RiftMcp {
         let read = index
             .file_row_frequencies(tree_revision, &terms)
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+            .map_err(StoreReadFailure::from)?;
         Ok(match read {
             RevisionScoped::Matched(frequencies) => Some(frequencies),
             RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
@@ -2307,7 +2358,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         phase: QueryPhase,
-    ) -> Result<RevisionScoped<StoreRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
         tracing::debug!(
             component = "search",
             operation = "search.rank",
@@ -2320,7 +2371,7 @@ impl RiftMcp {
         index
             .rank(tree_revision, query, phase, self.fetch_limit())
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(StoreReadFailure::from)
     }
 
     /// The store's answer for `tree_revision` and where that revision stands with the
@@ -2342,7 +2393,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         deadline: RequestDeadline,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
         let searched = rift_core::traced_async!(
             component = "search",
             operation = "search.read_store",
@@ -3425,11 +3476,12 @@ mod tests {
     use crate::validation::RebuildRequest;
 
     use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
+    use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
         LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
         RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, rebuild_workspace,
-        record_rebuild_failure, workspace_capture,
+        record_rebuild_failure, unwatched, workspace_capture,
     };
     use rift_core::ProjectPath as CoreProjectPath;
 
@@ -4415,8 +4467,8 @@ mod tests {
     /// budget a waiting read spends is far longer.
     const UNWAITED_READ_MAX: Duration = Duration::from_secs(5);
 
-    /// A server whose index supervisor is not running and whose watcher is gone, so the
-    /// observations and the failure a test records are the only ones the published state
+    /// A server whose index supervisor is not running and whose watcher watches no path, so
+    /// the observations and the failure a test records are the only ones the published state
     /// sees. The invalidation receiver stays open so an observation still lands.
     struct UnsupervisedServer {
         server: RiftMcp,
@@ -4432,21 +4484,25 @@ mod tests {
         Ok((directory, assembled))
     }
 
-    /// Assembles a server over `root` and drops its watcher.
+    /// Assembles a server over `root` with a watcher on no path.
+    ///
+    /// A native watcher dropped after assembly would still have watched the initial build,
+    /// and on Windows its drop only asks the watch thread to stop, so a report of the
+    /// fixture's own writes could land in either window.
     async fn unsupervised_server(root: &std::path::Path) -> TestResult<UnsupervisedServer> {
         let super::AssembledServer {
             server,
-            watcher,
+            watcher: _,
             invalidations,
             context,
         } = RiftMcp::assemble(
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            unwatched,
             LexicalLane::spawn,
         )
         .await?;
-        drop(watcher);
         Ok(UnsupervisedServer {
             server,
             context,
@@ -5364,6 +5420,60 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            super::workspace_watcher,
+            move |index, blocking, cancellation, executable_digest| {
+                gate.attach(index);
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    executable_digest,
+                )
+            },
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        // The first write is a whole one, and a store holding nothing it can keep is cleared
+        // before a whole write lands, so the write is held once the apply follows the clear.
+        let revision = current_publication(&server)
+            .await
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![("clear", String::new()), ("apply", revision)]
+        );
+        Ok((server, double))
+    }
+
+    /// A server whose workspace database pools one connection, waiting at most the least
+    /// `[search] busy_timeout` for it, with its lexical lane held at the gate so no write
+    /// takes that connection; returns the database to hold the connection through.
+    async fn server_over_one_slot(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        RiftMcp,
+        Arc<StoreDouble>,
+        Arc<rift_index::WorkspaceDatabase>,
+    )> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            root,
+            "\n[search]\npool_slots = 1\nbusy_timeout = \"100ms\"\n",
+        )?;
+        let storage = WorkspaceStorage::open(root).await;
+        let database = storage
+            .database()
+            .ok_or("the one-slot workspace database must open")?;
+        let double = StoreDouble::new();
+        let gate = Arc::clone(&double);
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(root)?,
+            WorkspaceIndexLimits::default(),
+            Some(storage),
+            super::workspace_watcher,
             move |index, blocking, cancellation, executable_digest| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
@@ -5378,7 +5488,76 @@ mod tests {
         .await?;
         let server = assembled.supervised().await;
         double.calls_within_bound(1).await?;
-        Ok((server, double))
+        Ok((server, double, database))
+    }
+
+    /// A search whose store read meets a pool with no free connection answers from its
+    /// other rankers, warning that the full-text ranking was unavailable and naming the
+    /// slot wait, instead of refusing the whole request.
+    #[tokio::test]
+    async fn a_search_that_gets_no_pooled_connection_ranks_without_the_store() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(&server, "beacon"))
+            .await
+            .map_err(|_elapsed| "the search waited past its bound for the held connection")?
+            .map_err(|refusal| format!("the search must answer without the store: {refusal:?}"))?;
+        drop(held);
+
+        assert!(
+            answer
+                .results
+                .iter()
+                .any(|hit| format!("{hit:?}").contains("beacon")),
+            "identifier matching answers while the store is out of reach: {:?}",
+            answer.results
+        );
+        let detail = answer
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .ok_or("the answer warns that the full-text ranking was unavailable")?;
+        assert!(detail.contains("pool_slots"), "{detail}");
+        assert!(detail.contains("busy_timeout"), "{detail}");
+        Ok(())
+    }
+
+    /// A `pattern` search whose trigram read meets a pool with no free connection answers
+    /// from every held file, as it does when the store could not open, instead of refusing
+    /// the request.
+    #[tokio::test]
+    async fn a_pattern_search_with_no_pooled_connection_verifies_every_held_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params)))
+            .await
+            .map_err(|_elapsed| "the pattern search waited past its bound for the held connection")?
+            .map_err(|refusal| {
+                format!("the pattern search must answer without the store: {refusal:?}")
+            })?
+            .0;
+        drop(held);
+
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 14)))],
+            "every held file is verified while the store is out of reach"
+        );
+        assert!(
+            answer.warnings.is_empty(),
+            "a complete answer warns nothing: {:?}",
+            answer.warnings
+        );
+        Ok(())
     }
 
     /// The publication `server` currently answers from.
@@ -5477,6 +5656,7 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            super::workspace_watcher,
             move |index, blocking, cancellation, executable_digest| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
@@ -5909,11 +6089,16 @@ mod tests {
         Ok(())
     }
 
+    /// The server watches no path, so the epoch the detail names is the one the initial
+    /// build published.
     #[tokio::test]
     async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
-        let (_directory, server) = fixture().await?;
+        let (_directory, assembled) = unsupervised_fixture().await?;
 
-        let detail = server.readiness_stall(Duration::from_millis(25)).await;
+        let detail = assembled
+            .server
+            .readiness_stall(Duration::from_millis(25))
+            .await;
 
         assert!(detail.contains("the index settled at epoch 0"), "{detail}");
         assert!(
@@ -6152,10 +6337,41 @@ mod tests {
         Ok(())
     }
 
+    /// Whether one `rift://logs` record closes a whole scan of the tree: the read service's
+    /// `index.build` span for a first build or a rescan. The supervisor's `index.build` span
+    /// carries `trigger` and wraps one scan, an incremental rebuild, or no build at all, and
+    /// an incremental rebuild's carries `changed_count` and reads only the paths it names.
+    fn closes_a_whole_scan(record: &serde_json::Value) -> bool {
+        let fields = &record["fields"];
+        let build = record["message"] == "index.build";
+        let closed = fields["span"] == "closed";
+        let supervisor = fields.get("trigger").is_some();
+        let incremental = fields.get("changed_count").is_some();
+        build && closed && !supervisor && !incremental
+    }
+
+    /// Stops the index supervisor and waits until every blocking operation has returned its
+    /// worker permit. Cancelling the supervisor leaves a scan already on the pool running to
+    /// its end, so only the returned permits say that no scan can still write a record.
+    async fn stop_index_work(server: &RiftMcp) -> TestResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        server.index_supervisor().shutdown(deadline).await?;
+        let workers = u32::try_from(server.server_configuration().await.num_workers)?;
+        let permits = server.blocking.operations.acquire_many(workers);
+        drop(tokio::time::timeout_at(deadline, permits).await??);
+        Ok(())
+    }
+
     /// A file past `[providers.syntax] max_file` stays in the index as text under the
-    /// default `[search.text] large_files = "split"`, so its one record says it is held
-    /// unparsed, with the fields a left-out file's record carries, and no record calls it
-    /// left out.
+    /// default `[search.text] large_files = "split"`, so every record naming it says it is
+    /// held unparsed, with the fields a left-out file's record carries, and no record calls
+    /// it left out.
+    ///
+    /// Each whole scan of the tree records the file once. A filesystem event that lands
+    /// during the startup scan supersedes it and startup scans again, and a later event that
+    /// asks for the whole workspace rescans it, so the page holds one such record per whole
+    /// scan. The index work stops before the drain does, so a rescan still running then
+    /// closes first and the page holds both of its records.
     #[tokio::test]
     async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -6188,6 +6404,7 @@ mod tests {
             "the held file's text answers search: {held:#}"
         );
 
+        stop_index_work(&server).await?;
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs/component/index").await?;
@@ -6199,26 +6416,36 @@ mod tests {
             return Err("a log read answers with text".into());
         };
         let page: serde_json::Value = serde_json::from_str(text)?;
-        let named: Vec<&serde_json::Value> = page["records"]
+        let records = page["records"]
             .as_array()
-            .ok_or("a log page carries records")?
+            .ok_or("a log page carries records")?;
+        let scans = records
+            .iter()
+            .filter(|record| closes_a_whole_scan(record))
+            .count();
+        let named: Vec<&serde_json::Value> = records
             .iter()
             .filter(|record| record["fields"]["path"] == "src/wide.rs")
             .collect();
-        let [record] = named.as_slice() else {
-            return Err(format!("one record must name the held file: {text}").into());
-        };
+        assert!(scans > 0, "startup closes a whole scan: {text}");
         assert_eq!(
-            record["message"], "file held unparsed in the index",
-            "{record:#}"
+            named.len(),
+            scans,
+            "each whole scan records the held file once: {text}"
         );
-        assert_eq!(record["level"], "warn", "{record:#}");
-        assert_eq!(record["operation"], "index.build", "{record:#}");
-        let reason = record["fields"]["reason"].as_str().unwrap_or_default();
-        assert!(
-            reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
-            "the record names the bound the file crossed: {record:#}"
-        );
+        for record in named {
+            assert_eq!(
+                record["message"], "file held unparsed in the index",
+                "{record:#}"
+            );
+            assert_eq!(record["level"], "warn", "{record:#}");
+            assert_eq!(record["operation"], "index.build", "{record:#}");
+            let reason = record["fields"]["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
+                "the record names the bound the file crossed: {record:#}"
+            );
+        }
         assert!(
             !text.contains("file left out of the index"),
             "no file in this workspace is left out: {text}"
@@ -6234,6 +6461,10 @@ mod tests {
     /// The sink captures under the workspace's own `[logs] capture` default, the filter a
     /// served workspace records under. Without it the lane also takes the storage driver's own
     /// trace records, and the read then waits out its bound behind thousands of them.
+    ///
+    /// A second lane exists in the process before the read, as it does under `cargo test`,
+    /// where every test is a thread of one process and builds its own. The read waits for the
+    /// lane its own thread records into, never the one built last.
     #[tokio::test]
     async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -6257,6 +6488,7 @@ mod tests {
         let server =
             RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
                 .await?;
+        let (_other_sink, _other_drain) = crate::logs::log_capture();
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;

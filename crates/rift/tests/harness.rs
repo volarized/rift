@@ -12,6 +12,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -204,24 +205,102 @@ pub(crate) async fn within<Value>(
 
 /// The base `rift mcp` child command for one fixture workspace, before either
 /// the rmcp transport wrapper or a raw-pipe session spawns it.
+///
+/// `NO_COLOR` keeps the traced lines plain, since they end up in a test's
+/// captured output rather than on a terminal; the server the proxy spawns
+/// inherits both variables.
 fn base_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(rift_binary());
     command
         .arg("mcp")
         .current_dir(root)
-        .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info");
+        .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info")
+        .env("NO_COLOR", "1");
     command
 }
 
 /// The `rift mcp` child command for one fixture workspace.
-pub(crate) fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
+fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
     TokioChildProcess::builder(base_command(root))
 }
 
-/// One connected `rift mcp` child with its stderr discarded.
+/// One connected `rift mcp` child whose stderr is relayed onto the test's own.
 pub(crate) async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let (transport, _stderr) = proxy_command(root).stderr(Stdio::null()).spawn()?;
-    Ok(().serve(transport).await?)
+    let (client, _stderr) = relayed_proxy_client(root).await?;
+    Ok(client)
+}
+
+/// One connected `rift mcp` child, and its stderr relayed onto the test's own.
+///
+/// The proxy's lifecycle lines, and the stderr of a server it spawned that
+/// exited before serving, are what explain a start that never answered, so
+/// every proxied case keeps them where a failure report shows them.
+pub(crate) async fn relayed_proxy_client(
+    root: &Path,
+) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
+    let (reader, writer) = std::io::pipe()?;
+    let (transport, _stderr) = proxy_command(root).stderr(writer).spawn()?;
+    let stderr = RelayedStderr::spawn(reader);
+    Ok((().serve(transport).await?, stderr))
+}
+
+/// Bytes of one child's stderr the relay writes and keeps; the rest is read
+/// and dropped, so the child never blocks on a full pipe.
+const RELAYED_STDERR_BYTES_MAX: usize = 1 << 20;
+
+/// A child's stderr, copied onto this test process's stderr as it arrives
+/// and kept for the test to assert on.
+///
+/// Nextest prints a test's captured output when the test fails or times
+/// out, and it ends a timed-out test by killing it - on Windows at once,
+/// with every descendant - so a copy printed after the fact would never
+/// run. The relay writes each read as it lands, through `std::io::stderr`,
+/// which no test harness capture intercepts.
+pub(crate) struct RelayedStderr {
+    relay: std::thread::JoinHandle<String>,
+}
+
+impl RelayedStderr {
+    /// Starts relaying `stream` on a thread of its own, which ends at the
+    /// stream's end-of-file.
+    ///
+    /// The relay stays off tokio's blocking pool: the runtime's shutdown
+    /// joins every blocking thread, so a read parked there would hold the
+    /// test's end until the stream closed.
+    fn spawn(stream: impl Read + Send + 'static) -> Self {
+        Self {
+            relay: std::thread::spawn(move || relay_until_closed(stream)),
+        }
+    }
+
+    /// The relayed text, once every holder of the stream's write end has
+    /// closed it.
+    ///
+    /// On Windows a detached server the child started inherits that end,
+    /// so the text arrives only when the server leaves too.
+    pub(crate) async fn text(self) -> TestResult<String> {
+        let relay = self.relay;
+        tokio::task::spawn_blocking(move || relay.join())
+            .await?
+            .map_err(|_panic| "the stderr relay panicked".into())
+    }
+}
+
+/// Copies `stream` onto this process's stderr until end-of-file, keeping
+/// what it copied, both bounded by [`RELAYED_STDERR_BYTES_MAX`].
+fn relay_until_closed(mut stream: impl Read) -> String {
+    let mut kept = Vec::new();
+    let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
+    loop {
+        let read_bytes = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read_bytes) => read_bytes,
+        };
+        let relayed = &buffer[..read_bytes.min(RELAYED_STDERR_BYTES_MAX - kept.len())];
+        let _ = std::io::stderr().write_all(relayed);
+        kept.extend_from_slice(relayed);
+    }
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 pub(crate) fn arguments(

@@ -595,8 +595,9 @@ busy_timeout = "5s"
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16
-- `busy_timeout` bounds how long a connection waits for a database lock held by another
-  process before failing with `SQLITE_BUSY`, 100ms to 30s
+- `busy_timeout` bounds how long a read or write waits for one of those connections to come
+  free, and how long a connection waits for a database lock held by another process before
+  failing with `SQLITE_BUSY`, 100ms to 30s
 
 <VersionBadge version="v0.0.46" />
 

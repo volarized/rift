@@ -138,6 +138,17 @@ impl SearchFault {
     pub const fn violation(&self) -> SearchViolation {
         self.violation
     }
+
+    /// Whether the store this failure wraps got no pooled connection, so it
+    /// answered nothing; see
+    /// [`LexicalIndexFault::is_connection_unavailable`](rift_index::LexicalIndexFault::is_connection_unavailable).
+    #[must_use]
+    pub fn is_store_connection_unavailable(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<rift_index::LexicalIndexError>())
+            .is_some_and(|store| store.fault().is_connection_unavailable())
+    }
 }
 
 impl Fault for SearchFault {

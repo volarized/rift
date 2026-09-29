@@ -268,12 +268,20 @@ impl ElectionGuard {
 impl Drop for ElectionGuard {
     fn drop(&mut self) {
         self.retire();
-        // Closing the handle would release the advisory lock anyway; the
-        // explicit unlock makes the release immediate on Windows, where a
-        // close releases lazily.
-        if let Err(error) = self.election_file.unlock() {
-            tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
-        }
+        release_election_lock(&self.election_file);
+    }
+}
+
+/// Releases this process's lock on the election file ahead of closing it.
+///
+/// Closing the handle releases the lock too, but Windows releases a closed
+/// handle's locks lazily: `LockFileEx` states that "the time it takes for the
+/// operating system to unlock these locks depends upon available system
+/// resources". A claim that meets such a lock loses the election although no
+/// process holds it, so every lock this module takes is released explicitly.
+fn release_election_lock(election_file: &std::fs::File) {
+    if let Err(error) = election_file.unlock() {
+        tracing::debug!(component = "mcp", %error, "election lock release reported a failure");
     }
 }
 
@@ -426,9 +434,12 @@ fn election_state(root: &Path) -> ElectionState {
         Err(_) => return ElectionState::Unobservable,
     };
     match election_file.try_lock_shared() {
-        // Nothing holds the exclusive lock; the probe's shared lock
-        // releases with the handle at the end of this scope.
-        Ok(()) => ElectionState::Unheld,
+        // Nothing holds the exclusive lock. The probe releases its shared
+        // lock at once, ahead of the handle's close.
+        Ok(()) => {
+            release_election_lock(&election_file);
+            ElectionState::Unheld
+        }
         Err(TryLockError::WouldBlock) => ElectionState::Held,
         Err(TryLockError::Error(_)) => ElectionState::Unobservable,
     }

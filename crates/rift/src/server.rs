@@ -25,8 +25,9 @@ use rift_index::{
 };
 use rift_mcp::{
     ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
-    START_WAIT_MAX, ServerPresence, SpawnedServer, StaleReason, TokenCheck, WorkspaceStorage,
-    install_panic_hook, probe, read_serving, serve_elected_with_storage, spawn_detached_server,
+    START_WAIT_MAX, ServerPresence, SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns,
+    StartedServer, TokenCheck, WorkspaceStorage, install_panic_hook, probe, read_serving,
+    serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use serde_json::{Map, Value};
@@ -550,15 +551,23 @@ async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError
     // Remember them so the wait below never answers with the old document
     // read in the instant the child already holds the election.
     let stale_bytes = std::fs::read(rift_mcp::document_path(root)).ok();
-    let mut child = spawn_detached_server(root)
-        .map_err(|source| Error::new(ServerCommandFault::SpawnFailed { source }))?;
+    let mut spawns = StartSpawns::default();
+    spawns
+        .spawn(|| spawn_detached_server(root))
+        .map_err(spawn_failed)?;
     await_serving(
         root,
         START_POLL_ATTEMPT_COUNT,
         stale_bytes.as_deref(),
-        Some(&mut child),
+        &mut spawns,
+        || spawn_detached_server(root),
     )
     .await
+}
+
+/// The refusal for a detached server that could not be spawned.
+fn spawn_failed(source: io::Error) -> ServerCommandError {
+    Error::new(ServerCommandFault::SpawnFailed { source })
 }
 
 /// The child a start watches beside the published document.
@@ -591,37 +600,49 @@ impl ChildWatch for SpawnedServer {
 /// pid, token, and port), so the leftover can only mean the child has not
 /// published yet.
 ///
-/// `child` is the server this command spawned, when it spawned one. A child
-/// that exited while no process holds the election ends the wait at once:
-/// nothing is left to publish. A wait that runs out while the child is
-/// still running, or while another process holds the election, is not a
-/// failure: the server is indexing, and the outcome says so.
-async fn await_serving(
+/// `spawns` holds the server this command spawned, when it spawned one, and
+/// [`StartSpawns::poll`] weighs its exit against the election each probe
+/// finds. A child that lost the election while no process holds it is
+/// replaced through `launch`, bounded by
+/// [`START_SPAWN_COUNT_MAX`](rift_mcp::START_SPAWN_COUNT_MAX); a child
+/// that exited for another reason while no process holds the election ends
+/// the wait at once, since nothing is left to publish. A wait that runs out
+/// while the child is still running, or while another process holds the
+/// election, is not a failure: the server is indexing, and the outcome says
+/// so.
+async fn await_serving<Spawned>(
     root: &Path,
     attempt_count: u32,
     stale_bytes: Option<&[u8]>,
-    mut child: Option<&mut dyn ChildWatch>,
-) -> Result<ServerOutcome, ServerCommandError> {
+    spawns: &mut StartSpawns<Spawned>,
+    mut launch: impl FnMut() -> io::Result<Spawned>,
+) -> Result<ServerOutcome, ServerCommandError>
+where
+    Spawned: ChildWatch + StartedServer<Failure = u32>,
+{
     for _ in 0..attempt_count {
-        if !leftover_unscrubbed(root, stale_bytes)
-            && let Some(lock) = read_serving(root)
-        {
-            return Ok(ServerOutcome::Listening {
-                port: lock.port,
-                pid: lock.pid,
-            });
-        }
-        if let Some(child) = child.as_mut()
-            && !child.is_running()
-            && !probe(root).election_held()
-        {
-            return Err(Error::new(ServerCommandFault::StartExited {
-                pid: child.pid(),
-            }));
+        let presence = probe(root);
+        let election_held = presence.election_held();
+        let serving = match presence {
+            ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(lock),
+            _ => None,
+        };
+        match spawns.poll(serving, election_held) {
+            SpawnPollOutcome::Ready(lock) => {
+                return Ok(ServerOutcome::Listening {
+                    port: lock.port,
+                    pid: lock.pid,
+                });
+            }
+            SpawnPollOutcome::Failed(pid) => {
+                return Err(Error::new(ServerCommandFault::StartExited { pid }));
+            }
+            SpawnPollOutcome::ElectionUnheld => spawns.spawn(&mut launch).map_err(spawn_failed)?,
+            SpawnPollOutcome::Waiting => {}
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    if let Some(child) = child.as_mut()
+    if let Some(child) = spawns.running()
         && child.is_running()
     {
         return Ok(ServerOutcome::Starting {
@@ -1300,18 +1321,19 @@ mod tests {
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
         SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount,
-        TokenCheck, await_election_released, await_serving, await_stopped, discard_stale_document,
-        foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
-        logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
-        request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
-        stop_log_drain, token_check,
+        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, StartSpawns,
+        StartedServer, TailCount, TokenCheck, await_election_released, await_serving,
+        await_stopped, discard_stale_document, foreground_refused, holder_evidence, label,
+        level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs, rendered_fields,
+        rendered_line, rendered_timestamp, request_stop, stale_reason_phrase, start_detached,
+        start_mode, status, stop, stop_log_drain, token_check,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
     use rift_index::{
         LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
     };
+    use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
 
     /// Milliseconds in one hour, for fixture instants only.
@@ -1360,10 +1382,38 @@ mod tests {
         Ok((listener, port))
     }
 
-    /// A stand-in for the spawned server: running until told otherwise.
+    /// A stand-in for the spawned server: running until told otherwise, and
+    /// then exited the way `exit` names.
+    #[derive(Debug)]
     struct FakeChild {
         pid: u32,
         running: bool,
+        exit: FakeExit,
+    }
+
+    /// How a [`FakeChild`] that is not running ended.
+    #[derive(Debug, Clone, Copy)]
+    enum FakeExit {
+        LostElection,
+        Failed,
+    }
+
+    impl FakeChild {
+        fn running(pid: u32) -> Self {
+            Self {
+                pid,
+                running: true,
+                exit: FakeExit::Failed,
+            }
+        }
+
+        fn exited(pid: u32, exit: FakeExit) -> Self {
+            Self {
+                pid,
+                running: false,
+                exit,
+            }
+        }
     }
 
     impl ChildWatch for FakeChild {
@@ -1374,6 +1424,36 @@ mod tests {
         fn is_running(&mut self) -> bool {
             self.running
         }
+    }
+
+    impl StartedServer for FakeChild {
+        type Failure = u32;
+
+        fn observed_exit(&mut self) -> Option<StartExit<u32>> {
+            if self.running {
+                return None;
+            }
+            Some(match self.exit {
+                FakeExit::LostElection => StartExit::LostElection {
+                    stderr: String::new(),
+                },
+                FakeExit::Failed => StartExit::Failed(self.pid),
+            })
+        }
+    }
+
+    /// The spawns of a start that spawned `child` first.
+    fn spawned(child: FakeChild) -> StartSpawns<FakeChild> {
+        let mut spawns = StartSpawns::default();
+        spawns
+            .spawn(|| Ok(child))
+            .expect("a fake child always launches");
+        spawns
+    }
+
+    /// A launch for a wait that must not spawn again.
+    fn no_launch() -> std::io::Result<FakeChild> {
+        Err(std::io::Error::other("this wait must not spawn again"))
     }
 
     #[test]
@@ -1774,7 +1854,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_times_out_against_an_empty_workspace() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let error = await_serving(directory.path(), 1, None, None)
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let error = await_serving(directory.path(), 1, None, &mut spawns, no_launch)
             .await
             .expect_err("a workspace nobody serves must time the wait out");
         assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
@@ -1800,11 +1881,13 @@ mod tests {
                 tokio::time::sleep(PRESENCE_POLL_INTERVAL * 2).await;
                 guard.publish(&fresh).expect("the holder must publish");
             };
+            let mut spawns = StartSpawns::<FakeChild>::default();
             let wait = await_serving(
                 directory.path(),
                 START_POLL_ATTEMPT_COUNT,
                 Some(&leftover),
-                None,
+                &mut spawns,
+                no_launch,
             );
             let (outcome, ()) = tokio::join!(wait, publish);
             outcome?
@@ -1825,7 +1908,9 @@ mod tests {
         let _guard = rift_mcp::claim(directory.path())?;
         let leftover = serde_json::to_vec(&holder())?;
         std::fs::write(rift_mcp::document_path(directory.path()), &leftover)?;
-        let outcome = await_serving(directory.path(), 2, Some(&leftover), None).await?;
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let wait = await_serving(directory.path(), 2, Some(&leftover), &mut spawns, no_launch);
+        let outcome = wait.await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: None });
         Ok(())
     }
@@ -1835,11 +1920,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_reports_the_running_child_as_starting_at_the_bound() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: true,
-        };
-        let outcome = await_serving(directory.path(), 2, None, Some(&mut child)).await?;
+        let mut spawns = spawned(FakeChild::running(77));
+        let outcome = await_serving(directory.path(), 2, None, &mut spawns, no_launch).await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: Some(77) });
         Ok(())
     }
@@ -1849,18 +1931,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_fails_at_once_when_the_child_exited_and_nobody_holds() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: false,
-        };
-        let error = await_serving(
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::Failed));
+        let wait = await_serving(
             directory.path(),
             START_POLL_ATTEMPT_COUNT,
             None,
-            Some(&mut child),
-        )
-        .await
-        .expect_err("an exited child under a free election must fail the start");
+            &mut spawns,
+            no_launch,
+        );
+        let error = wait
+            .await
+            .expect_err("an exited child under a free election must fail the start");
         assert!(
             matches!(error.fault(), ServerCommandFault::StartExited { pid: 77 }),
             "{error:?}"
@@ -1874,12 +1955,53 @@ mod tests {
     async fn await_serving_waits_for_another_holder_when_the_child_lost() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: false,
-        };
-        let outcome = await_serving(directory.path(), 2, None, Some(&mut child)).await?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let outcome = await_serving(directory.path(), 2, None, &mut spawns, no_launch).await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: None });
+        Ok(())
+    }
+
+    /// The child lost an election nobody holds - a lock no serving process holds met its
+    /// claim - so the wait spawns again, once, and reports the new child starting.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_spawns_again_when_the_child_lost_an_election_nobody_holds() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let mut launches = 0_u32;
+        let launch = || {
+            launches += 1;
+            Ok(FakeChild::running(78))
+        };
+        let outcome = await_serving(directory.path(), 5, None, &mut spawns, launch).await?;
+        assert_eq!(outcome, ServerOutcome::Starting { pid: Some(78) });
+        assert_eq!(launches, 1, "one respawn replaces the lost child");
+        Ok(())
+    }
+
+    /// Every child loses an election nobody holds: the wait spawns until the count is
+    /// spent, then waits out its bound and reports the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_stops_spawning_at_the_spawn_count() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let mut launches = 0_u32;
+        let launch = || {
+            launches += 1;
+            Ok(FakeChild::exited(78, FakeExit::LostElection))
+        };
+        let wait = await_serving(
+            directory.path(),
+            START_POLL_ATTEMPT_COUNT,
+            None,
+            &mut spawns,
+            launch,
+        );
+        let error = wait
+            .await
+            .expect_err("a start whose every child loses must time the wait out");
+        assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
+        assert_eq!(launches, START_SPAWN_COUNT_MAX - 1);
         Ok(())
     }
 
