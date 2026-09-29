@@ -1080,8 +1080,9 @@ pub enum WorkspaceIndexWarning {
     DeclarationsBeyondBound(ProjectPath),
 }
 
-/// Outcome of reading one file into the index: held, or left out with the
-/// warning that names it.
+/// Outcome of reading one file into the index: parsed, or skipped with the warning
+/// that names it - left out, or held as text the provider did not parse
+/// ([`WorkspaceIndexWarning::holds_text`]).
 enum IndexRead<File> {
     Included(File),
     Skipped(WorkspaceIndexWarning),
@@ -1094,6 +1095,13 @@ impl<File> IndexRead<File> {
         log_left_out(&warning);
         Self::Skipped(warning)
     }
+
+    /// Holds one file as text its provider did not parse, recording the warning that
+    /// names it once, at the build that read it.
+    fn held_unparsed(warning: WorkspaceIndexWarning) -> Self {
+        log_held_unparsed(&warning);
+        Self::Skipped(warning)
+    }
 }
 
 /// Records one file left out of the index, once, at the build that left it out.
@@ -1104,6 +1112,18 @@ fn log_left_out(warning: &WorkspaceIndexWarning) {
         path = warning.path().as_str(),
         reason = %warning.reason(),
         "file left out of the index"
+    );
+}
+
+/// Records one file the index holds as text its provider did not parse, once, at the
+/// build that read it, with the fields a left-out file's record carries.
+fn log_held_unparsed(warning: &WorkspaceIndexWarning) {
+    tracing::warn!(
+        component = "index",
+        operation = "index.build",
+        path = warning.path().as_str(),
+        reason = %warning.reason(),
+        "file held unparsed in the index"
     );
 }
 
@@ -3332,8 +3352,9 @@ fn read_file(
     Ok(file)
 }
 
-/// Reads one cataloged file's syntax facts, leaving the file out when the
-/// provider refuses it under one of its bounds.
+/// Reads one cataloged file's syntax facts. A file the provider refuses for its source
+/// size alone is held as text it does not parse; one refused under any other bound is
+/// left out.
 fn syntax_read(
     file: &TextSourceFile,
     context_path: &Path,
@@ -3343,6 +3364,7 @@ fn syntax_read(
     match indexed_file_from_catalog(file, context_path, provider, limits) {
         Ok(indexed) => Ok(IndexRead::Included(indexed)),
         Err(error) => match error.fault().left_out_file(file.path().clone()) {
+            Some(warning) if warning.holds_text() => Ok(IndexRead::held_unparsed(warning)),
             Some(warning) => Ok(IndexRead::left_out(warning)),
             None => Err(error),
         },

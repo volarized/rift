@@ -65,6 +65,10 @@ class CorpusPin(BaseModel):
     oversized_path: str
     oversized_bytes: Nonnegative
     seconds: Annotated[int, Field(gt=0)]
+    # A claimed source past `[providers.syntax] max_file`, held as text its provider does
+    # not parse. Absent where the tree holds none.
+    unparsed_path: str = ""
+    unparsed_bytes: Nonnegative = 0
 
 
 class CorpusPins(BaseModel):

@@ -74,9 +74,9 @@ const KEY_FIELD: &str = "key";
 /// Grammar field holding a pair's value.
 const VALUE_FIELD: &str = "value";
 
-/// The YAML kind word behind the wire kind `yaml.mapping_entry`.
+/// The kind word a YAML mapping entry carries on the wire.
 const MAPPING_ENTRY_KIND_WORD: &str = "mapping_entry";
-/// The YAML kind word behind the wire kind `yaml.document`.
+/// The kind word a YAML document carries on the wire.
 const DOCUMENT_KIND_WORD: &str = "document";
 
 /// The separator YAML qualified names join nested entry keys with.

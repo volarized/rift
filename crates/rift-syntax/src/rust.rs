@@ -41,7 +41,7 @@ enum RustSymbolKind {
 }
 
 impl RustSymbolKind {
-    /// The provider kind word behind the wire kind `rust.{word}`.
+    /// The kind word this declaration kind carries on the wire.
     const fn word(self) -> &'static str {
         match self {
             Self::Function => "function",

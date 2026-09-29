@@ -1127,11 +1127,7 @@ impl Records {
             unit: unit.clone(),
             name: declaration.name.clone(),
             qualified_name: declaration.qualified_name.clone(),
-            kind: ExactKind(format!(
-                "{}.{}",
-                language.identity_segment(),
-                declaration.kind
-            )),
+            kind: ExactKind(declaration.kind.to_owned()),
             range: TextRange {
                 start: declaration.range.start,
                 end: declaration.range.end,
@@ -1626,6 +1622,7 @@ mod tests {
         PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
         PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
     };
+    use rift_protocol::schema::package_index_schema_document;
     use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
     use super::fixture::{analyzed, identity, language, package_analysis, package_result};
@@ -1919,6 +1916,59 @@ mod tests {
             assert_eq!(public, expected, "{path}");
             assert_eq!(publication.units.len(), 1, "{path}");
         }
+    }
+
+    /// A dialect's identity segment carries a colon (`typescript:tsx`), which `ExactKind`'s
+    /// pattern refuses, so a declaration's kind is the provider's own word and the language
+    /// rides in `presentation.language`. The whole publication then validates against the
+    /// package index schema Rift serves.
+    #[test]
+    fn test_a_tsx_declaration_kind_is_the_provider_word_the_schema_accepts() {
+        let publication = analyzed(
+            ShippedLanguage::TypeScriptTsx,
+            vec![(
+                "index.tsx",
+                "export class Panel {\n  render(): null {\n    return null;\n  }\n}\n\
+                 export function mount(): void {}\n",
+            )],
+        );
+
+        let kinds: Vec<(&str, &str)> = publication
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind.0.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("Panel", "class"),
+                ("Panel.render", "method"),
+                ("mount", "function")
+            ]
+        );
+        for symbol in &publication.symbols {
+            assert_eq!(
+                symbol.kind, symbol.presentation.kind,
+                "the record and its presentation carry one kind: {}",
+                symbol.qualified_name
+            );
+            assert_eq!(
+                symbol.presentation.language,
+                language(ShippedLanguage::TypeScriptTsx)
+            );
+        }
+        let schema: serde_json::Value = serde_json::from_str(&package_index_schema_document())
+            .expect("the package index schema parses");
+        let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+        let instance = serde_json::to_value(&publication).expect("the publication serializes");
+        let refusals: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|refusal| format!("{}: {refusal}", refusal.instance_path()))
+            .collect();
+        assert!(
+            refusals.is_empty(),
+            "a TSX publication validates against the package index schema: {refusals:#?}"
+        );
     }
 
     /// The public names of the one file `path` holds, analyzed alone under `shipped`.

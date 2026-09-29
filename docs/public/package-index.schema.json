@@ -1255,7 +1255,7 @@
         },
         "kind": {
           "$ref": "#/$defs/ExactKind",
-          "description": "The provider's own kind word, composed as `{language}.{kind}`."
+          "description": "What the declaration is in the provider's vocabulary, such as `function` or\n`class`. The language rides beside it in `presentation.language`."
         },
         "line": {
           "description": "The one-based line the declaration starts on.",

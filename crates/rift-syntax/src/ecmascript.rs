@@ -169,7 +169,7 @@ pub(crate) enum EcmaScriptSymbolKind {
 }
 
 impl EcmaScriptSymbolKind {
-    /// The provider kind word behind the wire kind `{language}.{word}`.
+    /// The kind word this declaration kind carries on the wire.
     const fn word(self) -> &'static str {
         match self {
             Self::Function => "function",
@@ -1039,7 +1039,7 @@ mod tests {
         let _ = EcmaScriptKinds::resolve_typescript(&tree_sitter_javascript::LANGUAGE.into());
     }
 
-    /// Every kind word behind the wire kind `{language}.{word}`, pinned.
+    /// Every kind word a declaration carries on the wire, pinned.
     #[test]
     fn test_kind_words_are_the_wire_spellings() {
         let words = [
