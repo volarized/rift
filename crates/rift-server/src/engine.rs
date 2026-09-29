@@ -1984,7 +1984,9 @@ mod tests {
     /// each request with no location once it is sent, and ends its work at the
     /// first request `analyzing_secs` or more whole seconds after its start:
     /// the `$/progress` end and that request's answer arrive in one read, as
-    /// they would from an engine whose end landed between two requests.
+    /// they would from an engine whose end landed between two requests. It
+    /// leaves on `exit`, so a pool shutdown ends with the engine instead of at
+    /// the shutdown timeout.
     #[cfg(unix)]
     fn analyzing_engine(directory: &Path, analyzing_secs: u64) -> LspConfiguration {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
@@ -1999,6 +2001,8 @@ while IFS= read -r header; do
     *'"method":"initialize"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
       frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
     *'"id":'*)
       if [ "$ended" -eq 0 ] && [ $(( $(date +%s) - start )) -ge ANALYZING_SECS ]; then
         frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
@@ -2327,7 +2331,8 @@ done
 
     /// A `sh` engine serving references and call hierarchy that refuses every
     /// later request with JSON-RPC error `code`, as rust-analyzer answers
-    /// `-32801` content modified while it loads.
+    /// `-32801` content modified while it loads. It answers `shutdown` and
+    /// leaves on `exit`, so a pool shutdown ends with the engine.
     #[cfg(unix)]
     fn refusing_slot(directory: &Path, code: i64) -> EnginePool {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
@@ -2341,6 +2346,8 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true,\"callHierarchyProvider\":true}}}" ;;
     *'"method":"shutdown"'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
     *'"id":'*)
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":REFUSAL_CODE,\"message\":\"refused\"}}" ;;
   esac
