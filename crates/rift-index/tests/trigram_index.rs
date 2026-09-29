@@ -64,6 +64,10 @@ fn case_classes() -> Vec<Vec<char>> {
 
 /// Each row's tokens, as the bundled `trigram` tokenizer wrote them into a scratch table
 /// holding `texts`, keyed by row id.
+///
+/// The rows go in through one transaction: a statement outside one commits on its own, and
+/// each commit syncs the file to disk. Where a sync is slow, as on Windows, thousands of
+/// single-row commits outlast the test's deadline.
 async fn tokenizer_terms(texts: &[String]) -> TestResult<BTreeMap<i64, BTreeSet<String>>> {
     let directory = TempDir::new()?;
     let database = probe(&directory.path().join("tokens.db")).await?;
@@ -78,13 +82,15 @@ async fn tokenizer_terms(texts: &[String]) -> TestResult<BTreeMap<i64, BTreeSet<
     )
     .exec(&mut connection)
     .await?;
+    let mut transaction = connection.transaction().await?;
     for (row, text) in texts.iter().enumerate() {
         toasty::sql::statement("INSERT INTO scratch(rowid, text) VALUES (?1, ?2)")
             .bind(i64::try_from(row)?)
             .bind(text.clone())
-            .exec(&mut connection)
+            .exec(&mut transaction)
             .await?;
     }
+    transaction.commit().await?;
     let rows = toasty::sql::query("SELECT doc, term FROM scratch_terms")
         .column_types([Type::I64, Type::String])
         .exec(&mut connection)
@@ -107,8 +113,9 @@ async fn tokenizer_terms(texts: &[String]) -> TestResult<BTreeMap<i64, BTreeSet<
 /// token for that row equals the rule's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_fold_equals_the_bundled_tokenizer_for_every_case_class_member() -> TestResult {
-    let members: Vec<char> = case_classes().into_iter().flatten().collect();
-    assert_eq!(case_classes().len(), CASE_CLASSES);
+    let classes = case_classes();
+    assert_eq!(classes.len(), CASE_CLASSES);
+    let members: Vec<char> = classes.into_iter().flatten().collect();
     assert_eq!(members.len(), CASE_CLASS_MEMBERS);
     let texts: Vec<String> = members
         .iter()
