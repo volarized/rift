@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::ProjectPath;
 use rift_core::constants::{
@@ -171,6 +171,9 @@ impl RebuildRequest {
             }
             return ChangeSet::Incremental(PathChanges::default());
         }
+        if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
+            return ChangeSet::Full;
+        }
         let Some(observed) = observed_digests(root, &self.work.paths, &previous.source_policy)
         else {
             return ChangeSet::Full;
@@ -248,6 +251,20 @@ impl PublishedWorkspace {
             observed.push((path.clone(), digest));
         }
         PathChanges::resolve(observed, |path| self.reads.file_digest(path)).is_empty()
+    }
+
+    /// Whether this publication holds files below one of `paths` that is no longer a
+    /// directory on disk.
+    ///
+    /// Such a path is a directory renamed or removed by an event classified before this
+    /// publication held its files: before the first publication, or against an earlier
+    /// one. Reading the path finds nothing, so only a scan of the whole workspace drops
+    /// the files it held. Work is one ordered-map probe per path, and a disk probe only for
+    /// a path this publication holds files below.
+    fn holds_files_below_a_gone_path(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        paths
+            .iter()
+            .any(|path| self.reads.holds_files_below(path) && !root.join(path.as_str()).is_dir())
     }
 
     /// Whether `error` refuses `path` exactly as this publication recorded leaving it out:
@@ -805,17 +822,16 @@ impl IndexValidation {
             .is_none_or(|published| published.source_policy.may_include_descendant(path))
     }
 
-    /// Whether the index may hold files below one event path: the current publication
-    /// holds at least one file below it.
+    /// Whether the current publication holds at least one file below one event path.
     ///
-    /// A path outside the policy's root holds nothing the index knows about. Before the
-    /// first publication no index says what the startup scan read, so a path gone from the
-    /// disk counts as holding files: it may be a directory the scan read and that was then
-    /// renamed or removed, and only a scan of the whole workspace drops what it held.
-    fn may_hold_files_below(&self, path: &Path) -> bool {
+    /// A path outside the policy's root, or one observed before the first publication,
+    /// holds nothing the index knows about. Before that publication the startup candidate
+    /// answers the same question for the paths it is observed with, through
+    /// [`PublishedWorkspace::holds_files_below_a_gone_path`].
+    fn published_holds_files_below(&self, path: &Path) -> bool {
         let current = self.current_publication();
         let Some(published) = current.as_ref() else {
-            return !path.exists();
+            return false;
         };
         published
             .source_policy
@@ -1151,7 +1167,7 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 ///
 /// A name event, and a create or remove event whose kind does not say it names a file,
 /// asks for the whole workspace only when its path names a directory the index can hold
-/// files under: one on disk right now, or one the index may hold files below, as a
+/// files under: one on disk right now, or one the publication holds files below, as a
 /// directory renamed or removed is. notify reports every create and remove on Windows as
 /// `Create(Any)` and `Remove(Any)`, so a directory moved in or out arrives in that shape,
 /// with no event for the files it carries. External writes can stage each file as an
@@ -1204,7 +1220,7 @@ pub(crate) fn watch_path_impact(
         | EventKind::Remove(_)
         | EventKind::Modify(ModifyKind::Name(_))
         | EventKind::Any
-        | EventKind::Other => names_a_directory(validation, path),
+        | EventKind::Other => names_a_directory(validation, kind, path),
     };
     if reshapes_tree {
         return WatchImpact::WholeWorkspace;
@@ -1219,19 +1235,25 @@ pub(crate) fn watch_path_impact(
         })
 }
 
-/// Whether one event path names a directory the index can hold files under: an
-/// extensionless path the policy may include descendants of, that is a directory on
-/// disk right now or that the index may hold files below.
+/// Whether one event path names a directory the index can hold files under: a path the
+/// policy may include descendants of, that the publication holds files below or, unless the
+/// event reports the side a removal or a rename left, that is a directory on disk now.
 ///
-/// The disk probes are the only filesystem reads event classification makes: a renamed
-/// directory's new spelling is known to the disk alone, and its old spelling to the
-/// publication alone, or before the first publication to nothing but its absence.
-fn names_a_directory(validation: &IndexValidation, path: &Path) -> bool {
-    let extensionless = path.extension().is_none();
-    if !extensionless || !validation.source_directory_is_relevant(path) {
+/// The side decides which fact is read, whatever the path's spelling. A path that left is
+/// gone from the disk, so only the publication knows what it held, and asking it is an
+/// ordered-map probe. Only a path an event may have created or renamed into place costs a
+/// disk probe, the one filesystem read event classification makes, so a file's content
+/// write costs none. A directory's name may carry a dot like a file's, which is why the
+/// spelling decides nothing.
+fn names_a_directory(validation: &IndexValidation, kind: EventKind, path: &Path) -> bool {
+    if !validation.source_directory_is_relevant(path) {
         return false;
     }
-    path.is_dir() || validation.may_hold_files_below(path)
+    let left = matches!(
+        kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+    );
+    validation.published_holds_files_below(path) || (!left && path.is_dir())
 }
 
 /// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
@@ -1321,8 +1343,9 @@ impl ScannedTree {
 /// [`CandidateAnswer::published_at_startup`] publishes the candidate and leaves every path it
 /// does not hold to the supervisor's first rebuild. Only an observation that asks for the
 /// whole workspace - a written `.gitignore`, a directory event, more paths than the
-/// workspace may hold files - or a `rift.toml` that moved under the candidate captures the
-/// workspace again, within [`INDEX_CAPTURE_ATTEMPTS_MAX`] attempts.
+/// workspace may hold files - a path the candidate holds files below that is gone from the
+/// disk, or a `rift.toml` that moved under the candidate captures the workspace again,
+/// within [`INDEX_CAPTURE_ATTEMPTS_MAX`] attempts.
 ///
 /// A capture that comes back [`WorkspaceCandidate::ConfigurationChanged`] folds no tree at
 /// all, so it contributes no scan to compare; the span records it and the refusal names it
@@ -3041,8 +3064,9 @@ enum CandidateAnswer {
     /// The observation names a path whose bytes the candidate does not hold, or could not
     /// read under its own policy; a rebuild reading the named paths answers it.
     Behind,
-    /// The observation asks for the whole workspace, or `rift.toml` moved since the
-    /// candidate accepted it; only a capture of the whole workspace answers it.
+    /// The observation asks for the whole workspace, names a path the candidate holds
+    /// files below that is gone from the disk, or was made while `rift.toml` moved since
+    /// the candidate accepted it; only a capture of the whole workspace answers it.
     Rescan,
 }
 
@@ -3086,8 +3110,9 @@ impl CandidateAnswer {
 /// holds all of them answers the later observation too, as its twin under that epoch: a
 /// change's own write reaches the watcher after the change captured it, and reading the
 /// same bytes a second time is the work this drops. An observation that names a path the
-/// candidate does not hold leaves it behind; one that asks for the whole workspace, or one
-/// made while `rift.toml` moved, asks for a rescan.
+/// candidate does not hold leaves it behind; one that asks for the whole workspace, one
+/// naming a path the candidate holds files below that is gone from the disk, or one made
+/// while `rift.toml` moved, asks for a rescan.
 ///
 /// Work is one digest per observed path, bounded by how many paths one observation
 /// retains, and it runs under the publication lane alone.
@@ -3102,6 +3127,7 @@ fn answered_candidate(
     }
     if pending.covers_whole_workspace()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
+        || candidate.holds_files_below_a_gone_path(root, &pending.paths)
     {
         return CandidateAnswer::Rescan;
     }
@@ -4211,8 +4237,9 @@ pub(crate) mod tests {
             (
                 renamed,
                 "src/departed",
-                super::WatchImpact::WholeWorkspace,
-                "a path renamed away may be a directory the startup scan read files below",
+                named("src/departed")?,
+                "a path renamed away names itself, and the startup candidate decides whether \
+                 it held files below it",
             ),
             (
                 renamed,
