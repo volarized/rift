@@ -15,7 +15,10 @@ use crate::resolver::{DIRECTORY_ENTRIES_MAX, FileObservation, StaticInputs};
 
 /// The project environment directory uv creates beside the lockfile's manifest when
 /// `UV_PROJECT_ENVIRONMENT` does not name another, which a static pass cannot read.
-const ENVIRONMENT_DIRECTORY_NAME: &str = ".venv";
+pub const PROJECT_ENVIRONMENT_DIRECTORY: &str = ".venv";
+/// The file `uv venv` and `python3 -m venv` write at a project environment's root, naming
+/// the interpreter the environment was created from.
+pub const PROJECT_ENVIRONMENT_MARKER: &str = "pyvenv.cfg";
 /// The directory holding one `python<X.Y>` directory: the POSIX layout.
 const LIBRARY_DIRECTORY_NAME: &str = "lib";
 /// The directory below an environment holding `site-packages` directly: the Windows layout.
@@ -61,7 +64,7 @@ impl SitePackages {
     /// The `site-packages` of the environment beside `directory`, the folder holding the
     /// lockfile: below `lib/python<X.Y>`, else below `Lib`. Absent when neither stands.
     pub(super) fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
-        let environment = directory.join(ENVIRONMENT_DIRECTORY_NAME);
+        let environment = directory.join(PROJECT_ENVIRONMENT_DIRECTORY);
         let library = environment.join(LIBRARY_DIRECTORY_NAME);
         let posix = inputs
             .list_directory(&library, DIRECTORY_ENTRIES_MAX)

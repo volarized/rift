@@ -26,6 +26,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER};
 use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncoding};
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
@@ -50,13 +51,6 @@ const PAYLOAD_BYTES_MAX: usize = 8 * 1024 * 1024;
 /// The scheme and empty authority ty's `VendoredPath` display puts before a vendored
 /// stub's path.
 const VENDORED_URI_PREFIX: &str = "vendored://";
-
-/// The virtual environment directory `uv sync` creates beside a project's manifest, where
-/// the dependency resolver reads a tree's installed packages.
-const TREE_ENVIRONMENT_DIRECTORY: &str = ".venv";
-
-/// The file every virtual environment holds at its root, PEP 405's `pyvenv.cfg`.
-const VIRTUAL_ENVIRONMENT_MARKER: &str = "pyvenv.cfg";
 
 /// JSON-RPC error code for a method this engine does not serve.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -383,16 +377,16 @@ fn built_database(root: &Path) -> Result<ProjectDatabase, String> {
 /// Options naming the tree's own virtual environment as ty's Python environment, when
 /// `.venv` holds one; `None` otherwise.
 ///
-/// ty takes the environment `VIRTUAL_ENV` names ahead of the tree's `.venv`, and `uv run`
-/// sets that variable to whichever project it ran in. The dependency resolver reads the
-/// tree's installed packages from `.venv`, so an engine resolving imports through another
-/// environment names callees in files no package the resolver found holds. The options
-/// sit below the project's own ty configuration, which still names another environment
-/// when it sets one.
+/// The dependency resolver reads the tree's installed packages from its project
+/// environment, `.venv`, and the interpreter version from that environment's
+/// `pyvenv.cfg`, so an engine resolving imports through another environment names callees
+/// in files no package the resolver found holds. A `.venv` without `pyvenv.cfg` holds no
+/// virtual environment and names none. The options sit below the project's own ty
+/// configuration, which still names another environment when it sets one.
 fn tree_environment(root: &SystemPath) -> Option<Options> {
-    let environment = root.join(TREE_ENVIRONMENT_DIRECTORY);
+    let environment = root.join(PROJECT_ENVIRONMENT_DIRECTORY);
     let marked = environment
-        .join(VIRTUAL_ENVIRONMENT_MARKER)
+        .join(PROJECT_ENVIRONMENT_MARKER)
         .as_std_path()
         .is_file();
     marked.then(|| Options {
