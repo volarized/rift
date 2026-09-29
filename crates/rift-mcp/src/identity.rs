@@ -102,6 +102,24 @@ mod tests {
         );
     }
 
+    /// The digest over many blocks and a partial last block equals the one an independent
+    /// SHA-256, `shasum -a 256`, printed for the same bytes, so the backend a target's build
+    /// selects cannot move a lock document's identity.
+    #[test]
+    fn executable_digest_equals_an_independent_sha256_over_many_blocks() {
+        const BYTES: usize = (1 << 20) + 13;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let executable = directory.path().join("rift");
+        let bytes: Vec<u8> = (0..BYTES)
+            .map(|index| u8::try_from((index * 31 + 7) % 251).expect("a residue below 251"))
+            .collect();
+        fs::write(&executable, bytes).expect("fixture");
+        assert_eq!(
+            super::executable_digest(&executable).expect("digest"),
+            "59facc7129eb285381699c869e4d33112119bcdb753081c7ae5103cc01d29d77"
+        );
+    }
+
     #[test]
     fn executable_digest_rejects_non_file_empty_and_oversized_inputs() {
         let directory = tempfile::tempdir().expect("temporary directory");
