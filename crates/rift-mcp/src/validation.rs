@@ -805,14 +805,17 @@ impl IndexValidation {
             .is_none_or(|published| published.source_policy.may_include_descendant(path))
     }
 
-    /// Whether the current publication holds at least one file below one event path.
+    /// Whether the index may hold files below one event path: the current publication
+    /// holds at least one file below it.
     ///
-    /// A path outside the policy's root, or one observed before the first publication,
-    /// holds nothing the index knows about.
-    fn published_holds_files_below(&self, path: &Path) -> bool {
+    /// A path outside the policy's root holds nothing the index knows about. Before the
+    /// first publication no index says what the startup scan read, so a path gone from the
+    /// disk counts as holding files: it may be a directory the scan read and that was then
+    /// renamed or removed, and only a scan of the whole workspace drops what it held.
+    fn may_hold_files_below(&self, path: &Path) -> bool {
         let current = self.current_publication();
         let Some(published) = current.as_ref() else {
-            return false;
+            return !path.exists();
         };
         published
             .source_policy
@@ -1211,17 +1214,17 @@ pub(crate) fn watch_path_impact(
 
 /// Whether one event path names a directory the index can hold files under: an
 /// extensionless path the policy may include descendants of, that is a directory on
-/// disk right now or that the current publication holds files below.
+/// disk right now or that the index may hold files below.
 ///
-/// The disk probe is the one filesystem read event classification makes: a renamed
+/// The disk probes are the only filesystem reads event classification makes: a renamed
 /// directory's new spelling is known to the disk alone, and its old spelling to the
-/// publication alone.
+/// publication alone, or before the first publication to nothing but its absence.
 fn names_a_directory(validation: &IndexValidation, path: &Path) -> bool {
     let extensionless = path.extension().is_none();
     if !extensionless || !validation.source_directory_is_relevant(path) {
         return false;
     }
-    path.is_dir() || validation.published_holds_files_below(path)
+    path.is_dir() || validation.may_hold_files_below(path)
 }
 
 /// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
