@@ -199,6 +199,11 @@ change touches a manifest, lockfile, or version pin it read, or when a language 
 library gains its first visible file or loses its last. Every other file change leaves it
 untouched.
 
+A `uv sync` that installs from an unchanged `uv.lock` changes no visible file, since `.venv`
+holds its own `.gitignore`. The context therefore keeps the `site-packages` listing of each
+project environment it read beside a `uv.lock`, and each request lists it again: a listing that
+differs reads the context again before the request is answered.
+
 <VersionBadge version="v0.0.46" />
 
 An entry's `availability` says whether a public registry serves the package. An entry
