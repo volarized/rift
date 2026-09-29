@@ -2580,9 +2580,15 @@ done
         PathChanges::resolve(
             [(
                 ProjectPath::new("other.rs").expect("path"),
-                Some(rift_core::FileDigest::of(b"edited")),
+                Some(rift_index::FileRecord::Digest(rift_core::FileDigest::of(
+                    b"edited",
+                ))),
             )],
-            |_path| Some(rift_core::FileDigest::of(b"held")),
+            |_path| {
+                Some(rift_index::FileRecord::Digest(rift_core::FileDigest::of(
+                    b"held",
+                )))
+            },
         )
     }
 
@@ -2709,11 +2715,11 @@ done
         let first_ask = Arc::clone(&asked);
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut references = counted_references(&attempts);
-        let held = rift_core::FileDigest::of(b"held");
+        let held = rift_index::FileRecord::Digest(rift_core::FileDigest::of(b"held"));
         let beyond_the_bound = PathChanges::resolve(
             (0..=OWED_CHANGES_MAX).map(|index| {
                 let path = ProjectPath::new(format!("f{index}.rs")).expect("path");
-                (path, Some(held))
+                (path, Some(held.clone()))
             }),
             |_path| None,
         );
@@ -2885,17 +2891,16 @@ done
     #[test]
     fn owed_changes_classify_merge_and_mark_the_bound_spent() {
         let path = |name: &str| ProjectPath::new(name).expect("path");
-        let held = rift_core::FileDigest::of(b"held");
+        let record =
+            |bytes: &[u8]| rift_index::FileRecord::Digest(rift_core::FileDigest::of(bytes));
+        let held = record(b"held");
         let first = PathChanges::resolve(
             [
-                (path("added.rs"), Some(rift_core::FileDigest::of(b"new"))),
-                (
-                    path("changed.rs"),
-                    Some(rift_core::FileDigest::of(b"edited")),
-                ),
+                (path("added.rs"), Some(record(b"new"))),
+                (path("changed.rs"), Some(record(b"edited"))),
                 (path("removed.rs"), None),
             ],
-            |observed| (observed.as_str() != "added.rs").then_some(held),
+            |observed| (observed.as_str() != "added.rs").then(|| held.clone()),
         );
         let mut owed = OwedChanges::default();
         owed.record(&first);
@@ -2914,7 +2919,7 @@ done
             ]
         );
         owed.record(&PathChanges::resolve([(path("added.rs"), None)], |_| {
-            Some(held)
+            Some(held.clone())
         }));
         assert_eq!(
             owed.paths.get(&path("added.rs")),
@@ -2923,7 +2928,7 @@ done
         );
 
         let many = PathChanges::resolve(
-            (0..=OWED_CHANGES_MAX).map(|index| (path(&format!("f{index}.rs")), Some(held))),
+            (0..=OWED_CHANGES_MAX).map(|index| (path(&format!("f{index}.rs")), Some(held.clone()))),
             |_| None,
         );
         let mut owed = OwedChanges::default();
