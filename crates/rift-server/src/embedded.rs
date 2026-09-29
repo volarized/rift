@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER};
+use rift_dependency::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
 use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncoding};
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
@@ -43,6 +43,7 @@ use ty_project::metadata::value::RelativePathBuf;
 use ty_project::watch::{ChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as _, ProjectDatabase, ProjectMetadata, SemanticDb as _};
 
+use crate::dependency::{FilesystemInputs, ResolutionPolicy};
 use hermetic::HermeticSystem;
 
 /// Bytes the in-memory transport buffers per direction before a writer waits.
@@ -342,9 +343,10 @@ fn databases() -> &'static Mutex<HashMap<PathBuf, TreeDatabase>> {
 ///
 /// Each call observes the tree's project environment once and rebuilds the
 /// database when the observation differs from the one it was built under, so
-/// a `.venv` created, removed, or recreated after the first request takes
-/// effect on the next one. A failed rebuild keeps the previous database and
-/// refuses the call; the next call tries again.
+/// a `.venv` created, removed, or recreated after the first request, and a
+/// distribution installed into it, takes effect on the next one. A failed
+/// rebuild keeps the previous database and refuses the call; the next call
+/// tries again.
 fn with_database<T>(
     tree_root: &Path,
     answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, AnswerRefusal>,
@@ -405,24 +407,39 @@ impl TreeDatabase {
 /// environment, `.venv`, and the interpreter version from that environment's
 /// `pyvenv.cfg`, so an engine resolving imports through another environment names callees
 /// in files no package the resolver found holds. A `.venv` without `pyvenv.cfg` holds no
-/// virtual environment and names none.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// virtual environment and names none. A marked environment is observed the way the
+/// resolver observes it, through [`SitePackages::observe`], so a distribution `uv sync`
+/// installs, removes, or upgrades changes the observation as it changes the resolver's.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TreeEnvironment {
     /// No `pyvenv.cfg` stands in the tree's `.venv`.
     Absent,
-    /// `.venv/pyvenv.cfg` stands, last modified at the time the filesystem reports;
-    /// `None` on a filesystem that reports none.
-    Marked(Option<SystemTime>),
+    /// `.venv/pyvenv.cfg` stands.
+    Marked {
+        /// When the marker was last modified, as the filesystem reports it; `None` on a
+        /// filesystem that reports none.
+        marker_modified: Option<SystemTime>,
+        /// The environment's `site-packages` and its listing; `None` when neither layout
+        /// stands.
+        site_packages: Option<SitePackages>,
+    },
 }
 
 impl TreeEnvironment {
-    /// Observes the tree's `.venv` marker with one metadata read.
+    /// Observes the tree's `.venv`: one metadata read of its marker and, when it is
+    /// marked, the resolver's `site-packages` listing.
     fn observe(root: &Path) -> Self {
         let marker = root
             .join(PROJECT_ENVIRONMENT_DIRECTORY)
             .join(PROJECT_ENVIRONMENT_MARKER);
         match std::fs::metadata(marker) {
-            Ok(metadata) if metadata.is_file() => Self::Marked(metadata.modified().ok()),
+            Ok(metadata) if metadata.is_file() => Self::Marked {
+                marker_modified: metadata.modified().ok(),
+                site_packages: SitePackages::observe(
+                    root,
+                    &mut FilesystemInputs::new(ResolutionPolicy::default()),
+                ),
+            },
             Ok(_) | Err(_) => Self::Absent,
         }
     }
@@ -430,8 +447,8 @@ impl TreeEnvironment {
     /// Options naming the tree's `.venv` as ty's Python environment when it is marked;
     /// `None` otherwise. The options sit below the project's own ty configuration, which
     /// still names another environment when it sets one.
-    fn options(self, root: &SystemPath) -> Option<Options> {
-        (self != Self::Absent).then(|| Options {
+    fn options(&self, root: &SystemPath) -> Option<Options> {
+        (*self != Self::Absent).then(|| Options {
             environment: Some(EnvironmentOptions {
                 python: Some(RelativePathBuf::cli(
                     root.join(PROJECT_ENVIRONMENT_DIRECTORY),
@@ -837,7 +854,10 @@ mod tests {
         )
         .expect("environment marker");
         let marked = observed();
-        assert!(matches!(marked, TreeEnvironment::Marked(_)), "{marked:?}");
+        assert!(
+            matches!(marked, TreeEnvironment::Marked { .. }),
+            "{marked:?}"
+        );
         let options = marked
             .options(&root)
             .expect("a marked `.venv` names the environment");
