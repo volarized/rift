@@ -2039,17 +2039,17 @@ mod tests {
     }
 
     /// A `sh` engine that answers `initialize` and then announces work, answers
-    /// each request with no location once it is sent, and ends its work at the
-    /// first request `analyzing_secs` or more whole seconds after its start:
-    /// the `$/progress` end and that request's answer arrive in one read, as
-    /// they would from an engine whose end landed between two requests. It
-    /// leaves on `exit`, so a pool shutdown ends with the engine instead of at
-    /// the shutdown timeout.
+    /// each request with no location once it is sent, and ends its work with its
+    /// answer to request number `analyzing_requests`, counted from the first
+    /// request after `initialize`: the `$/progress` end and that request's
+    /// answer arrive in one read, as they would from an engine whose end landed
+    /// between two requests. Counting requests, not time, fixes the attempt
+    /// that reads the end whatever each request costs. It leaves on `exit`, so
+    /// a pool shutdown ends with the engine instead of at the shutdown timeout.
     #[cfg(unix)]
-    fn analyzing_engine(directory: &Path, analyzing_secs: u64) -> LspConfiguration {
+    fn analyzing_engine(directory: &Path, analyzing_requests: u64) -> LspConfiguration {
         const SCRIPT: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
-start=$(date +%s)
-ended=0
+asked=0
 while IFS= read -r header; do
   IFS= read -r blank
   length=$(printf '%s' "$header" | tr -dc 0-9)
@@ -2062,9 +2062,9 @@ while IFS= read -r header; do
     *'"method":"exit"'*)
       exit 0 ;;
     *'"id":'*)
-      if [ "$ended" -eq 0 ] && [ $(( $(date +%s) - start )) -ge ANALYZING_SECS ]; then
+      asked=$((asked + 1))
+      if [ "$asked" -eq ANALYZING_REQUESTS ]; then
         frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'
-        ended=1
       fi
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
   esac
@@ -2073,7 +2073,7 @@ done
         let script = directory.join("engine.sh");
         std::fs::write(
             &script,
-            SCRIPT.replace("ANALYZING_SECS", &analyzing_secs.to_string()),
+            SCRIPT.replace("ANALYZING_REQUESTS", &analyzing_requests.to_string()),
         )
         .expect("engine script");
         let mut configuration = table("sh");
@@ -2086,11 +2086,11 @@ done
     }
 
     #[cfg(unix)]
-    fn analyzing_slot(directory: &Path, analyzing_secs: u64) -> EnginePool {
+    fn analyzing_slot(directory: &Path, analyzing_requests: u64) -> EnginePool {
         let key = LspProcessKey::named("rust");
         EnginePool::new(
             directory,
-            BTreeMap::from([(key.clone(), analyzing_engine(directory, analyzing_secs))]),
+            BTreeMap::from([(key.clone(), analyzing_engine(directory, analyzing_requests))]),
             BTreeMap::from([("rust".to_owned(), key)]),
         )
     }
@@ -2133,14 +2133,15 @@ done
     }
 
     /// An exchange that is no walk ends at the retry table's 8th attempt,
-    /// 9.75 s of waits in, while the engine reads analyzing until 13 s: an
-    /// engine whose load passes 9.75 s answers such a request with
-    /// [`EngineFault::Analyzing`], well inside the 30 s `readiness_timeout`.
+    /// 9.75 s of waits in, while the engine reads analyzing until its 9th
+    /// request: an engine whose load outlasts the retry table answers such a
+    /// request with [`EngineFault::Analyzing`], inside the default 30 s
+    /// `readiness_timeout`.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_analyzing_engine_spends_the_retry_table_before_the_readiness_timeout() {
         let directory = tempfile::tempdir().expect("workspace");
-        let pool = analyzing_slot(directory.path(), 13);
+        let pool = analyzing_slot(directory.path(), 9);
         let slot = pool
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
@@ -2160,7 +2161,16 @@ done
             EngineFault::Analyzing { attempts: 8 }
         ));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 8);
-        assert!(elapsed >= Duration::from_millis(9_750) && elapsed < Duration::from_secs(13));
+        let readiness_timeout = Duration::from_millis(
+            rift_protocol::configuration::ServerConfiguration::default()
+                .readiness_timeout
+                .milliseconds(),
+        );
+        assert!(
+            elapsed >= Duration::from_millis(9_750) && elapsed < readiness_timeout,
+            "the exchange waits the retry table's 9.75 s and ends inside the default \
+             `readiness_timeout` of {readiness_timeout:?}: {elapsed:?}"
+        );
         pool.shutdown().await;
     }
 
@@ -2257,10 +2267,10 @@ done
 
     /// A walk waits under the deadline, past the retry table's attempt
     /// bound, and reads ready one `settle_delay` after the attempt that read
-    /// the engine's end: this engine sends its end with an answer at attempt
-    /// 10, 13.75 s of waits in, and the wait that follows reads the engine
-    /// quiet 0.5 s later and ends there, so attempt 11 settles. The engine's
-    /// whole-second clock can end its work one attempt early, at attempt 9.
+    /// the engine's end: this engine sends its end with its answer to the
+    /// 10th request, attempt 10, 13.75 s of waits in, and the wait that
+    /// follows reads the engine quiet 0.5 s later and ends there, so attempt
+    /// 11 settles.
     ///
     /// The assertions read the gaps between attempt starts, so the time each
     /// request takes cannot move them: every wait before the end ran its
@@ -2270,7 +2280,7 @@ done
     #[tokio::test]
     async fn a_walk_waits_under_the_deadline_until_the_engine_reads_ready() {
         let directory = tempfile::tempdir().expect("workspace");
-        let pool = analyzing_slot(directory.path(), 13);
+        let pool = analyzing_slot(directory.path(), 10);
         let slot = pool
             .engine_by_key(&LspProcessKey::named("rust"))
             .expect("slot");
@@ -2293,10 +2303,10 @@ done
             started.elapsed()
         );
         assert_eq!(answer, OutgoingAnswer::Ready(0));
-        assert!(
-            (10..=11).contains(&stamps.len()),
-            "the end arrives at attempt 9 or 10: {} attempts",
-            stamps.len()
+        assert_eq!(
+            stamps.len(),
+            11,
+            "the end arrives with attempt 10, and attempt 11 settles"
         );
 
         // The analyzing engine keeps this table's retry schedule and settle_delay.
