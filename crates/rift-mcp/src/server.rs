@@ -6096,10 +6096,28 @@ mod tests {
         Ok(())
     }
 
+    /// Whether one `rift://logs` record closes a whole scan of the tree: the read service's
+    /// `index.build` span for a first build or a rescan. The supervisor's `index.build` span
+    /// carries `trigger` and wraps one scan, an incremental rebuild, or no build at all, and
+    /// an incremental rebuild's carries `changed_count` and reads only the paths it names.
+    fn closes_a_whole_scan(record: &serde_json::Value) -> bool {
+        let fields = &record["fields"];
+        let build = record["message"] == "index.build";
+        let closed = fields["span"] == "closed";
+        let supervisor = fields.get("trigger").is_some();
+        let incremental = fields.get("changed_count").is_some();
+        build && closed && !supervisor && !incremental
+    }
+
     /// A file past `[providers.syntax] max_file` stays in the index as text under the
-    /// default `[search.text] large_files = "split"`, so its one record says it is held
-    /// unparsed, with the fields a left-out file's record carries, and no record calls it
-    /// left out.
+    /// default `[search.text] large_files = "split"`, so every record naming it says it is
+    /// held unparsed, with the fields a left-out file's record carries, and no record calls
+    /// it left out.
+    ///
+    /// Each whole scan of the tree records the file once. A filesystem event that lands
+    /// during the startup scan supersedes it and startup scans again, and a later event that
+    /// asks for the whole workspace rescans it, so the page holds one such record per whole
+    /// scan it closed.
     #[tokio::test]
     async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -6143,26 +6161,36 @@ mod tests {
             return Err("a log read answers with text".into());
         };
         let page: serde_json::Value = serde_json::from_str(text)?;
-        let named: Vec<&serde_json::Value> = page["records"]
+        let records = page["records"]
             .as_array()
-            .ok_or("a log page carries records")?
+            .ok_or("a log page carries records")?;
+        let scans = records
+            .iter()
+            .filter(|record| closes_a_whole_scan(record))
+            .count();
+        let named: Vec<&serde_json::Value> = records
             .iter()
             .filter(|record| record["fields"]["path"] == "src/wide.rs")
             .collect();
-        let [record] = named.as_slice() else {
-            return Err(format!("one record must name the held file: {text}").into());
-        };
+        assert!(scans > 0, "startup closes a whole scan: {text}");
         assert_eq!(
-            record["message"], "file held unparsed in the index",
-            "{record:#}"
+            named.len(),
+            scans,
+            "each whole scan records the held file once: {text}"
         );
-        assert_eq!(record["level"], "warn", "{record:#}");
-        assert_eq!(record["operation"], "index.build", "{record:#}");
-        let reason = record["fields"]["reason"].as_str().unwrap_or_default();
-        assert!(
-            reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
-            "the record names the bound the file crossed: {record:#}"
-        );
+        for record in named {
+            assert_eq!(
+                record["message"], "file held unparsed in the index",
+                "{record:#}"
+            );
+            assert_eq!(record["level"], "warn", "{record:#}");
+            assert_eq!(record["operation"], "index.build", "{record:#}");
+            let reason = record["fields"]["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
+                "the record names the bound the file crossed: {record:#}"
+            );
+        }
         assert!(
             !text.contains("file left out of the index"),
             "no file in this workspace is left out: {text}"
