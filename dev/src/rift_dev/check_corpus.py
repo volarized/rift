@@ -16,17 +16,20 @@ from mcp.shared.exceptions import MCPError
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     CONTEXT_SPAN,
+    HELD_UNPARSED_RECORD,
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
+    build_records,
     chunked_answer,
     churn_answer,
     database_bytes,
     exact_degradation,
     fields,
     language_counts,
+    last_line_pattern,
     lexical_breach,
     lexical_content,
     map_paths,
@@ -270,6 +273,7 @@ class Corpus:
                 await self.symbols(client, candidates)
                 await self.lexical_persistence(client)
                 await self.oversized(client)
+                await self.unparsed(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -378,9 +382,54 @@ class Corpus:
                 "limit": 1,
             },
         )
-        chunked_answer(answer, path, len(data), offset)
+        named = chunked_answer(answer, path, len(data), offset)
+        require(not named, f"{path}: named by {named} although split holds it whole")
         self.record(
             "oversized", path=path, bytes=len(data), pattern=token, offset=offset
+        )
+
+    async def unparsed(self, client: Client) -> None:
+        """Search the pinned file past `[providers.syntax] max_file` held as text.
+
+        The provider refuses its source for its size alone, so under the default `split`
+        its text answers search, every answer names it in `large_file_unparsed`, and the
+        build that reads it records it as held unparsed rather than left out.
+        """
+        if not self.pin.unparsed_path:
+            return
+        path = self.pin.unparsed_path
+        data = (self.root / path).read_bytes()
+        require(
+            len(data) == self.pin.unparsed_bytes, f"{path}: pinned byte count changed"
+        )
+        pattern, offset = last_line_pattern(data)
+        answer = await settled_pattern(
+            client,
+            {
+                "pattern": pattern,
+                "target": "file",
+                "paths": {"include": [path]},
+                "limit": 1,
+            },
+        )
+        named = chunked_answer(answer, path, len(data), offset)
+        require(
+            named == ["large_file_unparsed"],
+            f"{path}: named by {named}, expected large_file_unparsed alone",
+        )
+        found = await observed(
+            client,
+            "rift://logs/component/index",
+            lambda rows: bool(build_records(rows, path)),
+        )
+        # One record per build that read the file; a rebuild of the whole tree reads it again.
+        messages = build_records(found, path)
+        require(
+            set(messages) == {HELD_UNPARSED_RECORD},
+            f"{path}: build records {messages}, expected {HELD_UNPARSED_RECORD!r} alone",
+        )
+        self.record(
+            "unparsed", path=path, bytes=len(data), pattern=pattern, offset=offset
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
