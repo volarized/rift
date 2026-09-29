@@ -513,8 +513,9 @@ pub enum SpawnPollOutcome<Adopted, Failure> {
     /// The spawned server exited before it started serving, for a reason
     /// other than a lost election, and no process holds the election.
     Failed(Failure),
-    /// The spawned server lost the start election and no process holds it:
-    /// nothing is left to publish, and the caller spawns again.
+    /// The spawned server lost the start election, no process holds it, and
+    /// the spawn count is not spent: nothing is left to publish, and the
+    /// caller spawns again.
     ElectionUnheld,
     /// Nothing decided yet: the spawned server is still starting, or it
     /// exited while another process holds the election and may still
@@ -531,13 +532,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
     ///
     /// Returns `launch`'s failure; the attempt still counts.
     pub fn spawn(&mut self, launch: impl FnOnce() -> io::Result<Spawned>) -> io::Result<()> {
-        if self.spawn_count >= START_SPAWN_COUNT_MAX {
-            let spawn_count = self.spawn_count;
-            tracing::warn!(
-                component = "mcp",
-                spawn_count,
-                "the spawn count is spent; the start window passes as a wait"
-            );
+        if self.is_spent() {
             self.latest = SpawnWatch::Idle;
             return Ok(());
         }
@@ -552,6 +547,11 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                 Err(error)
             }
         }
+    }
+
+    /// Whether [`START_SPAWN_COUNT_MAX`] spawns already ran.
+    fn is_spent(&self) -> bool {
+        self.spawn_count >= START_SPAWN_COUNT_MAX
     }
 
     /// The latest spawn, while the poll has not seen it exit.
@@ -588,6 +588,15 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
             }
             SpawnWatch::Exited(exit) if election_held => {
                 self.latest = SpawnWatch::Exited(exit);
+                SpawnPollOutcome::Waiting
+            }
+            SpawnWatch::Exited(StartExit::LostElection { .. }) if self.is_spent() => {
+                let spawn_count = self.spawn_count;
+                tracing::warn!(
+                    component = "mcp",
+                    spawn_count,
+                    "the spawn count is spent; the start window passes as a wait"
+                );
                 SpawnPollOutcome::Waiting
             }
             SpawnWatch::Exited(StartExit::LostElection { .. }) => {
@@ -1012,6 +1021,38 @@ mod tests {
         assert!(
             matches!(spawns.poll::<u32>(None, false), SpawnPollOutcome::Waiting),
             "with the count spent the poll only waits"
+        );
+    }
+
+    /// The poll that finds an unheld election with the spawn count spent says the count is
+    /// spent and waits; it neither asks for another spawn nor announces one.
+    #[test]
+    fn a_spent_spawn_count_waits_without_announcing_another_spawn() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let mut spawns = StartSpawns::<StartupCapture> {
+            latest: SpawnWatch::Exited(StartExit::LostElection {
+                stderr: String::new(),
+            }),
+            spawn_count: START_SPAWN_COUNT_MAX,
+        };
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let outcome =
+            tracing::subscriber::with_default(subscriber, || spawns.poll::<u32>(None, false));
+
+        assert!(
+            matches!(outcome, SpawnPollOutcome::Waiting),
+            "a spent count asks for no spawn: {outcome:?}"
+        );
+        let mut messages = Vec::new();
+        while let Ok(record) = drain.try_recv_record() {
+            messages.push(record.message().to_owned());
+        }
+        assert_eq!(
+            messages,
+            ["the spawn count is spent; the start window passes as a wait"],
+            "the spent poll names the count once and announces no spawn"
         );
     }
 
