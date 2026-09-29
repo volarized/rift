@@ -18,13 +18,16 @@ use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ServerCapabilities, ServerConfig, ServerPeerInfo,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, Extensions,
+    Implementation, ListResourceTemplatesRequest, ListResourceTemplatesRequestMethod,
+    ListResourceTemplatesResult, ListResourcesRequest, ListResourcesRequestMethod,
+    ListResourcesResult, ListToolsRequest, ListToolsRequestMethod, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig, ServerPeerInfo, ServerResult,
 };
 use rmcp::service::{
-    ClientInitializeError, Peer, QuitReason, RequestContext, RoleClient, RoleServer,
-    RunningService, ServerInitializeError,
+    ClientInitializeError, Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient,
+    RoleServer, RunningService, ServerInitializeError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -365,31 +368,29 @@ impl RiftProxy {
         });
     }
 
-    /// Forwards one request to the upstream with a single reconnect retry.
+    /// Forwards one request to the upstream with a single reconnect retry,
+    /// reading its answer through `answer`.
     ///
     /// A transport-shaped failure marks the held connection dead and
     /// retries exactly once on a freshly leased connection; every other
-    /// failure maps straight through [`forwarded_error`]. Each send is
-    /// bounded by the proxy's forward budget, and a send that outlives it
-    /// refuses as [`ForwardFault::Unanswered`].
+    /// failure maps straight through [`forwarded_error`], and an answer of
+    /// another kind than `answer` reads refuses as an unexpected response.
+    /// Each send is bounded by the proxy's forward budget, and a send that
+    /// outlives it is cancelled on the server and refuses as
+    /// [`ForwardFault::Unanswered`].
     ///
     /// # Cancel safety
     ///
     /// Dropping this future abandons the forward; a reconnect another
     /// request started is unaffected.
-    async fn forward<Request, Value, Forward, Fut>(
+    async fn forward<Value>(
         &self,
-        request: Request,
-        send: Forward,
-    ) -> Result<Value, ErrorData>
-    where
-        Request: Clone,
-        Forward: Fn(Peer<RoleClient>, Request) -> Fut,
-        Fut: Future<Output = Result<Value, ServiceError>>,
-    {
+        request: ClientRequest,
+        answer: fn(ServerResult) -> Option<Value>,
+    ) -> Result<Value, ErrorData> {
         let (peer, generation) = self.leased_peer(None).await?;
-        let failure = match self.answered(send(peer, request.clone())).await? {
-            Ok(value) => return Ok(value),
+        let failure = match self.answered(&peer, request.clone()).await? {
+            Ok(result) => return answered_as(result, answer),
             Err(error) if transport_failed(&error) => error,
             Err(error) => return Err(forwarded_error(error)),
         };
@@ -399,33 +400,52 @@ impl RiftProxy {
             "upstream connection lost; reconnecting"
         );
         let (peer, _generation) = self.leased_peer(Some(generation)).await?;
-        self.answered(send(peer, request))
+        let result = self
+            .answered(&peer, request)
             .await?
-            .map_err(forwarded_error)
+            .map_err(forwarded_error)?;
+        answered_as(result, answer)
     }
 
     /// What one send answered, or the refusal for a server that did not
     /// answer it within the forward budget.
     ///
+    /// The request goes out cancellable under the budget. When the budget
+    /// ends, rmcp's `RequestHandle::await_response` cancels the request:
+    /// over Streamable HTTP that closes the request's response stream, which
+    /// the MCP specification makes the cancellation signal, so the server
+    /// stops the request instead of answering into a dropped channel.
+    ///
     /// # Cancel safety
     ///
-    /// Dropping this future drops the send; the request stays with the
-    /// server, which answers it into a dropped channel.
-    async fn answered<Value>(
+    /// Dropping this future drops the send before its budget ends; the
+    /// request's response stream closes with it.
+    async fn answered(
         &self,
-        send: impl Future<Output = Result<Value, ServiceError>>,
-    ) -> Result<Result<Value, ServiceError>, ErrorData> {
-        tokio::time::timeout(self.forward_budget, send)
+        peer: &Peer<RoleClient>,
+        request: ClientRequest,
+    ) -> Result<Result<ServerResult, ServiceError>, ErrorData> {
+        let budget = self.forward_budget;
+        let answer = match peer
+            .send_cancellable_request(request, PeerRequestOptions::with_timeout(budget))
             .await
-            .map_err(|_elapsed| {
-                let budget = self.forward_budget;
+        {
+            Ok(handle) => handle.await_response().await,
+            Err(error) => Err(error),
+        };
+        match answer {
+            Err(ServiceError::Timeout { .. }) => {
                 tracing::warn!(
                     component = "mcp",
                     budget = ?budget,
-                    "the workspace server did not answer a forwarded request within its budget"
+                    "the workspace server did not answer a forwarded request within its budget; \
+                     the request is cancelled"
                 );
-                Error::new(ForwardFault::Unanswered { budget }).tool_error(wire::ErrorPhase::Read)
-            })
+                Err(Error::new(ForwardFault::Unanswered { budget })
+                    .tool_error(wire::ErrorPhase::Read))
+            }
+            answered => Ok(answered),
+        }
     }
 
     /// The info advertised downstream: the upstream's mirrored
@@ -471,6 +491,15 @@ pub fn forward_budget(server: &ServerConfiguration) -> Duration {
             server.worker_queue_timeout.milliseconds(),
         ))
         .saturating_add(FORWARD_ANSWER_GRACE)
+}
+
+/// The value `answer` reads from one upstream result, or the refusal for a
+/// result of another kind than the request asked for.
+fn answered_as<Value>(
+    result: ServerResult,
+    answer: fn(ServerResult) -> Option<Value>,
+) -> Result<Value, ErrorData> {
+    answer(result).ok_or_else(|| forwarded_error(ServiceError::UnexpectedResponse))
 }
 
 /// Why a forwarded request produced no answer from the upstream.
@@ -1087,8 +1116,9 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_tools(request).await
+        self.forward(list_tools_request(request), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -1098,8 +1128,14 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.call_tool_once(request).await
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+        self.forward(request, |result| match result {
+            ServerResult::CallToolResult(result) => Some(CallToolResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Some(CallToolResponse::InputRequired(result))
+            }
+            ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
+            _ => None,
         })
         .await
     }
@@ -1109,8 +1145,14 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_resources(request).await
+        let request = ClientRequest::ListResourcesRequest(ListResourcesRequest {
+            method: ListResourcesRequestMethod,
+            params: request,
+            extensions: Extensions::default(),
+        });
+        self.forward(request, |result| match result {
+            ServerResult::ListResourcesResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -1120,8 +1162,14 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_resource_templates(request).await
+        let request = ClientRequest::ListResourceTemplatesRequest(ListResourceTemplatesRequest {
+            method: ListResourceTemplatesRequestMethod,
+            params: request,
+            extensions: Extensions::default(),
+        });
+        self.forward(request, |result| match result {
+            ServerResult::ListResourceTemplatesResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -1131,12 +1179,27 @@ impl ServerHandler for RiftProxy {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.read_resource(request).await
+        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request));
+        self.forward(request, |result| match result {
+            ServerResult::ReadResourceResult(result) => {
+                Some(ReadResourceResponse::Complete(result))
+            }
+            ServerResult::InputRequiredResult(result) => {
+                Some(ReadResourceResponse::InputRequired(result))
+            }
+            _ => None,
         })
         .await
-        .map(Into::into)
     }
+}
+
+/// The `tools/list` request the proxy forwards for one page.
+fn list_tools_request(page: Option<PaginatedRequestParams>) -> ClientRequest {
+    ClientRequest::ListToolsRequest(ListToolsRequest {
+        method: ListToolsRequestMethod,
+        params: page,
+        extensions: Extensions::default(),
+    })
 }
 
 #[cfg(test)]
@@ -1148,11 +1211,12 @@ mod tests {
     use std::time::Duration;
 
     use rift_protocol::lock::{ProductIdentity, SERVER_TOKEN_LENGTH, ServerLock};
-    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo};
+    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo, ServerResult};
     use rmcp::service::{QuitReason, RoleClient, RunningService, serve_directly};
     use rmcp::transport::DynamicTransportError;
     use rmcp::{ErrorData, ServiceError};
     use serde_json::json;
+    use tokio::io::AsyncBufReadExt as _;
 
     use super::{
         ConnectAttemptFailure, ProxyFault, Replacement, RiftProxy, ServerStanding, Upstream,
@@ -1657,25 +1721,13 @@ mod tests {
         assert!(std::error::Error::source(&initialize).is_some());
     }
 
-    #[tokio::test]
-    async fn forward_maps_a_non_transport_failure_without_retry() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity());
-        let (running, _upstream_alive) = direct_upstream();
-        {
-            let mut slot = proxy.upstream.lock().await;
-            slot.connected = Some(Upstream {
-                running,
-                generation: 0,
-            });
-            slot.generation_next = 1;
-        }
-        let refusal = proxy
-            .forward((), |_peer, ()| async {
-                Err::<(), _>(ServiceError::UnexpectedResponse)
-            })
-            .await
-            .expect_err("a non-transport failure must refuse without retry");
+    #[test]
+    fn an_answer_of_another_kind_refuses_as_unexpected() {
+        let refusal = super::answered_as(ServerResult::empty(()), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
+        })
+        .expect_err("an answer of another kind must refuse");
         assert!(
             refusal.message.contains("forwarded request"),
             "{}",
@@ -1698,7 +1750,7 @@ mod tests {
             "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
         )?;
         let proxy = RiftProxy::new(directory.path(), test_identity());
-        let (running, _upstream_silent) = direct_upstream();
+        let (running, upstream_silent) = direct_upstream();
         {
             let mut slot = proxy.upstream.lock().await;
             slot.connected = Some(Upstream {
@@ -1709,8 +1761,9 @@ mod tests {
         }
 
         let started = tokio::time::Instant::now();
-        let forward = proxy.forward(None, |peer, request| async move {
-            peer.list_tools(request).await
+        let forward = proxy.forward(super::list_tools_request(None), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
         });
         let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
             .await
@@ -1731,6 +1784,32 @@ mod tests {
             refusal.message.contains("did not answer"),
             "{}",
             refusal.message
+        );
+
+        // The silent server received the request, then its cancellation, both naming
+        // one request id: the budget's end cancels the work instead of abandoning it.
+        let mut received = tokio::io::BufReader::new(upstream_silent).lines();
+        let request: serde_json::Value = serde_json::from_str(
+            &received
+                .next_line()
+                .await?
+                .ok_or("the request reached the server")?,
+        )?;
+        let cancellation: serde_json::Value = serde_json::from_str(
+            &received
+                .next_line()
+                .await?
+                .ok_or("the cancellation reached the server")?,
+        )?;
+        assert_eq!(request["method"], json!("tools/list"), "{request}");
+        assert_eq!(
+            cancellation["method"],
+            json!("notifications/cancelled"),
+            "{cancellation}"
+        );
+        assert_eq!(
+            cancellation["params"]["requestId"], request["id"],
+            "{cancellation}"
         );
         Ok(())
     }
