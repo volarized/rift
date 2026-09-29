@@ -3396,6 +3396,9 @@ mod tests {
     /// A fake engine that registers one `**/*.rs` file watcher once initialized and
     /// appends every `workspace/didChangeWatchedFiles` body it receives to the log named
     /// by `$1`. It answers every request with an empty list.
+    ///
+    /// It handles one message at a time, in the order they arrive, so the answer to a
+    /// request follows everything the engine did for the messages sent before it.
     #[cfg(unix)]
     const WATCHING_ENGINE: &str = r#"log="$1"
 frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
@@ -3422,6 +3425,10 @@ done
     /// The incremental set names `carried.rs`, which neither publication holds, so
     /// only the carried set can name it; the full rebuild names `lib.rs`, which the
     /// two publications hold with different bytes.
+    ///
+    /// Each exchange asks the engine for references and awaits the answer. The answer
+    /// arrives after the watcher registration the batches need and after every batch
+    /// sent before it, so the log is read only once both batches are written.
     #[cfg(unix)]
     #[tokio::test]
     async fn owe_publication_hands_on_an_incremental_change_set_and_compares_a_full_one()
@@ -3438,8 +3445,11 @@ done
         let after = stable_candidate(directory.path(), 1)?;
 
         let key = LspProcessKey::named("rust");
+        // The slot resends a request the engine answered empty through its retry
+        // table, and this engine answers every request empty; one attempt sends it once.
         let configuration: LspConfiguration = serde_json::from_value(json!({
             "command": ["sh", script.display().to_string(), notified.display().to_string()],
+            "retry": { "attempts": 1 },
         }))?;
         let hold = super::EngineHold::new(
             directory.path().to_path_buf(),
@@ -3448,16 +3458,12 @@ done
         );
         let pool = Arc::clone(&hold.held());
         let slot = pool.engine_by_key(&key).ok_or("the slot")?;
+        let asked = rift_core::ProjectPath::new("lib.rs")?;
+        let position = serde_json::from_value(json!({ "line": 0, "character": 0 }))?;
         let exchange = || {
             slot.request(|session| {
-                Box::pin(async move {
-                    session
-                        .read_output(
-                            tokio::time::Instant::now() + Duration::from_millis(200),
-                            |_session| false,
-                        )
-                        .await
-                })
+                let path = asked.clone();
+                Box::pin(async move { session.references(&path, position).await })
             })
         };
         exchange().await?;
