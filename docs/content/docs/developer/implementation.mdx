@@ -234,8 +234,13 @@ the rows the index lacks beside the index.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
-pooled connection when every one of the `search.pool_slots` is checked out: past it the read or
-write refuses with `storage_failure`.
+pooled connection when every one of the `search.pool_slots` is checked out.
+
+Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
+`lexical_ranking_unavailable`, with a `detail` naming the slot wait. A regex search verifies every
+file its `paths` select in place of the rows the trigram index would select, and warns nothing.
+Every other checkout refuses, a [`rift://logs`](/docs/mcp#resource-logs) read and a write among
+them.
 
 Every checkout sets its pragmas again, `mmap_size` among them, from
 [`[search.lexical]`](/docs/developer/configuration#search) `mmap_size`, so a pooled connection
