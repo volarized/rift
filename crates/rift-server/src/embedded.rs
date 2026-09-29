@@ -1027,6 +1027,42 @@ mod tests {
         );
     }
 
+    /// An ancestor's `ty.toml` never reaches the engine. ty's own discovery roots the
+    /// project at the ancestor and resolves `outside` through its `extra-paths`; the
+    /// engine's project stays the served tree, whose plain `pyproject.toml` names none.
+    #[test]
+    fn test_an_ancestor_ty_configuration_stays_unread() {
+        let parent = tempfile::tempdir().expect("fixture directory");
+        let parent_root = parent.path().canonicalize().expect("canonical parent");
+        std::fs::write(
+            parent_root.join("ty.toml"),
+            "[environment]\nextra-paths = [\"extra\"]\n",
+        )
+        .expect("ancestor configuration");
+        let outside = parent_root.join("extra/outside");
+        std::fs::create_dir_all(&outside).expect("extra path");
+        std::fs::write(outside.join("__init__.py"), "value = 1\n").expect("extra module");
+        let root = parent_root.join("tree");
+        std::fs::create_dir(&root).expect("tree directory");
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"tree\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("tree marker");
+        std::fs::write(root.join("app.py"), IMPORTS).expect("fixture module");
+
+        let default_unresolved = default_unresolved_imports(&root);
+        assert!(
+            !names_module(&default_unresolved, "outside"),
+            "ty's own discovery reads the ancestor's `ty.toml`: {default_unresolved:?}"
+        );
+        let engine = engine_unresolved_imports(&root);
+        assert!(
+            names_module(&engine, "outside"),
+            "the engine reads no configuration above the tree: {engine:?}"
+        );
+    }
+
     #[test]
     fn test_another_environment_named_by_virtual_env_stays_unread() {
         let environment = tempfile::tempdir().expect("environment directory");
