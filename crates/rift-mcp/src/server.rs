@@ -2728,7 +2728,7 @@ impl RiftMcp {
                 rift_core::traced!(component = "index", operation = "fingerprint.fold", {
                     digests.fingerprint() == current.fingerprint
                 }) && configuration_matches;
-            if tree_matches {
+            if tree_matches && !self.project_environment_moved(&current, phase).await? {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
@@ -2798,6 +2798,34 @@ impl RiftMcp {
             "workspace changed across bounded reconciliation attempts",
         )
         .tool_error(phase))
+    }
+
+    /// Whether a project environment `current`'s dependency context listed lists
+    /// differently now, observed on the worker pool.
+    ///
+    /// A `uv sync` that installs from an unchanged lockfile moves no visible path, so the
+    /// capture cannot see it; this observation is what asks for the rebuild that reads the
+    /// context again. A context that listed no environment answers `false` without
+    /// entering the pool.
+    async fn project_environment_moved(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<bool, ErrorData> {
+        if !current.reads.observes_project_environment() {
+            return Ok(false);
+        }
+        let reads = Arc::clone(&current.reads);
+        self.blocking
+            .run("project environment", move || {
+                Ok(rift_core::traced!(
+                    component = "index",
+                    operation = "fingerprint.environment",
+                    { reads.project_environment_moved() }
+                ))
+            })
+            .await
+            .map_err(|error| error.tool_error(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under

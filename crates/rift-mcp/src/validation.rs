@@ -1486,14 +1486,16 @@ fn whole_workspace_candidate(
 /// Index-owned configuration, the compiled source policy, the dependency plan, and the
 /// dependency store carry over unchanged. Other accepted configuration may change without
 /// rebuilding source files. An empty change set still produces a candidate because
-/// current-tree requests wait for its observation epoch.
+/// current-tree requests wait for its observation epoch; it shares `previous` whole unless
+/// a project environment the dependency context listed lists differently now, the one
+/// movement no changed path reports, in which case the rebuild reads the context again.
 fn shared_workspace_candidate(
     previous: &PublishedWorkspace,
     changes: &PathChanges,
     configuration: ConfigurationState,
     epoch: u64,
 ) -> Result<PublishedWorkspace, ReadError> {
-    if changes.is_empty() {
+    if changes.is_empty() && !previous.reads.project_environment_moved() {
         return Ok(previous.under(configuration, epoch));
     }
     let reads = previous.reads.rebuilt(changes)?;
