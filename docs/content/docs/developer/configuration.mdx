@@ -428,8 +428,9 @@ Its Python environment is the one that configuration names, else the project env
 `.venv` when its `pyvenv.cfg` stands, else none, which leaves the tree's own modules and the
 typeshed stubs the engine ships. The server's `VIRTUAL_ENV`, `CONDA_PREFIX`, `PYTHONPATH`, and
 `PATH` never reach it, so the engine reads the same `.venv` the uv resolver reads beside a
-`uv.lock` at the tree's root. Creating, removing, or recreating `.venv` takes effect on the
-engine's next request, with no server restart.
+`uv.lock` at the tree's root. Creating, removing, or recreating `.venv`, and each distribution
+`uv sync` installs, removes, or upgrades in it, takes effect on the engine's next request, with no
+server restart.
 
 `command` accepts a program string without whitespace or a nonempty list holding the program and
 its literal arguments. The list holds one program and at most 64 arguments; each argument holds
