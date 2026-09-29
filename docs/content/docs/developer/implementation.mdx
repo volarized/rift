@@ -214,7 +214,9 @@ transaction: the ones already committed recorded their files' digests with their
 start's comparison writes only the files the stopped write did not reach.
 
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
-snapshots. `search.busy_timeout` bounds a lock wait caused by another process.
+snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
+pooled connection when every one of the `search.pool_slots` is checked out: past it the read or
+write refuses with `storage_failure`.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.

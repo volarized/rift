@@ -8,10 +8,13 @@
 //! and shared, is what every store attaches to.
 //!
 //! Read checkouts use WAL snapshots with `query_only` enabled. Write checkouts
-//! wait for one process-wide turn and start with `BEGIN IMMEDIATE`.
+//! wait for one process-wide turn and start with `BEGIN IMMEDIATE`. A checkout
+//! waits for a free connection at most the pool's busy-wait budget, the same
+//! budget a connection waits for a lock another process holds.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use toasty::Db;
 use toasty::db::{Connection, Transaction};
@@ -31,7 +34,7 @@ use crate::lexical::{
 use crate::log::LogRecordRow;
 use crate::vector::VectorRecord;
 
-/// Connection count and lock-wait bounds for one database file.
+/// Connection count and wait bounds for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
     slots: u32,
@@ -40,7 +43,8 @@ pub struct DatabasePool {
 
 impl DatabasePool {
     /// Builds the pool's bounds: connection slots, and the busy-wait budget
-    /// `SQLite` grants a connection before it refuses.
+    /// that bounds both a caller's wait for a free slot and the wait `SQLite`
+    /// grants a connection for another process's lock before it refuses.
     #[must_use]
     pub const fn new(slots: u32, busy_timeout_ms: u32) -> Self {
         Self {
@@ -105,7 +109,13 @@ impl WorkspaceDatabase {
                 VectorRecord,
                 LogRecordRow
             ))
-            .max_pool_size(bound_as_usize(pool.slots()));
+            .max_pool_size(bound_as_usize(pool.slots()))
+            // The pool waits for a free slot without a bound unless told one ("Passing
+            // `None` disables the timeout, which is the default"), and a read that met a
+            // pool every other caller held would wait for as long as they did.
+            .pool_wait_timeout(Some(Duration::from_millis(u64::from(
+                pool.busy_timeout_ms(),
+            ))));
         let database = builder
             .build(Sqlite::open(database_path))
             .await
@@ -255,6 +265,44 @@ mod tests {
 
     fn pool() -> DatabasePool {
         DatabasePool::new(4, 1_000)
+    }
+
+    /// The busy-wait budget of the one-slot pool a held-slot case reads from: the least
+    /// `[search] busy_timeout` accepts.
+    const HELD_POOL_BUSY_TIMEOUT_MS: u32 = 100;
+    /// Bound on the whole read in a held-slot case, well past its budget: a read still
+    /// waiting here has no bound of its own.
+    const HELD_POOL_READ_MAX: Duration = Duration::from_secs(10);
+
+    /// A read that meets a pool whose every slot is held refuses once the busy-wait budget
+    /// passes, naming the wait, instead of waiting for as long as the holder keeps the slot.
+    #[tokio::test]
+    async fn a_read_that_meets_a_held_pool_refuses_within_the_busy_wait_budget() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), one_slot).await?;
+        let logs = crate::log::LogStore::attached(Arc::clone(&database));
+        let held = database.connection().await?;
+
+        let started = std::time::Instant::now();
+        let newest = crate::log::LogQuery::newest(1);
+        let refused = tokio::time::timeout(HELD_POOL_READ_MAX, logs.recent(&newest))
+            .await
+            .map_err(|_elapsed| "the read kept waiting for the held slot past its budget")?;
+        let waited = started.elapsed();
+        let error = refused.expect_err("a read that meets a held pool refuses");
+
+        assert_eq!(error.descriptor().code(), "storage_failure");
+        let causes = rift_core::causes(&error).join(": ");
+        assert!(causes.contains("waiting for a slot"), "{causes}");
+        assert!(
+            waited >= Duration::from_millis(u64::from(HELD_POOL_BUSY_TIMEOUT_MS)),
+            "the read waits out the budget first: waited={waited:?}"
+        );
+        drop(held);
+        let released = logs.recent(&crate::log::LogQuery::newest(1)).await?;
+        assert!(released.is_empty(), "a freed slot serves the read again");
+        Ok(())
     }
 
     #[tokio::test]
