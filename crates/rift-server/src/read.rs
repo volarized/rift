@@ -13,9 +13,9 @@ use rift_dependency::{DependencyContext, StandardLibrary};
 use rift_history::{HistoryError, Repository};
 use rift_history_store::StoreError;
 use rift_index::{
-    FileDigest, IndexedFile, PathChange, PathChanges, ReadableSymbol, RelationshipStore,
-    SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
+    RelationshipStore, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
 use rift_protocol::dependencies::{
@@ -561,6 +561,13 @@ impl ReadService {
     #[must_use]
     pub fn file_digest(&self, path: &CoreProjectPath) -> Option<FileDigest> {
         self.index.digest(path)
+    }
+
+    /// What this snapshot records at `path`, as a change set compares it: the digest of
+    /// the bytes it read, or the warning naming a file it left out before reading one.
+    #[must_use]
+    pub fn file_record(&self, path: &CoreProjectPath) -> Option<FileRecord> {
+        self.index.record(path)
     }
 
     /// The exact warning this snapshot holds for a file it left out, before wire warning

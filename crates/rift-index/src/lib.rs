@@ -18,7 +18,9 @@ mod vector;
 mod workspace;
 
 pub use capture::LastCapture;
-pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
+pub use change_set::{
+    ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
+};
 pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
@@ -47,8 +49,8 @@ pub use workspace::{
     IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,
     WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
     WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
-    capture_digests_with_languages, declaration_identity, source_line_matches, symbol_matches,
-    text_line_matches,
+    capture_digests_with_languages, declaration_identity, relative_path, source_line_matches,
+    symbol_matches, text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.
