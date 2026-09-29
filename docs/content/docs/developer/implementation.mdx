@@ -49,6 +49,19 @@ meets any other lock. When that leaves no process holding the election - on Wind
 shared lock can outlive the probe for a moment - the starter starts another within the same
 30-second window.
 
+When the window closes on a server that holds the election but has not published
+`.rift/server.json`, the proxy weighs the workspace database. A server records its diagnostics into
+`.rift/db` while it builds its first index, so when `.rift/db` or its write-ahead log changed during
+the window, the request gets a `temporarily_unavailable` refusal saying the server is still
+building, and the agent resends it. A holder that wrote nothing keeps the refusal that names an
+operator action.
+
+Each forwarded request waits at most the proxy's forward budget: the
+[`[server]`](/docs/developer/configuration#server) `readiness_timeout` and `worker_queue_timeout`
+the workspace accepts, plus an allowance for the answer. When the budget ends, the proxy cancels
+the request, which closes its Streamable HTTP response stream, and the caller gets a
+`temporarily_unavailable` refusal naming the budget.
+
 Before it adopts a live server, the proxy compares the product identity from the lock with its
 own: the version and the canonical MCP schema SHA-256. The version is the package version with the
 git commit the binary was built from as semantic-versioning build metadata, the version
