@@ -2,31 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from typing import cast
+from unittest.mock import AsyncMock, patch
 
-from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus
+from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_pattern
 from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     PROBE_PATH,
     PROBE_SOURCE,
+    TEXT_CHUNK_BYTES,
     active_operation,
     active_stdout,
+    chunked_answer,
     exact_degradation,
     language_counts,
     lexical_breach,
     lexical_content,
     map_paths,
+    named_paths,
     no_failed_builds,
     probe_units,
     records,
     sample_symbols,
+    token_past_chunk,
     warnings,
 )
 from rift_dev.corpus_cache import (
@@ -37,7 +43,7 @@ from rift_dev.corpus_cache import (
     missing_history_objects,
     pins,
 )
-from rift_dev.rift_test_client import JsonObject
+from rift_dev.rift_test_client import Client, JsonObject, object_value
 
 
 class Measurements(unittest.TestCase):
@@ -486,6 +492,208 @@ class Decisions(unittest.TestCase):
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 warnings({"warnings": source})
+
+
+def chunk_answer(path: str, size: int, start: int, *extra: JsonObject) -> JsonObject:
+    """A `pattern` answer whose first hit is a file hit on `path`, with `extra` warnings."""
+    return {
+        "results": [
+            {
+                "hit": {"target": "file", "size": size},
+                "range": {"start": start, "end": start + 13},
+                "path": path,
+            }
+        ],
+        "warnings": list(extra),
+    }
+
+
+class OversizedFile(unittest.TestCase):
+    """The pinned oversized file answers search past its first chunk under `split`."""
+
+    def test_the_token_is_the_first_one_absent_from_the_first_chunk(self) -> None:
+        head = b"shared_token " * 80_000 + b"outer_innerToken\n"
+        # `straddle_token` starts inside the first chunk and ends past it.
+        padding = b"-" * (TEXT_CHUNK_BYTES - 10 - len(head))
+        tail = b"shared_token innerToken straddle_token fresh_token_a fresh_token_b\n"
+        data = head + padding + b"straddle_token\n" + tail
+        token, offset = token_past_chunk(data)
+        self.assertEqual(token, "fresh_token_a")
+        self.assertEqual(offset, data.find(b"fresh_token_a"))
+        self.assertGreater(offset, TEXT_CHUNK_BYTES)
+
+    def test_a_token_may_start_exactly_where_the_first_chunk_ends(self) -> None:
+        exact = b"-" * TEXT_CHUNK_BYTES + b"lateToken_two\n"
+        self.assertEqual(token_past_chunk(exact), ("lateToken_two", TEXT_CHUNK_BYTES))
+        short = b"-" * TEXT_CHUNK_BYTES + b"\nx lateToken_one\n"
+        self.assertEqual(
+            token_past_chunk(short), ("lateToken_one", TEXT_CHUNK_BYTES + 3)
+        )
+
+    def test_a_file_within_one_chunk_or_with_no_new_token_is_refused(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "within one"):
+            token_past_chunk(b"only_token\n" * 10)
+        with self.assertRaisesRegex(AssertionError, "within one"):
+            token_past_chunk(b"a" * TEXT_CHUNK_BYTES)
+        repeated = b"shared_token " * (TEXT_CHUNK_BYTES // 13 + 1000)
+        with self.assertRaisesRegex(AssertionError, "no token first occurs"):
+            token_past_chunk(repeated)
+
+    def test_warnings_name_decoded_paths_through_unit_and_files(self) -> None:
+        self.assertEqual(
+            named_paths(
+                {"code": "source_unavailable", "unit": "rift://file/src/a%20b.c"}
+            ),
+            {"src/a b.c"},
+        )
+        self.assertEqual(
+            named_paths(
+                {
+                    "code": "large_file_unparsed",
+                    "files": ["rift://file/big.js", "rift://file/lib/huge.ts"],
+                }
+            ),
+            {"big.js", "lib/huge.ts"},
+        )
+        self.assertEqual(named_paths({"code": "results_truncated"}), set())
+        with self.assertRaisesRegex(AssertionError, "invalid file identity"):
+            named_paths(
+                {"code": "source_unavailable", "unit": "rift://symbol/rust/a.rs/main"}
+            )
+        with self.assertRaises(UnicodeDecodeError):
+            named_paths({"code": "large_file_unparsed", "files": ["rift://file/a%ff"]})
+
+    def test_a_chunked_answer_holds_the_file_whole_and_hits_past_the_chunk(
+        self,
+    ) -> None:
+        path = "src/sqlite3.c"
+        other: JsonObject = {
+            "code": "large_file_unparsed",
+            "files": ["rift://file/test/huge.js"],
+            "detail": "1 files are past [providers.syntax] max_file",
+        }
+        chunked_answer(
+            chunk_answer(path, 9_508_000, 1_048_655, other), path, 9_508_000, 1_048_655
+        )
+        refused: list[tuple[JsonObject, str]] = [
+            ({"results": [], "warnings": []}, "no pattern hit"),
+            (chunk_answer("src/other.c", 9_508_000, 1_048_655), "expected a file hit"),
+            (chunk_answer(path, 1_048_576, 1_048_655), "expected a file hit"),
+            (chunk_answer(path, 9_508_000, 12), "first hit at byte 12"),
+            (
+                chunk_answer(
+                    path,
+                    9_508_000,
+                    1_048_655,
+                    {"code": "large_file_skipped", "skipped": 1, "detail": "skip"},
+                ),
+                "skipped a large file",
+            ),
+            (
+                chunk_answer(
+                    path,
+                    9_508_000,
+                    1_048_655,
+                    {"code": "source_unavailable", "unit": f"rift://file/{path}"},
+                ),
+                "named by source_unavailable",
+            ),
+            (
+                chunk_answer(
+                    path,
+                    9_508_000,
+                    1_048_655,
+                    {"code": "large_file_unparsed", "files": [f"rift://file/{path}"]},
+                ),
+                "named by large_file_unparsed",
+            ),
+        ]
+        for answer, message in refused:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(AssertionError, message),
+            ):
+                chunked_answer(answer, path, 9_508_000, 1_048_655)
+        symbol: JsonObject = {
+            "results": [
+                {
+                    "hit": {"target": "symbol", "size": 9_508_000},
+                    "range": {"start": 1_048_655, "end": 1_048_668},
+                    "path": path,
+                }
+            ],
+        }
+        with self.assertRaisesRegex(AssertionError, "expected a file hit"):
+            chunked_answer(symbol, path, 9_508_000, 1_048_655)
+
+    def test_a_preparing_answer_is_resent_until_the_trigram_index_settles(
+        self,
+    ) -> None:
+        preparing: JsonObject = {
+            "results": [],
+            "warnings": [
+                {
+                    "code": "pattern_index_preparing",
+                    "prepared": 10,
+                    "total": 20,
+                    "detail": "10 of 20 rows",
+                }
+            ],
+        }
+        settled = chunk_answer("big.c", 2_000_000, 1_048_700)
+        client = AsyncMock(spec=Client)
+        client.call.side_effect = [preparing, preparing, settled]
+        request: JsonObject = {"pattern": "fresh_token", "target": "file"}
+        with patch("rift_dev.check_corpus.POLL_SECONDS", 0.0):
+            answer = asyncio.run(settled_pattern(cast(Client, client), request))
+        self.assertEqual(answer, settled)
+        self.assertEqual(client.call.await_count, 3)
+        client.call.assert_awaited_with("search", request)
+        client.call.side_effect = None
+        client.call.return_value = preparing
+        with (
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+            patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.05),
+            self.assertRaisesRegex(AssertionError, "never covered every stored row"),
+        ):
+            asyncio.run(settled_pattern(cast(Client, client), request))
+
+    def test_the_pinned_file_is_searched_past_its_first_chunk(self) -> None:
+        path = "src/big.c"
+        data = b"shared_token\n" * (TEXT_CHUNK_BYTES // 13 + 1) + b"fresh_token_z\n"
+        offset = data.find(b"fresh_token_z")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / path).write_bytes(data)
+            pin = dataclasses.replace(
+                pins()["bun"], oversized_path=path, oversized_bytes=len(data)
+            )
+            corpus = Corpus(pin, root / "rift", root / "report.json")
+            corpus.root = root
+            client = AsyncMock(spec=Client)
+            client.call.return_value = chunk_answer(path, len(data), offset)
+            asyncio.run(corpus.oversized(cast(Client, client)))
+            client.call.assert_awaited_once_with(
+                "search",
+                {
+                    "pattern": "fresh_token_z",
+                    "target": "file",
+                    "paths": {"include": [path]},
+                    "limit": 1,
+                },
+            )
+            self.assertEqual(
+                object_value(corpus.actions[-1], "action")["action"], "oversized"
+            )
+            (root / path).write_bytes(data + b"\n")
+            with self.assertRaisesRegex(AssertionError, "pinned byte count changed"):
+                asyncio.run(corpus.oversized(cast(Client, client)))
+            empty = dataclasses.replace(pin, oversized_path="", oversized_bytes=0)
+            client.call.reset_mock()
+            unpinned = Corpus(empty, root / "rift", root / "report.json")
+            asyncio.run(unpinned.oversized(cast(Client, client)))
+            client.call.assert_not_awaited()
 
 
 # The document table as `rift-index/src/lexical.rs` creates it, with the ranking columns
