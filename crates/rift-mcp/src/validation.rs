@@ -4685,6 +4685,109 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The change set one taken observation resolves to against `previous`.
+    fn change_set_of(
+        root: &std::path::Path,
+        validation: &IndexValidation,
+        previous: &Arc<PublishedWorkspace>,
+    ) -> ChangeSet {
+        let mut request = validation.take_pending();
+        request.previous = Some(Arc::clone(previous));
+        request.change_set(root, &ConfigurationState::accept(root))
+    }
+
+    /// The paths an incremental change set names, or nothing for a whole one.
+    fn changed_paths(change_set: &ChangeSet) -> Option<Vec<String>> {
+        match change_set {
+            ChangeSet::Full => None,
+            ChangeSet::Incremental(changes) => Some(
+                changes
+                    .iter()
+                    .map(|(path, _)| path.as_str().to_owned())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Windows reports a directory's last-write time moving as `Modify(Any)` on the
+    /// directory whenever an entry inside it is added or removed. A directory the
+    /// publication holds files below is known one without a disk probe, so that report has
+    /// no impact, and the file created in it is the rebuild's one change.
+    #[test]
+    fn a_directory_modified_beside_a_file_created_in_it_rebuilds_that_file_alone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        let previous = Arc::clone(&state.blocking_read().current);
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let folder_modified = event_at(
+            EventKind::Modify(ModifyKind::Any),
+            &roots.canonical().join("src"),
+        );
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &folder_modified),
+            super::WatchImpact::None,
+            "a directory's own modify report names nothing to read"
+        );
+
+        fs::write(directory.path().join("src/fresh.rs"), "pub fn fresh() {}\n")?;
+        let created = event_at(
+            EventKind::Create(CreateKind::File),
+            &roots.canonical().join("src/fresh.rs"),
+        );
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified));
+        let change_set = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(
+            changed_paths(&change_set),
+            Some(vec!["src/fresh.rs".to_owned()]),
+            "{change_set:?}"
+        );
+        Ok(())
+    }
+
+    /// A directory the publication holds nothing below reaches the rebuild as a path when
+    /// its own modify report arrives, and reading a directory as a file fails. It holds no
+    /// file, so it adds nothing to the change set: alone it changes nothing, and beside a
+    /// file created in it the change names that file alone.
+    #[test]
+    fn a_directory_modified_with_nothing_indexed_below_adds_nothing_to_the_change_set() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::create_dir_all(directory.path().join("docs"))?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        let previous = Arc::clone(&state.blocking_read().current);
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let folder = roots.canonical().join("docs");
+        let folder_modified = event_at(EventKind::Modify(ModifyKind::Any), &folder);
+
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified.clone()));
+        let alone = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(changed_paths(&alone), Some(Vec::new()), "{alone:?}");
+
+        fs::write(folder.join("first.rs"), "pub fn first() {}\n")?;
+        let created = event_at(
+            EventKind::Create(CreateKind::File),
+            &folder.join("first.rs"),
+        );
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified));
+        let beside = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(
+            changed_paths(&beside),
+            Some(vec!["docs/first.rs".to_owned()]),
+            "{beside:?}"
+        );
+        Ok(())
+    }
+
     /// A path observed before a publication held files below it can name a directory that
     /// has left the disk since. Reading the path finds nothing, so the change set reads the
     /// whole workspace instead of keeping the files the publication holds below it.
