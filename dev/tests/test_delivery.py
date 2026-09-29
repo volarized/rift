@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,21 @@ BUILD_CACHE_COMMAND = "rift-dev build-cache"
 BUILD_CACHE_SECRET = re.compile(r"secrets\.R2_BUILD_CACHE_[A-Z_]+")
 CARGO_COMMAND = re.compile(r"(?:^|\s)(?:cargo|just)\s")
 
+# The job that builds and runs the unit suite on each release target but x86-64
+# Linux, the profile its legs run under unless a leg names its own, and the one
+# leg that does: the slowest runner, whose run needs a longer global timeout.
+NATIVE_JOB = "native"
+CI_PROFILE = "ci"
+MACOS_INTEL_RUNNER = "macos-15-intel"
+MACOS_INTEL_PROFILE = "ci-macos-intel"
+
+# A workflow expression reading one matrix value, or the text after `||` when
+# the leg sets none: `${{ matrix.profile || 'ci' }}`.
+MATRIX_VALUE = re.compile(r"\$\{\{\s*matrix\.([a-z_]+)\s*\|\|\s*'([^']*)'\s*\}\}")
+
+# The upload action that carries a leg's test report out of its job.
+UPLOAD_ACTION = "actions/upload-artifact@"
+
 # The workflow that merges a dependency pull request without a human, the step
 # that decides whether a bump may take that path, and the output it decides it
 # in.
@@ -145,6 +161,70 @@ def suite_deadline(binary: str) -> float:
         if f"binary(={binary})" in override["filter"] and "slow-timeout" in override:
             timeout = override["slow-timeout"]
     return timeout_seconds(timeout["period"]) * timeout.get("terminate-after", 1)
+
+
+def nextest_profile_setting(name: str, *keys: str) -> Any:
+    """One setting of a nextest profile, read through its inheritance chain.
+
+    A profile names its parent with `inherits`, every chain ends at the
+    `default` profile, and nextest looks each setting up along the chain, so a
+    nested key such as `junit.path` comes from the nearest profile that sets it.
+    """
+    profiles = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))[
+        "profile"
+    ]
+    visited: list[str] = []
+    while name not in visited:
+        visited.append(name)
+        profile = profiles.get(name, {})
+        value: Any = profile
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        if value is not None:
+            return value
+        if name == "default":
+            return None
+        name = profile.get("inherits", "default")
+    raise AssertionError(f"nextest profiles inherit in a cycle: {visited}")
+
+
+def native_legs() -> list[dict[str, Any]]:
+    """Each leg of the native job, as its matrix entry."""
+    job = workflow_documents()[COVERAGE_WORKFLOW]["jobs"][NATIVE_JOB]
+    return job["strategy"]["matrix"]["include"]
+
+
+def native_step(accepts: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    """The one native step `accepts` holds for."""
+    steps = workflow_documents()[COVERAGE_WORKFLOW]["jobs"][NATIVE_JOB]["steps"]
+    found = [step for step in steps if accepts(step)]
+    assert len(found) == 1, f"expected one such native step, found {len(found)}"
+    return found[0]
+
+
+def for_leg(text: str, leg: dict[str, Any]) -> str:
+    """`text` with every matrix expression replaced by the value `leg` gives it."""
+    return MATRIX_VALUE.sub(
+        lambda matched: str(leg.get(matched.group(1)) or matched.group(2)), text
+    )
+
+
+def leg_profile(leg: dict[str, Any]) -> str:
+    """The nextest profile one native leg runs the unit suite under."""
+    run = native_step(lambda step: "nextest run" in step.get("run", ""))["run"]
+    command = for_leg(run, leg)
+    matched = re.search(r"--profile\s+(\S+)", command)
+    assert matched, f"the native suite names no profile: {command}"
+    return matched.group(1)
+
+
+def leg_report(leg: dict[str, Any]) -> str:
+    """The path one native leg uploads its test report from."""
+    upload = native_step(
+        lambda step: step.get("uses", "").startswith(UPLOAD_ACTION)
+        and "native-tests" in (step.get("with") or {}).get("name", "")
+    )
+    return for_leg(upload["with"]["path"], leg)
 
 
 def automerge_step(step_id: str) -> dict[str, Any]:
@@ -496,6 +576,52 @@ class JobBudgets(unittest.TestCase):
 
     def test_the_repository_declares_bounded_steps_to_check(self) -> None:
         self.assertTrue(jobs_with_step_limits(), "no job bounds a step of its own")
+
+
+class NativeRunBounds(unittest.TestCase):
+    """The slowest native leg alone runs under a longer global timeout.
+
+    The macos-15-intel runner needs more than the `ci` profile's bound for the
+    same suite, so it runs under a profile of its own that changes that bound
+    and nothing else, while every other leg keeps `ci`. Nextest writes a run's
+    report under the folder of the profile it ran, so each leg's upload has to
+    name that same folder or the report never leaves the job.
+    """
+
+    def test_the_intel_profile_changes_only_the_global_timeout(self) -> None:
+        configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+        profile = configuration["profile"][MACOS_INTEL_PROFILE]
+        self.assertEqual(
+            profile.keys(),
+            {"inherits", "global-timeout"},
+            f"{MACOS_INTEL_PROFILE!r} must differ from {CI_PROFILE!r} in its "
+            "global timeout alone",
+        )
+        self.assertEqual(profile["inherits"], CI_PROFILE)
+        self.assertGreater(
+            timeout_seconds(profile["global-timeout"]),
+            timeout_seconds(nextest_profile_setting(CI_PROFILE, "global-timeout")),
+        )
+
+    def test_only_the_intel_leg_runs_under_the_intel_profile(self) -> None:
+        profiles = {leg["os"]: leg_profile(leg) for leg in native_legs()}
+        self.assertEqual(profiles.pop(MACOS_INTEL_RUNNER), MACOS_INTEL_PROFILE)
+        self.assertTrue(profiles, "the native job runs no other leg")
+        self.assertEqual(
+            set(profiles.values()),
+            {CI_PROFILE},
+            f"every leg but {MACOS_INTEL_RUNNER} runs under {CI_PROFILE!r}: {profiles}",
+        )
+
+    def test_every_leg_uploads_the_report_its_profile_writes(self) -> None:
+        configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+        store = configuration["store"]["dir"]
+        for leg in native_legs():
+            with self.subTest(runner=leg["os"]):
+                profile = leg_profile(leg)
+                report = nextest_profile_setting(profile, "junit", "path")
+                self.assertTrue(report, f"the {profile!r} profile writes no report")
+                self.assertEqual(leg_report(leg), f"{store}/{profile}/{report}")
 
 
 class MachineGlobalSuites(unittest.TestCase):

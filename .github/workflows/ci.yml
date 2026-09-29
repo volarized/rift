@@ -421,7 +421,10 @@ jobs:
         include:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # The slowest leg runs under a global timeout of its own; the
+          # profile's comment in `.config/nextest.toml` derives it.
           - os: macos-15-intel
+            profile: ci-macos-intel
             target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
@@ -484,7 +487,8 @@ jobs:
       # Ignored tests run too, except the `_probe` tests, which exist only as
       # the child processes their parent tests spawn. On Windows that admits
       # the update publisher's replace-while-running test, which reads the CLI
-      # this same build produced.
+      # this same build produced. A leg naming a profile of its own runs under
+      # it, and nextest writes that run's report under the profile's folder.
       - name: Build every target and run the unit suite
         env:
           RIFT_UPDATE_TEST_BINARY: >-
@@ -492,13 +496,13 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: >-
           cargo nextest run --locked
-          --workspace --all-targets --all-features --profile ci --no-tests fail
+          --workspace --all-targets --all-features --profile ${{ matrix.profile || 'ci' }} --no-tests fail
           --run-ignored all -E 'not test(/_probe$/)'
       - uses: actions/upload-artifact@v6.0.0
         if: always()
         with:
           name: native-tests-${{ matrix.target }}
-          path: target/nextest/ci/junit.xml
+          path: target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
           if-no-files-found: error
           retention-days: 7
       - name: Report the build cache
