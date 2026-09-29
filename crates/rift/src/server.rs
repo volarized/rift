@@ -36,8 +36,9 @@ use waitpid_any::WaitHandle;
 
 /// Longest wait for an asked server to leave the serving state.
 ///
-/// The stop poll runs `STOP_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 100
-/// bounded iterations.
+/// The stop poll runs at most `STOP_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 100
+/// iterations, and stops at this span of elapsed time when its probes are
+/// slower than the interval.
 const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 /// Probe attempts one stop waits: `STOP_WAIT_MAX` over the interval.
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
@@ -463,7 +464,9 @@ pub(super) async fn run(
     let root = Path::new(".");
     match command {
         ServerCommand::Start { foreground, auth } => match start_mode(foreground) {
-            StartMode::Detached => start_detached(root).await.map(Some),
+            StartMode::Detached => start_detached(root, STOP_POLL_ATTEMPT_COUNT)
+                .await
+                .map(Some),
             StartMode::Foreground => {
                 serve_foreground(root, drain, retention_records, token_check(auth))
                     .await
@@ -531,9 +534,13 @@ fn stale_reason_phrase(reason: &StaleReason) -> String {
 /// running server's address and starts nothing, and a workspace whose
 /// server is still building answers that it is starting. A server that
 /// stopped answering its port is on its way out: the start waits for it to
-/// release the election, bounded by [`STOP_WAIT_MAX`], before electing a
-/// fresh one.
-async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
+/// release the election, bounded by `stop_attempt_count` probes and the
+/// [`poll_window`] they span, before electing a fresh one. The commands pass
+/// [`STOP_POLL_ATTEMPT_COUNT`], the probes [`STOP_WAIT_MAX`] spans.
+async fn start_detached(
+    root: &Path,
+    stop_attempt_count: u32,
+) -> Result<ServerOutcome, ServerCommandError> {
     match probe(root) {
         ServerPresence::Serving(lock) => {
             return Ok(ServerOutcome::AlreadyListening {
@@ -543,7 +550,7 @@ async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError
         }
         ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
-            await_election_released(root, pid, STOP_POLL_ATTEMPT_COUNT).await?;
+            await_election_released(root, pid, stop_attempt_count).await?;
         }
         ServerPresence::Stale(_) | ServerPresence::Absent => {}
     }
@@ -591,7 +598,8 @@ impl ChildWatch for SpawnedServer {
     }
 }
 
-/// Polls until the workspace serves, bounded by `attempt_count` probes.
+/// Polls until the workspace serves, bounded by `attempt_count` probes and by
+/// the [`poll_window`] they span.
 ///
 /// The caller passes [`START_POLL_ATTEMPT_COUNT`], which derives from
 /// [`START_WAIT_MAX`] over the poll interval. A poll that finds the document
@@ -620,6 +628,7 @@ async fn await_serving<Spawned>(
 where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
 {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
         let presence = probe(root);
         let election_held = presence.election_held();
@@ -639,6 +648,9 @@ where
             }
             SpawnPollOutcome::ElectionUnheld => spawns.spawn(&mut launch).map_err(spawn_failed)?,
             SpawnPollOutcome::Waiting => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
@@ -660,6 +672,19 @@ where
     Err(Error::new(ServerCommandFault::StartTimedOut))
 }
 
+/// The elapsed time a poll of `attempt_count` probes at [`PRESENCE_POLL_INTERVAL`]
+/// may take: [`STOP_WAIT_MAX`] for [`STOP_POLL_ATTEMPT_COUNT`].
+///
+/// A poll counts its probes and also stops once this span has passed since it
+/// began. A probe is not instant: one that meets a port nothing accepts on
+/// spends its whole connect timeout, which on Windows is every refused port,
+/// because Winsock retries a refused connect instead of failing it. Counting
+/// alone, 100 such probes would run for about a minute against a ten-second
+/// bound; the span keeps the bound, and slow probes shorten the count.
+fn poll_window(attempt_count: u32) -> Duration {
+    PRESENCE_POLL_INTERVAL.saturating_mul(attempt_count)
+}
+
 /// Whether the document on disk is still byte-equal to the pre-spawn
 /// leftover, so a read of it would answer with the previous holder's facts.
 fn leftover_unscrubbed(root: &Path, stale_bytes: Option<&[u8]>) -> bool {
@@ -670,7 +695,8 @@ fn leftover_unscrubbed(root: &Path, stale_bytes: Option<&[u8]>) -> bool {
 }
 
 /// Polls until the named process exits or releases the election, bounded by
-/// `attempt_count` probes. A replacement still building must not extend this wait.
+/// `attempt_count` probes and by the [`poll_window`] they span. A replacement
+/// still building must not extend this wait.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval; `pid` names the holder in the
@@ -680,10 +706,14 @@ async fn await_election_released(
     pid: u32,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     let mut process = ProcessExit::open(pid);
     for _ in 0..attempt_count {
         if process.exited() || !probe(root).election_held() {
             return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
@@ -961,7 +991,7 @@ async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
 }
 
 /// Polls until the stopped server exits or releases the election, bounded by
-/// `attempt_count` probes.
+/// `attempt_count` probes and by the [`poll_window`] they span.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval. The port closes before the
@@ -974,9 +1004,13 @@ async fn await_stopped(
     mut process: ProcessExit,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
         if process.exited() || !probe(root).election_held() {
             return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
@@ -1008,7 +1042,7 @@ fn discard_stale_document(root: &Path) {
 /// Stops the serving server, then starts a fresh detached one.
 async fn restart(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
     stop(root, STOP_POLL_ATTEMPT_COUNT).await?;
-    start_detached(root).await
+    start_detached(root, STOP_POLL_ATTEMPT_COUNT).await
 }
 
 /// The store read one `rift server logs` run issues.
@@ -2173,6 +2207,11 @@ mod tests {
         Ok(())
     }
 
+    /// Probes the start makes of a holder whose port refuses. The clock is paused, but a
+    /// probe's connect is not: on Windows each refused connect spends the whole connect
+    /// timeout, so the stop window's 100 probes would hold this case for most of a minute.
+    const REFUSING_HOLDER_ATTEMPT_COUNT: u32 = 3;
+
     /// A holder that stopped answering its port is on its way out: the start waits for
     /// it to release the election and refuses with its pid when it keeps the election.
     #[tokio::test(start_paused = true)]
@@ -2185,7 +2224,7 @@ mod tests {
             ..holder_on(dead_port()?)
         };
         guard.publish(&document)?;
-        let error = start_detached(directory.path())
+        let error = start_detached(directory.path(), REFUSING_HOLDER_ATTEMPT_COUNT)
             .await
             .expect_err("a holder that keeps the election past the stop window refuses the start");
         let fault = error.fault();
@@ -2203,7 +2242,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
         assert_eq!(
-            start_detached(directory.path()).await?,
+            start_detached(directory.path(), STOP_POLL_ATTEMPT_COUNT).await?,
             ServerOutcome::Starting { pid: None }
         );
         Ok(())
