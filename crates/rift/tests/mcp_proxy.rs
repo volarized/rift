@@ -98,15 +98,24 @@ fn serving_document(root: &Path) -> Option<ServerLock> {
 }
 
 /// Polls `condition` every [`PRESENCE_POLL_INTERVAL`] up to `attempts`
-/// times.
+/// times, and for no longer than those attempts span at that interval.
+///
+/// A condition that probes the workspace is not instant: a probe of a port
+/// nothing accepts on spends its whole connect timeout, which on Windows is
+/// every refused port, so counting alone would stretch the wait several times
+/// over.
 async fn wait_for<T>(
     attempts: u32,
     what: &str,
     mut condition: impl FnMut() -> Option<T>,
 ) -> TestResult<T> {
+    let deadline = tokio::time::Instant::now() + PRESENCE_POLL_INTERVAL.saturating_mul(attempts);
     for _ in 0..attempts {
         if let Some(value) = condition() {
             return Ok(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
