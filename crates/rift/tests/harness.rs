@@ -32,16 +32,37 @@ pub(crate) fn rift_binary() -> PathBuf {
         .into()
 }
 
-/// Bound on one proxied round trip that may include a server election. A
-/// refusal can wait out two start windows - the warmup's and the request's
-/// own - before it surfaces.
-pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
+/// Bound on one proxied round trip that may include a server election.
+///
+/// The bounds nest, each inside the next, so the innermost one that trips is
+/// the one a failing case reports: the proxy's forward budget, which
+/// [`FIXTURE_READINESS_TIMEOUT`] and [`FIXTURE_WORKER_QUEUE_TIMEOUT`] set,
+/// ends inside this bound, and this bound ends inside nextest's one-minute
+/// deadline. It also covers the proxy's start window, the longest a refusal to
+/// start takes. `mcp_proxy`'s `proxied_forward_budget_ends_inside_the_call_bound`
+/// pins the first relation and `dev/tests/test_delivery.py` the second.
+pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_secs(45);
 /// Bound on one proxied call that starts and settles a language engine.
 pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 
 /// The declaration every non-engine fixture serves, and the file
 /// referencing it.
 pub(crate) const LIBRARY: &str = "pub fn beacon() {}\n";
+
+/// `[server] readiness_timeout` of every fixture but the engine one.
+///
+/// With [`FIXTURE_WORKER_QUEUE_TIMEOUT`] and the proxy's answer grace it makes
+/// the forward budget the proxy gives each request, which ends inside
+/// [`PROXIED_CALL_MAX`]. The shipped defaults make a budget past both that
+/// bound and nextest's deadline, so a server that stopped answering would end
+/// a case with no report. The fixture indexes a handful of files, far inside
+/// this bound.
+pub(crate) const FIXTURE_READINESS_TIMEOUT: rift_protocol::configuration::Duration =
+    rift_protocol::configuration::Duration::from_millis(15_000);
+/// `[server] worker_queue_timeout` of every fixture but the engine one; see
+/// [`FIXTURE_READINESS_TIMEOUT`].
+pub(crate) const FIXTURE_WORKER_QUEUE_TIMEOUT: rift_protocol::configuration::Duration =
+    rift_protocol::configuration::Duration::from_millis(5_000);
 
 /// A workspace fixture: one Rust source and a `rift.toml` whose
 /// `[server]` idle timeout reaps any orphaned server within a minute and
@@ -93,9 +114,14 @@ pub(crate) fn rust_project() -> Vec<(&'static str, &'static str)> {
 
 /// Cargo project fixture with real Rust language LSP configuration appended,
 /// serving `rust` through rust-analyzer.
+///
+/// It keeps the shipped `[server]` request bounds: a request here waits for
+/// rust-analyzer to be ready, which [`PROXIED_ENGINE_CALL_MAX`] covers and
+/// [`FIXTURE_READINESS_TIMEOUT`] does not.
 pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(
+    fixture_workspace(
         &rust_project(),
+        "",
         &format!(
             "{}{}",
             assigned_port_key()?,
@@ -115,11 +141,27 @@ pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
-/// vector ranking, the orphan-safety idle timeout, and `extra_toml` - an
-/// LSP configuration, a `[source]` policy, or another
-/// table a case needs beyond the two every fixture already carries.
+/// vector ranking, the orphan-safety idle timeout, the request bounds
+/// [`FIXTURE_READINESS_TIMEOUT`] and [`FIXTURE_WORKER_QUEUE_TIMEOUT`], and
+/// `extra_toml` - an LSP configuration, a `[source]` policy, or another
+/// table a case needs beyond what every fixture already carries.
 pub(crate) fn laid_out_workspace(
     files: &[(&str, &str)],
+    extra_toml: &str,
+) -> TestResult<tempfile::TempDir> {
+    let request_bounds = format!(
+        "readiness_timeout = \"{}\"\nworker_queue_timeout = \"{}\"\n",
+        String::from(FIXTURE_READINESS_TIMEOUT),
+        String::from(FIXTURE_WORKER_QUEUE_TIMEOUT)
+    );
+    fixture_workspace(files, &request_bounds, extra_toml)
+}
+
+/// The fixture [`laid_out_workspace`] lays out, with `server_keys` in its
+/// `[server]` table ahead of `extra_toml`.
+fn fixture_workspace(
+    files: &[(&str, &str)],
+    server_keys: &str,
     extra_toml: &str,
 ) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
@@ -132,12 +174,16 @@ pub(crate) fn laid_out_workspace(
     }
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{extra_toml}"),
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{server_keys}{extra_toml}"),
     )?;
     Ok(directory)
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
+///
+/// The stop's standard error reaches the test's own, so a stop that refuses or
+/// runs out its window says why in the case's report; its standard output, the
+/// one line a stop that worked prints, does not.
 pub(crate) struct StopOnDrop {
     root: PathBuf,
     binary: PathBuf,
@@ -159,7 +205,7 @@ impl Drop for StopOnDrop {
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .status();
     }
 }
