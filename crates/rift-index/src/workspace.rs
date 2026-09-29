@@ -4438,11 +4438,28 @@ mod tests {
         assert_eq!(next.file_count(), index.file_count());
     }
 
+    /// Builds the oversized case under a one-mebibyte per-file bound: the default `split`
+    /// strategy holds a file up to the workspace byte bound, and writing a file past that
+    /// bound would spend the test on half a gibibyte of disk writes.
     #[test]
     fn test_rebuilt_omits_a_newly_invalid_file_and_recovers_a_fixed_one() {
         let directory = fixture();
         let root = directory.path();
-        let index = indexed(root, &TextFileInclusion::default());
+        let limits = WorkspaceIndexLimits::new(
+            WORKSPACE_FILES_MAX_DEFAULT,
+            1_048_576,
+            WORKSPACE_BYTES_MAX_DEFAULT,
+            WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
+            READ_RESULTS_MAX_DEFAULT,
+        )
+        .expect("every bound is positive");
+        let index = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture workspace must index");
         assert!(index.warnings().is_empty());
         let lib_path = ProjectPath::new("src/lib.rs").expect("fixture path");
 
