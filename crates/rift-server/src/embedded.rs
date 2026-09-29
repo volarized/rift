@@ -14,12 +14,14 @@
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
 //! advertises.
 //!
-//! ty analyzes the tree on disk: the database is rooted at the workspace,
-//! discovery stays inside it (`discover_without_uv` only when the tree
-//! carries a `pyproject.toml` or `ty.toml` marker), and a document open
-//! feeds the database the file's current on-disk state. The session hands
-//! indexed source that the server has already witnessed against disk, so
-//! the two views agree by the time an exchange runs.
+//! ty analyzes the tree on disk: project discovery runs only when the tree
+//! carries a `pyproject.toml` or `ty.toml` marker, and a document open feeds the
+//! database the file's current on-disk state. The session hands indexed source
+//! that the server has already witnessed against disk, so the two views agree by
+//! the time an exchange runs. The Python environment comes from the tree alone:
+//! the one its ty configuration names, else its `.venv`, else none.
+
+mod hermetic;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -31,7 +33,7 @@ use rift_lsp::{EngineError, EngineLaunch, EngineSession, Framing, PositionEncodi
 use ruff_db::Db as _;
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_text_size::{TextRange, TextSize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +41,8 @@ use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::watch::{ChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as _, ProjectDatabase, ProjectMetadata, SemanticDb as _};
+
+use hermetic::HermeticSystem;
 
 /// Bytes the in-memory transport buffers per direction before a writer waits.
 const DUPLEX_BYTES: usize = 256 * 1024;
@@ -347,18 +351,25 @@ fn with_database<T>(
     answer(database, &root)
 }
 
-/// Builds a project database rooted exactly at `root`.
+/// Builds a project database for the tree at `root`.
 ///
-/// Discovery is hermetic: `discover_without_uv` runs only when the tree
-/// carries its own project marker, so semantic answers never leak past the
-/// served directory; a markerless tree gets default metadata pinned at its
-/// root. A tree holding a virtual environment in `.venv` resolves imports
-/// through it, as [`tree_environment`] states.
+/// A markerless tree gets default metadata pinned at its root. A tree carrying its own
+/// `pyproject.toml` or `ty.toml` goes through `discover_without_uv`, which keeps walking
+/// the ancestors for a `ty.toml` or a `[tool.ty]` table when the tree's own
+/// `pyproject.toml` carries neither.
+///
+/// The database runs on a [`HermeticSystem`], so the process's variables, programs, and
+/// user configuration never reach it. Imports resolve through the Python environment the
+/// project's ty configuration names, else through the tree's `.venv` when it holds a
+/// virtual environment, as [`tree_environment`] states, else through none: the project's
+/// own modules and the vendored typeshed standard library. ty's look for an environment
+/// around its own executable finds none, since the Rift binary is named neither `ty` nor
+/// a Python interpreter.
 fn built_database(root: &Path) -> Result<ProjectDatabase, String> {
     let has_marker = root.join("pyproject.toml").is_file() || root.join("ty.toml").is_file();
     let system_root = SystemPathBuf::from_path_buf(root.to_path_buf())
         .map_err(|path| format!("tree root is not UTF-8: {}", path.display()))?;
-    let system = OsSystem::new(&system_root);
+    let system = HermeticSystem::new(&system_root);
     let mut metadata = if has_marker {
         ProjectMetadata::discover_without_uv(&system_root, &system)
             .map_err(|error| format!("ty project discovery: {error}"))?
@@ -772,7 +783,7 @@ mod tests {
             .expect("a UTF-8 temporary root");
         assert!(
             tree_environment(&root).is_none(),
-            "a tree without `.venv` leaves discovery to ty"
+            "a tree without `.venv` names no environment"
         );
 
         std::fs::create_dir(directory.path().join(".venv")).expect("environment directory");
@@ -1118,10 +1129,10 @@ mod tests {
         served.await.expect("the loop ends on unreadable bytes");
     }
 
-    /// A project marker routes database construction through hermetic
+    /// A project marker routes database construction through project
     /// discovery, and the pull still answers findings from that tree.
     #[test]
-    fn test_a_pyproject_marker_routes_through_hermetic_discovery() {
+    fn test_a_pyproject_marker_routes_through_project_discovery() {
         let directory = tempfile::tempdir().expect("fixture directory");
         std::fs::write(
             directory.path().join("pyproject.toml"),
