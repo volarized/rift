@@ -10,8 +10,9 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
@@ -39,6 +40,10 @@ use crate::spawn::{
     StartSpawns, StartupCapture,
 };
 use crate::validation::ConfigurationState;
+
+/// The suffix `SQLite` gives a WAL database's write-ahead log, appended to the
+/// database file's name.
+const WRITE_AHEAD_LOG_SUFFIX: &str = "-wal";
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -523,7 +528,10 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// election spawns again, at most
 /// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
 /// all, and any other exit refuses with the server's captured stderr.
-/// Exhaustion refuses with the operator's next step.
+/// When the window closes on a holder of the election that is still building
+/// its first index and wrote to the workspace database during the window,
+/// the refusal is one the caller resends; any other exhaustion refuses with
+/// the operator's next step.
 ///
 /// A recorded server of another identity is weighed by [`ServerStanding`].
 /// One this process replaces is asked to stop first, and the spawn waits
@@ -555,9 +563,12 @@ async fn connect_upstream(
     if !awaiting_release && !matches!(probed(root).await, ServerPresence::Starting) {
         spawns.spawn_captured(root);
     }
+    let opened = DatabaseActivity::observed(root).await;
+    let mut building = false;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
         let presence = probed(root).await;
+        building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
         let adopted = adopt_presence(presence, identity, &mut replacement).await?;
         // The replaced server released the election, and no other starter
@@ -577,7 +588,91 @@ async fn connect_upstream(
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err(upstream_unavailable())
+    let closed = DatabaseActivity::observed(root).await;
+    Err(start_window_refusal(building && opened != closed))
+}
+
+/// What the workspace database's files looked like at one instant: each
+/// file's length and modification time, or nothing for an absent file.
+///
+/// A server records its diagnostics into `.rift/db` from before it claims the
+/// election, while it builds its first index too, and `SQLite` in WAL mode
+/// appends each commit to the write-ahead log. Two readings that differ
+/// therefore show that a process wrote between them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DatabaseActivity {
+    files: [Option<(u64, SystemTime)>; 2],
+}
+
+impl DatabaseActivity {
+    /// Reads the database file and its write-ahead log below `root`, and none
+    /// of their bytes, on the blocking pool. A reading the pool could not
+    /// finish names no file.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future abandons the reading; it changes nothing.
+    async fn observed(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::read(&root))
+            .await
+            .unwrap_or(Self {
+                files: [None, None],
+            })
+    }
+
+    /// Reads the database file and its write-ahead log below `root`.
+    fn read(root: &Path) -> Self {
+        let state = root.join(RIFT_STATE_DIRECTORY);
+        let database = state.join(WORKSPACE_DATABASE_FILE_NAME);
+        let log = state.join(format!(
+            "{WORKSPACE_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
+        ));
+        Self {
+            files: [database, log].map(|path| {
+                let metadata = std::fs::metadata(path).ok()?;
+                Some((metadata.len(), metadata.modified().ok()?))
+            }),
+        }
+    }
+}
+
+/// The refusal a request gets when the start window closed without a server
+/// that answers: one the caller resends while the holder of the election is
+/// `building` its first index and wrote during the window, and the
+/// operator's next step otherwise.
+fn start_window_refusal(building: bool) -> ErrorData {
+    if building {
+        return Error::new(StartFault::Building).tool_error(wire::ErrorPhase::Read);
+    }
+    upstream_unavailable()
+}
+
+/// Why the start window closed without a server that answers, when the
+/// caller can resend the request.
+#[derive(Debug)]
+enum StartFault {
+    /// The workspace's server holds the election, has published no lock
+    /// document yet, and wrote to the workspace database during the window.
+    Building,
+}
+
+impl Fault for StartFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Building => vec![
+                ErrorContext::new(
+                    "detail",
+                    "the workspace's rift server is still building its first index",
+                ),
+                ErrorContext::new("waited", format!("{START_WAIT_MAX:?}")),
+            ],
+        }
+    }
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -1733,6 +1828,82 @@ mod tests {
             .await
             .expect_err("a holder that never publishes must exhaust the start window");
         assert_eq!(refusal.message, upstream_unavailable().message);
+        Ok(())
+    }
+
+    /// A holder of the election that publishes nothing but writes to the
+    /// workspace database during the start window is still building: the
+    /// connect refuses with a refusal the caller resends, naming the build.
+    #[tokio::test(start_paused = true)]
+    async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let log = directory.path().join(".rift").join("db-wal");
+        let writing = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::fs::write(&log, b"a commit the building server wrote")
+        };
+        let (refusal, written) = tokio::join!(
+            connect_upstream(directory.path(), &test_identity()),
+            writing
+        );
+        written?;
+        let refusal = refusal.expect_err("a holder that never publishes exhausts the window");
+        let data = refusal
+            .data
+            .ok_or("the refusal carries its classification")?;
+        assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
+        assert!(
+            refusal.message.contains("still building its first index"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
+    /// Only a holder still building, together with a database that moved,
+    /// selects the retryable refusal.
+    #[test]
+    fn the_start_window_refusal_follows_the_evidence() {
+        let building = super::start_window_refusal(true);
+        assert!(
+            building.message.contains("still building"),
+            "{}",
+            building.message
+        );
+        let wedged = super::start_window_refusal(false);
+        assert_eq!(wedged.message, upstream_unavailable().message);
+    }
+
+    /// Database activity reads each file's length and modification time, and
+    /// moves when either file is written.
+    #[test]
+    fn database_activity_moves_when_the_database_is_written() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let before = super::DatabaseActivity::read(directory.path());
+        assert_eq!(before.files, [None, None]);
+        std::fs::create_dir_all(directory.path().join(".rift"))?;
+        std::fs::write(directory.path().join(".rift").join("db"), b"pages")?;
+        let written = super::DatabaseActivity::read(directory.path());
+        assert_ne!(written, before);
+        std::fs::write(directory.path().join(".rift").join("db-wal"), b"a commit")?;
+        assert_ne!(super::DatabaseActivity::read(directory.path()), written);
+        Ok(())
+    }
+
+    /// A server still building its first index has published no lock
+    /// document, so no identity is read and nothing asks it to stop.
+    #[tokio::test]
+    async fn a_building_server_is_never_asked_to_stop() -> TestResult {
+        let mut replacement = Replacement::default();
+        let adopted = super::adopt_presence(
+            ServerPresence::Starting,
+            &identity("999.0.0", SCHEMA_DIGEST_A),
+            &mut replacement,
+        )
+        .await?;
+        assert!(adopted.is_none());
+        assert!(!replacement.is_asked());
         Ok(())
     }
 
