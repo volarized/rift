@@ -2,9 +2,10 @@
 //!
 //! Tree-sitter's `Node::child`, `Node::prev_sibling`, and `Node::parent` search again from the
 //! first child or from the root on every call, so a walk or a rule stepping through siblings
-//! with them is quadratic in the sibling count. Each test builds one such shape and requires
-//! its analysis to finish within a budget sized from the linear walk: a regression spends the
-//! budget on the first file it reaches.
+//! with them is quadratic in the sibling count. Each test analyzes one such shape at two sizes
+//! [`GROWTH_FACTOR`] apart: a linear analysis takes about [`GROWTH_FACTOR`] times as long on
+//! the larger file, a quadratic one about its square. Both sizes run on the same machine, so
+//! the ratio between them does not depend on how fast that machine is.
 //!
 //! The loops walk [`registry::providers`], so a provider registered later joins these proofs
 //! once [`wide_line`] and [`attached_run`] name its language.
@@ -17,55 +18,37 @@ use rift_syntax::{
     MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, registry,
 };
 
-/// Lines in each generated file, each one more child of the same node.
-const WIDE_NODE_LINES: usize = 40_000;
+/// How many times larger the larger file of each shape is.
+const GROWTH_FACTOR: usize = 8;
 
-/// The longest every provider together may spend analyzing its generated file.
+/// The largest time ratio between the larger and the smaller file a linear analysis may show.
 ///
-/// A debug build on an Apple M-series machine analyzes all of them in 1.1 s.
-/// The walk that indexed each child took 38.6 s for the Rust file alone and 82 s for the
-/// JavaScript one. Twenty-five seconds leaves slower CI runners and coverage
-/// instrumentation a tenfold margin and stays below nextest's 60 s test deadline, so the
-/// budget reports a regression on the first provider it reaches, before the deadline does.
-const ANALYSIS_BUDGET: Duration = Duration::from_secs(25);
+/// On an Apple M-series debug build every shape measured 7.9 to 8.2 after the walks stopped
+/// restarting from the first sibling, each size the fastest of [`REPEATS`] runs. The quadratic
+/// walks measured 60 to 63 for wide nodes and attached runs, 28 for headings, and 15.8 for
+/// link reference definitions, where tree-sitter's own parse carries most of the time. Eleven
+/// leaves linear growth a third of headroom for timing noise and stays a third below the
+/// smallest quadratic ratio.
+const RATIO_MAX: f64 = 11.0;
+
+/// Runs per size. The fastest counts, so a run slowed by other work on the machine drops out.
+const REPEATS: usize = 3;
+
+/// Lines in each wide-node file, each one more child of the same node.
+const WIDE_NODE_LINES: usize = 8_000;
 
 /// Doc comment lines in front of the one declaration in each attached-run file.
-const ATTACHED_DOC_LINES: usize = 15_000;
-
-/// The longest every attaching provider together may spend on its attached-run file.
-///
-/// A debug build on an Apple M-series machine analyzes the four files in 0.22 s, while
-/// stepping through the run with `Node::prev_sibling` took 20.5 s for the Rust file alone
-/// and 22 s for each ECMAScript one. Five seconds leaves a twentyfold margin.
-const ATTACHED_RUN_BUDGET: Duration = Duration::from_secs(5);
+const ATTACHED_DOC_LINES: usize = 8_000;
 
 /// Headings in the heading file, each opening a section directly under the document.
-const HEADINGS: usize = 60_000;
-
-/// The longest the markdown provider may spend on the heading file.
-///
-/// A debug build on an Apple M-series machine analyzes it in 2.3 s, while looking each
-/// heading's symbol up with a scan over every symbol took 24.8 s. Twelve seconds leaves a
-/// fivefold margin and stays half the scanning time.
-const HEADING_BUDGET: Duration = Duration::from_secs(12);
+const HEADINGS: usize = 16_000;
 
 /// Link reference definitions in the reference file, each its own block.
-const REFERENCE_DEFINITIONS: usize = 160_000;
+const REFERENCE_DEFINITIONS: usize = 32_000;
 
-/// The longest the markdown provider may spend on the reference file.
-///
-/// A debug build on an Apple M-series machine analyzes it in 7.9 s, nearly all of it
-/// tree-sitter's own parse, while matching each link to its block with a scan over every
-/// block took 48.7 s. Twenty-four seconds leaves a threefold margin and stays half the
-/// scanning time.
-const REFERENCE_BUDGET: Duration = Duration::from_secs(24);
-
-/// Node bound for the markdown files, whose every line is three or four nodes.
-const MARKDOWN_NODES_MAX: usize = 1_000_000;
-
-/// One line of the generated file for `language`: a construct the grammar places as one
-/// more child of the same node. Panics when a registered provider names a language this
-/// table has no entry for, which tells the next implementer to add one.
+/// One line of the wide-node file for `language`: a construct the grammar places as one more
+/// child of the same node. Panics when a registered provider names a language this table has
+/// no entry for, which tells the next implementer to add one.
 fn wide_line(language: &Language) -> &'static str {
     match language.name.as_str() {
         "rust" | "javascript" | "typescript" | "json" => "// wide node comment line\n",
@@ -95,59 +78,62 @@ fn attached_run(language: &Language) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// Analyzes `text` under `limits`, adds the time it took to `spent`, and requires the
-/// running total to stay within `budget`.
-fn analyze_within(
-    provider: &dyn SyntaxProvider,
-    text: &str,
-    limits: SyntaxLimits,
-    spent: &mut Duration,
-    budget: Duration,
-) -> SyntaxDocument {
+/// Analyzes `text` once and returns the document with the time it took.
+fn timed_analysis(provider: &dyn SyntaxProvider, text: &str) -> (SyntaxDocument, Duration) {
     let path = ProjectPath::new("wide").expect("valid fixture path");
-    let language = provider.language();
     let source = SyntaxSource { path: &path, text };
     let (analysis, measurement) = measure_elapsed!(SystemMonotonicClock, "syntax.analyze", {
-        provider.analyze(source, limits)
+        provider.analyze(source, SyntaxLimits::default())
     })
     .expect("the monotonic clock must not regress");
     let document = analysis.unwrap_or_else(|error| {
-        panic!("a wide shape must analyze: language={language:?}, error={error}")
+        panic!(
+            "a wide shape must analyze under the default limits: language={:?}, error={error}",
+            provider.language()
+        )
     });
-    *spent += measurement.elapsed();
-    assert!(
-        *spent < budget,
-        "siblings must be read in time linear in their count: language={language:?}, \
-         elapsed={:?}, spent={spent:?}, budget={budget:?}",
-        measurement.elapsed(),
-    );
-    document
+    (document, measurement.elapsed())
 }
 
-/// Limits admitting the markdown files: the default bounds with a wider node bound.
-fn markdown_limits() -> SyntaxLimits {
-    let defaults = SyntaxLimits::default();
-    SyntaxLimits::new(
-        defaults.source_bytes_max(),
-        MARKDOWN_NODES_MAX,
-        defaults.syntax_depth_max(),
-    )
-    .expect("positive markdown limits")
+/// Analyzes the shape `build` spells at `lines` and at `lines / GROWTH_FACTOR` and refuses a
+/// time ratio above [`RATIO_MAX`]; returns the larger file's document.
+///
+/// The smaller file runs once before the measured runs, so neither size pays for first-use
+/// setup, and the two sizes alternate so both meet the same machine load.
+fn analyze_linearly(
+    provider: &dyn SyntaxProvider,
+    build: impl Fn(usize) -> String,
+    lines: usize,
+) -> SyntaxDocument {
+    let small_text = build(lines / GROWTH_FACTOR);
+    let large_text = build(lines);
+    timed_analysis(provider, &small_text);
+    let mut small = Duration::MAX;
+    let mut large = Duration::MAX;
+    let mut document = None;
+    for _ in 0..REPEATS {
+        small = small.min(timed_analysis(provider, &small_text).1);
+        let (analysis, elapsed) = timed_analysis(provider, &large_text);
+        large = large.min(elapsed);
+        document = Some(analysis);
+    }
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    assert!(
+        ratio < RATIO_MAX,
+        "analysis time must grow linearly with the sibling count: language={:?}, \
+         lines={lines}, small={small:?}, large={large:?}, ratio={ratio:.2}, \
+         ratio_max={RATIO_MAX}",
+        provider.language(),
+    );
+    document.expect("at least one measured run")
 }
 
 #[test]
-fn every_provider_analyzes_a_node_with_many_children_within_the_budget() {
-    let mut spent = Duration::ZERO;
+fn every_provider_reads_a_node_with_many_children_in_linear_time() {
     for provider in registry::providers() {
         let language = provider.language();
-        let text = wide_line(language).repeat(WIDE_NODE_LINES);
-        let document = analyze_within(
-            provider,
-            &text,
-            SyntaxLimits::default(),
-            &mut spent,
-            ANALYSIS_BUDGET,
-        );
+        let line = wide_line(language);
+        let document = analyze_linearly(provider, |count| line.repeat(count), WIDE_NODE_LINES);
         assert!(
             document.nodes().len() > WIDE_NODE_LINES,
             "every generated line must reach the walk as a node: language={language:?}, \
@@ -158,22 +144,14 @@ fn every_provider_analyzes_a_node_with_many_children_within_the_budget() {
 }
 
 #[test]
-fn a_declaration_after_many_attached_doc_lines_analyzes_within_the_budget() {
-    let mut spent = Duration::ZERO;
+fn a_declaration_after_many_attached_doc_lines_attaches_in_linear_time() {
     for provider in registry::providers() {
         let language = provider.language();
         let Some((doc_line, declaration)) = attached_run(language) else {
             continue;
         };
-        let mut text = doc_line.repeat(ATTACHED_DOC_LINES);
-        text.push_str(declaration);
-        let document = analyze_within(
-            provider,
-            &text,
-            SyntaxLimits::default(),
-            &mut spent,
-            ATTACHED_RUN_BUDGET,
-        );
+        let build = |count| format!("{}{declaration}", doc_line.repeat(count));
+        let document = analyze_linearly(provider, build, ATTACHED_DOC_LINES);
         let symbol = document
             .symbols()
             .first()
@@ -186,16 +164,9 @@ fn a_declaration_after_many_attached_doc_lines_analyzes_within_the_budget() {
 }
 
 #[test]
-fn many_headings_analyze_within_the_budget() {
-    let mut spent = Duration::ZERO;
-    let text = "# Wide node heading\n\n".repeat(HEADINGS);
-    let document = analyze_within(
-        &MarkdownSyntaxProvider::default(),
-        &text,
-        markdown_limits(),
-        &mut spent,
-        HEADING_BUDGET,
-    );
+fn many_headings_analyze_in_linear_time() {
+    let provider = MarkdownSyntaxProvider::default();
+    let document = analyze_linearly(&provider, |count| "# h\n".repeat(count), HEADINGS);
     let facts = document.markdown_facts().expect("markdown facts");
     assert_eq!(
         facts.headings().len(),
@@ -205,16 +176,10 @@ fn many_headings_analyze_within_the_budget() {
 }
 
 #[test]
-fn many_link_reference_definitions_analyze_within_the_budget() {
-    let mut spent = Duration::ZERO;
-    let text = "[wide]: /wide-node\n".repeat(REFERENCE_DEFINITIONS);
-    let document = analyze_within(
-        &MarkdownSyntaxProvider::default(),
-        &text,
-        markdown_limits(),
-        &mut spent,
-        REFERENCE_BUDGET,
-    );
+fn many_link_reference_definitions_analyze_in_linear_time() {
+    let provider = MarkdownSyntaxProvider::default();
+    let build = |count| "[w]: /w\n".repeat(count);
+    let document = analyze_linearly(&provider, build, REFERENCE_DEFINITIONS);
     let facts = document.markdown_facts().expect("markdown facts");
     assert_eq!(
         facts.links().len(),
