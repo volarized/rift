@@ -285,7 +285,7 @@ pub(crate) fn parse_markdown_trees(
         block.root_node(),
         0,
         source.path,
-        limits.syntax_nodes_max(),
+        NodeBound::whole(limits.syntax_nodes_max()),
         limits.syntax_depth_max(),
     )?;
     let (inline_nodes, inline_ranges) =
@@ -441,12 +441,11 @@ fn check_combined_node_bound(
     inline: &[InlineTreeFact],
 ) -> Result<(), SyntaxError> {
     for tree in inline {
-        let remaining = limits.syntax_nodes_max().saturating_sub(node_count);
         let nodes = bounded_tree_nodes(
             tree.tree.root_node(),
             tree.base_depth,
             path,
-            remaining,
+            NodeBound::after(limits.syntax_nodes_max(), node_count),
             limits.syntax_depth_max(),
         )?;
         node_count = node_count.saturating_add(nodes.len());
@@ -514,7 +513,7 @@ fn extract_block_facts(
         trees.block.root_node(),
         0,
         source.path,
-        limits.syntax_nodes_max(),
+        NodeBound::whole(limits.syntax_nodes_max()),
         limits.syntax_depth_max(),
     )?;
     let line_starts = rift_core::line::line_starts(source.text);
@@ -639,7 +638,7 @@ fn extract_authored_facts(
             root,
             inline_tree.base_depth,
             source.path,
-            limits.syntax_nodes_max(),
+            NodeBound::whole(limits.syntax_nodes_max()),
             limits.syntax_depth_max(),
         )?;
         for (index, entry) in inline_nodes.iter().enumerate() {
@@ -803,11 +802,49 @@ fn required_kind(language: &tree_sitter::Language, kind: &str) -> u16 {
     id
 }
 
+/// The nodes one bounded walk may take, and the configured bound its refusal
+/// names.
+#[derive(Debug, Clone, Copy)]
+struct NodeBound {
+    /// Nodes this walk may take: the configured bound less the nodes earlier
+    /// trees of the same source already took.
+    remaining: usize,
+    /// The configured `syntax_nodes_max`.
+    syntax_nodes_max: usize,
+}
+
+impl NodeBound {
+    /// A walk that may take the whole configured bound.
+    fn whole(syntax_nodes_max: usize) -> Self {
+        Self {
+            remaining: syntax_nodes_max,
+            syntax_nodes_max,
+        }
+    }
+
+    /// A walk after earlier trees of the same source took `taken` nodes.
+    fn after(syntax_nodes_max: usize, taken: usize) -> Self {
+        Self {
+            remaining: syntax_nodes_max.saturating_sub(taken),
+            syntax_nodes_max,
+        }
+    }
+
+    /// The refusal for a walk that crossed this bound, naming the configured
+    /// bound rather than what was left of it.
+    fn exceeded(self, path: &ProjectPath) -> SyntaxError {
+        Error::new(SyntaxFault::TooManyNodes {
+            path: path.clone(),
+            syntax_nodes_max: self.syntax_nodes_max,
+        })
+    }
+}
+
 fn bounded_tree_nodes<'tree>(
     root: Node<'tree>,
     base_depth: usize,
     path: &ProjectPath,
-    nodes_max: usize,
+    bound: NodeBound,
     depth_max: usize,
 ) -> Result<Vec<BoundedNode<'tree>>, SyntaxError> {
     let mut result = Vec::new();
@@ -820,11 +857,8 @@ fn bounded_tree_nodes<'tree>(
                 syntax_depth_max: depth_max,
             }));
         }
-        if result.len() == nodes_max {
-            return Err(Error::new(SyntaxFault::TooManyNodes {
-                path: path.clone(),
-                syntax_nodes_max: nodes_max,
-            }));
+        if result.len() == bound.remaining {
+            return Err(bound.exceeded(path));
         }
         let index = result.len();
         result.push(BoundedNode {
@@ -832,11 +866,8 @@ fn bounded_tree_nodes<'tree>(
             depth,
             parent,
         });
-        if result.len() + pending.len() + node.named_child_count() > nodes_max {
-            return Err(Error::new(SyntaxFault::TooManyNodes {
-                path: path.clone(),
-                syntax_nodes_max: nodes_max,
-            }));
+        if result.len() + pending.len() + node.named_child_count() > bound.remaining {
+            return Err(bound.exceeded(path));
         }
         extract::push_named_children(&mut pending, &mut cursor, node, |child| {
             (child, depth + 1, Some(index))
@@ -1402,7 +1433,8 @@ mod tests {
             .set_language(&tree_sitter_md::LANGUAGE.into())
             .expect("pinned grammar");
         let tree = parser.parse("", None).expect("empty document parses");
-        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, 0, 16) else {
+        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, NodeBound::whole(0), 16)
+        else {
             panic!("root exceeds zero node bound");
         };
         assert_eq!(
@@ -1482,6 +1514,47 @@ mod tests {
         assert_eq!(
             kept, expected,
             "a span inside a block and an empty range on its end both drop it; untouched blocks stay"
+        );
+    }
+
+    #[test]
+    fn inline_trees_past_the_combined_node_bound_name_the_configured_bound() {
+        let text = "# Title\n\nSome *emphasis* and `code` with a [link](target).\n";
+        let path = ProjectPath::new("docs/facts.md").expect("valid path");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .expect("pinned grammar");
+        let block = parser.parse(text, None).expect("fixture parses");
+        let block_nodes =
+            bounded_tree_nodes(block.root_node(), 0, &path, NodeBound::whole(1024), 16)
+                .expect("the block tree fits")
+                .len();
+        let syntax_nodes_max = block_nodes + 1;
+        let source = SyntaxSource { path: &path, text };
+        let error = parse_markdown_trees(
+            source,
+            SyntaxLimits::declared(1024, syntax_nodes_max, 16),
+            MarkdownParseBounds::default(),
+        )
+        .expect_err("the inline trees cross the bound the block tree left");
+        assert_eq!(
+            error.fault().violation(),
+            crate::SyntaxViolation::TooManyNodes
+        );
+        assert!(
+            error.context().contains(&ErrorContext::new(
+                "syntax_nodes_max",
+                syntax_nodes_max.to_string()
+            )),
+            "the refusal must name the configured bound: context={:?}",
+            error.context()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("syntax_nodes_max {syntax_nodes_max}")),
+            "the message must name the configured bound: {error}"
         );
     }
 
