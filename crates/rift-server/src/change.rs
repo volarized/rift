@@ -752,15 +752,13 @@ mod tests {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
-            let current = ReadService::build(
-                self.directory.path(),
-                self.limits,
-                &SourceVisibility::default(),
-                &TextFileInclusion::default(),
-                HistoryConfiguration::default(),
-            )?;
+            let root = self.directory.path();
+            let visibility = SourceVisibility::default();
+            let inclusion = TextFileInclusion::default();
+            let history = HistoryConfiguration::default();
+            let current = ReadService::build(root, self.limits, &visibility, &inclusion, history)?;
             search_change(
-                self.directory.path(),
+                root,
                 &params,
                 &change,
                 &current,
@@ -1086,10 +1084,8 @@ mod tests {
         let fixture = Fixture::baseline(&base)?;
         let root = fixture.directory.path();
         fs::write(root.join(".gitignore"), "generated/\n")?;
-        fs::write(
-            root.join("generated/out.rs"),
-            "pub fn generated(flag: bool) {}\n",
-        )?;
+        let grown = "pub fn generated(flag: bool) {}\n";
+        fs::write(root.join("generated/out.rs"), grown)?;
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline", "head": {"kind": "working_tree"}}
@@ -1137,21 +1133,19 @@ mod tests {
             |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
         let directory = tempfile::tempdir()?;
         let root = directory.path();
-        write_all(
-            root,
-            &[
-                (
-                    ".gitattributes",
-                    "assets/*.md filter=lfs diff=lfs merge=lfs -text\n\
-                     src/shout.rs filter=upper\n\
-                     docs/notes.md working-tree-encoding=UTF-16LE\n",
-                ),
-                ("assets/diagram.md", LFS_POINTER),
-                ("assets/unedited.md", LFS_POINTER),
-                ("src/lib.rs", "pub fn kept() {}\n"),
-                ("src/shout.rs", "pub fn shout() {}\n"),
-            ],
-        )?;
+        let baseline = [
+            (
+                ".gitattributes",
+                "assets/*.md filter=lfs diff=lfs merge=lfs -text\n\
+                 src/shout.rs filter=upper\n\
+                 docs/notes.md working-tree-encoding=UTF-16LE\n",
+            ),
+            ("assets/diagram.md", LFS_POINTER),
+            ("assets/unedited.md", LFS_POINTER),
+            ("src/lib.rs", "pub fn kept() {}\n"),
+            ("src/shout.rs", "pub fn shout() {}\n"),
+        ];
+        write_all(root, &baseline)?;
         fs::create_dir_all(root.join("docs"))?;
         fs::write(root.join("docs/notes.md"), utf16("# Notes\n"))?;
         init(root);
@@ -1162,15 +1156,13 @@ mod tests {
             limits: WorkspaceIndexLimits::default(),
         };
         let root = fixture.directory.path();
-        write_all(
-            root,
-            &[
-                ("assets/diagram.md", "# Diagram\n\n## Edited\n"),
-                ("assets/unedited.md", "binary payload of unedited\n"),
-                ("src/lib.rs", "pub fn kept(flag: bool) {}\n"),
-                ("src/shout.rs", "pub fn shout(loud: bool) {}\n"),
-            ],
-        )?;
+        let edited = [
+            ("assets/diagram.md", "# Diagram\n\n## Edited\n"),
+            ("assets/unedited.md", "binary payload of unedited\n"),
+            ("src/lib.rs", "pub fn kept(flag: bool) {}\n"),
+            ("src/shout.rs", "pub fn shout(loud: bool) {}\n"),
+        ];
+        write_all(root, &edited)?;
         fs::write(root.join("docs/notes.md"), utf16("# Notes\n\n## Added\n"))?;
 
         let answer = fixture.search(&json!({

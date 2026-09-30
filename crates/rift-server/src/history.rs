@@ -942,6 +942,16 @@ mod tests {
         }
     }
 
+    /// A current-tree snapshot of `root` under the default bounds and history table.
+    fn current(root: &Path) -> TestResult<ReadService> {
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::build(root, limits, &visibility, &inclusion, history)?;
+        Ok(service)
+    }
+
     /// Two declarations sharing one file across two commits, served through
     /// a current-tree read whose files match the second commit.
     fn shared_path_fixture() -> TestResult<(tempfile::TempDir, ReadService)> {
@@ -1116,9 +1126,8 @@ mod tests {
         store_folder: &Path,
         history: &HistoryConfiguration,
     ) -> TestResult<rift_history_store::HistoryStore> {
-        let store = rift_history_store::HistoryStore::open(
-            &rift_history_store::StoreLocation::new(store_folder, "aa"),
-        )?;
+        let location = rift_history_store::StoreLocation::new(store_folder, "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
         let mut filler = store.filler()?.ok_or("no other filler runs")?;
         let analysis = crate::HistoryAnalysis::open(
             root,
@@ -1210,18 +1219,12 @@ mod tests {
         let (directory, service) = shared_path_fixture()?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
-        let empty = rift_history_store::HistoryStore::open(
-            &rift_history_store::StoreLocation::new(folder.path(), "aa"),
-        )?;
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let empty = rift_history_store::HistoryStore::open(&location)?;
         let (stored_empty, lagged) = stored(&empty, HistoryStrategy::Everything);
+        let root = directory.path();
 
-        let lagging = stored_timeline(
-            directory.path(),
-            &service,
-            &history,
-            &stored_empty,
-            "beacon_one",
-        )?;
+        let lagging = stored_timeline(root, &service, &history, &stored_empty, "beacon_one")?;
 
         assert!(!lagging.complete, "the store holds nothing yet");
         assert!(lagging.versions.is_empty());
@@ -1231,13 +1234,7 @@ mod tests {
 
         let store = filled_store(directory.path(), folder.path(), &history)?;
         let (stored_filled, lagged) = stored(&store, HistoryStrategy::Everything);
-        let caught_up = stored_timeline(
-            directory.path(),
-            &service,
-            &history,
-            &stored_filled,
-            "beacon_one",
-        )?;
+        let caught_up = stored_timeline(root, &service, &history, &stored_filled, "beacon_one")?;
         assert!(caught_up.complete, "the store holds the whole history now");
         assert_eq!(lagged.load(Ordering::SeqCst), 0);
         Ok(())
@@ -1274,20 +1271,12 @@ mod tests {
         rift_history::fixture::init(root);
         fs::write(root.join("before.rs"), "pub fn travelled() {}\n")?;
         rift_history::fixture::commit_all(root, "introduce travelled");
-        fs::write(
-            root.join("before.rs"),
-            "pub fn travelled() { let _grown = 1; }\n",
-        )?;
+        let grown = "pub fn travelled() { let _grown = 1; }\n";
+        fs::write(root.join("before.rs"), grown)?;
         rift_history::fixture::commit_all(root, "grow travelled");
         rift_history::fixture::git(root, &["mv", "before.rs", "after.rs"]);
         rift_history::fixture::commit_all(root, "move travelled");
-        let service = ReadService::build(
-            root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let service = current(root)?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
         let store = filled_store(root, folder.path(), &history)?;
@@ -1348,24 +1337,14 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         rift_history::fixture::init(root);
-        fs::write(
-            root.join("from.rs"),
-            "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n",
-        )?;
+        let introduced = "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n";
+        fs::write(root.join("from.rs"), introduced)?;
         rift_history::fixture::commit_all(root, "introduce travelled");
         fs::remove_file(root.join("from.rs"))?;
-        fs::write(
-            root.join("to.rs"),
-            "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n",
-        )?;
+        let moved = "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n";
+        fs::write(root.join("to.rs"), moved)?;
         rift_history::fixture::commit_all(root, "move travelled");
-        let service = ReadService::build(
-            root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let service = current(root)?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
         let store = filled_store(root, folder.path(), &history)?;
@@ -1422,10 +1401,8 @@ mod tests {
         assert_eq!(moved.pending().len(), 1, "only the new commit is owed");
 
         rift_history::fixture::git(root, &["reset", "-q", "--hard", "HEAD~2"]);
-        fs::write(
-            root.join("lib.rs"),
-            "pub fn beacon_one() { let _rewritten = 1; }\n",
-        )?;
+        let rewritten_source = "pub fn beacon_one() { let _rewritten = 1; }\n";
+        fs::write(root.join("lib.rs"), rewritten_source)?;
         rift_history::fixture::commit_all(root, "rewrite");
         let rewritten = analysis
             .plan(&filler.held()?)
