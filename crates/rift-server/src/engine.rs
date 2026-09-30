@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -353,11 +354,16 @@ fn watched_change(change: PathChange) -> FileChangeType {
     }
 }
 
-/// Everything one slot's lock guards: the running engine and the restarts
-/// already spent on it.
+/// Everything one slot's lock guards: the running engine, a start still in flight,
+/// and the restarts already spent on it.
 #[derive(Debug, Default)]
 struct SlotState {
     session: Option<EngineSession>,
+    /// A start running as a task the slot owns. A request that is dropped while it
+    /// waits for the start leaves it here, and the next request waits for the same
+    /// start instead of claiming another: the start ends when the engine answers
+    /// `initialize` or `startup_timeout` passes, whatever happens to the requests.
+    starting: Option<tokio::task::JoinHandle<Result<EngineSession, EngineError>>>,
     restarts: RestartBudget,
 }
 
@@ -390,7 +396,9 @@ impl Drop for RequestSessionGuard<'_> {
                     .is_some_and(EngineSession::is_intact));
         if !survives {
             drop(self.state.session.take());
-            self.reported_state.send_replace(LspState::Failed);
+            if self.state.starting.is_none() {
+                self.reported_state.send_replace(LspState::Failed);
+            }
         }
     }
 }
@@ -641,6 +649,21 @@ impl<T> Transient<T> {
     }
 }
 
+/// What one spawned start ended with: the session or the start's failure, a panic
+/// resumed on the waiting request, or [`EngineFault::Ended`] for a start the slot
+/// aborted while shutting down.
+fn joined_start(
+    joined: Result<Result<EngineSession, EngineError>, tokio::task::JoinError>,
+) -> Result<EngineSession, EngineError> {
+    match joined {
+        Ok(started) => started,
+        Err(failure) => match failure.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(_aborted) => Err(Error::new(EngineFault::Ended)),
+        },
+    }
+}
+
 /// Closes the documents the slot's live session holds open, before an exchange begins.
 ///
 /// An exchange's `finish` closes what its `begin` opened, so a document still open here
@@ -741,8 +764,17 @@ impl EngineSlot {
     }
 
     /// Ends the running session under the slot's lock and reports the slot stopped.
+    ///
+    /// A start still in flight is aborted, and a start that already finished is shut
+    /// down as a running session is.
     async fn end_session(self: Arc<Self>) {
         let mut held = self.state.lock().await;
+        if let Some(start) = held.starting.take() {
+            start.abort();
+            if let Ok(Ok(started)) = start.await {
+                started.shutdown().await;
+            }
+        }
         let Some(session) = held.session.take() else {
             return;
         };
@@ -1263,8 +1295,11 @@ impl EngineSlot {
     /// Starts one engine, restarting past a failed start while the budget
     /// allows.
     ///
-    /// The loop runs at most `restart.attempts` + 1 times: each pass
-    /// claims one start, and a refused claim ends it. A refused claim
+    /// Each start runs as a task the slot owns ([`EngineSlot::spawn_start`]), kept in
+    /// `state` until it ends, so a request dropped while it waits leaves the start
+    /// running, and the next request waits for that start instead of claiming
+    /// another. After the start it may find in flight, the loop claims at most
+    /// `restart.attempts` + 1 starts, and a refused claim ends it. A refused claim
     /// surfaces `reported` - the failure that sent the caller back here -
     /// or [`EngineFault::Ended`] when this call has no failure of its own
     /// to report, which is the honest answer for a budget an earlier
@@ -1275,11 +1310,22 @@ impl EngineSlot {
     /// holding that refusal looks for the program that could not run.
     async fn start_within_budget(
         &self,
-        budget: &mut RestartBudget,
+        state: &mut SlotState,
         mut reported: Option<EngineError>,
     ) -> Result<EngineSession, EngineError> {
         loop {
-            if !budget.claim(&self.configuration.restart, Instant::now()) {
+            if let Some(start) = state.starting.as_mut() {
+                let started = joined_start(start.await);
+                state.starting = None;
+                match self.settled_start(started) {
+                    ControlFlow::Break(outcome) => return outcome,
+                    ControlFlow::Continue(failure) => reported = Some(failure),
+                }
+            }
+            if !state
+                .restarts
+                .claim(&self.configuration.restart, Instant::now())
+            {
                 self.report_state(LspState::Failed);
                 let engine = self.name();
                 let surfaced = reported
@@ -1298,38 +1344,53 @@ impl EngineSlot {
                 return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
             }
             self.report_state(LspState::Starting);
-            let started = match (
-                self.configuration.embedded,
-                self.configuration.command.as_ref(),
-            ) {
-                (Some(engine), _) => {
-                    crate::embedded::started_session(
-                        self.embedded_launch(engine),
-                        &self.workspace_root,
-                    )
-                    .await
-                }
-                (None, Some(command)) => {
-                    EngineSession::start(self.launch(command), &self.workspace_root).await
-                }
-                (None, None) => unreachable!(
-                    "acceptance refuses an LSP table naming neither command nor embedded"
-                ),
-            };
-            match started {
-                Ok(session) => {
-                    self.report_readiness(session.readiness());
-                    return Ok(session);
-                }
-                Err(failure) if !restart_may_help(&failure) => {
-                    self.report_state(LspState::Failed);
-                    self.record_start_failure(&failure, false);
-                    return Err(failure);
-                }
-                Err(failure) => {
-                    self.record_start_failure(&failure, true);
-                    reported = Some(failure);
-                }
+            state.starting = Some(self.spawn_start());
+        }
+    }
+
+    /// Settles what one start ended with: a session, or a failure no restart can fix,
+    /// ends the start loop; a failure a restart may fix is recorded and continues it.
+    fn settled_start(
+        &self,
+        started: Result<EngineSession, EngineError>,
+    ) -> ControlFlow<Result<EngineSession, EngineError>, EngineError> {
+        match started {
+            Ok(session) => {
+                self.report_readiness(session.readiness());
+                ControlFlow::Break(Ok(session))
+            }
+            Err(failure) if !restart_may_help(&failure) => {
+                self.report_state(LspState::Failed);
+                self.record_start_failure(&failure, false);
+                ControlFlow::Break(Err(failure))
+            }
+            Err(failure) => {
+                self.record_start_failure(&failure, true);
+                ControlFlow::Continue(failure)
+            }
+        }
+    }
+
+    /// Spawns one start of this slot's engine as a task the slot owns.
+    ///
+    /// The task ends when the engine answers `initialize` or `startup_timeout` passes;
+    /// a request that waits for it can be dropped without ending it.
+    fn spawn_start(&self) -> tokio::task::JoinHandle<Result<EngineSession, EngineError>> {
+        let root = self.workspace_root.clone();
+        match (
+            self.configuration.embedded,
+            self.configuration.command.as_ref(),
+        ) {
+            (Some(engine), _) => {
+                let launch = self.embedded_launch(engine);
+                tokio::spawn(async move { crate::embedded::started_session(launch, &root).await })
+            }
+            (None, Some(command)) => {
+                let launch = self.launch(command);
+                tokio::spawn(async move { EngineSession::start(launch, &root).await })
+            }
+            (None, None) => {
+                unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
             }
         }
     }
@@ -1426,8 +1487,8 @@ impl EngineSlot {
             // Boxed: a reap awaits the session's shutdown request.
             Box::pin(self.reap(replaced)).await;
         }
-        // Boxed: a start holds a whole session and its handshake.
-        let started = Box::pin(self.start_within_budget(&mut state.restarts, reported)).await?;
+        // Boxed: a start's wait and its failure records stay out of every exchange's future.
+        let started = Box::pin(self.start_within_budget(state, reported)).await?;
         Ok(state.session.insert(started))
     }
 
@@ -1922,6 +1983,68 @@ done
             1,
             "the dropped exchange never reached its own request"
         );
+    }
+
+    /// A start whose request is dropped keeps running as the slot's own task, and the
+    /// next request waits for that start instead of claiming another: one engine
+    /// process, no restart spent, and the slot never reads failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_outlives_the_request_dropped_while_it_waits() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = logging_slot(directory.path(), false, 0);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        {
+            let exchange = slot.request(document_version);
+            tokio::pin!(exchange);
+            poll_until(&mut exchange, || {
+                pool.state_for_key(&key) == Some(LspState::Starting)
+            })
+            .await;
+        }
+        assert_eq!(
+            pool.state_for_key(&key),
+            Some(LspState::Starting),
+            "a start in flight is no failure"
+        );
+        let version = slot
+            .request(document_version)
+            .await
+            .expect("the next request meets the start in flight");
+        assert_eq!(version, 0, "the started session opened nothing");
+        assert!(
+            slot.state.lock().await.restarts.spent.is_empty(),
+            "the one start claimed no restart"
+        );
+        pool.shutdown().await;
+        assert_eq!(
+            engine_log(directory.path()),
+            ["start"],
+            "one engine process"
+        );
+    }
+
+    /// A pool shut down while a start is in flight ends that start with the slot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutting_down_the_pool_ends_a_start_in_flight() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let pool = logging_slot(directory.path(), false, 0);
+        let key = LspProcessKey::named("rust");
+        let slot = pool.engine_by_key(&key).expect("slot");
+        {
+            let exchange = slot.request(document_version);
+            tokio::pin!(exchange);
+            poll_until(&mut exchange, || {
+                pool.state_for_key(&key) == Some(LspState::Starting)
+            })
+            .await;
+        }
+        pool.shutdown().await;
+        let state = slot.state.lock().await;
+        assert!(state.starting.is_none(), "the shutdown took the start");
+        assert!(state.session.is_none(), "no session outlives the shutdown");
     }
 
     fn table(program: &str) -> LspConfiguration {
