@@ -870,7 +870,7 @@ mod tests {
             },
             name,
             name,
-            ExactKind("rust.struct".to_owned()),
+            ExactKind("struct".to_owned()),
         )
     }
 

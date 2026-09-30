@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use rift_core::constants::WORKSPACE_IGNORED_DIRECTORIES;
 use rift_core::{CompositionId, ProjectPath, SourceVisibility};
-use rift_history::{REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision};
+use rift_history::{
+    HistoryError, REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile,
+};
 use rift_protocol::source::SOURCE_FILES_FIELD;
 use rift_provider::CompositionBuilder;
 use rift_provider::ProviderComposition;
@@ -27,6 +29,11 @@ use rift_analysis::PathMatcher;
 
 #[derive(Debug)]
 pub(crate) struct RevisionFiles;
+
+/// Reads one committed file's bytes under the per-file byte bound it is handed; `None`
+/// leaves the file out.
+type CommittedBytes<'read> =
+    dyn FnMut(&TreeFile, usize) -> Result<Option<Vec<u8>>, HistoryError> + 'read;
 
 impl WorkspaceIndex {
     /// Builds read index over one committed tree.
@@ -104,6 +111,41 @@ impl WorkspaceIndex {
         languages: &rift_core::LanguageFileSelections,
         selection: &dyn Fn(&str) -> bool,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::at_revision_with_blob_reader(
+            repository,
+            revision,
+            limits,
+            visibility,
+            (text_inclusion, languages),
+            selection,
+            &mut |file, bytes_max| repository.blob_bytes(file, bytes_max).map(Some),
+        )
+    }
+
+    /// Builds one committed-tree index over the paths `selection` keeps, reading
+    /// each file's bytes through `read`, which is handed the per-file byte bound.
+    ///
+    /// `read` answering `None` leaves the file out with no warning; a blob past
+    /// the byte bound is left out the way [`Self::at_revision_with_selection`]
+    /// leaves it out. A comparison against the working tree reads the base
+    /// side's files in the working form this way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid paths, configuration,
+    /// bounds, history reads, or syntax.
+    pub fn at_revision_with_blob_reader(
+        repository: &Repository,
+        revision: &ResolvedRevision,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        (text_inclusion, languages): (
+            &rift_core::TextFileInclusion,
+            &rift_core::LanguageFileSelections,
+        ),
+        selection: &dyn Fn(&str) -> bool,
+        read: &mut CommittedBytes<'_>,
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
@@ -126,8 +168,9 @@ impl WorkspaceIndex {
                     &context_path,
                 ));
             }
-            let bytes = match repository.blob_bytes(tree_file, limits.file_bytes_max()) {
-                Ok(bytes) => bytes,
+            let bytes = match read(tree_file, limits.file_bytes_max()) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(error)
                     if matches!(
                         error.fault(),

@@ -20,9 +20,11 @@ workspace = true
 [dependencies]
 lsp-types.workspace = true
 percent-encoding.workspace = true
+globset.workspace = true
 rift-core.workspace = true
 rift-dependency.workspace = true
 rift-history.workspace = true
+rift-history-store.workspace = true
 rift-index.workspace = true
 rift-lsp.workspace = true
 rift-protocol.workspace = true
@@ -30,6 +32,7 @@ rift-provider.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true
 rift-syntax.workspace = true
+semver.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
@@ -52,6 +55,7 @@ serde_path_to_error.workspace = true
 [dev-dependencies]
 ignore.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
+rusqlite.workspace = true
 schemars.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

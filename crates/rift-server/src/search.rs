@@ -6,6 +6,9 @@
 mod body;
 #[cfg(test)]
 mod body_tests;
+mod commit;
+#[cfg(test)]
+mod commit_tests;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;
@@ -28,9 +31,9 @@ use rift_index::{
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
-    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SOURCE_WARNINGS_MAX, SearchChange,
-    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchScope, SearchTraversal, Symbol, SymbolId,
+    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, RevisionId, SOURCE_WARNINGS_MAX,
+    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchScope, SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
@@ -237,6 +240,9 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
+        if params.target == SearchParamsTarget::Commit {
+            return self.search_commits(params);
+        }
         if let Some(pattern) = self.validated_pattern(params, store, references)? {
             return self.search_pattern(params, &pattern, store);
         }
@@ -283,8 +289,8 @@ impl ReadService {
             )?;
         }
         let mut traversal_report = TraversalReport::default();
-        // `validate_search` refuses a `traversal` naming no `seed` unless `change` names
-        // the walk's starting declarations, and this path serves no comparison.
+        // `validate_search` refuses a `traversal` naming no `seed`, and one beside
+        // `change`, so a walk here always starts at its `seed`.
         if let Some(traversal) = params.traversal.as_ref()
             && let Some(seed) = traversal.seed.as_ref()
             && matches!(
@@ -812,6 +818,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
+    if let Some(conflict) = commit::commit_conflict(params) {
+        return Err(conflict);
+    }
     if let Some(conflict) = pattern::pattern_conflict(params) {
         return Err(conflict);
     }
@@ -839,8 +848,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
 /// The capability a walk beside a comparison names.
 ///
 /// The language engine lane resolves the references a walk follows, and an engine session
-/// serves the current tree; a comparison names two committed revisions instead. No resend
-/// of the same request clears that.
+/// serves the current tree alone, so a committed revision has none. A comparison against
+/// the working tree is refused the same way: the walk from its changed declarations is not
+/// served. No resend of the same request clears that.
 pub(crate) const CHANGE_TRAVERSAL_CAPABILITY: &str = "relationship traversal beside a comparison";
 
 /// Refuses a `traversal` that names no `seed`, and one riding beside `change`.
@@ -861,14 +871,15 @@ fn validate_traversal_seed(
 }
 
 /// Refuses a `change` beside a field that selects another result set or another tree, and
-/// a revision spelling that breaks the charset [`RevisionId`] advertises.
+/// a revision spelling that breaks the charset [`RevisionId`] advertises. A working-tree
+/// `head` names no revision, so it has no spelling to check.
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
 /// to address, and `query` selects a result set of its own. A `scope` past `local`
 /// follows the rule every revision-addressed read applies, since package facts are
 /// served for the current tree alone. A `traversal` is refused beside a comparison by
-/// [`validate_traversal_seed`], since no lane resolves references for a committed
-/// revision.
+/// [`validate_traversal_seed`], since no lane serves the walk from a comparison's changed
+/// declarations.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
     if params.rev.is_some() {
         return Err(ReadFault::invalid(
@@ -886,11 +897,11 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
         return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
     }
     let sides = [
-        (CHANGE_BASE_FIELD, &change.base),
-        (CHANGE_HEAD_FIELD, &change.head),
+        (CHANGE_BASE_FIELD, Some(&change.base)),
+        (CHANGE_HEAD_FIELD, change.head.revision()),
     ];
     for (field, revision) in sides {
-        if let Some(violation) = revision.violation() {
+        if let Some(violation) = revision.and_then(RevisionId::violation) {
             return Err(ReadFault::invalid(field, violation.as_str()));
         }
     }
@@ -900,15 +911,20 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
 /// The lexical `query` the request carries, if any: refused when the request carries
 /// none of `query`, `pattern`, `traversal`, and `change`, and when the query is empty.
 fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
-    let query = params.query.as_deref();
     let selects = params.pattern.is_some() || params.traversal.is_some() || params.change.is_some();
-    if query.is_none() && !selects {
-        return Err(ReadFault::invalid("query", "missing"));
+    if params.query.is_none() && selects {
+        return Ok(None);
     }
-    if query.is_some_and(str::is_empty) {
-        return Err(ReadFault::invalid("query", "empty"));
+    required_query(params).map(Some)
+}
+
+/// The `query` a request must carry: refused when it is missing or empty.
+fn required_query(params: &SearchParams) -> Result<&str, ReadError> {
+    match params.query.as_deref() {
+        None => Err(ReadFault::invalid("query", "missing")),
+        Some("") => Err(ReadFault::invalid("query", "empty")),
+        Some(query) => Ok(query),
     }
-    Ok(query)
 }
 
 /// Refuses `selector` when any `include`, `exclude`, or `force_include` pattern breaks
@@ -1579,14 +1595,15 @@ pub(crate) fn find_symbol_hit_mut<'a>(
         .find(|hit| hit_symbol_id(hit) == Some(&identity))
 }
 
-/// One hit's declaration identity: absent for a node or file hit, and for a symbol hit
-/// whose identity no accepted evidence established.
+/// One hit's declaration identity: absent for a node, file, documentation, or commit
+/// hit, and for a symbol hit whose identity no accepted evidence established.
 pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
     match &hit.hit {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref(),
         SearchHitTarget::Node { .. }
         | SearchHitTarget::File { .. }
-        | SearchHitTarget::Documentation { .. } => None,
+        | SearchHitTarget::Documentation { .. }
+        | SearchHitTarget::Commit { .. } => None,
     }
 }
 
@@ -1658,6 +1675,7 @@ fn hit_identity(hit: &SearchHit) -> &str {
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => &documentation.block.identity.0,
+        SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
 }
 
@@ -2010,6 +2028,37 @@ impl Tower {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    /// One commit hit at `revision`, as a commit search answers it.
+    fn commit_search_hit(revision: &str) -> TestResult<SearchHit> {
+        let wire = json!({
+            "hit": {"target": "commit", "commit": {
+                "revision": revision,
+                "message": "Fix the release notes\n",
+                "message_truncated": false,
+                "author": {"name": "Rift Fixture", "email": "fixture@rift.invalid"},
+                "timestamp": "2026-01-01T00:03:00+00:00",
+                "paths": ["NOTES.md"],
+                "paths_truncated": false
+            }}
+        });
+        let hit = serde_json::from_value(wire)?;
+        Ok(hit)
+    }
+
+    #[test]
+    fn a_commit_hit_names_no_declaration_and_orders_by_its_revision() -> TestResult {
+        let newer = "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4";
+        let older = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+        let mut hits = vec![commit_search_hit(newer)?, commit_search_hit(older)?];
+
+        super::order_hits(&mut hits, ResultOrder::Identity);
+
+        assert!(hits.iter().all(|hit| super::hit_symbol_id(hit).is_none()));
+        let revisions: Vec<&str> = hits.iter().map(super::hit_identity).collect();
+        assert_eq!(revisions, [older, newer]);
+        Ok(())
     }
 
     #[test]
@@ -4692,24 +4741,30 @@ impl Tower {
     }
 
     /// A configured language engine resolves the references a walk follows, and an engine
-    /// session serves the current tree; a comparison names two committed revisions.
+    /// session serves the current tree; the walk from a comparison's changed declarations
+    /// is not served, whether `head` names a revision or the working tree.
     #[test]
     fn validate_search_refuses_a_traversal_riding_beside_a_comparison() {
-        let params: SearchParams = serde_json::from_value(json!({
-            "change": {"base": "baseline"},
-            "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
-        }))
-        .expect("the request parses");
+        for change in [
+            json!({"base": "baseline"}),
+            json!({"base": "baseline", "head": {"kind": "working_tree"}}),
+        ] {
+            let params: SearchParams = serde_json::from_value(json!({
+                "change": change,
+                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+            }))
+            .expect("the request parses");
 
-        let error = super::validate_search(&params).expect_err("the pairing must refuse");
+            let error = super::validate_search(&params).expect_err("the pairing must refuse");
 
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
-        assert!(
-            error
-                .to_string()
-                .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
-            "{error}"
-        );
+            assert_eq!(error.descriptor().code(), "capability_unavailable");
+            assert!(
+                error
+                    .to_string()
+                    .contains(super::CHANGE_TRAVERSAL_CAPABILITY),
+                "{error}"
+            );
+        }
     }
 
     /// A walk standing without a comparison and naming its seed passes the rule.

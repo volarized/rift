@@ -418,7 +418,7 @@ mod tests {
     type Occurrence<'a> = (&'a str, &'a str, (u64, u64), &'a str);
 
     /// The exact kind every hand-built declaration publishes, which a hub carries through.
-    const DECLARED_KIND: &str = "rust.function";
+    const DECLARED_KIND: &str = "function";
 
     /// The identity a fact-less declaration anchors, so a reference resolves to a record the
     /// hub ranking cannot assemble.

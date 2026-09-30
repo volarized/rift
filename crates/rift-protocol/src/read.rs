@@ -111,12 +111,13 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 // `search` so this module stays below its size bound; re-exporting them here keeps every
 // existing `rift_protocol::read::SearchParams`-style path resolving.
 pub use crate::search::{
-    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, GraphHop, HopDirection, MatchedField, PathPattern,
-    PathPatternViolation, PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT,
-    SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
-    SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
-    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
-    SearchResult, SearchTraversal, SymbolChange, TraversalDirection,
+    CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, COMMIT_MESSAGE_BYTES_MAX, COMMIT_PATHS_MAX, ChangeHead,
+    ChangeTree, CommitHit, GraphHop, HopDirection, MatchedField, PathPattern, PathPatternViolation,
+    PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT, SEARCH_CHANGE_PATHS_MAX,
+    SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
+    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchTraversal, SymbolChange, TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -516,14 +517,22 @@ fn default_get_symbol_params_page_index() -> u64 {
                             "path": "src/config.rs",
                             "kind": "signature_changed",
                             "timestamp": "2026-08-21T14:03:22+00:00",
-                            "summary": "Return ConfigError from load_config"
+                            "summary": "Return ConfigError from load_config",
+                            "author": {
+                                "name": "Alice",
+                                "email": "alice@example.com"
+                            }
                         },
                         {
                             "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
                             "path": "src/config.rs",
                             "kind": "introduced",
                             "timestamp": "2026-08-17T09:41:05+00:00",
-                            "summary": "Add workspace configuration loading"
+                            "summary": "Add workspace configuration loading",
+                            "author": {
+                                "name": "Alice",
+                                "email": "alice@example.com"
+                            }
                         }
                     ],
                     "complete": true
@@ -1151,15 +1160,19 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
-    /// crosses a per-file bound - so it answers no search or lookup, and addressing it
-    /// directly still refuses `content_unavailable`. Every other file in the workspace
-    /// stays available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
-    /// project-path order; when more files are left out, one more carries no `unit` and
-    /// counts the rest, and `rift://logs` names each of them.
+    /// A file answers nothing from its bytes. Either the index left the claimed file out -
+    /// its bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no
+    /// search or lookup, and addressing it directly still refuses `content_unavailable`;
+    /// or a comparison against the working tree read the changed file in no working form -
+    /// its attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it
+    /// answers changed with no declarations. Every other file in the workspace stays
+    /// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
+    /// project-path order; when more files are named, one more carries no `unit` and
+    /// counts the rest. `rift://logs` names each file the index left out, and `paths`
+    /// narrows a comparison onto the others.
     SourceUnavailable {
-        /// The file whose bytes could not be read. Absent on the one warning that counts
-        /// the files past `SOURCE_WARNINGS_MAX`.
+        /// The file the warning names. Absent on the one warning that counts the files
+        /// past `SOURCE_WARNINGS_MAX`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unit: Option<FileId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
@@ -1287,9 +1300,22 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The history store the server fills in the background has not analyzed every commit
+    /// `[providers.history]` selects, so a commit search answers from the `analyzed` ones
+    /// alone and a commit the store has not reached answers nothing. The fill runs newest
+    /// first and continues without a request; a later search answers the rest.
+    HistoryStoreFilling {
+        /// Commits the history store holds of the ones its latest fill selects.
+        analyzed: u64,
+        /// Commits the history store's latest fill selects.
+        total: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The comparison reached `paths_max` changed paths and stopped there, so declarations
     /// in the changed paths past it are missing from this answer. Narrow the comparison
-    /// with `paths`, or name two revisions that differ in fewer files.
+    /// with `paths`, or name two sides that differ in fewer files.
     ChangeTruncated {
         /// Changed paths the comparison stopped at, equal to the bound it reached.
         paths_max: u64,
@@ -1591,18 +1617,21 @@ pub enum RelationshipFacet {
 }
 
 /// Longest revision spelling the wire accepts, in bytes; the accepted charset is ASCII, so
-/// the schema's `{1,128}` repetition counts the same units.
+/// the schema's `maxLength` counts the same units.
 pub const REVISION_ID_BYTES_MAX: usize = 128;
 
 /// Identity of one revision in the workspace's version-control history, spelled the way the
-/// version-control system spells it. Rift carries it opaquely and never orders two revisions
-/// by comparing their identifiers.
+/// version-control system spells it: a branch, tag, or commit id, optionally followed by
+/// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
+/// the second parent. Rift carries it opaquely and never orders two revisions by comparing
+/// their identifiers.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct RevisionId(
     #[schemars(example = &"main")]
-    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]{1,128}$"))]
+    #[schemars(length(min = 1, max = 128))]
+    #[schemars(regex(pattern = r"^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$"))]
     pub String,
 );
 
@@ -1625,8 +1654,11 @@ pub enum RevisionIdViolation {
     Empty,
     /// The spelling is longer than [`REVISION_ID_BYTES_MAX`] bytes.
     TooLong,
-    /// The spelling carries a byte outside `A-Z a-z 0-9 . _ / -`.
+    /// The spelling carries a byte outside `A-Z a-z 0-9 . _ / - ~ ^`.
     CharsetForbidden,
+    /// An ancestry suffix follows no name, or a `~` or `^` is followed by something other
+    /// than digits or another suffix, as in `~1` or `HEAD~1/src`.
+    AncestryInvalid,
 }
 
 impl RevisionIdViolation {
@@ -1637,6 +1669,7 @@ impl RevisionIdViolation {
             Self::Empty => "empty",
             Self::TooLong => "too_long",
             Self::CharsetForbidden => "charset_forbidden",
+            Self::AncestryInvalid => "ancestry_invalid",
         }
     }
 }
@@ -1644,15 +1677,29 @@ impl RevisionIdViolation {
 /// Classifies one revision spelling against the rules [`RevisionId`]'s schema advertises.
 /// Arms are ordered by precedence: the first matching rule names the violation.
 fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
-    let accepted =
+    let name_byte =
         |byte: &u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-');
+    let accepted = |byte: &u8| name_byte(byte) || ANCESTRY_MARKERS.contains(byte);
+    let name_end = value
+        .bytes()
+        .position(|byte| ANCESTRY_MARKERS.contains(&byte))
+        .unwrap_or(value.len());
+    let (name, ancestry) = value.as_bytes().split_at(name_end);
+    let ancestry_accepted = ancestry
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || ANCESTRY_MARKERS.contains(byte));
     match value.as_bytes() {
         [] => Some(RevisionIdViolation::Empty),
         bytes if bytes.len() > REVISION_ID_BYTES_MAX => Some(RevisionIdViolation::TooLong),
         bytes if !bytes.iter().all(accepted) => Some(RevisionIdViolation::CharsetForbidden),
+        _ if name.is_empty() || !ancestry_accepted => Some(RevisionIdViolation::AncestryInvalid),
         _ => None,
     }
 }
+
+/// The bytes that open an ancestry suffix on a revision name: `~` walks first parents and
+/// `^` picks a parent, each optionally followed by a count.
+const ANCESTRY_MARKERS: [u8; 2] = *b"~^";
 
 /// Which corpus a read searches. The names identify logical corpora, not storage
 /// locations: `global` reaches dependency package facts wherever the server holds them.
@@ -1989,9 +2036,10 @@ pub enum SymbolFacet {
 }
 
 /// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The walk follows first parents from the served revision along the declaration's
-/// current path only, bounded by the configured history depth and by a shallow clone's
-/// boundary.
+/// first. The timeline follows first parents from the served revision, or the selected
+/// releases in version order, through the revisions the history store holds, and follows
+/// the declaration's file across a rename that kept its bytes. It is bounded by
+/// `[providers.history] max_revisions` and by a shallow clone's boundary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
@@ -1999,17 +2047,18 @@ pub struct SymbolHistory {
     pub symbol: SymbolId,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
-    /// Whether the walk reached the repository's first commit. `false` when the
-    /// `max_revisions` bound or a shallow clone's boundary ended the walk first, so
-    /// revisions older than the listed ones may have touched the symbol.
+    /// Whether the timeline reached the repository's first commit. `false` when the
+    /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
+    /// ended it first, or while the history store has not yet analyzed the served
+    /// revision, so revisions older than the listed ones may have touched the symbol.
     pub complete: bool,
 }
 
-/// Identity of one symbol. The name after the language is the provider's stable qualified
-/// name for the declaration; where the language derives module identity from the file path,
-/// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
-/// the qualified name alone cannot, such as overloads that dispatch separately. A move can
-/// change the identity when the language includes module path in that qualified name.
+/// Identity of one symbol: the language, the path of the declaring file, and the provider's
+/// stable qualified name for the declaration. No shipped provider puts the file path into a
+/// qualified name, so a declaration moved to another file keeps its qualified name while its
+/// identity names the new path. A `~N` suffix separates declarations the qualified name
+/// alone cannot, such as overloads that dispatch separately.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -2076,13 +2125,27 @@ pub struct SymbolVersion {
     pub path: ProjectPath,
     /// How the revision changed the symbol.
     pub kind: SymbolVersionKind,
-    /// When the revision was recorded, as RFC 3339 date-time.
+    /// When the revision was committed, as RFC 3339 date-time carrying the recorded offset:
+    /// the committer time, not the author time.
     #[schemars(length(max = 64))]
     pub timestamp: String,
     /// The revision's own first summary line, where the version control records one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub summary: Option<String>,
+    /// Who authored the revision, as the version control records it.
+    pub author: CommitAuthor,
+}
+
+/// The author one revision records, as committed: no `.mailmap` rewrites the name or the
+/// address.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitAuthor {
+    /// The author's name.
+    pub name: String,
+    /// The author's email address.
+    pub email: String,
 }
 
 /// What the revision did to the symbol.
@@ -2348,12 +2411,10 @@ mod tests {
     }
 
     #[test]
-    fn revision_id_schema_pattern_states_the_enforced_length_bound() {
+    fn revision_id_schema_states_the_enforced_length_bound() {
         let schema = serde_json::to_value(schema_for!(RevisionId)).expect("revision id schema");
-        assert_eq!(
-            schema["pattern"],
-            json!(format!("^[A-Za-z0-9._/-]{{1,{REVISION_ID_BYTES_MAX}}}$"))
-        );
+        assert_eq!(schema["maxLength"], json!(REVISION_ID_BYTES_MAX));
+        assert_eq!(schema["minLength"], json!(1));
     }
 
     #[test]
@@ -2364,21 +2425,36 @@ mod tests {
                 "a".repeat(REVISION_ID_BYTES_MAX + 1).leak() as &str,
                 Some(RevisionIdViolation::TooLong),
             ),
-            ("HEAD~1", Some(RevisionIdViolation::CharsetForbidden)),
             (
                 "rev with space",
                 Some(RevisionIdViolation::CharsetForbidden),
             ),
+            ("HEAD@{1}", Some(RevisionIdViolation::CharsetForbidden)),
+            ("~1", Some(RevisionIdViolation::AncestryInvalid)),
+            ("^", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~1/src", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~x", Some(RevisionIdViolation::AncestryInvalid)),
+            ("HEAD~1", None),
+            ("HEAD~", None),
+            ("HEAD^", None),
+            ("main^2~3", None),
             ("main", None),
             ("feature/rev-reads", None),
             ("v0.0.6", None),
             ("dd0a482", None),
         ];
+        let schema = serde_json::to_value(schema_for!(RevisionId)).expect("revision schema");
+        let advertised = jsonschema::validator_for(&schema).expect("the schema compiles");
         for (spelling, expected) in cases {
             assert_eq!(
                 RevisionId(spelling.to_owned()).violation(),
                 expected,
                 "spelling {spelling:?}"
+            );
+            assert_eq!(
+                advertised.is_valid(&json!(spelling)),
+                expected.is_none(),
+                "the advertised schema and the classifier agree on {spelling:?}"
             );
         }
     }
@@ -2389,6 +2465,7 @@ mod tests {
             (RevisionIdViolation::Empty, "empty"),
             (RevisionIdViolation::TooLong, "too_long"),
             (RevisionIdViolation::CharsetForbidden, "charset_forbidden"),
+            (RevisionIdViolation::AncestryInvalid, "ancestry_invalid"),
         ] {
             assert_eq!(violation.as_str(), label);
             assert_eq!(
@@ -2674,6 +2751,19 @@ mod tests {
                     "total": 4_800,
                     "ready_in": "45s",
                     "detail": "Vector search is being prepared",
+                }),
+            ),
+            (
+                ReadWarning::HistoryStoreFilling {
+                    analyzed: 40,
+                    total: 100,
+                    detail: "the history store has analyzed 40 of 100 commits".to_owned(),
+                },
+                json!({
+                    "code": "history_store_filling",
+                    "analyzed": 40,
+                    "total": 100,
+                    "detail": "the history store has analyzed 40 of 100 commits",
                 }),
             ),
             (
@@ -3065,6 +3155,7 @@ mod tests {
             "package_unavailable",
             "package_context_degraded",
             "relationship_coverage_missing",
+            "history_store_filling",
         ] {
             assert!(
                 codes.contains(&json!({ "const": code, "type": "string" })),

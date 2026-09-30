@@ -335,7 +335,7 @@ mod tests {
             },
             identity,
             identity,
-            ExactKind("rust.function".to_owned()),
+            ExactKind("function".to_owned()),
         );
         Contribution::builder(
             ContributionKey::new(

@@ -65,8 +65,26 @@ pub const EXECUTION_TIMEOUT_MS_MAX: u64 = 86_400_000;
 pub const EXECUTION_OUTPUT_BYTES_MAX: u64 = 16 << 10;
 /// Evaluations running concurrently across the workspace, at most.
 pub const EXECUTION_CONCURRENT_MAX: u64 = 64;
-/// Revisions the history provider may walk from the current head, at most.
+/// Revisions the history store holds per worktree or per selected release set, at most.
 pub const HISTORY_REVISIONS_MAX: u64 = 100_000;
+/// Revisions [`HistoryConfiguration::max_revisions`] defaults to.
+pub const HISTORY_REVISIONS_DEFAULT: u64 = 100;
+/// Commits one history store batch writes when `providers.history.batch_commits` is absent.
+pub const HISTORY_BATCH_COMMITS_DEFAULT: u64 = 25;
+/// Commits `providers.history.batch_commits` may allow, at most.
+pub const HISTORY_BATCH_COMMITS_MAX: u64 = 10_000;
+/// Parsed bytes one history store batch holds past its first commit when
+/// `providers.history.batch_size` is absent.
+pub const HISTORY_BATCH_BYTES_DEFAULT: u64 = 1_000_000;
+/// Parsed bytes `providers.history.batch_size` may allow, at least: one kilobyte.
+pub const HISTORY_BATCH_BYTES_MIN: u64 = 1 << 10;
+/// Parsed bytes `providers.history.batch_size` may allow, at most: one gigabyte.
+pub const HISTORY_BATCH_BYTES_MAX: u64 = 1 << 30;
+/// The share of one core the history task parses at when `providers.history.cpu_share`
+/// is absent.
+pub const HISTORY_CPU_SHARE_DEFAULT: f64 = 0.25;
+/// Bytes one `providers.history.releases` pattern may hold, at most.
+pub const HISTORY_RELEASE_PATTERN_BYTES_MAX: usize = 256;
 /// Bytes of one source a syntax provider parses when `providers.syntax.max_file` is absent.
 pub const SYNTAX_FILE_BYTES_DEFAULT: u64 = 4 << 20;
 /// Bytes `providers.syntax.max_file` may hold, at most.
@@ -927,35 +945,149 @@ impl SyntaxConfiguration {
     }
 }
 
-/// The `[providers.history]` table. The history provider's cost scales with
-/// how far back it walks, so its depth is the budget worth setting.
+/// The `[providers.history]` table. The history provider analyzes the revisions its
+/// strategy selects into the history store, one repository-wide store every worktree
+/// reads, and fills it in the background: `max_revisions` bounds what the store holds,
+/// and the batch and CPU-share keys bound what one fill costs the machine. The server
+/// reads the table at startup, so a change applies on the next start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_history_ranges)]
 pub struct HistoryConfiguration {
     /// Whether the history provider runs at all.
     pub enabled: bool,
-    /// Revisions the walk covers from the current head, newest first.
+    /// Revisions the history store holds, newest first, 1 to 100000: the first-parent
+    /// commits from each worktree's `HEAD` under `everything`, the releases under
+    /// `selective`.
     #[schemars(range(min = 1, max = 100_000))]
     pub max_revisions: u64,
+    /// Which revisions the history store analyzes.
+    pub strategy: HistoryStrategy,
+    /// Tag names or tag patterns naming the releases `selective` analyzes, such as `v1.*`,
+    /// at most 64. The releases order by the version each tag name spells once the
+    /// pattern's literal text up to its first digit or wildcard is removed; a tag whose
+    /// rest is no version is left out. Only `selective` reads them.
+    #[schemars(length(max = 64))]
+    pub releases: Vec<String>,
+    /// Commits one history store batch writes, 1 to 10000.
+    #[schemars(range(min = 1, max = 10_000))]
+    pub batch_commits: u64,
+    /// Parsed bytes one history store batch holds past its first commit, 1kb to 1gb. A
+    /// commit that parses more is a batch of its own.
+    pub batch_size: ByteSize,
+    /// The share of one core the history task parses at, above 0.0 up to 1.0: after each
+    /// commit it pauses long enough to hold the share.
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub cpu_share: f64,
 }
 
 impl Default for HistoryConfiguration {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_revisions: 500,
+            max_revisions: HISTORY_REVISIONS_DEFAULT,
+            strategy: HistoryStrategy::Everything,
+            releases: Vec::new(),
+            batch_commits: HISTORY_BATCH_COMMITS_DEFAULT,
+            batch_size: ByteSize::from_bytes(HISTORY_BATCH_BYTES_DEFAULT),
+            cpu_share: HISTORY_CPU_SHARE_DEFAULT,
         }
     }
 }
 
+/// Which revisions the history store analyzes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryStrategy {
+    /// The newest `max_revisions` first-parent commits from each live worktree's `HEAD`,
+    /// each compared with its first parent.
+    #[default]
+    Everything,
+    /// The newest `max_revisions` of the releases `releases` names, in version order, each
+    /// compared with the release before it.
+    Selective,
+}
+
 impl HistoryConfiguration {
+    /// The table's bounds in key order, then the release rules.
     fn violation(&self) -> Option<ConfigurationViolation> {
-        out_of_range(
-            "providers.history.max_revisions",
-            self.max_revisions,
-            1,
-            HISTORY_REVISIONS_MAX,
-        )
+        first_out_of_range([
+            (
+                "providers.history.max_revisions",
+                self.max_revisions,
+                1,
+                HISTORY_REVISIONS_MAX,
+            ),
+            (
+                "providers.history.releases",
+                self.releases.len() as u64,
+                0,
+                CONFIGURATION_PATTERNS_MAX as u64,
+            ),
+            (
+                "providers.history.batch_commits",
+                self.batch_commits,
+                1,
+                HISTORY_BATCH_COMMITS_MAX,
+            ),
+            (
+                "providers.history.batch_size",
+                self.batch_size.bytes(),
+                HISTORY_BATCH_BYTES_MIN,
+                HISTORY_BATCH_BYTES_MAX,
+            ),
+        ])
+        .or_else(|| self.cpu_share_violation())
+        .or_else(|| self.releases_violation())
+    }
+
+    /// The CPU share's rule: finite, above 0, and at most 1.
+    fn cpu_share_violation(&self) -> Option<ConfigurationViolation> {
+        let share = self.cpu_share;
+        let accepted = share.is_finite() && share > 0.0 && share <= 1.0;
+        (!accepted).then_some(ConfigurationViolation::HistoryCpuShareInvalid { share })
+    }
+
+    /// The release rules: `selective` names at least one release, only `selective` names
+    /// any, and every pattern keeps its form.
+    fn releases_violation(&self) -> Option<ConfigurationViolation> {
+        match (self.strategy, self.releases.is_empty()) {
+            (HistoryStrategy::Selective, true) => {
+                return Some(ConfigurationViolation::HistoryReleasesMissing);
+            }
+            (HistoryStrategy::Everything, false) => {
+                return Some(ConfigurationViolation::HistoryReleasesOutsideSelective);
+            }
+            _ => {}
+        }
+        self.releases.iter().find_map(|pattern| {
+            release_pattern_form_violation(pattern).map(|detail| {
+                ConfigurationViolation::HistoryReleasePatternInvalid {
+                    pattern: pattern.clone(),
+                    detail,
+                }
+            })
+        })
+    }
+}
+
+/// The form rule one release pattern breaks, as the refusal's account of it: empty,
+/// longer than [`HISTORY_RELEASE_PATTERN_BYTES_MAX`], or carrying whitespace or a control
+/// character, which no tag name git accepts carries. Whether the pattern compiles as a glob
+/// is decided where the glob parser runs, beside the history fill.
+fn release_pattern_form_violation(pattern: &str) -> Option<String> {
+    let unspellable = |character: char| character.is_whitespace() || character.is_control();
+    match pattern {
+        "" => Some("the pattern is empty".to_owned()),
+        _ if pattern.len() > HISTORY_RELEASE_PATTERN_BYTES_MAX => Some(format!(
+            "the pattern is longer than {HISTORY_RELEASE_PATTERN_BYTES_MAX} bytes"
+        )),
+        _ if pattern.chars().any(unspellable) => Some(
+            "the pattern carries whitespace or a control character, which no tag name git \
+             accepts carries"
+                .to_owned(),
+        ),
+        _ => None,
     }
 }
 
@@ -2669,6 +2801,28 @@ pub enum ConfigurationViolation {
         /// The configured upper end, below `min`.
         max: u16,
     },
+    /// `providers.history.cpu_share` is not a share of one core: it must lie above 0.0
+    /// and at most 1.0.
+    HistoryCpuShareInvalid {
+        /// The configured share.
+        share: f64,
+    },
+    /// `providers.history.strategy` is `selective` and `releases` names no release, so
+    /// the strategy selects nothing.
+    HistoryReleasesMissing,
+    /// `providers.history.releases` names releases while `strategy` is not `selective`,
+    /// which alone reads them.
+    HistoryReleasesOutsideSelective,
+    /// A `providers.history.releases` pattern is empty, longer than 256 bytes, carries
+    /// whitespace or a control character, or does not compile as a glob, such as the unclosed
+    /// class `v[1`.
+    HistoryReleasePatternInvalid {
+        /// The rejected pattern.
+        pattern: String,
+        /// The glob parser's account of the failure, or the form rule the pattern breaks
+        /// before it reaches the parser.
+        detail: String,
+    },
 }
 
 impl ConfigurationViolation {
@@ -2687,9 +2841,7 @@ impl ConfigurationViolation {
                 ("value", value.to_string()),
                 ("range", format!("{min}..={max}")),
             ],
-            Self::LanguageIdentityInvalid { language } => {
-                vec![("language", language.clone())]
-            }
+            Self::LanguageIdentityInvalid { language } => vec![("language", language.clone())],
             Self::LanguageLspUnknown { language, lsp } => {
                 vec![("language", language.clone()), ("lsp", lsp.clone())]
             }
@@ -2734,9 +2886,7 @@ impl ConfigurationViolation {
             Self::LspEnvironmentKeyInvalid { lsp, key } => {
                 vec![("lsp", lsp.clone()), ("key", key.clone())]
             }
-            Self::LspInitializationOptionsNotObject { lsp } => {
-                vec![("lsp", lsp.clone())]
-            }
+            Self::LspInitializationOptionsNotObject { lsp } => vec![("lsp", lsp.clone())],
             Self::LspEngineSelectionConflict { lsp } | Self::LspEngineMissing { lsp } => {
                 vec![
                     ("lsp", lsp.clone()),
@@ -2766,6 +2916,19 @@ impl ConfigurationViolation {
             Self::PortRangeInverted { min, max } => {
                 vec![("min", min.to_string()), ("max", max.to_string())]
             }
+            Self::HistoryCpuShareInvalid { share } => vec![
+                ("field", "providers.history.cpu_share".to_owned()),
+                ("share", share.to_string()),
+            ],
+            Self::HistoryReleasesMissing | Self::HistoryReleasesOutsideSelective => vec![(
+                "fields",
+                "providers.history.strategy, providers.history.releases".to_owned(),
+            )],
+            Self::HistoryReleasePatternInvalid { pattern, detail } => vec![
+                ("field", "providers.history.releases".to_owned()),
+                ("pattern", pattern.clone()),
+                ("detail", detail.clone()),
+            ],
         }
     }
 }
@@ -3254,7 +3417,18 @@ mod tests {
         assert_eq!(execution.max_output, ByteSize::from_bytes(8 << 10));
         assert_eq!(execution.max_concurrent, 2);
         assert!(configuration.providers.history.enabled);
-        assert_eq!(configuration.providers.history.max_revisions, 500);
+        assert_eq!(
+            configuration.providers.history,
+            HistoryConfiguration {
+                enabled: true,
+                max_revisions: HISTORY_REVISIONS_DEFAULT,
+                strategy: HistoryStrategy::Everything,
+                releases: Vec::new(),
+                batch_commits: HISTORY_BATCH_COMMITS_DEFAULT,
+                batch_size: ByteSize::from_bytes(HISTORY_BATCH_BYTES_DEFAULT),
+                cpu_share: HISTORY_CPU_SHARE_DEFAULT,
+            }
+        );
         let vector = &configuration.search.vector;
         let ranking = &configuration.search.ranking;
         assert!(is_weight(
@@ -3894,6 +4068,175 @@ mod tests {
             inverted.evidence(),
             vec![("min", "12000".to_owned()), ("max", "11000".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_history_strategy_and_releases_parse_from_the_file() {
+        let configuration: WorkspaceConfiguration = serde_json::from_value(json!({
+            "providers": {"history": {
+                "strategy": "selective",
+                "releases": ["v1.*", "1.80.0"],
+                "batch_commits": 5,
+                "batch_size": "2mb",
+                "cpu_share": 0.5
+            }}
+        }))
+        .expect("the table deserializes");
+        let history = &configuration.providers.history;
+        assert_eq!(history.strategy, HistoryStrategy::Selective);
+        assert_eq!(history.releases, ["v1.*", "1.80.0"]);
+        assert_eq!(history.batch_commits, 5);
+        assert_eq!(history.batch_size, ByteSize::from_bytes(2 << 20));
+        assert!(is_weight(history.cpu_share, 0.5));
+        assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_history_releases_belong_to_selective_alone() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.providers.history.strategy = HistoryStrategy::Selective;
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::HistoryReleasesMissing)
+        );
+        configuration.providers.history.strategy = HistoryStrategy::Everything;
+        configuration.providers.history.releases = vec!["v1.*".to_owned()];
+        assert_eq!(
+            configuration.validate(),
+            Err(ConfigurationViolation::HistoryReleasesOutsideSelective)
+        );
+    }
+
+    #[test]
+    fn test_history_release_patterns_keep_their_form() {
+        let oversized = "v".repeat(HISTORY_RELEASE_PATTERN_BYTES_MAX + 1);
+        let longest = "v".repeat(HISTORY_RELEASE_PATTERN_BYTES_MAX);
+        for (pattern, refused) in [
+            ("", Some("the pattern is empty")),
+            ("v1 .*", Some("whitespace or a control character")),
+            ("v1\u{7}", Some("whitespace or a control character")),
+            (oversized.as_str(), Some("longer than 256 bytes")),
+            (longest.as_str(), None),
+            ("tokio-*-alpha*", None),
+        ] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.providers.history.strategy = HistoryStrategy::Selective;
+            configuration.providers.history.releases = vec![pattern.to_owned()];
+            let verdict = configuration.validate();
+            match (&verdict, refused) {
+                (
+                    Err(ConfigurationViolation::HistoryReleasePatternInvalid { detail, .. }),
+                    Some(rule),
+                ) => assert!(
+                    detail.contains(rule),
+                    "pattern {pattern:?} answered {detail}"
+                ),
+                (Ok(()), None) => {}
+                _ => panic!("pattern {pattern:?} answered {verdict:?}"),
+            }
+        }
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.providers.history.strategy = HistoryStrategy::Selective;
+        configuration.providers.history.releases =
+            vec!["v1.*".to_owned(); CONFIGURATION_PATTERNS_MAX + 1];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "providers.history.releases",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_history_cpu_share_lies_above_zero_up_to_one() {
+        for (share, accepted) in [
+            (0.0, false),
+            (-0.25, false),
+            (1.5, false),
+            (f64::NAN, false),
+            (f64::INFINITY, false),
+            (0.01, true),
+            (1.0, true),
+        ] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.providers.history.cpu_share = share;
+            let verdict = configuration.validate();
+            assert_eq!(
+                verdict.is_ok(),
+                accepted,
+                "share {share} answered {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_history_batch_bounds_are_enforced_at_their_edges() {
+        let rows = [
+            (
+                0,
+                HISTORY_BATCH_BYTES_DEFAULT,
+                Some("providers.history.batch_commits"),
+            ),
+            (
+                HISTORY_BATCH_COMMITS_MAX + 1,
+                HISTORY_BATCH_BYTES_DEFAULT,
+                Some("providers.history.batch_commits"),
+            ),
+            (
+                1,
+                HISTORY_BATCH_BYTES_MIN - 1,
+                Some("providers.history.batch_size"),
+            ),
+            (
+                1,
+                HISTORY_BATCH_BYTES_MAX + 1,
+                Some("providers.history.batch_size"),
+            ),
+            (1, HISTORY_BATCH_BYTES_MIN, None),
+            (HISTORY_BATCH_COMMITS_MAX, HISTORY_BATCH_BYTES_MAX, None),
+        ];
+        for (commits, bytes, refused_field) in rows {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.providers.history.batch_commits = commits;
+            configuration.providers.history.batch_size = ByteSize::from_bytes(bytes);
+            let field = match configuration.validate() {
+                Err(ConfigurationViolation::LimitOutOfRange { field, .. }) => Some(field),
+                Ok(()) => None,
+                Err(other) => panic!("only a range violation is expected: {other:?}"),
+            };
+            assert_eq!(field, refused_field, "commits={commits} bytes={bytes}");
+        }
+    }
+
+    #[test]
+    fn test_history_schema_states_the_enforced_bounds_and_the_selective_rule() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let history = &schema["$defs"]["HistoryConfiguration"];
+        let properties = &history["properties"];
+        assert_eq!(
+            properties["releases"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX)
+        );
+        assert_eq!(
+            properties["batch_commits"]["maximum"],
+            json!(HISTORY_BATCH_COMMITS_MAX)
+        );
+        assert_eq!(
+            properties["batch_size"]["rift:range"],
+            json!({"min": "1kb", "max": "1gb"})
+        );
+        assert_eq!(properties["cpu_share"]["maximum"], json!(1.0));
+        let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+        let selective_without_releases =
+            json!({"providers": {"history": {"strategy": "selective"}}});
+        let releases_without_selective = json!({"providers": {"history": {"releases": ["v1.*"]}}});
+        let selective =
+            json!({"providers": {"history": {"strategy": "selective", "releases": ["v1.*"]}}});
+        assert!(!validator.is_valid(&selective_without_releases));
+        assert!(!validator.is_valid(&releases_without_selective));
+        assert!(validator.is_valid(&selective));
     }
 
     #[test]
@@ -5814,6 +6157,13 @@ mod tests {
                 identifier: 0.0,
                 lexical: 0.0,
                 vector: 0.0,
+            },
+            ConfigurationViolation::HistoryCpuShareInvalid { share: 0.0 },
+            ConfigurationViolation::HistoryReleasesMissing,
+            ConfigurationViolation::HistoryReleasesOutsideSelective,
+            ConfigurationViolation::HistoryReleasePatternInvalid {
+                pattern: text(),
+                detail: text(),
             },
             ConfigurationViolation::CommandProgramEmpty { field: "x" },
             ConfigurationViolation::CommandProgramWhitespace {

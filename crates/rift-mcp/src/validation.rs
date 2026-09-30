@@ -7720,8 +7720,8 @@ pub(crate) mod tests {
     }
 
     /// One build of 0.0.45, and a dirty rebuild of the same commit.
-    const BUILD_A: &str = "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34";
-    const BUILD_B: &str =
+    pub(crate) const BUILD_A: &str = "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34";
+    pub(crate) const BUILD_B: &str =
         "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789";
 
     /// Spawns a lane over `index` deriving under `product_version`, hands it one

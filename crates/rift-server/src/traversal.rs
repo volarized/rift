@@ -659,7 +659,7 @@ pub(crate) mod tests {
             },
             identity,
             identity,
-            rift_core::ExactKind("rust.function".to_owned()),
+            rift_core::ExactKind("function".to_owned()),
         );
         rift_core::Contribution::builder(
             rift_core::ContributionKey::new(

@@ -645,14 +645,14 @@ process key in `processes`.
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-`change` answers the declarations two committed revisions hold differently. `base` names the
-revision compared from and `head` the revision compared to, each a branch, tag, or commit id
-spelled the way git spells it; an omitted `head` is `HEAD`. Both sides name a commit, so
-uncommitted working-tree bytes take part in no comparison.
+`change` answers the declarations two sides hold differently. `base` names the committed revision
+compared from, spelled the way a [revision read](#revision-reads) spells `rev`, such as `main` or
+`HEAD~1`. `head` names the side
+compared to: a revision spelled the same way, or the working tree, spelled
+`{"kind": "working_tree"}`. An omitted `head` is `HEAD`.
 
-The server lists the paths the two revisions hold differently, reads and parses those paths
-alone on each side, and matches declarations within one path by the provider's qualified name
-and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
+The server lists the paths the two sides hold differently, reads and parses those paths alone on
+each side, and matches declarations within one path by the provider's qualified name and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
 bytes differ is classified the way a [symbol timeline](#tool-get_symbol) classifies two adjacent
 revisions, into `signature_changed`, `body_changed`, or `decorators_changed`. A declaration only
 `head` holds is `introduced`, and one only `base` holds is `removed`.
@@ -728,6 +728,23 @@ its base-side identity, path, range, and source, and its `change` carries `base_
 }
 ```
 
+<VersionBadge version="v0.0.46" />
+
+Against the working tree, the head side is the current publication, so staged and unstaged edits,
+files git does not track, and deleted files all take part, and the answer carries `stale_index`
+while that publication lags the filesystem, as any current-tree read does. The base side reads
+each changed file in the form the working tree holds it, so a checkout under
+`core.autocrlf=true` compares CRLF bytes on both sides. A changed path whose attributes name a
+`filter` driver, such as Git LFS, or a UTF-16 `working-tree-encoding` answers no declarations: the
+server runs no driver during a comparison, and the answer carries a `source_unavailable` warning
+naming the path and the driver or encoding.
+
+**Request:**
+
+```json
+{ "change": { "base": "HEAD", "head": { "kind": "working_tree" } }, "target": "symbol" }
+```
+
 A comparison ranks nothing, so no hit carries a `score` even when `include` names one. Ordering
 is deterministic for identical inputs: `relevance` has no score to rank by here and orders
 changed declarations by path, then by name, while `path` and `identity` order as they do in
@@ -744,13 +761,82 @@ contributes no declaration, and the changed paths beside it still answer.
 
 The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
 revisions, and beside `query` with `invalid_request`, since the two select different result
-sets. A `traversal` beside it refuses `capability_unavailable`, since a language engine serves
-the current tree and a comparison names two committed revisions. A `scope` past `local`
+sets. A `traversal` beside it refuses `capability_unavailable`, since no lane serves the walk from
+a comparison's changed declarations. A `scope` past `local`
 refuses with `invalid_request`, because package facts are served for the current tree alone.
 [`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
 [revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
 with no git repository refuses `capability_unavailable`, and a revision neither side resolves
 refuses `resource_not_found`.
+
+### Commit search [#search-commits]
+
+<VersionBadge version="v0.0.46" />
+
+`target: "commit"` matches `query` against the messages of the commits the
+[history store](/docs/developer/architecture#history) holds. The server parses the query the way a
+[full-text search](#search-fulltext) does, then answers the commits whose message carries every
+term before the ones carrying some, each group newest first by committer time, whatever `order`
+names.
+
+Under `[providers.history] strategy = "selective"` the store holds the selected releases alone, so
+a commit search answers those.
+
+While the store fills, a commit it has not analyzed yet answers nothing, and the answer carries a
+`history_store_filling` entry in `warnings`: `analyzed` counts the commits the store holds of the
+`total` its latest fill selects. The same warning appears when the store has not yet analyzed the
+commit `HEAD` names, such as right after a new commit, and the read asks the fill to catch up:
+
+**Warning:**
+
+```json
+{
+  "code": "history_store_filling",
+  "analyzed": 40,
+  "total": 100,
+  "detail": "the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest"
+}
+```
+
+Each hit carries a [`CommitHit`](/docs/developer/protocol/reference) as `commit`: the commit's
+`revision`, its `message`, its `author`, the committer `timestamp`, and the `paths` it changed
+against the commit it was compared with. The message is cut at 4,096 bytes on a character boundary,
+and `message_truncated` says so; `paths` lists at most 32 paths in path order, and
+`paths_truncated` says when the commit changed more. A commit hit carries no `path`, `unit`,
+`range`, `score`, or `matched_by`:
+
+**Request:**
+
+```json
+{ "target": "commit", "query": "change path bound", "limit": 10 }
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "commit",
+    "commit": {
+      "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
+      "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
+      "message_truncated": false,
+      "author": { "name": "Alice", "email": "alice@example.com" },
+      "timestamp": "2026-09-22T14:03:11+02:00",
+      "paths": ["crates/rift-protocol/src/search.rs", "crates/rift-server/src/change.rs"],
+      "paths_truncated": false
+    }
+  }
+}
+```
+
+The server refuses `target: "commit"` beside `pattern`, `traversal`, `change`, `rev`, `packages`,
+and `paths`, and with a `scope` past `local`, each with `invalid_request` naming the field: each of
+them selects declarations, file text, or another tree, and the global index holds no project
+history. A missing or empty `query` refuses `invalid_request` naming `query`.
+[`[providers.history]`](/docs/developer/configuration#providers) `enabled = false` refuses
+`capability_unavailable`, and so does a workspace whose server opened no history store, such as
+one with no git repository.
 
 ### Package scope [#search-scope]
 
@@ -881,14 +967,24 @@ global index holds no release of, so the nearest collected release, 1.0.0, answe
 An omitted `include` defaults to `["source"]`; an explicit empty list requests none of these fields.
 
 `include: ["history"]` attaches the symbol's version-control timeline as a
-[`SymbolHistory`](/docs/developer/protocol/reference). The server follows first parents
-from the served revision along the declaration's current path, bounded by the `max_revisions`
-key in [`[providers.history]`](/docs/developer/configuration#providers) and by a shallow clone's
-boundary, and classifies what each touching revision did: `introduced`, `body_changed`,
-`signature_changed`, `removed`, or `decorators_changed`. A revision whose source cannot be
-parsed, or where the symbol is absent, contributes no version. `complete` says whether the
-walk reached the repository's first commit; `false` means one of those bounds ended it first,
-so revisions older than the listed ones may have touched the symbol.
+[`SymbolHistory`](/docs/developer/protocol/reference). The server reads the timeline from the
+[history store](/docs/developer/architecture#history), following the revisions it holds from the
+served revision, and classifies what each revision did: `introduced`, `body_changed`,
+`signature_changed`, `moved`, `removed`, or `decorators_changed`. A revision whose source cannot be
+parsed, or where the symbol is absent, contributes no version.
+
+<VersionBadge version="v0.0.46" />
+
+Each [`SymbolVersion`](/docs/developer/protocol/reference) names the commit's `author`, name and
+email, as the commit records them; `timestamp` stays the committer time. A file renamed without a
+changed byte, or a declaration moved unchanged into another file, answers a `moved` version, and
+the timeline goes on at the path the declaration came from.
+
+`complete` says whether the timeline reached the repository's first commit. `false` means the
+`max_revisions` key in [`[providers.history]`](/docs/developer/configuration#providers), a shallow
+clone's boundary, or the oldest selected release ended it first, or that the store has not yet
+analyzed the served revision, so revisions older than the listed ones may have touched the symbol.
+A server whose store did not open walks git per request instead.
 
 ### Package scope [#get_symbol-scope]
 
@@ -1048,6 +1144,9 @@ The search ranking tiers carry their own warnings:
   that searched and found nothing. A read waits for a commit in flight until its
   `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
   budget with everything else the read waits for.
+- `history_store_filling` - a [commit search](#search-commits) answered while the history store
+  lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
+  `total` state how far the fill has got.
 - `lexical_ranking_truncated` - the lexical ranking stopped at `matches_max` units, and hits
   past that bound never reach a page, whatever `paths` selects. `total_pages` counts the units
   that did; a narrower `query` brings the rest inside the bound.
@@ -1175,6 +1274,20 @@ currently holds:
 
 ```json
 { "name": "ReadService", "rev": "main" }
+```
+
+<VersionBadge version="v0.0.46" />
+
+A name may carry git's ancestry suffixes: `~N` walks `N` first parents and `^N` picks the `N`th
+parent, each count defaulting to 1, so `HEAD~1` and `HEAD^` name the commit below `HEAD`. The server
+resolves the spelling through git's revision syntax, and a spelling that carries anything else -
+a reflog selector such as `HEAD@{1}`, or a path after a suffix - refuses `invalid_request` naming
+the field. This request reads the declaration one commit back:
+
+**Request:**
+
+```json
+{ "name": "ReadService", "rev": "HEAD~1" }
 ```
 
 A revision search refuses `force_include`: reaching index-excluded files is a walk of the

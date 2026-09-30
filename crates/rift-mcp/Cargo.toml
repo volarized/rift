@@ -30,6 +30,7 @@ rmcp = { workspace = true, features = [
 rift-core.workspace = true
 rift-cloud-client.workspace = true
 rift-dependency.workspace = true
+rift-history-store.workspace = true
 rift-index.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
@@ -50,6 +51,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 
@@ -88,6 +90,10 @@ path = "tests/live_vector_search.rs"
 [[test]]
 name = "map_resource"
 path = "tests/map_resource.rs"
+
+[[test]]
+name = "history_store"
+path = "tests/history_store.rs"
 
 [[test]]
 name = "search_change"

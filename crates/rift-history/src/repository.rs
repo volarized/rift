@@ -43,6 +43,11 @@ pub enum HistoryFault {
         /// The committed file's actual size.
         size: u64,
     },
+    /// The repository holds more tags than one listing reads.
+    TooManyTags {
+        /// The tag bound the listing enforces.
+        tags_max: usize,
+    },
     /// A committed path inside the workspace is not valid UTF-8.
     PathUnrepresentable {
         /// The offending path, rendered lossily for the reader.
@@ -64,7 +69,7 @@ impl Fault for HistoryFault {
             Self::RevisionUnknown { .. } | Self::RevisionNotCommit { .. } => {
                 ErrorName::Wire(ErrorCode::ResourceNotFound)
             }
-            Self::TreeTooLarge { .. } | Self::BlobTooLarge { .. } => {
+            Self::TreeTooLarge { .. } | Self::BlobTooLarge { .. } | Self::TooManyTags { .. } => {
                 ErrorName::Wire(ErrorCode::LimitExceeded)
             }
             Self::PathUnrepresentable { .. } => ErrorName::Wire(ErrorCode::UnsupportedPath),
@@ -106,6 +111,10 @@ impl Fault for HistoryFault {
                 ErrorContext::new("bytes_max", bytes_max.to_string()),
                 ErrorContext::new("size", size.to_string()),
             ],
+            Self::TooManyTags { tags_max } => vec![
+                ErrorContext::new("limit", "tags_max"),
+                ErrorContext::new("tags_max", tags_max.to_string()),
+            ],
             Self::PathUnrepresentable { path } => vec![ErrorContext::new("path", path.clone())],
             Self::Storage { operation, detail } => vec![
                 ErrorContext::new("operation", *operation),
@@ -121,7 +130,7 @@ pub type HistoryError = Error<HistoryFault>;
 /// One revision resolved to the commit it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRevision {
-    commit: gix::ObjectId,
+    pub(crate) commit: gix::ObjectId,
 }
 
 impl ResolvedRevision {
@@ -137,8 +146,8 @@ impl ResolvedRevision {
 /// path and the blob that holds its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeFile {
-    path: String,
-    blob: gix::ObjectId,
+    pub(crate) path: String,
+    pub(crate) blob: gix::ObjectId,
 }
 
 impl TreeFile {
@@ -163,6 +172,8 @@ pub struct PathRevision {
     commit_id: String,
     timestamp: String,
     summary: Option<String>,
+    author_name: String,
+    author_email: String,
     blob: Option<TreeFile>,
 }
 
@@ -184,6 +195,18 @@ impl PathRevision {
     #[must_use]
     pub fn summary(&self) -> Option<&str> {
         self.summary.as_deref()
+    }
+
+    /// The author's name, as committed.
+    #[must_use]
+    pub fn author_name(&self) -> &str {
+        &self.author_name
+    }
+
+    /// The author's email address, as committed.
+    #[must_use]
+    pub fn author_email(&self) -> &str {
+        &self.author_email
     }
 
     /// The blob the commit's tree holds at the path; `None` when the commit
@@ -223,8 +246,8 @@ impl PathHistory {
 /// comparison listed all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedFiles {
-    paths: Vec<String>,
-    truncated: bool,
+    pub(crate) paths: Vec<String>,
+    pub(crate) truncated: bool,
 }
 
 impl ChangedFiles {
@@ -249,11 +272,11 @@ impl ChangedFiles {
 /// then serve only entries inside the workspace, re-relativized to it.
 #[derive(Debug)]
 pub struct Repository {
-    inner: gix::Repository,
+    pub(crate) inner: gix::Repository,
     root: PathBuf,
     /// The workspace root's forward-slash path inside the repository's
     /// working tree; empty when the workspace is that root.
-    prefix: String,
+    pub(crate) prefix: String,
 }
 
 impl Repository {
@@ -410,9 +433,10 @@ impl Repository {
     /// tracking" (`gix-diff-0.66.0/src/tree/function.rs:23`), so a file that
     /// moved is one deletion beside one addition; pairing the two back up is
     /// the caller's decision, taken over the declarations inside them.
-    /// Symbolic links and submodules are never listed, and a committed path
-    /// whose bytes are not UTF-8 names no readable file, so the comparison
-    /// passes over it.
+    /// A path that is a symbolic link or a submodule on both sides is never
+    /// listed; one that held a file on either side is, so a file replaced by
+    /// a link is listed as the file's deletion. A committed path whose bytes
+    /// are not UTF-8 names no readable file, so the comparison passes over it.
     ///
     /// The walk stops once `paths_max` paths pass `includes` and reports
     /// itself truncated, so one comparison's work stays proportional to that
@@ -447,17 +471,20 @@ impl Repository {
             Err(gix::diff::tree::Error::Cancelled) if recorder.truncated => {}
             Err(error) => return Err(storage("compare commit trees", &error)),
         }
-        let mut paths = recorder.paths;
-        paths.sort_unstable();
-        paths.dedup();
-        Ok(ChangedFiles {
-            paths,
-            truncated: recorder.truncated,
-        })
+        let truncated = recorder.truncated;
+        let paths = recorder
+            .into_changes()
+            .into_iter()
+            .map(|change| change.path)
+            .collect();
+        Ok(ChangedFiles { paths, truncated })
     }
 
     /// The tree one resolved revision's commit points at.
-    fn commit_tree(&self, revision: &ResolvedRevision) -> Result<gix::Tree<'_>, HistoryError> {
+    pub(crate) fn commit_tree(
+        &self,
+        revision: &ResolvedRevision,
+    ) -> Result<gix::Tree<'_>, HistoryError> {
         self.inner
             .find_commit(revision.commit)
             .map_err(|error| storage("read commit", &error))?
@@ -563,7 +590,7 @@ impl Repository {
 /// The bytes of `filepath` below the workspace prefix, or `None` for a path
 /// outside the workspace. An empty prefix - the workspace at the repository
 /// root - keeps every path.
-fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if prefix.is_empty() {
         return Some(filepath);
     }
@@ -612,15 +639,30 @@ fn path_revision(
         .map_err(|error| storage("read commit message", &error))?
         .summary()
         .to_string();
+    let (author_name, author_email) = commit_author(commit)?;
     Ok(PathRevision {
         commit_id: commit.id.to_string(),
         timestamp,
         summary: (!summary.is_empty()).then_some(summary),
+        author_name,
+        author_email,
         blob: blob.map(|blob| TreeFile {
             path: path.to_owned(),
             blob,
         }),
     })
+}
+
+/// The name and email address `commit`'s author line records, trimmed of the
+/// whitespace the signature parser keeps.
+pub(crate) fn commit_author(commit: &gix::Commit<'_>) -> Result<(String, String), HistoryError> {
+    let author = commit
+        .author()
+        .map_err(|error| storage("read commit author", &error))?;
+    Ok((
+        author.name.to_str_lossy().trim().to_owned(),
+        author.email.to_str_lossy().trim().to_owned(),
+    ))
 }
 
 /// One committed path's UTF-8 form. The refusal renders the full
@@ -636,34 +678,104 @@ fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, HistoryError> {
 }
 
 /// One tree's entries, as the comparison reads them.
-fn tree_entries<'tree>(tree: &'tree gix::Tree<'_>) -> gix::objs::TreeRefIter<'tree> {
+pub(crate) fn tree_entries<'tree>(tree: &'tree gix::Tree<'_>) -> gix::objs::TreeRefIter<'tree> {
     gix::objs::TreeRefIter::from_bytes(&tree.data, tree.id.kind())
 }
 
+/// One blob path two trees hold differently, with the blob id each side
+/// holds there.
+#[derive(Debug)]
+pub(crate) struct RecordedChange {
+    pub(crate) path: String,
+    pub(crate) old: Option<gix::ObjectId>,
+    pub(crate) new: Option<gix::ObjectId>,
+}
+
+impl RecordedChange {
+    /// The blob id each side of one visited tree difference holds: an entry
+    /// that is no blob on a side - a tree, a symbolic link, a submodule -
+    /// holds none there.
+    ///
+    /// Each side is read from its own mode. gix reports a file turned into a
+    /// link as one modification, "turning a file into a symbolic link adjusts
+    /// its mode" (`gix-diff-0.66.0/src/tree/visit.rs:43`), and
+    /// `Change::entry_mode` answers the new side's mode alone.
+    fn blob_sides(
+        change: &gix::diff::tree::visit::Change,
+    ) -> (Option<gix::ObjectId>, Option<gix::ObjectId>) {
+        use gix::diff::tree::visit::Change;
+        let blob =
+            |mode: gix::objs::tree::EntryMode, id: gix::ObjectId| mode.is_blob().then_some(id);
+        match change {
+            Change::Addition {
+                entry_mode, oid, ..
+            } => (None, blob(*entry_mode, *oid)),
+            Change::Deletion {
+                entry_mode, oid, ..
+            } => (blob(*entry_mode, *oid), None),
+            Change::Modification {
+                previous_entry_mode,
+                previous_oid,
+                entry_mode,
+                oid,
+            } => (
+                blob(*previous_entry_mode, *previous_oid),
+                blob(*entry_mode, *oid),
+            ),
+        }
+    }
+}
+
 /// A [`gix::diff::tree::Recorder`] behind a path budget: it tracks the
-/// compared path the way gix's own recorder does, and keeps the blob paths
+/// compared path the way gix's own recorder does, and keeps the blob changes
 /// inside the workspace that pass `includes`, up to `paths_max`. The budget
 /// counts accepted paths alone, so a revision pair differing only in files
 /// the workspace policy excludes never reports itself truncated.
-struct ChangedPathRecorder<'a> {
+pub(crate) struct ChangedPathRecorder<'a> {
     inner: gix::diff::tree::Recorder,
     prefix: &'a [u8],
     includes: &'a dyn Fn(&str) -> bool,
     paths_max: usize,
-    paths: Vec<String>,
-    truncated: bool,
+    changes: Vec<RecordedChange>,
+    pub(crate) truncated: bool,
 }
 
 impl<'a> ChangedPathRecorder<'a> {
-    fn new(prefix: &'a [u8], includes: &'a dyn Fn(&str) -> bool, paths_max: usize) -> Self {
+    pub(crate) fn new(
+        prefix: &'a [u8],
+        includes: &'a dyn Fn(&str) -> bool,
+        paths_max: usize,
+    ) -> Self {
         Self {
             inner: gix::diff::tree::Recorder::default(),
             prefix,
             includes,
             paths_max,
-            paths: Vec::new(),
+            changes: Vec::new(),
             truncated: false,
         }
+    }
+
+    /// The recorded changes, sorted by path, one per path. The comparison
+    /// orders a folder's name as if it ended in `/`, so a blob that replaced a
+    /// folder is one path and the folder's files are others; only a tree that
+    /// names one path twice, which `git fsck` reports as `duplicateEntries`,
+    /// records it twice, and its change keeps the first blob id each side
+    /// names.
+    pub(crate) fn into_changes(self) -> Vec<RecordedChange> {
+        let mut changes = self.changes;
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut merged: Vec<RecordedChange> = Vec::with_capacity(changes.len());
+        for change in changes {
+            match merged.last_mut() {
+                Some(last) if last.path == change.path => {
+                    last.old = last.old.or(change.old);
+                    last.new = last.new.or(change.new);
+                }
+                _ => merged.push(change),
+            }
+        }
+        merged
     }
 
     /// The workspace-relative path this change names, or `None` for a path
@@ -694,19 +806,21 @@ impl gix::diff::tree::Visit for ChangedPathRecorder<'_> {
     }
 
     fn visit(&mut self, change: gix::diff::tree::visit::Change) -> ChangeVisitAction {
-        if !change.entry_mode().is_blob() {
-            // A tree added or deleted whole is announced before its blobs,
-            // which the walk goes on to announce one by one.
+        let (old, new) = RecordedChange::blob_sides(&change);
+        if old.is_none() && new.is_none() {
+            // Neither side holds a file: a tree added or deleted whole is
+            // announced before its blobs, which the walk goes on to announce
+            // one by one, and a link or submodule holds no bytes to compare.
             return std::ops::ControlFlow::Continue(());
         }
         let Some(path) = self.accepted(self.inner.path()) else {
             return std::ops::ControlFlow::Continue(());
         };
-        if self.paths.len() >= self.paths_max {
+        if self.changes.len() >= self.paths_max {
             self.truncated = true;
             return std::ops::ControlFlow::Break(());
         }
-        self.paths.push(path);
+        self.changes.push(RecordedChange { path, old, new });
         std::ops::ControlFlow::Continue(())
     }
 }
@@ -792,7 +906,7 @@ fn object_kind(repository: &gix::Repository, id: gix::ObjectId) -> String {
         .map_or_else(|_| "unknown".to_owned(), |header| header.kind().to_string())
 }
 
-fn storage(operation: &'static str, error: &dyn std::fmt::Display) -> HistoryError {
+pub(crate) fn storage(operation: &'static str, error: &dyn std::fmt::Display) -> HistoryError {
     Error::new(HistoryFault::Storage {
         operation,
         detail: error.to_string(),

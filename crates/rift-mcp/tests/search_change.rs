@@ -1,7 +1,6 @@
 //! Drives `search`'s `change` block through a live rmcp client over a committed fixture
-//! workspace: an introduced declaration, a removed one, a signature change, the walk a
-//! `traversal` riding beside the comparison runs, and the refusals a comparison of two
-//! committed revisions answers.
+//! workspace: an introduced declaration, a removed one, a signature change, a comparison
+//! against the working tree's uncommitted edits, and the refusals a comparison answers.
 
 mod hermetic_search;
 // `served_relative_workspace` and its `relative_spelling` helper are part of
@@ -143,6 +142,65 @@ async fn search_change_answers_every_declaration_the_two_revisions_differ_in() -
         "a removed declaration keeps its base-side source: {removed}"
     );
     assert_eq!(removed["path"], json!("src/gone.rs"), "{removed}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// The working tree as `head` answers the uncommitted edits against `baseline`: the same
+/// three declarations the committed head revision answers, with nothing committed.
+#[tokio::test]
+async fn search_change_against_the_working_tree_answers_uncommitted_edits() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::HERMETIC_TABLES,
+    )?;
+    write_all(directory.path(), BASELINE)?;
+    init(directory.path());
+    commit_all(directory.path(), "baseline");
+    git(directory.path(), &["tag", "baseline"]);
+    fs::remove_file(directory.path().join("src/gone.rs"))?;
+    write_all(directory.path(), HEAD)?;
+    let (client, _server_task) = served_root(directory.path()).await?;
+
+    let structured = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"change": {"base": "baseline", "head": {"kind": "working_tree"}}}),
+        ),
+    )
+    .await?;
+
+    assert_eq!(
+        changes(&structured),
+        [
+            (
+                "added".to_owned(),
+                "introduced".to_owned(),
+                Value::Null,
+                json!("src/added.rs")
+            ),
+            (
+                "gone".to_owned(),
+                "removed".to_owned(),
+                json!("src/gone.rs"),
+                Value::Null
+            ),
+            (
+                "shifted".to_owned(),
+                "signature_changed".to_owned(),
+                json!("src/shifted.rs"),
+                json!("src/shifted.rs")
+            ),
+        ],
+        "{structured}"
+    );
+    assert!(
+        structured["warnings"].as_array().is_none_or(Vec::is_empty),
+        "{structured}"
+    );
 
     client.cancel().await?;
     Ok(())

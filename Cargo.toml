@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.45"
+version = "0.0.46"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -15,6 +15,7 @@ rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }
 rift-dependency = { path = "crates/rift-dependency" }
 rift-history = { path = "crates/rift-history" }
+rift-history-store = { path = "crates/rift-history-store" }
 rift-index = { path = "crates/rift-index" }
 rift-lsp = { path = "crates/rift-lsp" }
 rift-mcp = { path = "crates/rift-mcp" }
@@ -35,7 +36,7 @@ data-encoding = "2.6.0"
 getrandom = { version = "0.4.3", features = ["std"] }
 flate2 = "1.1.9"
 fs4 = "1.1.0"
-gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1"] }
+gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1", "status"] }
 globset = { version = "0.4.20", default-features = false }
 http = "1.4"
 ignore = { version = "0.4.23", default-features = false }
@@ -85,7 +86,11 @@ regex-automata = { version = "0.4.18", default-features = false, features = [
 ] }
 regex-syntax = "0.8.11"
 rig-core = { version = "=0.42.0", default-features = false }
+# The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
+# second SQLite.
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "server", "transport-io"] }
+same-file = "1.0.6"
 schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }

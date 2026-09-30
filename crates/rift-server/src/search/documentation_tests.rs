@@ -131,6 +131,7 @@ fn hit_identity(hit: &SearchHit) -> Option<String> {
         SearchHitTarget::Symbol { symbol } => symbol.id.as_ref().map(|identity| identity.0.clone()),
         SearchHitTarget::Node { node } => Some(node.0.clone()),
         SearchHitTarget::File { .. } => hit.path.as_ref().map(|path| path.0.clone()),
+        SearchHitTarget::Commit { commit } => Some(commit.revision.0.clone()),
     }
 }
 

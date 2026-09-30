@@ -466,7 +466,7 @@ mod tests {
             },
             name,
             format!("crate::{name}"),
-            ExactKind("rust.function".to_owned()),
+            ExactKind("function".to_owned()),
         )
         .facets(vec![SymbolFacet::Value])
         .documentation(vec![Documentation {

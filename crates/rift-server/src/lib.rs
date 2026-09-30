@@ -8,6 +8,7 @@ mod embedded;
 mod engine;
 mod engine_read;
 mod history;
+mod history_fill;
 mod map;
 mod process;
 mod read;
@@ -21,6 +22,11 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
+pub use history::{FillCounts, FillProgress, StoredHistory};
+pub use history_fill::{
+    AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
+    release_version,
+};
 pub use read::{ReadError, ReadFault, ReadService, accepted_limit, wire_digest};
 pub use rift_core::CapturedStream;
 pub use rift_lsp::capabilities::PositionEncoding;

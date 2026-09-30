@@ -49,6 +49,15 @@ PATTERN_CHARS_MAX = 1_024
 # The record each build writes for a file it holds as text its syntax provider does not
 # parse; a file it leaves out gets `file left out of the index` instead.
 HELD_UNPARSED_RECORD = "file held unparsed in the index"
+# The record the history task writes as each store batch starts, with `pending`, the
+# commits its fill plan has not analyzed yet. A span reaches server output only when it
+# closes, so this record is what shows a batch in flight.
+HISTORY_BATCH_STARTED = (
+    'history batch started component="history" operation="history.batch" phase="start"'
+)
+HISTORY_BATCH_CLOSED = re.compile(
+    r"history\.batch\{[^}]*\}: rift_mcp::history: close\b"
+)
 
 
 def map_paths(answer: JsonObject) -> set[str]:
@@ -347,79 +356,59 @@ def exact_degradation(found: list[JsonObject], expected: str | None) -> None:
     )
 
 
-def active_operation(
-    found: list[JsonObject], operation: str, after: int, pending: bool
-) -> int:
-    """Require entered work without a later matching completion record."""
-    wanted = "index.build" if operation == "rebuild" else "get_symbol"
-    started = [
-        row
-        for row in found
-        if row.get("operation") == wanted
-        and fields(row).get("phase") == "start"
-        and number(row.get("identity"), "record identity") > after
-    ]
-    require(bool(started), f"{operation}: no start record after the request")
-    start = max(started, key=lambda row: number(row.get("identity"), "record identity"))
-    identity = number(start.get("identity"), "record identity")
-    for row in found:
-        if number(row.get("identity"), "record identity") <= identity:
-            continue
-        if operation == "rebuild":
-            same_epoch = fields(row).get("epoch") == fields(start).get("epoch")
-            closed = (
-                same_epoch
-                and row.get("message") == "index.build"
-                and fields(row).get("span") == "closed"
-            )
-            completed = closed or row.get("operation") == "index.publish"
-        else:
-            completed = (
-                row.get("operation") == wanted and fields(row).get("span") == "closed"
-            )
-        require(not completed, f"{operation} completed before stop: {row}")
-    require(operation == "rebuild" or pending, "history request completed before stop")
-    return identity
-
-
 def active_stdout(output: str, operation: str, epoch: str | None) -> str:
     """Require synchronous start without a later matching completion record."""
     require(
         output.endswith("\n"), f"{operation}: stderr ends with an incomplete record"
     )
+    if operation == "history":
+        batch = open_history_batch(output)
+        if batch is None:
+            raise AssertionError(
+                "history: no store batch with pending commits is open on stderr"
+            )
+        return batch
     rows = output.splitlines()
-    message = (
-        "index capture started" if operation == "rebuild" else "symbol history started"
+    marker = (
+        'index capture started component="index" operation="index.build" phase="start"'
     )
-    wanted = "index.build" if operation == "rebuild" else "get_symbol"
-    marker = f'{message} component="index" operation="{wanted}" phase="start"'
     started = [index for index, row in enumerate(rows) if marker in row]
     require(bool(started), f"{operation}: synchronous start record is absent")
     start = started[-1]
-    if operation == "rebuild":
-        captured = re.search(r"\bepoch=(\d+)(?:[ }]|$)", rows[start])
-        if captured is None:
-            raise AssertionError("rebuild start has no epoch")
-        observed_epoch = captured.group(1)
-        require(
-            observed_epoch != "0" and (epoch is None or observed_epoch == epoch),
-            "rebuild start must name the current epoch after startup",
-        )
-        epoch = observed_epoch
-    epoch_pattern = rf"\bepoch={re.escape(epoch or '')}(?:[ }}]|$)"
+    captured = re.search(r"\bepoch=(\d+)(?:[ }]|$)", rows[start])
+    if captured is None:
+        raise AssertionError("rebuild start has no epoch")
+    observed_epoch = captured.group(1)
+    require(
+        observed_epoch != "0" and (epoch is None or observed_epoch == epoch),
+        "rebuild start must name the current epoch after startup",
+    )
+    epoch_pattern = rf"\bepoch={re.escape(observed_epoch)}(?:[ }}]|$)"
     for row in rows[start + 1 :]:
-        if operation == "rebuild":
-            closed = "index.build{" in row and "rift_mcp::validation: close" in row
-            completed = (
-                closed and re.search(epoch_pattern, row) is not None
-            ) or 'operation="index.publish"' in row
-        else:
-            completed = (
-                "get_symbol{" in row
-                and 'phase="history"' in row
-                and "rift_server::history: close" in row
-            )
+        closed = "index.build{" in row and "rift_mcp::validation: close" in row
+        completed = (
+            closed and re.search(epoch_pattern, row) is not None
+        ) or 'operation="index.publish"' in row
         require(not completed, f"{operation} completed before stop on stderr: {row}")
+    return rows[start]
+
+
+def open_history_batch(output: str) -> str | None:
+    """The newest history store batch start with pending commits and no close record.
+
+    The history task runs one batch at a time, so a close record after the newest
+    start closes that batch. A batch that starts with no pending commit analyzes none.
+    """
+    rows = output.splitlines()
+    started = [index for index, row in enumerate(rows) if HISTORY_BATCH_STARTED in row]
+    if not started:
+        return None
+    start = started[-1]
+    pending = re.search(r"\bpending=(\d+)(?: |$)", rows[start])
+    if pending is None or int(pending.group(1)) == 0:
+        return None
+    if any(HISTORY_BATCH_CLOSED.search(row) for row in rows[start + 1 :]):
+        return None
     return rows[start]
 
 

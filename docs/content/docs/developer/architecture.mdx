@@ -334,24 +334,47 @@ transport through the same LSP session contract. Its version ships with the Rift
 ### History
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`
-subprocess. It publishes a bounded series of source catalogs keyed by revision. The same in-place
-access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept a `rev`, and
-the server indexes that commit's tree - the same syntax providers, over committed bytes - without
-touching the working tree.
+subprocess. That access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept
+a `rev`, and the server indexes that commit's tree - the same syntax providers, over committed
+bytes - without touching the working tree.
 
 <VersionBadge
   version="v0.0.13"
   languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
 />
 
-Asking for a symbol's history walks that same object store: the server follows first parents
-from the served revision along the declaration's current path and parses the committed bytes at
-each revision that changed the file - the same syntax provider, per revision. Comparing adjacent
-parsed states gives the symbol a timeline: introduced, body changed, signature changed, removed.
+A [change comparison](/docs/mcp#search-change) reads the same objects: the server lists the paths
+two sides hold differently, parses those paths alone on each side, and matches their declarations.
+<VersionBadge version="v0.0.46" inline /> Against the working tree, the head side is the current
+publication, and the base side reads each changed file in the form the working tree holds it.
 
-The walk is bounded by
-[`providers.history.max_revisions`](/docs/developer/configuration#providers), because its cost scales
-with how far back it reaches, and a workspace without version control serves no history facts.
+<VersionBadge version="v0.0.46" />
+
+Walking git on every read costs more the further back it reaches, so the server keeps a history
+store: tables derived from git and filled before any read asks. For each commit the
+[`[providers.history]`](/docs/developer/configuration#providers) strategy selects, the store holds
+the commit's author, time, and message, the paths it changed, the files it renamed without a
+changed byte, and the declarations whose shape changed. Git stays the source of truth, and a
+stored commit id names the git object it came from.
+
+One store serves every worktree of a repository. It lives in the `.rift/` folder of the common git
+directory, `.git/.rift/` in a plain checkout, so worktrees analyze the commits they share once; when
+that directory refuses writes, the store sits in the worktree's own `.rift/` folder instead.
+
+A history task fills the store. The server spawns it at start, and it analyzes newest first, so
+recent history answers soon, writing bounded batches at the share of one core `cpu_share` sets.
+When `HEAD` moves, the task analyzes only the commits the store lacks and deletes the ones
+outside every worktree's newest `max_revisions` commits.
+
+No request waits for the task. A symbol timeline and a
+[commit search](/docs/mcp#search-commits) answer from what the store holds: a timeline whose
+served revision the store has not analyzed yet answers `complete: false`, and a commit search
+answered before the fill lands carries a `history_store_filling` warning naming how far it has got.
+
+The task follows a declaration across files as it analyzes each commit. A deletion and an
+addition carrying one blob id are a rename, and a declaration an added file holds with the exact
+bytes a deleted file held is a move; a blob id or a declaration with more than one candidate pairs
+nothing, since no evidence says which addition answers which deletion.
 
 ### Custom
 

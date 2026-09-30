@@ -26,7 +26,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFace
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
-use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
@@ -173,10 +173,8 @@ impl PythonRules {
         };
         let mut content = String::new();
         let mut ranges = Vec::new();
-        for child_index in string.named_child_indices() {
-            let Some(child) = string.named_child(child_index) else {
-                continue;
-            };
+        let mut cursor = string.walk();
+        for child in string.named_children(&mut cursor) {
             if child.kind_id() == self.kinds.string_content
                 && let Some(piece) = text.get(child.byte_range())
             {
@@ -225,10 +223,11 @@ impl PythonRules {
 
     /// The declared variable behind an assignment: its one plain-identifier
     /// target, accepted only at module level or directly in a class body.
-    fn assignment_declaration(&self, node: Node<'_>, text: &str) -> Option<Declaration> {
-        if !self.assignment_scope_accepted(node) {
+    fn assignment_declaration(&self, visited: Visited<'_, '_>, text: &str) -> Option<Declaration> {
+        if !self.assignment_scope_accepted(visited) {
             return None;
         }
+        let node = visited.node();
         let target = node.child_by_field_id(self.kinds.left.get())?;
         if target.kind_id() != self.kinds.identifier {
             return None;
@@ -248,23 +247,23 @@ impl PythonRules {
     /// Whether an assignment sits at module level or directly in a class
     /// body: its statement's holder is the module root, or a suite whose
     /// definition is a class.
-    fn assignment_scope_accepted(&self, node: Node<'_>) -> bool {
-        let Some(statement) = node.parent() else {
+    fn assignment_scope_accepted(&self, visited: Visited<'_, '_>) -> bool {
+        let Some(statement) = visited.parent() else {
             return false;
         };
-        if statement.kind_id() != self.kinds.expression_statement {
+        if statement.node().kind_id() != self.kinds.expression_statement {
             return false;
         }
         let Some(holder) = statement.parent() else {
             return false;
         };
-        if holder.kind_id() == self.kinds.module {
+        if holder.node().kind_id() == self.kinds.module {
             return true;
         }
-        holder.kind_id() == self.kinds.block
+        holder.node().kind_id() == self.kinds.block
             && holder
                 .parent()
-                .is_some_and(|definition| definition.kind_id() == self.kinds.class)
+                .is_some_and(|definition| definition.node().kind_id() == self.kinds.class)
     }
 }
 
@@ -275,7 +274,12 @@ impl GrammarRules for PythonRules {
             .transpose()
     }
 
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         if node.kind_id() == self.kinds.function {
             return self.definition_declaration(
                 node,
@@ -293,7 +297,7 @@ impl GrammarRules for PythonRules {
             );
         }
         if node.kind_id() == self.kinds.assignment {
-            return Ok(self.assignment_declaration(node, text));
+            return Ok(self.assignment_declaration(visited, text));
         }
         Ok(None)
     }
@@ -307,10 +311,10 @@ impl GrammarRules for PythonRules {
 
     /// A decorated definition starts at its first decorator, so the whole
     /// declaration removes with its decorators.
-    fn declaration_start(&self, node: Node<'_>, _text: &str) -> usize {
-        match node.parent() {
+    fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
+        match visited.parent().map(Visited::node) {
             Some(parent) if parent.kind_id() == self.kinds.decorated => parent.start_byte(),
-            _ => node.start_byte(),
+            _ => visited.node().start_byte(),
         }
     }
 

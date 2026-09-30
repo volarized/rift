@@ -325,8 +325,8 @@ async fn search_traversal_without_an_engine_refuses_capability_unavailable() -> 
     Ok(())
 }
 
-/// A comparison names two committed revisions, which no engine session serves, so a walk
-/// beside one refuses.
+/// The walk from a comparison's changed declarations is not served, so a walk beside one
+/// refuses.
 #[tokio::test]
 async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;

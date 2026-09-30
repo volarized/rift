@@ -62,7 +62,7 @@ use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFace
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -400,11 +400,11 @@ impl EcmaScriptKinds {
 
     /// Whether `node` is a member signature outside an interface or class
     /// body, such as `{ size: number }` in a type annotation.
-    fn is_type_literal_member(&self, node: Node<'_>) -> bool {
-        self.member_signatures.contains(&node.kind_id())
-            && !node
+    fn is_type_literal_member(&self, visited: Visited<'_, '_>) -> bool {
+        self.member_signatures.contains(&visited.node().kind_id())
+            && !visited
                 .parent()
-                .is_some_and(|parent| self.member_bodies.contains(&parent.kind_id()))
+                .is_some_and(|parent| self.member_bodies.contains(&parent.node().kind_id()))
     }
 
     /// The symbol kind `node` declares; `None` for a kind outside the table.
@@ -488,9 +488,8 @@ impl EcmaScriptKinds {
     /// `export as namespace name` places an identifier in the same child
     /// position, so the token decides; `None` for any other `export`.
     fn export_assignment_value<'tree>(&self, statement: Node<'tree>) -> Option<Node<'tree>> {
-        let mut children = statement
-            .child_indices()
-            .filter_map(|index| statement.child(index));
+        let mut cursor = statement.walk();
+        let mut children = statement.children(&mut cursor);
         children.find(|child| child.kind_id() == self.equals_token)?;
         children.find(Node::is_named)
     }
@@ -568,10 +567,11 @@ impl EcmaScriptKinds {
     }
 }
 
-/// Every named child of `node`, in order.
+/// Every named child of `node`, in order, read in one cursor walk.
 fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    node.named_child_indices()
-        .filter_map(move |index| node.named_child(index))
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    children.into_iter()
 }
 
 /// What a module exports without an `export` wrapping the declaration, read
@@ -682,12 +682,12 @@ impl EcmaScriptRules<'_> {
     /// Whether the module exports the declaration `node` names `name`: an
     /// `export_statement` wraps it, an export names it at module scope, or it
     /// is a method of an object literal the module exports whole.
-    fn exported(&self, node: Node<'_>, name: &str) -> bool {
-        let wrapped = self.wrapped_by_export(node);
-        let named = self.exports.names.contains(name) && self.at_module_scope(node);
-        let in_exported_object = node
+    fn exported(&self, visited: Visited<'_, '_>, name: &str) -> bool {
+        let wrapped = self.wrapped_by_export(visited);
+        let named = self.exports.names.contains(name) && self.at_module_scope(visited);
+        let in_exported_object = visited
             .parent()
-            .is_some_and(|parent| self.exports.objects.contains(&parent.id()));
+            .is_some_and(|parent| self.exports.objects.contains(&parent.node().id()));
         wrapped || named || in_exported_object
     }
 
@@ -697,16 +697,17 @@ impl EcmaScriptRules<'_> {
     /// `JSDoc` block written above `export` or `const` stands before this
     /// node, since the grammar makes `export` the declaration's previous
     /// sibling.
-    fn statement<'tree>(&self, node: Node<'tree>) -> Node<'tree> {
-        let mut front = node;
+    fn statement<'walk, 'tree>(&self, visited: Visited<'walk, 'tree>) -> Visited<'walk, 'tree> {
+        let mut front = visited;
         if let Some(parent) = front.parent().filter(|parent| {
-            self.kinds.is_declaration_statement(*parent) && parent.named_child(0) == Some(front)
+            self.kinds.is_declaration_statement(parent.node())
+                && parent.node().named_child(0) == Some(front.node())
         }) {
             front = parent;
         }
         if let Some(parent) = front
             .parent()
-            .filter(|parent| parent.kind_id() == self.kinds.export_statement)
+            .filter(|parent| parent.node().kind_id() == self.kinds.export_statement)
         {
             front = parent;
         }
@@ -715,15 +716,16 @@ impl EcmaScriptRules<'_> {
 
     /// The `JSDoc` comments directly attached before `front`, nearest first:
     /// a run of `/**` comment siblings, each separated from the next by
-    /// whitespace holding at most one line break.
-    fn jsdoc_run<'tree>(&self, front: Node<'tree>, text: &str) -> Vec<Node<'tree>> {
+    /// whitespace holding at most one line break. Each step reads the previous
+    /// sibling the shared walk recorded, so the walk costs the run's length.
+    fn jsdoc_run<'tree>(&self, front: Visited<'_, 'tree>, text: &str) -> Vec<Node<'tree>> {
         let mut run = Vec::new();
         let mut front = front;
-        while let Some(previous) = front.prev_sibling() {
-            if !self.attaches(previous, front, text) {
+        while let Some(previous) = front.previous_sibling() {
+            if !self.attaches(previous.node(), front.node(), text) {
                 break;
             }
-            run.push(previous);
+            run.push(previous.node());
             front = previous;
         }
         run
@@ -750,7 +752,7 @@ impl EcmaScriptRules<'_> {
     /// empty once its markers are stripped.
     fn attached_jsdoc(
         &self,
-        statement: Node<'_>,
+        statement: Visited<'_, '_>,
         text: &str,
     ) -> Result<(Vec<Documentation>, Vec<ByteRange>), SyntaxError> {
         let mut run = self.jsdoc_run(statement, text);
@@ -780,38 +782,38 @@ impl EcmaScriptRules<'_> {
     /// Whether an `export_statement` wraps the declaration: its direct
     /// parent, or - for a declarator - the parent of its declaration
     /// statement.
-    fn wrapped_by_export(&self, node: Node<'_>) -> bool {
-        let Some(parent) = node.parent() else {
+    fn wrapped_by_export(&self, visited: Visited<'_, '_>) -> bool {
+        let Some(parent) = visited.parent() else {
             return false;
         };
-        if parent.kind_id() == self.kinds.export_statement {
+        if parent.node().kind_id() == self.kinds.export_statement {
             return true;
         }
-        self.kinds.is_declaration_statement(parent)
+        self.kinds.is_declaration_statement(parent.node())
             && parent
                 .parent()
-                .is_some_and(|wrapper| wrapper.kind_id() == self.kinds.export_statement)
+                .is_some_and(|wrapper| wrapper.node().kind_id() == self.kinds.export_statement)
     }
 
     /// Whether `node` declares at module scope: its statement - the node
     /// itself, or a declarator's declaration statement - sits directly in the
     /// program.
-    fn at_module_scope(&self, node: Node<'_>) -> bool {
-        let statement = node
+    fn at_module_scope(&self, visited: Visited<'_, '_>) -> bool {
+        let statement = visited
             .parent()
-            .filter(|parent| self.kinds.is_declaration_statement(*parent))
-            .unwrap_or(node);
+            .filter(|parent| self.kinds.is_declaration_statement(parent.node()))
+            .unwrap_or(visited);
         statement
             .parent()
-            .is_some_and(|parent| parent.kind_id() == self.kinds.program)
+            .is_some_and(|parent| parent.node().kind_id() == self.kinds.program)
     }
 
     /// The authored `accessibility_modifier` text on `node`; `None` when the
     /// grammar spells none or the declaration carries none.
     fn accessibility(&self, node: Node<'_>, text: &str) -> Option<String> {
         let modifier = self.kinds.accessibility_modifier?;
-        node.named_child_indices()
-            .filter_map(|index| node.named_child(index))
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
             .find(|child| child.kind_id() == modifier)
             .and_then(|child| text.get(child.byte_range()))
             .map(Into::into)
@@ -838,22 +840,27 @@ impl GrammarRules for EcmaScriptRules<'_> {
             .transpose()
     }
 
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         let Some(kind) = self.kinds.symbol_kind(node) else {
             return Ok(None);
         };
-        if self.kinds.is_type_literal_member(node) {
+        if self.kinds.is_type_literal_member(visited) {
             return Ok(None);
         }
         let Some(name) = self.declaration_name(node, kind, text) else {
             return Ok(None);
         };
         let mut facets = kind.facets();
-        if self.exported(node, &name) {
+        if self.exported(visited, &name) {
             facets.push(SymbolFacet::Public);
         }
         let (documentation, documentation_ranges) =
-            self.attached_jsdoc(self.statement(node), text)?;
+            self.attached_jsdoc(self.statement(visited), text)?;
         Ok(Some(Declaration {
             name,
             kind: kind.word(),
@@ -876,11 +883,11 @@ impl GrammarRules for EcmaScriptRules<'_> {
 
     /// Starts the declaration at the statement carrying it, extended over the
     /// `JSDoc` comments attached before that statement.
-    fn declaration_start(&self, node: Node<'_>, text: &str) -> usize {
-        let statement = self.statement(node);
+    fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize {
+        let statement = self.statement(visited);
         self.jsdoc_run(statement, text)
             .last()
-            .map_or(statement.start_byte(), Node::start_byte)
+            .map_or(statement.node().start_byte(), Node::start_byte)
     }
 
     fn qualification_separator(&self) -> &'static str {

@@ -676,9 +676,12 @@ fn search_request(
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
         },
+        // A commit search is refused past the `local` scope before any global request, so
+        // it never reaches this mapping.
         target: match params.target {
             rift_protocol::read::SearchParamsTarget::Symbol
-            | rift_protocol::read::SearchParamsTarget::File => None,
+            | rift_protocol::read::SearchParamsTarget::File
+            | rift_protocol::read::SearchParamsTarget::Commit => None,
             rift_protocol::read::SearchParamsTarget::Documentation => {
                 Some(PackageSearchRequestTarget::Documentation)
             }
@@ -1036,7 +1039,7 @@ fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitError>
 
 /// The identity a project search hit ranks under: its symbol address, or the source unit
 /// and qualified name for a hit that names a unit, its path for a file, its address for a
-/// node, and its block for documentation.
+/// node, its block for documentation, and its revision for a commit.
 fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitViolation> {
     let identity = match (&hit.hit, hit.unit.as_ref(), hit.path.as_ref()) {
         (SearchHitTarget::Symbol { symbol }, unit, _) => {
@@ -1056,6 +1059,9 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitViola
         (SearchHitTarget::Node { node }, ..) => DocumentIdentity::new(node.0.clone())?,
         (SearchHitTarget::Documentation { documentation }, ..) => {
             DocumentIdentity::for_documentation_block(&documentation.block.identity.0)?
+        }
+        (SearchHitTarget::Commit { commit }, ..) => {
+            DocumentIdentity::new(commit.revision.0.clone())?
         }
     };
     Ok(identity)
@@ -1099,6 +1105,7 @@ fn search_hit_key(hit: &SearchHit) -> &str {
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
         SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
+        SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
 }
 
@@ -1779,6 +1786,19 @@ mod tests {
         }))
         .expect("a node hit");
         let documentation_hit = documentation_hits().remove(0);
+        let revision = "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4";
+        let commit_hit: SearchHit = serde_json::from_value(serde_json::json!({
+            "hit": {"target": "commit", "commit": {
+                "revision": revision,
+                "message": "Bound comparisons at 512 changed paths\n",
+                "message_truncated": false,
+                "author": {"name": "Alice", "email": "alice@example.com"},
+                "timestamp": "2026-09-22T14:03:11+02:00",
+                "paths": ["crates/rift-server/src/change.rs"],
+                "paths_truncated": false
+            }}
+        }))
+        .expect("a commit hit");
         let block = search_hit_key(&documentation_hit).to_owned();
         let parsed_unit = rift_core::SourceUnitId::parse(unit).expect("a source unit");
         let unit_identity =
@@ -1791,6 +1811,7 @@ mod tests {
             example.results[1].clone(),
             node_hit,
             documentation_hit,
+            commit_hit,
         ];
         let expected = [
             "rift://symbol/rust/src/config.rs/load_config",
@@ -1798,12 +1819,21 @@ mod tests {
             "src/lib.rs",
             "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
             block_identity.as_str(),
+            revision,
         ];
 
         for (hit, expected) in hits.iter().zip(expected) {
             let identity = super::search_identity(hit).expect("a project hit ranks");
             assert_eq!(identity.as_str(), expected);
         }
+        let mut ordered = hits.to_vec();
+        super::order_search_hits(&mut ordered, super::ResultOrder::Identity);
+        let keys: Vec<&str> = ordered.iter().map(search_hit_key).collect();
+        assert!(keys.is_sorted(), "{keys:?}");
+        assert!(
+            keys.contains(&revision),
+            "a commit hit orders by its revision"
+        );
         let request = serde_json::json!({"query": "load_config", "limit": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");

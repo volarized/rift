@@ -225,6 +225,22 @@ impl WorkspaceLanguagePolicy {
         Ok(first)
     }
 
+    /// The syntax provider that parses `path`: the shipped provider of the one
+    /// enabled language entry claiming it, or `None` when no such entry does.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WorkspaceIndexError` when two language entries match `path`.
+    pub fn syntax_provider_for(
+        &self,
+        path: &Path,
+    ) -> Result<Option<&'static dyn SyntaxProvider>, WorkspaceIndexError> {
+        Ok(self
+            .language_for_path(path)?
+            .filter(|language| language.enabled)
+            .and_then(EffectiveLanguage::syntax_provider))
+    }
+
     /// Which lane one visible path joins.
     ///
     /// An enabled entry with a shipped provider makes the path source. Every
@@ -240,11 +256,7 @@ impl WorkspaceLanguagePolicy {
         path: &Path,
     ) -> Result<Option<ClassifiedPath>, WorkspaceIndexError> {
         let path = self.absolute(path);
-        if let Some(provider) = self
-            .language_for_path(&path)?
-            .filter(|language| language.enabled)
-            .and_then(EffectiveLanguage::syntax_provider)
-        {
+        if let Some(provider) = self.syntax_provider_for(&path)? {
             return Ok(Some(ClassifiedPath::Source(provider)));
         }
         if is_workspace_document(path.extension().and_then(|extension| extension.to_str())) {
@@ -262,9 +274,10 @@ impl WorkspaceLanguagePolicy {
     ///
     /// The index still reads such a file and records its digests, so an edit to it moves
     /// the workspace and the dependency context reads it again, but no syntax provider
-    /// parses it and it stores no row. [`Self::classifies`] still answers for it, so
+    /// parses it and it stores no row. `Self::classifies` still answers for it, so
     /// `paths.force_include` reaches it for one request.
-    pub(crate) fn excludes_lockfile(&self, path: &Path) -> bool {
+    #[must_use]
+    pub fn excludes_lockfile(&self, path: &Path) -> bool {
         path.file_name()
             .and_then(std::ffi::OsStr::to_str)
             .is_some_and(|name| self.excluded_lockfiles.contains(name))

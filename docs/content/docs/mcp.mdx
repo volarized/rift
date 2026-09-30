@@ -155,7 +155,7 @@ runs under and the warning a file with too many matches carries.
 ### More search options
 
 The agent can narrow the files it searches, look into dependencies, follow references,
-or compare committed revisions. These options use the same `search` tool:
+compare revisions, or search commit messages. These options use the same `search` tool:
 
 <Accordions>
 <Accordion title="Path filters" id="search-paths">
@@ -296,9 +296,54 @@ revisions. This request compares `main` with `HEAD`:
 ```
 
 Each result describes what changed and identifies the declaration on each side of the comparison.
-The comparison uses committed code, so it does not include uncommitted edits. `change` selects
-the result set on its own; see the [change reference](/docs/developer/protocol/mcp#search-change)
-for classifications and argument constraints.
+
+To check its own uncommitted edits, the agent names the working tree as `head`. The working-tree
+side is the current local index, so staged, unstaged, untracked, and deleted files all take part:
+
+```json
+{ "change": { "base": "HEAD", "head": { "kind": "working_tree" } }, "target": "symbol" }
+```
+
+`change` selects the result set on its own; see the
+[change reference](/docs/developer/protocol/mcp#search-change) for classifications and argument
+constraints.
+
+</Accordion>
+<Accordion title="Commit messages" id="search-commits">
+
+When the agent needs the commit that introduced a change, it can search commit messages.
+`target: "commit"` matches `query` against the messages of the commits the history store holds:
+
+**Request:**
+
+```json
+{ "target": "commit", "query": "change path bound", "limit": 10 }
+```
+
+**Search hit:**
+
+```json
+{
+  "hit": {
+    "target": "commit",
+    "commit": {
+      "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
+      "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
+      "message_truncated": false,
+      "author": { "name": "Alice", "email": "alice@example.com" },
+      "timestamp": "2026-09-22T14:03:11+02:00",
+      "paths": ["crates/rift-protocol/src/search.rs", "crates/rift-server/src/change.rs"],
+      "paths_truncated": false
+    }
+  }
+}
+```
+
+Each hit carries the commit's message, author, time, and the paths it changed. While the local
+server is still filling its history store, the answer carries a `history_store_filling` warning
+naming how many of the selected commits the store holds, and a later search answers the rest.
+A commit search takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
+for ordering, bounds, and refusals.
 
 </Accordion>
 </Accordions>
@@ -326,6 +371,46 @@ Use `include` to choose which additional information comes with each symbol. Opt
 
 If omitted, `include` defaults to `["source"]`. An explicit list replaces that default;
 `include: []` returns the symbol and its location without these additions.
+
+With `history`, each hit lists the revisions that changed the declaration, newest first, each
+with its author:
+
+**Request:**
+
+```json
+{ "name": "load_config", "include": ["history"] }
+```
+
+**Hit history:**
+
+```json
+{
+  "symbol": "rift://symbol/rust/src/config.rs/load_config",
+  "versions": [
+    {
+      "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
+      "path": "src/config.rs",
+      "kind": "signature_changed",
+      "timestamp": "2026-08-21T14:03:22+00:00",
+      "summary": "Return ConfigError from load_config",
+      "author": { "name": "Alice", "email": "alice@example.com" }
+    },
+    {
+      "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
+      "path": "src/config.rs",
+      "kind": "introduced",
+      "timestamp": "2026-08-17T09:41:05+00:00",
+      "summary": "Add workspace configuration loading",
+      "author": { "name": "Alice", "email": "alice@example.com" }
+    }
+  ],
+  "complete": true
+}
+```
+
+The local server fills its history store in the background after it starts. Until the store
+holds the revision a read is served from, the timeline answers `complete: false`, and a later
+read answers the rest.
 
 <span id="get_symbol-scope" />
 
@@ -400,6 +485,7 @@ For example, this reads the function from `main` without changing the working tr
 { "name": "load_config", "rev": "main" }
 ```
 
+Git's ancestry suffixes work too, so `"rev": "HEAD~1"` reads the commit below `HEAD`.
 Revision reads use committed source from a branch, tag, or commit and require a Git repository.
 See [revision-addressed reads](/docs/developer/protocol/mcp#revision-reads) for configuration
 and argument constraints.

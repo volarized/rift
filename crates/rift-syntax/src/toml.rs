@@ -57,7 +57,7 @@ use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
-use crate::extract::{self, ChildIndices, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
@@ -195,13 +195,10 @@ impl TomlRules {
     fn key_segments(&self, key: Node<'_>, text: &str) -> Vec<String> {
         let mut segments = Vec::new();
         let mut pending = vec![key];
+        let mut cursor = key.walk();
         while let Some(node) = pending.pop() {
             if node.kind_id() == self.kinds.dotted_key {
-                for index in node.named_child_indices().rev() {
-                    if let Some(child) = node.named_child(index) {
-                        pending.push(child);
-                    }
-                }
+                extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
                 continue;
             }
             if let Some(segment) = self.key_segment_spelling(node, text) {
@@ -232,9 +229,9 @@ impl TomlRules {
         &self,
         pair: Node<'tree>,
     ) -> (Option<Node<'tree>>, Option<Node<'tree>>) {
+        let mut cursor = pair.walk();
         let mut structural = pair
-            .named_child_indices()
-            .filter_map(|index| pair.named_child(index))
+            .named_children(&mut cursor)
             .filter(|child| child.kind_id() != self.kinds.comment);
         (structural.next(), structural.next())
     }
@@ -242,8 +239,8 @@ impl TomlRules {
     /// A table or table array element's header key: the first named child
     /// of a key kind, filtered the same way a pair's children are.
     fn header_key<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        node.named_child_indices()
-            .filter_map(|index| node.named_child(index))
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
             .find(|child| self.is_key_kind(child.kind_id()))
     }
 
@@ -289,7 +286,12 @@ impl TomlRules {
 }
 
 impl GrammarRules for TomlRules {
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         let id = node.kind_id();
         if id == self.kinds.pair {
             return self.pair_declaration(node, text);
@@ -315,8 +317,8 @@ impl GrammarRules for TomlRules {
     }
 
     /// A declaration starts at its own node: nothing attaches in front.
-    fn declaration_start(&self, node: Node<'_>, _text: &str) -> usize {
-        node.start_byte()
+    fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
+        visited.node().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {

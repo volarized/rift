@@ -38,7 +38,7 @@ use rift_protocol::read::{Language, NodeFacet};
 use tree_sitter::{Node, Parser};
 
 use crate::document::SyntaxDocument;
-use crate::extract::{self, Declaration, GrammarRules};
+use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
@@ -131,7 +131,12 @@ impl JsonRules {
 }
 
 impl GrammarRules for JsonRules {
-    fn declaration(&self, node: Node<'_>, text: &str) -> Result<Option<Declaration>, SyntaxError> {
+    fn declaration(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<Declaration>, SyntaxError> {
+        let node = visited.node();
         if node.kind_id() != self.kinds.pair {
             return Ok(None);
         }
@@ -161,8 +166,8 @@ impl GrammarRules for JsonRules {
     }
 
     /// A declaration starts at its own node: nothing attaches in front.
-    fn declaration_start(&self, node: Node<'_>, _text: &str) -> usize {
-        node.start_byte()
+    fn declaration_start(&self, visited: Visited<'_, '_>, _text: &str) -> usize {
+        visited.node().start_byte()
     }
 
     fn qualification_separator(&self) -> &'static str {

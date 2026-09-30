@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import time
 import traceback
@@ -35,6 +36,7 @@ from rift_dev.corpus_assertions import (
     map_paths,
     no_failed_builds,
     number,
+    open_history_batch,
     probe_units,
     records,
     sample_symbols,
@@ -84,6 +86,7 @@ CLEANUP_RESERVE_SECONDS = 30.0
 SEED = 34
 POLL_SECONDS = 0.1
 OBSERVATION_SECONDS = 60.0
+STARTUP_PUBLICATION = 'operation="index.publish" trigger="startup"'
 CONFIGURATION = (
     f'[server]\nreadiness_timeout = "{int(READINESS_SECONDS)}s"\n'
     "[search.vector]\ndisabled = true\n"
@@ -869,61 +872,84 @@ class Corpus:
                 )
             server.stop()
         self.record("stop", state="idle", process_gone=True)
-        await self.stop_during("rebuild")
-        await self.stop_during("history")
+        await self.stop_during_rebuild()
+        await self.stop_during_history_fill()
 
-    async def stop_during(self, operation: str) -> None:
-        """Observe synchronous output while the operation can hold the database writer."""
+    async def stop_during_rebuild(self) -> None:
+        """Observe synchronous output while the rebuild can hold the database writer."""
         with self.server() as server:
             async with server.connect() as client:
-                startup = await observed_output(
-                    server, 0, 'operation="index.publish" trigger="startup"'
+                startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+                (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
+                pending = asyncio.create_task(
+                    client.call("search", {"query": "corpus_probe"})
                 )
-                log_offset = len(startup)
-                if operation == "rebuild":
-                    (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
-                    pending = asyncio.create_task(
-                        client.call("search", {"query": "corpus_probe"})
-                    )
-                    wanted = "index capture started"
-                else:
-                    pending = asyncio.create_task(
-                        client.call(
-                            "get_symbol",
-                            {"name": "test", "include": ["history"], "limit": 200},
-                        )
-                    )
-                    wanted = "symbol history started"
                 try:
-                    output = await observed_output(server, log_offset, wanted)
-                    require(
-                        operation == "rebuild" or not pending.done(),
-                        "history request completed before stop",
+                    output = await observed_output(
+                        server, len(startup), "index capture started"
                     )
-                    evidence = active_stdout(output, operation, None)
-                    await asyncio.to_thread(server.stop)
-                    self.record(
-                        "stop",
-                        state=f"mid_{operation}",
-                        stderr=evidence,
-                        process_gone=True,
-                    )
+                    await self.stop_observed(server, "rebuild", output)
                 finally:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
 
+    async def stop_during_history_fill(self) -> None:
+        """Stop while a history store batch with pending commits has not finished.
+
+        A fill analyzes only the commits the history store lacks, so the case first
+        deletes the store the earlier servers filled, in the `.rift` folder of the common
+        git directory: this server's fill then owes every commit its plan selects. The
+        fill starts after the startup publication with no request, and while the server
+        runs none, each batch starts as soon as the one before it ends.
+        """
+        common = git(self.root, "rev-parse", "--git-common-dir").output().strip()
+        store = self.root / common / ".rift"
+        if store.exists():
+            shutil.rmtree(store)
+        with self.server() as server:
+            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+            output = await observed_state(
+                server,
+                startup.index(STARTUP_PUBLICATION),
+                "a history store batch with pending commits",
+                lambda text: open_history_batch(text) is not None,
+            )
+            await self.stop_observed(server, "history", output)
+
+    async def stop_observed(self, server: Server, operation: str, output: str) -> None:
+        """Stop once `output` shows the operation started and not finished."""
+        evidence = active_stdout(output, operation, None)
+        await asyncio.to_thread(server.stop)
+        self.record(
+            "stop", state=f"mid_{operation}", stderr=evidence, process_gone=True
+        )
+
 
 async def observed_output(server: Server, offset: int, message: str) -> str:
     """Read owned output without waiting for the log store's database write turn."""
-    async with asyncio.timeout(OBSERVATION_SECONDS):
-        for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
-            server.check_running()
-            output = server.read_log()[offset:]
-            if output.endswith("\n") and message in output:
-                return output
-            await asyncio.sleep(POLL_SECONDS)
-    raise AssertionError(f"required record never reached server output: {message}")
+    return await observed_state(server, offset, message, lambda text: message in text)
+
+
+async def observed_state(
+    server: Server, offset: int, wanted: str, holds: Callable[[str], bool]
+) -> str:
+    """Read owned output until its complete records satisfy `holds`.
+
+    The deadline alone bounds the loop, as in `Corpus.await_probe`, so a breach fails
+    naming what the case waited for.
+    """
+    deadline = time.monotonic() + OBSERVATION_SECONDS
+    while time.monotonic() < deadline:
+        server.check_running()
+        output = server.read_log()[offset:]
+        if output.endswith("\n") and holds(output):
+            return output
+        await asyncio.sleep(POLL_SECONDS)
+    raise AssertionError(
+        f"required record never reached server output within "
+        f"{OBSERVATION_SECONDS}s: {wanted}"
+    )
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:

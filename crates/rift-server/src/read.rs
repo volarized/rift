@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -11,6 +11,7 @@ use rift_core::{
 };
 use rift_dependency::{DependencyContext, StandardLibrary};
 use rift_history::{HistoryError, Repository};
+use rift_history_store::StoreError;
 use rift_index::{
     FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
     RelationshipStore, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
@@ -30,7 +31,7 @@ use rift_protocol::read::{
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
 
-use crate::history::SymbolTimelines;
+use crate::history::{StoredHistory, SymbolTimelines};
 
 /// One read-service failure: what was asked, and why it cannot be served.
 ///
@@ -43,6 +44,9 @@ pub enum ReadFault {
     Index(WorkspaceIndexError),
     /// The workspace's version control could not serve the requested revision.
     History(HistoryError),
+    /// The history store refused a read. The failure is boxed so the read fault stays
+    /// small on every `Result` it rides.
+    HistoryStore(Box<StoreError>),
     /// A language engine failed while serving the request.
     Engine(rift_lsp::session::EngineError),
     /// A language engine answered about bytes the served revision does not carry, so
@@ -126,6 +130,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => source.descriptor().name(),
             Self::History(source) => source.descriptor().name(),
+            Self::HistoryStore(source) => source.name(),
             Self::Engine(source) => source.name(),
 
             Self::Documentation(source) => source.name(),
@@ -149,6 +154,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => source.context(),
             Self::History(source) => source.context(),
+            Self::HistoryStore(source) => source.context(),
             Self::Engine(source) => source.context(),
 
             Self::Documentation(source) => source.context(),
@@ -194,6 +200,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => source.fault().limit_evidence(),
             Self::History(source) => source.fault().limit_evidence(),
+            Self::HistoryStore(source) => source.fault().limit_evidence(),
             Self::Engine(source) => source.fault().limit_evidence(),
 
             Self::Documentation(source) => source.fault().limit_evidence(),
@@ -214,6 +221,7 @@ impl Fault for ReadFault {
         match self {
             Self::Index(source) => Some(source),
             Self::History(source) => Some(source),
+            Self::HistoryStore(source) => Some(source.as_ref()),
             Self::Engine(source) => Some(source),
 
             Self::Documentation(source) => Some(source.as_ref()),
@@ -306,6 +314,12 @@ impl ReadFault {
         Error::new(Self::History(source))
     }
 
+    /// Keeps a history store failure's registry identity in one read failure.
+    #[must_use]
+    pub fn history_store(source: StoreError) -> ReadError {
+        Error::new(Self::HistoryStore(Box::new(source)))
+    }
+
     pub(crate) fn documentation(source: rift_index::DocumentationError) -> ReadError {
         Error::new(Self::Documentation(Box::new(source)))
     }
@@ -373,6 +387,9 @@ pub struct ReadService {
     /// The accepted `[dependencies]` table: the configured packages, and whether the
     /// standard library version probes run.
     dependency_configuration: DependenciesConfiguration,
+    /// The history store symbol-history reads answer from, attached by the serving
+    /// layer; with none attached, a timeline walks git per request.
+    stored_history: OnceLock<StoredHistory>,
 }
 
 impl ReadService {
@@ -472,6 +489,7 @@ impl ReadService {
             source_policy: Some(Arc::new(source_policy)),
             context,
             dependency_configuration: dependencies,
+            stored_history: OnceLock::new(),
         })
     }
 
@@ -633,6 +651,7 @@ impl ReadService {
             source_policy: Some(Arc::new(source_policy)),
             context,
             dependency_configuration: self.dependency_configuration.clone(),
+            stored_history: self.carried_history(),
         })
     }
 
@@ -676,6 +695,7 @@ impl ReadService {
             source_policy: self.source_policy.clone(),
             context,
             dependency_configuration: self.dependency_configuration.clone(),
+            stored_history: self.carried_history(),
         })
     }
 
@@ -828,6 +848,7 @@ impl ReadService {
             source_policy: None,
             context: Arc::new(DependencyContext::default()),
             dependency_configuration: DependenciesConfiguration::default(),
+            stored_history: OnceLock::new(),
         })
     }
 
@@ -850,6 +871,33 @@ impl ReadService {
     #[must_use]
     pub fn source_policy_handle(&self) -> Option<Arc<WorkspaceSourcePolicy>> {
         self.source_policy.clone()
+    }
+
+    /// Attaches the history store symbol-history reads answer from. The serving layer
+    /// opens one store and attaches it to every snapshot it serves; the first attach
+    /// stays, and an incremental rebuild carries it forward.
+    pub fn attach_history_store(&self, store: &StoredHistory) {
+        // The cell holds the one store the server opened, so a second attach of the same
+        // store has nothing to replace.
+        let _attached = self.stored_history.get_or_init(|| store.clone());
+    }
+
+    /// The history store the serving layer attached, which symbol-history reads and
+    /// commit searches answer from.
+    pub(crate) fn stored_history(&self) -> Option<&StoredHistory> {
+        self.stored_history.get()
+    }
+
+    /// The accepted `[providers.history]` table this snapshot serves under.
+    pub(crate) const fn history_configuration(&self) -> &HistoryConfiguration {
+        &self.history
+    }
+
+    /// The attached history store, for a snapshot built from this one.
+    fn carried_history(&self) -> OnceLock<StoredHistory> {
+        self.stored_history
+            .get()
+            .map_or_else(OnceLock::new, |store| OnceLock::from(store.clone()))
     }
 
     /// The packages the workspace's manifests and lockfiles name, as this snapshot read
@@ -1191,19 +1239,22 @@ impl ReadService {
         Ok((hit, disagreement))
     }
 
-    /// Opens this snapshot's timeline composition, walking from the served
-    /// commit for a revision read and from `HEAD` for a current-tree read.
+    /// Opens this snapshot's timeline composition, starting at the served
+    /// commit for a revision read and at `HEAD` for a current-tree read, and
+    /// reading the attached history store when there is one.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when `[providers.history]` is disabled or the
-    /// workspace's version control cannot serve a walk start.
+    /// Returns [`ReadError`] when `[providers.history]` is disabled, the
+    /// workspace's version control cannot serve a start, or the attached
+    /// store cannot be read.
     fn symbol_timelines(&self) -> Result<SymbolTimelines, ReadError> {
         SymbolTimelines::open(
             self.index.root(),
             self.revision.as_ref(),
             &self.history,
             self.index.limits().syntax(),
+            self.stored_history.get(),
         )
     }
 }
@@ -1531,7 +1582,7 @@ pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
 }
 
 /// Projects one index-build warning onto its wire form.
-fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
+pub(crate) fn wire_index_warning(warning: &WorkspaceIndexWarning) -> ReadWarning {
     let path = warning.path();
     ReadWarning::SourceUnavailable {
         unit: Some(file_id(path)),
@@ -2697,7 +2748,7 @@ pub fn compute() -> i32 {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration {
                 enabled: false,
-                max_revisions: 500,
+                ..HistoryConfiguration::default()
             },
         )?;
         let mut params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
@@ -4225,6 +4276,36 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// An ancestry suffix resolves through git's own revision syntax, and the snapshot
+    /// names the commit it resolved to rather than the spelling it was asked with.
+    #[test]
+    fn revision_read_resolves_an_ancestry_suffix_to_its_commit() -> TestResult {
+        let directory = committed_fixture()?;
+        rift_history::fixture::commit_all(directory.path(), "return seven");
+        let eight = "pub fn beacon() -> u8 {\n    8\n}\n";
+        fs::write(directory.path().join("src/lib.rs"), eight)?;
+        rift_history::fixture::commit_all(directory.path(), "return eight");
+        let first = rift_history::Repository::open(directory.path())?
+            .resolve("main~2")?
+            .commit_id();
+        let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
+
+        for spelling in ["HEAD~2", "HEAD^^", "main^1~1"] {
+            let service = revision_service(directory.path(), spelling)?;
+            assert_eq!(
+                service.revision(),
+                Some(&RevisionId(first.clone())),
+                "{spelling}"
+            );
+            let value = serde_json::to_value(service.get_symbol(&params)?)?;
+            assert_eq!(
+                value["hits"][0]["source"], "pub fn beacon() {}",
+                "{spelling}"
+            );
+        }
+        Ok(())
+    }
+
     /// A committed file the syntax provider refuses under its depth bound is left out of
     /// the revision index the way the workspace scan leaves it out, so `get_symbol` at
     /// the revision still answers from the file beside it and names the refused one.
@@ -4361,7 +4442,7 @@ pub fn compute() -> i32 {
     #[test]
     fn revision_read_refuses_a_forbidden_spelling_as_invalid() -> TestResult {
         let directory = committed_fixture()?;
-        let error = revision_service(directory.path(), "HEAD~1")
+        let error = revision_service(directory.path(), "HEAD@{1}")
             .expect_err("a spelling outside the advertised charset must refuse");
         assert_eq!(
             error.to_string(),

@@ -479,23 +479,122 @@
     },
     "HistoryConfiguration": {
       "additionalProperties": false,
-      "description": "The `[providers.history]` table. The history provider's cost scales with\nhow far back it walks, so its depth is the budget worth setting.",
+      "allOf": [
+        {
+          "description": "providers.history.strategy selective names at least one release",
+          "if": {
+            "properties": {
+              "strategy": {
+                "const": "selective"
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          },
+          "then": {
+            "properties": {
+              "releases": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "releases"
+            ]
+          }
+        },
+        {
+          "description": "providers.history.releases belongs to strategy selective alone",
+          "else": {
+            "properties": {
+              "releases": {
+                "maxItems": 0
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "strategy": {
+                "const": "selective"
+              }
+            },
+            "required": [
+              "strategy"
+            ]
+          }
+        }
+      ],
+      "description": "The `[providers.history]` table. The history provider analyzes the revisions its\nstrategy selects into the history store, one repository-wide store every worktree\nreads, and fills it in the background: `max_revisions` bounds what the store holds,\nand the batch and CPU-share keys bound what one fill costs the machine. The server\nreads the table at startup, so a change applies on the next start.",
       "properties": {
+        "batch_commits": {
+          "default": 25,
+          "description": "Commits one history store batch writes, 1 to 10000.",
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "batch_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1000000b",
+          "description": "Parsed bytes one history store batch holds past its first commit, 1kb to 1gb. A\ncommit that parses more is a batch of its own.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "1kb"
+          }
+        },
+        "cpu_share": {
+          "default": 0.25,
+          "description": "The share of one core the history task parses at, above 0.0 up to 1.0: after each\ncommit it pauses long enough to hold the share.",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
         "enabled": {
           "default": true,
           "description": "Whether the history provider runs at all.",
           "type": "boolean"
         },
         "max_revisions": {
-          "default": 500,
-          "description": "Revisions the walk covers from the current head, newest first.",
+          "default": 100,
+          "description": "Revisions the history store holds, newest first, 1 to 100000: the first-parent\ncommits from each worktree's `HEAD` under `everything`, the releases under\n`selective`.",
           "format": "uint64",
           "maximum": 100000,
           "minimum": 1,
           "type": "integer"
+        },
+        "releases": {
+          "default": [],
+          "description": "Tag names or tag patterns naming the releases `selective` analyzes, such as `v1.*`,\nat most 64. The releases order by the version each tag name spells once the\npattern's literal text up to its first digit or wildcard is removed; a tag whose\nrest is no version is left out. Only `selective` reads them.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "strategy": {
+          "$ref": "#/$defs/HistoryStrategy",
+          "default": "everything",
+          "description": "Which revisions the history store analyzes."
         }
       },
       "type": "object"
+    },
+    "HistoryStrategy": {
+      "description": "Which revisions the history store analyzes.",
+      "oneOf": [
+        {
+          "const": "everything",
+          "description": "The newest `max_revisions` first-parent commits from each live worktree's `HEAD`,\neach compared with its first parent.",
+          "type": "string"
+        },
+        {
+          "const": "selective",
+          "description": "The newest `max_revisions` of the releases `releases` names, in version order, each\ncompared with the release before it.",
+          "type": "string"
+        }
+      ]
     },
     "LanguageConfiguration": {
       "additionalProperties": false,
@@ -800,8 +899,13 @@
         "history": {
           "$ref": "#/$defs/HistoryConfiguration",
           "default": {
+            "batch_commits": 25,
+            "batch_size": "1000000b",
+            "cpu_share": 0.25,
             "enabled": true,
-            "max_revisions": 500
+            "max_revisions": 100,
+            "releases": [],
+            "strategy": "everything"
           },
           "description": "The history provider's budget."
         },
@@ -1394,8 +1498,13 @@
       "$ref": "#/$defs/ProvidersConfiguration",
       "default": {
         "history": {
+          "batch_commits": 25,
+          "batch_size": "1000000b",
+          "cpu_share": 0.25,
           "enabled": true,
-          "max_revisions": 500
+          "max_revisions": 100,
+          "releases": [],
+          "strategy": "everything"
         },
         "syntax": {
           "max_depth": 512,

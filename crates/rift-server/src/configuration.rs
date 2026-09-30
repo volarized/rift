@@ -16,6 +16,8 @@ use rift_core::acceptance::{ConfigurationEnvironment, NamedMembers, accept_confi
 use rift_core::constants::WORKSPACE_CONFIGURATION_FILE;
 use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguration};
 
+use crate::history_fill::release_matcher;
+
 /// Reads `<root>/rift.toml` and the process's `RIFT_*` variables into the
 /// validated configuration. A missing file is no document: the defaults, and
 /// any variable overriding them.
@@ -51,8 +53,14 @@ fn read_document(root: &Path) -> Result<Option<String>, ConfigurationError> {
 }
 
 /// Accepts one workspace configuration: the document and variables, then
-/// every value bound and the log capture filter. A refusal of a bound names
-/// the variables that overrode a key, since the broken value may be theirs.
+/// every value bound, the history release patterns, and the log capture
+/// filter. A refusal of a bound names the variables that overrode a key, since
+/// the broken value may be theirs.
+///
+/// The protocol model checks a release pattern's form alone; whether it
+/// compiles is decided here, through the compile a `selective` fill runs, so
+/// a pattern no fill could use refuses the file rather than leaving the
+/// history store unfilled.
 fn accept_workspace(
     document: Option<&str>,
     environment: &ConfigurationEnvironment,
@@ -76,6 +84,18 @@ fn accept_workspace(
         })
     };
     configuration.validate().map_err(invalid)?;
+    let releases = &configuration.providers.history.releases;
+    if let Some((pattern, error)) = releases
+        .iter()
+        .find_map(|pattern| release_matcher(pattern).err().map(|error| (pattern, error)))
+    {
+        return Err(invalid(
+            ConfigurationViolation::HistoryReleasePatternInvalid {
+                pattern: pattern.clone(),
+                detail: error.to_string(),
+            },
+        ));
+    }
     tracing_subscriber::EnvFilter::try_new(&configuration.logs.capture).map_err(|error| {
         invalid(ConfigurationViolation::LogCaptureInvalid {
             capture: configuration.logs.capture.clone(),
@@ -394,6 +414,44 @@ download_timeout = "5m"
             ),
             "unexpected configuration failure: {error:?}"
         );
+    }
+
+    #[test]
+    fn test_a_release_pattern_that_does_not_compile_is_refused() {
+        let document = concat!(
+            "[providers.history]\n",
+            "strategy = \"selective\"\n",
+            "releases = [\"v*\", \"v[1\"]\n",
+        );
+        let error = accept(document).expect_err("an unclosed class compiles into no matcher");
+        assert!(
+            matches!(
+                error.fault(),
+                ConfigurationFault::Invalid {
+                    violation: ConfigurationViolation::HistoryReleasePatternInvalid {
+                        pattern,
+                        detail,
+                    },
+                    ..
+                } if pattern == "v[1" && detail.contains("unclosed character class")
+            ),
+            "unexpected configuration failure: {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("providers.history.releases"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("unclosed character class"),
+            "the refusal carries the glob parser's account: {rendered}"
+        );
+        let alternation = concat!(
+            "[providers.history]\n",
+            "strategy = \"selective\"\n",
+            "releases = [\"v{1,2}.*\"]\n",
+        );
+        assert!(accept(alternation).is_ok(), "an alternation compiles");
     }
 
     #[test]

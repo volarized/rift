@@ -5,7 +5,7 @@ use rift_core::{Error, ProjectPath};
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Point, Range, Tree};
 
 use crate::document::{ByteRange, SyntaxDocument};
-use crate::extract::{self, ChildIndices};
+use crate::extract;
 use crate::failure::{SyntaxError, SyntaxFault, incompatible_grammar};
 use crate::provider::{SyntaxLimits, SyntaxSource};
 
@@ -285,7 +285,7 @@ pub(crate) fn parse_markdown_trees(
         block.root_node(),
         0,
         source.path,
-        limits.syntax_nodes_max(),
+        NodeBound::whole(limits.syntax_nodes_max()),
         limits.syntax_depth_max(),
     )?;
     let (inline_nodes, inline_ranges) =
@@ -441,12 +441,11 @@ fn check_combined_node_bound(
     inline: &[InlineTreeFact],
 ) -> Result<(), SyntaxError> {
     for tree in inline {
-        let remaining = limits.syntax_nodes_max().saturating_sub(node_count);
         let nodes = bounded_tree_nodes(
             tree.tree.root_node(),
             tree.base_depth,
             path,
-            remaining,
+            NodeBound::after(limits.syntax_nodes_max(), node_count),
             limits.syntax_depth_max(),
         )?;
         node_count = node_count.saturating_add(nodes.len());
@@ -478,18 +477,12 @@ pub(crate) fn extract_markdown_facts(
         });
     }
     let error_ranges = sorted_unique_ranges(error_ranges);
+    let errors = ErrorRangeIndex::new(&error_ranges);
     let mut blocks = block_facts.blocks;
-    blocks.retain(|block| {
-        !error_ranges
-            .iter()
-            .any(|error| ranges_overlap(block.range, *error))
-    });
-    links.retain(|link| blocks.iter().any(|block| block.range == link.block_range));
-    reference_candidates.retain(|candidate| {
-        blocks
-            .iter()
-            .any(|block| block.range == candidate.block_range)
-    });
+    blocks.retain(|block| !errors.overlaps(block.range));
+    let block_ranges: HashSet<ByteRange> = blocks.iter().map(|block| block.range).collect();
+    links.retain(|link| block_ranges.contains(&link.block_range));
+    reference_candidates.retain(|candidate| block_ranges.contains(&candidate.block_range));
     blocks.sort_by_key(|block| (block.range.start, block.range.end, block.structure as u8));
     links.sort_by_key(|link| (link.range.start, link.range.end, link.kind as u8));
     reference_candidates.sort_by_key(|candidate| (candidate.range.start, candidate.range.end));
@@ -520,7 +513,7 @@ fn extract_block_facts(
         trees.block.root_node(),
         0,
         source.path,
-        limits.syntax_nodes_max(),
+        NodeBound::whole(limits.syntax_nodes_max()),
         limits.syntax_depth_max(),
     )?;
     let line_starts = rift_core::line::line_starts(source.text);
@@ -528,9 +521,16 @@ fn extract_block_facts(
     let mut heading_for_node = HashMap::new();
     let mut blocks = Vec::new();
     let mut node_blocks = HashMap::with_capacity(block_nodes.len());
+    let heading_symbols = heading_symbols_by_start(syntax);
     // `bounded_tree_nodes` already checked this tree's node and depth limits.
-    let mut stack = vec![(trees.block.root_node(), None::<usize>, None::<ByteRange>)];
-    while let Some((node, inherited_heading, inherited_block)) = stack.pop() {
+    let mut stack = vec![(
+        trees.block.root_node(),
+        None::<Node<'_>>,
+        None::<usize>,
+        None::<ByteRange>,
+    )];
+    let mut cursor = trees.block.walk();
+    while let Some((node, parent, inherited_heading, inherited_block)) = stack.pop() {
         let mut child_heading = inherited_heading;
         if node.kind_id() == kinds.section {
             if let Some(declared) = declaring_heading(node, kinds.atx_heading, kinds.setext_heading)
@@ -538,7 +538,7 @@ fn extract_block_facts(
                     declared,
                     inherited_heading,
                     source.text,
-                    syntax,
+                    &heading_symbols,
                     &mut headings,
                 )?
             {
@@ -546,9 +546,14 @@ fn extract_block_facts(
                 child_heading = Some(index);
             }
         } else if node.kind_id() == kinds.setext_heading
-            && !declares_its_section(node, kinds.atx_heading, kinds.setext_heading)
-            && let Some(index) =
-                add_heading(node, inherited_heading, source.text, syntax, &mut headings)?
+            && !declares_its_section(node, parent, kinds.atx_heading, kinds.setext_heading)
+            && let Some(index) = add_heading(
+                node,
+                inherited_heading,
+                source.text,
+                &heading_symbols,
+                &mut headings,
+            )?
         {
             heading_for_node.insert(node.id(), index);
         }
@@ -585,15 +590,9 @@ fn extract_block_facts(
             node_blocks.insert(node.id(), block_range);
         }
 
-        for child_index in node.child_indices().rev() {
-            let Some(child) = node.child(child_index) else {
-                continue;
-            };
-            if !child.is_named() {
-                continue;
-            }
-            stack.push((child, child_heading, current_block));
-        }
+        extract::push_named_children(&mut stack, &mut cursor, node, |child| {
+            (child, Some(node), child_heading, current_block)
+        });
     }
 
     Ok(MarkdownBlockExtraction {
@@ -639,17 +638,21 @@ fn extract_authored_facts(
             root,
             inline_tree.base_depth,
             source.path,
-            limits.syntax_nodes_max(),
+            NodeBound::whole(limits.syntax_nodes_max()),
             limits.syntax_depth_max(),
         )?;
-        for entry in inline_nodes {
+        for (index, entry) in inline_nodes.iter().enumerate() {
             if entry.node.kind_id() == kinds.code_span {
                 let range = code_span_content_range(entry.node, kinds.code_span_delimiter)?;
                 if range.start < range.end {
                     reference_candidates.push(MarkdownReferenceCandidate { block_range, range });
                 }
             }
-            collect_inline_link(entry.node, block_range, source.text, kinds, &mut links)?;
+            let inline = InlineNode {
+                nodes: &inline_nodes,
+                index,
+            };
+            collect_inline_link(inline, block_range, source.text, kinds, &mut links)?;
         }
     }
     collect_block_links(trees.block.root_node(), source.text, kinds, &mut links)?;
@@ -699,6 +702,35 @@ impl ProgressBudget {
 struct BoundedNode<'tree> {
     node: Node<'tree>,
     depth: usize,
+    /// The parent's index among the walk's nodes; `None` for the root.
+    parent: Option<usize>,
+}
+
+/// One node of a bounded walk, with the walk's nodes its ancestors are read from.
+#[derive(Debug, Clone, Copy)]
+struct InlineNode<'walk, 'tree> {
+    nodes: &'walk [BoundedNode<'tree>],
+    index: usize,
+}
+
+impl<'tree> InlineNode<'_, 'tree> {
+    fn node(self) -> Node<'tree> {
+        self.nodes[self.index].node
+    }
+
+    /// The nearest ancestor whose kind is one of `kinds`, stepping through the
+    /// parents the bounded walk recorded.
+    fn nearest_ancestor(self, kinds: &[u16]) -> Option<Node<'tree>> {
+        let mut current = self.nodes[self.index].parent;
+        while let Some(index) = current {
+            let ancestor = self.nodes[index];
+            if kinds.contains(&ancestor.node.kind_id()) {
+                return Some(ancestor.node);
+            }
+            current = ancestor.parent;
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -770,44 +802,76 @@ fn required_kind(language: &tree_sitter::Language, kind: &str) -> u16 {
     id
 }
 
+/// The nodes one bounded walk may take, and the configured bound its refusal
+/// names.
+#[derive(Debug, Clone, Copy)]
+struct NodeBound {
+    /// Nodes this walk may take: the configured bound less the nodes earlier
+    /// trees of the same source already took.
+    remaining: usize,
+    /// The configured `syntax_nodes_max`.
+    syntax_nodes_max: usize,
+}
+
+impl NodeBound {
+    /// A walk that may take the whole configured bound.
+    fn whole(syntax_nodes_max: usize) -> Self {
+        Self {
+            remaining: syntax_nodes_max,
+            syntax_nodes_max,
+        }
+    }
+
+    /// A walk after earlier trees of the same source took `taken` nodes.
+    fn after(syntax_nodes_max: usize, taken: usize) -> Self {
+        Self {
+            remaining: syntax_nodes_max.saturating_sub(taken),
+            syntax_nodes_max,
+        }
+    }
+
+    /// The refusal for a walk that crossed this bound, naming the configured
+    /// bound rather than what was left of it.
+    fn exceeded(self, path: &ProjectPath) -> SyntaxError {
+        Error::new(SyntaxFault::TooManyNodes {
+            path: path.clone(),
+            syntax_nodes_max: self.syntax_nodes_max,
+        })
+    }
+}
+
 fn bounded_tree_nodes<'tree>(
     root: Node<'tree>,
     base_depth: usize,
     path: &ProjectPath,
-    nodes_max: usize,
+    bound: NodeBound,
     depth_max: usize,
 ) -> Result<Vec<BoundedNode<'tree>>, SyntaxError> {
     let mut result = Vec::new();
-    let mut pending = vec![(root, base_depth)];
-    while let Some((node, depth)) = pending.pop() {
+    let mut pending = vec![(root, base_depth, None)];
+    let mut cursor = root.walk();
+    while let Some((node, depth, parent)) = pending.pop() {
         if depth > depth_max {
             return Err(Error::new(SyntaxFault::TooDeep {
                 path: path.clone(),
                 syntax_depth_max: depth_max,
             }));
         }
-        if result.len() == nodes_max {
-            return Err(Error::new(SyntaxFault::TooManyNodes {
-                path: path.clone(),
-                syntax_nodes_max: nodes_max,
-            }));
+        if result.len() == bound.remaining {
+            return Err(bound.exceeded(path));
         }
-        result.push(BoundedNode { node, depth });
-        for index in node.child_indices().rev() {
-            let Some(child) = node.child(index) else {
-                continue;
-            };
-            if !child.is_named() {
-                continue;
-            }
-            if result.len() + pending.len() >= nodes_max {
-                return Err(Error::new(SyntaxFault::TooManyNodes {
-                    path: path.clone(),
-                    syntax_nodes_max: nodes_max,
-                }));
-            }
-            pending.push((child, depth + 1));
+        let index = result.len();
+        result.push(BoundedNode {
+            node,
+            depth,
+            parent,
+        });
+        if result.len() + pending.len() + node.named_child_count() > bound.remaining {
+            return Err(bound.exceeded(path));
         }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| {
+            (child, depth + 1, Some(index))
+        });
     }
     Ok(result)
 }
@@ -816,11 +880,9 @@ fn inline_parse_ranges(node: Node<'_>, block_continuation: u16) -> Vec<Range> {
     let mut ranges = Vec::new();
     let mut start_byte = node.start_byte();
     let mut start_point = node.start_position();
-    for index in node.child_indices() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
-        if !child.is_named() || child.kind_id() != block_continuation {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind_id() != block_continuation {
             continue;
         }
         let child_range = child.range();
@@ -852,26 +914,43 @@ fn declaring_heading(section: Node<'_>, atx_heading: u16, setext_heading: u16) -
     (first.kind_id() == atx_heading || first.kind_id() == setext_heading).then_some(first)
 }
 
-fn declares_its_section(node: Node<'_>, atx_heading: u16, setext_heading: u16) -> bool {
-    node.parent()
+/// Whether `node` is the heading its parent section declares; the block walk
+/// hands over the parent it already holds.
+fn declares_its_section(
+    node: Node<'_>,
+    parent: Option<Node<'_>>,
+    atx_heading: u16,
+    setext_heading: u16,
+) -> bool {
+    parent
         .and_then(|parent| declaring_heading(parent, atx_heading, setext_heading))
         .is_some_and(|heading| heading.id() == node.id())
+}
+
+/// Each heading symbol's index, by the byte offset it starts at; the first
+/// heading symbol wins where two start at one offset.
+///
+/// Every heading the block walk meets looks its symbol up here, so the
+/// symbols are read once instead of once per heading.
+fn heading_symbols_by_start(syntax: &SyntaxDocument) -> HashMap<u64, usize> {
+    let mut by_start = HashMap::new();
+    for (index, symbol) in syntax.symbols().iter().enumerate() {
+        if symbol.kind == super::HEADING_KIND_WORD {
+            by_start.entry(symbol.range.start).or_insert(index);
+        }
+    }
+    by_start
 }
 
 fn add_heading(
     node: Node<'_>,
     parent: Option<usize>,
     source: &str,
-    syntax: &SyntaxDocument,
+    heading_symbols: &HashMap<u64, usize>,
     headings: &mut Vec<MarkdownHeadingFact>,
 ) -> Result<Option<usize>, SyntaxError> {
     let range = extract::byte_range(node)?;
-    let Some((symbol_index, _)) = syntax
-        .symbols()
-        .iter()
-        .enumerate()
-        .find(|(_, symbol)| symbol.kind == "heading" && symbol.range.start == range.start)
-    else {
+    let Some(&symbol_index) = heading_symbols.get(&range.start) else {
         return Ok(None);
     };
     let level = heading_level(node, source);
@@ -957,6 +1036,7 @@ fn block_is_code(node_kind: u16, kinds: &MarkdownFactKinds) -> bool {
 
 fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<String> {
     let mut pending = vec![node];
+    let mut cursor = node.walk();
     while let Some(current) = pending.pop() {
         if current.kind_id() == info_string_kind {
             let start = current.start_byte();
@@ -964,27 +1044,22 @@ fn code_language(node: Node<'_>, source: &str, info_string_kind: u16) -> Option<
             let info = source.get(start..end)?.trim();
             return info.split_whitespace().next().map(str::to_owned);
         }
-        for index in current.child_indices().rev() {
-            if let Some(child) = current.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, current, |child| child);
     }
     None
 }
 
 fn collect_inline_link(
-    node: Node<'_>,
+    inline: InlineNode<'_, '_>,
     block_range: ByteRange,
     source: &str,
     kinds: &MarkdownFactKinds,
     links: &mut Vec<MarkdownLinkFact>,
 ) -> Result<(), SyntaxError> {
+    let node = inline.node();
     let kind = node.kind_id();
     if kind == kinds.link_destination {
-        let parent_link = nearest_ancestor(node, &[kinds.inline_link, kinds.image]);
+        let parent_link = inline.nearest_ancestor(&[kinds.inline_link, kinds.image]);
         let Some(parent_link) = parent_link else {
             return Ok(());
         };
@@ -1022,6 +1097,7 @@ fn collect_block_links(
     links: &mut Vec<MarkdownLinkFact>,
 ) -> Result<(), SyntaxError> {
     let mut pending = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
         if node.kind_id() == kinds.link_reference_definition {
             let range = extract::byte_range(node)?;
@@ -1037,36 +1113,19 @@ fn collect_block_links(
                 label_range: label.map(extract::byte_range).transpose()?,
             });
         }
-        for index in node.child_indices().rev() {
-            if let Some(child) = node.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
     }
     Ok(())
 }
 
 fn child_node(node: Node<'_>, kind: u16) -> Option<Node<'_>> {
-    node.child_indices()
-        .filter_map(|index| node.child(index))
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
         .find(|child| child.kind_id() == kind)
 }
 
 fn child_range(node: Node<'_>, kind: u16) -> Result<Option<ByteRange>, SyntaxError> {
     child_node(node, kind).map(extract::byte_range).transpose()
-}
-
-fn nearest_ancestor<'tree>(node: Node<'tree>, kinds: &[u16]) -> Option<Node<'tree>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if kinds.contains(&parent.kind_id()) {
-            return Some(parent);
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
@@ -1088,10 +1147,8 @@ fn fragment_range(source: &str, destination: ByteRange) -> Option<ByteRange> {
 fn code_span_content_range(node: Node<'_>, delimiter_kind: u16) -> Result<ByteRange, SyntaxError> {
     let mut first = None;
     let mut last = None;
-    for index in node.child_indices() {
-        let Some(child) = node.child(index) else {
-            continue;
-        };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         if child.kind_id() == delimiter_kind {
             let range = extract::byte_range(child)?;
             first.get_or_insert(range);
@@ -1116,17 +1173,12 @@ fn tree_error_ranges(root: Node<'_>) -> Result<Vec<ByteRange>, SyntaxError> {
 
 fn append_tree_errors(root: Node<'_>, ranges: &mut Vec<ByteRange>) -> Result<(), SyntaxError> {
     let mut pending = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = pending.pop() {
         if node.is_error() || node.is_missing() {
             ranges.push(extract::byte_range(node)?);
         }
-        for index in node.child_indices().rev() {
-            if let Some(child) = node.child(index)
-                && child.is_named()
-            {
-                pending.push(child);
-            }
-        }
+        extract::push_named_children(&mut pending, &mut cursor, node, |child| child);
     }
     Ok(())
 }
@@ -1192,10 +1244,74 @@ fn nearest_kept_heading(
     None
 }
 
-fn ranges_overlap(left: ByteRange, right: ByteRange) -> bool {
-    left.start < right.end && right.start < left.end
-        || left.start == left.end && right.start <= left.start && left.start <= right.end
-        || right.start == right.end && left.start <= right.start && right.start <= left.end
+/// The error ranges of one source, prepared so each block's overlap check is a
+/// binary search instead of a scan over every error range.
+///
+/// A non-empty block overlaps a non-empty error range it shares a byte with,
+/// and an empty error range whose position lies within the block, both ends
+/// included: a zero-width missing node at a block's edge still marks it. An
+/// empty block overlaps every error range whose ends enclose its position,
+/// both ends included.
+#[derive(Debug)]
+struct ErrorRangeIndex {
+    /// The non-empty error ranges' starts, ascending, each beside the largest
+    /// end among that range and every range before it.
+    spans: Vec<(u64, u64)>,
+    /// The empty error ranges' positions, ascending.
+    points: Vec<u64>,
+}
+
+impl ErrorRangeIndex {
+    /// Indexes `error_ranges`, sorted by start as `sorted_unique_ranges`
+    /// leaves them.
+    fn new(error_ranges: &[ByteRange]) -> Self {
+        let mut spans = Vec::new();
+        let mut points = Vec::new();
+        let mut end_max = 0;
+        for range in error_ranges {
+            if range.start == range.end {
+                points.push(range.start);
+            } else {
+                end_max = end_max.max(range.end);
+                spans.push((range.start, end_max));
+            }
+        }
+        Self { spans, points }
+    }
+
+    /// Whether `range` overlaps any indexed error range.
+    fn overlaps(&self, range: ByteRange) -> bool {
+        if range.start == range.end {
+            return self.encloses(range.start);
+        }
+        self.span_overlaps(range) || self.point_within(range)
+    }
+
+    /// Whether a non-empty error range starts before `range` ends and ends
+    /// after it starts.
+    fn span_overlaps(&self, range: ByteRange) -> bool {
+        let starting_before_end = self.spans.partition_point(|(start, _)| *start < range.end);
+        starting_before_end
+            .checked_sub(1)
+            .is_some_and(|last| self.spans[last].1 > range.start)
+    }
+
+    /// Whether an empty error range lies within `range`, both ends included.
+    fn point_within(&self, range: ByteRange) -> bool {
+        let first = self.points.partition_point(|point| *point < range.start);
+        self.points
+            .get(first)
+            .is_some_and(|point| *point <= range.end)
+    }
+
+    /// Whether an error range's ends enclose `position`, both ends included.
+    fn encloses(&self, position: u64) -> bool {
+        let starting_by_position = self.spans.partition_point(|(start, _)| *start <= position);
+        let in_span = starting_by_position
+            .checked_sub(1)
+            .is_some_and(|last| self.spans[last].1 >= position);
+        in_span || self.points.binary_search(&position).is_ok()
+    }
 }
 
 fn sorted_unique_ranges(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
@@ -1317,7 +1433,8 @@ mod tests {
             .set_language(&tree_sitter_md::LANGUAGE.into())
             .expect("pinned grammar");
         let tree = parser.parse("", None).expect("empty document parses");
-        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, 0, 16) else {
+        let Err(error) = bounded_tree_nodes(tree.root_node(), 0, &path, NodeBound::whole(0), 16)
+        else {
             panic!("root exceeds zero node bound");
         };
         assert_eq!(
@@ -1326,13 +1443,119 @@ mod tests {
         );
     }
 
+    /// The pairwise overlap rule [`ErrorRangeIndex`] answers, checked one error
+    /// range at a time: the oracle the index is compared against.
+    fn ranges_overlap(left: ByteRange, right: ByteRange) -> bool {
+        left.start < right.end && right.start < left.end
+            || left.start == left.end && right.start <= left.start && left.start <= right.end
+            || right.start == right.end && left.start <= right.start && right.start <= left.end
+    }
+
+    fn range(start: u64, end: u64) -> ByteRange {
+        ByteRange { start, end }
+    }
+
+    fn overlaps_indexed(block: ByteRange, errors: &[ByteRange]) -> bool {
+        ErrorRangeIndex::new(&sorted_unique_ranges(errors.to_vec())).overlaps(block)
+    }
+
     #[test]
     fn parser_error_ranges_include_zero_width_missing_nodes() {
-        let containing = ByteRange { start: 1, end: 5 };
-        assert!(ranges_overlap(containing, ByteRange { start: 3, end: 3 }));
-        assert!(ranges_overlap(ByteRange { start: 1, end: 1 }, containing));
-        assert!(!ranges_overlap(containing, ByteRange { start: 6, end: 6 }));
-        assert!(!ranges_overlap(containing, ByteRange { start: 5, end: 8 }));
+        let containing = range(1, 5);
+        assert!(overlaps_indexed(containing, &[range(3, 3)]));
+        assert!(overlaps_indexed(range(1, 1), &[containing]));
+        assert!(!overlaps_indexed(containing, &[range(6, 6)]));
+        assert!(!overlaps_indexed(containing, &[range(5, 8)]));
+    }
+
+    #[test]
+    fn error_range_index_answers_the_pairwise_rule_for_every_small_case() {
+        let ranges: Vec<ByteRange> = (0..=5_u64)
+            .flat_map(|start| (start..=5).map(move |end| range(start, end)))
+            .collect();
+        let count = ranges.len();
+        let error_sets = (0..count).flat_map(|first| {
+            (first..count)
+                .flat_map(move |second| (second..count).map(move |third| [first, second, third]))
+        });
+        for set in error_sets {
+            let errors = set.map(|index| ranges[index]);
+            let index = ErrorRangeIndex::new(&sorted_unique_ranges(errors.to_vec()));
+            for block in &ranges {
+                assert_eq!(
+                    index.overlaps(*block),
+                    errors.iter().any(|error| ranges_overlap(*block, *error)),
+                    "the index must answer the pairwise rule: block={block:?}, errors={errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_error_ranges_drop_exactly_the_blocks_they_touch() {
+        const BLOCKS: u64 = 20_000;
+        let blocks: Vec<ByteRange> = (0..BLOCKS)
+            .map(|index| range(index * 10, index * 10 + 5))
+            .collect();
+        let errors: Vec<ByteRange> = (0..BLOCKS)
+            .filter_map(|index| match index % 4 {
+                0 | 2 => Some(range(index * 10 + 1, index * 10 + 2)),
+                1 => Some(range(index * 10 + 5, index * 10 + 5)),
+                _ => None,
+            })
+            .collect();
+        let index = ErrorRangeIndex::new(&sorted_unique_ranges(errors));
+        let kept: Vec<u64> = blocks
+            .iter()
+            .filter(|block| !index.overlaps(**block))
+            .map(|block| block.start / 10)
+            .collect();
+        let expected: Vec<u64> = (0..BLOCKS).filter(|index| index % 4 == 3).collect();
+        assert_eq!(
+            kept, expected,
+            "a span inside a block and an empty range on its end both drop it; untouched blocks stay"
+        );
+    }
+
+    #[test]
+    fn inline_trees_past_the_combined_node_bound_name_the_configured_bound() {
+        let text = "# Title\n\nSome *emphasis* and `code` with a [link](target).\n";
+        let path = ProjectPath::new("docs/facts.md").expect("valid path");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .expect("pinned grammar");
+        let block = parser.parse(text, None).expect("fixture parses");
+        let block_nodes =
+            bounded_tree_nodes(block.root_node(), 0, &path, NodeBound::whole(1024), 16)
+                .expect("the block tree fits")
+                .len();
+        let syntax_nodes_max = block_nodes + 1;
+        let source = SyntaxSource { path: &path, text };
+        let error = parse_markdown_trees(
+            source,
+            SyntaxLimits::declared(1024, syntax_nodes_max, 16),
+            MarkdownParseBounds::default(),
+        )
+        .expect_err("the inline trees cross the bound the block tree left");
+        assert_eq!(
+            error.fault().violation(),
+            crate::SyntaxViolation::TooManyNodes
+        );
+        assert!(
+            error.context().contains(&ErrorContext::new(
+                "syntax_nodes_max",
+                syntax_nodes_max.to_string()
+            )),
+            "the refusal must name the configured bound: context={:?}",
+            error.context()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("syntax_nodes_max {syntax_nodes_max}")),
+            "the message must name the configured bound: {error}"
+        );
     }
 
     #[test]

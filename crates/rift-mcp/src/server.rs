@@ -53,6 +53,8 @@ use crate::global::{
     GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, callee_declarations,
     merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
 };
+use crate::history::{AnalysisGate, HistoryLane};
+use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
 use crate::parameters::Parameters;
 use crate::resource;
@@ -1457,6 +1459,13 @@ pub struct RiftMcp {
     /// The last request-time capture's stats and digests: the next capture reads only the
     /// paths whose stat moved since.
     last_capture: Arc<std::sync::Mutex<Arc<LastCapture>>>,
+    /// The authorized requests in flight, which the history task waits on before a batch
+    /// and the HTTP transport counts.
+    activity: Arc<IdleTracker>,
+    /// The history lane, absent when `[providers.history]` is off, the workspace has no
+    /// repository, or no folder takes the store; symbol history then walks git per
+    /// request.
+    history: Option<HistoryLane>,
     /// The capture a test forces in place of reading the tree, so every retry arm of the
     /// bounded reconciliation loop is reached without racing filesystem events.
     #[cfg(test)]
@@ -1571,6 +1580,7 @@ impl RiftMcp {
             checkout,
             workspace_watcher,
             LexicalLane::spawn,
+            None,
         )
         .await?;
         Ok(assembled.supervised().await)
@@ -1596,6 +1606,7 @@ impl RiftMcp {
             CancellationToken,
             Arc<str>,
         ) -> LexicalLane,
+        history_gate: Option<AnalysisGate>,
     ) -> Result<AssembledServer, ReadError> {
         let identity = crate::identity::product_identity(checkout)
             .await
@@ -1613,6 +1624,14 @@ impl RiftMcp {
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
         let storage = Self::resolve_storage(&root, storage).await;
+        let (activity, history) = Self::open_history_tier(
+            &root,
+            &startup_configuration,
+            &product_version,
+            validation.cancellation.clone(),
+            history_gate,
+        )
+        .await;
         let SearchTier {
             acquisition,
             search_index,
@@ -1679,6 +1698,8 @@ impl RiftMcp {
             logs,
             engines,
             last_capture: Arc::default(),
+            activity,
+            history,
             #[cfg(test)]
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
@@ -1689,6 +1710,21 @@ impl RiftMcp {
             invalidations,
             context,
         })
+    }
+
+    /// Opens the history tier: the authorized requests in flight, which every transport
+    /// counts, and the history lane that waits on them before each batch.
+    async fn open_history_tier(
+        root: &Path,
+        configuration: &ConfigurationState,
+        product_version: &str,
+        cancellation: CancellationToken,
+        gate: Option<AnalysisGate>,
+    ) -> (Arc<IdleTracker>, Option<HistoryLane>) {
+        let activity = Arc::new(IdleTracker::new());
+        let task = (Arc::clone(&activity), cancellation, gate);
+        let history = HistoryLane::start(root, configuration, product_version, task).await;
+        (activity, history)
     }
 
     /// Starts the filesystem watcher `watch` creates over `root`, on the worker pool.
@@ -1767,6 +1803,12 @@ impl RiftMcp {
     #[must_use]
     pub(crate) fn product_identity(&self) -> &ProductIdentity {
         &self.identity
+    }
+
+    /// The authorized requests in flight, which the HTTP transport counts and the
+    /// history task waits on.
+    pub(crate) fn request_activity(&self) -> Arc<IdleTracker> {
+        Arc::clone(&self.activity)
     }
 
     /// Returns owned supervisor shutdown access for transport adapters.
@@ -1866,15 +1908,16 @@ impl RiftMcp {
     /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
     /// regex against the text of every indexed file, line by line as ripgrep reads it, and
     /// answers each match and each declaration holding one, in place of `query` and
-    /// `traversal`. `change` answers the declarations two committed revisions hold
-    /// differently, in place of `query` and `traversal`. `rev` searches a version-control
-    /// revision instead of the current tree, and never combines with `pattern`, `traversal`,
-    /// or `change`. `scope` reaches past the project tree: `global` answers `query` from the
-    /// public declarations the global index holds for the workspace's dependencies alone and
-    /// `pattern` from their source, `all` from both, ordered together. `packages` names
-    /// package versions `query` and `pattern` search beside the workspace's own, such as an
-    /// upgrade target or a package the project does not use yet. Use `get_symbol` when the
-    /// declaration name is known.
+    /// `traversal`. `change` answers the declarations a committed revision and another
+    /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
+    /// `rev` searches a version-control revision instead of the current tree, and never
+    /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
+    /// tree: `global` answers `query` from the public declarations the global index holds for
+    /// the workspace's dependencies alone and `pattern` from their source, `all` from both,
+    /// ordered together. `packages` names package versions `query` and `pattern` search beside
+    /// the workspace's own, such as an upgrade target or a package the project does not use
+    /// yet. `target: "commit"` matches `query` alone against the messages of the commits the
+    /// history store holds. Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1886,6 +1929,9 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<Json<SearchResult>, ErrorData> {
+        if params.target == rift_protocol::read::SearchParamsTarget::Commit {
+            return self.commit_search(params).await;
+        }
         if let Some(change) = params.change.clone() {
             return self.change_search(params, change).await;
         }
@@ -1903,17 +1949,39 @@ impl RiftMcp {
         .await
     }
 
-    /// Compares the two committed revisions `change` names and answers the declarations
-    /// they hold differently.
+    /// Answers a commit search from the history store the server opened, behind the
+    /// acceptance gate every request passes. The answer reads no published tree, so it
+    /// carries no `stale_index`.
+    async fn commit_search(&self, params: SearchParams) -> Result<Json<SearchResult>, ErrorData> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        resolved
+            .published
+            .configuration
+            .accepted(wire::ErrorPhase::Read)?;
+        let reads = Arc::clone(&resolved.published.reads);
+        if let Some(history) = &self.history {
+            reads.attach_history_store(history.stored());
+        }
+        self.blocking
+            .run("commit search", move || reads.search_commits(&params))
+            .await
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// Compares the committed revision `change` names against another revision or the
+    /// working tree, and answers the declarations the two sides hold differently.
     ///
-    /// The comparison reads both sides from the workspace's git objects with no checkout,
-    /// under the same `[source]` policy and bounds a revision read applies, and
-    /// `[providers.history] enabled = false` refuses it the same way. Neither side is the
-    /// current tree, so the search index never takes part.
-    ///
-    /// A `traversal` riding beside the comparison walks the current publication's
-    /// relationship graph, so that publication is resolved once here and handed to the
-    /// comparison along with the revision policy.
+    /// A committed side is read from the workspace's git objects with no checkout, under
+    /// the same `[source]` policy and bounds a revision read applies, and
+    /// `[providers.history] enabled = false` refuses the comparison the same way. The
+    /// working-tree side is the current publication's index, resolved once here, and the
+    /// answer carries `stale_index` when that publication is served in spite of a
+    /// recorded rebuild failure, as any current-tree read does. The search index never
+    /// takes part.
     async fn change_search(
         &self,
         params: SearchParams,
@@ -1932,20 +2000,30 @@ impl RiftMcp {
             languages,
             history: _,
         } = revision_read;
-        self.blocking
+        // A committed head reads no publication, so only the working tree answers for the
+        // publication's lag.
+        let stale = match &change.head {
+            rift_protocol::read::ChangeHead::Tree(_) => resolved.stale.clone(),
+            rift_protocol::read::ChangeHead::Revision(_) => None,
+        };
+        let current = Arc::clone(&resolved.published.reads);
+        let mut answer = self
+            .blocking
             .run("revision comparison read", move || {
                 rift_server::search_change(
                     &root,
                     &params,
                     &change,
+                    &current,
                     limits,
                     &visibility,
                     (&text_inclusion, &languages),
                 )
             })
             .await
-            .map(Json)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(stale);
+        Ok(Json(answer))
     }
 
     /// Ranks and reads one current-tree search against one publication.
@@ -2702,6 +2780,7 @@ impl RiftMcp {
             languages,
             history,
         } = self.revision_read(&resolved.published)?;
+        let stored = self.history.as_ref().map(|lane| lane.stored().clone());
         self.blocking
             .run("revision workspace read", move || {
                 let reads = ReadService::at_revision_with_languages(
@@ -2713,6 +2792,9 @@ impl RiftMcp {
                     &languages,
                     history,
                 )?;
+                if let Some(stored) = &stored {
+                    reads.attach_history_store(stored);
+                }
                 operation(&reads)
             })
             .await
@@ -2767,6 +2849,9 @@ impl RiftMcp {
             .configuration
             .accepted(wire::ErrorPhase::Read)?;
         let reads = Arc::clone(&resolved.published.reads);
+        if let Some(history) = &self.history {
+            reads.attach_history_store(history.stored());
+        }
         let mut answer = self
             .blocking
             .run("current workspace read", move || operation(&reads))
@@ -4297,6 +4382,7 @@ done
             crate::identity::BuildCheckout::Unversioned,
             unwatched,
             LexicalLane::spawn,
+            None,
         )
         .await?;
         let server = assembled.supervised().await;
@@ -4997,7 +5083,7 @@ done
         let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
         let message = data.message.as_ref();
         assert!(
-            message.contains("field target, accepted all, documentation, file, symbol"),
+            message.contains("field target, accepted all, commit, documentation, file, symbol"),
             "{message}"
         );
         assert!(
@@ -5098,6 +5184,7 @@ done
             crate::identity::BuildCheckout::Unversioned,
             unwatched,
             LexicalLane::spawn,
+            None,
         )
         .await?;
         Ok(UnsupervisedServer {
@@ -5486,6 +5573,248 @@ done
         assert!(
             detail.contains("the next filesystem event retries"),
             "{detail}"
+        );
+        Ok(())
+    }
+
+    /// A gate the history task meets before each commit's analysis: the first meeting
+    /// is announced, and every meeting holds its blocking thread until the test opens
+    /// the gate.
+    struct HeldAnalysis {
+        reached: Option<std::sync::mpsc::Receiver<()>>,
+        open: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl HeldAnalysis {
+        fn new() -> (Self, crate::history::AnalysisGate) {
+            let (announce, reached) = std::sync::mpsc::channel();
+            let announce = std::sync::Mutex::new(Some(announce));
+            let open = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let held = Arc::clone(&open);
+            let gate: crate::history::AnalysisGate = Arc::new(move || {
+                if let Some(announce) = announce.lock().expect("the announcer lock").take() {
+                    announce
+                        .send(())
+                        .expect("the test waits for the announcement");
+                }
+                let (lock, signal) = &*held;
+                let mut opened = lock.lock().expect("the gate lock");
+                while !*opened {
+                    opened = signal.wait(opened).expect("the gate lock");
+                }
+            });
+            (
+                Self {
+                    reached: Some(reached),
+                    open,
+                },
+                gate,
+            )
+        }
+
+        /// Waits until the task meets the gate for the first time.
+        async fn reached(&mut self) -> TestResult {
+            let reached = self
+                .reached
+                .take()
+                .ok_or("the first meeting is awaited once")?;
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(30)))
+                .await?
+                .map_err(|_| "the history task never reached its first analysis")?;
+            Ok(())
+        }
+
+        /// Opens the gate for every meeting from now on.
+        fn release(&self) {
+            let (lock, signal) = &*self.open;
+            *lock.lock().expect("the gate lock") = true;
+            signal.notify_all();
+        }
+    }
+
+    impl Drop for HeldAnalysis {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    /// One `get_symbol` for `beacon` with its history.
+    async fn beacon_history(server: &RiftMcp) -> TestResult<rift_protocol::read::SymbolHistory> {
+        let params = serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.get_symbol(Parameters(params)))
+            .await
+            .map_err(|_| "a history read waits on no fill")??
+            .0;
+        let hit = answer.hits.into_iter().next().ok_or("beacon answers")?;
+        Ok(hit.history.ok_or("the hit carries its history")?)
+    }
+
+    #[tokio::test]
+    async fn requests_answer_while_the_history_task_is_held_mid_batch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let (mut held, gate) = HeldAnalysis::new();
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(directory.path())?,
+            WorkspaceIndexLimits::default(),
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
+            LexicalLane::spawn,
+            Some(gate),
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        held.reached().await?;
+
+        let lagging = beacon_history(&server).await?;
+        let search: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
+        let searched = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(search)))
+            .await
+            .map_err(|_| "a search waits on no fill")??
+            .0;
+
+        assert!(
+            !lagging.complete,
+            "the store holds nothing while the task is held"
+        );
+        assert!(lagging.versions.is_empty());
+        assert!(!searched.results.is_empty(), "{searched:#?}");
+
+        held.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let filled = loop {
+            let history = beacon_history(&server).await?;
+            if history.complete {
+                break history;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the store never caught up with the served commit".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let kinds: Vec<_> = filled.versions.iter().map(|version| version.kind).collect();
+        assert_eq!(kinds, [rift_protocol::read::SymbolVersionKind::Introduced]);
+        assert_eq!(filled.versions[0].author.name, "Rift Fixture");
+        Ok(())
+    }
+
+    /// One commit search for `beacon`, validated against the output schema the router serves
+    /// for `search`.
+    async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
+        let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params)))
+            .await
+            .map_err(|_| "a commit search waits on no fill")??
+            .0;
+        let output_schema = RiftMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "search")
+            .and_then(|tool| tool.output_schema)
+            .ok_or("search serves an output schema")?;
+        let validator =
+            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
+        let wire = serde_json::to_value(&answer)?;
+        let errors: Vec<String> = validator
+            .iter_errors(&wire)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}: {wire:#}");
+        Ok(answer)
+    }
+
+    /// While the history task is held before its first commit, a commit search answers
+    /// nothing and says the store is filling, naming how many selected commits it holds;
+    /// once the fill lands, the same search answers the commit and carries no warning.
+    #[tokio::test]
+    async fn a_commit_search_says_the_store_is_filling_until_the_fill_lands() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let (mut held, gate) = HeldAnalysis::new();
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(directory.path())?,
+            WorkspaceIndexLimits::default(),
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
+            LexicalLane::spawn,
+            Some(gate),
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        held.reached().await?;
+
+        let filling = beacon_commits(&server).await?;
+
+        assert!(filling.results.is_empty(), "{filling:#?}");
+        let [
+            ReadWarning::HistoryStoreFilling {
+                analyzed, total, ..
+            },
+        ] = filling.warnings.as_slice()
+        else {
+            return Err(format!("one filling warning: {:?}", filling.warnings).into());
+        };
+        assert_eq!((*analyzed, *total), (0, 1));
+
+        held.release();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let filled = loop {
+            let answer = beacon_commits(&server).await?;
+            if answer.warnings.is_empty() {
+                break answer;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("the store never filled: {answer:#?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(filled.results.len(), 1, "{filled:#?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_working_tree_change_under_a_rebuild_failure_answers_stale() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        rift_history::fixture::init(directory.path());
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        rift_history::fixture::commit_all(directory.path(), "introduce beacon");
+        let assembled = unsupervised_server(directory.path()).await?;
+        let server = &assembled.server;
+        fail_rebuild_after_events(directory.path(), server, 1).await?;
+
+        let request = json!({"change": {"base": "HEAD", "head": {"kind": "working_tree"}}});
+        let working_tree: SearchParams = serde_json::from_value(request)?;
+        let answer =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(working_tree)))
+                .await
+                .map_err(|_| "a comparison under a recorded failure must not wait")??
+                .0;
+
+        assert!(
+            answer.results.is_empty(),
+            "the published snapshot predates `lantern`: {answer:#?}"
+        );
+        let (index, _captured, detail) = stale_index_of(&answer.warnings)?;
+        assert_eq!(
+            index,
+            server.published.read().await.current.reads.tree_revision()
+        );
+        assert!(detail.contains("injected failure"), "{detail}");
+
+        let committed: SearchParams = serde_json::from_value(json!({"change": {"base": "HEAD"}}))?;
+        let answer = server.search(Parameters(committed)).await?.0;
+        assert!(
+            stale_index_of(&answer.warnings).is_err(),
+            "a committed head reads no publication: {answer:#?}"
         );
         Ok(())
     }
@@ -6255,6 +6584,7 @@ done
                     product_version,
                 )
             },
+            None,
         )
         .await?;
         let server = assembled.supervised().await;
@@ -6309,6 +6639,7 @@ done
                     product_version,
                 )
             },
+            None,
         )
         .await?;
         let server = assembled.supervised().await;
@@ -6542,6 +6873,7 @@ done
                     product_version,
                 )
             },
+            None,
         )
         .await?;
         let server = assembled.supervised().await;

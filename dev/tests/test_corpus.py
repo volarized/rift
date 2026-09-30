@@ -20,7 +20,6 @@ from rift_dev.corpus_assertions import (
     PROBE_PATH,
     PROBE_SOURCE,
     TEXT_CHUNK_BYTES,
-    active_operation,
     active_stdout,
     build_records,
     chunked_answer,
@@ -409,52 +408,42 @@ class Decisions(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 active_stdout(output, "rebuild", None)
 
-    def test_synchronous_history_refuses_finished_or_partial_records(self) -> None:
-        start = 'DEBUG rift_server::history: symbol history started component="index" operation="get_symbol" phase="start"\n'
-        self.assertEqual(active_stdout(start, "history", None), start.strip())
-        close = 'DEBUG get_symbol{component="index" operation="get_symbol" phase="history"}: rift_server::history: close time.busy=1s\n'
-        for output in (start + close, start.rstrip(), start + close.rstrip()):
-            with self.assertRaises(AssertionError):
-                active_stdout(output, "history", None)
-
-    def test_stop_requires_started_work_and_rejects_completed_history(self) -> None:
-        start: JsonObject = {
-            "identity": 2,
-            "operation": "get_symbol",
-            "fields": {"phase": "start"},
-        }
-        closed: JsonObject = {
-            "identity": 3,
-            "operation": "get_symbol",
-            "fields": {"span": "closed"},
-        }
-        self.assertEqual(active_operation([start], "history", 1, True), 2)
-        for found, pending in (
-            ([start], False),
-            ([start, closed], True),
-            ([start], True),
-        ):
-            after = 2 if found == [start] and pending else 1
-            with self.assertRaises(AssertionError):
-                active_operation(found, "history", after, pending)
-
-    def test_stop_rebuild_allows_answered_stale_read_but_refuses_matching_close(
+    def test_synchronous_history_requires_an_open_batch_with_pending_commits(
         self,
     ) -> None:
-        start: JsonObject = {
-            "identity": 2,
-            "operation": "index.build",
-            "fields": {"phase": "start", "epoch": "7"},
-        }
-        closed: JsonObject = {
-            "identity": 3,
-            "operation": "",
-            "message": "index.build",
-            "fields": {"span": "closed", "epoch": "7"},
-        }
-        self.assertEqual(active_operation([start], "rebuild", 1, False), 2)
-        with self.assertRaises(AssertionError):
-            active_operation([start, closed], "rebuild", 1, True)
+        span = 'history.batch{component="history" operation="history.batch"}'
+        start = (
+            f"DEBUG {span}: rift_mcp::history: history batch started "
+            'component="history" operation="history.batch" phase="start" pending=4\n'
+        )
+        close = f"INFO {span}: rift_mcp::history: close time.busy=1ms time.idle=2s\n"
+        analyzed = (
+            f'INFO {span}:history.analyze{{component="history" operation="history.analyze"}}:'
+            " rift_mcp::history: close time.busy=1s\n"
+        )
+        written = (
+            f'INFO {span}:history.write{{component="history" operation="history.write"}}:'
+            " rift_mcp::history: close time.busy=1ms\n"
+        )
+        self.assertEqual(active_stdout(start, "history", None), start.strip())
+        self.assertEqual(
+            active_stdout(start + analyzed + written, "history", None), start.strip()
+        )
+        self.assertEqual(
+            active_stdout(start + close + start, "history", None), start.strip()
+        )
+        for output in (
+            start + close,
+            start + analyzed + close,
+            start.rstrip(),
+            start + close.rstrip(),
+            start.replace("pending=4", "pending=0"),
+            start.replace(" pending=4", ""),
+            start.replace("history batch started", "history batch opened"),
+            start + close + start.replace("pending=4", "pending=0"),
+        ):
+            with self.assertRaises(AssertionError):
+                active_stdout(output, "history", None)
 
     def test_log_page_refuses_missing_store_and_truncation(self) -> None:
         answers: list[JsonObject] = [
