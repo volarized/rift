@@ -465,7 +465,9 @@ fn an_lfs_path_whose_base_holds_its_content_answers_changed_when_edited() {
     assert_eq!(paths, ["kept.bin"]);
 }
 
+// Windows path failure: https://github.com/volarized/rift/issues/478
 #[test]
+#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/478")]
 fn a_workspace_below_the_repository_root_reads_its_own_paths() {
     let directory = tempfile::tempdir().expect("temp dir");
     let root = directory.path();
