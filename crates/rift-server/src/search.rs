@@ -2030,6 +2030,36 @@ impl Tower {
         Ok((directory, service))
     }
 
+    /// One commit hit at `revision`, as a commit search answers it.
+    fn commit_search_hit(revision: &str) -> TestResult<SearchHit> {
+        let hit = serde_json::from_value(json!({
+            "hit": {"target": "commit", "commit": {
+                "revision": revision,
+                "message": "Fix the release notes\n",
+                "message_truncated": false,
+                "author": {"name": "Rift Fixture", "email": "fixture@rift.invalid"},
+                "timestamp": "2026-01-01T00:03:00+00:00",
+                "paths": ["NOTES.md"],
+                "paths_truncated": false
+            }}
+        }))?;
+        Ok(hit)
+    }
+
+    #[test]
+    fn a_commit_hit_names_no_declaration_and_orders_by_its_revision() -> TestResult {
+        let newer = "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4";
+        let older = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+        let mut hits = vec![commit_search_hit(newer)?, commit_search_hit(older)?];
+
+        super::order_hits(&mut hits, ResultOrder::Identity);
+
+        assert!(hits.iter().all(|hit| super::hit_symbol_id(hit).is_none()));
+        let revisions: Vec<&str> = hits.iter().map(super::hit_identity).collect();
+        assert_eq!(revisions, [older, newer]);
+        Ok(())
+    }
+
     #[test]
     fn project_symbol_lines_wait_for_paging_and_use_the_held_source() -> TestResult {
         let directory = tempfile::tempdir()?;

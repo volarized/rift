@@ -18,7 +18,7 @@ use rift_syntax::SyntaxLimits;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::commit::commit_conflict;
+use super::commit::{commit_conflict, commit_hit};
 use crate::HistoryAnalysis;
 use crate::history::{FillProgress, StoredHistory};
 use crate::read::{ReadFault, ReadService};
@@ -259,6 +259,70 @@ fn a_commit_search_past_the_results_bound_warns_results_truncated() -> TestResul
     assert_eq!(
         answer.warnings,
         [ReadWarning::ResultsTruncated { results_max: 1 }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_commit_search_whose_every_term_phase_fills_the_bound_adds_no_broad_match() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let history = HistoryConfiguration::default();
+    let store = filled_store(directory.path(), folder.path(), &history)?;
+    let limits = WorkspaceIndexLimits::new(10_000, 1 << 20, 64 << 20, 64, 1)?;
+    let service = service(directory.path(), limits, history, Some(&store))?;
+
+    // Two commits carry both terms, one past the bound of one, so the release notes
+    // commit carrying `the` alone is never read into the answer.
+    let answer = service.search_commits(&commit_search("the beacon")?)?;
+
+    assert_eq!(summaries(&answer), ["Grow the beacon body"]);
+    assert_eq!(
+        answer.warnings,
+        [ReadWarning::ResultsTruncated { results_max: 1 }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_commit_trimmed_between_the_match_and_the_read_answers_no_hit() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let history = HistoryConfiguration::default();
+    let store = filled_store(directory.path(), folder.path(), &history)?;
+    let reads = store.reader().connect()?;
+    let matched = reads.search_messages("release", 10)?;
+    let mut filler = store.filler()?.ok_or("no other filler runs")?;
+    filler.trim(&std::collections::BTreeSet::new())?;
+
+    let hit = commit_hit(&reads, &matched[0])?;
+
+    assert_eq!(matched.len(), 1);
+    assert!(hit.is_none(), "{hit:?}");
+    Ok(())
+}
+
+#[test]
+fn a_commit_search_over_a_store_whose_message_index_is_gone_refuses() -> TestResult {
+    use rift_core::{ErrorCode, ErrorName, Fault as _};
+
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let service = searchable(directory.path(), folder.path())?;
+    let store_folder = folder.path().join(rift_history_store::STORE_FOLDER_NAME);
+    let connection = rusqlite::Connection::open(store_folder.join("store-aa.db"))?;
+    connection.execute_batch("DROP TABLE commit_text;")?;
+
+    let refused = service.search_commits(&commit_search("beacon")?);
+
+    let error = refused.expect_err("no message index answers the match");
+    assert_eq!(
+        error.fault().name(),
+        ErrorName::Wire(ErrorCode::StorageFailure)
+    );
+    assert!(
+        error.to_string().contains("search commit messages"),
+        "{error}"
     );
     Ok(())
 }
