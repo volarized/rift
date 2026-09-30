@@ -1604,6 +1604,28 @@ mod tests {
         assert_eq!(merged.results.len(), hits.len());
     }
 
+    /// A package candidate ranks under the column its match names, and under the qualified
+    /// name when its match names no column the store holds.
+    #[test]
+    fn a_package_candidate_ranks_under_the_column_its_match_names() {
+        use rift_protocol::read::{MatchedField, SearchResult};
+        use rift_ranking::{FieldSet, SearchableField};
+
+        let example: SearchResult = authored_example();
+        let cases = [
+            (MatchedField::Name, SearchableField::Name),
+            (MatchedField::Signature, SearchableField::Signature),
+            (MatchedField::Documentation, SearchableField::Documentation),
+            (MatchedField::Content, SearchableField::FileContent),
+            (MatchedField::Path, SearchableField::QualifiedName),
+        ];
+        for (matched, field) in cases {
+            let mut hit = example.results[0].clone();
+            hit.matched_by = vec![matched];
+            assert_eq!(super::candidate_fields(&hit), FieldSet::of(field));
+        }
+    }
+
     /// A project search hit the merge cannot rank refuses the search as the server's own
     /// internal error, naming the hit, or its kind when it carries no identity.
     #[test]
