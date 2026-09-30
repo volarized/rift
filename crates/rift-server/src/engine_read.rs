@@ -1077,7 +1077,6 @@ async fn references_on_engine(
                     .is_ok_and(|locations| locations.len() <= 1),
             )
         },
-        |_report| None,
         deadline,
     )
     .await
