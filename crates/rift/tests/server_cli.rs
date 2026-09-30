@@ -1272,7 +1272,9 @@ const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
 /// locks lazily, so the first server `rift server start` spawns loses an
 /// election no process holds and exits. Once the lock goes, the start spawns
 /// again inside its window and reports the server it elected.
+// Leaked handles: https://github.com/volarized/rift/issues/484
 #[test]
+#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/484")]
 fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
