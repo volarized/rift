@@ -166,6 +166,7 @@ fn a_plan_keeps_the_union_of_every_live_worktree_window() -> TestResult {
     let side = rev(&linked, "HEAD")?;
 
     let plan = analysis(root, &everything(1))?.plan(&HashMap::new())?;
+    let shared = analysis(root, &everything(2))?.plan(&HashMap::new())?;
 
     let pending: Vec<String> = plan
         .pending()
@@ -174,6 +175,16 @@ fn a_plan_keeps_the_union_of_every_live_worktree_window() -> TestResult {
         .collect();
     assert_eq!(pending, [rev(root, "HEAD")?, side.clone()]);
     assert!(plan.keep().contains(&side));
+    let pending: Vec<String> = shared
+        .pending()
+        .iter()
+        .map(|pending| pending.revision().commit_id())
+        .collect();
+    assert_eq!(
+        pending,
+        [rev(root, "HEAD")?, rev(root, "HEAD~1")?, side],
+        "the commit both windows hold is pending once"
+    );
     Ok(())
 }
 
@@ -586,6 +597,136 @@ fn a_commit_changing_a_lockfile_writes_no_row_for_it() -> TestResult {
         paths,
         ["package-lock.json", "src/lib.rs"],
         "an empty lockfile list records every lockfile"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_commit_changing_more_paths_than_the_bound_writes_none_and_is_a_boundary() -> TestResult {
+    let directory = three_commits()?;
+    let root = directory.path();
+    let wide = rift_history::REVISION_TREE_ENTRIES_MAX + 1;
+    rift_history::fixture::commit_wide_folder(root, wide, "refs/heads/main");
+    let analysis = analysis(root, &everything(1))?;
+    let plan = analysis.plan(&HashMap::new())?;
+
+    let analyzed = analysis.analyze(&plan.pending()[0], &|| false)?;
+
+    let analyzed = analyzed.ok_or("nothing cancels the analysis")?;
+    assert!(
+        analyzed.record().boundary,
+        "a timeline cannot tell what it changed"
+    );
+    assert!(analyzed.record().paths.is_empty());
+    assert_eq!(analyzed.parsed_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_committed_path_the_project_contract_forbids_is_changed_with_no_declaration() -> TestResult {
+    let directory = three_commits()?;
+    let root = directory.path();
+    // A backslash is legal in a git tree entry, and `ProjectPath` refuses it.
+    rift_history::fixture::commit_raw_path(root, b"src\\evil.rs", "refs/heads/main");
+
+    let record = head_record(&analysis(root, &everything(1))?)?;
+
+    let paths: Vec<&str> = record
+        .paths
+        .iter()
+        .map(|changed| changed.path.as_str())
+        .collect();
+    assert_eq!(paths, ["src\\evil.rs"]);
+    assert!(record.declarations.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_file_a_symbolic_link_replaced_removes_its_declarations() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    init(root);
+    write(root, "lib.rs", "pub fn beacon() {}\n")?;
+    write(root, "target.rs", "pub fn target() {}\n")?;
+    commit_all(root, "introduce beacon");
+    rift_history::fixture::commit_symlink_in_place(root, "lib.rs", "target.rs", "refs/heads/main");
+
+    let record = head_record(&analysis(root, &everything(1))?)?;
+
+    let paths: Vec<(&str, bool, bool)> = record
+        .paths
+        .iter()
+        .map(|changed| {
+            (
+                changed.path.as_str(),
+                changed.old_blob.is_some(),
+                changed.new_blob.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(paths, [("lib.rs", true, false)]);
+    assert_eq!(
+        record.declarations,
+        [DeclarationChange {
+            path: "lib.rs".to_owned(),
+            qualified_name: "beacon".to_owned(),
+            change: SymbolVersionKind::Removed
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_blob_the_object_store_cannot_read_refuses_the_analysis() -> TestResult {
+    let directory = three_commits()?;
+    let root = directory.path();
+    rift_history::fixture::commit_missing_blob(root, "lost.rs", "refs/heads/main");
+    let analysis = analysis(root, &everything(1))?;
+    let plan = analysis.plan(&HashMap::new())?;
+
+    let refused = analysis
+        .analyze(&plan.pending()[0], &|| false)
+        .expect_err("a blob the store lacks cannot be parsed");
+
+    let rendered = refused.to_string();
+    assert!(rendered.contains("read blob"), "{rendered}");
+    Ok(())
+}
+
+#[test]
+fn a_changed_blob_that_is_not_utf8_answers_no_declaration_and_counts_its_bytes() -> TestResult {
+    let directory = three_commits()?;
+    let root = directory.path();
+    fs::write(root.join("src/binary.rs"), [0xff, 0xfe, 0xfd])?;
+    commit_all(root, "add a rust path that is not UTF-8");
+    let analysis = analysis(root, &everything(1))?;
+    let plan = analysis.plan(&HashMap::new())?;
+
+    let analyzed = analysis.analyze(&plan.pending()[0], &|| false)?;
+
+    let analyzed = analyzed.ok_or("nothing cancels the analysis")?;
+    assert!(analyzed.record().declarations.is_empty());
+    assert_eq!(analyzed.parsed_bytes(), 3);
+    Ok(())
+}
+
+#[test]
+fn declarations_moved_out_of_one_file_into_two_pair_in_new_path_order() -> TestResult {
+    let directory = moved_between_files(&[
+        ("src/two.rs", "pub fn stays() {}\n"),
+        ("src/one.rs", "pub fn travelled() {\n    let x = 1;\n}\n"),
+    ])?;
+
+    let record = head_record(&analysis(directory.path(), &everything(10))?)?;
+
+    let moves: Vec<(&str, &str)> = record
+        .moves
+        .iter()
+        .map(|moved| (moved.new_path.as_str(), moved.qualified_name.as_str()))
+        .collect();
+    assert_eq!(
+        moves,
+        [("src/one.rs", "travelled"), ("src/two.rs", "stays")]
     );
     Ok(())
 }

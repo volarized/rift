@@ -7,7 +7,7 @@ use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 use crate::lock::{LIVE_LOCK_ATTEMPTS_MAX, lock_live_checked};
 use crate::{
     ChangedPath, CommitRecord, DeclarationChange, HistoryStore, MovedDeclaration, RenamedPath,
-    StoreFault, StoreLocation,
+    STORE_FOLDER_NAME, StoreFault, StoreLocation,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -231,7 +231,7 @@ fn a_second_filler_is_refused_while_readers_read() -> TestResult {
 #[test]
 fn sweep_deletes_only_revisions_no_live_server_holds() -> TestResult {
     let folder = tempfile::tempdir()?;
-    let rift = folder.path().join("rift");
+    let rift = folder.path().join(STORE_FOLDER_NAME);
     let held = HistoryStore::open(&StoreLocation::new(folder.path(), "bb"))?;
     drop(filled(folder.path(), "aa")?);
     let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
@@ -293,6 +293,17 @@ fn an_opener_refuses_a_lock_file_replaced_on_every_attempt() -> TestResult {
         refused.fault(),
         StoreFault::LockUnstable { attempts, .. } if *attempts == LIVE_LOCK_ATTEMPTS_MAX
     ));
+    assert!(refused.fault().folder_cause().is_none());
+    assert!(
+        std::error::Error::source(&refused).is_none(),
+        "no filesystem call failed, so no cause rides the chain"
+    );
+    let rendered = refused.to_string();
+    assert!(rendered.contains("lock live store"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("attempts {LIVE_LOCK_ATTEMPTS_MAX}")),
+        "{rendered}"
+    );
     Ok(())
 }
 
@@ -333,7 +344,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
     let fallback = store
         .worktree_fallback()
         .ok_or("the store names the refusal")?;
-    assert_eq!(fallback.refused(), git.join("rift"));
+    assert_eq!(fallback.refused(), git.join(STORE_FOLDER_NAME));
     let cause = fallback
         .cause()
         .fault()
@@ -342,7 +353,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(store.location().folder(), worktree_state);
     assert!(worktree_state.join("store-aa.db").exists());
-    assert!(!git.join("rift").exists());
+    assert!(!git.join(STORE_FOLDER_NAME).exists());
 
     let mut filler = store.filler()?.ok_or("the filler takes the lock")?;
     filler.write_batch(&[commit("c1", None, 10, "Add lexical search")])?;
@@ -352,6 +363,85 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
     );
     assert!(second.worktree_fallback().is_some());
     assert!(store.sweep()?.deleted().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_folder_refusal_other_than_access_keeps_the_refusal_without_a_fallback() -> TestResult {
+    let checkout = tempfile::tempdir()?;
+    // A linked worktree's `.git` is a file, so no folder can be created below it.
+    let git = checkout.path().join(".git");
+    std::fs::write(&git, b"gitdir: elsewhere\n")?;
+    let worktree_state = checkout.path().join(".rift");
+    let location = StoreLocation::new(&git, "aa").or_worktree(&worktree_state);
+
+    let refused = HistoryStore::open(&location).expect_err("no folder is created below a file");
+
+    let cause = refused
+        .fault()
+        .folder_cause()
+        .ok_or("the refusal is the folder's")?;
+    assert_ne!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        std::error::Error::source(&refused).is_some(),
+        "the filesystem's report rides the cause chain"
+    );
+    assert!(
+        !worktree_state.exists(),
+        "only a refusal for want of write access moves the store"
+    );
+    Ok(())
+}
+
+#[test]
+fn sweep_reports_a_live_lock_it_cannot_open_and_sweeps_the_rest() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let rift = folder.path().join(STORE_FOLDER_NAME);
+    drop(filled(folder.path(), "aa")?);
+    // A folder where the lock file goes opens as no file on any platform.
+    std::fs::create_dir_all(rift.join("store-zz.live.lock"))?;
+    let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
+
+    let swept = current.sweep()?;
+
+    assert_eq!(swept.deleted(), ["aa"], "the rest of the folder is swept");
+    let [failure] = swept.failures() else {
+        panic!("one lock the sweep cannot open: {:?}", swept.failures());
+    };
+    assert!(failure.fault().folder_cause().is_some());
+    let rendered = failure.to_string();
+    assert!(rendered.contains("open swept live lock"), "{rendered}");
+    assert!(rendered.contains("store-zz.live.lock"), "{rendered}");
+    assert!(rift.join("store-zz.live.lock").is_dir());
+    Ok(())
+}
+
+#[test]
+fn sweep_reports_a_file_it_cannot_delete_and_keeps_the_revisions_live_lock() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let rift = folder.path().join(STORE_FOLDER_NAME);
+    std::fs::create_dir_all(rift.join("store-aa.db"))?;
+    std::fs::write(rift.join("store-aa.db/held"), b"")?;
+    std::fs::write(rift.join("store-aa.live.lock"), b"")?;
+    let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
+
+    let swept = current.sweep()?;
+
+    assert!(swept.deleted().is_empty());
+    assert_eq!(swept.failures().len(), 1, "one refused deletion");
+    let failure = &swept.failures()[0];
+    assert!(failure.fault().folder_cause().is_some());
+    let rendered = failure.to_string();
+    assert!(rendered.contains("delete swept store file"), "{rendered}");
+    assert!(
+        rift.join("store-aa.live.lock").exists(),
+        "the live lock stays while another file of the revision does"
+    );
+    assert_eq!(
+        current.sweep()?.failures().len(),
+        1,
+        "a later sweep finds the revision again"
+    );
     Ok(())
 }
 
@@ -366,7 +456,7 @@ fn a_writable_common_git_directory_keeps_the_store_there() -> TestResult {
 
     assert!(store.worktree_fallback().is_none());
     assert_eq!(store.location().revision(), "aa");
-    assert!(checkout.path().join(".git/rift/store-aa.db").exists());
+    assert!(checkout.path().join(".git/.rift/store-aa.db").exists());
     assert!(!worktree_state.exists());
     Ok(())
 }

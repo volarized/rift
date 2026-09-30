@@ -4282,10 +4282,8 @@ pub fn compute() -> i32 {
     fn revision_read_resolves_an_ancestry_suffix_to_its_commit() -> TestResult {
         let directory = committed_fixture()?;
         rift_history::fixture::commit_all(directory.path(), "return seven");
-        fs::write(
-            directory.path().join("src/lib.rs"),
-            "pub fn beacon() -> u8 {\n    8\n}\n",
-        )?;
+        let eight = "pub fn beacon() -> u8 {\n    8\n}\n";
+        fs::write(directory.path().join("src/lib.rs"), eight)?;
         rift_history::fixture::commit_all(directory.path(), "return eight");
         let first = rift_history::Repository::open(directory.path())?
             .resolve("main~2")?

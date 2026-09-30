@@ -370,7 +370,7 @@ below. All three fuse by weighted reciprocal rank, under the shares
 <VersionBadge version="v0.0.46" />
 
 The history store is a second SQLite database, apart from `.rift/db`, so lexical and log writes
-never wait on a fill. It sits in a `rift/` folder of the common git directory, one file per
+never wait on a fill. It sits in the `.rift/` folder of the common git directory, one file per
 derivation revision: the build, by the product version the server publishes in its lock, the
 corpus revision, the index-owned tables, and the `[providers.history]` strategy and releases. Two
 builds sharing a repository each fill and read their own file, and a server deletes a file no live

@@ -752,15 +752,13 @@ mod tests {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
-            let current = ReadService::build(
-                self.directory.path(),
-                self.limits,
-                &SourceVisibility::default(),
-                &TextFileInclusion::default(),
-                HistoryConfiguration::default(),
-            )?;
+            let root = self.directory.path();
+            let visibility = SourceVisibility::default();
+            let inclusion = TextFileInclusion::default();
+            let history = HistoryConfiguration::default();
+            let current = ReadService::build(root, self.limits, &visibility, &inclusion, history)?;
             search_change(
-                self.directory.path(),
+                root,
                 &params,
                 &change,
                 &current,
@@ -1086,10 +1084,8 @@ mod tests {
         let fixture = Fixture::baseline(&base)?;
         let root = fixture.directory.path();
         fs::write(root.join(".gitignore"), "generated/\n")?;
-        fs::write(
-            root.join("generated/out.rs"),
-            "pub fn generated(flag: bool) {}\n",
-        )?;
+        let grown = "pub fn generated(flag: bool) {}\n";
+        fs::write(root.join("generated/out.rs"), grown)?;
 
         let answer = fixture.search(&json!({
             "change": {"base": "baseline", "head": {"kind": "working_tree"}}
@@ -1137,21 +1133,19 @@ mod tests {
             |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
         let directory = tempfile::tempdir()?;
         let root = directory.path();
-        write_all(
-            root,
-            &[
-                (
-                    ".gitattributes",
-                    "assets/*.md filter=lfs diff=lfs merge=lfs -text\n\
-                     src/shout.rs filter=upper\n\
-                     docs/notes.md working-tree-encoding=UTF-16LE\n",
-                ),
-                ("assets/diagram.md", LFS_POINTER),
-                ("assets/unedited.md", LFS_POINTER),
-                ("src/lib.rs", "pub fn kept() {}\n"),
-                ("src/shout.rs", "pub fn shout() {}\n"),
-            ],
-        )?;
+        let baseline = [
+            (
+                ".gitattributes",
+                "assets/*.md filter=lfs diff=lfs merge=lfs -text\n\
+                 src/shout.rs filter=upper\n\
+                 docs/notes.md working-tree-encoding=UTF-16LE\n",
+            ),
+            ("assets/diagram.md", LFS_POINTER),
+            ("assets/unedited.md", LFS_POINTER),
+            ("src/lib.rs", "pub fn kept() {}\n"),
+            ("src/shout.rs", "pub fn shout() {}\n"),
+        ];
+        write_all(root, &baseline)?;
         fs::create_dir_all(root.join("docs"))?;
         fs::write(root.join("docs/notes.md"), utf16("# Notes\n"))?;
         init(root);
@@ -1162,15 +1156,13 @@ mod tests {
             limits: WorkspaceIndexLimits::default(),
         };
         let root = fixture.directory.path();
-        write_all(
-            root,
-            &[
-                ("assets/diagram.md", "# Diagram\n\n## Edited\n"),
-                ("assets/unedited.md", "binary payload of unedited\n"),
-                ("src/lib.rs", "pub fn kept(flag: bool) {}\n"),
-                ("src/shout.rs", "pub fn shout(loud: bool) {}\n"),
-            ],
-        )?;
+        let edited = [
+            ("assets/diagram.md", "# Diagram\n\n## Edited\n"),
+            ("assets/unedited.md", "binary payload of unedited\n"),
+            ("src/lib.rs", "pub fn kept(flag: bool) {}\n"),
+            ("src/shout.rs", "pub fn shout(loud: bool) {}\n"),
+        ];
+        write_all(root, &edited)?;
         fs::write(root.join("docs/notes.md"), utf16("# Notes\n\n## Added\n"))?;
 
         let answer = fixture.search(&json!({
@@ -1600,6 +1592,78 @@ mod tests {
                     if unit.0.contains("deep.rs")
             ),
             "{answer:?}"
+        );
+        Ok(())
+    }
+
+    /// Index bounds tight enough that a file three folders deep crosses them.
+    fn shallow_limits() -> TestResult<WorkspaceIndexLimits> {
+        let limits = WorkspaceIndexLimits::new(10_000, 1 << 20, 64 << 20, 2, 1_000)?;
+        Ok(limits)
+    }
+
+    /// A base side whose changed path crosses the index's directory depth bound
+    /// refuses the comparison rather than answering the head side alone.
+    #[test]
+    fn change_refuses_a_base_side_past_the_directory_depth_bound() -> TestResult {
+        let base = [
+            ("src/lib.rs", "pub fn kept() {}\n"),
+            ("a/b/c/deep.rs", "pub fn deep() {}\n"),
+        ];
+        let fixture = Fixture::baseline(&base)?.under(shallow_limits()?);
+        let root = fixture.directory.path();
+        fs::remove_dir_all(root.join("a"))?;
+        commit_all(root, "head");
+
+        let error = fixture
+            .baseline_to_head()
+            .expect_err("the base side crosses the depth bound");
+
+        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
+        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        Ok(())
+    }
+
+    /// A committed head side whose changed path crosses the index's directory depth
+    /// bound refuses the comparison once the base side is indexed.
+    #[test]
+    fn change_refuses_a_head_side_past_the_directory_depth_bound() -> TestResult {
+        let base = [("src/lib.rs", "pub fn kept() {}\n")];
+        let fixture = Fixture::baseline(&base)?.under(shallow_limits()?);
+        let root = fixture.directory.path();
+        write_all(root, &[("a/b/c/deep.rs", "pub fn deep() {}\n")])?;
+        commit_all(root, "head");
+        // The working tree no longer holds the file, so the current index builds.
+        fs::remove_dir_all(root.join("a"))?;
+
+        let error = fixture
+            .baseline_to_head()
+            .expect_err("the head side crosses the depth bound");
+
+        assert_eq!(wire_code(&error), ErrorName::Wire(ErrorCode::LimitExceeded));
+        assert!(error.to_string().contains("a/b/c/deep.rs"), "{error}");
+        Ok(())
+    }
+
+    /// A comparison answers declarations, and a commit search answers commits.
+    #[test]
+    fn change_with_a_commit_target_refuses_as_an_invalid_request() -> TestResult {
+        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
+        let request = json!({"target": "commit", "query": "kept", "change": {"base": "baseline"}});
+
+        let error = fixture
+            .search(&request)
+            .expect_err("a commit search beside change must refuse");
+
+        assert_eq!(
+            wire_code(&error),
+            ErrorName::Wire(ErrorCode::InvalidRequest)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("a commit search answers commits"),
+            "{error}"
         );
         Ok(())
     }

@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest as _, Sha256};
+
 use super::{WorkingForm, blob_id_of_length, pointer_size};
 use crate::Repository;
 use crate::fixture::{commit_all, git, init};
@@ -368,6 +370,139 @@ fn a_working_form_past_the_byte_bound_refuses_the_blob() {
         error.fault(),
         crate::HistoryFault::BlobTooLarge { bytes_max: 4, .. }
     ));
+    let rendered = format!("{converter:?}");
+    assert!(rendered.starts_with("WorkingForms"), "{rendered}");
+}
+
+#[test]
+fn a_staged_pointer_edit_reverted_in_the_working_tree_answers_unchanged() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    write(root, &[("pointer.bin", EDITED_POINTER)]);
+    commit_all(root, "edited pointer");
+    write(root, &[("pointer.bin", UNEDITED_POINTER)]);
+    commit_all(root, "unedited pointer");
+    write(root, &[(".gitattributes", "*.bin filter=lfs -text\n")]);
+    commit_all(root, "attributes");
+    let edited = gix::objs::compute_hash(
+        gix::hash::Kind::Sha1,
+        gix::objs::Kind::Blob,
+        EDITED_POINTER.as_bytes(),
+    )
+    .expect("hash");
+    // The index names the edited pointer while the working file holds the base's,
+    // so the index-to-working-tree pass reports the path with the base's bytes.
+    let entry = format!("100644,{edited},pointer.bin");
+    git(root, &["update-index", "--cacheinfo", &entry]);
+
+    let (paths, _) = changed(root, "HEAD", &[], 512);
+
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+/// The git-lfs spec v1 pointer for `content`.
+fn pointer_for(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    let size = content.len();
+    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest:x}\nsize {size}\n")
+}
+
+#[test]
+fn an_lfs_file_longer_than_any_pointer_matches_its_base_by_digest() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    let unedited = "a payload line past the pointer bytes\n".repeat(40);
+    let edited = unedited.replacen("payload", "PAYLOAD", 1);
+    let pointer = pointer_for(&unedited);
+    write(
+        root,
+        &[
+            ("unedited.bin", pointer.as_str()),
+            ("edited.bin", pointer.as_str()),
+        ],
+    );
+    commit_all(root, "pointers");
+    write(root, &[(".gitattributes", "*.bin filter=lfs -text\n")]);
+    commit_all(root, "attributes");
+    write(
+        root,
+        &[
+            ("unedited.bin", unedited.as_str()),
+            ("edited.bin", edited.as_str()),
+        ],
+    );
+
+    let (paths, _) = changed(root, "HEAD", &[], 512);
+
+    assert!(unedited.len() > 1024 && edited.len() == unedited.len());
+    assert_eq!(paths, ["edited.bin"]);
+}
+
+#[test]
+fn an_lfs_path_whose_base_holds_its_content_answers_changed_when_edited() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    let content = "a payload committed before the path was tracked by lfs\n".repeat(30);
+    write(root, &[("kept.bin", content.as_str())]);
+    commit_all(root, "content");
+    // The attribute lives outside the tree, so no commit runs a clean filter over the
+    // content: the base blob is the content itself, longer than any pointer.
+    fs::create_dir_all(root.join(".git/info")).expect("info folder");
+    fs::write(
+        root.join(".git/info/attributes"),
+        "*.bin filter=lfs -text\n",
+    )
+    .expect("attributes");
+    let edited = content.replacen("payload", "PAYLOAD", 1);
+    write(root, &[("kept.bin", edited.as_str())]);
+
+    let (paths, _) = changed(root, "HEAD", &[], 512);
+
+    assert!(content.len() > 1024);
+    assert_eq!(paths, ["kept.bin"]);
+}
+
+#[test]
+fn a_workspace_below_the_repository_root_reads_its_own_paths() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    fs::create_dir_all(root.join("sub")).expect("workspace folder");
+    write(
+        root,
+        &[
+            ("sub/lib.rs", "pub fn beacon() {}\n"),
+            ("other.rs", "pub fn other() {}\n"),
+        ],
+    );
+    commit_all(root, "base");
+    write(
+        root,
+        &[
+            ("sub/lib.rs", "pub fn beacon(flag: bool) {}\n"),
+            ("sub/new.rs", "pub fn new() {}\n"),
+            ("other.rs", "pub fn other(flag: bool) {}\n"),
+        ],
+    );
+    let repository = Repository::open(&root.join("sub")).expect("repository");
+    let base = repository.resolve("HEAD").expect("base");
+
+    let changed = repository
+        .changed_working_files(&base, &["lib.rs", "new.rs"], &|_| true, 512)
+        .expect("working changes");
+    let files = repository.tree_files(&base, &|_| true, 16).expect("files");
+    let mut forms = repository.working_forms().expect("working forms");
+    let form = forms.form(&files[0], 1024).expect("working form");
+
+    assert_eq!(changed.paths(), ["lib.rs", "new.rs"]);
+    assert_eq!(files.len(), 1, "the workspace holds its own files alone");
+    assert_eq!(
+        form,
+        WorkingForm::Converted(b"pub fn beacon() {}\n".to_vec())
+    );
 }
 
 #[test]

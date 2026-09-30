@@ -898,13 +898,13 @@ class Corpus:
         """Stop while a history store batch with pending commits has not finished.
 
         A fill analyzes only the commits the history store lacks, so the case first
-        deletes the store the earlier servers filled, in the `rift` folder of the common
+        deletes the store the earlier servers filled, in the `.rift` folder of the common
         git directory: this server's fill then owes every commit its plan selects. The
         fill starts after the startup publication with no request, and while the server
         runs none, each batch starts as soon as the one before it ends.
         """
         common = git(self.root, "rev-parse", "--git-common-dir").output().strip()
-        store = self.root / common / "rift"
+        store = self.root / common / ".rift"
         if store.exists():
             shutil.rmtree(store)
         with self.server() as server:

@@ -183,7 +183,7 @@ fn append_unseen(
 
 /// One matched commit as a hit, or `None` when a trim deleted it between the match and
 /// this read.
-fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHit>, ReadError> {
+pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHit>, ReadError> {
     let Some(commit) = reads.commit(id).map_err(ReadFault::history_store)? else {
         return Ok(None);
     };

@@ -101,7 +101,7 @@ def fill_server(tmp_path: Path, outputs: list[str]) -> MagicMock:
 def filled_corpus(tmp_path: Path) -> Corpus:
     """A stop corpus over a repository whose history store earlier servers filled."""
     git(tmp_path, "init", "--quiet").output_bytes()
-    store = tmp_path / ".git" / "rift"
+    store = tmp_path / ".git" / ".rift"
     store.mkdir()
     (store / "store-filled.db").write_bytes(b"filled")
     corpus = Corpus(pins()["bun"], tmp_path / "rift", tmp_path / "bun.json", "stop")
@@ -119,7 +119,7 @@ def test_history_stop_waits_until_a_batch_with_pending_commits_is_open(
     store_at_start: list[bool] = []
 
     def started() -> MagicMock:
-        store_at_start.append((tmp_path / ".git" / "rift").exists())
+        store_at_start.append((tmp_path / ".git" / ".rift").exists())
         return server
 
     with (

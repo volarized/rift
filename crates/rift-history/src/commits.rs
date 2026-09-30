@@ -124,13 +124,15 @@ impl ChangedBlob {
         &self.path
     }
 
-    /// The blob the compared side holds; `None` for an addition.
+    /// The blob the compared side holds; `None` for an addition, or where
+    /// that side holds a symbolic link or a submodule.
     #[must_use]
     pub const fn old_blob(&self) -> Option<&TreeFile> {
         self.old.as_ref()
     }
 
-    /// The blob the commit holds; `None` for a deletion.
+    /// The blob the commit holds; `None` for a deletion, including a file the
+    /// commit replaced with a symbolic link or a submodule.
     #[must_use]
     pub const fn new_blob(&self) -> Option<&TreeFile> {
         self.new.as_ref()

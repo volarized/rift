@@ -272,8 +272,9 @@ fn record_fallback(store: &HistoryStore) {
     );
 }
 
-/// Deletes the store files no live server holds, logging each deletion the
-/// filesystem refused.
+/// Deletes the store files no live server holds, logging each released
+/// revision the sweep could not take: a live lock it could not open or try, or
+/// a deletion the filesystem refused.
 fn sweep(store: &HistoryStore) {
     match store.sweep() {
         Ok(swept) => {
@@ -282,7 +283,7 @@ fn sweep(store: &HistoryStore) {
                     component = "history",
                     operation = "history.sweep",
                     error = %failure,
-                    "a released history store file could not be deleted"
+                    "a released history store revision could not be swept"
                 );
             }
         }

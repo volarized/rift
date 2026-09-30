@@ -51,6 +51,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 rift-history = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 

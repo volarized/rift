@@ -556,7 +556,8 @@ background, and the configuration allows you to describe:
 - `strategy` - which revisions the store holds: `everything`, the newest first-parent commits of
   every live worktree, or `selective`, the releases `releases` names
 - `releases` - tag names or tag patterns such as `v1.*`, at most 64, which `selective` requires and
-  no other strategy accepts
+  no other strategy accepts; a pattern that does not compile as a glob, such as the unclosed class
+  `v[1`, is refused
 - `max_revisions` - how many revisions the store holds, 1 to 100000: commits under `everything`,
   releases under `selective`
 - `batch_commits` - how many commits one store write holds, 1 to 10000

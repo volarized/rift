@@ -1826,6 +1826,14 @@ mod tests {
             let identity = super::search_identity(hit).expect("a project hit ranks");
             assert_eq!(identity.as_str(), expected);
         }
+        let mut ordered = hits.to_vec();
+        super::order_search_hits(&mut ordered, super::ResultOrder::Identity);
+        let keys: Vec<&str> = ordered.iter().map(search_hit_key).collect();
+        assert!(keys.is_sorted(), "{keys:?}");
+        assert!(
+            keys.contains(&revision),
+            "a commit hit orders by its revision"
+        );
         let request = serde_json::json!({"query": "load_config", "limit": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");

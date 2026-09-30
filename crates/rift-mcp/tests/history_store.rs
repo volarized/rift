@@ -124,7 +124,7 @@ async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() ->
             "{version}"
         );
     }
-    assert_eq!(store_files(&directory.path().join(".git/rift")).len(), 1);
+    assert_eq!(store_files(&directory.path().join(".git/.rift")).len(), 1);
     client.cancel().await?;
     Ok(())
 }
@@ -161,7 +161,7 @@ async fn a_second_worktree_reads_the_store_the_first_filled() -> TestResult {
     );
     assert_eq!(history["versions"].as_array().map(Vec::len), Some(3));
     assert_eq!(
-        store_files(&root.join(".git/rift")).len(),
+        store_files(&root.join(".git/.rift")).len(),
         1,
         "one store per repository"
     );

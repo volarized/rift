@@ -5561,9 +5561,8 @@ done
         let server = &assembled.server;
         fail_rebuild_after_events(directory.path(), server, 1).await?;
 
-        let working_tree: SearchParams = serde_json::from_value(
-            json!({"change": {"base": "HEAD", "head": {"kind": "working_tree"}}}),
-        )?;
+        let request = json!({"change": {"base": "HEAD", "head": {"kind": "working_tree"}}});
+        let working_tree: SearchParams = serde_json::from_value(request)?;
         let answer =
             tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(working_tree)))
                 .await

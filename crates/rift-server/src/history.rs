@@ -384,13 +384,17 @@ impl StoredTimelines {
     /// at the path it came from. The timeline is
     /// complete once it passes a commit compared with nothing; it is not
     /// when it meets a commit the store does not hold, a boundary, or the
-    /// `max_revisions` bound first.
+    /// `max_revisions` bound first, nor when the store holds no commit to
+    /// start at, as a `selective` store holding no release yet does.
     fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, ReadError> {
         let symbol = symbol_id(matched.file, matched.symbol);
+        let Some(start) = self.start.clone() else {
+            return Ok(timeline_answer(symbol, Vec::new(), false));
+        };
         let qualified_name = matched.symbol.qualified_name.as_str();
         let mut path = matched.file.path().as_str().to_owned();
         let mut versions = Vec::new();
-        let mut next = self.start.clone();
+        let mut next = Some(start);
         let mut complete = false;
         for _ in 0..self.revisions_max {
             let Some(id) = next else {
@@ -942,6 +946,16 @@ mod tests {
         }
     }
 
+    /// A current-tree snapshot of `root` under the default bounds and history table.
+    fn current(root: &Path) -> TestResult<ReadService> {
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::build(root, limits, &visibility, &inclusion, history)?;
+        Ok(service)
+    }
+
     /// Two declarations sharing one file across two commits, served through
     /// a current-tree read whose files match the second commit.
     fn shared_path_fixture() -> TestResult<(tempfile::TempDir, ReadService)> {
@@ -1116,9 +1130,8 @@ mod tests {
         store_folder: &Path,
         history: &HistoryConfiguration,
     ) -> TestResult<rift_history_store::HistoryStore> {
-        let store = rift_history_store::HistoryStore::open(
-            &rift_history_store::StoreLocation::new(store_folder, "aa"),
-        )?;
+        let location = rift_history_store::StoreLocation::new(store_folder, "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
         let mut filler = store.filler()?.ok_or("no other filler runs")?;
         let analysis = crate::HistoryAnalysis::open(
             root,
@@ -1210,18 +1223,12 @@ mod tests {
         let (directory, service) = shared_path_fixture()?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
-        let empty = rift_history_store::HistoryStore::open(
-            &rift_history_store::StoreLocation::new(folder.path(), "aa"),
-        )?;
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let empty = rift_history_store::HistoryStore::open(&location)?;
         let (stored_empty, lagged) = stored(&empty, HistoryStrategy::Everything);
+        let root = directory.path();
 
-        let lagging = stored_timeline(
-            directory.path(),
-            &service,
-            &history,
-            &stored_empty,
-            "beacon_one",
-        )?;
+        let lagging = stored_timeline(root, &service, &history, &stored_empty, "beacon_one")?;
 
         assert!(!lagging.complete, "the store holds nothing yet");
         assert!(lagging.versions.is_empty());
@@ -1231,13 +1238,7 @@ mod tests {
 
         let store = filled_store(directory.path(), folder.path(), &history)?;
         let (stored_filled, lagged) = stored(&store, HistoryStrategy::Everything);
-        let caught_up = stored_timeline(
-            directory.path(),
-            &service,
-            &history,
-            &stored_filled,
-            "beacon_one",
-        )?;
+        let caught_up = stored_timeline(root, &service, &history, &stored_filled, "beacon_one")?;
         assert!(caught_up.complete, "the store holds the whole history now");
         assert_eq!(lagged.load(Ordering::SeqCst), 0);
         Ok(())
@@ -1274,20 +1275,12 @@ mod tests {
         rift_history::fixture::init(root);
         fs::write(root.join("before.rs"), "pub fn travelled() {}\n")?;
         rift_history::fixture::commit_all(root, "introduce travelled");
-        fs::write(
-            root.join("before.rs"),
-            "pub fn travelled() { let _grown = 1; }\n",
-        )?;
+        let grown = "pub fn travelled() { let _grown = 1; }\n";
+        fs::write(root.join("before.rs"), grown)?;
         rift_history::fixture::commit_all(root, "grow travelled");
         rift_history::fixture::git(root, &["mv", "before.rs", "after.rs"]);
         rift_history::fixture::commit_all(root, "move travelled");
-        let service = ReadService::build(
-            root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let service = current(root)?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
         let store = filled_store(root, folder.path(), &history)?;
@@ -1348,24 +1341,14 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         rift_history::fixture::init(root);
-        fs::write(
-            root.join("from.rs"),
-            "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n",
-        )?;
+        let introduced = "pub fn travelled() {\n    let x = 1;\n}\npub fn stays() {}\n";
+        fs::write(root.join("from.rs"), introduced)?;
         rift_history::fixture::commit_all(root, "introduce travelled");
         fs::remove_file(root.join("from.rs"))?;
-        fs::write(
-            root.join("to.rs"),
-            "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n",
-        )?;
+        let moved = "pub fn travelled() {\n    let x = 1;\n}\npub fn arrived() {}\n";
+        fs::write(root.join("to.rs"), moved)?;
         rift_history::fixture::commit_all(root, "move travelled");
-        let service = ReadService::build(
-            root,
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &rift_core::TextFileInclusion::default(),
-            HistoryConfiguration::default(),
-        )?;
+        let service = current(root)?;
         let folder = tempfile::tempdir()?;
         let history = HistoryConfiguration::default();
         let store = filled_store(root, folder.path(), &history)?;
@@ -1422,10 +1405,8 @@ mod tests {
         assert_eq!(moved.pending().len(), 1, "only the new commit is owed");
 
         rift_history::fixture::git(root, &["reset", "-q", "--hard", "HEAD~2"]);
-        fs::write(
-            root.join("lib.rs"),
-            "pub fn beacon_one() { let _rewritten = 1; }\n",
-        )?;
+        let rewritten_source = "pub fn beacon_one() { let _rewritten = 1; }\n";
+        fs::write(root.join("lib.rs"), rewritten_source)?;
         rift_history::fixture::commit_all(root, "rewrite");
         let rewritten = analysis
             .plan(&filler.held()?)
@@ -1441,6 +1422,83 @@ mod tests {
             held.len(),
             1,
             "the root commit every window still reaches stays"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_selective_timeline_over_a_store_holding_no_release_is_incomplete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration {
+            strategy: HistoryStrategy::Selective,
+            releases: vec!["v*".to_owned()],
+            ..HistoryConfiguration::default()
+        };
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let empty = rift_history_store::HistoryStore::open(&location)?;
+        let (stored, lagged) = stored(&empty, HistoryStrategy::Selective);
+        let root = directory.path();
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "beacon_one")?;
+
+        assert!(timeline.versions.is_empty());
+        assert!(!timeline.complete, "no held release starts the timeline");
+        assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
+        Ok(())
+    }
+
+    #[test]
+    fn a_selective_store_reports_its_fill_without_reading_head() -> TestResult {
+        let unversioned = tempfile::tempdir()?;
+        let folder = tempfile::tempdir()?;
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
+        let (selective, lagged) = stored(&store, HistoryStrategy::Selective);
+        let (everything, _) = stored(&store, HistoryStrategy::Everything);
+        selective.progress().record_plan(2, 1);
+        everything.progress().record_plan(2, 1);
+        let counts = selective.progress().counts().ok_or("a plan landed")?;
+
+        let warning = selective.filling(&selective.connect()?, unversioned.path())?;
+        let refused = everything.filling(&everything.connect()?, unversioned.path());
+
+        assert!(warning.is_some());
+        assert_eq!(warning, counts.filling_warning(false));
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        assert!(refused.is_err(), "`everything` reads the commit HEAD names");
+        let rendered = format!("{selective:?}");
+        assert!(rendered.starts_with("StoredHistory"), "{rendered}");
+        assert!(rendered.contains("Selective"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_timeline_over_a_store_that_cannot_be_read_refuses_as_a_storage_failure() -> TestResult {
+        use rift_core::{ErrorCode, ErrorName, Fault as _};
+
+        let (directory, _service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let common = folder.path().join("common");
+        let location = rift_history_store::StoreLocation::new(&common, "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+        drop(store);
+        fs::remove_dir_all(&common)?;
+        let history = HistoryConfiguration::default();
+        let syntax = SyntaxLimits::default();
+
+        let opened = SymbolTimelines::open(directory.path(), None, &history, syntax, Some(&stored));
+
+        let refused = opened.expect_err("no folder holds the store's file any more");
+        let fault = refused.fault();
+        assert_eq!(fault.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        assert!(fault.limit_evidence().is_none());
+        let rendered = refused.to_string();
+        assert!(rendered.contains("open store"), "{rendered}");
+        assert!(
+            std::error::Error::source(&refused).is_some(),
+            "the driver's report rides the cause chain"
         );
         Ok(())
     }
