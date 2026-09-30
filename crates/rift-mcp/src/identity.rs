@@ -188,6 +188,13 @@ mod tests {
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     const COMMIT: &str = "b006b8433ba06679f06a3c7f0743d65634d32c34";
+    /// How far a relink moves the modification time: the coarsest modification-time
+    /// resolution among the file systems a test may run on, so every one of them
+    /// records the move. APFS and ext4 with large inodes keep 1 ns, NTFS 100 ns, HFS+
+    /// and ext4 with 128-byte inodes 1 s, and FAT 2 s for a write time. The step is
+    /// FAT's, and the times it moves between are whole even seconds, on FAT's grid, so
+    /// no file system rounds the moved time back to the earlier one.
+    const RELINK_STEP: Duration = Duration::from_secs(2);
 
     fn unread() -> std::io::Result<ExecutableStamp> {
         Err(std::io::Error::other("a clean build reads no executable"))
@@ -274,6 +281,8 @@ mod tests {
     /// link writes it again, so its modification time, and usually its size, move. Its
     /// identity therefore never equals the one a server started from the earlier build
     /// published.
+    ///
+    /// The relink moves the modification time by [`RELINK_STEP`].
     #[test]
     fn a_rebuilt_dirty_binary_never_names_the_earlier_builds_identity() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -288,7 +297,7 @@ mod tests {
         let earlier = checkout.product_version(&executable)?;
 
         fs::write(&executable, b"first build")?;
-        let relinked = first_written + Duration::from_nanos(1);
+        let relinked = first_written + RELINK_STEP;
         fs::File::options()
             .write(true)
             .open(&executable)?

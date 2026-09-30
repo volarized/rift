@@ -79,11 +79,13 @@ async fn open_workspace_database(root: &Path) -> Option<Arc<WorkspaceDatabase>> 
     match WorkspaceDatabase::open(&database_path, configured_pool(root)).await {
         Ok(database) => Some(database),
         Err(error) => {
+            let causes = rift_core::causes(&error).join(": ");
             tracing::warn!(
                 component = "storage",
                 operation = "database.open",
                 path = %database_path.display(),
                 error = %error,
+                causes,
                 "the workspace database failed to open; the server starts without it"
             );
             None
