@@ -178,8 +178,8 @@ fn pin_lockfile(
         answer.install_folders.push(installed_folder(
             &directory,
             key,
-            installed.name,
-            installed.version,
+            (installed.name, installed.version),
+            inputs,
         ));
         answer.entries.push(PackageContextEntry::new(
             NPM_MANAGER,
@@ -353,8 +353,12 @@ mod tests {
 
     #[test]
     fn test_a_lockfile_pins_exact_versions_and_sorts_every_locator_by_kind() {
-        let mut inspector =
-            RecordedInspector::default().with_file(format!("{ROOT}/package-lock.json"), LOCKFILE);
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/package-lock.json"), LOCKFILE)
+            .with_canonical(
+                format!("{ROOT}/node_modules/left-pad"),
+                format!("{ROOT}/node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad"),
+            );
 
         let answer = context(&["package.json"], &mut inspector);
 
@@ -407,7 +411,7 @@ mod tests {
                 ),
                 (
                     "npm/left-pad@1.3.0".to_owned(),
-                    &at("node_modules/left-pad")
+                    &at("node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad")
                 ),
                 (
                     "npm/zod@3.25.76".to_owned(),
@@ -416,7 +420,8 @@ mod tests {
                 ("npm/tool@3.0.0".to_owned(), &at("node_modules/tool")),
                 ("npm/zod@4.0.0".to_owned(), &at("node_modules/zod")),
             ],
-            "a nested copy at another version gets a folder of its own"
+            "a nested copy at another version gets a folder of its own, and a linked \
+             folder is recorded where the link resolves"
         );
         assert!(
             answer

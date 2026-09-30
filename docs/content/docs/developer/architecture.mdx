@@ -207,6 +207,11 @@ change touches a manifest, lockfile, or version pin it read, or when a language 
 library gains its first visible file or loses its last. Every other file change leaves it
 untouched.
 
+A `uv sync` that installs from an unchanged `uv.lock` changes no visible file, since `.venv`
+holds its own `.gitignore`. The context therefore keeps the `site-packages` listing of each
+project environment it read beside a `uv.lock`, and each request lists it again: a listing that
+differs reads the context again before the request is answered.
+
 <VersionBadge version="v0.0.46" />
 
 An entry's `availability` says whether a public registry serves the package. An entry
@@ -305,17 +310,23 @@ The server invalidates a changed path's syntax facts and search-index entries.
 ### Language engines
 
 A **language engine** resolves facts the grammar alone cannot provide, such as references to a
-declaration in another file. Rift's LSP client requests references and diagnostics over
-[LSP](https://microsoft.github.io/language-server-protocol/).
+declaration in another file. Rift's LSP client requests references, call hierarchy, and
+diagnostics over [LSP](https://microsoft.github.io/language-server-protocol/).
 
 Each [`[languages.<identity>]`](/docs/developer/configuration#languages-and-lsp) table selects
 one named or inline process for an exact language identity: rust-analyzer for `rust`, or
 `typescript-language-server` for `typescript` and `typescript:tsx`. Several identities may
 select the same named process.
 
-[`search`](/docs/mcp#search-engine-references) uses the engine for incoming reference
-traversal: the engine is the one source of resolved references a walk follows. Source and
-configuration must match the captured index before and after the engine request.
+[`search`](/docs/mcp#search-engine-references) uses the engine for relationship traversal: the
+engine is the one source of the references an incoming walk follows and of the calls an outgoing
+walk follows. Source and configuration must match the captured index before and after the engine
+request.
+
+Before a running engine's next request, the server sends it each publication's changed files
+that match a file watcher the engine registered, as one `workspace/didChangeWatchedFiles`
+notification. An engine that learns of file changes through its client, as rust-analyzer does,
+then answers from the published source, including files the walk never opens.
 
 The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
 transport through the same LSP session contract. Its version ships with the Rift binary.

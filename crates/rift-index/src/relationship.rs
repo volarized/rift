@@ -1,6 +1,4 @@
-pub use rift_analysis::{
-    RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, produced_relationship_facets,
-};
+pub use rift_analysis::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 
 #[cfg(test)]
 mod tests {

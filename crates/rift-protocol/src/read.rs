@@ -166,6 +166,61 @@ pub enum DocumentationFormat {
 #[schemars(transparent)]
 pub struct ExactKind(#[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9._-]*$"))] pub String);
 
+impl ExactKind {
+    /// Whether the kind has the form the schema pattern advertises: an ASCII letter, then
+    /// ASCII letters, digits, `.`, `_`, or `-`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        is_kind_word(&self.0)
+    }
+}
+
+impl TryFrom<String> for ExactKind {
+    type Error = ExactKindError;
+
+    fn try_from(kind: String) -> Result<Self, Self::Error> {
+        if is_kind_word(&kind) {
+            Ok(Self(kind))
+        } else {
+            Err(ExactKindError { kind })
+        }
+    }
+}
+
+/// A kind outside the form [`ExactKind`] advertises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactKindError {
+    kind: String,
+}
+
+impl ExactKindError {
+    /// The kind that was refused.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+impl std::fmt::Display for ExactKindError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "kind {:?} must start with an ASCII letter followed by ASCII letters, digits, `.`, \
+             `_`, or `-`, such as `function` or `type_alias`",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for ExactKindError {}
+
+/// Whether one kind matches the form `ExactKind` advertises.
+fn is_kind_word(kind: &str) -> bool {
+    let mut bytes = kind.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
 /// A reverse-domain namespaced extension or extension-operation identifier.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -1186,16 +1241,48 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
-    /// A language engine serves the seed's language, and this read dropped what it
-    /// answered: the answer addressed bytes the served revision does not carry. The
-    /// indexed relationships stand; whatever the engine resolves on top of them is
-    /// missing. The warning states that an engine's analysis is absent from this answer;
-    /// it never states that the seed has no such neighbor. A later read served from a
-    /// revision the engine has caught up with carries the engine's edges again.
+    /// A language engine serves the seed's language, and this read carries none of its
+    /// edges: the engine answered about bytes the served revision does not carry, answered
+    /// more than the walk's node bound holds, or was still analyzing when
+    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
+    /// the engine resolves on top of them is missing. The warning states that an engine's
+    /// analysis is absent from this answer; it never states that the seed has no such
+    /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
+    /// revision the engine has caught up with or sent once it reads ready, carries the
+    /// engine's edges again.
     EngineAnalysisUnavailable {
         /// The seed declaration's language, whose engine's answer was dropped.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<Language>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// An outgoing walk dropped its edges to callees it named no declaration for. The
+    /// language engine's call hierarchy named each in a file outside the project and every
+    /// installed package the workspace's dependencies name, or in a package or standard
+    /// library file where the global index answered no declaration at the callee's
+    /// position. Every package callee drops when the global API is off or did not answer,
+    /// and the answer then carries the global warning naming why. Every other edge stands.
+    /// The warning states that edges are missing from this answer; it never states that
+    /// the seed calls nothing more.
+    CalleesDropped {
+        /// Edges the walk dropped over every depth, one per call the engine named.
+        callees: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// The walk took a language engine's answer without progress evidence that the engine
+    /// had settled: it announced no work since it started or was last told of a changed
+    /// file, and stayed quiet past its `settle_delay`. The answer stands. An engine that
+    /// recomputes without announcing work may have answered before it read that change, and
+    /// a later read meets it settled.
+    EngineReadinessUnconfirmed {
+        /// The engines the walk took unconfirmed, by accepted process key, sorted. Inline
+        /// processes use the exact language identity segment.
+        #[schemars(length(min = 1))]
+        processes: Vec<String>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -2125,6 +2212,46 @@ mod tests {
     };
     use schemars::schema_for;
     use serde_json::json;
+
+    /// The kinds the advertised schema pattern accepts are the kinds `ExactKind` accepts,
+    /// over both sides of every rule the pattern states.
+    #[test]
+    fn exact_kind_schema_pattern_equals_the_kind_rule() {
+        let schema = serde_json::to_value(schema_for!(super::ExactKind)).expect("kind schema");
+        let validator = jsonschema::validator_for(&schema).expect("the kind schema compiles");
+        let samples = [
+            ("function", true),
+            ("type_alias", true),
+            ("rust.struct", true),
+            ("enum-member", true),
+            ("F9", true),
+            ("", false),
+            ("9struct", false),
+            ("_private", false),
+            (".hidden", false),
+            ("two words", false),
+            ("kind:dialect", false),
+            ("naïve", false),
+        ];
+        for (kind, accepted) in samples {
+            assert_eq!(
+                validator.is_valid(&json!(kind)),
+                accepted,
+                "schema: {kind:?}"
+            );
+            let parsed = super::ExactKind::try_from(kind.to_owned());
+            assert_eq!(parsed.is_ok(), accepted, "rule: {kind:?}");
+            assert_eq!(
+                super::ExactKind(kind.to_owned()).is_valid(),
+                accepted,
+                "held: {kind:?}"
+            );
+            if let Err(error) = parsed {
+                assert_eq!(error.kind(), kind);
+                assert!(error.to_string().contains("such as `function`"), "{error}");
+            }
+        }
+    }
 
     /// A refused identity segment renders with the segment it read and the two
     /// forms it accepts, so an operator fixing `rift.toml` sees both.

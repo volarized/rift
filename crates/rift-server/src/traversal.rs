@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::OnceLock;
 
 use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
 use rift_index::{
@@ -13,12 +12,13 @@ use rift_index::{
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchTraversal, SymbolId,
+    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
+    SearchTraversal, SymbolId, TraversalDirection,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
-use crate::engine_read::EngineReferences;
+use crate::engine_read::{EngineReferences, PackageDeclaration};
 use crate::read::parse_symbol_address;
 use crate::read::{ReadError, ReadFault, ReadService};
 use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes, resolve_symbol};
@@ -52,9 +52,10 @@ pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), Read
 
 /// The capability a refused walk names: nothing this workspace holds can answer it.
 ///
-/// A walk follows the relationship store's edges and the incoming references a configured
-/// language engine resolves. With an empty store and no engine answer for the seed, the
-/// walk has no edge source at all, and a resend of the same request changes nothing.
+/// A walk follows the relationship store's edges and the incoming references or outgoing
+/// calls a configured language engine resolves. With an empty store and no engine answer
+/// for the seed, the walk has no edge source at all, and a resend of the same request
+/// changes nothing.
 pub(crate) const TRAVERSAL_CAPABILITY: &str =
     "relationship traversal (no language engine serves the seed)";
 
@@ -92,7 +93,10 @@ pub(crate) fn collect_traversal_hits(
 ) -> Result<TraversalReport, ReadError> {
     let store = reads.relationships();
     let walked_seed = resolve_traversal_seed(reads, seed)?;
-    if store.is_empty() && !references.resolved(seed) {
+    // A dropped engine contribution answers with its warning: no resend of the same
+    // request clears the condition, so a refusal would only hide what the warning names.
+    if store.is_empty() && !references.resolved(seed) && references.analysis_unavailable().is_none()
+    {
         return Err(ReadFault::unsupported(TRAVERSAL_CAPABILITY));
     }
     let coverage_missing = relationship_coverage_missing(traversal);
@@ -108,6 +112,7 @@ pub(crate) fn collect_traversal_hits(
         root,
         to: traversal.to.as_ref(),
         payloads,
+        references,
     };
     merge_walk_hits(reads, walk.discovered, merge, results)?;
     Ok(TraversalReport {
@@ -117,21 +122,24 @@ pub(crate) fn collect_traversal_hits(
 }
 
 /// What one walk's discoveries pass before they become hits: the files the request's
-/// `paths` selector reaches, the one symbol `to` keeps, and what the walk's own hits are
-/// scored by.
+/// `paths` selector reaches, the one symbol `to` keeps, what the walk's own hits are
+/// scored by, and the package declarations its outgoing edges end at.
 #[derive(Clone, Copy)]
 pub(crate) struct WalkMerge<'merge> {
     pub(crate) matcher: Option<&'merge PathMatcher>,
     pub(crate) root: &'merge Path,
     pub(crate) to: Option<&'merge SymbolId>,
     pub(crate) payloads: HitPayloads,
+    pub(crate) references: &'merge EngineReferences,
 }
 
 /// Merges every symbol one walk discovered into `results`, in the order the walk found
 /// them.
 ///
 /// A discovery `results` already holds absorbs the walk; any other becomes a new hit
-/// tagged [`MatchedField::Relationship`].
+/// tagged [`MatchedField::Relationship`]. A package declaration an outgoing edge ends at
+/// becomes a hit addressed by its `unit`, unless a `paths` selector narrows the answer to
+/// project files.
 ///
 /// # Errors
 ///
@@ -147,9 +155,14 @@ pub(crate) fn merge_walk_hits(
             continue;
         }
         let Some((file, symbol)) = resolve_graph_symbol(reads.index(), &identity) else {
-            // A graph node with no lexical declaration in this snapshot: the store outlived
-            // the file it was built from. Skipping it is the same choice `merge_symbol_hit`
-            // makes for a ranked unit whose declaration is likewise gone.
+            if let Some(declaration) = merge.references.package_declaration(&identity)
+                && merge.matcher.is_none()
+            {
+                results.push(package_traversal_hit(declaration, path));
+            }
+            // Any other graph node with no lexical declaration in this snapshot: the store
+            // outlived the file it was built from. Skipping it is the same choice
+            // `merge_symbol_hit` makes for a ranked unit whose declaration is likewise gone.
             continue;
         };
         if !includes(merge.matcher, merge.root, file.path()) {
@@ -176,17 +189,27 @@ pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> bool {
 /// Answers `None` when every requested facet has a lane: an empty answer then means the
 /// walk ran and the seed has no neighbor under the request.
 fn relationship_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
-    relationship_coverage_warning(unproducible_facets(&traversal.facets))
+    relationship_coverage_warning(unproducible_facets(&traversal.facets, traversal.direction))
 }
 
-/// The relationship facets a lane populates today.
+/// The facet a language engine's hops carry in `direction`: an incoming hop is a
+/// reference the engine resolved, and an outgoing hop is a call its call hierarchy names.
+pub(crate) fn engine_facet(direction: TraversalDirection) -> RelationshipFacet {
+    match direction {
+        TraversalDirection::Incoming => RelationshipFacet::References,
+        TraversalDirection::Outgoing => RelationshipFacet::Calls,
+    }
+}
+
+/// The relationship facets a lane populates for a walk in `direction`.
 ///
-/// The language engine lane resolves incoming references, which the walk carries as
-/// [`RelationshipFacet::References`]. No provider publishes a resolved reference into the
-/// index, so the store holds no edge of any other facet.
-pub(crate) fn produced_relationship_facets() -> &'static BTreeSet<RelationshipFacet> {
-    static PRODUCED: OnceLock<BTreeSet<RelationshipFacet>> = OnceLock::new();
-    PRODUCED.get_or_init(|| BTreeSet::from([RelationshipFacet::References]))
+/// The language engine lane alone produces edges, [`engine_facet`] of the direction. No
+/// provider publishes a resolved reference into the index, so the store holds no edge of
+/// any other facet.
+pub(crate) fn produced_relationship_facets(
+    direction: TraversalDirection,
+) -> BTreeSet<RelationshipFacet> {
+    BTreeSet::from([engine_facet(direction)])
 }
 
 /// The requested facets no lane populates, in the request's own order, deduplicated.
@@ -195,8 +218,11 @@ pub(crate) fn produced_relationship_facets() -> &'static BTreeSet<RelationshipFa
 ///
 /// `validate_traversal` refuses a list longer than `SEARCH_TRAVERSAL_FACETS_MAX` before this
 /// runs, which bounds both the scan and the deduplication it carries.
-pub(crate) fn unproducible_facets(requested: &[RelationshipFacet]) -> Vec<RelationshipFacet> {
-    let produced = produced_relationship_facets();
+pub(crate) fn unproducible_facets(
+    requested: &[RelationshipFacet],
+    direction: TraversalDirection,
+) -> Vec<RelationshipFacet> {
+    let produced = produced_relationship_facets(direction);
     let mut missing: Vec<RelationshipFacet> = Vec::new();
     for facet in requested {
         if !produced.contains(facet) && !missing.contains(facet) {
@@ -312,7 +338,7 @@ pub(crate) fn walk_traversal_with_references(
         if path.len() as u64 >= traversal.depth {
             continue;
         }
-        for edge in combined_edges(store, &current, references) {
+        for edge in combined_edges(store, &current, references, traversal.direction) {
             if !edge.eligible(&traversal.facets) {
                 continue;
             }
@@ -367,10 +393,18 @@ impl TraversalEdge<'_> {
     fn next(&self) -> Option<CoreSymbolId> {
         match self {
             Self::Indexed(edge, HopDirection::Outgoing) => Some(edge.to().clone()),
-            Self::Indexed(edge, HopDirection::Incoming) | Self::Confirmed(edge, _) => {
-                Some(edge.from().clone())
+            Self::Indexed(edge, HopDirection::Incoming) => Some(edge.from().clone()),
+            Self::Confirmed(edge, resolved) => match resolved.direction {
+                HopDirection::Outgoing => Some(edge.to().clone()),
+                HopDirection::Incoming => Some(edge.from().clone()),
+            },
+            Self::Resolved(hop) => {
+                let next = match hop.direction {
+                    HopDirection::Outgoing => &hop.relationship.to,
+                    HopDirection::Incoming => &hop.relationship.from,
+                };
+                CoreSymbolId::new(next.0.clone()).ok()
             }
-            Self::Resolved(hop) => CoreSymbolId::new(hop.relationship.from.0.clone()).ok(),
         }
     }
 
@@ -378,7 +412,7 @@ impl TraversalEdge<'_> {
         match self {
             Self::Indexed(edge, direction) => graph_hop(edge, *direction),
             Self::Confirmed(edge, resolved) => {
-                let mut hop = graph_hop(edge, HopDirection::Incoming);
+                let mut hop = graph_hop(edge, resolved.direction);
                 hop.relationship.derivation = resolved.relationship.derivation;
                 hop
             }
@@ -389,27 +423,48 @@ impl TraversalEdge<'_> {
 
 /// Borrows graph edges until the walk selects a new symbol, preserving indexed evidence.
 ///
-/// A walk follows edges arriving at `current`: the store's own incoming edges, and the
-/// incoming references a language engine resolved for this read. A store edge an engine
-/// also named is reported once, as the engine's confirmation of it.
+/// A walk follows the edges of `direction` at `current`: the store's own edges, and the
+/// hops a language engine resolved for this read, incoming references or outgoing calls.
+/// A store edge an engine also named is reported once, as the engine's confirmation of it.
 fn combined_edges<'edge>(
     store: &'edge RelationshipStore,
     current: &CoreSymbolId,
     references: &'edge EngineReferences,
+    direction: TraversalDirection,
 ) -> Vec<TraversalEdge<'edge>> {
-    let mut resolved: BTreeMap<_, _> = references
-        .incoming(current)
+    let (engine_hops, stored, hop_direction) = match direction {
+        TraversalDirection::Incoming => (
+            references.incoming(current),
+            store.incoming(current),
+            HopDirection::Incoming,
+        ),
+        TraversalDirection::Outgoing => (
+            references.outgoing(current),
+            store.outgoing(current),
+            HopDirection::Outgoing,
+        ),
+    };
+    let neighbor = |relationship: &'edge Relationship| match hop_direction {
+        HopDirection::Incoming => relationship.from.0.as_str(),
+        HopDirection::Outgoing => relationship.to.0.as_str(),
+    };
+    let mut resolved: BTreeMap<_, _> = engine_hops
         .iter()
-        .map(|hop| (hop.relationship.from.0.as_str(), hop))
+        .map(|hop| (neighbor(&hop.relationship), hop))
         .collect();
+    let facet = engine_facet(direction);
     let mut edges = Vec::new();
-    for edge in store.incoming(current) {
-        let confirmed = (edge.facet() == RelationshipFacet::References)
-            .then(|| resolved.remove(edge.from().as_str()))
+    for edge in stored {
+        let stored_neighbor = match hop_direction {
+            HopDirection::Incoming => edge.from(),
+            HopDirection::Outgoing => edge.to(),
+        };
+        let confirmed = (edge.facet() == facet)
+            .then(|| resolved.remove(stored_neighbor.as_str()))
             .flatten();
         edges.push(match confirmed {
             Some(hop) => TraversalEdge::Confirmed(edge, hop),
-            None => TraversalEdge::Indexed(edge, HopDirection::Incoming),
+            None => TraversalEdge::Indexed(edge, hop_direction),
         });
     }
     edges.extend(resolved.into_values().map(TraversalEdge::Resolved));
@@ -481,6 +536,28 @@ fn merge_traversal_hit(
     hit.distance = Some(distance);
     results.push(hit);
     Ok(())
+}
+
+/// The hit for one package declaration an outgoing edge ends at: its symbol, addressed by
+/// the unit of the package file holding it. The local index holds none of its bytes, so
+/// the hit carries no range, line, or source.
+fn package_traversal_hit(declaration: &PackageDeclaration, path: Vec<GraphHop>) -> SearchHit {
+    let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
+    SearchHit {
+        hit: SearchHitTarget::Symbol {
+            symbol: Box::new(declaration.symbol.clone()),
+        },
+        score: Some(distance_score(distance)),
+        matched_by: vec![MatchedField::Relationship],
+        source: None,
+        range: None,
+        line: None,
+        path: None,
+        unit: Some(declaration.unit.clone()),
+        traversal_path: Some(path),
+        distance: Some(distance),
+        change: None,
+    }
 }
 
 /// Records that `existing` was also reached by the walk: adds [`MatchedField::Relationship`]
@@ -878,16 +955,34 @@ pub(crate) mod tests {
     /// the engine lane populates names no gap.
     #[test]
     fn unproducible_facets_names_nothing_for_an_empty_or_fully_produced_list() {
-        assert!(super::unproducible_facets(&[]).is_empty());
-        assert!(super::unproducible_facets(&[RelationshipFacet::References]).is_empty());
+        assert!(super::unproducible_facets(&[], TraversalDirection::Incoming).is_empty());
+        assert!(
+            super::unproducible_facets(
+                &[RelationshipFacet::References],
+                TraversalDirection::Incoming
+            )
+            .is_empty()
+        );
     }
 
-    /// The engine lane resolves references alone, so every other facet names a gap.
+    /// The engine lane resolves references incoming and calls outgoing, so every other
+    /// facet names a gap.
     #[test]
-    fn produced_relationship_facets_holds_references_alone() {
+    fn produced_relationship_facets_hold_the_engine_facet_of_the_direction() {
         assert_eq!(
-            super::produced_relationship_facets(),
-            &std::collections::BTreeSet::from([RelationshipFacet::References])
+            super::produced_relationship_facets(TraversalDirection::Incoming),
+            std::collections::BTreeSet::from([RelationshipFacet::References])
+        );
+        assert_eq!(
+            super::produced_relationship_facets(TraversalDirection::Outgoing),
+            std::collections::BTreeSet::from([RelationshipFacet::Calls])
+        );
+        assert_eq!(
+            super::unproducible_facets(
+                &[RelationshipFacet::References, RelationshipFacet::Calls],
+                TraversalDirection::Outgoing
+            ),
+            [RelationshipFacet::References]
         );
     }
 
@@ -896,18 +991,21 @@ pub(crate) mod tests {
     #[test]
     fn unproducible_facets_keeps_only_the_unproduced_ones_in_request_order() {
         assert_eq!(
-            super::unproducible_facets(&[
-                RelationshipFacet::Implements,
-                RelationshipFacet::References,
-                RelationshipFacet::Extends,
-            ]),
+            super::unproducible_facets(
+                &[
+                    RelationshipFacet::Implements,
+                    RelationshipFacet::References,
+                    RelationshipFacet::Extends,
+                ],
+                TraversalDirection::Incoming
+            ),
             [RelationshipFacet::Implements, RelationshipFacet::Extends]
         );
         assert_eq!(
-            super::unproducible_facets(&[
-                RelationshipFacet::Extends,
-                RelationshipFacet::Implements,
-            ]),
+            super::unproducible_facets(
+                &[RelationshipFacet::Extends, RelationshipFacet::Implements,],
+                TraversalDirection::Incoming
+            ),
             [RelationshipFacet::Extends, RelationshipFacet::Implements]
         );
     }
@@ -917,12 +1015,15 @@ pub(crate) mod tests {
     #[test]
     fn unproducible_facets_names_a_repeated_facet_once() {
         assert_eq!(
-            super::unproducible_facets(&[
-                RelationshipFacet::Implements,
-                RelationshipFacet::Implements,
-                RelationshipFacet::Extends,
-                RelationshipFacet::Implements,
-            ]),
+            super::unproducible_facets(
+                &[
+                    RelationshipFacet::Implements,
+                    RelationshipFacet::Implements,
+                    RelationshipFacet::Extends,
+                    RelationshipFacet::Implements,
+                ],
+                TraversalDirection::Incoming
+            ),
             [RelationshipFacet::Implements, RelationshipFacet::Extends]
         );
     }
@@ -1420,6 +1521,48 @@ pub(crate) mod tests {
         );
         assert_eq!(walk.discovered.len(), 1);
         assert_eq!(walk.discovered[0].0, caller);
+        assert_eq!(walk.discovered[0].1[0], prior);
+        assert_eq!(
+            walk.discovered[0].1[0].relationship.derivation,
+            rift_protocol::read::RelationshipDerivation::Resolution
+        );
+    }
+
+    /// An indexed call an engine also names is walked once, forward, as the engine's
+    /// confirmation of the indexed edge.
+    #[test]
+    fn confirmed_call_preserves_indexed_evidence_and_one_hit() {
+        let caller = graph_symbol_id("rift://symbol/rust/lib.rs/caller");
+        let target = graph_symbol_id("rift://symbol/rust/lib.rs/target");
+        let store = RelationshipStore::build(&graph_normalized(vec![
+            graph_definition("caller", caller.as_str(), (0, 40)),
+            graph_definition("target", target.as_str(), (40, 80)),
+            graph_reference(
+                "caller_calls_target",
+                graph_binding("lib.rs", 5, 10),
+                rift_core::ReferenceRole::Call,
+                "target",
+            ),
+        ]));
+        let edge = &store.outgoing(&caller)[0];
+        let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Outgoing);
+        let mut confirmed = prior.clone();
+        confirmed.relationship.evidence.clear();
+        let references = crate::EngineReferences::from_outgoing(BTreeMap::from([(
+            caller.clone(),
+            vec![confirmed],
+        )]));
+        let mut request = traversal_request(&caller, 1, vec![RelationshipFacet::Calls]);
+        request.direction = TraversalDirection::Outgoing;
+        let walk = super::walk_traversal_with_references(
+            &store,
+            &caller,
+            &request,
+            TRAVERSAL_NODES_MAX,
+            &references,
+        );
+        assert_eq!(walk.discovered.len(), 1);
+        assert_eq!(walk.discovered[0].0, target);
         assert_eq!(walk.discovered[0].1[0], prior);
         assert_eq!(
             walk.discovered[0].1[0].relationship.derivation,

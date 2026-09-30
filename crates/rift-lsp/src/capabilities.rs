@@ -5,7 +5,8 @@
 //! operations consult this record before sending anything.
 
 use lsp_types::{
-    ClientCapabilities, DiagnosticClientCapabilities, DiagnosticServerCapabilities,
+    CallHierarchyClientCapabilities, CallHierarchyServerCapability, ClientCapabilities,
+    DiagnosticClientCapabilities, DiagnosticServerCapabilities,
     DiagnosticWorkspaceClientCapabilities, DidChangeWatchedFilesClientCapabilities,
     GeneralClientCapabilities, InitializeResult, OneOf, PositionEncodingKind,
     ReferenceClientCapabilities, TextDocumentClientCapabilities, WindowClientCapabilities,
@@ -58,6 +59,9 @@ pub struct Capabilities {
     pub position_encoding: PositionEncoding,
     /// Whether the engine serves `textDocument/references`.
     pub references: bool,
+    /// Whether the engine serves `textDocument/prepareCallHierarchy` and
+    /// `callHierarchy/outgoingCalls`.
+    pub call_hierarchy: bool,
     /// Whether the engine serves `textDocument/diagnostic`.
     pub pull_diagnostics: bool,
     /// The identifier the engine registered its diagnostics under.
@@ -70,6 +74,7 @@ impl Default for Capabilities {
         Self {
             position_encoding: PositionEncoding::Utf16,
             references: false,
+            call_hierarchy: false,
             pull_diagnostics: false,
             diagnostic_identifier: None,
         }
@@ -102,6 +107,11 @@ impl Capabilities {
             Some(OneOf::Right(_options)) => true,
             None => false,
         };
+        let call_hierarchy = match advertised.call_hierarchy_provider {
+            Some(CallHierarchyServerCapability::Simple(served)) => served,
+            Some(CallHierarchyServerCapability::Options(_options)) => true,
+            None => false,
+        };
         let (pull_diagnostics, diagnostic_identifier) =
             match advertised.diagnostic_provider.as_ref() {
                 Some(DiagnosticServerCapabilities::Options(options)) => {
@@ -115,6 +125,7 @@ impl Capabilities {
         Ok(Self {
             position_encoding,
             references,
+            call_hierarchy,
             pull_diagnostics,
             diagnostic_identifier,
         })
@@ -138,7 +149,11 @@ pub(crate) fn glob_matches(glob: &str, ignore_case: bool, path: &str) -> bool {
 /// What the session offers every engine.
 ///
 /// UTF-8 positions preferred with the mandatory UTF-16 fallback, references,
-/// and document diagnostic pulls.
+/// call hierarchy, and document diagnostic pulls.
+///
+/// `textDocument.callHierarchy` is what makes typescript-language-server
+/// advertise `callHierarchyProvider` at all: 6.0.0 declares it only when the
+/// client offers it.
 ///
 /// `window.workDoneProgress` is what makes an engine report the work it is
 /// doing: the protocol forbids server-initiated progress unless the client
@@ -180,6 +195,7 @@ pub fn offered() -> ClientCapabilities {
         }),
         text_document: Some(TextDocumentClientCapabilities {
             references: Some(ReferenceClientCapabilities::default()),
+            call_hierarchy: Some(CallHierarchyClientCapabilities::default()),
             diagnostic: Some(DiagnosticClientCapabilities {
                 dynamic_registration: Some(true),
                 ..DiagnosticClientCapabilities::default()
@@ -249,6 +265,28 @@ mod tests {
                 .expect("record")
                 .references
         );
+    }
+
+    #[test]
+    fn call_hierarchy_forms_map_to_the_call_hierarchy_flag() {
+        let negotiated = |provider| {
+            Capabilities::negotiated(&answer(ServerCapabilities {
+                call_hierarchy_provider: provider,
+                ..ServerCapabilities::default()
+            }))
+            .expect("record")
+            .call_hierarchy
+        };
+        assert!(!negotiated(None));
+        assert!(!negotiated(Some(CallHierarchyServerCapability::Simple(
+            false
+        ))));
+        assert!(negotiated(Some(CallHierarchyServerCapability::Simple(
+            true
+        ))));
+        assert!(negotiated(Some(CallHierarchyServerCapability::Options(
+            lsp_types::CallHierarchyOptions::default()
+        ))));
     }
 
     #[test]
@@ -345,6 +383,10 @@ mod tests {
         assert!(
             text_document.references.is_some(),
             "reference requests require textDocument/references"
+        );
+        assert!(
+            text_document.call_hierarchy.is_some(),
+            "typescript-language-server advertises call hierarchy only when offered it"
         );
         let window = offered.window.expect("window capabilities are offered");
         assert_eq!(

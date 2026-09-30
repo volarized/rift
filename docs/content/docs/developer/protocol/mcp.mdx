@@ -366,7 +366,7 @@ index, as [package scope](#search-scope) describes. `target: "documentation"` re
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
-`traversal` walks the references a configured
+`traversal` walks the references or calls a configured
 [language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
 from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
 the optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference)
@@ -376,11 +376,20 @@ values, the same identity a `get_symbol` or `search` hit already carries.
 reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
 carries both entries.
 
-`direction` takes `incoming`, its default and its one value: the engine answers which
-declarations reference the seed, and no lane resolves what a declaration reaches outward. Two
-shapes cover most questions:
+`direction` names the edges the walk follows from each visited symbol:
+
+- `incoming`, the default - the engine answers which declarations reference the symbol, and each
+  hop carries the `references` facet.
+- `outgoing` <VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> -
+  the engine's call hierarchy answers which declarations the symbol calls, and each hop carries the
+  `calls` facet.
+
+These shapes cover most questions:
 
 - **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
+- **Callees** - `direction: "outgoing"`: what this symbol relies on, and at `depth: 2` what
+  those declarations rely on in turn. A callee in an installed package or a standard library is
+  a hit carrying the global index's identity for it, and the walk stops there.
 - **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
 
 Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
@@ -409,9 +418,128 @@ reference `serve` in `service.py`:
 Each caller's `traversal_path` carries a relationship from the caller to `serve`, with
 `facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
 
+In the same workspace, `serve` returns `handle(port) + len("serve")`, and `handle` lives in
+`handlers.py`. `len` is Python's own, declared in the typeshed stubs the embedded engine ships,
+and the global API resolves the workspace's Python to release 3.12.9. This request asks which
+declarations `serve` calls:
+
+**Request:**
+
+```json
+{
+  "traversal": {
+    "seed": "rift://symbol/python/service.py/serve",
+    "direction": "outgoing",
+    "facets": ["calls"],
+    "depth": 1
+  },
+  "target": "symbol"
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "hit": {
+        "target": "symbol",
+        "symbol": {
+          "id": "rift://symbol/python/handlers.py/handle",
+          "language": "python",
+          "name": "handle",
+          "kind": "function",
+          "facets": [
+            "value",
+            "callable"
+          ],
+          "signatures": [
+            {
+              "display": "def handle(port: int) -> int:",
+              "language": "python"
+            }
+          ]
+        }
+      },
+      "matched_by": [
+        "relationship"
+      ],
+      "range": {
+        "start": 0,
+        "end": 45
+      },
+      "line": 1,
+      "path": "handlers.py",
+      "traversal_path": [
+        {
+          "relationship": {
+            "from": "rift://symbol/python/service.py/serve",
+            "kind": "calls",
+            "facets": [
+              "calls"
+            ],
+            "to": "rift://symbol/python/handlers.py/handle",
+            "derivation": "resolution"
+          },
+          "direction": "outgoing"
+        }
+      ],
+      "distance": 1
+    },
+    {
+      "hit": {
+        "target": "symbol",
+        "symbol": {
+          "id": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
+          "language": "python",
+          "name": "len",
+          "kind": "function",
+          "origin": {
+            "location": "stdlib",
+            "source_kind": "authored"
+          }
+        }
+      },
+      "matched_by": [
+        "relationship"
+      ],
+      "unit": "rift://source/stdlib/python@3.12.9/builtins.pyi",
+      "traversal_path": [
+        {
+          "relationship": {
+            "from": "rift://symbol/python/service.py/serve",
+            "kind": "calls",
+            "facets": [
+              "calls"
+            ],
+            "to": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
+            "derivation": "resolution"
+          },
+          "direction": "outgoing"
+        }
+      ],
+      "distance": 1
+    }
+  ],
+  "pagination": {
+    "page_index": 0,
+    "total_pages": 1
+  }
+}
+```
+
+`handle`'s `traversal_path` carries a relationship from `serve` to `handle`, with
+`facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. The local
+index holds no declaration of `len`, so its hit carries the identity and the `kind` the global
+index holds for it, the same a `get_symbol` hit with `scope: "global"` carries. Its `unit` names
+the stub it is declared in, in place of `path`, and it carries no `range` or `line`: the local
+index holds none of its bytes.
+
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference)
-values; an empty or omitted list follows every facet a lane populates, which is `references`
-today. `target: "file"` never carries a walked hit, since a traversal only reaches symbols.
+values; an empty or omitted list follows every facet a lane populates, which is `references` on
+an incoming walk and `calls` on an outgoing one. `target: "file"` never carries a walked hit,
+since a traversal only reaches symbols.
 
 A `traversal` names the declaration its walk starts at, so a request carrying no `seed`
 refuses `invalid_request` naming the field.
@@ -419,10 +547,16 @@ refuses `invalid_request` naming the field.
 A walk whose seed no engine answers for refuses `capability_unavailable` naming
 `relationship traversal (no language engine serves the seed)`: nothing this workspace holds
 resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
-no facet a lane populates draws the same refusal. An engine session serves the current tree, so
-`traversal` combines with neither `rev` nor `change`, and refuses `capability_unavailable` for
-each. A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine
-answers for with no callers returns an empty result set, since an isolated declaration is a
+no facet a lane populates draws the same refusal, such as `references` alone on an outgoing walk.
+An engine session serves the current tree, so `traversal` combines with neither `rev` nor
+`change`, and refuses `capability_unavailable` for each, whatever its `direction`.
+
+An outgoing walk from a seed the ready engine prepares no call hierarchy item at refuses
+`capability_unavailable` naming the seed's kind, such as a `struct` under rust-analyzer. The
+engine answers that only once it reads ready, so a resend changes nothing.
+
+A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine answers
+for with no callers or callees returns an empty result set, since an isolated declaration is a
 legitimate answer.
 
 A walk the server stops at its node bound attaches a `traversal_truncated` entry to
@@ -435,20 +569,46 @@ beside the `references` the engine lane resolves. An empty answer carrying it me
 could not run; an empty answer without it means the walk ran and the seed has no neighbor
 under the request.
 
+An outgoing walk attaches a `callees_dropped` entry to `warnings` when the engine names callees
+no declaration answers for: a file outside the project and every installed package, or a
+position where the global index holds no declaration. With `[global] enabled = false`, or when
+the global API does not answer, every callee in a package or a standard library drops, and the
+answer also carries the global warning naming why, such as `global_access_disabled`. The walk
+carries no edge to a dropped callee; `callees` counts the edges it dropped over every depth.
+
 ### Language-engine references [#search-engine-references]
 
 <VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
 
 A current-tree symbol traversal consults the configured
-[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` contains
-`references` or is empty. The engine's answer is what the walk follows, under the same
-traversal depth and result bounds.
+[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` is empty or
+names the engine facet of its `direction`: `references` for `incoming`, `calls` for `outgoing`.
+The engine's answer is what the walk follows, under the same traversal depth and result bounds.
 
-The server maps each reference location to the smallest indexed declaration containing it.
-Locations outside the workspace or without an indexed declaration contribute no hit. When no
-engine is configured, or the engine lacks reference support, the walk refuses
-`capability_unavailable`. A configured engine that fails to start returns its failure through
-[`ErrorData`](/docs/developer/protocol/reference).
+The server maps each reference location, and each callee's name in a project file, to the
+smallest indexed declaration containing it. Locations outside the workspace or without an
+indexed declaration contribute no hit. When no engine is configured, or the engine lacks
+reference support, the walk refuses `capability_unavailable`. A configured engine that fails to
+start returns its failure through [`ErrorData`](/docs/developer/protocol/reference).
+
+<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} />
+
+A callee outside the project maps to the package whose files hold it, at an exact version:
+
+- an installed package the workspace's dependencies name, under its `node_modules` folder, its
+  Cargo registry folder, or its import folder in the Python environment, at the version the
+  lockfile pins
+- the Rust standard library below `rustc --print sysroot`, at the toolchain's version
+- a crate the Rust standard library vendors, such as `library/vendor/hashbrown-0.17.1/` below
+  the sysroot, as that Cargo package at the version the standard library's `Cargo.lock` pins
+- the TypeScript built-ins in the `lib.*.d.ts` files of the `typescript` package the engine
+  runs, at that package's version
+- Python's standard library, in the typeshed stubs the embedded engine ships, at the release the
+  global API resolves for the workspace's Python
+
+A package folder inside the workspace, such as `node_modules` or `.venv`, maps as its package.
+The server then asks the global API which declaration holds each such callee's position, in one
+request per walk, and the walk does not continue from a package callee.
 
 The server captures source and configuration before and after the engine request. If either
 changes, the server captures the current publication, refreshes the search ranking, and repeats
@@ -459,6 +619,24 @@ once where the request enters. Exhausted attempts or an expired deadline return
 
 A stale publication uses indexed relationships and carries `stale_index`. Each engine request
 also uses the configured engine retry and restart bounds.
+
+<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} />
+
+A walk takes an engine's answer once the engine reads ready: the work it announced has ended and
+stayed quiet for its `settle_delay`. The walk waits for that until a tenth of the
+`[server] readiness_timeout` budget before the request's deadline, so the answer and its warning
+still fit in the budget.
+
+When that wait is spent, when the engine answers about bytes the served tree does not hold, or
+when it answers more than the node bound holds, the walk drops the engine's contribution and
+attaches an `engine_analysis_unavailable` entry to `warnings`, naming the seed's `language`. A
+spent wait keeps the engine's session, so the engine goes on loading and a later read carries its
+edges.
+
+An engine that announced no work since it started, or since the server last sent it changed
+files, gives no evidence that it settled. The walk takes its answer once the engine stayed quiet
+for its `settle_delay`, and attaches an `engine_readiness_unconfirmed` entry naming the engine's
+process key in `processes`.
 
 ### Change [#search-change]
 

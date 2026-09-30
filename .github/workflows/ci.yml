@@ -383,6 +383,59 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The live suites on macOS, run from the archive the `native` job's
+  # aarch64-apple-darwin leg writes, since a binary built for Linux cannot run
+  # there. Windows runs no live suite: a detached server there inherits the
+  # starting process's output pipes (issue #388). A failed macOS leg uploads no
+  # archive, and the download below fails this job with it.
+  live-macos:
+    needs: native
+    if: ${{ !cancelled() }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7.0.0
+        with:
+          name: native-live
+          path: target
+      - uses: astral-sh/setup-uv@v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: dev/uv.lock
+      - uses: taiki-e/install-action@v2.87.20
+        with:
+          tool: just,cargo-nextest@0.9.145
+      - run: >-
+          rustup toolchain install 1.98 --profile minimal
+          --component rust-analyzer
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: latest
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/.cache/huggingface/hub
+          key: live-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: live-${{ runner.os }}-
+      - name: Run live engines
+        id: live
+        timeout-minutes: 15
+        run: just live-test target/native-live.tar.zst
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
+        with:
+          name: live-results-macos
+          path: |
+            target/nextest/live/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+
   installers:
     strategy:
       fail-fast: false
@@ -429,8 +482,10 @@ jobs:
           - os: macos-15-intel
             profile: ci-macos-intel
             target: x86_64-apple-darwin
+          # The live suites' macOS job runs from this leg's build.
           - os: macos-15
             target: aarch64-apple-darwin
+            live: true
           # rustc links a proc-macro DLL with `/DEBUG` and no `/Brepro`, so
           # link.exe stamps every build with a new timestamp and PDB signature.
           # sccache hashes that DLL into the key of each crate using the macro,
@@ -489,6 +544,26 @@ jobs:
           R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID: ${{ secrets.R2_BUILD_CACHE_WRITE_ACCESS_KEY_ID }}
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
         run: uv run --locked ${{ matrix.python && format('--python {0}', matrix.python) }} --project dev rift-dev build-cache
+      # `live-macos` runs the live suites from this archive, so the compile below
+      # finds every target already built and macOS compiles the workspace once.
+      # The filterset leaves out the corpus suites, as `just fast-archive` does.
+      - name: Build every target and archive the live suites
+        if: ${{ matrix.live }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >-
+          cargo nextest archive --locked
+          --workspace --all-targets --all-features
+          --archive-file target/native-live.tar.zst
+          -E 'not binary(/^corpus_/)'
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ matrix.live }}
+        with:
+          name: native-live
+          path: target/native-live.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
       # The ci profile's default filter keeps the live and corpus suites out.
       # Ignored regressions retain their issue links and do not run here.
       # The Windows publisher remains ignored until #477 is resolved:
@@ -796,6 +871,7 @@ jobs:
       - rust-build
       - rust
       - live
+      - live-macos
       - installers
       - native
       - integration-build

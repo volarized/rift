@@ -4405,7 +4405,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "strum",
  "tar",
  "tempfile",
  "tree-sitter",
@@ -4656,6 +4655,7 @@ dependencies = [
  "rift-search",
  "rift-syntax",
  "ruff_db",
+ "ruff_notebook",
  "ruff_text_size",
  "schemars 1.2.2",
  "serde_json",
@@ -4670,6 +4670,7 @@ dependencies = [
  "ty_project",
  "ty_python_core",
  "url",
+ "which",
 ]
 
 [[package]]

@@ -5,21 +5,23 @@
 //! started from its fixture-local executable after a frozen install, so
 //! package resolution cannot read a shared runner cache. Spawn policy,
 //! framing, and encoding negotiation are checked against another engine
-//! with cross-file references and a clean shutdown.
+//! with cross-file references, call hierarchy, and a clean shutdown.
 
 #![cfg(unix)]
 
 mod engine_fixture;
 mod live_engine_gate;
 mod typescript_engine;
+mod typescript_install;
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use live_engine_gate::engine_live;
 use rift_core::ProjectPath;
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::session::{EngineLaunch, EngineSession};
-use typescript_engine::{install_typescript_engine, typescript_package_files};
+use typescript_install::{install_typescript_engine, typescript_package_files};
 
 /// The live launch, built from the shared fixture's typescript-language-server
 /// data - `tsserver.useSyntaxServer = "never"` keeps the engine to one
@@ -27,6 +29,10 @@ use typescript_engine::{install_typescript_engine, typescript_package_files};
 fn launch() -> EngineLaunch {
     typescript_engine::fixture().launch()
 }
+
+/// A function whose callees reach into the project and the engine's own
+/// TypeScript lib, beside an interface.
+const WALK: &str = include_str!("fixtures/typescript/walk.ts");
 
 /// One bun project on disk with the pinned `typescript` installed.
 fn bun_project() -> tempfile::TempDir {
@@ -42,6 +48,7 @@ fn bun_project() -> tempfile::TempDir {
         ("hub.ts", include_str!("fixtures/typescript/hub.ts")),
         ("caller.ts", include_str!("fixtures/typescript/caller.ts")),
         ("view.tsx", include_str!("fixtures/typescript/view.tsx")),
+        ("walk.ts", WALK),
     ] {
         std::fs::write(workspace.path().join(name), source).expect("source fixture writes");
     }
@@ -117,4 +124,60 @@ async fn typescript_language_server_falls_back_to_utf16_and_advertises_the_pinne
         "stderr: {} bytes, truncated {}",
         stderr.total_bytes, stderr.truncated
     );
+}
+
+/// typescript-language-server advertises call hierarchy once the session
+/// offers it, and an open document's function prepares one item whose
+/// outgoing calls name one callee in the project and one in the pinned
+/// TypeScript's `lib.es5.d.ts`. The first request waits out the project load.
+#[tokio::test]
+async fn typescript_language_server_names_the_callees_of_a_prepared_function() {
+    if !engine_live() {
+        return;
+    }
+    let workspace = bun_project();
+    let mut session = EngineSession::start(launch(), workspace.path())
+        .await
+        .expect("typescript-language-server starts");
+    assert!(
+        session.capabilities().call_hierarchy,
+        "the engine advertises call hierarchy: {:#?}",
+        session.capabilities()
+    );
+    let document = ProjectPath::new("walk.ts").expect("fixture path");
+    session
+        .open(&document, "typescript", WALK.to_owned())
+        .await
+        .expect("didOpen is sent");
+    let asked = Instant::now();
+    let items = session
+        .prepare_call_hierarchy(&document, lsp_types::Position::new(6, 16))
+        .await
+        .expect("prepare answers");
+    eprintln!("prepare answered in {:?}", asked.elapsed());
+    let [item] = items.as_slice() else {
+        panic!("one item at `larger`: {items:?}");
+    };
+    assert_eq!(item.name, "larger");
+    let asked = Instant::now();
+    let calls = session
+        .outgoing_calls(item.clone())
+        .await
+        .expect("outgoing calls answer");
+    eprintln!(
+        "outgoing calls answered in {:?}, walk readiness {:?}",
+        asked.elapsed(),
+        session.walk_readiness()
+    );
+    let callees: BTreeSet<&str> = calls.iter().map(|call| call.to.name.as_str()).collect();
+    assert_eq!(callees, BTreeSet::from(["beacon", "max"]), "{calls:#?}");
+    for (name, file) in [("beacon", "hub.ts"), ("max", "lib.es5.d.ts")] {
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.to.name == name && call.to.uri.path().as_str().ends_with(file)),
+            "`{name}` answers from {file}: {calls:#?}"
+        );
+    }
+    session.shutdown().await;
 }

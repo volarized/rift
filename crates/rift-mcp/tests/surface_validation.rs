@@ -1,11 +1,18 @@
 //! Served read requests and responses validate against their advertised schemas.
 
+#[cfg(unix)]
+mod fake_engine;
 #[allow(
     dead_code,
     reason = "shared fixture global API exposes helpers this suite does not use"
 )]
 mod global_api;
 mod hermetic_search;
+// This binary serves its own fixture; the scripted engines reach their workspaces
+// through `workspace_client`, whose relative-root helpers no suite here calls.
+#[cfg(unix)]
+#[expect(dead_code, reason = "the relative-root helpers serve other suites")]
+mod workspace_client;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -210,8 +217,8 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
 /// `traversal` requests over the one real call edge the fixture already carries -
 /// `traversal_caller.py`'s `calls_callee` calling `traversal_callee.py`'s `callee` - so
 /// this corpus proves the params without perturbing any other corpus entry's fixture
-/// source. `rev` combined with `traversal` is proven refused, not accepted, by
-/// `search_traversal_with_rev_refuses_capability_unavailable` below; a runtime refusal has no
+/// source. Incoming walks start at the callee and outgoing walks at the caller. The walks
+/// the server refuses are proven by `traversal_refusal_corpus` below; a refusal has no
 /// structured content to validate against this corpus's output schema.
 fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
@@ -252,12 +259,55 @@ fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
                 }
             }),
         ),
+        // The caller's call hierarchy names `callee` in the project and `len` in the
+        // standard library the local index does not analyze, so the answer carries the
+        // `callees_dropped` warning and validates the schema arm serving it.
+        (
+            "search",
+            json!({
+                "traversal": { "seed": TRAVERSAL_CALLER, "direction": "outgoing" }
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": TRAVERSAL_CALLER,
+                    "direction": "outgoing",
+                    "depth": 2,
+                    "to": TRAVERSAL_CALLEE
+                }
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "callee",
+                "traversal": {
+                    "seed": TRAVERSAL_CALLER,
+                    "direction": "outgoing",
+                    "facets": ["calls"]
+                }
+            }),
+        ),
+        // Call hierarchy names calls alone, so `references` beside them has no lane on an
+        // outgoing walk.
+        (
+            "search",
+            json!({
+                "traversal": {
+                    "seed": TRAVERSAL_CALLER,
+                    "direction": "outgoing",
+                    "facets": ["references", "calls"]
+                }
+            }),
+        ),
     ]
 }
 
 /// The declaration every walk in this corpus starts at.
 const TRAVERSAL_CALLEE: &str = "rift://symbol/python/traversal_callee.py/callee";
-/// The one declaration referencing it.
+/// The one declaration referencing it, and the seed of every outgoing walk.
 const TRAVERSAL_CALLER: &str = "rift://symbol/python/traversal_caller.py/calls_callee";
 
 /// Search requests only the lexical search-index tier can fully answer: a multi-word
@@ -575,7 +625,8 @@ async fn served_fixture() -> TestResult<(
     )?;
     fs::write(
         directory.path().join("traversal_caller.py"),
-        "from traversal_callee import callee\n\n\ndef calls_callee() -> int:\n    return callee()\n",
+        "from traversal_callee import callee\n\n\n\
+         def calls_callee() -> int:\n    return callee() + len(\"callee\")\n",
     )?;
     // No syntax provider claims it; `nodes` names the missing extension.
     fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
@@ -654,6 +705,8 @@ struct CorpusArms {
     added_entries: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
+    outgoing_hops: usize,
+    callees_dropped: usize,
 }
 
 impl CorpusArms {
@@ -686,6 +739,8 @@ impl CorpusArms {
                 self.escaped_identities += 1;
             }
         }
+        self.outgoing_hops += outgoing_call_hops(structured);
+        self.callees_dropped += warning_count(structured, "callees_dropped");
     }
 
     /// Fails the walk unless every tracked arm was produced live.
@@ -728,7 +783,40 @@ impl CorpusArms {
             self.literal_at_identities,
             self.escaped_identities
         );
+        assert!(
+            self.outgoing_hops > 0 && self.callees_dropped > 0,
+            "the corpus must prove an outgoing walk's `calls` hop and its `callees_dropped` \
+             warning against the served schema: outgoing_hops={}, callees_dropped={}",
+            self.outgoing_hops,
+            self.callees_dropped
+        );
     }
+}
+
+/// How many hops across one answer's traversal paths an outgoing walk followed through a
+/// `calls` relationship.
+fn outgoing_call_hops(structured: &Value) -> usize {
+    structured["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| hit["traversal_path"].as_array())
+        .flatten()
+        .filter(|hop| {
+            hop["direction"] == json!("outgoing")
+                && hop["relationship"]["facets"] == json!(["calls"])
+        })
+        .count()
+}
+
+/// How many of one answer's warnings carry `code`.
+fn warning_count(structured: &Value, code: &str) -> usize {
+    structured["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == json!(code))
+        .count()
 }
 
 /// Every node identity one answer carries, whatever tool produced it.
@@ -939,24 +1027,128 @@ fn every_tool_example_validates_against_its_advertised_schemas() -> TestResult {
     Ok(())
 }
 
-/// `traversal` combined with `rev` is a schema-valid, runtime-refused request: the edge lane
-/// serves the current tree alone, so the server refuses `capability_unavailable` rather than
-/// answering. This is the one traversal case the schema-validating corpus above cannot carry,
-/// since a refusal produces no structured content to validate.
+/// The served input schema's verdict on a request the server refuses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputSchema {
+    /// The schema admits the request, and the server alone refuses it.
+    Admits,
+    /// The schema states the rule too, and the server enforces it for a caller that
+    /// validates nothing.
+    Refuses,
+}
+
+/// `traversal` requests the server refuses, with the input schema's verdict on each and the
+/// code its refusal carries. An engine session serves the current tree alone, so a walk
+/// beside `rev` or `change` refuses; the relationship graph serves the project alone, so a
+/// walk under `scope: "global"` refuses; and call hierarchy names calls alone, so an
+/// outgoing walk asking for `references` alone has no lane.
+fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, &'static str)> {
+    let outgoing = json!({ "seed": TRAVERSAL_CALLER, "direction": "outgoing" });
+    vec![
+        (
+            json!({ "rev": "main", "traversal": { "seed": TRAVERSAL_CALLEE } }),
+            InputSchema::Admits,
+            "capability_unavailable",
+        ),
+        (
+            json!({ "rev": "main", "traversal": outgoing }),
+            InputSchema::Admits,
+            "capability_unavailable",
+        ),
+        (
+            json!({ "scope": "global", "traversal": outgoing }),
+            InputSchema::Admits,
+            "invalid_request",
+        ),
+        (
+            json!({
+                "traversal": {
+                    "seed": TRAVERSAL_CALLER,
+                    "direction": "outgoing",
+                    "facets": ["references"]
+                }
+            }),
+            InputSchema::Admits,
+            "capability_unavailable",
+        ),
+        (
+            json!({ "change": { "base": "baseline", "head": "HEAD" }, "traversal": outgoing }),
+            InputSchema::Refuses,
+            "capability_unavailable",
+        ),
+    ]
+}
+
+/// Every refused walk draws its code, and the served input schema admits exactly the ones
+/// the server alone refuses. A refusal carries no structured content, so the corpus walk
+/// above cannot hold these requests.
 #[tokio::test]
-async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResult {
+async fn every_refused_traversal_carries_its_code_and_the_schema_verdict() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
-    let request = tools_call_request(
-        "search",
-        &json!({
-            "rev": "main",
-            "traversal": { "seed": TRAVERSAL_CALLEE }
-        }),
-    )?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input_validator, _output_validator) = validators
+        .get("search")
+        .ok_or("search must be advertised")?;
+    for (request, verdict, code) in traversal_refusal_corpus() {
+        assert_eq!(
+            input_validator.is_valid(&request),
+            verdict == InputSchema::Admits,
+            "the served input schema's verdict on {request:#}"
+        );
+        let error = client
+            .call_tool(tools_call_request("search", &request)?)
+            .await
+            .expect_err("the server refuses this walk");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(code)),
+            "{request:#} {error:?}"
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A language engine serving call hierarchy answers the two outgoing arms the embedded
+/// engine above never does. A seed the ready engine prepares no item at refuses
+/// `capability_unavailable`, naming the seed's kind, and an engine that announced no work
+/// answers with `engine_readiness_unconfirmed`. Each request validates against the served
+/// input schema, and the answer against the served output schema.
+#[cfg(unix)]
+#[tokio::test]
+async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> TestResult {
+    let (_engine, configuration) = fake_engine::rust_engine(fake_engine::READY_UNPREPARED_ENGINE)?;
+    let (_directory, client, _server_task) = workspace_client::served_workspace(
+        &[("lib.rs", "pub struct Beacon;\n")],
+        Some(configuration),
+    )
+    .await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input_validator, output_validator) = validators
+        .get("search")
+        .ok_or("search must be advertised")?;
+    workspace_client::call_retrying_acceptance(
+        &client,
+        workspace_client::tool_request("search", &json!({ "query": "Beacon" })),
+    )
+    .await?;
+    let unprepared = json!({
+        "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
+    });
+    assert_validates(
+        input_validator,
+        &unprepared,
+        "an outgoing walk from a struct",
+    );
     let error = client
-        .call_tool(request)
+        .call_tool(tools_call_request("search", &unprepared)?)
         .await
-        .expect_err("traversal combined with rev must be refused");
+        .expect_err("the ready engine prepares no call hierarchy item at a struct");
     let rmcp::ServiceError::McpError(error) = error else {
         return Err(format!("expected an McpError, found {error:?}").into());
     };
@@ -965,9 +1157,97 @@ async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResul
         Some(&json!("capability_unavailable")),
         "{error:?}"
     );
-
+    assert!(error.message.contains("of kind `struct`"), "{error:?}");
     client.cancel().await?;
-    server_task.await?;
+
+    let (_engine, (_directory, client, _server_task)) = fake_engine::scripted_calls_workspace(
+        fake_engine::UNANNOUNCED_WORK,
+        fake_engine::SERVED_LINES,
+    )
+    .await?;
+    let unconfirmed = json!({
+        "traversal": { "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing" }
+    });
+    assert_validates(input_validator, &unconfirmed, "an outgoing walk");
+    let structured = workspace_client::call_retrying_acceptance(
+        &client,
+        workspace_client::tool_request("search", &unconfirmed),
+    )
+    .await?;
+    assert_validates(
+        output_validator,
+        &structured,
+        "an unconfirmed engine's walk",
+    );
+    assert_eq!(
+        warning_count(&structured, "engine_readiness_unconfirmed"),
+        1,
+        "{structured:#}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A standard library callee the global API names answers as a hit carrying the global
+/// identity and a `unit` in place of `path`, and a callee it names nothing at drops: the
+/// answer validates against the served output schema.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> TestResult {
+    let global = GlobalFixture::start_with(global_api::FixtureOptions {
+        python_collection: true,
+        ..global_api::FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"5s\"\n\n\
+         [languages.python.lsp]\nembedded = \"ty\"\n",
+        global.endpoint
+    );
+    let (_directory, client, _server_task) = workspace_client::served_workspace(
+        &[(
+            "caller.py",
+            "import json\n\n\ndef caller() -> int:\n    return len(json.dumps(1))\n",
+        )],
+        Some(configuration),
+    )
+    .await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let (input_validator, output_validator) = validators
+        .get("search")
+        .ok_or("search must be advertised")?;
+    let walk = json!({
+        "traversal": { "seed": "rift://symbol/python/caller.py/caller", "direction": "outgoing" }
+    });
+    assert_validates(input_validator, &walk, "an outgoing walk");
+    let structured = workspace_client::call_retrying_acceptance(
+        &client,
+        workspace_client::tool_request("search", &walk),
+    )
+    .await?;
+    assert_validates(
+        output_validator,
+        &structured,
+        "an outgoing walk naming package callees",
+    );
+    let units: Vec<&Value> = structured["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| &hit["unit"])
+        .collect();
+    assert_eq!(
+        units,
+        [&json!("rift://source/stdlib/python@3.12.9/builtins.pyi")],
+        "{structured:#}"
+    );
+    assert_eq!(
+        warning_count(&structured, "callees_dropped"),
+        1,
+        "`json.dumps` is named nothing: {structured:#}"
+    );
+    client.cancel().await?;
     Ok(())
 }
 

@@ -22,6 +22,8 @@ const CRATES_IO_SOURCES: [&str; 2] = [
     "registry+https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io",
 ];
+/// The folder below the standard library source that holds the packages it vendors.
+const VENDOR_DIRECTORY_NAME: &str = "vendor";
 /// The operator that pins one exact version in a Cargo requirement.
 const EXACT_OPERATOR: char = '=';
 /// The separator between the clauses of a multi-clause Cargo requirement.
@@ -158,26 +160,74 @@ fn pin_lockfile(
     }
 }
 
-/// The folder a registry package unpacks into, `<name>-<version>`, minted from the
-/// lockfile's own name and version: a folder name is never parsed, since `md-5-0.11.0`
-/// and `toml-0.9.12+spec-1.1.0` split no way that holds. Absent for a git or path
-/// package, whose checkout folder Cargo names by a hash this pass cannot mint.
+/// The folder a registry package unpacks into, below each registry source folder.
 fn registry_folder(
     package: &LockedPackage,
     availability: PackageAvailability,
 ) -> Option<InstallFolder> {
+    let (package, folder) = registry_package(package, availability)?;
+    Some(InstallFolder {
+        package,
+        location: InstallLocation::CargoRegistry(folder),
+    })
+}
+
+/// A registry package's identity and the folder Cargo unpacks it into, `<name>-<version>`,
+/// minted from the lockfile's own name and version: a folder name is never parsed, since
+/// `md-5-0.11.0` and `toml-0.9.12+spec-1.1.0` split no way that holds. Absent for a git or
+/// path package, whose checkout folder Cargo names by a hash this pass cannot mint.
+fn registry_package(
+    package: &LockedPackage,
+    availability: PackageAvailability,
+) -> Option<(PackageIdentity, String)> {
     let registry = matches!(
         availability,
         PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
     );
-    registry.then(|| InstallFolder {
-        package: PackageIdentity {
+    registry.then(|| {
+        let identity = PackageIdentity {
             manager: CARGO_MANAGER.to_owned(),
             name: package.name.clone(),
             version: package.version.clone(),
-        },
-        location: InstallLocation::CargoRegistry(format!("{}-{}", package.name, package.version)),
+        };
+        (identity, format!("{}-{}", package.name, package.version))
     })
+}
+
+/// The registry packages the Rust standard library source vendors, each in its
+/// `vendor/<name>-<version>` folder below `library`.
+///
+/// The `rust-src` component vendors every registry package the standard library's own
+/// `Cargo.lock` pins, under the folder name Cargo unpacks it into, so each folder is minted
+/// from the lockfile as a registry folder is and no folder name is read. A package without
+/// a registry source, such as `std` itself, has no folder there. An absent lockfile, as on
+/// a toolchain without `rust-src`, names none.
+///
+/// # Errors
+///
+/// Returns `StaticFileFailure` when the lockfile is over its bound or unparsable.
+pub(crate) fn vendored_folders(
+    library: &Path,
+    inputs: &mut dyn StaticInputs,
+) -> Result<Vec<InstallFolder>, StaticFileFailure> {
+    let lockfile = match read_static_file(library, CARGO_LOCK_FILE_NAME, inputs) {
+        Ok(bytes) => parse_lockfile(&bytes)?,
+        Err(failure) if failure.is_absent() => return Ok(Vec::new()),
+        Err(failure) => return Err(failure),
+    };
+    let vendor = library.join(VENDOR_DIRECTORY_NAME);
+    Ok(lockfile
+        .package
+        .iter()
+        .filter_map(|package| {
+            let availability = source_availability(package.source.as_deref(), None)?;
+            let (package, folder) = registry_package(package, availability)?;
+            Some(InstallFolder {
+                package,
+                location: InstallLocation::Path(vendor.join(folder)),
+            })
+        })
+        .collect())
 }
 
 /// One `Cargo.toml`'s parsed dependency tables, absent when no file stands there.

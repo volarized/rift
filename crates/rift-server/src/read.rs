@@ -680,10 +680,11 @@ impl ReadService {
     }
 
     /// The dependency context an incremental rebuild over `changes` carries: the standing
-    /// one while no changed path is one of its inputs or a manifest a resolver claims, and
-    /// no change adds a language's first visible path or removes its last; a fresh read
-    /// otherwise. Reading it costs one pass over the workspace's manifests and lockfiles,
-    /// so a rebuild that touches none of them keeps what it holds.
+    /// one while no changed path is one of its inputs or a manifest a resolver claims, no
+    /// change adds a language's first visible path or removes its last, and no project
+    /// environment it listed lists differently now; a fresh read otherwise. Reading it
+    /// costs one pass over the workspace's manifests and lockfiles, so a rebuild that
+    /// touches none of them keeps what it holds.
     ///
     /// `index` is the rebuilt index: a removed path's language counts as gone only when
     /// no file it still holds is of that language.
@@ -697,7 +698,10 @@ impl ReadService {
             let path = project_path(path);
             self.context.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
         });
-        if !touches_input && !self.changes_standard_libraries(source_policy, changes, index) {
+        if !touches_input
+            && !self.changes_standard_libraries(source_policy, changes, index)
+            && !self.project_environment_moved()
+        {
             return Ok(Arc::clone(&self.context));
         }
         let context = resolved_context(
@@ -706,6 +710,27 @@ impl ReadService {
             &self.dependency_configuration,
         )?;
         Ok(Arc::new(context))
+    }
+
+    /// Whether the dependency context listed a project environment, so
+    /// [`Self::project_environment_moved`] has one to observe.
+    #[must_use]
+    pub fn observes_project_environment(&self) -> bool {
+        self.context.observes_project_environment()
+    }
+
+    /// Whether a project environment the dependency context listed lists differently now:
+    /// a distribution `uv sync` installed, removed, or upgraded while the lockfile stood
+    /// still. The environment sits outside every visible path, so no changed path reports
+    /// it, and a context that listed no environment answers `false` without a read.
+    #[must_use]
+    pub fn project_environment_moved(&self) -> bool {
+        self.context.observes_project_environment()
+            && self.context.project_environment_moved(
+                &mut crate::dependency::FilesystemInputs::new(
+                    crate::dependency::ResolutionPolicy::from(&self.dependency_configuration),
+                ),
+            )
     }
 
     /// Whether `changes` adds the first visible path of a language whose standard

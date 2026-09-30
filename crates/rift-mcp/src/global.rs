@@ -1,25 +1,28 @@
 //! Global package routing for current-tree reads.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
-    ClientError, Config, ConfigError, GlobalClient, PackageAvailability as WireAvailability,
-    PackageContextEntry as WireContextEntry, PackageIdentity as WirePackageIdentity,
-    PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
-    PackageSymbolCandidate, PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning,
-    WarningCode,
+    ClientError, Config, ConfigError, DECLARATION_POSITIONS_MAX, GlobalClient, PACKAGES_MAX,
+    POSITION_COMPONENT_MAX, PackageAvailability as WireAvailability,
+    PackageContextEntry as WireContextEntry, PackageDeclarationRequest,
+    PackageDeclarationRequestPositionEncoding, PackageIdentity as WirePackageIdentity,
+    PackagePatternMatch, PackagePatternRequest, PackagePosition, PackageResolutionRequest,
+    PackageSearchCandidate, PackageSearchRequest, PackageSearchRequestPhase,
+    PackageSearchRequestTarget, PackageSymbolCandidate, PackageSymbolRequest,
+    PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
 };
 use rift_core::{ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
-    DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
+    DEPENDENCY_WARNINGS_MAX, ExactKind, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
     ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
     SearchParamsTarget, SearchResult, SearchScope, SymbolId,
@@ -28,7 +31,9 @@ use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
-use rift_server::{ReadError, ReadService};
+use rift_server::{
+    CalleeDeclaration, CalleePackage, PackageCallee, PositionEncoding, ReadError, ReadService,
+};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -84,6 +89,15 @@ impl<'a> ReadContext<'a> {
             snapshot: reads.dependency_context(),
             requested,
         })
+    }
+
+    /// The context a read of `reads` requesting no package sends: the snapshot's own.
+    pub(crate) fn snapshot(reads: &'a ReadService) -> Self {
+        Self {
+            context: Arc::clone(reads.dependency_context()),
+            snapshot: reads.dependency_context(),
+            requested: &[],
+        }
     }
 
     /// The context this read sends under `entries_max`: its own when it fits, otherwise the
@@ -290,6 +304,200 @@ pub(crate) async fn package_symbols(
         .map(PackageSymbolCandidate::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(GlobalSymbolCandidates { items, warnings })
+}
+
+/// The declarations the global API named at one walk's package callee positions.
+#[derive(Debug, Default)]
+pub(crate) struct CalleeDeclarations {
+    /// The declaration answered at each position asked, with its kind, by the position's
+    /// encoding and key.
+    named:
+        HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
+    /// The releases the resolution served, which name a standard library's version.
+    served: Vec<WirePackageIdentity>,
+}
+
+/// One package position as a request carries it and its answer names it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CalleePosition {
+    package: (String, String, String),
+    path: String,
+    line: i64,
+    character: i64,
+}
+
+impl CalleeDeclarations {
+    /// The declaration the global API named at `callee`'s position, with its kind and the
+    /// exact package holding it; `None` for a position it answered no declaration at, or
+    /// one left unasked.
+    pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
+        let package = callee_package(callee, &self.served)?;
+        let key = (wire_encoding(callee), callee_position(callee, &package)?);
+        let (id, kind) = self.named.get(&key)?;
+        Some(CalleeDeclaration {
+            id: id.clone(),
+            kind: kind.clone(),
+            package: protocol_package_identity(package),
+        })
+    }
+}
+
+/// Asks the global API which declaration holds each callee's position, one request per
+/// position encoding the walk's engines counted in.
+///
+/// A callee in an installed package is asked at the exact version its install folder
+/// names, since a position belongs to one version of a file. A standard library callee is
+/// asked at the release the resolution `served` for the library's context entry; a callee
+/// of a library the resolution served no release of is left unasked. Past
+/// [`DECLARATION_POSITIONS_MAX`] distinct positions in one encoding the rest are left
+/// unasked too.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] when a request fails; nothing the earlier requests named is
+/// kept.
+pub(crate) async fn callee_declarations(
+    client: &GlobalClient,
+    callees: &[PackageCallee],
+    served: &[WirePackageIdentity],
+) -> Result<CalleeDeclarations, ClientError> {
+    let mut named = HashMap::new();
+    for request in declaration_requests(callees, served) {
+        let answer = client.find_package_declarations(&request).await?;
+        let encoding = request.position_encoding;
+        for result in answer.results {
+            let (Some(declaration), Some(kind)) = (result.declaration, result.kind) else {
+                continue;
+            };
+            let position = result.position;
+            let key = CalleePosition {
+                package: (
+                    position.package.manager,
+                    position.package.name,
+                    position.package.version,
+                ),
+                path: position.path,
+                line: position.line,
+                character: position.character,
+            };
+            named.insert(
+                (encoding.clone(), key),
+                (SymbolId(declaration), ExactKind(kind)),
+            );
+        }
+    }
+    Ok(CalleeDeclarations {
+        named,
+        served: served.to_vec(),
+    })
+}
+
+/// The requests asking for `callees`' positions: one per position encoding, each within
+/// the positions bound, every position once.
+fn declaration_requests(
+    callees: &[PackageCallee],
+    served: &[WirePackageIdentity],
+) -> Vec<PackageDeclarationRequest> {
+    batched_positions(callees.iter().filter_map(|callee| {
+        let package = callee_package(callee, served)?;
+        Some((wire_encoding(callee), callee_position(callee, &package)?))
+    }))
+}
+
+/// How the engine that named `callee` counts characters, as a request spells it.
+const fn wire_encoding(callee: &PackageCallee) -> PackageDeclarationRequestPositionEncoding {
+    match callee.encoding() {
+        PositionEncoding::Utf8 => PackageDeclarationRequestPositionEncoding::Utf8,
+        PositionEncoding::Utf16 => PackageDeclarationRequestPositionEncoding::Utf16,
+    }
+}
+
+// A request holds at most `DECLARATION_POSITIONS_MAX` positions, each in one package, so
+// it never names more packages than the client's own packages bound.
+const _: () = assert!(DECLARATION_POSITIONS_MAX <= PACKAGES_MAX);
+
+/// `positions` batched into one request per encoding, each position once, in the order
+/// met. A request stops taking positions at [`DECLARATION_POSITIONS_MAX`]; the positions
+/// past it stay unasked.
+fn batched_positions(
+    positions: impl IntoIterator<Item = (PackageDeclarationRequestPositionEncoding, CalleePosition)>,
+) -> Vec<PackageDeclarationRequest> {
+    let mut requests: Vec<PackageDeclarationRequest> = Vec::new();
+    let mut asked = HashSet::new();
+    for (position_encoding, key) in positions {
+        let held = requests
+            .iter()
+            .position(|request| request.position_encoding == position_encoding);
+        let index = held.unwrap_or_else(|| {
+            requests.push(PackageDeclarationRequest {
+                position_encoding: position_encoding.clone(),
+                positions: Vec::new(),
+            });
+            requests.len() - 1
+        });
+        let request = &mut requests[index];
+        if request.positions.len() >= DECLARATION_POSITIONS_MAX
+            || !asked.insert((position_encoding, key.clone()))
+        {
+            continue;
+        }
+        let (manager, name, version) = key.package;
+        request.positions.push(PackagePosition {
+            package: WirePackageIdentity {
+                manager,
+                name,
+                version,
+            },
+            path: key.path,
+            line: key.line,
+            character: key.character,
+        });
+    }
+    requests
+}
+
+/// The exact package a callee's position is asked in: its installed version, or the
+/// release the resolution served for its standard library.
+fn callee_package(
+    callee: &PackageCallee,
+    served: &[WirePackageIdentity],
+) -> Option<WirePackageIdentity> {
+    match callee.package() {
+        CalleePackage::Installed(package) => Some(WirePackageIdentity {
+            manager: package.manager.clone(),
+            name: package.name.clone(),
+            version: package.version.clone(),
+        }),
+        CalleePackage::StandardLibrary(_) => served
+            .iter()
+            .find(|release| {
+                let package = callee.package();
+                release.manager == package.manager() && release.name == package.name()
+            })
+            .cloned(),
+    }
+}
+
+/// The key of `callee`'s position in `package`; `None` for a line or character past the
+/// bound a request carries.
+fn callee_position(
+    callee: &PackageCallee,
+    package: &WirePackageIdentity,
+) -> Option<CalleePosition> {
+    let position = callee.position();
+    let line = i64::from(position.line);
+    let character = i64::from(position.character);
+    let within_bound = line <= POSITION_COMPONENT_MAX && character <= POSITION_COMPONENT_MAX;
+    within_bound.then(|| CalleePosition {
+        package: (
+            package.manager.clone(),
+            package.name.clone(),
+            package.version.clone(),
+        ),
+        path: callee.path().as_str().to_owned(),
+        line,
+        character,
+    })
 }
 
 /// Package symbol candidates and page warnings returned by one remote read.
@@ -986,6 +1194,16 @@ impl GlobalRoute {
                     .chain(substituted)
                     .take(DEPENDENCY_WARNINGS_MAX),
             )
+            .collect()
+    }
+
+    /// The warnings a read that asked the global API for no package facts of its own
+    /// carries: the typed warning naming why the global API did not answer, or
+    /// `capability_unavailable` naming the feature its capabilities do not advertise.
+    pub(crate) fn service_warnings(&self) -> Vec<ReadWarning> {
+        self.state_warning()
+            .into_iter()
+            .chain(self.unadvertised_feature.map(unadvertised_feature_warning))
             .collect()
     }
 
@@ -2047,6 +2265,99 @@ mod tests {
         assert_eq!(
             Some(reason.as_str()),
             rift_protocol::dependencies::PackageAvailability::Path.unavailable_reason()
+        );
+    }
+
+    /// A read that asked the global API for no package facts of its own carries the service
+    /// state alone: none of the context's own warnings.
+    #[test]
+    fn service_warnings_name_the_service_state_alone() {
+        let context = context_with_path_dependencies(2);
+        let disabled =
+            GlobalRoute::unanswered(&context, RouteState::Disabled, Arc::new(Mutex::new(None)));
+        assert_eq!(
+            disabled.service_warnings(),
+            [rift_protocol::read::ReadWarning::GlobalAccessDisabled]
+        );
+        let available =
+            GlobalRoute::unanswered(&context, RouteState::Available, Arc::new(Mutex::new(None)));
+        assert!(available.service_warnings().is_empty());
+        let mut unadvertised = available;
+        unadvertised.discard_remote(&ClientError::FeatureUnavailable {
+            feature: "declarations",
+        });
+        let codes: Vec<String> = unadvertised
+            .service_warnings()
+            .iter()
+            .map(|warning| {
+                serde_json::to_value(warning).expect("warning serializes")["code"].to_string()
+            })
+            .collect();
+        assert_eq!(codes, ["\"global_page_warning\""]);
+    }
+
+    fn position(name: &str, line: i64) -> super::CalleePosition {
+        super::CalleePosition {
+            package: ("pypi".to_owned(), name.to_owned(), "1.0.0".to_owned()),
+            path: format!("{name}/core.py"),
+            line,
+            character: 4,
+        }
+    }
+
+    /// Positions batch into one request per encoding, each position once in the order met.
+    #[test]
+    fn positions_batch_once_per_encoding() {
+        use rift_cloud_client::PackageDeclarationRequestPositionEncoding as Encoding;
+
+        let requests = super::batched_positions([
+            (Encoding::Utf16, position("greeting", 0)),
+            (Encoding::Utf8, position("greeting", 0)),
+            (Encoding::Utf16, position("greeting", 0)),
+            (Encoding::Utf16, position("other", 3)),
+        ]);
+        let batched: Vec<(Encoding, Vec<(String, i64)>)> = requests
+            .into_iter()
+            .map(|request| {
+                let positions = request
+                    .positions
+                    .into_iter()
+                    .map(|position| (position.package.name, position.line))
+                    .collect();
+                (request.position_encoding, positions)
+            })
+            .collect();
+        assert_eq!(
+            batched,
+            [
+                (
+                    Encoding::Utf16,
+                    vec![("greeting".to_owned(), 0), ("other".to_owned(), 3)]
+                ),
+                (Encoding::Utf8, vec![("greeting".to_owned(), 0)]),
+            ]
+        );
+        assert!(super::batched_positions([]).is_empty());
+    }
+
+    /// A request stops taking positions at the positions bound.
+    #[test]
+    fn positions_past_the_bound_stay_unasked() {
+        use rift_cloud_client::PackageDeclarationRequestPositionEncoding as Encoding;
+
+        let lines = 0..=i64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX)
+            .expect("the bound fits a line");
+        let requests = super::batched_positions(
+            lines.map(|line| (Encoding::Utf8, position("greeting", line))),
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].positions.len(),
+            rift_cloud_client::DECLARATION_POSITIONS_MAX
+        );
+        assert_eq!(
+            requests[0].positions.last().map(|position| position.line),
+            i64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX - 1).ok()
         );
     }
 

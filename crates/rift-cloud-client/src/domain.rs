@@ -695,7 +695,8 @@ fn convert_symbol(value: &Symbol) -> Result<rift_protocol::read::Symbol, ClientE
         id: value.id.clone().map(rift_protocol::read::SymbolId),
         language: language(&value.language)?,
         name: value.name.clone(),
-        kind: rift_protocol::read::ExactKind(value.kind.clone()),
+        kind: rift_protocol::read::ExactKind::try_from(value.kind.clone())
+            .map_err(|_| invalid("kind"))?,
         facets: value
             .facets
             .as_deref()
@@ -1325,6 +1326,28 @@ mod tests {
             Some("value")
         );
         assert_eq!(candidate.hit.symbol.extensions.0.len(), 1);
+    }
+
+    #[test]
+    fn candidate_rejects_a_malformed_kind() {
+        let package = package();
+        let mut symbol = symbol(&package);
+        symbol.kind = "9struct".to_owned();
+        let hit = PackageSymbol {
+            package,
+            symbol,
+            unit: unit(),
+            range: TextRange { start: 8, end: 24 },
+            line: 3,
+            match_class: crate::generated::IdentifierMatchClass::NameExact,
+            source: None,
+            documentation: None,
+            additional_properties: HashMap::new(),
+        };
+        assert_eq!(
+            PackageSymbolCandidate::try_from(hit),
+            Err(ClientError::InvalidResponseField { field: "kind" })
+        );
     }
 
     #[test]

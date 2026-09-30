@@ -46,7 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
-use crate::server::BlockingExecutor;
+use crate::server::{BlockingExecutor, EngineHold};
 
 /// Filesystem events coalesced while one rebuild is pending.
 pub(crate) const INDEX_INVALIDATIONS_MAX: usize = 1;
@@ -378,6 +378,9 @@ pub(crate) struct IndexValidation {
     /// silent: the flag makes it a named refusal on the first request instead
     /// of a timeout on every one.
     pub(crate) supervisor_running: Arc<AtomicBool>,
+    /// The engine hold each publication hands its changed files to, set once the server
+    /// holds one. Absent in a test that builds no server.
+    engines: std::sync::OnceLock<Arc<EngineHold>>,
 }
 
 /// Owned shutdown handle for the workspace index supervisor.
@@ -673,9 +676,18 @@ impl IndexValidation {
                 published: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
+                engines: std::sync::OnceLock::new(),
             }),
             receiver,
         )
+    }
+
+    /// Hands every later publication's changed files to `engines`.
+    ///
+    /// The server builds one hold for its one validation, so the first hold handed here
+    /// is the one fed, and a second is ignored.
+    pub(crate) fn feed_engines(&self, engines: Arc<EngineHold>) {
+        let _first_hold_stays = self.engines.set(engines);
     }
 
     /// Records one observation that names no path, so the next rebuild reads every visible
@@ -1635,14 +1647,16 @@ fn whole_workspace_candidate(
 /// Index-owned configuration, the compiled source policy, the dependency plan, and the
 /// dependency store carry over unchanged. Other accepted configuration may change without
 /// rebuilding source files. An empty change set still produces a candidate because
-/// current-tree requests wait for its observation epoch.
+/// current-tree requests wait for its observation epoch; it shares `previous` whole unless
+/// a project environment the dependency context listed lists differently now, the one
+/// movement no changed path reports, in which case the rebuild reads the context again.
 fn shared_workspace_candidate(
     previous: &PublishedWorkspace,
     changes: &PathChanges,
     configuration: ConfigurationState,
     epoch: u64,
 ) -> Result<PublishedWorkspace, ReadError> {
-    if changes.is_empty() {
+    if changes.is_empty() && !previous.reads.project_environment_moved() {
         return Ok(previous.under(configuration, epoch));
     }
     let reads = previous.reads.rebuilt(changes)?;
@@ -2922,6 +2936,7 @@ pub(crate) async fn rebuild_workspace(
     match captured {
         CapturedRebuild::Candidate {
             published,
+            change_set,
             write,
             work,
         } => {
@@ -2929,14 +2944,15 @@ pub(crate) async fn rebuild_workspace(
                 .lexical
                 .clone()
                 .map(|lane| LexicalHandoff::new(lane, write));
-            let outcome = publish_captured(context, published, work, lexical).await?;
+            let outcome = publish_captured(context, published, change_set, work, lexical).await?;
             if outcome == RebuildOutcome::Published {
                 trace_publication(epoch);
             }
             Ok(outcome)
         }
         CapturedRebuild::Unchanged { published, work } => {
-            let outcome = publish_captured(context, published, work, None).await?;
+            let unchanged = ChangeSet::Incremental(PathChanges::default());
+            let outcome = publish_captured(context, published, unchanged, work, None).await?;
             Ok(match outcome {
                 RebuildOutcome::Published => RebuildOutcome::Unchanged,
                 other => other,
@@ -2960,6 +2976,7 @@ pub(crate) async fn rebuild_workspace(
 async fn publish_captured(
     context: &IndexSupervisorContext,
     candidate: Arc<PublishedWorkspace>,
+    change_set: ChangeSet,
     work: PendingWork,
     lexical: Option<LexicalHandoff>,
 ) -> Result<RebuildOutcome, ReadError> {
@@ -2974,6 +2991,7 @@ async fn publish_captured(
                 &published,
                 &validation,
                 &candidate,
+                &change_set,
                 work,
                 lexical,
             ))
@@ -2990,6 +3008,9 @@ pub(crate) enum CapturedRebuild {
     Candidate {
         /// The candidate publication.
         published: Arc<PublishedWorkspace>,
+        /// What the rebuild covers against the publication it captured from, which the
+        /// engine feed hands on.
+        change_set: ChangeSet,
         /// What the lexical index applies before that candidate publishes.
         write: LexicalWrite,
         /// The observation's work, returned to the supervisor when nothing publishes.
@@ -3082,6 +3103,7 @@ pub(crate) fn capture_rebuild_with(
     let write = lexical_write(&candidate, &change_set);
     Ok(CapturedRebuild::Candidate {
         published: candidate,
+        change_set,
         write,
         work: request.work,
     })
@@ -3094,10 +3116,19 @@ pub(crate) fn finish_rebuild(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
     candidate: &Arc<PublishedWorkspace>,
+    change_set: &ChangeSet,
     work: PendingWork,
     lexical: Option<LexicalHandoff>,
 ) -> RebuildOutcome {
-    let outcome = publish_rebuild_after(root, published, validation, candidate, lexical, || {});
+    let outcome = publish_rebuild_after(
+        root,
+        published,
+        validation,
+        candidate,
+        change_set,
+        lexical,
+        || {},
+    );
     if outcome == RebuildOutcome::Published {
         validation.changed.notify_waiters();
     } else {
@@ -3132,13 +3163,23 @@ pub(crate) fn publish_rebuild(
     validation: &IndexValidation,
     candidate: &Arc<PublishedWorkspace>,
 ) -> RebuildOutcome {
-    publish_rebuild_after(root, published, validation, candidate, None, || {})
+    publish_rebuild_after(
+        root,
+        published,
+        validation,
+        candidate,
+        &ChangeSet::Full,
+        None,
+        || {},
+    )
 }
 
 /// Publishes under observation lane; hook enables deterministic overlap tests.
 ///
 /// A published candidate's lexical write is handed to the lane before the lane's lock
 /// releases, so two publications hand their writes over in the order they published.
+/// Its `change_set`, the rebuild's own against the publication it captured from, reaches
+/// the engine hold under the same locks.
 /// A candidate that meets a cancelled token under those locks is refused unpublished:
 /// the token is cancelled only at shutdown, and the lane it would be handed to has ended.
 ///
@@ -3149,6 +3190,7 @@ pub(crate) fn publish_rebuild_after(
     published: &RwLock<IndexState>,
     validation: &IndexValidation,
     candidate: &Arc<PublishedWorkspace>,
+    change_set: &ChangeSet,
     lexical: Option<LexicalHandoff>,
     after_state_lock: impl FnOnce(),
 ) -> RebuildOutcome {
@@ -3169,11 +3211,17 @@ pub(crate) fn publish_rebuild_after(
         return RebuildOutcome::Superseded;
     };
     let publishing = Arc::clone(&candidate);
+    let previous = Arc::clone(&state.current);
     // IndexState::publish owns the still-current check, so a superseded
     // candidate is rejected in exactly one place.
     let published = state.publish(candidate, observed_epoch);
     if published {
         validation.replace_publication_locked(&publishing);
+        // Under the state lock, so no request reads this publication before its
+        // engines owe its changed files (engine_read.rs opens and maps index bytes).
+        if let Some(engines) = validation.engines.get() {
+            engines.owe_publication(&previous, &publishing, change_set);
+        }
         if let Some(handoff) = lexical {
             handoff.hand_over(publishing);
         }
@@ -4165,6 +4213,7 @@ pub(crate) mod tests {
                 &publisher_state,
                 &publisher_validation,
                 &published_candidate,
+                &ChangeSet::Full,
                 None,
                 || {
                     locked.wait();
@@ -8742,6 +8791,7 @@ pub(crate) mod tests {
                 &fixture.state,
                 &fixture.validation,
                 &fixture.after,
+                &ChangeSet::Full,
                 work,
                 None,
             ),

@@ -7,12 +7,13 @@ use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, Pack
 use rift_protocol::read::{PackageIdentity, ProjectPath};
 use serde::Deserialize;
 
-use super::environment::SitePackages;
 use super::{
     LockedSource, PYPI_MANAGER, UV_LOCK_FILE_NAME, UV_MANIFEST_FILE_NAME, normalized_name,
     parse_lockfile,
 };
-use crate::context::{ContextAnswer, InstallFolder, InstallLocation, is_whole_version};
+use crate::context::{
+    ContextAnswer, EnvironmentObservation, InstallFolder, InstallLocation, is_whole_version,
+};
 use crate::manifest::{
     StaticFileFailure, WorkspacePaths, file_beside, manifest_directory_path, read_static_file,
 };
@@ -125,7 +126,7 @@ fn pin_lockfile(
         Ok(lockfile) => lockfile,
         Err(failure) => return report(answer, manifest, &failure),
     };
-    let site_packages = SitePackages::observe(&directory, inputs);
+    let environment = EnvironmentObservation::observe(&directory, inputs);
     for package in &lockfile.package {
         let name = normalized_name(&package.name);
         if let Some(path) = package.source.directory_path() {
@@ -141,18 +142,21 @@ fn pin_lockfile(
         let Some(version) = package.version.clone() else {
             continue;
         };
-        if let Some(site_packages) = &site_packages {
+        if let Some(site_packages) = &environment.site_packages {
             answer.install_folders.extend(
                 site_packages
-                    .import_folders(&name, &version, inputs)
+                    .import_roots(&name, &version, inputs)
                     .into_iter()
-                    .map(|folder| InstallFolder {
+                    .map(|root| InstallFolder {
                         package: PackageIdentity {
                             manager: PYPI_MANAGER.to_owned(),
                             name: name.clone(),
                             version: version.clone(),
                         },
-                        location: InstallLocation::Path(folder),
+                        location: InstallLocation::ImportRoot {
+                            site_packages: site_packages.directory().to_path_buf(),
+                            root,
+                        },
                     }),
             );
         }
@@ -163,6 +167,7 @@ fn pin_lockfile(
             package.source.availability(),
         ));
     }
+    answer.environments.push(environment);
 }
 
 /// Reports every requirement one `pyproject.toml`, standing in `directory`, declares. A
@@ -1052,7 +1057,7 @@ plugin = { workspace = true }
     }
 
     #[test]
-    fn test_a_pinned_distribution_records_the_import_folders_its_record_lists() {
+    fn test_a_pinned_distribution_records_the_import_roots_its_record_lists() {
         let site_packages = format!("{ROOT}/.venv/lib/python3.12/site-packages");
         let mut inspector = RecordedInspector::default()
             .with_file(format!("{ROOT}/uv.lock"), LOCKFILE)
@@ -1082,7 +1087,10 @@ typing_extensions-4.15.0.dist-info/RECORD,,
                 )
             })
             .collect();
-        let at = |path: &str| InstallLocation::Path(Path::new(&site_packages).join(path));
+        let at = |root: &str| InstallLocation::ImportRoot {
+            site_packages: std::path::PathBuf::from(&site_packages),
+            root: root.to_owned(),
+        };
         assert_eq!(
             folders,
             [
@@ -1093,6 +1101,66 @@ typing_extensions-4.15.0.dist-info/RECORD,,
                 ("pypi/internal-tool@2.0.0".to_owned(), &at("internal_tool")),
             ],
             "a distribution the environment does not hold records no folder"
+        );
+    }
+
+    /// The lockfile pass records the environment it listed, and a distribution installed
+    /// there afterwards moves it while `uv.lock` stands still.
+    #[test]
+    fn test_a_lockfile_records_its_environment_and_an_install_moves_it() {
+        let site_packages = format!("{ROOT}/.venv/lib/python3.12/site-packages");
+        let listed = |installed: &[&str]| {
+            installed.iter().fold(
+                RecordedInspector::default()
+                    .with_file(format!("{ROOT}/uv.lock"), LOCKFILE)
+                    .with_file(format!("{site_packages}/_virtualenv.py"), ""),
+                |inspector, record| {
+                    inspector.with_file(format!("{site_packages}/{record}/RECORD"), "")
+                },
+            )
+        };
+        let answer = context(&["pyproject.toml"], &mut listed(&[]));
+        let [environment] = answer.environments.as_slice() else {
+            panic!(
+                "one lockfile lists one environment: {:?}",
+                answer.environments
+            );
+        };
+        assert_eq!(environment.directory, Path::new(ROOT));
+        assert!(environment.site_packages.is_some(), "the POSIX layout");
+        assert!(!environment.moved(&mut listed(&[])), "the same listing");
+        assert!(
+            environment.moved(&mut listed(&["typing_extensions-4.15.0.dist-info"])),
+            "an installed distribution moves the environment"
+        );
+
+        let context = crate::resolve_context(
+            Path::new(ROOT),
+            &[project("pyproject.toml")],
+            &[&UvResolver::new()],
+            &mut listed(&[]),
+            &[],
+        );
+        assert!(context.observes_project_environment());
+        assert!(!context.project_environment_moved(&mut listed(&[])));
+        assert!(
+            context.project_environment_moved(&mut listed(&["typing_extensions-4.15.0.dist-info"]))
+        );
+
+        let unlocked = crate::resolve_context(
+            Path::new(ROOT),
+            &[project("pyproject.toml")],
+            &[&UvResolver::new()],
+            &mut RecordedInspector::default(),
+            &[],
+        );
+        assert!(
+            !unlocked.observes_project_environment(),
+            "no lockfile, no environment to observe"
+        );
+        assert!(
+            !unlocked
+                .project_environment_moved(&mut listed(&["typing_extensions-4.15.0.dist-info"]))
         );
     }
 }

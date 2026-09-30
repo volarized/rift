@@ -15,7 +15,10 @@ use crate::resolver::{DIRECTORY_ENTRIES_MAX, FileObservation, StaticInputs};
 
 /// The project environment directory uv creates beside the lockfile's manifest when
 /// `UV_PROJECT_ENVIRONMENT` does not name another, which a static pass cannot read.
-const ENVIRONMENT_DIRECTORY_NAME: &str = ".venv";
+pub const PROJECT_ENVIRONMENT_DIRECTORY: &str = ".venv";
+/// The file `uv venv` and `python3 -m venv` write at a project environment's root, naming
+/// the interpreter the environment was created from.
+pub const PROJECT_ENVIRONMENT_MARKER: &str = "pyvenv.cfg";
 /// The directory holding one `python<X.Y>` directory: the POSIX layout.
 const LIBRARY_DIRECTORY_NAME: &str = "lib";
 /// The directory below an environment holding `site-packages` directly: the Windows layout.
@@ -50,8 +53,12 @@ const PACKAGE_INIT_FILES: [&str; 2] = ["__init__.py", "__init__.pyi"];
 const MODULE_SEPARATOR: &str = "_";
 
 /// One environment's `site-packages` directory and its listing, read once per lockfile.
-#[derive(Debug)]
-pub(super) struct SitePackages {
+///
+/// Two observations are equal when the same `site-packages` lists the same entries, so a
+/// distribution `uv sync` installs, removes, or upgrades makes the next observation
+/// differ: each one adds or removes its `.dist-info` directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SitePackages {
     directory: PathBuf,
     /// Every entry name by its ASCII-lowercase form, for the metadata directory match.
     by_lowercase: BTreeMap<String, String>,
@@ -60,8 +67,11 @@ pub(super) struct SitePackages {
 impl SitePackages {
     /// The `site-packages` of the environment beside `directory`, the folder holding the
     /// lockfile: below `lib/python<X.Y>`, else below `Lib`. Absent when neither stands.
-    pub(super) fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
-        let environment = directory.join(ENVIRONMENT_DIRECTORY_NAME);
+    ///
+    /// The work is at most three listings of [`DIRECTORY_ENTRIES_MAX`] entries each.
+    #[must_use]
+    pub fn observe(directory: &Path, inputs: &mut dyn StaticInputs) -> Option<Self> {
+        let environment = directory.join(PROJECT_ENVIRONMENT_DIRECTORY);
         let library = environment.join(LIBRARY_DIRECTORY_NAME);
         let posix = inputs
             .list_directory(&library, DIRECTORY_ENTRIES_MAX)
@@ -88,37 +98,36 @@ impl SitePackages {
         })
     }
 
-    /// The absolute import folders and single-file modules the distribution `normalized`
-    /// at `version` installed, in path order. Empty when its metadata directory is not
-    /// listed or its `RECORD` is absent, over its bound, or names no module.
+    /// The `site-packages` folder this listing read.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    /// The import folders and single-file modules the distribution `normalized` at
+    /// `version` installed, relative to [`Self::directory`] with forward slashes, in path
+    /// order. Empty when its metadata directory is not listed or its `RECORD` is absent,
+    /// over its bound, or names no module.
     ///
     /// The metadata directory matches without regard to case, since a wheel keeps the
     /// project's own spelling (`PyYAML-6.0.3.dist-info`). The work is one read of at most
     /// `RECORD_BYTES_MAX` bytes and one pass over its lines.
-    pub(super) fn import_folders(
+    pub(super) fn import_roots(
         &self,
         normalized: &str,
         version: &str,
         inputs: &mut dyn StaticInputs,
-    ) -> Vec<PathBuf> {
+    ) -> BTreeSet<String> {
         let wanted = dist_info_name(normalized, version).to_ascii_lowercase();
         let Some(dist_info) = self.by_lowercase.get(&wanted) else {
-            return Vec::new();
+            return BTreeSet::new();
         };
         let record = self.directory.join(dist_info).join(RECORD_FILE_NAME);
         let text = match inputs.read_file(&record, RECORD_BYTES_MAX) {
             FileObservation::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            FileObservation::Absent | FileObservation::OverBound { .. } => return Vec::new(),
+            FileObservation::Absent | FileObservation::OverBound { .. } => return BTreeSet::new(),
         };
         record_import_roots(&text, dist_info)
-            .into_iter()
-            .map(|root| {
-                root.split(RECORD_PATH_SEPARATOR)
-                    .fold(self.directory.clone(), |folder, segment| {
-                        folder.join(segment)
-                    })
-            })
-            .collect()
     }
 }
 
@@ -267,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_folders_match_the_metadata_directory_without_regard_to_case() {
+    fn test_import_roots_match_the_metadata_directory_without_regard_to_case() {
         let mut inputs = RecordedInspector::default()
             .with_directory(format!("{SITE_PACKAGES}/PyJWT-2.10.1.dist-info"))
             .with_file(
@@ -279,16 +288,46 @@ mod tests {
         let site_packages =
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the POSIX layout");
 
+        assert_eq!(site_packages.directory(), Path::new(SITE_PACKAGES));
         assert_eq!(
-            site_packages.import_folders("pyjwt", "2.10.1", &mut inputs),
-            [PathBuf::from(format!("{SITE_PACKAGES}/jwt"))],
+            Vec::from_iter(site_packages.import_roots("pyjwt", "2.10.1", &mut inputs)),
+            ["jwt"],
             "PyJWT installs as `jwt`, a name the distribution name does not spell"
         );
         assert!(
             site_packages
-                .import_folders("pyjwt", "2.9.0", &mut inputs)
+                .import_roots("pyjwt", "2.9.0", &mut inputs)
                 .is_empty(),
             "another version is not installed here"
+        );
+    }
+
+    #[test]
+    fn test_an_installed_distribution_makes_the_next_observation_differ() {
+        let listed = |files: &[&str]| {
+            let mut inputs = files
+                .iter()
+                .fold(RecordedInspector::default(), |inputs, file| {
+                    inputs.with_file(format!("{SITE_PACKAGES}/{file}"), "")
+                });
+            SitePackages::observe(Path::new(ROOT), &mut inputs)
+        };
+        let before = listed(&["six.py", "six-1.17.0.dist-info/RECORD"]);
+        assert!(before.is_some(), "the POSIX layout");
+        assert_eq!(
+            before,
+            listed(&["six.py", "six-1.17.0.dist-info/RECORD"]),
+            "the same listing observes equal"
+        );
+        assert_ne!(
+            before,
+            listed(&[
+                "six.py",
+                "six-1.17.0.dist-info/RECORD",
+                "jwt/__init__.py",
+                "PyJWT-2.10.1.dist-info/RECORD",
+            ]),
+            "an installed distribution adds its entries"
         );
     }
 
@@ -301,9 +340,10 @@ mod tests {
         );
         let site_packages =
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the Windows layout");
+        assert_eq!(site_packages.directory(), Path::new(&windows));
         assert_eq!(
-            site_packages.import_folders("six", "1.17.0", &mut inputs),
-            [PathBuf::from(format!("{windows}/six.py"))]
+            Vec::from_iter(site_packages.import_roots("six", "1.17.0", &mut inputs)),
+            ["six.py"]
         );
 
         let mut empty = RecordedInspector::default().with_directory(ROOT);
@@ -321,7 +361,7 @@ mod tests {
             SitePackages::observe(Path::new(ROOT), &mut inputs).expect("the POSIX layout");
         assert!(
             site_packages
-                .import_folders("big", "1.0.0", &mut inputs)
+                .import_roots("big", "1.0.0", &mut inputs)
                 .is_empty()
         );
     }

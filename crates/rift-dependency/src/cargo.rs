@@ -3,6 +3,8 @@
 mod context;
 mod lockfile;
 
+pub(crate) use context::vendored_folders;
+
 use crate::context::ContextAnswer;
 use crate::resolver::{ContextRequest, DependencyResolver, ResolverName, StaticInputs};
 

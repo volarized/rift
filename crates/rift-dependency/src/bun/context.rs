@@ -75,7 +75,7 @@ fn pin_lockfile(
         if let (PackageSelector::Version(exact), Some(path)) = (&selector, install_path(key)) {
             answer
                 .install_folders
-                .push(installed_folder(&directory, &path, name, exact));
+                .push(installed_folder(&directory, &path, (name, exact), inputs));
         }
         answer.entries.push(PackageContextEntry::new(
             NPM_MANAGER,

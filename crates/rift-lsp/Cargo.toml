@@ -27,6 +27,7 @@ tokio = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "live_rust_analyzer"

@@ -1806,7 +1806,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -1824,6 +1824,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees it named no declaration for. The\nlanguage engine's call hierarchy named each in a file outside the project and every\ninstalled package the workspace's dependencies name, or in a package or standard\nlibrary file where the global index answered no declaration at the callee's\nposition. Every package callee drops when the global API is off or did not answer,\nand the answer then carries the global warning naming why. Every other edge stands.\nThe warning states that edges are missing from this answer; it never states that\nthe seed calls nothing more.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per call the engine named.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"
@@ -4277,7 +4333,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -4295,6 +4351,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees it named no declaration for. The\nlanguage engine's call hierarchy named each in a file outside the project and every\ninstalled package the workspace's dependencies name, or in a package or standard\nlibrary file where the global index answered no declaration at the callee's\nposition. Every package callee drops when the global API is off or did not answer,\nand the answer then carries the global warning naming why. Every other edge stands.\nThe warning states that edges are missing from this answer; it never states that\nthe seed calls nothing more.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per call the engine named.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"
@@ -4893,7 +5005,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone and `pattern` from their\nsource, `all` from both, ordered together. `packages` names package versions `query`\nand `pattern` search beside the workspace's own, such as an upgrade target or a\npackage the project does not use yet. Use `get_symbol` when the declaration name is\nknown.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations two committed revisions hold\ndifferently, in place of `query` and `traversal`. `rev` searches a version-control\nrevision instead of the current tree, and never combines with `pattern`, `traversal`,\nor `change`. `scope` reaches past the project tree: `global` answers `query` from the\npublic declarations the global index holds for the workspace's dependencies alone and\n`pattern` from their source, `all` from both, ordered together. `packages` names\npackage versions `query` and `pattern` search beside the workspace's own, such as an\nupgrade target or a package the project does not use yet. Use `get_symbol` when the\ndeclaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -5270,7 +5382,7 @@
               "direction": {
                 "$ref": "#/$defs/TraversalDirection",
                 "default": "incoming",
-                "description": "Which edges the walk follows from each visited symbol. Omitted, `incoming`."
+                "description": "Which edges the walk follows from each visited symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. Omitted, `incoming`."
               },
               "facets": {
                 "description": "Portable relationship facets eligible for the walk. Omitted or empty, every facet is\neligible.",
@@ -5302,11 +5414,16 @@
             "type": "string"
           },
           "TraversalDirection": {
-            "description": "Which edge direction a search traversal walks from each visited symbol.",
+            "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
             "oneOf": [
               {
                 "const": "incoming",
-                "description": "Walks edges arriving at each visited symbol.",
+                "description": "Walks edges arriving at each visited symbol: the references a language engine\nresolves to it, each hop carrying the `references` facet.",
+                "type": "string"
+              },
+              {
+                "const": "outgoing",
+                "description": "Walks edges leaving each visited symbol: the calls a language engine's call\nhierarchy names for it, each hop carrying the `calls` facet.",
                 "type": "string"
               }
             ]
@@ -5400,6 +5517,17 @@
                 "references"
               ],
               "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+            }
+          },
+          {
+            "limit": 25,
+            "target": "symbol",
+            "traversal": {
+              "direction": "outgoing",
+              "facets": [
+                "calls"
+              ],
+              "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees"
             }
           },
           {
@@ -7014,7 +7142,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "A language engine serves the seed's language, and this read dropped what it\nanswered: the answer addressed bytes the served revision does not carry. The\nindexed relationships stand; whatever the engine resolves on top of them is\nmissing. The warning states that an engine's analysis is absent from this answer;\nit never states that the seed has no such neighbor. A later read served from a\nrevision the engine has caught up with carries the engine's edges again.",
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
                 "properties": {
                   "code": {
                     "const": "engine_analysis_unavailable",
@@ -7032,6 +7160,62 @@
                 },
                 "required": [
                   "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees it named no declaration for. The\nlanguage engine's call hierarchy named each in a file outside the project and every\ninstalled package the workspace's dependencies name, or in a package or standard\nlibrary file where the global index answered no declaration at the callee's\nposition. Every package callee drops when the global API is off or did not answer,\nand the answer then carries the global warning naming why. Every other edge stands.\nThe warning states that edges are missing from this answer; it never states that\nthe seed calls nothing more.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per call the engine named.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
                   "detail"
                 ],
                 "type": "object"

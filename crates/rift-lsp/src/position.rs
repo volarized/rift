@@ -6,6 +6,9 @@
 //! starts. A position past a line's end or the document's end is refused,
 //! never clamped: a clamp would silently move an engine's location.
 
+use std::cmp::Ordering;
+use std::iter;
+
 use lsp_types::Position;
 use rift_core::line::{LineEnding, lines_inclusive, without_ending};
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
@@ -119,21 +122,24 @@ impl<'text> LineIndex<'text> {
     ) -> Result<usize, PositionError> {
         let line_start = self.line_start(position.line)?;
         let content = without_ending(self.line_text(position.line as usize, line_start));
+        // The line's end joins the character boundaries, so a character inside the last
+        // character is misaligned like one inside any other.
+        let boundaries = content
+            .char_indices()
+            .map(|(offset, character)| (offset, unit_width(encoding, character)))
+            .chain(iter::once((content.len(), 0)));
         let mut units: u32 = 0;
-        for (offset, character) in content.char_indices() {
-            if units == position.character {
-                return Ok(line_start + offset);
+        for (offset, width) in boundaries {
+            match units.cmp(&position.character) {
+                Ordering::Equal => return Ok(line_start + offset),
+                Ordering::Greater => {
+                    return Err(Error::new(PositionFault::CharacterMisaligned {
+                        line: position.line,
+                        character: position.character,
+                    }));
+                }
+                Ordering::Less => units += width,
             }
-            if units > position.character {
-                return Err(Error::new(PositionFault::CharacterMisaligned {
-                    line: position.line,
-                    character: position.character,
-                }));
-            }
-            units += unit_width(encoding, character);
-        }
-        if units == position.character {
-            return Ok(line_start + content.len());
         }
         Err(Error::new(PositionFault::CharacterOutOfRange {
             line: position.line,
@@ -342,6 +348,47 @@ mod tests {
             inside_euro.fault(),
             PositionFault::CharacterMisaligned { .. }
         ));
+    }
+
+    /// A character inside the line's last character splits it, whatever the
+    /// line ending: the position is misaligned, never past the line's end.
+    #[test]
+    fn refuses_a_character_inside_the_last_character_of_a_line() {
+        for text in ["x𝄞", "x𝄞\nend", "x𝄞\r\nend"] {
+            let index = LineIndex::new(text);
+            for (encoding, inside, line_units) in [
+                (PositionEncoding::Utf16, 2..3, 3),
+                (PositionEncoding::Utf8, 2..5, 5),
+            ] {
+                for character in inside {
+                    let error = index
+                        .byte_offset(encoding, at(0, character))
+                        .expect_err("the character splits the astral one");
+                    assert_eq!(
+                        *error.fault(),
+                        PositionFault::CharacterMisaligned { line: 0, character },
+                        "{text:?} {encoding:?}"
+                    );
+                }
+                assert_eq!(
+                    index.byte_offset(encoding, at(0, line_units)),
+                    Ok("x𝄞".len()),
+                    "{text:?} {encoding:?}"
+                );
+                let past = index
+                    .byte_offset(encoding, at(0, line_units + 1))
+                    .expect_err("past the line's end");
+                assert_eq!(
+                    *past.fault(),
+                    PositionFault::CharacterOutOfRange {
+                        line: 0,
+                        character: line_units + 1,
+                        line_units
+                    },
+                    "{text:?} {encoding:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -27,19 +27,24 @@ pub(crate) const NODE_MODULES_DIRECTORY_NAME: &str = "node_modules";
 ///
 /// `install_path` is the lockfile's own spelling, `node_modules/<name>` or a nested
 /// `node_modules/<parent>/node_modules/<name>`, with forward slashes: every nested copy
-/// gets a folder of its own, whatever version it pins.
+/// gets a folder of its own, whatever version it pins. The folder is recorded as its real
+/// path: pnpm and Bun's isolated installs link `node_modules/<name>` into a store folder
+/// such as `node_modules/.pnpm/<name>@<version>/node_modules/<name>`, and a language engine
+/// names the files it reads there by the store path. A folder no link resolves keeps the
+/// lockfile's spelling.
 #[must_use]
 pub(crate) fn installed_folder(
     directory: &Path,
     install_path: &str,
-    name: &str,
-    version: &str,
+    (name, version): (&str, &str),
+    inputs: &mut dyn StaticInputs,
 ) -> InstallFolder {
     let folder: PathBuf = install_path
         .split('/')
         .fold(directory.to_path_buf(), |folder, segment| {
             folder.join(segment)
         });
+    let folder = inputs.canonical_path(&folder).unwrap_or(folder);
     InstallFolder {
         package: PackageIdentity {
             manager: NPM_MANAGER.to_owned(),

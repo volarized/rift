@@ -3,6 +3,8 @@
 mod context;
 mod environment;
 
+pub use environment::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER, SitePackages};
+
 use serde::Deserialize;
 
 use crate::context::ContextAnswer;

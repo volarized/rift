@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges, WorkspaceDigests,
-    WorkspaceFingerprint, WorkspaceIndexLimits, capture_digests_with_languages,
+    ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -18,7 +18,7 @@ use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
     Digest, GetSymbolParams, GetSymbolResult, Language, NodesParams, NodesResult, Pagination,
-    ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope,
+    ProjectPath, ReadWarning, SearchParams, SearchResult, SearchScope, TraversalDirection,
 };
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
@@ -33,8 +33,8 @@ use rift_search::{
     SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault, ReadService,
-    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault,
+    ReadService, StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -44,14 +44,14 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, merge_patterns, merge_search,
-    merge_symbols, package_patterns, package_search, package_symbols,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, callee_declarations,
+    merge_patterns, merge_search, merge_symbols, package_patterns, package_search, package_symbols,
 };
 use crate::identity::BuildCheckout;
 use crate::parameters::Parameters;
@@ -607,19 +607,26 @@ struct RevisionRead {
     history: rift_protocol::configuration::HistoryConfiguration,
 }
 
-/// One current-tree request's publication, and the warning it carries when that
-/// publication is served in spite of a recorded rebuild failure.
+/// One current-tree request's publication, the warning it carries when that
+/// publication is served in spite of a recorded rebuild failure, and how long the
+/// request-time capture that resolved it took.
 struct ResolvedWorkspace {
     published: Arc<PublishedWorkspace>,
     stale: Option<ReadWarning>,
+    /// The request-time capture's time, worker admission included. A traversal checks
+    /// the same tree once more after its engine walk, and sizes the time it reserves
+    /// for that check from this capture ([`RequestDeadline::walk_end`]).
+    capture_elapsed: Duration,
 }
 
 impl ResolvedWorkspace {
-    /// A publication that answers for the tree as it stands.
-    const fn current(published: Arc<PublishedWorkspace>) -> Self {
+    /// A publication that answers for the tree as it stands, resolved by a capture that
+    /// took `capture_elapsed`.
+    const fn current(published: Arc<PublishedWorkspace>, capture_elapsed: Duration) -> Self {
         Self {
             published,
             stale: None,
+            capture_elapsed,
         }
     }
 
@@ -638,10 +645,15 @@ impl ResolvedWorkspace {
         moved: Option<CaptureMovement>,
         reason: &StaleIndexReason<'_>,
         phase: wire::ErrorPhase,
+        capture_elapsed: Duration,
     ) -> Result<Self, ErrorData> {
         published.configuration.accepted(phase)?;
         let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
-        Ok(Self { published, stale })
+        Ok(Self {
+            published,
+            stale,
+            capture_elapsed,
+        })
     }
 }
 
@@ -703,6 +715,14 @@ struct PreviousCapture {
     requested_epoch: u64,
     /// The latest superseded epoch recorded before the capture began.
     superseded_seen: u64,
+}
+
+/// One request-time tree capture, folded for its reconciliation attempt.
+struct ReconciliationCapture {
+    digests: WorkspaceDigests,
+    configuration: ConfigurationFingerprint,
+    tree: WorkspaceFingerprint,
+    capture_elapsed: Duration,
 }
 
 impl PreviousCapture {
@@ -868,14 +888,22 @@ type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests
 /// Reaching every retry arm of the bounded reconciliation loop by racing real filesystem
 /// events is not reproducible; forcing the capture the loop runs makes each arm a plain
 /// function call.
+///
+/// The capture comes back after its delay, which a test sets to stand in for the time a
+/// large tree takes: the delay is an asynchronous wait, so a request deadline can pass
+/// during it as it passes during a capture on the worker pool.
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct ForcedCapture(Arc<std::sync::Mutex<Option<Arc<ForcedTreeCapture>>>>);
+struct ForcedCapture(Arc<std::sync::Mutex<Option<DelayedCapture>>>);
+
+/// One forced capture and the delay before each of its answers.
+#[cfg(test)]
+type DelayedCapture = (Arc<ForcedTreeCapture>, Duration);
 
 #[cfg(test)]
 impl ForcedCapture {
-    /// The forced capture, when one is installed.
-    fn installed(&self) -> Option<Arc<ForcedTreeCapture>> {
+    /// The forced capture and its delay, when one is installed.
+    fn installed(&self) -> Option<DelayedCapture> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -902,11 +930,26 @@ impl RiftMcp {
         + Sync
         + 'static,
     ) {
+        self.force_capture_after(Duration::ZERO, capture);
+    }
+
+    /// Forces `capture` as the request-time capture every later request runs, each one
+    /// answered `delay` after it is asked for.
+    fn force_capture_after(
+        &self,
+        delay: Duration,
+        capture: impl Fn(
+            &PublishedWorkspace,
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        + Send
+        + Sync
+        + 'static,
+    ) {
         *self
             .forced_capture
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(capture));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Arc::new(capture), delay));
     }
 }
 
@@ -1113,6 +1156,21 @@ fn ranking_of(
     }
 }
 
+/// The least a walk reserves before the request's deadline, as a share of the request
+/// budget: a tenth. Closing the walk's document and building the answer with its warning
+/// fit inside it; [`WALK_CAPTURE_RESERVE_FACTOR`] sizes the reserve past it for a tree
+/// whose check takes longer.
+const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
+
+/// How many request-time captures of the same tree a walk reserves time for after it
+/// ends: the one check that decides whether its answer stands, twice over.
+///
+/// Two captures of one unchanged tree run the same directory walk and the same stat per
+/// file seconds apart, so the request's own capture predicts the check after the walk.
+/// The factor covers a check that runs slower than the capture it is predicted from,
+/// such as one queued behind other work on the worker pool.
+const WALK_CAPTURE_RESERVE_FACTOR: u32 = 2;
+
 /// The instant every wait inside one request must end by.
 ///
 /// `[server] readiness_timeout` bounds one request, not each wait that request makes. A
@@ -1161,6 +1219,20 @@ impl RequestDeadline {
     /// already at hand.
     fn is_spent(self) -> bool {
         self.remaining().is_zero()
+    }
+
+    /// The instant a traversal's engine walk stops waiting for readiness and abandons a
+    /// retry still in flight, so the work after it fits before [`RequestDeadline::at`].
+    ///
+    /// The walk reserves the larger of a tenth of the budget
+    /// ([`WALK_BUDGET_RESERVE_DIVISOR`]) and [`WALK_CAPTURE_RESERVE_FACTOR`] times
+    /// `capture_elapsed`, the request-time capture of the tree the walk is checked
+    /// against when it ends. A reserve past the budget is held at the budget: the walk's
+    /// waits end where the request began, so the walk makes only its first attempt.
+    fn walk_end(self, capture_elapsed: Duration) -> tokio::time::Instant {
+        let floor = self.budget / WALK_BUDGET_RESERVE_DIVISOR;
+        let check = capture_elapsed.saturating_mul(WALK_CAPTURE_RESERVE_FACTOR);
+        self.at - floor.max(check).min(self.budget)
     }
 }
 
@@ -1590,6 +1662,7 @@ impl RiftMcp {
         let supervisor_cancellation = Arc::new(validation.cancellation.clone().drop_guard());
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
+        validation.feed_engines(Arc::clone(&engines));
         let server = Self {
             root: root.clone(),
             identity,
@@ -1789,18 +1862,19 @@ impl RiftMcp {
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol. `pattern` matches a regex
-    /// against the text of every indexed file, line by line as ripgrep reads it, and answers
-    /// each match and each declaration holding one, in place of `query` and `traversal`.
-    /// `change` answers the declarations two committed revisions hold differently, in place
-    /// of `query` and `traversal`. `rev` searches a version-control revision instead of the
-    /// current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
-    /// reaches past the project tree: `global` answers `query` from the public declarations
-    /// the global index holds for the workspace's dependencies alone and `pattern` from their
-    /// source, `all` from both, ordered together. `packages` names package versions `query`
-    /// and `pattern` search beside the workspace's own, such as an upgrade target or a
-    /// package the project does not use yet. Use `get_symbol` when the declaration name is
-    /// known.
+    /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
+    /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
+    /// regex against the text of every indexed file, line by line as ripgrep reads it, and
+    /// answers each match and each declaration holding one, in place of `query` and
+    /// `traversal`. `change` answers the declarations two committed revisions hold
+    /// differently, in place of `query` and `traversal`. `rev` searches a version-control
+    /// revision instead of the current tree, and never combines with `pattern`, `traversal`,
+    /// or `change`. `scope` reaches past the project tree: `global` answers `query` from the
+    /// public declarations the global index holds for the workspace's dependencies alone and
+    /// `pattern` from their source, `all` from both, ordered together. `packages` names
+    /// package versions `query` and `pattern` search beside the workspace's own, such as an
+    /// upgrade target or a package the project does not use yet. Use `get_symbol` when the
+    /// declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1915,7 +1989,7 @@ impl RiftMcp {
             ranking = self.ranking(&params, &resolved.published, deadline).await?;
         }
         let requested = &params;
-        let (resolved, ranking, references) = tokio::time::timeout_at(
+        let (resolved, ranking, mut references) = tokio::time::timeout_at(
             deadline.at(),
             Box::pin(rift_core::traced_async!(
                 component = "search",
@@ -1931,7 +2005,13 @@ impl RiftMcp {
             ReadFault::unavailable("engine references", "request deadline exceeded")
                 .tool_error(wire::ErrorPhase::Read)
         })??;
-        let SearchRanking { answer, warnings } = ranking.unwrap_or_else(|| {
+        let callee_warnings = self
+            .name_package_callees(&resolved, &mut references, deadline)
+            .await;
+        let SearchRanking {
+            answer,
+            mut warnings,
+        } = ranking.unwrap_or_else(|| {
             SearchRanking::unavailable(
                 "the lexical index is stamped for a publication newer than the one this \
                  request captured, and the workspace kept publishing across the bounded \
@@ -1940,6 +2020,7 @@ impl RiftMcp {
                 self.ranking_weights,
             )
         });
+        warnings.extend(callee_warnings);
         self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
             .await
     }
@@ -2143,7 +2224,7 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<(ResolvedWorkspace, Option<SearchRanking>, EngineReferences), ErrorData> {
         for attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
-            if let Some(references) = self.engine_references(&resolved, params).await? {
+            if let Some(references) = self.engine_references(&resolved, params, deadline).await? {
                 return Ok((resolved, ranking, references));
             }
             if attempt + 1 < INDEX_CAPTURE_ATTEMPTS_MAX {
@@ -2164,27 +2245,42 @@ impl RiftMcp {
     ///
     /// `None` asks the caller to capture a fresh publication after source or configuration
     /// movement. A stale publication uses its index and keeps its existing stale warning.
+    ///
+    /// The request-time capture that resolved `resolved` already matched the tree to the
+    /// publication, so the walk starts at once, and one capture after it decides whether
+    /// its answer stands: a tree that moved at any point before that capture and stayed
+    /// moved fails it, as it would have failed a capture before the walk.
+    ///
+    /// A walk, in either direction, stops waiting for engine readiness, and abandons a
+    /// retry still in flight, early enough for that capture to fit before `deadline`
+    /// ([`RequestDeadline::walk_end`]), so a spent wait answers with its warning instead
+    /// of reaching the request's own timeout, which refuses the request. A request
+    /// refused there keeps the engine session while it reads intact, and the next walk
+    /// first closes the document the refused one left open.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,
         params: &SearchParams,
+        deadline: RequestDeadline,
     ) -> Result<Option<EngineReferences>, ErrorData> {
         if params.traversal.is_none() || resolved.stale.is_some() {
             return Ok(Some(EngineReferences::default()));
         }
+        let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
         let engines = self.engine_pool_for(&resolved.published).await;
         if !uses_engine_references(&resolved.published.reads, &engines, params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
         {
             return Ok(Some(EngineReferences::default()));
         }
-        if !self.engine_tree_matches(&resolved.published).await? {
-            return Ok(None);
-        }
+        let roots = self
+            .callee_roots(&resolved.published, &engines, params)
+            .await?;
         let references = Box::pin(resolve_engine_references(
             &resolved.published.reads,
             &engines,
             params,
+            (walk_deadline, &roots),
         ))
         .await
         .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
@@ -2193,6 +2289,81 @@ impl RiftMcp {
         } else {
             Ok(None)
         }
+    }
+
+    /// The installed packages an outgoing walk addresses its callees' files through, read
+    /// on the worker pool; no package for an incoming walk, which maps into the tree alone.
+    async fn callee_roots(
+        &self,
+        published: &PublishedWorkspace,
+        engines: &Arc<EnginePool>,
+        params: &SearchParams,
+    ) -> Result<CalleeRoots, ErrorData> {
+        let outgoing = params
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.direction == TraversalDirection::Outgoing);
+        if !outgoing {
+            return Ok(CalleeRoots::default());
+        }
+        let reads = Arc::clone(&published.reads);
+        let engines = Arc::clone(engines);
+        self.blocking
+            .run("callee package roots", move || {
+                Ok(CalleeRoots::read(&reads, &engines))
+            })
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// Names the declaration of each callee an outgoing walk found in a package file, in
+    /// one global API request per position encoding, and returns the warnings the global
+    /// lane carries.
+    ///
+    /// A callee answered no declaration, one left out of a request past its bounds, and
+    /// every callee when `[global] enabled = false` or the global API did not answer, is
+    /// counted in `callees_dropped`; the last two carry the global warning naming why.
+    async fn name_package_callees(
+        &self,
+        resolved: &ResolvedWorkspace,
+        references: &mut EngineReferences,
+        deadline: RequestDeadline,
+    ) -> Vec<ReadWarning> {
+        if references.package_callees().is_empty() {
+            return Vec::new();
+        }
+        let read_context = ReadContext::snapshot(&resolved.published.reads);
+        let configuration = resolved.published.configuration.global_configuration();
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(&configuration, &read_context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(&read_context),
+        };
+        let Some(client) = route.client.clone() else {
+            references.drop_package_callees();
+            return route.service_warnings();
+        };
+        let asked = callee_declarations(
+            &client,
+            references.package_callees(),
+            &route.remote_packages,
+        );
+        match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
+            Ok(Ok(named)) => references.name_package_callees(|callee| named.declaration(callee)),
+            Ok(Err(error)) => {
+                route.discard_remote(&error);
+                references.drop_package_callees();
+            }
+            Err(_) => {
+                route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                references.drop_package_callees();
+            }
+        }
+        route.service_warnings()
     }
 
     /// Whether the captured source and configuration still match the publication.
@@ -2733,24 +2904,31 @@ impl RiftMcp {
         while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
             let superseded_seen = self.validation.superseded_epoch();
-            let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
-            let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
-                digests.fingerprint()
-            });
-            let configuration_matches =
-                current.configuration.fingerprint == configuration_fingerprint;
-            if tree == current.fingerprint && configuration_matches {
+            let capture = self.reconciliation_capture(&current, phase).await?;
+            let configuration_matches = current.configuration.fingerprint == capture.configuration;
+            if capture.tree == current.fingerprint
+                && configuration_matches
+                && !self.project_environment_moved(&current, phase).await?
+            {
                 current.configuration.accepted(phase)?;
-                return Ok(ResolvedWorkspace::current(current));
+                return Ok(ResolvedWorkspace::current(current, capture.capture_elapsed));
             }
-            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+            let changes =
+                PathChanges::between(&current.reads.workspace_digests(), &capture.digests);
             let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
             if let Some(failure) = rebuild_failure {
                 let reason = StaleIndexReason::RebuildFailed(&failure);
-                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
+                return ResolvedWorkspace::stale(
+                    current,
+                    &capture.digests,
+                    moved,
+                    &reason,
+                    phase,
+                    capture.capture_elapsed,
+                );
             }
             let owed_publication = previous.as_ref().is_some_and(|previous| {
-                previous.awaits_publication(&current, &tree, configuration_fingerprint)
+                previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
                 wait = ReadWait::Rebuild { superseded_seen };
@@ -2758,7 +2936,7 @@ impl RiftMcp {
             }
             let moved_since_previous = previous
                 .as_ref()
-                .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
+                .filter(|previous| !previous.matches(&capture.tree, capture.configuration));
             attempts += 1;
             let requested_epoch = self
                 .request_rebuild(&current, &changes, configuration_matches, phase)
@@ -2773,7 +2951,14 @@ impl RiftMcp {
                     epoch,
                     changes: &changes,
                 };
-                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
+                return ResolvedWorkspace::stale(
+                    current,
+                    &capture.digests,
+                    moved,
+                    &reason,
+                    phase,
+                    capture.capture_elapsed,
+                );
             }
             wait = if configuration_matches {
                 ReadWait::Rebuild { superseded_seen }
@@ -2781,24 +2966,60 @@ impl RiftMcp {
                 ReadWait::Configuration
             };
             previous = Some(PreviousCapture {
-                tree,
-                configuration: configuration_fingerprint,
+                tree: capture.tree,
+                configuration: capture.configuration,
                 requested_epoch,
                 superseded_seen,
             });
-            spent = Some((current, digests, changes, moved));
+            let (digests, capture_elapsed) = (capture.digests, capture.capture_elapsed);
+            spent = Some((current, digests, changes, moved, capture_elapsed));
         }
         if matches!(wait, ReadWait::Rebuild { .. })
-            && let Some((current, digests, changes, moved)) = spent
+            && let Some((current, digests, changes, moved, capture_elapsed)) = spent
         {
             let reason = StaleIndexReason::TreeKeptMoving { changes: &changes };
-            return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
+            return ResolvedWorkspace::stale(
+                current,
+                &digests,
+                moved,
+                &reason,
+                phase,
+                capture_elapsed,
+            );
         }
         Err(ReadFault::unavailable(
             "current workspace read",
             "workspace changed across bounded reconciliation attempts",
         )
         .tool_error(phase))
+    }
+
+    /// Whether a project environment `current`'s dependency context listed lists
+    /// differently now, observed on the worker pool.
+    ///
+    /// A `uv sync` that installs from an unchanged lockfile moves no visible path, so the
+    /// capture cannot see it; this observation is what asks for the rebuild that reads the
+    /// context again. A context that listed no environment answers `false` without
+    /// entering the pool.
+    async fn project_environment_moved(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<bool, ErrorData> {
+        if !current.reads.observes_project_environment() {
+            return Ok(false);
+        }
+        let reads = Arc::clone(&current.reads);
+        self.blocking
+            .run("project environment", move || {
+                Ok(rift_core::traced!(
+                    component = "index",
+                    operation = "fingerprint.environment",
+                    { reads.project_environment_moved() }
+                ))
+            })
+            .await
+            .map_err(|error| error.tool_error(phase))
     }
 
     /// Captures the tree one reconciliation attempt compares with `current`.
@@ -2813,6 +3034,27 @@ impl RiftMcp {
         self.capture_tree(current).await.map_err(|error| {
             let _ = self.validation.observe_whole_workspace();
             error.tool_error(phase)
+        })
+    }
+
+    /// Captures the tree one reconciliation attempt compares with `current`, folding its
+    /// digest and recording the capture's elapsed time.
+    async fn reconciliation_capture(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<ReconciliationCapture, ErrorData> {
+        let capture_started = tokio::time::Instant::now();
+        let (digests, configuration) = self.capture_read(current, phase).await?;
+        let capture_elapsed = capture_started.elapsed();
+        let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+            digests.fingerprint()
+        });
+        Ok(ReconciliationCapture {
+            digests,
+            configuration,
+            tree,
+            capture_elapsed,
         })
     }
 
@@ -2890,7 +3132,10 @@ impl RiftMcp {
         current: &PublishedWorkspace,
     ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
         #[cfg(test)]
-        if let Some(forced) = self.forced_capture.installed() {
+        if let Some((forced, delay)) = self.forced_capture.installed() {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             return forced(current);
         }
         let root = self.root.clone();
@@ -3202,10 +3447,13 @@ impl ServerHandler for RiftMcp {
 /// long-lived services, so the hold compares the published tables against
 /// the pool it keeps: unchanged tables reuse the running sessions, and
 /// changed tables swap in a fresh pool and shut the replaced one down.
+///
+/// The lock is a std one, held for a compare or a swap and never across an await, so a
+/// publication can hand the held pool its changed files from the blocking pool.
 #[derive(Debug)]
 pub(crate) struct EngineHold {
     root: PathBuf,
-    pool: AsyncMutex<Arc<EnginePool>>,
+    pool: std::sync::Mutex<Arc<EnginePool>>,
 }
 
 impl EngineHold {
@@ -3218,7 +3466,43 @@ impl EngineHold {
         let pool = Arc::new(EnginePool::new(&root, definitions, bindings));
         Self {
             root,
-            pool: AsyncMutex::new(pool),
+            pool: std::sync::Mutex::new(pool),
+        }
+    }
+
+    /// The held pool.
+    fn held(&self) -> std::sync::MutexGuard<'_, Arc<EnginePool>> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hands the held pool the files one publication changed against the one it
+    /// replaced, when the pool runs an engine.
+    ///
+    /// An incremental rebuild's own `change_set` already names those files, so it is
+    /// handed on as it stands. A full rebuild names none, so both publications'
+    /// digests are compared, O(files), and only while an engine is running: a pool
+    /// with none has no session to tell.
+    pub(crate) fn owe_publication(
+        &self,
+        previous: &PublishedWorkspace,
+        publishing: &PublishedWorkspace,
+        change_set: &ChangeSet,
+    ) {
+        if Arc::ptr_eq(&previous.reads, &publishing.reads) {
+            return;
+        }
+        let pool = Arc::clone(&self.held());
+        if !pool.runs_an_engine() {
+            return;
+        }
+        match change_set {
+            ChangeSet::Incremental(changes) => pool.owe_changed_paths(changes),
+            ChangeSet::Full => pool.owe_changed_paths(&PathChanges::between(
+                &previous.reads.workspace_digests(),
+                &publishing.reads.workspace_digests(),
+            )),
         }
     }
 
@@ -3241,13 +3525,18 @@ impl EngineHold {
         definitions: BTreeMap<LspProcessKey, LspConfiguration>,
         bindings: BTreeMap<String, LspProcessKey>,
     ) -> Arc<EnginePool> {
-        let mut held = self.pool.lock().await;
-        if held.built_from(&definitions, &bindings) {
-            return Arc::clone(&held);
-        }
-        let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
-        let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
-        drop(held);
+        // The std guard lives in a block rather than ending at a `drop`: the compiler
+        // counts a dropped `MutexGuard` as live across the await below, which would make
+        // this future, and every tool future awaiting it, not `Send`.
+        let (rebuilt, replaced) = {
+            let mut held = self.held();
+            if held.built_from(&definitions, &bindings) {
+                return Arc::clone(&held);
+            }
+            let rebuilt = Arc::new(held.reconfigure(&self.root, definitions, bindings));
+            let replaced = std::mem::replace(&mut *held, Arc::clone(&rebuilt));
+            (rebuilt, replaced)
+        };
         replaced.shutdown_replaced_by(&rebuilt).await;
         rebuilt
     }
@@ -3255,7 +3544,7 @@ impl EngineHold {
     /// Ends the held pool's running engines; the pool stays usable and a
     /// later request respawns what it needs.
     pub(crate) async fn shutdown(&self) {
-        let held = Arc::clone(&*self.pool.lock().await);
+        let held = Arc::clone(&*self.held());
         held.shutdown().await;
     }
 }
@@ -3402,6 +3691,121 @@ mod tests {
         );
         let (definitions, bindings) = lsp_runtime_configuration("pyright");
         assert!(replaced.built_from(&definitions, &bindings));
+        hold.shutdown().await;
+        Ok(())
+    }
+
+    /// A fake engine that registers one `**/*.rs` file watcher once initialized and
+    /// appends every `workspace/didChangeWatchedFiles` body it receives to the log named
+    /// by `$1`. It answers every request with an empty list and ends on `exit`.
+    ///
+    /// It handles one message at a time, in the order they arrive, so the answer to a
+    /// request follows everything the engine did for the messages sent before it.
+    #[cfg(unix)]
+    const WATCHING_ENGINE: &str = r#"log="$1"
+frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}" ;;
+    *'"method":"initialized"'*)
+      frame '{"jsonrpc":"2.0","id":"watch","method":"client/registerCapability","params":{"registrations":[{"id":"watch-rust","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs"}]}}]}}' ;;
+    *'"method":"workspace/didChangeWatchedFiles"'*)
+      printf '%s\n' "$body" >> "$log" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+    /// An incremental rebuild's own change set reaches the engine as it stands,
+    /// and a full rebuild's changes come from comparing both publications' digests.
+    /// The incremental set names `carried.rs`, which neither publication holds, so
+    /// only the carried set can name it; the full rebuild names `lib.rs`, which the
+    /// two publications hold with different bytes.
+    ///
+    /// Each exchange asks the engine for references and awaits the answer. The answer
+    /// arrives after the watcher registration the batches need and after every batch
+    /// sent before it, so the log is read only once both batches are written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owe_publication_hands_on_an_incremental_change_set_and_compares_a_full_one()
+    -> TestResult {
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        let notified = engine.path().join("notified.log");
+        fs::write(&script, WATCHING_ENGINE)?;
+        let directory = tempfile::tempdir()?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::write(directory.path().join("lib.rs"), "pub fn before() {}\n")?;
+        let before = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn after() {}\n")?;
+        let after = stable_candidate(directory.path(), 1)?;
+
+        let key = LspProcessKey::named("rust");
+        // The slot resends a request the engine answered empty through its retry
+        // table, and this engine answers every request empty; one attempt sends it once.
+        let table = json!({
+            "command": ["sh", script.display().to_string(), notified.display().to_string()],
+            "retry": { "attempts": 1 },
+        });
+        let configuration: LspConfiguration = serde_json::from_value(table)?;
+        let hold = super::EngineHold::new(
+            directory.path().to_path_buf(),
+            std::collections::BTreeMap::from([(key.clone(), configuration)]),
+            std::collections::BTreeMap::from([("rust".to_owned(), key.clone())]),
+        );
+        let pool = Arc::clone(&hold.held());
+        let slot = pool.engine_by_key(&key).ok_or("the slot")?;
+        let asked = rift_core::ProjectPath::new("lib.rs")?;
+        let position = serde_json::from_value(json!({ "line": 0, "character": 0 }))?;
+        let exchange = || {
+            slot.request(|session| {
+                let path = asked.clone();
+                Box::pin(async move { session.references(&path, position).await })
+            })
+        };
+        exchange().await?;
+        assert!(
+            pool.runs_an_engine(),
+            "the first exchange started the engine"
+        );
+
+        let carried = rift_index::PathChanges::resolve(
+            [(
+                rift_core::ProjectPath::new("carried.rs")?,
+                Some(rift_index::FileRecord::Digest(rift_core::FileDigest::of(
+                    b"carried",
+                ))),
+            )],
+            |_path| None,
+        );
+        hold.owe_publication(
+            &before,
+            &after,
+            &rift_index::ChangeSet::Incremental(carried),
+        );
+        exchange().await?;
+        hold.owe_publication(&before, &after, &rift_index::ChangeSet::Full);
+        exchange().await?;
+
+        let text = fs::read_to_string(&notified)?;
+        let batches: Vec<&str> = text.lines().collect();
+        assert_eq!(batches.len(), 2, "{text}");
+        assert!(
+            batches[0].contains("carried.rs") && !batches[0].contains("lib.rs"),
+            "the incremental rebuild's own change set, not a comparison: {text}"
+        );
+        assert!(
+            batches[1].contains("lib.rs") && !batches[1].contains("carried.rs"),
+            "the full rebuild compares both publications' digests: {text}"
+        );
         hold.shutdown().await;
         Ok(())
     }
@@ -4717,18 +5121,7 @@ mod tests {
         assert!(server.engine_tree_matches(&published).await?);
         fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
         assert!(!server.engine_tree_matches(&published).await?);
-        let params = serde_json::from_value(json!({"traversal": {
-            "seed": "rift://symbol/rust/lib.rs/beacon",
-            "direction": "incoming", "facets": ["references"], "depth": 1
-        }}))?;
-        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published));
-        assert!(
-            server
-                .engine_references(&resolved, &params)
-                .await?
-                .is_none(),
-            "moved source asks for a fresh publication, not an empty engine answer"
-        );
+        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published), Duration::ZERO);
         for facets in [json!(["calls"]), json!(["implements"])] {
             let mut request = json!({"traversal": {
                 "seed": "rift://symbol/rust/lib.rs/beacon",
@@ -4738,7 +5131,11 @@ mod tests {
             let indexed = serde_json::from_value(request)?;
             assert!(
                 server
-                    .engine_references(&resolved, &indexed)
+                    .engine_references(
+                        &resolved,
+                        &indexed,
+                        RequestDeadline::starting(Duration::from_secs(30))
+                    )
                     .await?
                     .is_some(),
                 "an indexed traversal must not recapture source for unused engine references"
@@ -4761,14 +5158,152 @@ mod tests {
             "seed": "rift://symbol/rust/lib.rs/beacon",
             "direction": "incoming", "facets": ["references"], "depth": 1
         }}))?;
-        let resolved = super::ResolvedWorkspace::current(published);
+        let resolved = super::ResolvedWorkspace::current(published, Duration::ZERO);
         assert!(
             server
-                .engine_references(&resolved, &params)
+                .engine_references(
+                    &resolved,
+                    &params,
+                    RequestDeadline::starting(Duration::from_secs(30))
+                )
                 .await?
                 .is_some(),
             "no selected engine leaves the indexed read unchanged"
         );
+        Ok(())
+    }
+
+    /// A walk reserves the larger of a tenth of the request budget and twice the
+    /// request-time capture, held at the budget, which leaves the walk no wait at all.
+    #[tokio::test]
+    async fn a_walk_reserves_the_larger_of_a_tenth_and_twice_the_capture() {
+        let deadline = RequestDeadline::starting(Duration::from_secs(30));
+        let reserve = |capture| deadline.at() - deadline.walk_end(capture);
+        assert_eq!(reserve(Duration::ZERO), Duration::from_secs(3));
+        assert_eq!(
+            reserve(Duration::from_millis(1_500)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            reserve(Duration::from_millis(1_501)),
+            Duration::from_millis(3_002)
+        );
+        assert_eq!(reserve(Duration::from_secs(14)), Duration::from_secs(28));
+        assert_eq!(
+            reserve(Duration::from_secs(20)),
+            Duration::from_secs(30),
+            "a reserve past the budget is held at the budget"
+        );
+    }
+
+    /// A `sh` engine that answers `initialize`, announces work it never ends, and answers
+    /// every later request with no location, so a walk reads it analyzing on every attempt.
+    #[cfg(unix)]
+    const ANALYZING_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+    /// A traversal whose tree check takes a third of the 3 s budget still answers inside
+    /// it: the walk reserves twice the request-time capture, so the check after a walk
+    /// that waited out its engine fits before the deadline. Three such captures alone
+    /// spend the whole budget, which is what a check before the walk cost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_walk_leaves_room_for_a_slow_tree_check_after_it() -> TestResult {
+        const CAPTURE: Duration = Duration::from_secs(1);
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        fs::write(&script, ANALYZING_ENGINE)?;
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+        )?;
+        super::hermetic_workspace(
+            directory.path(),
+            &format!(
+                "[server]\nreadiness_timeout = \"3s\"\n\n\
+                 [languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
+                script.display()
+            ),
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let root = directory.path().to_path_buf();
+        server.force_capture_after(CAPTURE, move |current| captured_tree(&root, current));
+        let params = serde_json::from_value(json!({"traversal": {
+            "seed": "rift://symbol/rust/lib.rs/beacon"
+        }}))?;
+        let answer = server
+            .search(Parameters(params))
+            .await
+            .map_err(|refusal| format!("the walk must answer inside the budget: {refusal:?}"))?
+            .0;
+        let warnings = serde_json::to_value(&answer.warnings)?;
+        assert_eq!(
+            warnings[0]["code"], "engine_analysis_unavailable",
+            "{warnings}"
+        );
+        server.engine_pool().await.shutdown().await;
+        Ok(())
+    }
+
+    /// An engine walk checks the tree once, after it ends: the request-time capture that
+    /// resolved the publication already matched the tree, so none runs before the walk.
+    #[tokio::test]
+    async fn an_engine_walk_captures_the_tree_once_after_it_ends() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("service.py"),
+            "def serve(port: int) -> int:\n    return port\n",
+        )?;
+        fs::write(
+            directory.path().join("main.py"),
+            "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n",
+        )?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
+            .await?;
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&captures);
+        let root = directory.path().to_path_buf();
+        server.force_capture(move |current| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            captured_tree(&root, current)
+        });
+        let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
+            "seed": "rift://symbol/python/service.py/serve",
+            "direction": "incoming", "facets": ["references"], "depth": 1
+        }}))?;
+        let references = server
+            .engine_references(&resolved, &params, deadline)
+            .await?;
+        assert!(references.is_some(), "the tree did not move under the walk");
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            1,
+            "one capture decides the walk's answer, after the walk"
+        );
+        server.engine_pool().await.shutdown().await;
         Ok(())
     }
 
@@ -4803,7 +5338,11 @@ mod tests {
         )?;
         assert!(
             server
-                .engine_references(&resolved, &params)
+                .engine_references(
+                    &resolved,
+                    &params,
+                    RequestDeadline::starting(Duration::from_secs(30))
+                )
                 .await?
                 .is_none(),
             "the captured publication predates the new caller"

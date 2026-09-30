@@ -1,5 +1,6 @@
 //! Long-lived workspace application service.
 
+mod callee;
 mod change;
 mod configuration;
 mod dependency;
@@ -13,6 +14,7 @@ mod read;
 mod search;
 mod traversal;
 
+pub use callee::{CalleeDeclaration, CalleePackage, CalleeRoots, PackageCallee};
 pub use change::search_change;
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, ConfigurationFault, load_configuration,
@@ -21,6 +23,7 @@ pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
 pub use read::{ReadError, ReadFault, ReadService, accepted_limit, wire_digest};
 pub use rift_core::CapturedStream;
+pub use rift_lsp::capabilities::PositionEncoding;
 pub use search::{PatternBounds, StoreAnswer, accepted_pattern, search_page_limit};
 
 /// Compile-time marker for server-layer ownership.

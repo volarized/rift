@@ -20,7 +20,9 @@ use global_api::{
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use workspace_client::{ServedWorkspace, TestResult, served_workspace, tool_request};
+use workspace_client::{
+    ServedWorkspace, TestResult, call_retrying_acceptance, served_workspace, tool_request,
+};
 
 const LOCK_WITH_HELPER: &str = "version = 4\n\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n]\n";
 
@@ -250,6 +252,73 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     client.cancel().await?;
     server_task.await?;
     Ok(())
+}
+
+/// How long the fixture holds the global answer an outgoing walk waits for: past the
+/// request deadline [`CALLEE_WALK_BUDGET`] sets, however slow the machine running the test.
+const CALLEE_HOLD: Duration = Duration::from_secs(60);
+
+/// The `[server] readiness_timeout` an outgoing walk against a held global answer runs
+/// under: the embedded engine's walk fits in the nine tenths of it the walk may spend,
+/// and the held answer outlasts all of it.
+const CALLEE_WALK_BUDGET: &str = "5s";
+
+/// A module whose `counted` calls the standard library's `len`, the callee an outgoing
+/// walk asks the global API to name.
+const CALLEE_FILES: &[(&str, &str)] = &[("app.py", "def counted() -> int:\n    return len([1])\n")];
+
+/// An outgoing walk from `counted` against a fixture holding `hold` past the request
+/// deadline: the walk answers well before the held answer would have arrived, the
+/// standard library callee drops, and the answer carries the timeout warning.
+async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        hold: Some(hold),
+        python_collection: true,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[server]\nreadiness_timeout = \"{CALLEE_WALK_BUDGET}\"\n\n\
+         [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
+         [languages.python.lsp]\nembedded = \"ty\"\n",
+        fixture.endpoint
+    );
+    let (_directory, client, server_task) =
+        served_workspace(CALLEE_FILES, Some(configuration)).await?;
+    let walk = json!({
+        "traversal": { "seed": "rift://symbol/python/app.py/counted", "direction": "outgoing" }
+    });
+    let started = tokio::time::Instant::now();
+    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < CALLEE_HOLD,
+        "the request deadline must end the wait: elapsed={elapsed:?}"
+    );
+    let warnings = answer["warnings"].clone();
+    assert_eq!(warnings[0]["code"], "callees_dropped", "{answer:#}");
+    assert_eq!(warnings[0]["callees"], 1, "{answer:#}");
+    assert_eq!(
+        warnings[1],
+        json!({"code": "global_api_unavailable", "failure_class": "timeout"}),
+        "{answer:#}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A resolution held past the request deadline names no callee.
+#[tokio::test]
+async fn request_deadline_bounds_the_resolution_an_outgoing_walk_waits_for() -> TestResult {
+    outgoing_walk_past_a_held_global_answer(Hold::Resolution(CALLEE_HOLD)).await
+}
+
+/// A declarations answer held past the request deadline names no callee.
+#[tokio::test]
+async fn request_deadline_bounds_the_declarations_an_outgoing_walk_waits_for() -> TestResult {
+    outgoing_walk_past_a_held_global_answer(Hold::Declarations(CALLEE_HOLD)).await
 }
 
 /// A path dependency outside the workspace reaches no index: the package hits come from

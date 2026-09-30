@@ -7,7 +7,8 @@
 //! laid over its environment, so no toolchain manager installs what a pin names. A
 //! probe that answers nothing leaves the static reading, or the requirement `>=0`, and
 //! a degradation naming the entry. A Rust version the probe read also records the
-//! standard library's install folder below `rustc --print sysroot`.
+//! standard library's install folder below `rustc --print sysroot`, and one folder for
+//! each registry package the standard library source vendors.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,7 @@ use crate::context::{InstallFolder, InstallLocation, is_whole_version};
 use crate::resolver::{
     CommandOutput, ContextInputs, FileObservation, ResolverName, StaticInputs, ToolchainCommand,
 };
+use crate::uv::{PROJECT_ENVIRONMENT_DIRECTORY, PROJECT_ENVIRONMENT_MARKER};
 
 /// The manager every standard library entry names, as local reads minted it.
 pub const STANDARD_LIBRARY_MANAGER: &str = "stdlib";
@@ -52,8 +54,6 @@ const NPM_MANAGER: &str = "npm";
 
 /// The Rust toolchain files rustup reads, in the order it prefers them.
 const RUST_TOOLCHAIN_FILES: [&str; 2] = ["rust-toolchain.toml", "rust-toolchain"];
-/// The Python environment file `uv venv` and `python3 -m venv` write.
-const PYVENV_FILE: &str = ".venv/pyvenv.cfg";
 /// The `pyvenv.cfg` keys naming the interpreter version: uv's, then `venv`'s.
 const PYVENV_VERSION_KEYS: [&str; 2] = ["version_info", "version"];
 /// The Python pin pyenv and uv read.
@@ -95,8 +95,9 @@ impl StandardLibrary {
         }
     }
 
-    /// The entry name under [`STANDARD_LIBRARY_MANAGER`].
-    const fn name(self) -> &'static str {
+    /// The entry name under [`STANDARD_LIBRARY_MANAGER`], such as `python`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::Node => "node",
@@ -132,7 +133,8 @@ pub struct StandardLibraryAnswer {
     /// The entries, one per package.
     pub entries: Vec<PackageContextEntry>,
     /// Where a library whose exact version the probe read is installed: the Rust
-    /// standard library below the sysroot.
+    /// standard library below the sysroot, and each registry package it vendors below
+    /// its `vendor` folder.
     pub install_folders: Vec<InstallFolder>,
     /// The workspace paths the pass read or would read; a change to any makes the
     /// answer stale.
@@ -176,6 +178,7 @@ pub fn standard_library_answer(
                 location: InstallLocation::Path(folder),
             });
         }
+        answer.install_folders.extend(outcome.vendored_folders);
         answer.entries.push(PackageContextEntry::new(
             STANDARD_LIBRARY_MANAGER,
             library.name(),
@@ -194,11 +197,12 @@ pub fn standard_library_answer(
     answer
 }
 
-/// One library's selector, where it is installed when the probe found it, and why the
-/// probe fell short when it did.
+/// One library's selector, where it is installed when the probe found it, the packages
+/// it vendors, and why the probe fell short when it did.
 struct VersionOutcome {
     selector: PackageSelector,
     install_folder: Option<PathBuf>,
+    vendored_folders: Vec<InstallFolder>,
     degradations: Vec<String>,
 }
 
@@ -207,6 +211,7 @@ impl VersionOutcome {
         Self {
             selector,
             install_folder: None,
+            vendored_folders: Vec::new(),
             degradations: Vec::new(),
         }
     }
@@ -215,8 +220,23 @@ impl VersionOutcome {
         Self {
             selector,
             install_folder: None,
+            vendored_folders: Vec::new(),
             degradations: vec![reason],
         }
+    }
+
+    /// Records the Rust standard library source at `library`, with the registry packages
+    /// its `Cargo.lock` vendors below it. A lockfile the pass cannot read keeps the
+    /// library's folder and names the failure.
+    fn locate_rust_library(&mut self, library: PathBuf, inputs: &mut dyn StaticInputs) {
+        match crate::cargo::vendored_folders(&library, inputs) {
+            Ok(folders) => self.vendored_folders = folders,
+            Err(failure) => self.degradations.push(format!(
+                "{}: {failure}; no install folder for the packages it vendors",
+                library.display()
+            )),
+        }
+        self.install_folder = Some(library);
     }
 }
 
@@ -268,13 +288,12 @@ fn rust_version(
     };
     let mut outcome = VersionOutcome::read(PackageSelector::Version(version));
     match probe_sysroot(request.root, inputs) {
-        Ok(sysroot) => {
-            outcome.install_folder = Some(
-                SYSROOT_LIBRARY_SEGMENTS
-                    .iter()
-                    .fold(sysroot, |folder, segment| folder.join(segment)),
-            );
-        }
+        Ok(sysroot) => outcome.locate_rust_library(
+            SYSROOT_LIBRARY_SEGMENTS
+                .iter()
+                .fold(sysroot, |folder, segment| folder.join(segment)),
+            inputs,
+        ),
         Err(reason) => outcome.degradations.push(reason),
     }
     outcome
@@ -519,10 +538,12 @@ fn python_version(
     inputs: &mut dyn StaticInputs,
     read: &mut Vec<ProjectPath>,
 ) -> VersionOutcome {
+    let pyvenv_file = format!("{PROJECT_ENVIRONMENT_DIRECTORY}/{PROJECT_ENVIRONMENT_MARKER}");
     read.extend(
-        [PYVENV_FILE, PYTHON_VERSION_FILE, PYPROJECT_FILE].map(|file| ProjectPath(file.to_owned())),
+        [pyvenv_file.as_str(), PYTHON_VERSION_FILE, PYPROJECT_FILE]
+            .map(|file| ProjectPath(file.to_owned())),
     );
-    let pin = pin_text(inputs, &root.join(PYVENV_FILE))
+    let pin = pin_text(inputs, &root.join(&pyvenv_file))
         .and_then(|text| pyvenv_version(&text))
         .or_else(|| {
             pin_text(inputs, &root.join(PYTHON_VERSION_FILE))
@@ -832,6 +853,159 @@ mod tests {
                 )),
             }],
             "the folder below the sysroot holds the standard library source"
+        );
+    }
+
+    /// The standard library source below the sysroot [`rust_probed`] prints.
+    const LIBRARY: &str = "/toolchains/1.98-aarch64-apple-darwin/lib/rustlib/src/rust/library";
+
+    /// The standard library's own `Cargo.lock` as `rust-src` ships it: members without a
+    /// source, registry packages whose names and versions carry `-` and `+`, and a git
+    /// package.
+    const LIBRARY_LOCKFILE: &str = "\
+version = 4
+
+[[package]]
+name = \"hashbrown\"
+version = \"0.17.1\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+
+[[package]]
+name = \"rustc-literal-escaper\"
+version = \"0.0.8\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+
+[[package]]
+name = \"std\"
+version = \"0.0.0\"
+
+[[package]]
+name = \"unwinding\"
+version = \"0.2.8\"
+source = \"git+https://github.com/nbdd0121/unwinding?rev=1a2b3c#1a2b3c\"
+
+[[package]]
+name = \"wasip2\"
+version = \"1.0.3+wasi-0.2.9\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+";
+
+    /// `inputs` answering the Rust probes with 1.98.1 and a sysroot holding [`LIBRARY`].
+    fn rust_probed(inputs: RecordedInspector) -> RecordedInspector {
+        inputs
+            .with_command(
+                "rustc --version",
+                RecordedInspector::succeeded("rustc 1.98.1 (48a229cea 2026-09-01)\n"),
+            )
+            .with_command(
+                "rustc --print sysroot",
+                RecordedInspector::succeeded("/toolchains/1.98-aarch64-apple-darwin\n"),
+            )
+    }
+
+    fn folder(manager: &str, name: &str, version: &str, path: &str) -> InstallFolder {
+        InstallFolder {
+            package: PackageIdentity {
+                manager: manager.to_owned(),
+                name: name.to_owned(),
+                version: version.to_owned(),
+            },
+            location: InstallLocation::Path(PathBuf::from(path)),
+        }
+    }
+
+    #[test]
+    fn test_each_registry_package_the_library_lockfile_pins_is_vendored_below_it() {
+        let mut inputs = rust_probed(
+            RecordedInspector::default()
+                .with_file(format!("{LIBRARY}/Cargo.lock"), LIBRARY_LOCKFILE)
+                .with_directory(format!("{LIBRARY}/vendor/stray")),
+        );
+
+        let answer = answer(&[StandardLibrary::Rust], true, &mut inputs);
+
+        assert!(answer.degradations.is_empty(), "{:?}", answer.degradations);
+        assert_eq!(
+            answer.install_folders,
+            [
+                folder("stdlib", "rust", "1.98.1", LIBRARY),
+                folder(
+                    "cargo",
+                    "hashbrown",
+                    "0.17.1",
+                    &format!("{LIBRARY}/vendor/hashbrown-0.17.1")
+                ),
+                folder(
+                    "cargo",
+                    "rustc-literal-escaper",
+                    "0.0.8",
+                    &format!("{LIBRARY}/vendor/rustc-literal-escaper-0.0.8")
+                ),
+                folder(
+                    "cargo",
+                    "wasip2",
+                    "1.0.3+wasi-0.2.9",
+                    &format!("{LIBRARY}/vendor/wasip2-1.0.3+wasi-0.2.9")
+                ),
+            ],
+            "a member without a source and a git package vendor nothing"
+        );
+        assert!(
+            !inputs.asked.iter().any(|asked| asked.starts_with("list ")),
+            "the lockfile names every folder, so no folder name is read: {:?}",
+            inputs.asked
+        );
+    }
+
+    #[test]
+    fn test_an_unreadable_library_lockfile_keeps_the_library_folder_and_names_the_failure() {
+        let mut inputs = rust_probed(
+            RecordedInspector::default().with_file(format!("{LIBRARY}/Cargo.lock"), "[[package]"),
+        );
+
+        let answer = answer(&[StandardLibrary::Rust], true, &mut inputs);
+
+        assert_eq!(
+            answer.install_folders,
+            [folder("stdlib", "rust", "1.98.1", LIBRARY)]
+        );
+        assert_eq!(answer.degradations.len(), 1, "{:?}", answer.degradations);
+        let (resolver, reason) = &answer.degradations[0];
+        assert_eq!(*resolver, ResolverName::StdlibRust);
+        let names_the_library = reason.starts_with("/toolchains/1.98-aarch64-apple-darwin");
+        let names_the_failure = reason.contains(": Cargo.lock could not be parsed: ");
+        let names_the_loss = reason.ends_with("; no install folder for the packages it vendors");
+        assert!(
+            names_the_library && names_the_failure && names_the_loss,
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn test_a_library_lockfile_past_the_bound_vendors_nothing() {
+        let bytes_max = usize::try_from(crate::LOCKFILE_BYTES_MAX).expect("bound fits");
+        let mut inputs = rust_probed(
+            RecordedInspector::default()
+                .with_file(format!("{LIBRARY}/Cargo.lock"), vec![b'#'; bytes_max + 1]),
+        );
+
+        let answer = answer(&[StandardLibrary::Rust], true, &mut inputs);
+
+        assert_eq!(
+            answer.install_folders,
+            [folder("stdlib", "rust", "1.98.1", LIBRARY)]
+        );
+        let expected = format!(
+            ": Cargo.lock holds {} bytes, past the {} byte bound; no install folder for the \
+             packages it vendors",
+            crate::LOCKFILE_BYTES_MAX + 1,
+            crate::LOCKFILE_BYTES_MAX
+        );
+        assert_eq!(answer.degradations.len(), 1, "{:?}", answer.degradations);
+        assert!(
+            answer.degradations[0].1.ends_with(&expected),
+            "{:?}",
+            answer.degradations
         );
     }
 

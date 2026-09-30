@@ -6,6 +6,8 @@ use crate::declaration::{
 use serde_json::{Value, json};
 
 const DECLARATION: &str = "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo";
+/// The kind package analysis stores for [`DECLARATION`].
+const KIND: &str = "function";
 
 /// One edit to a submitted position, beside the field the client names when it refuses it.
 type PositionEdit = (fn(&mut PackagePosition), &'static str);
@@ -33,7 +35,7 @@ fn position_json(line: i64) -> Value {
 /// The fixture's answer: a declaration for the call on line 3, none for the comment on line 0.
 pub(super) fn declaration_response_json() -> Value {
     json!({"results": [
-        {"position": position_json(3), "declaration": DECLARATION},
+        {"position": position_json(3), "declaration": DECLARATION, "kind": KIND},
         {"position": position_json(0)}
     ]})
 }
@@ -61,9 +63,18 @@ async fn test_fixture_declarations_answer_each_position_once() {
     let declarations = answer
         .results
         .iter()
-        .map(|result| (result.position.line, result.declaration.as_deref()))
+        .map(|result| {
+            (
+                result.position.line,
+                result.declaration.as_deref(),
+                result.kind.as_deref(),
+            )
+        })
         .collect::<Vec<_>>();
-    assert_eq!(declarations, [(3, Some(DECLARATION)), (0, None)]);
+    assert_eq!(
+        declarations,
+        [(3, Some(DECLARATION), Some(KIND)), (0, None, None)]
+    );
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/declarations")
@@ -219,7 +230,7 @@ fn test_declaration_responses_account_for_every_position() {
         Ok(())
     );
     let cases = [
-        json!({"results": [{"position": position_json(3), "declaration": DECLARATION}]}),
+        json!({"results": [{"position": position_json(3), "declaration": DECLARATION, "kind": KIND}]}),
         json!({"results": [
             {"position": position_json(3)}, {"position": position_json(3)}, {"position": position_json(0)}
         ]}),
@@ -237,7 +248,7 @@ fn test_declaration_responses_account_for_every_position() {
     }
     let answer = |declaration: &str| {
         decoded(json!({"results": [
-            {"position": position_json(3), "declaration": declaration},
+            {"position": position_json(3), "declaration": declaration, "kind": KIND},
             {"position": position_json(0)}
         ]}))
     };
@@ -264,4 +275,30 @@ fn test_declaration_responses_account_for_every_position() {
         validate_declaration_response(&request, &answer(module)),
         Ok(())
     );
+}
+
+#[test]
+fn test_declaration_responses_carry_a_well_formed_kind_exactly_beside_a_declaration() {
+    let request = declaration_request();
+    let cases = [
+        json!({"results": [
+            {"position": position_json(3), "declaration": DECLARATION},
+            {"position": position_json(0)}
+        ]}),
+        json!({"results": [
+            {"position": position_json(3), "declaration": DECLARATION, "kind": KIND},
+            {"position": position_json(0), "kind": KIND}
+        ]}),
+        json!({"results": [
+            {"position": position_json(3), "declaration": DECLARATION, "kind": "9function"},
+            {"position": position_json(0)}
+        ]}),
+    ];
+    for response in cases {
+        assert_eq!(
+            validate_declaration_response(&request, &decoded(response.clone())),
+            Err(ClientError::InvalidResponseField { field: "kind" }),
+            "{response}"
+        );
+    }
 }

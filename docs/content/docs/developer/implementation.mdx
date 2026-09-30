@@ -619,12 +619,22 @@ exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.sc
 
 ## Language engines
 
-The `rift-lsp` crate owns LSP sessions. A session opens source documents, requests references,
-and pulls diagnostics when the language server advertises that capability. It also retains
-published diagnostics under per-document and document-count bounds.
+The `rift-lsp` crate owns LSP sessions. A session opens source documents, requests references
+and call hierarchy, and pulls diagnostics when the language server advertises that capability.
+It also retains published diagnostics under per-document and document-count bounds.
 
 The reference request includes the declaration's own occurrence. An empty answer can therefore
 mean the engine has not loaded the file; it cannot prove the declaration has no references.
+
+A call hierarchy answer carries no such evidence, so a walk reads the session's readiness alone.
+That readiness leaves out rust-analyzer's `cargo check` progress, which resolves nothing a walk
+reads, while a diagnostics read still waits for it. An embedded engine answers from its own
+in-memory state and declares itself ready.
+
+The server records each publication's changed files per engine and sends them to a running
+session as one `workspace/didChangeWatchedFiles` batch before its next request. When more
+changed files are owed than the record holds, the server replaces the session at its next request
+instead, and the new session reads every file from disk.
 
 Each process has configured startup and request timeouts. The
 [`[lsp]`](/docs/developer/configuration#languages-and-lsp) configuration also bounds retries

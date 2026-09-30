@@ -119,11 +119,12 @@ semantic facts come through language engines.
 
 A [language engine](/docs/developer/configuration#languages-and-lsp) runs the language's own
 analysis and returns facts the parse does not contain. Rift currently asks language engines for
-references and diagnostics through LSP.
+references, call hierarchy, and diagnostics through LSP.
 
-For [incoming relationship traversal](/docs/mcp#search-engine-references), Rift asks the engine
-for references to the requested declaration and uses syntax to map the returned source locations
-back to indexed declarations. These engine facts belong to that read; they do not enter the index.
+For [relationship traversal](/docs/mcp#search-traversal), Rift asks the engine for references to
+the requested declaration, or for the calls it makes, and uses syntax to map the returned source
+locations back to indexed declarations. These engine facts belong to that read; they do not enter
+the index.
 
 In some cases, Rift embeds a language engine when it is available as a Rust library. Other
 configured language engines run as separate LSP processes.
@@ -138,9 +139,17 @@ identifies the declaration containing each location. Together they establish a r
 each caller to the requested declaration for that read.
 
 At the next depth, each caller becomes the declaration whose references Rift requests. This gives
-Rift bounded traversal within the project without indexing every relationship in advance. The
-current engine contract supplies incoming references; it does not identify the target of each
-reference for outgoing traversal.
+Rift bounded traversal within the project without indexing every relationship in advance.
+
+<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> Outgoing
+traversal walks the other way, from a declaration to the declarations it calls. Rift asks the
+engine for the declaration's
+[call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
+and syntax identifies the declaration that holds each callee's name.
+
+A callee in a standard library or an OSS package has no declaration in the local index, so the
+walk stops there and the answer counts the callees it dropped. At the next depth, each callee in
+the project becomes the declaration whose calls Rift requests.
 
 <VersionBadge version="planned" inline /> The global index will hold relationships within and
 between OSS packages, allowing similar traversal.
@@ -189,9 +198,10 @@ several projects or languages. The [local and global indexes](#index) use the sa
 
 ## Codebase intelligence
 
-Rift connects a declaration to the source that defines it, the references that use it, and its
-committed history. An agent reaches those facts through [search](/docs/mcp#tool-search) and
-[symbol lookup](/docs/mcp#tool-get_symbol), whether they come from the local or global index.
+Rift connects a declaration to the source that defines it, the references that use it, the
+declarations it calls, and its committed history. An agent reaches those facts through
+[search](/docs/mcp#tool-search) and [symbol lookup](/docs/mcp#tool-get_symbol), whether they come
+from the local or global index.
 
 <CodebaseIntelligence />
 
@@ -199,7 +209,8 @@ committed history. An agent reaches those facts through [search](/docs/mcp#tool-
 
 Rift selects a syntax provider by file type. [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)
 parses the source into declarations and syntax nodes; for project files, byte ranges identify the
-text each read returns. Language engines add references that require name or type resolution.
+text each read returns. Language engines add references and calls that require name or type
+resolution.
 
 <CodebaseLanguages />
 

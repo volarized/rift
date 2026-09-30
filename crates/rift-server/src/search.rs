@@ -360,7 +360,7 @@ impl ReadService {
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(self.documentation_warnings(target));
-        warnings.extend(references.analysis_unavailable().cloned());
+        warnings.extend(references.warnings());
         warnings
     }
 
@@ -1416,7 +1416,9 @@ fn populate_symbol_lines(
     )
     .entered();
     for hit in results {
-        if hit.line.is_some() || !matches!(hit.hit, SearchHitTarget::Symbol { .. }) {
+        // A package declaration a walk reached carries its unit and no local bytes.
+        let local_symbol = matches!(hit.hit, SearchHitTarget::Symbol { .. }) && hit.unit.is_none();
+        if hit.line.is_some() || !local_symbol {
             continue;
         }
         let (Some(path), Some(range)) = (hit.path.as_ref(), hit.range.as_ref()) else {
