@@ -394,17 +394,24 @@ fn a_folder_refusal_other_than_access_keeps_the_refusal_without_a_fallback() -> 
 }
 
 #[test]
-fn sweep_skips_a_live_lock_it_cannot_open() -> TestResult {
+fn sweep_reports_a_live_lock_it_cannot_open_and_sweeps_the_rest() -> TestResult {
     let folder = tempfile::tempdir()?;
     let rift = folder.path().join(STORE_FOLDER_NAME);
     drop(filled(folder.path(), "aa")?);
+    // A folder where the lock file goes opens as no file on any platform.
     std::fs::create_dir_all(rift.join("store-zz.live.lock"))?;
     let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
 
     let swept = current.sweep()?;
 
     assert_eq!(swept.deleted(), ["aa"], "the rest of the folder is swept");
-    assert!(swept.failures().is_empty());
+    let [failure] = swept.failures() else {
+        panic!("one lock the sweep cannot open: {:?}", swept.failures());
+    };
+    assert!(failure.fault().folder_cause().is_some());
+    let rendered = failure.to_string();
+    assert!(rendered.contains("open swept live lock"), "{rendered}");
+    assert!(rendered.contains("store-zz.live.lock"), "{rendered}");
     assert!(rift.join("store-zz.live.lock").is_dir());
     Ok(())
 }

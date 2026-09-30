@@ -134,7 +134,8 @@ impl SweptRevisions {
         &self.deleted
     }
 
-    /// The deletions the filesystem refused.
+    /// The released revisions the sweep could not take: a live lock it could
+    /// not open or try, and a deletion the filesystem refused.
     #[must_use]
     pub fn failures(&self) -> &[StoreError] {
         &self.failures
@@ -241,9 +242,10 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] when the folder cannot be listed. A file the
-    /// filesystem refuses to delete is reported in
-    /// [`SweptRevisions::failures`] and leaves the rest of the sweep running.
+    /// Returns [`StoreError`] when the folder cannot be listed. A live lock the
+    /// sweep cannot open or try, and a file the filesystem refuses to delete,
+    /// are reported in [`SweptRevisions::failures`] and leave the rest of the
+    /// sweep running.
     pub fn sweep(&self) -> Result<SweptRevisions, StoreError> {
         let folder = &self.location.folder;
         let entries =
@@ -268,14 +270,17 @@ impl HistoryStore {
     }
 
     /// Deletes one released revision's files, its live lock last, while
-    /// holding that lock exclusively. A lock another server holds is skipped.
+    /// holding that lock exclusively. A lock another server holds is skipped;
+    /// a lock the sweep cannot open or try is recorded in `swept.failures`.
     fn sweep_revision(&self, revision: &str, live: &Path, swept: &mut SweptRevisions) {
-        let Ok(lock) = open_lock(live) else {
-            return;
+        let lock = match lock_released(live) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return,
+            Err(failure) => {
+                swept.failures.push(failure);
+                return;
+            }
         };
-        if lock.try_lock().is_err() {
-            return;
-        }
         let mut files: Vec<PathBuf> = std::iter::once(DATABASE_SUFFIX)
             .chain(DATABASE_COMPANION_SUFFIXES)
             .chain([FILL_LOCK_SUFFIX])
@@ -292,6 +297,26 @@ impl HistoryStore {
         }
         drop(lock);
         swept.deleted.push(revision.to_owned());
+    }
+}
+
+/// Takes a revision's live lock at `live` exclusively; `None` while a server
+/// holds it shared.
+///
+/// std's `try_lock` separates the two outcomes: `TryLockError::WouldBlock`
+/// when the lock "is held by another handle/process", and
+/// `TryLockError::Error` for "an I/O error on the file", which never carries
+/// `ErrorKind::WouldBlock`.
+fn lock_released(live: &Path) -> Result<Option<File>, StoreError> {
+    let lock = open_lock(live).map_err(folder_error(live, "open swept live lock"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(source)) => Err(Error::new(StoreFault::Folder {
+            path: live.to_owned(),
+            operation: "lock swept live lock",
+            source,
+        })),
     }
 }
 

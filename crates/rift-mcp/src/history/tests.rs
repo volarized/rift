@@ -484,7 +484,7 @@ fn a_released_store_file_the_sweep_cannot_delete_is_logged_and_the_lane_opens() 
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(
         records[0].0,
-        "a released history store file could not be deleted"
+        "a released history store revision could not be swept"
     );
     assert!(folder.join("store-released.live.lock").exists());
     Ok(())
