@@ -585,7 +585,7 @@ impl ListeningForeground {
             .stderr(Stdio::piped())
             .spawn()?;
         let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-            serving_document(root)
+            published_foreground_document(root, child.id())
         })?;
         assert_eq!(serving.pid, child.id(), "the child itself must serve");
         let stdout = child
