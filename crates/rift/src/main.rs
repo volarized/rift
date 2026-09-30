@@ -15,6 +15,7 @@ use std::fmt;
 use std::io::IsTerminal as _;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use clap::{Command, CommandFactory};
@@ -29,8 +30,30 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 /// Default filter keeps dependency diagnostics out of MCP stderr.
 const DEFAULT_TRACING_FILTER: &str = "rift=info,rift_mcp=info,rift_server=info,rift_index=warn";
 
+/// The checkout this binary was built from, as `build.rs` recorded it. Every server and
+/// proxy this binary runs names its build through it.
+const BUILD_CHECKOUT: rift_mcp::BuildCheckout =
+    rift_mcp::BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
+
+/// This binary's product version, as `rift --version` prints it and its servers publish it.
+///
+/// A dirty build whose executable cannot be read prints its commit and the dirty mark
+/// without the executable's metadata, where a server refuses to start instead.
+fn product_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(|executable| BUILD_CHECKOUT.product_version(&executable))
+            .unwrap_or_else(|_| BUILD_CHECKOUT.version_without_stamp())
+    })
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "rift", version, about = "agentic development toolkit")]
+#[command(
+    name = "rift",
+    version = product_version(),
+    about = "agentic development toolkit"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -332,7 +355,7 @@ async fn run(
     match cli.command {
         None => Ok(None),
         Some(CliCommand::Mcp) => {
-            rift_mcp::serve_proxy(Path::new("."))
+            rift_mcp::serve_proxy(Path::new("."), BUILD_CHECKOUT)
                 .await
                 .map_err(CliError::Mcp)?;
             Ok(None)
@@ -374,6 +397,14 @@ mod tests {
     use tracing::span::{Attributes, Id};
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
     use tracing_subscriber::{EnvFilter, Layer};
+
+    #[test]
+    fn version_prints_the_product_version() {
+        let printed = Cli::try_parse_from(["rift", "--version"])
+            .expect_err("--version prints and exits")
+            .to_string();
+        assert_eq!(printed.trim(), format!("rift {}", super::product_version()));
+    }
 
     #[test]
     fn empty_invocation_remains_valid() {

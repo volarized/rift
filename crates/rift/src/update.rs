@@ -1685,10 +1685,11 @@ mod tests {
         fs::File::open(&version_path)?
             .take(256)
             .read_to_string(&mut version_text)?;
-        assert_eq!(
-            version_text.trim(),
-            concat!("rift ", env!("CARGO_PKG_VERSION"))
-        );
+        let (released, _build) = version_text
+            .trim()
+            .split_once('+')
+            .unwrap_or((version_text.trim(), ""));
+        assert_eq!(released, concat!("rift ", env!("CARGO_PKG_VERSION")));
         assert!(fs::metadata(&version_path)?.len() < 256);
 
         // Bound temporary-file removal even if Windows retains an executable handle briefly.

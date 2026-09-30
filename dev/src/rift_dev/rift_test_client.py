@@ -129,7 +129,11 @@ def workspace_version() -> str:
 
 
 def verify_version(binary: Path, version: str) -> None:
-    """Require the supplied executable to report exactly the expected release version."""
+    """Require the supplied executable to report exactly the expected release version.
+
+    `rift --version` follows the version with `+` and the build it came from, which the
+    comparison leaves aside.
+    """
     expected = f"rift {version.removeprefix('v')}"
     observed = (
         Command(binary.resolve(), "--version")
@@ -137,7 +141,8 @@ def verify_version(binary: Path, version: str) -> None:
         .output()
         .strip()
     )
-    require(observed == expected, f"expected {expected!r}, received {observed!r}")
+    released, _, _build = observed.partition("+")
+    require(released == expected, f"expected {expected!r}, received {observed!r}")
 
 
 def remaining_seconds(seconds: float) -> float:

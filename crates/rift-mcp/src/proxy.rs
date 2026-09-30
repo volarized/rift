@@ -7,35 +7,46 @@
 //! single-flight, one retry per request - when the server it held goes
 //! away, so an agent session survives server restarts.
 
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ServerCapabilities, ServerConfig, ServerPeerInfo,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, Extensions,
+    Implementation, ListResourceTemplatesRequest, ListResourceTemplatesRequestMethod,
+    ListResourceTemplatesResult, ListResourcesRequest, ListResourcesRequestMethod,
+    ListResourcesResult, ListToolsRequest, ListToolsRequestMethod, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerConfig, ServerPeerInfo, ServerResult,
 };
 use rmcp::service::{
-    ClientInitializeError, Peer, QuitReason, RequestContext, RoleClient, RoleServer,
-    RunningService, ServerInitializeError,
+    ClientInitializeError, Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient,
+    RoleServer, RunningService, ServerInitializeError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
+use semver::Version;
 
 use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
-use crate::http::MCP_PATH;
+use crate::http::{MCP_PATH, request_stop};
+use crate::identity::BuildCheckout;
 use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
     StartSpawns, StartupCapture,
 };
 use crate::validation::ConfigurationState;
+
+/// The suffix `SQLite` gives a WAL database's write-ahead log, appended to the
+/// database file's name.
+const WRITE_AHEAD_LOG_SUFFIX: &str = "-wal";
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,7 +101,7 @@ impl Fault for ProxyFault {
 }
 
 /// Serves agents over stdio MCP, forwarding every request to the
-/// workspace's elected server.
+/// workspace's elected server, as the build `checkout` describes.
 ///
 /// Serving starts immediately: a background warmup attempts the first
 /// upstream connect - starting a server when the workspace has none - and
@@ -106,9 +117,9 @@ impl Fault for ProxyFault {
 ///
 /// Dropping this future closes the owned MCP service and the upstream
 /// connection; the detached server keeps serving the workspace.
-pub async fn serve_proxy(root: &Path) -> Result<(), ProxyServeError> {
+pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), ProxyServeError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
-    let identity = crate::identity::product_identity()
+    let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| Error::new(ProxyFault::Identity(error)))?;
     let proxy = RiftProxy::new(root, identity);
@@ -357,31 +368,29 @@ impl RiftProxy {
         });
     }
 
-    /// Forwards one request to the upstream with a single reconnect retry.
+    /// Forwards one request to the upstream with a single reconnect retry,
+    /// reading its answer through `answer`.
     ///
     /// A transport-shaped failure marks the held connection dead and
     /// retries exactly once on a freshly leased connection; every other
-    /// failure maps straight through [`forwarded_error`]. Each send is
-    /// bounded by the proxy's forward budget, and a send that outlives it
-    /// refuses as [`ForwardFault::Unanswered`].
+    /// failure maps straight through [`forwarded_error`], and an answer of
+    /// another kind than `answer` reads refuses as an unexpected response.
+    /// Each send is bounded by the proxy's forward budget, and a send that
+    /// outlives it is cancelled on the server and refuses as
+    /// [`ForwardFault::Unanswered`].
     ///
     /// # Cancel safety
     ///
     /// Dropping this future abandons the forward; a reconnect another
     /// request started is unaffected.
-    async fn forward<Request, Value, Forward, Fut>(
+    async fn forward<Value>(
         &self,
-        request: Request,
-        send: Forward,
-    ) -> Result<Value, ErrorData>
-    where
-        Request: Clone,
-        Forward: Fn(Peer<RoleClient>, Request) -> Fut,
-        Fut: Future<Output = Result<Value, ServiceError>>,
-    {
+        request: ClientRequest,
+        answer: fn(ServerResult) -> Option<Value>,
+    ) -> Result<Value, ErrorData> {
         let (peer, generation) = self.leased_peer(None).await?;
-        let failure = match self.answered(send(peer, request.clone())).await? {
-            Ok(value) => return Ok(value),
+        let failure = match self.answered(&peer, request.clone()).await? {
+            Ok(result) => return answered_as(result, answer),
             Err(error) if transport_failed(&error) => error,
             Err(error) => return Err(forwarded_error(error)),
         };
@@ -391,33 +400,52 @@ impl RiftProxy {
             "upstream connection lost; reconnecting"
         );
         let (peer, _generation) = self.leased_peer(Some(generation)).await?;
-        self.answered(send(peer, request))
+        let result = self
+            .answered(&peer, request)
             .await?
-            .map_err(forwarded_error)
+            .map_err(forwarded_error)?;
+        answered_as(result, answer)
     }
 
     /// What one send answered, or the refusal for a server that did not
     /// answer it within the forward budget.
     ///
+    /// The request goes out cancellable under the budget. When the budget
+    /// ends, rmcp's `RequestHandle::await_response` cancels the request:
+    /// over Streamable HTTP that closes the request's response stream, which
+    /// the MCP specification makes the cancellation signal, so the server
+    /// stops the request instead of answering into a dropped channel.
+    ///
     /// # Cancel safety
     ///
-    /// Dropping this future drops the send; the request stays with the
-    /// server, which answers it into a dropped channel.
-    async fn answered<Value>(
+    /// Dropping this future drops the send before its budget ends; the
+    /// request's response stream closes with it.
+    async fn answered(
         &self,
-        send: impl Future<Output = Result<Value, ServiceError>>,
-    ) -> Result<Result<Value, ServiceError>, ErrorData> {
-        tokio::time::timeout(self.forward_budget, send)
+        peer: &Peer<RoleClient>,
+        request: ClientRequest,
+    ) -> Result<Result<ServerResult, ServiceError>, ErrorData> {
+        let budget = self.forward_budget;
+        let answer = match peer
+            .send_cancellable_request(request, PeerRequestOptions::with_timeout(budget))
             .await
-            .map_err(|_elapsed| {
-                let budget = self.forward_budget;
+        {
+            Ok(handle) => handle.await_response().await,
+            Err(error) => Err(error),
+        };
+        match answer {
+            Err(ServiceError::Timeout { .. }) => {
                 tracing::warn!(
                     component = "mcp",
                     budget = ?budget,
-                    "the workspace server did not answer a forwarded request within its budget"
+                    "the workspace server did not answer a forwarded request within its budget; \
+                     the request is cancelled"
                 );
-                Error::new(ForwardFault::Unanswered { budget }).tool_error(wire::ErrorPhase::Read)
-            })
+                Err(Error::new(ForwardFault::Unanswered { budget })
+                    .tool_error(wire::ErrorPhase::Read))
+            }
+            answered => Ok(answered),
+        }
     }
 
     /// The info advertised downstream: the upstream's mirrored
@@ -463,6 +491,15 @@ pub fn forward_budget(server: &ServerConfiguration) -> Duration {
             server.worker_queue_timeout.milliseconds(),
         ))
         .saturating_add(FORWARD_ANSWER_GRACE)
+}
+
+/// The value `answer` reads from one upstream result, or the refusal for a
+/// result of another kind than the request asked for.
+fn answered_as<Value>(
+    result: ServerResult,
+    answer: fn(ServerResult) -> Option<Value>,
+) -> Result<Value, ErrorData> {
+    answer(result).ok_or_else(|| forwarded_error(ServiceError::UnexpectedResponse))
 }
 
 /// Why a forwarded request produced no answer from the upstream.
@@ -520,17 +557,27 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// election spawns again, at most
 /// [`START_SPAWN_COUNT_MAX`](crate::spawn::START_SPAWN_COUNT_MAX) spawns in
 /// all, and any other exit refuses with the server's captured stderr.
-/// Exhaustion refuses with the operator's next step.
+/// When the window closes on a holder of the election that is still building
+/// its first index and wrote to the workspace database during the window,
+/// the refusal is one the caller resends; any other exhaustion refuses with
+/// the operator's next step.
+///
+/// A recorded server of another identity is weighed by [`ServerStanding`].
+/// One this process replaces is asked to stop first, and the spawn waits
+/// until that server has released the election, so the new server never
+/// opens the workspace beside the one leaving it.
 ///
 /// # Cancel safety
 ///
 /// Dropping this future abandons the connect; a spawned server keeps
-/// serving and the next attempt adopts it.
+/// serving and the next attempt adopts it. A server already asked to stop
+/// stops.
 async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
-    if let Some(running) = adopt_serving(root, identity).await? {
+    let mut replacement = Replacement::default();
+    if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
         return Ok(running);
     }
     // A server another starter elected is still building: a spawn now would
@@ -541,14 +588,24 @@ async fn connect_upstream(
     // spawn that cannot launch at all is reported, and the poll still gives
     // a concurrently started server its chance.
     let mut spawns = StartSpawns::<StartupCapture>::default();
-    if !matches!(probe(root), ServerPresence::Starting) {
+    let mut awaiting_release = replacement.is_asked();
+    if !awaiting_release && !matches!(probed(root).await, ServerPresence::Starting) {
         spawns.spawn_captured(root);
     }
+    let opened = DatabaseActivity::observed(root).await;
+    let mut building = false;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        let presence = probe(root);
+        let presence = probed(root).await;
+        building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
-        let adopted = adopt_presence(presence, identity).await?;
+        let adopted = adopt_presence(presence, identity, &mut replacement).await?;
+        // The replaced server released the election, and no other starter
+        // took it: this process starts the server it replaces it with.
+        if awaiting_release && !election_held {
+            awaiting_release = false;
+            spawns.spawn_captured(root);
+        }
         match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => return Ok(running),
             SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
@@ -560,7 +617,91 @@ async fn connect_upstream(
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    Err(upstream_unavailable())
+    let closed = DatabaseActivity::observed(root).await;
+    Err(start_window_refusal(building && opened != closed))
+}
+
+/// What the workspace database's files looked like at one instant: each
+/// file's length and modification time, or nothing for an absent file.
+///
+/// A server records its diagnostics into `.rift/db` from before it claims the
+/// election, while it builds its first index too, and `SQLite` in WAL mode
+/// appends each commit to the write-ahead log. Two readings that differ
+/// therefore show that a process wrote between them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DatabaseActivity {
+    files: [Option<(u64, SystemTime)>; 2],
+}
+
+impl DatabaseActivity {
+    /// Reads the database file and its write-ahead log below `root`, and none
+    /// of their bytes, on the blocking pool. A reading the pool could not
+    /// finish names no file.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future abandons the reading; it changes nothing.
+    async fn observed(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::read(&root))
+            .await
+            .unwrap_or(Self {
+                files: [None, None],
+            })
+    }
+
+    /// Reads the database file and its write-ahead log below `root`.
+    fn read(root: &Path) -> Self {
+        let state = root.join(RIFT_STATE_DIRECTORY);
+        let database = state.join(WORKSPACE_DATABASE_FILE_NAME);
+        let log = state.join(format!(
+            "{WORKSPACE_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
+        ));
+        Self {
+            files: [database, log].map(|path| {
+                let metadata = std::fs::metadata(path).ok()?;
+                Some((metadata.len(), metadata.modified().ok()?))
+            }),
+        }
+    }
+}
+
+/// The refusal a request gets when the start window closed without a server
+/// that answers: one the caller resends while the holder of the election is
+/// `building` its first index and wrote during the window, and the
+/// operator's next step otherwise.
+fn start_window_refusal(building: bool) -> ErrorData {
+    if building {
+        return Error::new(StartFault::Building).tool_error(wire::ErrorPhase::Read);
+    }
+    upstream_unavailable()
+}
+
+/// Why the start window closed without a server that answers, when the
+/// caller can resend the request.
+#[derive(Debug)]
+enum StartFault {
+    /// The workspace's server holds the election, has published no lock
+    /// document yet, and wrote to the workspace database during the window.
+    Building,
+}
+
+impl Fault for StartFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        match self {
+            Self::Building => vec![
+                ErrorContext::new(
+                    "detail",
+                    "the workspace's rift server is still building its first index",
+                ),
+                ErrorContext::new("waited", format!("{START_WAIT_MAX:?}")),
+            ],
+        }
+    }
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -630,12 +771,42 @@ impl Fault for SpawnFault {
 ///
 /// A probe that names no serving server, and a recorded server that
 /// refuses the connect or initialize, both answer `None`: the recorded
-/// state is stale and the caller elects afresh.
+/// state is stale and the caller elects afresh. A server of another
+/// identity answers as [`ServerStanding`] decides.
 async fn adopt_serving(
     root: &Path,
     identity: &ProductIdentity,
+    replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    adopt_presence(probe(root), identity).await
+    adopt_presence(probed(root).await, identity, replacement).await
+}
+
+/// One presence probe, off the async runtime.
+///
+/// A probe connects to the recorded port and can spend its whole connect
+/// bound doing it: on Windows a connect to a port nothing listens on keeps
+/// retrying until that bound passes. The probe therefore runs on the
+/// blocking pool, so the start poll never holds a runtime worker for it. A
+/// probe that panicked answers that the election's state could not be
+/// observed.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the answer; the probe itself finishes on
+/// the blocking pool and changes nothing.
+async fn probed(root: &Path) -> ServerPresence {
+    probed_with(root, probe).await
+}
+
+/// [`probed`] over any probe, so a test can hold one probe open.
+async fn probed_with(
+    root: &Path,
+    probe: impl FnOnce(&Path) -> ServerPresence + Send + 'static,
+) -> ServerPresence {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || probe(&root))
+        .await
+        .unwrap_or(ServerPresence::Stale(StaleReason::ElectionUnobservable))
 }
 
 /// The serving server one probe found, as a live connection, under the
@@ -646,6 +817,7 @@ async fn adopt_serving(
 async fn adopt_presence(
     presence: ServerPresence,
     identity: &ProductIdentity,
+    replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
     let lock = match presence {
         ServerPresence::Serving(lock) => lock,
@@ -661,7 +833,14 @@ async fn adopt_presence(
             return Ok(None);
         }
     };
-    require_identity_match(identity, &lock)?;
+    match ServerStanding::of(identity, &lock.identity) {
+        ServerStanding::Adopt => {}
+        ServerStanding::Replace => {
+            replacement.replace(&lock, identity).await?;
+            return Ok(None);
+        }
+        ServerStanding::Refuse => return Err(identity_refusal(identity, &lock)),
+    }
     match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
         Ok(running) => {
             tracing::info!(
@@ -684,24 +863,126 @@ async fn adopt_presence(
     }
 }
 
-/// Refuses a serving process whose executable or served tools differ.
-fn require_identity_match(expected: &ProductIdentity, lock: &ServerLock) -> Result<(), ErrorData> {
-    if lock.identity == *expected {
-        return Ok(());
+/// What a proxy does with a recorded server, by the two product identities.
+///
+/// Versions order by semantic-versioning precedence, which leaves build
+/// metadata aside, so two builds of one version stand level. Every release
+/// bumps the version, so a proxy of a new release replaces the server of the
+/// one before it, while two development builds of one version never replace
+/// each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerStanding {
+    /// The identities are equal: the proxy forwards to the server.
+    Adopt,
+    /// The server's version strictly precedes this process's: the proxy asks
+    /// it to stop and starts its own.
+    Replace,
+    /// The server's version equals this process's from another build, or
+    /// follows it: the proxy refuses, so a server is only ever displaced by
+    /// a newer release.
+    Refuse,
+}
+
+impl ServerStanding {
+    /// How the server recording `theirs` stands against `ours`. A version
+    /// either side cannot parse orders nothing, and the proxy refuses.
+    fn of(ours: &ProductIdentity, theirs: &ProductIdentity) -> Self {
+        if ours == theirs {
+            return Self::Adopt;
+        }
+        let (Ok(ours), Ok(theirs)) = (
+            Version::parse(&ours.version),
+            Version::parse(&theirs.version),
+        ) else {
+            return Self::Refuse;
+        };
+        match theirs.cmp_precedence(&ours) {
+            Ordering::Less => Self::Replace,
+            Ordering::Equal | Ordering::Greater => Self::Refuse,
+        }
     }
-    Err(ErrorData::internal_error(
+}
+
+/// The one server a connect asked to stop, by the pid and token its lock
+/// records.
+///
+/// A server mints its token when it starts, so the pair names one server:
+/// a later probe that reads it again sees that server leaving, and one that
+/// reads another pair sees a server started after it.
+#[derive(Debug, Default)]
+struct Replacement {
+    asked: Option<(u32, String)>,
+}
+
+impl Replacement {
+    /// Whether this connect asked a server to stop.
+    const fn is_asked(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    /// Asks the server `lock` records to stop so this process can serve the
+    /// workspace, once per connect.
+    ///
+    /// The server this connect already asked answers `Ok` while it leaves.
+    /// A second older server is refused rather than stopped: another process
+    /// of an older release started it after the replaced one left, and
+    /// stopping it in turn would only race that process for the election.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity refusal for a second server, and for a server
+    /// that did not accept the stop request.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping this future abandons the request; a request the server
+    /// already received still stops it.
+    async fn replace(
+        &mut self,
+        lock: &ServerLock,
+        identity: &ProductIdentity,
+    ) -> Result<(), ErrorData> {
+        match &self.asked {
+            Some((pid, token)) if *pid == lock.pid && *token == lock.token => return Ok(()),
+            Some(_) => return Err(identity_refusal(identity, lock)),
+            None => {}
+        }
+        if let Err(failure) = request_stop(lock).await {
+            tracing::warn!(
+                component = "mcp",
+                pid = lock.pid,
+                failure = ?failure,
+                "the workspace server did not accept the stop request"
+            );
+            return Err(identity_refusal(identity, lock));
+        }
+        let server_version = lock.identity.version.as_str();
+        tracing::info!(
+            component = "mcp",
+            pid = lock.pid,
+            server_version,
+            version = identity.version.as_str(),
+            "asked the workspace server to stop so this rift process can serve the workspace"
+        );
+        self.asked = Some((lock.pid, lock.token.clone()));
+        Ok(())
+    }
+}
+
+/// The refusal for a serving process whose build or served tools differ
+/// and that this process does not replace.
+fn identity_refusal(expected: &ProductIdentity, lock: &ServerLock) -> ErrorData {
+    ErrorData::internal_error(
         format!(
-            "workspace server identity differs from this rift process: server pid {}, version {}, executable digest {}, schema digest {}; this process version {}, executable digest {}, schema digest {}; run rift server stop, then retry",
+            "workspace server identity differs from this rift process: server pid {}, version {}, schema digest {}; this process version {}, schema digest {}; run rift server stop, then retry",
             lock.pid,
             lock.identity.version,
-            lock.identity.executable_digest,
             lock.identity.schema_digest,
             expected.version,
-            expected.executable_digest,
             expected.schema_digest,
         ),
         None,
-    ))
+    )
 }
 
 /// Why one bounded connect attempt produced no live connection.
@@ -835,8 +1116,9 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_tools(request).await
+        self.forward(list_tools_request(request), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -846,8 +1128,14 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.call_tool_once(request).await
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
+        self.forward(request, |result| match result {
+            ServerResult::CallToolResult(result) => Some(CallToolResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Some(CallToolResponse::InputRequired(result))
+            }
+            ServerResult::CreateTaskResult(result) => Some(CallToolResponse::Task(result)),
+            _ => None,
         })
         .await
     }
@@ -857,8 +1145,14 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_resources(request).await
+        let request = ClientRequest::ListResourcesRequest(ListResourcesRequest {
+            method: ListResourcesRequestMethod,
+            params: request,
+            extensions: Extensions::default(),
+        });
+        self.forward(request, |result| match result {
+            ServerResult::ListResourcesResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -868,8 +1162,14 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.list_resource_templates(request).await
+        let request = ClientRequest::ListResourceTemplatesRequest(ListResourceTemplatesRequest {
+            method: ListResourceTemplatesRequestMethod,
+            params: request,
+            extensions: Extensions::default(),
+        });
+        self.forward(request, |result| match result {
+            ServerResult::ListResourceTemplatesResult(result) => Some(result),
+            _ => None,
         })
         .await
     }
@@ -879,57 +1179,73 @@ impl ServerHandler for RiftProxy {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        self.forward(request, |peer, request| async move {
-            peer.read_resource(request).await
+        let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request));
+        self.forward(request, |result| match result {
+            ServerResult::ReadResourceResult(result) => {
+                Some(ReadResourceResponse::Complete(result))
+            }
+            ServerResult::InputRequiredResult(result) => {
+                Some(ReadResourceResponse::InputRequired(result))
+            }
+            _ => None,
         })
         .await
-        .map(Into::into)
     }
+}
+
+/// The `tools/list` request the proxy forwards for one page.
+fn list_tools_request(page: Option<PaginatedRequestParams>) -> ClientRequest {
+    ClientRequest::ListToolsRequest(ListToolsRequest {
+        method: ListToolsRequestMethod,
+        params: page,
+        extensions: Extensions::default(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::any::TypeId;
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use rift_protocol::lock::{ProductIdentity, SERVER_TOKEN_LENGTH, ServerLock};
-    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo};
+    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo, ServerResult};
     use rmcp::service::{QuitReason, RoleClient, RunningService, serve_directly};
     use rmcp::transport::DynamicTransportError;
     use rmcp::{ErrorData, ServiceError};
     use serde_json::json;
+    use tokio::io::AsyncBufReadExt as _;
 
     use super::{
-        ConnectAttemptFailure, ProxyFault, RiftProxy, Upstream, UpstreamSlot, adopt_serving,
-        connect_recorded, connect_upstream, fallback_info, forwarded_error, mirrored_info,
-        quit_reason_result, require_identity_match, reuse_current, serve_connection,
-        server_start_failed, transport_failed, upstream_unavailable,
+        ConnectAttemptFailure, ProxyFault, Replacement, RiftProxy, ServerStanding, Upstream,
+        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, fallback_info,
+        forwarded_error, identity_refusal, mirrored_info, quit_reason_result, reuse_current,
+        serve_connection, server_start_failed, transport_failed, upstream_unavailable,
     };
-    use crate::election::claim;
+    use crate::election::{ServerPresence, StaleReason, claim};
     use rift_core::{CapturedStream, Error};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    const EXECUTABLE_DIGEST_A: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const EXECUTABLE_DIGEST_B: &str =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// One build of 0.0.11, and another build of the same version.
+    const BUILD_A: &str = "0.0.11+b006b8433ba06679f06a3c7f0743d65634d32c34";
+    const BUILD_B: &str = "0.0.11+71ea9ed284538bd4b5429df592afd7424e2bad13";
     const SCHEMA_DIGEST_A: &str =
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const SCHEMA_DIGEST_B: &str =
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    fn identity(version: &str, executable_digest: &str, schema_digest: &str) -> ProductIdentity {
+    fn identity(version: &str, schema_digest: &str) -> ProductIdentity {
         ProductIdentity {
             version: version.to_owned(),
-            executable_digest: executable_digest.to_owned(),
             schema_digest: schema_digest.to_owned(),
         }
     }
 
     fn test_identity() -> ProductIdentity {
-        identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A)
+        identity(BUILD_A, SCHEMA_DIGEST_A)
     }
 
     fn transport_send_failure() -> ServiceError {
@@ -945,7 +1261,7 @@ mod tests {
             port,
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
-            identity: identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A),
+            identity: identity(BUILD_A, SCHEMA_DIGEST_A),
         }
     }
 
@@ -1067,46 +1383,218 @@ mod tests {
     }
 
     #[test]
-    fn matching_product_identities_are_accepted() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        assert_eq!(require_identity_match(&expected, &lock), Ok(()));
+    fn an_equal_identity_is_adopted() {
+        assert_eq!(
+            ServerStanding::of(
+                &identity(BUILD_A, SCHEMA_DIGEST_A),
+                &identity(BUILD_A, SCHEMA_DIGEST_A)
+            ),
+            ServerStanding::Adopt
+        );
     }
 
     #[test]
-    fn same_version_with_a_different_executable_digest_is_refused() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_B, SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another executable at the same version must be refused");
-        assert!(refusal.message.contains(EXECUTABLE_DIGEST_A));
-        assert!(refusal.message.contains(EXECUTABLE_DIGEST_B));
-        assert!(refusal.message.contains("pid 4242"), "{}", refusal.message);
+    fn an_older_version_is_replaced() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity("0.0.10", SCHEMA_DIGEST_A),
+            identity(
+                "0.0.10+b006b8433ba06679f06a3c7f0743d65634d32c34",
+                SCHEMA_DIGEST_A,
+            ),
+            identity(
+                "0.0.10+71ea9ed284538bd4b5429df592afd7424e2bad13.dirty.78008464.1790239195123456789",
+                SCHEMA_DIGEST_B,
+            ),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Replace,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    /// Two builds of one version stand level whatever their commits, dirty
+    /// stamps, or tool schemas, so neither replaces the other.
+    #[test]
+    fn another_build_of_this_version_is_refused() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity(BUILD_B, SCHEMA_DIGEST_A),
+            identity("0.0.11", SCHEMA_DIGEST_A),
+            identity(
+                "0.0.11+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789",
+                SCHEMA_DIGEST_A,
+            ),
+            identity(BUILD_A, SCHEMA_DIGEST_B),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Refuse,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newer_version_and_an_unordered_one_are_refused() {
+        let ours = identity(BUILD_A, SCHEMA_DIGEST_A);
+        for theirs in [
+            identity("0.0.12", SCHEMA_DIGEST_A),
+            identity(
+                "0.1.0+71ea9ed284538bd4b5429df592afd7424e2bad13",
+                SCHEMA_DIGEST_A,
+            ),
+            identity("1.0.0", SCHEMA_DIGEST_A),
+            identity("v0.0.12", SCHEMA_DIGEST_A),
+        ] {
+            assert_eq!(
+                ServerStanding::of(&ours, &theirs),
+                ServerStanding::Refuse,
+                "{theirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_refusal_names_both_identities_and_the_operator_step() {
+        let expected = identity(BUILD_B, SCHEMA_DIGEST_B);
+        let refusal = identity_refusal(&expected, &recorded_lock(12_345));
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        for named in [
+            BUILD_A,
+            BUILD_B,
+            SCHEMA_DIGEST_A,
+            SCHEMA_DIGEST_B,
+            "pid 4242",
+            "rift server stop",
+        ] {
+            assert!(refusal.message.contains(named), "{}", refusal.message);
+        }
+    }
+
+    /// A recorded server answering an authorized `POST /api/stop` the way a
+    /// server does, and counting the requests it accepted. Any other token is
+    /// refused with `401`.
+    async fn stop_counting_server(
+        token: &str,
+    ) -> TestResult<(u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let expected = format!("Bearer {token}");
+        let counted = Arc::clone(&accepted);
+        let router = axum::Router::new().route(
+            crate::http::STOP_PATH,
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let counted = Arc::clone(&counted);
+                let expected = expected.clone();
+                async move {
+                    let authorized = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .is_some_and(|value| value.as_bytes() == expected.as_bytes());
+                    if !authorized {
+                        return axum::http::StatusCode::UNAUTHORIZED;
+                    }
+                    counted.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let served = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok((port, accepted, served))
+    }
+
+    /// A connect asks the server it replaces to stop once. Reading that server
+    /// again while it leaves sends nothing, and a second server of another
+    /// identity is refused rather than stopped in turn.
+    #[tokio::test]
+    async fn a_replacement_asks_one_server_once_and_refuses_the_next() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"a".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let newer = identity("0.0.12", SCHEMA_DIGEST_A);
+        let mut lock = recorded_lock(port);
+        let mut replacement = Replacement::default();
+        replacement.replace(&lock, &newer).await?;
+        assert!(replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+
+        replacement.replace(&lock, &newer).await?;
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            1,
+            "the server already asked is leaving"
+        );
+
+        lock.pid = 4_243;
+        lock.token = "b".repeat(SERVER_TOKEN_LENGTH);
+        let refusal = replacement
+            .replace(&lock, &newer)
+            .await
+            .expect_err("a second server of another identity must be refused");
         assert!(
             refusal.message.contains("rift server stop"),
             "{}",
             refusal.message
         );
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        served.abort();
+        Ok(())
     }
 
-    #[test]
-    fn a_different_schema_digest_is_refused() {
-        let expected = identity("0.0.11", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_B);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another served tool schema must be refused");
-        assert!(refusal.message.contains(SCHEMA_DIGEST_A));
-        assert!(refusal.message.contains(SCHEMA_DIGEST_B));
+    #[tokio::test]
+    async fn a_server_that_refuses_the_stop_request_is_refused() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"b".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let mut replacement = Replacement::default();
+        let refusal = replacement
+            .replace(&recorded_lock(port), &identity("0.0.12", SCHEMA_DIGEST_A))
+            .await
+            .expect_err("a server that refused the stop keeps serving");
+        assert!(
+            refusal.message.contains("rift server stop"),
+            "{}",
+            refusal.message
+        );
+        assert!(!replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 0);
+        served.abort();
+        Ok(())
     }
 
-    #[test]
-    fn a_different_package_version_is_refused() {
-        let expected = identity("0.0.12", EXECUTABLE_DIGEST_A, SCHEMA_DIGEST_A);
-        let lock = recorded_lock(12_345);
-        let refusal = require_identity_match(&expected, &lock)
-            .expect_err("another package version must be refused");
-        assert!(refusal.message.contains("0.0.11"));
-        assert!(refusal.message.contains("0.0.12"));
+    /// Adoption asks an older recorded server to stop and answers nothing to
+    /// adopt, and refuses a newer one without asking it anything.
+    #[tokio::test]
+    async fn adopt_replaces_an_older_server_and_refuses_a_newer_one() -> TestResult {
+        let (port, accepted, served) =
+            stop_counting_server(&"a".repeat(SERVER_TOKEN_LENGTH)).await?;
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        guard.publish(&recorded_lock(port))?;
+
+        let newer_proxy = identity("0.0.12", SCHEMA_DIGEST_A);
+        let mut replacement = Replacement::default();
+        let adopted = adopt_serving(directory.path(), &newer_proxy, &mut replacement).await?;
+        assert!(adopted.is_none(), "a replaced server is never adopted");
+        assert!(replacement.is_asked());
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+
+        let older_proxy = identity("0.0.10", SCHEMA_DIGEST_A);
+        let refusal = adopt_serving(directory.path(), &older_proxy, &mut Replacement::default())
+            .await
+            .expect_err("a newer server must be refused");
+        assert!(refusal.message.contains(BUILD_A), "{}", refusal.message);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            1,
+            "a newer server is never asked to stop"
+        );
+        served.abort();
+        drop(guard);
+        Ok(())
     }
 
     #[test]
@@ -1233,25 +1721,13 @@ mod tests {
         assert!(std::error::Error::source(&initialize).is_some());
     }
 
-    #[tokio::test]
-    async fn forward_maps_a_non_transport_failure_without_retry() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity());
-        let (running, _upstream_alive) = direct_upstream();
-        {
-            let mut slot = proxy.upstream.lock().await;
-            slot.connected = Some(Upstream {
-                running,
-                generation: 0,
-            });
-            slot.generation_next = 1;
-        }
-        let refusal = proxy
-            .forward((), |_peer, ()| async {
-                Err::<(), _>(ServiceError::UnexpectedResponse)
-            })
-            .await
-            .expect_err("a non-transport failure must refuse without retry");
+    #[test]
+    fn an_answer_of_another_kind_refuses_as_unexpected() {
+        let refusal = super::answered_as(ServerResult::empty(()), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
+        })
+        .expect_err("an answer of another kind must refuse");
         assert!(
             refusal.message.contains("forwarded request"),
             "{}",
@@ -1274,7 +1750,7 @@ mod tests {
             "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
         )?;
         let proxy = RiftProxy::new(directory.path(), test_identity());
-        let (running, _upstream_silent) = direct_upstream();
+        let (running, upstream_silent) = direct_upstream();
         {
             let mut slot = proxy.upstream.lock().await;
             slot.connected = Some(Upstream {
@@ -1285,8 +1761,9 @@ mod tests {
         }
 
         let started = tokio::time::Instant::now();
-        let forward = proxy.forward(None, |peer, request| async move {
-            peer.list_tools(request).await
+        let forward = proxy.forward(super::list_tools_request(None), |result| match result {
+            ServerResult::ListToolsResult(result) => Some(result),
+            _ => None,
         });
         let answered = tokio::time::timeout(STALLED_FORWARD_MAX, forward)
             .await
@@ -1307,6 +1784,32 @@ mod tests {
             refusal.message.contains("did not answer"),
             "{}",
             refusal.message
+        );
+
+        // The silent server received the request, then its cancellation, both naming
+        // one request id: the budget's end cancels the work instead of abandoning it.
+        let mut received = tokio::io::BufReader::new(upstream_silent).lines();
+        let request: serde_json::Value = serde_json::from_str(
+            &received
+                .next_line()
+                .await?
+                .ok_or("the request reached the server")?,
+        )?;
+        let cancellation: serde_json::Value = serde_json::from_str(
+            &received
+                .next_line()
+                .await?
+                .ok_or("the cancellation reached the server")?,
+        )?;
+        assert_eq!(request["method"], json!("tools/list"), "{request}");
+        assert_eq!(
+            cancellation["method"],
+            json!("notifications/cancelled"),
+            "{cancellation}"
+        );
+        assert_eq!(
+            cancellation["params"]["requestId"], request["id"],
+            "{cancellation}"
         );
         Ok(())
     }
@@ -1350,6 +1853,28 @@ mod tests {
         );
     }
 
+    /// The probe runs on the blocking pool: on a single-threaded runtime,
+    /// another task completes while a probe still blocks, and that task is
+    /// what releases the probe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_probe_that_blocks_leaves_the_runtime_free() -> TestResult {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let probing = super::probed_with(std::path::Path::new("."), move |_root| {
+            match released.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => ServerPresence::Absent,
+                Err(_) => ServerPresence::Stale(StaleReason::DocumentUnreadable),
+            }
+        });
+        let releasing = async { release.send(()) };
+        let (presence, sent) = tokio::join!(probing, releasing);
+        sent?;
+        assert!(
+            matches!(presence, ServerPresence::Absent),
+            "the runtime released the probe while it blocked: {presence:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn adopt_treats_an_unanswering_recorded_server_as_stale() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -1360,9 +1885,13 @@ mod tests {
         };
         guard.publish(&recorded_lock(port))?;
         assert!(
-            adopt_serving(directory.path(), &test_identity())
-                .await?
-                .is_none(),
+            adopt_serving(
+                directory.path(),
+                &test_identity(),
+                &mut Replacement::default()
+            )
+            .await?
+            .is_none(),
             "a recorded server that answers nothing must be treated as stale"
         );
         Ok(())
@@ -1378,6 +1907,81 @@ mod tests {
             .await
             .expect_err("a holder that never publishes must exhaust the start window");
         assert_eq!(refusal.message, upstream_unavailable().message);
+        Ok(())
+    }
+
+    /// A holder of the election that publishes nothing but writes to the
+    /// workspace database during the start window is still building: the
+    /// connect refuses with a refusal the caller resends, naming the build.
+    #[tokio::test(start_paused = true)]
+    async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let log = directory.path().join(".rift").join("db-wal");
+        let writing = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::fs::write(&log, b"a commit the building server wrote")
+        };
+        let identity = test_identity();
+        let (refusal, written) =
+            tokio::join!(connect_upstream(directory.path(), &identity), writing);
+        written?;
+        let refusal = refusal.expect_err("a holder that never publishes exhausts the window");
+        let data = refusal
+            .data
+            .ok_or("the refusal carries its classification")?;
+        assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
+        assert!(
+            refusal.message.contains("still building its first index"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
+    /// Only a holder still building, together with a database that moved,
+    /// selects the retryable refusal.
+    #[test]
+    fn the_start_window_refusal_follows_the_evidence() {
+        let building = super::start_window_refusal(true);
+        assert!(
+            building.message.contains("still building"),
+            "{}",
+            building.message
+        );
+        let wedged = super::start_window_refusal(false);
+        assert_eq!(wedged.message, upstream_unavailable().message);
+    }
+
+    /// Database activity reads each file's length and modification time, and
+    /// moves when either file is written.
+    #[test]
+    fn database_activity_moves_when_the_database_is_written() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let before = super::DatabaseActivity::read(directory.path());
+        assert_eq!(before.files, [None, None]);
+        std::fs::create_dir_all(directory.path().join(".rift"))?;
+        std::fs::write(directory.path().join(".rift").join("db"), b"pages")?;
+        let written = super::DatabaseActivity::read(directory.path());
+        assert_ne!(written, before);
+        std::fs::write(directory.path().join(".rift").join("db-wal"), b"a commit")?;
+        assert_ne!(super::DatabaseActivity::read(directory.path()), written);
+        Ok(())
+    }
+
+    /// A server still building its first index has published no lock
+    /// document, so no identity is read and nothing asks it to stop.
+    #[tokio::test]
+    async fn a_building_server_is_never_asked_to_stop() -> TestResult {
+        let mut replacement = Replacement::default();
+        let adopted = super::adopt_presence(
+            ServerPresence::Starting,
+            &identity("999.0.0", SCHEMA_DIGEST_A),
+            &mut replacement,
+        )
+        .await?;
+        assert!(adopted.is_none());
+        assert!(!replacement.is_asked());
         Ok(())
     }
 
