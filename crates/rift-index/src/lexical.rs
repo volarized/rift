@@ -405,13 +405,6 @@ impl LexicalMatch {
         }
     }
 
-    /// The same match, its row holding the bytes `file_range` of its file.
-    #[must_use]
-    pub fn with_file_range(mut self, file_range: Range<u64>) -> Self {
-        self.file_range = Some(file_range);
-        self
-    }
-
     /// The bytes of its file the matched row holds - the whole file, or one chunk of a
     /// large one - or `None` for a row holding no file text.
     #[must_use]
@@ -2452,10 +2445,10 @@ mod tests {
         LexicalChange, LexicalDocumentRecord, LexicalFileRecord, LexicalIndexFault,
         LexicalIndexLimits, LexicalIndexStateRecord, LexicalIndexViolation, LexicalMatch,
         LexicalRanking, LexicalSearchIndex, MIGRATION_FILES, checked_byte_length,
-        decode_lexical_match, decode_recorded, isolated_weights, lexical_error,
-        lexical_error_caused_by, lexical_search_column_types, lexical_search_sql, matched_fields,
-        project_location, rank_weights, require_pragma_row, searchable_columns,
-        validate_lexical_batch,
+        checked_byte_offset, decode_document, decode_lexical_match, decode_recorded,
+        isolated_weights, lexical_error, lexical_error_caused_by, lexical_search_column_types,
+        lexical_search_sql, matched_fields, project_location, rank_weights, require_pragma_row,
+        searchable_columns, validate_lexical_batch,
     };
     use crate::trigram_store::TRIGRAM_ROWS;
     use rift_core::{ErrorCode, ErrorName, Fault, ProjectPath, SourceUnitId};
@@ -2944,6 +2937,62 @@ mod tests {
     #[should_panic(expected = "content byte length must fit i64 once bounded by unit_bytes_max")]
     fn test_checked_byte_length_usize_max_panics_on_i64_overflow() {
         let _ = checked_byte_length(usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "a file offset must fit i64 once bounded by file_bytes_max")]
+    fn test_checked_byte_offset_u64_max_panics_on_i64_overflow() {
+        let _ = checked_byte_offset(u64::MAX);
+    }
+
+    /// A typed row holding one file chunk: `symbol_name` and `byte_offset` are what the
+    /// decoding cases vary.
+    fn chunk_record(symbol_name: String, byte_offset: i64) -> LexicalDocumentRecord {
+        LexicalDocumentRecord {
+            identity: "docs/a.md#1".to_owned(),
+            path: "docs/a.md".to_owned(),
+            kind: "text_file".to_owned(),
+            digest: "0f1e2d3c".to_owned(),
+            byte_length: 5,
+            byte_offset: Some(byte_offset),
+            name: Some(symbol_name),
+            qualified_name: None,
+            identifier_terms: None,
+            signature: None,
+            documentation: None,
+            file_content: Some("chunk".to_owned()),
+        }
+    }
+
+    #[test]
+    fn test_a_stored_row_decodes_at_the_offset_it_was_written_at() {
+        let document =
+            decode_document(chunk_record("a".to_owned(), 64)).expect("a written row decodes");
+        assert_eq!(document.byte_offset(), Some(64));
+    }
+
+    #[test]
+    fn test_a_stored_row_with_a_negative_offset_refuses_naming_the_offset() {
+        let error = decode_document(chunk_record("a".to_owned(), -1))
+            .expect_err("no write stores a negative offset");
+        assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
+        let context = error.context();
+        let offset = context
+            .iter()
+            .find(|entry| entry.key() == "byte offset")
+            .map(rift_core::ErrorContext::value);
+        assert_eq!(offset, Some("a stored row offset is negative: offset=-1"));
+    }
+
+    #[test]
+    fn test_a_stored_row_with_a_field_past_its_bound_refuses() {
+        let overlong = "n".repeat(rift_ranking::NAME_BYTES_MAX + 1);
+        let error = decode_document(chunk_record(overlong, 0))
+            .expect_err("a name past its bound is no document");
+        assert_eq!(
+            error.fault().violation(),
+            LexicalIndexViolation::StoredKindInvalid
+        );
     }
 
     #[test]

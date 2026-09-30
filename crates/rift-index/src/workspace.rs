@@ -7952,6 +7952,102 @@ mod tests {
         );
     }
 
+    /// A capture record prints how many paths it holds and how many it read, never the
+    /// paths or their digests.
+    #[test]
+    fn test_a_capture_record_prints_its_counts() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (_, last) = captured_after(root, &LastCapture::default());
+        assert_eq!(format!("{last:?}"), "LastCapture { paths: 2, read: 2, .. }");
+        let (_, next) = captured_after(root, &last);
+        assert_eq!(format!("{next:?}"), "LastCapture { paths: 2, read: 0, .. }");
+    }
+
+    /// A request-time capture refuses a language selection the build refuses, before it
+    /// reads a file.
+    #[test]
+    fn test_capture_refuses_a_language_selection_the_build_refuses() {
+        let (directory, _) = two_file_workspace();
+        let mut configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "ruby".to_owned(),
+            rift_protocol::configuration::LanguageConfiguration::default(),
+        );
+        let languages = LanguageFileSelections::from(&configuration);
+        let error = capture_digests_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &languages,
+            &LastCapture::default(),
+        )
+        .expect_err("an unshipped language names no include");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::LanguageIncludeRequired
+        );
+    }
+
+    /// A request-time capture refuses a directory the process cannot read, naming it, as
+    /// the build does.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_refuses_a_directory_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let locked = root.join("locked");
+        fs::create_dir(&locked).expect("locked directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let outcome = capture_digests_with_languages(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
+        let error = outcome.expect_err("an unreadable directory fails the walk");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(error.fault().path(), Some(locked.as_path()));
+    }
+
+    /// A request-time capture refuses a file the process cannot read, naming it, as the
+    /// build does.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_refuses_a_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let sealed = root.join("sealed.txt");
+        fs::write(&sealed, "sealed\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let outcome = capture_digests_with_languages(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
+        let error = outcome.expect_err("a read this process cannot make fails the capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(error.fault().path(), Some(sealed.as_path()));
+    }
+
     #[test]
     fn test_capture_reads_again_a_path_whose_modification_time_moved() {
         let (directory, modified) = two_file_workspace();
@@ -8111,6 +8207,52 @@ mod tests {
         )
         .expect("the capture reads the tree");
         assert_eq!(captured.fingerprint(), *index.fingerprint());
+    }
+
+    /// A lockfile holding a NUL byte is left out as any binary file is, digest and all, and
+    /// the capture of the tree agrees with the index.
+    #[test]
+    fn test_a_binary_lockfile_is_left_out_with_its_warning() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        fs::write(root.join("Cargo.lock"), "version = 4\0\n").expect("binary lockfile");
+        let index = indexed(root, &TextFileInclusion::default());
+        let path = project("Cargo.lock");
+        assert_eq!(
+            index.warnings(),
+            [WorkspaceIndexWarning::BinarySource(path.clone())]
+        );
+        assert!(index.digest(&path).is_none());
+        let (captured, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+    }
+
+    /// Lockfile bytes count against `workspace_bytes_max` as a text file's do, so a
+    /// lockfile past the bound refuses the build and the capture alike, naming it.
+    #[test]
+    fn test_a_lockfile_past_the_workspace_bound_refuses_naming_it() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("Cargo.lock"), "version = 4\n").expect("lockfile");
+        let limits = WorkspaceIndexLimits::new(8, 1_024, 24, 8, 8).expect("bounds");
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let built = WorkspaceIndex::build(&root, limits, &visibility, &text)
+            .expect_err("the lockfile passes the workspace bound");
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let captured =
+            capture_digests_with_languages(&root, limits, &visibility, &text, &languages, &last)
+                .expect_err("the capture counts the lockfile too");
+        let lockfile = root.join("Cargo.lock");
+        for error in [built, captured] {
+            assert_eq!(
+                error.fault().violation(),
+                WorkspaceIndexViolation::WorkspaceTooLarge
+            );
+            assert_eq!(error.fault().path(), Some(lockfile.as_path()));
+        }
     }
 
     /// `paths.force_include` reaches a lockfile the index leaves out, and parses it when a
