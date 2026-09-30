@@ -2805,8 +2805,9 @@ pub enum ConfigurationViolation {
     /// `providers.history.releases` names releases while `strategy` is not `selective`,
     /// which alone reads them.
     HistoryReleasesOutsideSelective,
-    /// A `providers.history.releases` pattern is empty, longer than 256 bytes, or carries
-    /// whitespace or a control character.
+    /// A `providers.history.releases` pattern is empty, longer than 256 bytes, carries
+    /// whitespace or a control character, or does not compile as a glob, such as the unclosed
+    /// class `v[1`.
     HistoryReleasePatternInvalid {
         /// The rejected pattern.
         pattern: String,

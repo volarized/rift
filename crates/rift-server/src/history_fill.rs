@@ -155,8 +155,8 @@ impl ReleasePatterns {
         let compiled = patterns
             .iter()
             .map(|pattern| {
-                globset::Glob::new(pattern)
-                    .map(|glob| (pattern.clone(), glob.compile_matcher()))
+                release_matcher(pattern)
+                    .map(|matcher| (pattern.clone(), matcher))
                     .map_err(|error| {
                         ReadFault::invalid(
                             "providers.history.releases",
@@ -178,6 +178,18 @@ impl ReleasePatterns {
             .find(|(_, matcher)| matcher.is_match(tag))?;
         Some(release_version(tag, pattern))
     }
+}
+
+/// Compiles one release pattern into the matcher a `selective` fill tests tag
+/// names against. Acceptance of `rift.toml` compiles every pattern through it
+/// too, so a fill never meets a pattern it cannot compile.
+///
+/// # Errors
+///
+/// Returns globset's refusal when `pattern` is no glob, such as the unclosed
+/// class `v[1`.
+pub(crate) fn release_matcher(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    globset::Glob::new(pattern).map(|glob| glob.compile_matcher())
 }
 
 /// The version one tag name spells under the pattern that matched it: the

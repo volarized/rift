@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use rift_history::fixture::{commit_all, commit_missing_subtree, git, init};
 use rift_history_store::{CommitRecord, HistoryStore, STORE_FOLDER_NAME, StoreLocation};
-use rift_protocol::configuration::HistoryConfiguration;
+use rift_protocol::configuration::{ConfigurationViolation, HistoryConfiguration};
 use rift_protocol::read::CommitAuthor;
-use rift_server::FillProgress;
+use rift_server::{ConfigurationFault, FillProgress};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -434,24 +434,37 @@ fn a_store_folder_the_filesystem_cannot_create_leaves_the_lane_off_and_warns() -
     Ok(())
 }
 
-#[test]
-fn a_release_pattern_no_glob_compiles_from_leaves_the_lane_off_and_warns() -> TestResult {
+#[tokio::test]
+async fn a_release_pattern_that_does_not_compile_refuses_the_configuration() -> TestResult {
     let directory = committed_workspace(
         "[providers.history]\nstrategy = \"selective\"\nreleases = [\"v[1\"]\n",
     )?;
     let root = directory.path();
-    assert!(ConfigurationState::accept(root).is_accepted());
 
-    let (opened, mut drain) = opened_under_capture(root);
+    let configuration = ConfigurationState::accept(root);
 
-    assert!(opened.is_none());
-    let records = records_at(&mut drain, "history.open");
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0].0, STORE_NOT_OPENED);
+    let Err(refused) = &configuration.accepted else {
+        return Err("an unclosed class compiles into no matcher, so rift.toml is refused".into());
+    };
     assert!(
-        records[0].1.contains("providers.history.releases"),
-        "{records:?}"
+        matches!(
+            refused.fault(),
+            ConfigurationFault::Invalid {
+                violation: ConfigurationViolation::HistoryReleasePatternInvalid { pattern },
+                ..
+            } if pattern == "v[1"
+        ),
+        "{refused:?}"
     );
+    let lane = HistoryLane::start(
+        root,
+        &configuration,
+        BUILD_A,
+        (Arc::new(IdleTracker::new()), CancellationToken::new(), None),
+    )
+    .await;
+    assert!(lane.is_none(), "a refused configuration opens no store");
+    assert!(!root.join(".git").join(STORE_FOLDER_NAME).exists());
     Ok(())
 }
 
