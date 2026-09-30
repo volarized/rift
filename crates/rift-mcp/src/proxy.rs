@@ -1922,10 +1922,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             std::fs::write(&log, b"a commit the building server wrote")
         };
-        let (refusal, written) = tokio::join!(
-            connect_upstream(directory.path(), &test_identity()),
-            writing
-        );
+        let identity = test_identity();
+        let (refusal, written) =
+            tokio::join!(connect_upstream(directory.path(), &identity), writing);
         written?;
         let refusal = refusal.expect_err("a holder that never publishes exhausts the window");
         let data = refusal
