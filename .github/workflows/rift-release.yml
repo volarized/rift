@@ -195,7 +195,7 @@ jobs:
           uv run --locked --project tools/rift-release rift-release checksums
           --directory dist
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@v3.2.0
+        uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: dist/*
       - name: Create GitHub Release
