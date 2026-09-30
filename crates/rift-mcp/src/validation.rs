@@ -277,6 +277,18 @@ impl PublishedWorkspace {
         })
     }
 
+    /// Whether a rebuild naming `paths` moves every one of them: each reads, under this
+    /// publication's own policy, as something other than what this publication holds.
+    ///
+    /// This is the comparison [`RebuildRequest::change_set`] makes, so a path that fails it
+    /// is one a rebuild naming it leaves as it is. A read that fails asks for the whole
+    /// workspace there, and answers `false` here.
+    pub(crate) fn rebuild_moves_every(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
+            PathChanges::resolve(observed, |path| self.reads.file_record(path)).len() == paths.len()
+        })
+    }
+
     /// Whether this publication holds files below one of `paths` that is no longer a
     /// directory on disk.
     ///
@@ -6509,7 +6521,11 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        // The store lives outside the captured tree, as `.rift/db` does: the second capture
+        // runs after the open, and a file the open writes beside the database would join
+        // the tree as a moved file.
+        let state = tempfile::tempdir()?;
+        let index = Arc::new(search_index(&state.path().join("search.db")).await?);
         let double = StoreDouble::new();
         double.attach(Arc::clone(&index));
         let cancellation = CancellationToken::new();

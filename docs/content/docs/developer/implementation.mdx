@@ -169,7 +169,10 @@ selection, `[search.text]` inclusion or chunk bound, `[documentation]`, `[depend
 Before each current-tree read, the server captures an exact digest of every included workspace
 file, then waits until the published index counter matches its observation. That capture already
 read the tree, so a read that finds the index behind names the files that moved rather than
-asking for a whole rebuild.
+asking for a whole rebuild. A file that appeared or disappeared because a `.gitignore` changed
+is the exception: the published index still applies the ignore files it was built under, so
+rebuilding that one file changes nothing, and the read asks for the whole workspace without
+waiting for the watcher to report the `.gitignore` write.
 
 <VersionBadge version="v0.0.46" />
 
@@ -208,6 +211,13 @@ vectors, and server logs. The server lock stays in a separate file under `.rift`
 through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surface is raw SQL,
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
+
+Every process that opens `.rift/db`, a starting server and `rift server logs` alike, holds an
+exclusive lock on `.rift/db.lock` while it switches the file to WAL and applies the schema
+migrations. SQLite refuses a second process's WAL switch at once, without waiting for the first,
+and Toasty applies every migration it read as missing, so two processes preparing one new file
+side by side leave one of them without the database. A process that meets the lock waits for it
+up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
 
 Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
 bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its
