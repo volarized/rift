@@ -566,6 +566,7 @@ impl ListeningForeground {
 
         let mut child = Command::new(rift_binary()?)
             .args(["server", "start", "--foreground"])
+            .envs(SERVER_LOG_VARIABLES)
             .envs(variables.iter().copied())
             .current_dir(root)
             .stdin(Stdio::null())
