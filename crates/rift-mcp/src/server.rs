@@ -606,19 +606,26 @@ struct RevisionRead {
     history: rift_protocol::configuration::HistoryConfiguration,
 }
 
-/// One current-tree request's publication, and the warning it carries when that
-/// publication is served in spite of a recorded rebuild failure.
+/// One current-tree request's publication, the warning it carries when that
+/// publication is served in spite of a recorded rebuild failure, and how long the
+/// request-time capture that resolved it took.
 struct ResolvedWorkspace {
     published: Arc<PublishedWorkspace>,
     stale: Option<ReadWarning>,
+    /// The request-time capture's time, worker admission included. A traversal checks
+    /// the same tree once more after its engine walk, and sizes the time it reserves
+    /// for that check from this capture ([`RequestDeadline::walk_end`]).
+    capture_elapsed: Duration,
 }
 
 impl ResolvedWorkspace {
-    /// A publication that answers for the tree as it stands.
-    const fn current(published: Arc<PublishedWorkspace>) -> Self {
+    /// A publication that answers for the tree as it stands, resolved by a capture that
+    /// took `capture_elapsed`.
+    const fn current(published: Arc<PublishedWorkspace>, capture_elapsed: Duration) -> Self {
         Self {
             published,
             stale: None,
+            capture_elapsed,
         }
     }
 }
@@ -804,14 +811,18 @@ type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests
 /// Reaching every retry arm of the bounded reconciliation loop by racing real filesystem
 /// events is not reproducible; forcing the capture the loop runs makes each arm a plain
 /// function call.
+///
+/// The capture comes back after its delay, which a test sets to stand in for the time a
+/// large tree takes: the delay is an asynchronous wait, so a request deadline can pass
+/// during it as it passes during a capture on the worker pool.
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct ForcedCapture(Arc<std::sync::Mutex<Option<Arc<ForcedTreeCapture>>>>);
+struct ForcedCapture(Arc<std::sync::Mutex<Option<(Arc<ForcedTreeCapture>, Duration)>>>);
 
 #[cfg(test)]
 impl ForcedCapture {
-    /// The forced capture, when one is installed.
-    fn installed(&self) -> Option<Arc<ForcedTreeCapture>> {
+    /// The forced capture and its delay, when one is installed.
+    fn installed(&self) -> Option<(Arc<ForcedTreeCapture>, Duration)> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -838,11 +849,26 @@ impl RiftMcp {
         + Sync
         + 'static,
     ) {
+        self.force_capture_after(Duration::ZERO, capture);
+    }
+
+    /// Forces `capture` as the request-time capture every later request runs, each one
+    /// answered `delay` after it is asked for.
+    fn force_capture_after(
+        &self,
+        delay: Duration,
+        capture: impl Fn(
+            &PublishedWorkspace,
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        + Send
+        + Sync
+        + 'static,
+    ) {
         *self
             .forced_capture
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(capture));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Arc::new(capture), delay));
     }
 }
 
@@ -1066,12 +1092,20 @@ fn ranking_of(
     }
 }
 
-/// A walk stops waiting for engine readiness, and abandons a retry still in flight, this
-/// share of the request budget before the request's deadline, a tenth, so closing the
-/// walk's document, checking the tree again, and the answer with its warning still fit
-/// inside the budget, and a spent wait never reaches the request timeout, which refuses
-/// the request in place of the warning.
+/// The least a walk reserves before the request's deadline, as a share of the request
+/// budget: a tenth. Closing the walk's document and building the answer with its warning
+/// fit inside it; [`WALK_CAPTURE_RESERVE_FACTOR`] sizes the reserve past it for a tree
+/// whose check takes longer.
 const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
+
+/// How many request-time captures of the same tree a walk reserves time for after it
+/// ends: the one check that decides whether its answer stands, twice over.
+///
+/// Two captures of one unchanged tree run the same directory walk and the same stat per
+/// file seconds apart, so the request's own capture predicts the check after the walk.
+/// The factor covers a check that runs slower than the capture it is predicted from,
+/// such as one queued behind other work on the worker pool.
+const WALK_CAPTURE_RESERVE_FACTOR: u32 = 2;
 
 /// The instant every wait inside one request must end by.
 ///
@@ -1121,6 +1155,20 @@ impl RequestDeadline {
     /// already at hand.
     fn is_spent(self) -> bool {
         self.remaining().is_zero()
+    }
+
+    /// The instant a traversal's engine walk stops waiting for readiness and abandons a
+    /// retry still in flight, so the work after it fits before [`RequestDeadline::at`].
+    ///
+    /// The walk reserves the larger of a tenth of the budget
+    /// ([`WALK_BUDGET_RESERVE_DIVISOR`]) and [`WALK_CAPTURE_RESERVE_FACTOR`] times
+    /// `capture_elapsed`, the request-time capture of the tree the walk is checked
+    /// against when it ends. A reserve past the budget is held at the budget: the walk's
+    /// waits end where the request began, so the walk makes only its first attempt.
+    fn walk_end(self, capture_elapsed: Duration) -> tokio::time::Instant {
+        let floor = self.budget / WALK_BUDGET_RESERVE_DIVISOR;
+        let check = capture_elapsed.saturating_mul(WALK_CAPTURE_RESERVE_FACTOR);
+        self.at - floor.max(check).min(self.budget)
     }
 }
 
@@ -2113,12 +2161,17 @@ impl RiftMcp {
     /// `None` asks the caller to capture a fresh publication after source or configuration
     /// movement. A stale publication uses its index and keeps its existing stale warning.
     ///
+    /// The request-time capture that resolved `resolved` already matched the tree to the
+    /// publication, so the walk starts at once, and one capture after it decides whether
+    /// its answer stands: a tree that moved at any point before that capture and stayed
+    /// moved fails it, as it would have failed a capture before the walk.
+    ///
     /// A walk, in either direction, stops waiting for engine readiness, and abandons a
-    /// retry still in flight, a tenth of the budget before `deadline`, so a spent wait
-    /// answers with its warning instead of reaching the request's own timeout, which
-    /// refuses the request. A request refused there keeps the engine session while it
-    /// reads intact, and the next walk first closes the document the refused one left
-    /// open.
+    /// retry still in flight, early enough for that capture to fit before `deadline`
+    /// ([`RequestDeadline::walk_end`]), so a spent wait answers with its warning instead
+    /// of reaching the request's own timeout, which refuses the request. A request
+    /// refused there keeps the engine session while it reads intact, and the next walk
+    /// first closes the document the refused one left open.
     async fn engine_references(
         &self,
         resolved: &ResolvedWorkspace,
@@ -2128,15 +2181,12 @@ impl RiftMcp {
         if params.traversal.is_none() || resolved.stale.is_some() {
             return Ok(Some(EngineReferences::default()));
         }
-        let walk_deadline = deadline.at() - deadline.budget() / WALK_BUDGET_RESERVE_DIVISOR;
+        let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
         let engines = self.engine_pool_for(&resolved.published).await;
         if !uses_engine_references(&resolved.published.reads, &engines, params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
         {
             return Ok(Some(EngineReferences::default()));
-        }
-        if !self.engine_tree_matches(&resolved.published).await? {
-            return Ok(None);
         }
         let roots = self
             .callee_roots(&resolved.published, &engines, params)
@@ -2755,7 +2805,9 @@ impl RiftMcp {
         let mut wait = ReadWait::Capture;
         for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
+            let capture_started = tokio::time::Instant::now();
             let capture = self.capture_tree(&current).await;
+            let capture_elapsed = capture_started.elapsed();
             let (digests, configuration_fingerprint) = match capture {
                 Ok(capture) => capture,
                 Err(error) => {
@@ -2771,7 +2823,7 @@ impl RiftMcp {
                 }) && configuration_matches;
             if tree_matches && !self.project_environment_moved(&current, phase).await? {
                 current.configuration.accepted(phase)?;
-                return Ok(ResolvedWorkspace::current(current));
+                return Ok(ResolvedWorkspace::current(current, capture_elapsed));
             }
             let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
             let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
@@ -2781,6 +2833,7 @@ impl RiftMcp {
                 return Ok(ResolvedWorkspace {
                     published: current,
                     stale,
+                    capture_elapsed,
                 });
             }
             let observed = if configuration_matches {
@@ -2808,6 +2861,7 @@ impl RiftMcp {
                 return Ok(ResolvedWorkspace {
                     published: current,
                     stale,
+                    capture_elapsed,
                 });
             }
             wait = if configuration_matches {
@@ -2815,10 +2869,10 @@ impl RiftMcp {
             } else {
                 ReadWait::Configuration
             };
-            spent = Some((current, digests, changes, moved));
+            spent = Some((current, digests, changes, moved, capture_elapsed));
         }
         if matches!(wait, ReadWait::Rebuild)
-            && let Some((current, digests, changes, moved)) = spent
+            && let Some((current, digests, changes, moved, capture_elapsed)) = spent
         {
             current.configuration.accepted(phase)?;
             let stale = moved.map(|moved| {
@@ -2832,6 +2886,7 @@ impl RiftMcp {
             return Ok(ResolvedWorkspace {
                 published: current,
                 stale,
+                capture_elapsed,
             });
         }
         Err(ReadFault::unavailable(
@@ -2878,7 +2933,10 @@ impl RiftMcp {
         current: &PublishedWorkspace,
     ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
         #[cfg(test)]
-        if let Some(forced) = self.forced_capture.installed() {
+        if let Some((forced, delay)) = self.forced_capture.installed() {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             return forced(current);
         }
         let root = self.root.clone();
@@ -4800,22 +4858,7 @@ done
         assert!(server.engine_tree_matches(&published).await?);
         fs::write(directory.path().join("lib.rs"), "pub fn later() {}\n")?;
         assert!(!server.engine_tree_matches(&published).await?);
-        let params = serde_json::from_value(json!({"traversal": {
-            "seed": "rift://symbol/rust/lib.rs/beacon",
-            "direction": "incoming", "facets": ["references"], "depth": 1
-        }}))?;
-        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published));
-        assert!(
-            server
-                .engine_references(
-                    &resolved,
-                    &params,
-                    RequestDeadline::starting(Duration::from_secs(30))
-                )
-                .await?
-                .is_none(),
-            "moved source asks for a fresh publication, not an empty engine answer"
-        );
+        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published), Duration::ZERO);
         for facets in [json!(["calls"]), json!(["implements"])] {
             let mut request = json!({"traversal": {
                 "seed": "rift://symbol/rust/lib.rs/beacon",
@@ -4852,7 +4895,7 @@ done
             "seed": "rift://symbol/rust/lib.rs/beacon",
             "direction": "incoming", "facets": ["references"], "depth": 1
         }}))?;
-        let resolved = super::ResolvedWorkspace::current(published);
+        let resolved = super::ResolvedWorkspace::current(published, Duration::ZERO);
         assert!(
             server
                 .engine_references(
@@ -4864,6 +4907,140 @@ done
                 .is_some(),
             "no selected engine leaves the indexed read unchanged"
         );
+        Ok(())
+    }
+
+    /// A walk reserves the larger of a tenth of the request budget and twice the
+    /// request-time capture, held at the budget, which leaves the walk no wait at all.
+    #[tokio::test]
+    async fn a_walk_reserves_the_larger_of_a_tenth_and_twice_the_capture() {
+        let deadline = RequestDeadline::starting(Duration::from_secs(30));
+        let reserve = |capture| deadline.at() - deadline.walk_end(capture);
+        assert_eq!(reserve(Duration::ZERO), Duration::from_secs(3));
+        assert_eq!(
+            reserve(Duration::from_millis(1_500)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            reserve(Duration::from_millis(1_501)),
+            Duration::from_millis(3_002)
+        );
+        assert_eq!(reserve(Duration::from_secs(14)), Duration::from_secs(28));
+        assert_eq!(
+            reserve(Duration::from_secs(20)),
+            Duration::from_secs(30),
+            "a reserve past the budget is held at the budget"
+        );
+    }
+
+    /// A `sh` engine that answers `initialize`, announces work it never ends, and answers
+    /// every later request with no location, so a walk reads it analyzing on every attempt.
+    #[cfg(unix)]
+    const ANALYZING_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"referencesProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}' ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[]}" ;;
+  esac
+done
+"#;
+
+    /// A traversal whose tree check takes a third of the 3 s budget still answers inside
+    /// it: the walk reserves twice the request-time capture, so the check after a walk
+    /// that waited out its engine fits before the deadline. Three such captures alone
+    /// spend the whole budget, which is what a check before the walk cost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_walk_leaves_room_for_a_slow_tree_check_after_it() -> TestResult {
+        const CAPTURE: Duration = Duration::from_secs(1);
+        let engine = tempfile::tempdir()?;
+        let script = engine.path().join("engine.sh");
+        fs::write(&script, ANALYZING_ENGINE)?;
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+        )?;
+        super::hermetic_workspace(
+            directory.path(),
+            &format!(
+                "[server]\nreadiness_timeout = \"3s\"\n\n\
+                 [languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
+                script.display()
+            ),
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let root = directory.path().to_path_buf();
+        server.force_capture_after(CAPTURE, move |current| captured_tree(&root, current));
+        let params = serde_json::from_value(json!({"traversal": {
+            "seed": "rift://symbol/rust/lib.rs/beacon"
+        }}))?;
+        let answer = server
+            .search(Parameters(params))
+            .await
+            .map_err(|refusal| format!("the walk must answer inside the budget: {refusal:?}"))?
+            .0;
+        let warnings = serde_json::to_value(&answer.warnings)?;
+        assert_eq!(
+            warnings[0]["code"], "engine_analysis_unavailable",
+            "{warnings}"
+        );
+        server.engine_pool().await.shutdown().await;
+        Ok(())
+    }
+
+    /// An engine walk checks the tree once, after it ends: the request-time capture that
+    /// resolved the publication already matched the tree, so none runs before the walk.
+    #[tokio::test]
+    async fn an_engine_walk_captures_the_tree_once_after_it_ends() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("service.py"),
+            "def serve(port: int) -> int:\n    return port\n",
+        )?;
+        fs::write(
+            directory.path().join("main.py"),
+            "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n",
+        )?;
+        super::hermetic_workspace(
+            directory.path(),
+            "[languages.python.lsp]\nembedded = 'ty'\nretry = { attempts = 2, delay = '1ms', delay_limit = '1ms' }\n",
+        )?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let deadline = server.request_deadline().await;
+        let resolved = server
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
+            .await?;
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&captures);
+        let root = directory.path().to_path_buf();
+        server.force_capture(move |current| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            captured_tree(&root, current)
+        });
+        let params = serde_json::from_value(json!({"target": "symbol", "traversal": {
+            "seed": "rift://symbol/python/service.py/serve",
+            "direction": "incoming", "facets": ["references"], "depth": 1
+        }}))?;
+        let references = server
+            .engine_references(&resolved, &params, deadline)
+            .await?;
+        assert!(references.is_some(), "the tree did not move under the walk");
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            1,
+            "one capture decides the walk's answer, after the walk"
+        );
+        server.engine_pool().await.shutdown().await;
         Ok(())
     }
 
