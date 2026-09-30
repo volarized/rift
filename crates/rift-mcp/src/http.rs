@@ -16,7 +16,7 @@ use axum::routing::post;
 use data_encoding::BASE64URL_NOPAD;
 use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_index::WorkspaceIndexLimits;
-use rift_protocol::lock::ProductIdentity;
+use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rift_server::ReadError;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
@@ -26,6 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::RiftMcp;
+use crate::identity::BuildCheckout;
 use crate::server::EngineHold;
 use crate::storage::WorkspaceStorage;
 use crate::validation::IndexSupervisor;
@@ -177,6 +178,9 @@ impl TokenCheck {
 /// scan still finishes in the bounded blocking executor. A returned
 /// [`HttpServer`] owns the serving tasks and is driven through
 /// [`HttpServer::stopped`].
+///
+/// The server names itself as [`BuildCheckout::Unversioned`], as
+/// [`RiftMcp::build`] does.
 pub async fn serve_http(
     root: &Path,
     shutdown: CancellationToken,
@@ -189,21 +193,24 @@ pub async fn serve_http(
         storage,
         WorkspaceIndexLimits::default(),
         check,
+        BuildCheckout::Unversioned,
     )
     .await
 }
 
 /// Serves HTTP through storage already opened by the serving process, under
-/// explicit index bounds and one token policy.
+/// explicit index bounds and one token policy, naming the build `checkout`
+/// describes.
 pub(crate) async fn serve_http_with_storage(
     root: &Path,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
+    checkout: BuildCheckout,
 ) -> Result<HttpServer, HttpServeError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
-    let server = RiftMcp::build_with_storage(root, limits, storage)
+    let server = RiftMcp::build_with_storage(root, limits, storage, checkout)
         .await
         .map_err(HttpServeFault::workspace)?;
     let identity = server.product_identity().clone();
@@ -546,6 +553,54 @@ async fn stop_server(State(stop): State<CancellationToken>) -> StatusCode {
     StatusCode::ACCEPTED
 }
 
+/// Bound on one stop request: connect, send, and read the answer.
+pub const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a stop request did not reach a server that accepted it.
+#[derive(Debug)]
+pub enum StopRequestFailure {
+    /// The request could not be built or sent, or its answer could not be read.
+    Failed(reqwest::Error),
+    /// The server answered with something other than acceptance.
+    Refused(reqwest::StatusCode),
+}
+
+/// Asks the server `lock` records to stop, through its authorized `POST /api/stop`.
+///
+/// The server answers `202 Accepted` and starts the same shutdown an interrupt does; a
+/// repeated request answers the same way. A refused connect counts as accepted: nothing
+/// listens on the recorded port, so the server has already left. The request carries the
+/// token `lock` records, so it stops that one server and no other: a server started after
+/// it mints another token and refuses this one.
+///
+/// # Errors
+///
+/// Returns [`StopRequestFailure::Refused`] for any answer but acceptance, and
+/// [`StopRequestFailure::Failed`] when the request outlives [`STOP_REQUEST_TIMEOUT`] or
+/// fails for any other reason than a refused connect.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the request; a request the server already received still
+/// stops it.
+pub async fn request_stop(lock: &ServerLock) -> Result<(), StopRequestFailure> {
+    let client = reqwest::Client::builder()
+        .timeout(STOP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(StopRequestFailure::Failed)?;
+    let answer = client
+        .post(format!("http://127.0.0.1:{}{STOP_PATH}", lock.port))
+        .bearer_auth(&lock.token)
+        .send()
+        .await;
+    match answer {
+        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => Ok(()),
+        Ok(response) => Err(StopRequestFailure::Refused(response.status())),
+        Err(error) if error.is_connect() => Ok(()),
+        Err(error) => Err(StopRequestFailure::Failed(error)),
+    }
+}
+
 /// Per-request policy shared by every route: the token requests must
 /// present, whether that token is checked at all, and the activity instant
 /// served requests refresh.
@@ -790,7 +845,6 @@ mod tests {
             pid: 1,
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         };
@@ -942,7 +996,6 @@ mod tests {
                 token: mint_token().expect("token must mint"),
                 identity: ProductIdentity {
                     version: "0.0.9".to_owned(),
-                    executable_digest: "a".repeat(64),
                     schema_digest: "b".repeat(64),
                 },
                 stop: CancellationToken::new(),
@@ -1008,7 +1061,6 @@ mod tests {
             token: mint_token().expect("token must mint"),
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
             stop: CancellationToken::new(),
@@ -1057,7 +1109,6 @@ mod tests {
             token: mint_token().expect("token must mint"),
             identity: ProductIdentity {
                 version: "0.0.9".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
             stop: stop.clone(),

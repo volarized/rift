@@ -4703,6 +4703,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -4720,6 +4721,7 @@ version = "0.0.46"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

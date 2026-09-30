@@ -246,6 +246,35 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
     assert_eq!(validate_resolution_response(&request, &response), Ok(()));
 }
 
+/// A resolved entry names one selector, as a requested entry does: an answer whose entry
+/// carries both a version and a requirement, or neither, answers no entry the request sent.
+#[test]
+fn test_resolution_refuses_a_resolved_entry_with_both_selectors_or_neither() {
+    let requirement = requirement_entry();
+    let request = PackageResolutionRequest {
+        entries: vec![requirement.clone()],
+    };
+    let both = PackageContextEntry {
+        version: Some("5.7.2".to_owned()),
+        ..requirement.clone()
+    };
+    let neither = PackageContextEntry {
+        requirement: None,
+        ..requirement
+    };
+    for entry in [both, neither] {
+        let resolved = json!([{"entry": entry_json(&entry), "package": served("5.7.2")}]);
+        let response = decoded(resolution(&resolved, &json!([]), None));
+        assert_eq!(
+            validate_resolution_response(&request, &response),
+            Err(ClientError::InvalidResponseField {
+                field: "resolved_requirement"
+            }),
+            "{entry:?}"
+        );
+    }
+}
+
 /// A `requirement_unsatisfied` detail for an entry at every package field's bound fills the
 /// warning detail bound exactly, and the resolution naming it is accepted. The bounds count
 /// characters, as the contract's `maxLength` does, so a name in a multi-byte script at its

@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::http::serve_http;
 use crate::http::{HttpServeError, HttpServer, TokenCheck, serve_http_with_storage};
+use crate::identity::BuildCheckout;
 use crate::storage::WorkspaceStorage;
 
 /// The zero-byte election file's name under the `.rift` state directory.
@@ -479,7 +480,8 @@ fn served_document(
 /// again - bounded by `UNPUBLISHED_SHUTDOWN_DEADLINE` - before the error
 /// returns, so no unreachable serving loop survives.
 ///
-/// Requests are served under [`TokenCheck::Required`].
+/// Requests are served under [`TokenCheck::Required`], and the server names
+/// itself as [`BuildCheckout::Unversioned`], as [`crate::RiftMcp::build`] does.
 ///
 /// # Errors
 ///
@@ -497,11 +499,19 @@ pub async fn serve_elected(
     shutdown: CancellationToken,
 ) -> Result<ElectedServer, ElectionError> {
     let storage = WorkspaceStorage::open(root).await;
-    serve_elected_with_storage(root, shutdown, storage, TokenCheck::Required).await
+    serve_elected_with_storage(
+        root,
+        shutdown,
+        storage,
+        TokenCheck::Required,
+        BuildCheckout::Unversioned,
+    )
+    .await
 }
 
 /// Serves the workspace through storage already opened by this process,
-/// under one token policy.
+/// under one token policy, naming the build `checkout` describes: the one
+/// the `rift` binary's build script recorded.
 ///
 /// # Errors
 ///
@@ -515,6 +525,7 @@ pub async fn serve_elected_with_storage(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     check: TokenCheck,
+    checkout: BuildCheckout,
 ) -> Result<ElectedServer, ElectionError> {
     serve_elected_at(
         root,
@@ -522,6 +533,7 @@ pub async fn serve_elected_with_storage(
         storage,
         WorkspaceIndexLimits::default(),
         check,
+        checkout,
     )
     .await
 }
@@ -550,8 +562,9 @@ pub(crate) async fn serve_elected_at(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
+    checkout: BuildCheckout,
 ) -> Result<ElectedServer, ElectionError> {
-    let elected = elect_and_serve(root, shutdown, storage, limits, check).await;
+    let elected = elect_and_serve(root, shutdown, storage, limits, check, checkout).await;
     if let Err(error) = &elected {
         record_start_failure(error);
     }
@@ -585,12 +598,14 @@ async fn elect_and_serve(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
+    checkout: BuildCheckout,
 ) -> Result<ElectedServer, ElectionError> {
     let guard = claim(root)?;
     let serving_stop = shutdown.child_token();
-    let server = serve_http_with_storage(root, serving_stop.clone(), storage, limits, check)
-        .await
-        .map_err(ElectionFault::serve)?;
+    let server =
+        serve_http_with_storage(root, serving_stop.clone(), storage, limits, check, checkout)
+            .await
+            .map_err(ElectionFault::serve)?;
     let document = served_document(
         server.port(),
         server.token(),
@@ -715,7 +730,6 @@ mod tests {
             pid: 4_242,
             identity: rift_protocol::lock::ProductIdentity {
                 version: "0.0.11".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         }
@@ -1065,6 +1079,7 @@ mod tests {
             storage,
             limits,
             TokenCheck::Required,
+            crate::identity::BuildCheckout::Unversioned,
         )
         .await
         .expect_err("a workspace over files_max must fail the start");
