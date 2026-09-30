@@ -1459,9 +1459,26 @@ fn fixture_problem(status: StatusCode, documented: bool) -> ClientError {
     }
 }
 
+/// Every problem status an operation's contract documents, each decoded into its own
+/// response variant.
+const DOCUMENTED_PROBLEM_STATUSES: [StatusCode; 11] = [
+    StatusCode::BAD_REQUEST,
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::NOT_ACCEPTABLE,
+    StatusCode::PAYLOAD_TOO_LARGE,
+    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    StatusCode::TOO_MANY_REQUESTS,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
+
 /// Every operation answers a problem status as `Http`, with the problem details a documented
 /// status carries and without them for an undocumented one. The operation records the
-/// failure, so a later request answers it without reaching the endpoint.
+/// failure, so a later request answers it without reaching the endpoint. One attempt per
+/// request keeps the retried statuses to one request each.
 #[tokio::test]
 async fn test_fixture_every_operation_answers_problem_statuses() {
     use crate::contract::Endpoint;
@@ -1472,12 +1489,19 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
         Endpoint::Patterns,
         Endpoint::Declarations,
     ];
-    for (status, documented) in [
-        (StatusCode::BAD_REQUEST, true),
-        (StatusCode::CONFLICT, false),
-    ] {
+    let statuses = DOCUMENTED_PROBLEM_STATUSES
+        .map(|status| (status, true))
+        .into_iter()
+        .chain([(StatusCode::CONFLICT, false)]);
+    for (status, documented) in statuses {
         for endpoint in operations {
-            let (server, client) = operation_client(OperationFixture::Problem(status)).await;
+            let mode = FixtureMode::Operations(OperationFixture::Problem(status));
+            let server = FixtureServer::start(mode).await.expect("fixture server");
+            let config = Config {
+                attempts: 1,
+                ..server.config()
+            };
+            let client = GlobalClient::new(config).expect("fixture client");
             let expected = Some(fixture_problem(status, documented));
             assert_eq!(
                 operation_failure(&client, endpoint).await,
