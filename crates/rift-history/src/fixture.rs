@@ -4,6 +4,7 @@
 //! so fixture repositories hash identically across machines and never touch
 //! the developer's gpg configuration.
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -120,10 +121,27 @@ pub fn commit_all_at(root: &Path, message: &str, date: &str) {
 ///
 /// Panics when git cannot run or exits nonzero.
 pub fn commit_missing_subtree(root: &Path, branch: &str) {
+    commit_missing_object(root, "040000 tree", "absent", branch);
+}
+
+/// Commits a tree naming, at `path`, a blob the object store does not hold,
+/// reachable as the ref `branch`: every read of that file's bytes fails.
+/// `path` is one entry of the root tree, so it holds no `/`.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_missing_blob(root: &Path, path: &str, branch: &str) {
+    commit_missing_object(root, "100644 blob", path, branch);
+}
+
+/// Commits a tree whose one entry, `mode_and_kind` at `path`, names an object
+/// the object store does not hold, reachable as the ref `branch`.
+fn commit_missing_object(root: &Path, mode_and_kind: &str, path: &str, branch: &str) {
     let absent = "0123456789abcdef0123456789abcdef01234567";
-    let entry = format!("040000 tree {absent}\tabsent\n");
+    let entry = format!("{mode_and_kind} {absent}\t{path}\n");
     let tree = plumb(root, &["mktree", "--missing"], entry.as_bytes());
-    let commit = plumb(root, &["commit-tree", &tree, "-m", "missing subtree"], b"");
+    let commit = plumb(root, &["commit-tree", &tree, "-m", "missing object"], b"");
     git(root, &["update-ref", branch, &commit]);
 }
 
@@ -150,6 +168,37 @@ pub fn commit_duplicate_path(root: &Path, path: &str, branch: &str) {
     let entries = format!("100644 blob {first}\t{path}\n100644 blob {second}\t{path}\n");
     let tree = plumb(root, &["mktree"], entries.as_bytes());
     let commit = plumb(root, &["commit-tree", &tree, "-m", "duplicate path"], b"");
+    git(root, &["update-ref", branch, &commit]);
+}
+
+/// Commits `count` files `wide/<index>.txt` naming one blob, on top of the
+/// commit `branch` names, and moves `branch` to it.
+///
+/// The tree is written through git plumbing, so a commit changing more paths
+/// than a comparison's bound costs one blob and one tree, not one file on
+/// disk per path.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_wide_folder(root: &Path, count: usize, branch: &str) {
+    let blob = plumb(root, &["hash-object", "-w", "--stdin"], b"wide\n");
+    let mut entries = String::new();
+    for index in 0..count {
+        writeln!(entries, "100644 blob {blob}\t{index:06}.txt")
+            .expect("a String takes every write");
+    }
+    let wide = plumb(root, &["mktree"], entries.as_bytes());
+    let parent = plumb(root, &["rev-parse", branch], b"");
+    let parent_tree = plumb(root, &["rev-parse", &format!("{parent}^{{tree}}")], b"");
+    let mut listing = plumb(root, &["ls-tree", &parent_tree], b"");
+    writeln!(listing, "\n040000 tree {wide}\twide").expect("a String takes every write");
+    let tree = plumb(root, &["mktree"], listing.trim_start().as_bytes());
+    let commit = plumb(
+        root,
+        &["commit-tree", &tree, "-p", &parent, "-m", "wide folder"],
+        b"",
+    );
     git(root, &["update-ref", branch, &commit]);
 }
 
