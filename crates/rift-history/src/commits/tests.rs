@@ -160,13 +160,18 @@ fn tagged_commits_peel_annotated_tags_and_refuse_past_the_bound() {
     let root = directory.path();
     git(root, &["tag", "v0.0.1", "HEAD~2"]);
     git(root, &["tag", "-a", "v0.0.2", "-m", "release", "HEAD"]);
+    git(root, &["tag", "v0.0.3-tree", "HEAD^{tree}"]);
     let repository = Repository::open(root).expect("repository");
     let head = head_of(&repository);
 
     let tagged = repository.tagged_commits(8).expect("tags");
 
     let names: Vec<&str> = tagged.iter().map(crate::TaggedCommit::name).collect();
-    assert_eq!(names, ["v0.0.1", "v0.0.2"]);
+    assert_eq!(
+        names,
+        ["v0.0.1", "v0.0.2"],
+        "a tag naming a tree is left out"
+    );
     assert_eq!(tagged[1].revision(), &head);
 
     let refused = repository
@@ -176,6 +181,25 @@ fn tagged_commits_peel_annotated_tags_and_refuse_past_the_bound() {
         refused.fault(),
         HistoryFault::TooManyTags { tags_max: 1 }
     ));
+    let rendered = refused.to_string();
+    assert!(rendered.contains("tags_max 1"), "{rendered}");
+}
+
+#[test]
+fn changed_blobs_refuse_a_tree_the_object_store_cannot_read() {
+    let directory = three_commits();
+    let root = directory.path();
+    crate::fixture::commit_missing_subtree(root, "refs/heads/broken");
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let broken = repository.resolve("broken").expect("broken resolves");
+
+    let error = repository
+        .changed_blobs(Some(&head), &broken, &|_| true, 16)
+        .expect_err("an unreadable tree refuses rather than answering part of the listing");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("compare commit trees"), "{rendered}");
 }
 
 #[test]
