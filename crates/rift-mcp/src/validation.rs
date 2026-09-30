@@ -6568,7 +6568,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(1)).await??;
         double.release_one();
