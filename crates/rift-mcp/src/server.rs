@@ -3488,10 +3488,11 @@ done
         let key = LspProcessKey::named("rust");
         // The slot resends a request the engine answered empty through its retry
         // table, and this engine answers every request empty; one attempt sends it once.
-        let configuration: LspConfiguration = serde_json::from_value(json!({
+        let table = json!({
             "command": ["sh", script.display().to_string(), notified.display().to_string()],
             "retry": { "attempts": 1 },
-        }))?;
+        });
+        let configuration: LspConfiguration = serde_json::from_value(table)?;
         let hold = super::EngineHold::new(
             directory.path().to_path_buf(),
             std::collections::BTreeMap::from([(key.clone(), configuration)]),

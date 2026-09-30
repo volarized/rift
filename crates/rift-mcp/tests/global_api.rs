@@ -126,6 +126,8 @@ pub(crate) enum Hold {
     Resolution(Duration),
     /// The symbol and search endpoints' answers.
     Read(Duration),
+    /// The declarations endpoint's answer.
+    Declarations(Duration),
 }
 
 /// How the fixture answers, beyond the collection it holds.
@@ -180,6 +182,13 @@ impl FixtureState {
     /// Waits out the read hold, when the fixture holds symbol and search pages.
     async fn hold_read(&self) {
         if let Some(Hold::Read(delay)) = self.options.hold {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    /// Waits out the declarations hold, when the fixture holds declaration answers.
+    async fn hold_declarations(&self) {
+        if let Some(Hold::Declarations(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
         }
     }
@@ -275,6 +284,7 @@ async fn global_handler(
         return json_response(&resolution(&body, options.python_collection));
     }
     if path.ends_with("/declarations") {
+        state.hold_declarations().await;
         return json_response(&declarations(&body));
     }
     if path.ends_with("/search") {
