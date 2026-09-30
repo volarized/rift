@@ -1627,6 +1627,20 @@ mod tests {
         }
     }
 
+    /// Whether `directory` lists an entry named `name` without opening it.
+    ///
+    /// A backup marked for deletion stays listed until its last handle closes.
+    /// `Path::try_exists` opens the backup and can return `ERROR_ACCESS_DENIED`.
+    #[cfg(windows)]
+    fn windows_directory_lists(directory: &std::path::Path, name: &str) -> std::io::Result<bool> {
+        for entry in fs::read_dir(directory)? {
+            if entry?.file_name() == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
@@ -1645,7 +1659,6 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let current = directory.path().join("rift.exe");
         let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
-        let backup = directory.path().join(super::WINDOWS_UPDATE_BACKUP_NAME);
         fs::copy(&original, &current)?;
 
         let mut child = tokio::process::Command::new(&current)
@@ -1662,13 +1675,8 @@ mod tests {
             .spawn()?;
         windows_wait_update_child(&mut child).await?;
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while backup.try_exists()? {
-                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
-            }
-            Ok::<(), std::io::Error>(())
-        })
-        .await??;
+        // The published binary reads and launches at once, while the cleanup process running
+        // from it may still be removing the backup.
         assert!(!prepared.try_exists()?);
         assert_eq!(super::sha256(&current)?, expected_digest);
         assert_eq!(super::sha256(&candidate)?, expected_digest);
@@ -1691,6 +1699,17 @@ mod tests {
             .unwrap_or((version_text.trim(), ""));
         assert_eq!(released, concat!("rift ", env!("CARGO_PKG_VERSION")));
         assert!(fs::metadata(&version_path)?.len() < 256);
+
+        // The cleanup process removes the backup within its `CLEANUP_RETRY_COUNT_MAX` attempts.
+        // Windows can reject an open of a backup marked for deletion, so this reads the directory
+        // listing instead of opening the backup.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while windows_directory_lists(directory.path(), super::WINDOWS_UPDATE_BACKUP_NAME)? {
+                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await??;
 
         // Bound temporary-file removal even if Windows retains an executable handle briefly.
         tokio::time::timeout(Duration::from_secs(5), async {
