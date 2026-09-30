@@ -384,13 +384,17 @@ impl StoredTimelines {
     /// at the path it came from. The timeline is
     /// complete once it passes a commit compared with nothing; it is not
     /// when it meets a commit the store does not hold, a boundary, or the
-    /// `max_revisions` bound first.
+    /// `max_revisions` bound first, nor when the store holds no commit to
+    /// start at, as a `selective` store holding no release yet does.
     fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, ReadError> {
         let symbol = symbol_id(matched.file, matched.symbol);
+        let Some(start) = self.start.clone() else {
+            return Ok(timeline_answer(symbol, Vec::new(), false));
+        };
         let qualified_name = matched.symbol.qualified_name.as_str();
         let mut path = matched.file.path().as_str().to_owned();
         let mut versions = Vec::new();
-        let mut next = self.start.clone();
+        let mut next = Some(start);
         let mut complete = false;
         for _ in 0..self.revisions_max {
             let Some(id) = next else {
@@ -1419,6 +1423,28 @@ mod tests {
             1,
             "the root commit every window still reaches stays"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_selective_timeline_over_a_store_holding_no_release_is_incomplete() -> TestResult {
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration {
+            strategy: HistoryStrategy::Selective,
+            releases: vec!["v*".to_owned()],
+            ..HistoryConfiguration::default()
+        };
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let empty = rift_history_store::HistoryStore::open(&location)?;
+        let (stored, lagged) = stored(&empty, HistoryStrategy::Selective);
+        let root = directory.path();
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "beacon_one")?;
+
+        assert!(timeline.versions.is_empty());
+        assert!(!timeline.complete, "no held release starts the timeline");
+        assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
         Ok(())
     }
 }
