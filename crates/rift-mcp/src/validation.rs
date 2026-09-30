@@ -3295,11 +3295,17 @@ pub(crate) mod lexical_double {
     /// Polls one lane pass a test waits on before it gives up: three seconds, at
     /// [`LANE_POLL`] each.
     pub(crate) const LANE_ATTEMPTS_MAX: usize = 60;
+    /// Longest a test waits for the lexical lane, this double, or the supervisor to reach
+    /// a state it expects.
+    ///
+    /// Each wait ends as soon as the state holds, so a passing test never spends this
+    /// bound: it only ends a wait for a state that never comes, with that wait's own
+    /// message, well inside nextest's one-minute deadline. The slowest of these tests took
+    /// 2.4 s from start to end on the slowest CI runner, macos-15-intel, so a runner three
+    /// times slower still ends every wait inside half of it.
+    pub(crate) const LANE_WAIT_MAX: Duration = Duration::from_secs(15);
     /// Wait between two reads of a store the lane has not stamped yet.
     pub(crate) const LANE_POLL: Duration = Duration::from_millis(50);
-    /// Waits on one lane event a test awaits before it gives up: the three seconds
-    /// [`LANE_ATTEMPTS_MAX`] polls allow.
-    pub(crate) const LANE_WAIT_MAX: Duration = Duration::from_secs(3);
     /// Bounds that never leave a unit out and never split a write into parts.
     pub(crate) const UNBOUNDED: LexicalLaneBounds = LexicalLaneBounds {
         unit_bytes_max: usize::MAX,
