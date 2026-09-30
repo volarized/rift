@@ -1713,6 +1713,33 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_write_cleanup_pid(path: &std::path::Path, pid: u32) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cleanup process id `{}` has no parent directory",
+                    path.display()
+                ),
+            )
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| windows_update_io_error("creating cleanup process id", path, error))?;
+        temporary
+            .write_all(pid.to_string().as_bytes())
+            .map_err(|error| windows_update_io_error("writing cleanup process id", path, error))?;
+        temporary
+            .flush()
+            .map_err(|error| windows_update_io_error("flushing cleanup process id", path, error))?;
+        temporary.persist(path).map_err(|error| {
+            windows_update_io_error("publishing cleanup process id", path, error.error)
+        })?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
     async fn windows_wait_for_cleanup_acknowledgement(
         path: &std::path::Path,
     ) -> std::io::Result<()> {
@@ -1737,29 +1764,19 @@ mod tests {
     }
 
     #[cfg(windows)]
-    async fn windows_wait_cleanup_process(
+    fn windows_wait_cleanup_process(
         mut cleanup: WaitHandle,
         pid: u32,
+        timeout: std::time::Duration,
     ) -> std::io::Result<()> {
-        use std::time::Duration;
-
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || cleanup.wait()),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("waiting for cleanup process {pid} failed: {error}"),
-                )
-            }),
-            Ok(Err(error)) => Err(std::io::Error::other(format!(
-                "waiting for cleanup process {pid} ended: {error}"
-            ))),
-            Err(error) => Err(std::io::Error::new(
+        match cleanup.wait_timeout(timeout) {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
+                format!("waiting for cleanup process {pid} timed out"),
+            )),
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
                 format!("waiting for cleanup process {pid} failed: {error}"),
             )),
         }
@@ -1900,12 +1917,17 @@ mod tests {
                 < 256
         );
 
-        windows_wait_cleanup_process(cleanup, cleanup_pid).await?;
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        windows_wait_cleanup_process(
+            cleanup,
+            cleanup_pid,
+            cleanup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )?;
 
         // The cleanup process removes the backup within its `CLEANUP_RETRY_COUNT_MAX` attempts.
         // Windows can reject an open of a backup marked for deletion, so this reads the directory
         // listing instead of opening the backup.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout_at(cleanup_deadline, async {
             while windows_directory_lists(directory.path(), super::WINDOWS_UPDATE_BACKUP_NAME)? {
                 tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
             }
@@ -1948,13 +1970,7 @@ mod tests {
         };
         let cleanup_pid = std::env::var_os(WINDOWS_UPDATE_TEST_CLEANUP_PID_ENV)
             .ok_or("RIFT_UPDATE_TEST_CLEANUP_PID must name a temporary file")?;
-        fs::write(&cleanup_pid, pid.to_string()).map_err(|error| {
-            windows_update_io_error(
-                "writing cleanup process id",
-                std::path::Path::new(&cleanup_pid),
-                error,
-            )
-        })?;
+        windows_write_cleanup_pid(std::path::Path::new(&cleanup_pid), pid)?;
         let cleanup_acknowledgement = std::env::var_os(WINDOWS_UPDATE_TEST_CLEANUP_ACK_ENV)
             .ok_or("RIFT_UPDATE_TEST_CLEANUP_ACK must name a temporary file")?;
         windows_wait_for_cleanup_acknowledgement(std::path::Path::new(&cleanup_acknowledgement))
