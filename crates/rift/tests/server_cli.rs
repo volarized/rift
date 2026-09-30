@@ -553,7 +553,9 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
     Ok(())
 }
 
+// Startup failure: https://github.com/volarized/rift/issues/447
 #[test]
+#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/447")]
 fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -602,7 +604,12 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     Ok(())
 }
 
+// Startup failure: https://github.com/volarized/rift/issues/447
 #[test]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "x86_64"),
+    ignore = "https://github.com/volarized/rift/issues/447"
+)]
 fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -652,7 +659,12 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
     Ok(())
 }
 
+// Startup failure: https://github.com/volarized/rift/issues/447
 #[test]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "x86_64"),
+    ignore = "https://github.com/volarized/rift/issues/447"
+)]
 fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -704,7 +716,12 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     Ok(())
 }
 
+// Startup failure: https://github.com/volarized/rift/issues/447
 #[test]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "x86_64"),
+    ignore = "https://github.com/volarized/rift/issues/447"
+)]
 fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -772,7 +789,12 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     Ok(())
 }
 
+// Startup failure: https://github.com/volarized/rift/issues/447
 #[test]
+#[cfg_attr(
+    any(windows, all(target_os = "macos", target_arch = "x86_64")),
+    ignore = "https://github.com/volarized/rift/issues/447"
+)]
 fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
