@@ -33,6 +33,57 @@ macro_rules! identity_path_character {
     };
 }
 
+/// A character class of what one project path segment holds - anything but the `/`
+/// separator, a backslash, or a control character - less the characters `$excluded` names.
+macro_rules! project_path_class {
+    ($($excluded:literal)?) => {
+        concat!(r"[^\\\u0000-\u001F\u007F/", $($excluded,)? "]")
+    };
+}
+
+/// One project path segment other than `.` and `..`: a run holding a character other than
+/// `.`, or three dots or more.
+macro_rules! project_path_segment {
+    () => {
+        concat!(
+            r"(?:\.*",
+            project_path_class!("."),
+            project_path_class!(),
+            r"*|\.{3,})"
+        )
+    };
+}
+
+/// The first segment of a project path: one `project_path_segment!` other than `.rift`,
+/// spelled out prefix by prefix, since the regex dialects a JSON Schema pattern must
+/// satisfy share no lookahead.
+macro_rules! project_path_first_segment {
+    () => {
+        concat!(
+            "(?:",
+            project_path_class!("."),
+            project_path_class!(),
+            r"*|\.\.",
+            project_path_class!(),
+            r"+|\.",
+            project_path_class!(".r"),
+            project_path_class!(),
+            r"*|\.r(?:",
+            project_path_class!("i"),
+            project_path_class!(),
+            "*|i(?:",
+            project_path_class!("f"),
+            project_path_class!(),
+            "*|f(?:",
+            project_path_class!("t"),
+            project_path_class!(),
+            "*|t",
+            project_path_class!(),
+            "+)?)?)?)"
+        )
+    };
+}
+
 /// The language segment a `rift://node/` or `rift://symbol/` identity carries before its path:
 /// one word, or two joined by `:`.
 macro_rules! identity_language_segment {
@@ -898,15 +949,27 @@ pub struct ProjectPath(
     #[schemars(example = &"src/lib.rs")]
     #[schemars(length(max = 1000))]
     #[schemars(regex(
-        pattern = r"^(?:$|(?!\.rift(?:/|$))(?!/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)[^\\\u0000-\u001F\u007F/]+(?:/[^\\\u0000-\u001F\u007F/]+)*)$"
+        pattern = concat!(
+            "^(?:",
+            project_path_first_segment!(),
+            "(?:/",
+            project_path_segment!(),
+            ")*)?$"
+        )
     ))]
     pub String,
 );
 
 /// Most package and dependency-context warnings one answer carries together: degraded
 /// resolvers, then entries no public registry serves, then packages absent from the global
-/// publication.
+/// publication, then entries a release other than the requested one answers.
 pub const DEPENDENCY_WARNINGS_MAX: usize = 8;
+
+/// Most characters the `detail` of one global API warning carries: the longest
+/// `requirement_unsatisfied` detail the global API's package fields admit,
+/// `<manager>/<name> <requirement> answered by <version>`, at 128 characters of manager and
+/// 4,096 characters each of name, requirement, and version.
+pub const GLOBAL_WARNING_DETAIL_CHARS_MAX: usize = 12_431;
 
 /// Most `source_unavailable` warnings one answer carries for the files the index left out,
 /// in project-path order; when more files are left out, one more warning follows them and
@@ -1169,12 +1232,17 @@ pub enum ReadWarning {
     },
     /// The global package page carried a bounded condition while its items remained valid.
     /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
+    /// `capability_unavailable` also names a feature the global API's capabilities do not
+    /// advertise, such as `patterns` for a `pattern` search, and the answer then carries the
+    /// project hits alone.
     GlobalPageWarning {
-        /// Stable condition code returned by the global package service.
+        /// Stable condition code returned by the global package service, or
+        /// `capability_unavailable` for a feature its capabilities do not advertise.
         warning_code: GlobalPageWarningCode,
-        /// Optional bounded explanation returned by the global package service.
+        /// Optional bounded explanation returned by the global package service, or the
+        /// feature its capabilities do not advertise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[schemars(length(max = 1024))]
+        #[schemars(length(max = 12_431))]
         detail: Option<String>,
     },
     /// The global publication holds no release of an exact package the dependency
@@ -1191,6 +1259,17 @@ pub enum ReadWarning {
         /// The declared requirement absent from the global publication.
         entry: crate::dependencies::PackageContextEntry,
     },
+    /// The global publication holds no release at the exact version the dependency context
+    /// names, or none inside the range a declared requirement states, so the collected
+    /// release nearest it answers in its place: the package facts for `entry` come from
+    /// `package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
+    /// ride one answer.
+    PackageSubstituted {
+        /// The dependency context entry, as the workspace's manifests and lockfiles state it.
+        entry: crate::dependencies::PackageContextEntry,
+        /// The collected release that answers for `entry`.
+        package: PackageIdentity,
+    },
     /// The dependency context names a package no public registry serves: a path outside
     /// the workspace, a git repository, a private registry, or a URL. No global package
     /// index answers for it, and `reason` names the capability Rift does not have yet. At
@@ -1204,14 +1283,18 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         reason: String,
     },
-    /// One resolver or standard library probe read less than the workspace states, so the
-    /// dependency context may miss packages or name a standard library by its static
-    /// reading. Rides only an answer whose `scope` reaches packages; at most
-    /// `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer,
-    /// this one first, in resolver order.
+    /// One resolver or standard library probe read less than the workspace states, or the
+    /// context passed the bound on the entries one read carries, the smaller of the
+    /// server's own and the one the global API advertises, and its entries sorted last left:
+    /// every held entry before any the request's `packages` names. The dependency context
+    /// may then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`
+    /// reaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
+    /// warnings ride one answer, this one first, in resolver order.
     PackageContextDegraded {
-        /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`,
-        /// or a standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`.
+        /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a
+        /// standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the
+        /// package manager whose held or requested entries left past the entry bound, such
+        /// as `pypi`.
         #[schemars(length(max = 128))]
         resolver: String,
         /// What the resolver could not do - prose for a reader; nothing keys on it.
@@ -2034,11 +2117,11 @@ mod tests {
     use crate::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 
     use super::{
-        Digest, Duration, FileId, GetSymbolParams, GlobalFailureClass, GlobalPageWarningCode,
-        IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
-        PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
-        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
-        SymbolId,
+        Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
+        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
+        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
+        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
+        RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2068,6 +2151,23 @@ mod tests {
         assert_eq!(
             schema["properties"]["page_index"]["default"],
             json!(PAGE_INDEX_DEFAULT)
+        );
+    }
+
+    /// A `global_page_warning` carries the global API's `detail` as it arrived, so its
+    /// advertised `maxLength` is the bound the client accepts a detail under.
+    #[test]
+    fn global_page_warning_schema_detail_length_equals_the_global_bound() {
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let arm = schema["oneOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|arm| arm["properties"]["code"]["const"] == "global_page_warning")
+            .expect("the warning union holds a global_page_warning arm");
+        assert_eq!(
+            arm["properties"]["detail"]["maxLength"],
+            json!(GLOBAL_WARNING_DETAIL_CHARS_MAX)
         );
     }
 
@@ -2322,6 +2422,62 @@ mod tests {
         );
     }
 
+    /// The `ProjectPath` pattern states the rules `rift_core::ProjectPath` enforces with no
+    /// lookahead, which neither the JSON Schema dialect nor the `regex` crate the global
+    /// API client generator reads it with share: the root, no leading, trailing, or doubled
+    /// separator, no `.` or `..` segment, no backslash or control character, and no `.rift`
+    /// first segment.
+    #[test]
+    fn project_path_pattern_refuses_what_the_path_rules_refuse() {
+        let schema =
+            serde_json::to_value(schema_for!(super::ProjectPath)).expect("project path schema");
+        let pattern = schema["pattern"].as_str().expect("an advertised pattern");
+        assert!(!pattern.contains("(?!"), "no lookahead: {pattern}");
+        let validator = jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+            .expect("the advertised pattern compiles");
+        let accepted = [
+            "",
+            "src/lib.rs",
+            ".github/workflows/ci.yml",
+            ".r",
+            ".ri",
+            ".rif",
+            ".rifts",
+            ".rift.toml",
+            "src/.rift",
+            "...",
+            "..a/b",
+            "a./.b",
+        ];
+        for path in accepted {
+            assert!(
+                validator.is_valid(&json!(path)),
+                "{pattern} must accept {path:?}"
+            );
+        }
+        let refused = [
+            ".rift",
+            ".rift/db",
+            "/src",
+            "src/",
+            "src//lib.rs",
+            ".",
+            "..",
+            "./src",
+            "src/./lib.rs",
+            "src/..",
+            "src\\lib.rs",
+            "src/\u{1}.rs",
+            "src/\u{7f}.rs",
+        ];
+        for path in refused {
+            assert!(
+                !validator.is_valid(&json!(path)),
+                "{pattern} must refuse {path:?}"
+            );
+        }
+    }
+
     #[test]
     fn source_unit_id_schema_pattern_is_resolver_then_project_path_charset() {
         let schema = serde_json::to_value(schema_for!(SourceUnitId)).expect("source unit schema");
@@ -2536,6 +2692,35 @@ mod tests {
                         "name": "missing-helper",
                         "requirement": "^0.1",
                         "availability": "canonical",
+                    },
+                }),
+            ),
+            (
+                ReadWarning::PackageSubstituted {
+                    entry: PackageContextEntry::new(
+                        "npm",
+                        "typescript",
+                        PackageSelector::Requirement("~5.7.2".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package: PackageIdentity {
+                        manager: "npm".to_owned(),
+                        name: "typescript".to_owned(),
+                        version: "5.9.3".to_owned(),
+                    },
+                },
+                json!({
+                    "code": "package_substituted",
+                    "entry": {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "requirement": "~5.7.2",
+                        "availability": "canonical",
+                    },
+                    "package": {
+                        "manager": "npm",
+                        "name": "typescript",
+                        "version": "5.9.3",
                     },
                 }),
             ),

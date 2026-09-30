@@ -252,7 +252,7 @@ impl ReadService {
             return Err(ReadFault::unsupported("force_include at a revision"));
         }
         let query = accepted_query(params)?;
-        let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        let limit = search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
         let payloads = HitPayloads::requested(params);
         // The whole candidate pool is collected up to the index's own `results_max` bound -
@@ -386,7 +386,7 @@ impl ReadService {
         validate_search(params)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         accepted_query(params)?;
-        accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        search_page_limit(params)?;
         path_matcher(self.index().root(), params.paths.as_ref())?;
         if let Some(selector) = params.paths.as_ref() {
             PathMatcher::build(
@@ -793,6 +793,17 @@ fn lockfile_warning(lockfiles: &[ProjectPath]) -> Option<ReadWarning> {
         count = lockfiles.len(),
     );
     Some(ReadWarning::LockfileExcluded { files, detail })
+}
+
+/// The page size one search answers with: its `limit`, or the default page size when it
+/// names none.
+///
+/// # Errors
+///
+/// Returns `invalid_request` naming `limit` for zero, or for a limit past
+/// `PAGE_LIMIT_MAX`.
+pub fn search_page_limit(params: &SearchParams) -> Result<usize, ReadError> {
+    accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))
 }
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {

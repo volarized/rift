@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use rift_protocol::dependencies::{DEPENDENCIES_PACKAGES_MAX, PackageContextEntry};
 use rift_protocol::documentation::{DocumentationContext, DocumentationHit};
-use rift_protocol::read::{PackageIdentity, SourceUnitId, Symbol, SymbolId};
+use rift_protocol::read::{
+    PackageIdentity, SEARCH_PATTERN_CHARS_MAX, SourceUnitId, Symbol, SymbolId,
+};
 use rift_ranking::{
     IDENTIFIER_CANDIDATES_MAX, PARSED_QUERY_MEMBERS_MAX, QUERY_BYTES_MAX, QUERY_TERM_BYTES_MAX,
 };
@@ -38,11 +40,13 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 4] = [
+const ENDPOINTS: [Endpoint; 6] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
+    Endpoint::Patterns,
+    Endpoint::Declarations,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -51,6 +55,8 @@ pub(crate) enum Endpoint {
     Resolutions,
     Search,
     Symbols,
+    Patterns,
+    Declarations,
 }
 
 impl Endpoint {
@@ -60,13 +66,19 @@ impl Endpoint {
             Self::Resolutions => "/v1/resolutions",
             Self::Search => "/v1/search",
             Self::Symbols => "/v1/symbols",
+            Self::Patterns => "/v1/patterns",
+            Self::Declarations => "/v1/declarations",
         }
     }
 
     pub(crate) fn method(self) -> Method {
         match self {
             Self::Capabilities => Method::GET,
-            Self::Resolutions | Self::Search | Self::Symbols => Method::POST,
+            Self::Resolutions
+            | Self::Search
+            | Self::Symbols
+            | Self::Patterns
+            | Self::Declarations => Method::POST,
         }
     }
 
@@ -76,6 +88,8 @@ impl Endpoint {
             Self::Resolutions => "resolvePackageContext",
             Self::Search => "searchPackages",
             Self::Symbols => "listPackageSymbols",
+            Self::Patterns => "searchPackagePatterns",
+            Self::Declarations => "findPackageDeclarations",
         }
     }
 
@@ -192,6 +206,8 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_security(&spec).map_err(&invalid)?;
     validate_operations(&spec).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
+    validate_optional_properties_omit_null(&document).map_err(&invalid)?;
+    validate_patterns(&document).map_err(&invalid)?;
     validate_shared_schemas(&document).map_err(&invalid)?;
     Ok(())
 }
@@ -351,11 +367,34 @@ fn validate_request(spec: &Spec, endpoint: Endpoint, operation: &Operation) -> R
 }
 
 fn validate_bounds(spec: &Spec) -> Result<(), String> {
+    // Before the pins below, so a package field raised past the detail bound names the
+    // detail it no longer fits.
+    validate_warning_detail_bound(spec)?;
+    let page_items_max =
+        usize::try_from(crate::PAGE_LIMIT_MAX).map_err(|error| error.to_string())?;
     let expected_max_items = [
         (
             "PackageResolutionRequest",
             "entries",
             DEPENDENCIES_PACKAGES_MAX,
+        ),
+        (
+            "PackageResolutionResponse",
+            "warnings",
+            crate::DEPENDENCY_ENTRIES_MAX,
+        ),
+        ("PackageSearchPage", "items", page_items_max),
+        ("PackageSymbolPage", "items", page_items_max),
+        ("PackagePatternPage", "items", page_items_max),
+        (
+            "PackageDeclarationRequest",
+            "positions",
+            crate::DECLARATION_POSITIONS_MAX,
+        ),
+        (
+            "PackageDeclarationResponse",
+            "results",
+            crate::DECLARATION_POSITIONS_MAX,
         ),
         ("PackageSearchRequest", "terms", PARSED_QUERY_MEMBERS_MAX),
         (
@@ -372,10 +411,70 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             u64::try_from(value).map_err(|error| error.to_string())?,
         )?;
     }
+    validate_max_lengths(spec)?;
 
+    let limit = parameter_schema(spec, "Limit")?;
+    expect_bound("Limit/schema/default", limit.default, json!(100))?;
+    expect_bound(
+        "Limit/schema/maximum",
+        limit.maximum,
+        serde_json::Number::from(crate::PAGE_LIMIT_MAX),
+    )?;
+    for property in ["page_limit_min", "page_limit_max", "page_limit_default"] {
+        let schema = property_schema(spec, "CapabilityBounds", property)?;
+        expect_bound(
+            &format!("CapabilityBounds/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::PAGE_LIMIT_MAX),
+        )?;
+    }
+    let cursor = parameter_schema(spec, "Cursor")?;
+    expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
+    for property in ["line", "character"] {
+        let schema = property_schema(spec, "PackagePosition", property)?;
+        expect_bound(
+            &format!("PackagePosition/properties/{property}/maximum"),
+            schema.maximum,
+            serde_json::Number::from(crate::POSITION_COMPONENT_MAX),
+        )?;
+    }
+    validate_pattern_page_bound(spec)
+}
+
+/// Pins each string bound the client enforces to the contract's `maxLength` for it.
+fn validate_max_lengths(spec: &Spec) -> Result<(), String> {
     let expected_max_lengths = [
         ("PackageSearchRequest", "query", QUERY_BYTES_MAX),
         ("QueryTerm", "text", QUERY_TERM_BYTES_MAX),
+        ("PackagePatternRequest", "pattern", SEARCH_PATTERN_CHARS_MAX),
+        ("Warning", "detail", crate::WARNING_DETAIL_CHARS_MAX),
+        (
+            "PackageIdentity",
+            "manager",
+            crate::PACKAGE_MANAGER_CHARS_MAX,
+        ),
+        ("PackageIdentity", "name", crate::PACKAGE_NAME_CHARS_MAX),
+        (
+            "PackageIdentity",
+            "version",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
+        (
+            "PackageContextEntry",
+            "manager",
+            crate::PACKAGE_MANAGER_CHARS_MAX,
+        ),
+        ("PackageContextEntry", "name", crate::PACKAGE_NAME_CHARS_MAX),
+        (
+            "PackageContextEntry",
+            "version",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
+        (
+            "PackageContextEntry",
+            "requirement",
+            crate::PACKAGE_VERSION_CHARS_MAX,
+        ),
     ];
     for (component, property, value) in expected_max_lengths {
         let schema = property_schema(spec, component, property)?;
@@ -385,17 +484,51 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             u64::try_from(value).map_err(|error| error.to_string())?,
         )?;
     }
-
-    let limit = parameter_schema(spec, "Limit")?;
-    expect_bound("Limit/schema/default", limit.default, json!(100))?;
-    expect_bound(
-        "Limit/schema/maximum",
-        limit.maximum,
-        serde_json::Number::from(200),
-    )?;
-    let cursor = parameter_schema(spec, "Cursor")?;
-    expect_bound("Cursor/schema/maxLength", cursor.max_length, 4096)?;
     Ok(())
+}
+
+/// Pins the warning `detail` bound to the longest `requirement_unsatisfied` detail the
+/// contract's own package fields admit: `<manager>/<name> <requirement> answered by
+/// <version>`, each part at its `maxLength`.
+fn validate_warning_detail_bound(spec: &Spec) -> Result<(), String> {
+    let parts = [
+        ("PackageContextEntry", "manager"),
+        ("PackageContextEntry", "name"),
+        ("PackageContextEntry", "requirement"),
+        ("PackageIdentity", "version"),
+    ];
+    let mut longest = u64::try_from("/".len() + " ".len() + crate::ANSWERED_BY.len())
+        .map_err(|error| error.to_string())?;
+    for (component, property) in parts {
+        let bound = property_schema(spec, component, property)?
+            .max_length
+            .ok_or_else(|| format!("{component}/properties/{property}/maxLength is missing"))?;
+        longest = longest.saturating_add(bound);
+    }
+    let detail = property_schema(spec, "Warning", "detail")?;
+    expect_bound(
+        "Warning/properties/detail/maxLength",
+        detail.max_length,
+        longest,
+    )
+}
+
+/// Pins the files bound the pattern operation states to the one the client enforces.
+fn validate_pattern_page_bound(spec: &Spec) -> Result<(), String> {
+    let endpoint = Endpoint::Patterns;
+    let operation = spec
+        .operation(&endpoint.method(), endpoint.path())
+        .ok_or_else(|| format!("{} is missing", endpoint.path()))?;
+    let expected =
+        u64::try_from(crate::PATTERN_PAGE_FILES_MAX).map_err(|error| error.to_string())?;
+    expect_bound(
+        "x-rift-page-files-max",
+        operation
+            .extensions
+            .get("rift-page-files-max")
+            .and_then(Value::as_u64),
+        expected,
+    )
 }
 
 fn property_schema(spec: &Spec, component: &str, property: &str) -> Result<ObjectSchema, String> {
@@ -462,6 +595,71 @@ where
     Ok(())
 }
 
+/// The component schemas of `document`.
+fn component_schemas(document: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    document
+        .get("components")
+        .and_then(|components| components.get("schemas"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| "components/schemas must be an object".to_owned())
+}
+
+/// Refuses a component schema whose optional property accepts `null`.
+///
+/// The service omits an absent optional field, as the MCP surface does, so an optional
+/// property's `null` arm advertises a value no answer carries. The rule is the one
+/// `rift_protocol::schema::strip_optional_null_arms` applies to the served MCP schemas: a
+/// schema that stripping changes still holds such an arm.
+fn validate_optional_properties_omit_null(document: &Value) -> Result<(), String> {
+    for (name, schema) in component_schemas(document)? {
+        let Some(schema) = schema.as_object() else {
+            continue;
+        };
+        let mut stripped = schema.clone();
+        rift_protocol::schema::strip_optional_null_arms(&mut stripped);
+        if &stripped != schema {
+            return Err(format!(
+                "schema `{name}` accepts `null` on an optional property; the service omits an \
+                 absent field, so the property states its value type alone"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a schema `pattern` the `regex` crate cannot compile.
+///
+/// A JSON Schema validator reads a pattern as an ECMA-262 regular expression, and the client
+/// generator compiles it with the `regex` crate, which has no lookaround: a pattern outside
+/// the dialect both read leaves the generated client without the check, and the generator
+/// only prints a warning. The walk skips `examples`, whose values are data.
+fn validate_patterns(document: &Value) -> Result<(), String> {
+    let mut pending = vec![("", document)];
+    while let Some((key, value)) = pending.pop() {
+        match value {
+            Value::String(pattern) if key == "pattern" => {
+                regex::Regex::new(pattern).map_err(|error| {
+                    format!(
+                        "pattern `{pattern}` must compile under the `regex` crate the client \
+                         generator reads it with: {error}"
+                    )
+                })?;
+            }
+            Value::Object(members) => pending.extend(
+                members
+                    .iter()
+                    .filter(|(member, _)| !matches!(member.as_str(), "examples" | "example"))
+                    .map(|(member, value)| (member.as_str(), value)),
+            ),
+            Value::Array(items) => pending.extend(items.iter().map(|item| ("", item))),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Compares each shared schema with its Rust model's, in the form the MCP surface serves:
+/// with the `null` arm stripped from every optional property.
 fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let mut settings = SchemaSettings::draft2020_12();
     settings.definitions_path = "/components/schemas".into();
@@ -477,13 +675,12 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.
-    let components = document
-        .get("components")
-        .and_then(|components| components.get("schemas"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| "components/schemas must be an object".to_owned())?;
+    let components = component_schemas(document)?;
     for (name, mut expected) in generator.take_definitions(true) {
         normalize_shared_string_enum(&mut expected);
+        if let Some(schema) = expected.as_object_mut() {
+            rift_protocol::schema::strip_optional_null_arms(schema);
+        }
         let actual = components
             .get(&name)
             .ok_or_else(|| format!("shared schema `{name}` is missing"))?;

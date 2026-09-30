@@ -50,8 +50,8 @@ use tracing::Instrument as _;
 
 use crate::failure::WireFailure;
 use crate::global::{
-    GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
-    package_symbols,
+    GlobalRoute, GlobalState, GlobalSymbolCandidates, ReadContext, merge_patterns, merge_search,
+    merge_symbols, package_patterns, package_search, package_symbols,
 };
 use crate::identity::BuildCheckout;
 use crate::parameters::Parameters;
@@ -1742,54 +1742,19 @@ impl RiftMcp {
     /// resolves the snapshot's dependency context with the request's `packages` applied.
     /// A route the global API did not answer, or a remote read that failed, leaves the
     /// project hits alone with the typed global warning.
+    ///
+    /// The page arguments are accepted and the project side reads first, so a lookup the
+    /// server refuses spends no global request.
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
     ) -> Result<Json<GetSymbolResult>, ErrorData> {
+        let limit = rift_server::accepted_limit(params.limit)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let context = resolved
-            .published
-            .reads
-            .read_context(params.scope, params.rev.as_ref(), &params.packages)
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        let configuration = resolved.published.configuration.global_configuration();
-        let mut route = match tokio::time::timeout_at(
-            deadline.at(),
-            Box::pin(self.global.route(&configuration, &context)),
-        )
-        .await
-        {
-            Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(&context),
-        };
-        let mut remote_warnings = Vec::new();
-        let remote = match (&route.client, route.remote_packages.is_empty()) {
-            (Some(client), false) => {
-                match tokio::time::timeout_at(
-                    deadline.at(),
-                    Box::pin(package_symbols(client, &params, &route.remote_packages)),
-                )
-                .await
-                {
-                    Ok(Ok(remote)) => {
-                        remote_warnings = remote.warnings;
-                        remote.items
-                    }
-                    Ok(Err(error)) => {
-                        route.discard_remote(&error);
-                        Vec::new()
-                    }
-                    Err(_) => {
-                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
-                        Vec::new()
-                    }
-                }
-            }
-            _ => Vec::new(),
-        };
         let mut collected = params.clone();
         collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
         collected.page_index = 0;
@@ -1797,7 +1762,25 @@ impl RiftMcp {
             .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
             .await?
             .0;
-        let mut answer = merge_symbols(&params, local, remote)
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let configuration = resolved.published.configuration.global_configuration();
+        let requested = &params;
+        let (route, remote) = self
+            .global_read(deadline, &configuration, &read_context, |client, packages| async move {
+                package_symbols(&client, requested, &packages).await
+            })
+            .await;
+        let GlobalSymbolCandidates {
+            items: remote,
+            warnings: mut remote_warnings,
+        } = remote;
+        let mut answer = merge_symbols(&params, limit, local, remote)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         answer.warnings.append(&mut remote_warnings);
         answer.warnings.extend(route.warnings());
@@ -1813,10 +1796,11 @@ impl RiftMcp {
     /// of `query` and `traversal`. `rev` searches a version-control revision instead of the
     /// current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
     /// reaches past the project tree: `global` answers `query` from the public declarations
-    /// the global index holds for the workspace's dependencies alone, `all` from both,
-    /// ordered together. `packages` names package versions `query` searches beside the
-    /// workspace's own, such as an upgrade target or a package the project does not use yet.
-    /// Use `get_symbol` when the declaration name is known.
+    /// the global index holds for the workspace's dependencies alone and `pattern` from their
+    /// source, `all` from both, ordered together. `packages` names package versions `query`
+    /// and `pattern` search beside the workspace's own, such as an upgrade target or a
+    /// package the project does not use yet. Use `get_symbol` when the declaration name is
+    /// known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1965,6 +1949,9 @@ impl RiftMcp {
     /// ordered together, for the snapshot's dependency context with the request's
     /// `packages` applied. A route the global API did not answer, or a remote read that
     /// failed, leaves the project hits alone with the typed global warning.
+    ///
+    /// The page arguments are accepted and the project side reads first, so a search the
+    /// server refuses spends no global request.
     async fn route_current_tree_search(
         &self,
         resolved: ResolvedWorkspace,
@@ -1975,6 +1962,11 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let references = Arc::new(references);
+        if params.pattern.is_some() && params.scope != SearchScope::Local {
+            return self
+                .route_pattern_search(resolved, params, answer, warnings, references, deadline)
+                .await;
+        }
         let parsed = params
             .query
             .as_deref()
@@ -1990,16 +1982,9 @@ impl RiftMcp {
             return Ok(answer);
         };
 
-        let context = resolved
-            .published
-            .reads
-            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+        let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-        let configuration = resolved.published.configuration.global_configuration();
-        let (route, mut remote) = self
-            .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
-            .await;
-        let remote_warnings = std::mem::take(&mut remote.warnings);
+
         let mut collected = params.clone();
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
@@ -2008,58 +1993,124 @@ impl RiftMcp {
             .await?
             .0;
         local.warnings.extend(warnings);
-        let mut answer = merge_search(&params, local, remote)
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let configuration = resolved.published.configuration.global_configuration();
+        let requested = &params;
+        let parsed = &parsed;
+        let (route, mut remote) = self
+            .global_read(
+                deadline,
+                &configuration,
+                &read_context,
+                |client, packages| async move {
+                    package_search(&client, requested, parsed, &packages).await
+                },
+            )
+            .await;
+        let remote_warnings = std::mem::take(&mut remote.warnings);
+        let mut answer = merge_search(&params, limit, local, remote)
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
 
-    /// Resolves and reads the remote branch inside one MCP request deadline.
-    async fn global_search_candidates(
+    /// Routes one current-tree `pattern` search whose `scope` reaches packages: the
+    /// project's matches come from the published snapshot, `global` verifying no project
+    /// file, and the package matches from one page of the global API's pattern search. The
+    /// page arguments are accepted and the project side reads first, so a pattern the
+    /// server refuses spends no global request.
+    async fn route_pattern_search(
+        &self,
+        resolved: ResolvedWorkspace,
+        params: SearchParams,
+        answer: StoreAnswer,
+        warnings: Vec<ReadWarning>,
+        references: Arc<EngineReferences>,
+        deadline: RequestDeadline,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        let limit = rift_server::search_page_limit(&params)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let mut collected = params.clone();
+        collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        collected.page_index = 0;
+        let mut local = self
+            .current_tree_search_selected(&resolved, collected, answer, references)
+            .await?
+            .0;
+        local.warnings.extend(warnings);
+        let read_context = ReadContext::accepted(
+            &resolved.published.reads,
+            params.scope,
+            params.rev.as_ref(),
+            &params.packages,
+        )
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        let configuration = resolved.published.configuration.global_configuration();
+        let requested = &params;
+        let (route, remote) = self
+            .global_read(deadline, &configuration, &read_context, |client, packages| async move {
+                package_patterns(&client, requested, &packages).await
+            })
+            .await;
+        let mut answer = merge_patterns(&params, limit, local, remote);
+        answer.warnings.extend(route.warnings());
+        Ok(Json(answer))
+    }
+
+    /// Resolves the package context and runs `read` over the packages the global API
+    /// serves, both inside one MCP request deadline.
+    ///
+    /// A route the global API did not answer, a route serving no package, a failed read,
+    /// and a spent deadline all answer `T::default()`: the read answers project hits alone,
+    /// and the route carries the typed warning naming why.
+    async fn global_read<T, Read, Answer>(
         &self,
         deadline: RequestDeadline,
         configuration: &rift_protocol::configuration::GlobalConfiguration,
-        context: &Arc<rift_dependency::DependencyContext>,
-        params: &SearchParams,
-        parsed: &ParsedQuery,
-    ) -> (GlobalRoute, GlobalSearchCandidates) {
+        read_context: &ReadContext<'_>,
+        read: Read,
+    ) -> (GlobalRoute, T)
+    where
+        T: Default,
+        Read: FnOnce(
+            rift_cloud_client::GlobalClient,
+            Vec<rift_cloud_client::PackageIdentity>,
+        ) -> Answer,
+        Answer: std::future::Future<Output = Result<T, rift_cloud_client::ClientError>>,
+    {
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.route(configuration, context)),
+            Box::pin(self.global.route(configuration, read_context)),
         )
         .await
         {
             Ok(route) => route,
-            Err(_) => self.global.deadline_exceeded(context),
+            Err(_) => self.global.deadline_exceeded(read_context),
         };
-        let remote = match (&route.client, route.remote_packages.is_empty()) {
-            (Some(client), false) => {
-                match tokio::time::timeout_at(
-                    deadline.at(),
-                    Box::pin(package_search(
-                        client,
-                        params,
-                        parsed,
-                        &route.remote_packages,
-                    )),
-                )
-                .await
-                {
-                    Ok(Ok(remote)) => remote,
-                    Ok(Err(error)) => {
-                        route.discard_remote(&error);
-                        GlobalSearchCandidates::default()
-                    }
-                    Err(_) => {
-                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
-                        GlobalSearchCandidates::default()
-                    }
+        let (Some(client), false) = (route.client.clone(), route.remote_packages.is_empty()) else {
+            return (route, T::default());
+        };
+        let packages = route.remote_packages.clone();
+        let answer =
+            match tokio::time::timeout_at(deadline.at(), Box::pin(read(client, packages))).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => {
+                    route.discard_remote(&error);
+                    T::default()
                 }
-            }
-            _ => GlobalSearchCandidates::default(),
-        };
-        (route, remote)
+                Err(_) => {
+                    route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                    T::default()
+                }
+            };
+        (route, answer)
     }
 
     /// Executes one search against the published snapshot `resolved` captured.
@@ -2234,14 +2285,19 @@ impl RiftMcp {
     /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
     /// batches: the rows the trigram index lacks ride the selection, and the read path
     /// verifies them, or answers from the rows the index holds and warns
-    /// `pattern_index_preparing`.
+    /// `pattern_index_preparing`. A `global` scope verifies no project file, so the store
+    /// is not read.
     async fn pattern_ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
     ) -> Result<SearchRanking, ErrorData> {
         let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
-        let Some(index) = self.search_index.as_ref() else {
+        let Some(index) = self
+            .search_index
+            .as_ref()
+            .filter(|_| params.scope != SearchScope::Global)
+        else {
             return Ok(SearchRanking::unranked(answer));
         };
         let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds) else {

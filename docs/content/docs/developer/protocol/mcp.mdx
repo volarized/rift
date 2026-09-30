@@ -356,9 +356,10 @@ A file past `pattern_matches_per_file` is cut there, and the answer carries a
 `pattern_matches_truncated` warning naming it, while every other file answers in full.
 `results_truncated` still reports the result bound alone.
 
-The server refuses `pattern` beside `query`, `traversal`, `change`, or `rev`, and with a `scope`
-past `local`, with `invalid_request`: the trigram index holds the current project tree alone, and
-the other fields select another result set, tree, or index. `target: "documentation"` refuses
+The server refuses `pattern` beside `query`, `traversal`, `change`, or `rev` with
+`invalid_request`: the trigram index holds the current tree alone, and the other fields select
+another result set or tree. A `scope` past `local` reaches the package files through the global
+index, as [package scope](#search-scope) describes. `target: "documentation"` refuses
 `capability_unavailable`, since a documentation block carries no file text.
 
 ### Traversal [#search-traversal]
@@ -577,7 +578,7 @@ refuses `resource_not_found`.
 
 <VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-`scope` selects what `query` runs over, with the three values
+`scope` selects what `query` and `pattern` run over, with the three values
 [`get_symbol`](#get_symbol-scope) takes. `local`, the default, runs the lanes above: the
 indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
 `traversal`. `global` runs none of them and answers from the public declarations the global
@@ -588,8 +589,13 @@ then the package hits in unit order.
 A package hit is addressed by `unit` in place of `path` - the
 [`SourceUnitId`](/docs/developer/protocol/reference) of the package file - with `range` and
 `line` inside that unit, and `source` when `include` names it. Its `matched_by` names the fields
-the global index matched. A package contributes no file, so `target: "file"` answers nothing
-from it.
+the global index matched, such as `name` for its name and `content` for a term inside its body.
+A package contributes no file to `query`, so `target: "file"` answers nothing from it.
+
+A `pattern` reaches the package files too. The global index answers each match as a `file` hit
+addressed by `unit`, with the file's `size`, and each declaration holding a match as a `symbol`
+hit at its first match, both tagged `matched_by: ["content"]`. `global` answers the package
+matches alone; `all` answers them after the project's, in package, path, and offset order.
 
 <VersionBadge version="v0.0.43" />
 
@@ -603,9 +609,16 @@ The resolvers read at most 256 manifests per workspace, taken in path order, so 
 `all` search over a workspace reaches packages those manifests declare. The package side takes
 the same global API route as [`get_symbol`](#get_symbol-scope).
 
-This search runs in a workspace whose `Cargo.lock` pins the `demo` crate at 1.0.0, which the
-global index holds, and whose `Cargo.toml` names a `helper` crate by a path outside the
-workspace. Its Rust toolchain is 1.98.1, a `stdlib/rust` release the global publication lacks:
+The server asks the global API for one page per query phase, at most 1,000 declarations or the
+smaller page the API advertises, and for one page of matches per `pattern`. A declaration page the
+global API stopped at its response bound, or a `pattern` page it stopped at its limit, its file
+bound, or its verified-text bound, answers what it holds and carries a `global_page_warning` with
+`warning_code: "result_truncated"`; the server does not ask for the rest.
+
+This search runs in a workspace whose `Cargo.lock` pins the `demo` crate at 1.0.1, which the
+global index holds no release of, so the nearest collected release, 1.0.0, answers. Its
+`Cargo.toml` names a `helper` crate by a path outside the workspace, and its Rust toolchain is
+1.98.1, a `stdlib/rust` release the global publication lacks:
 
 **Request:**
 
@@ -657,6 +670,16 @@ workspace. Its Rust toolchain is 1.98.1, a `stdlib/rust` release the global publ
     {
       "code": "package_absent",
       "package": { "manager": "stdlib", "name": "rust", "version": "1.98.1" }
+    },
+    {
+      "code": "package_substituted",
+      "entry": {
+        "manager": "cargo",
+        "name": "demo",
+        "version": "1.0.1",
+        "availability": "canonical"
+      },
+      "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" }
     }
   ]
 }
@@ -707,22 +730,26 @@ package. The hit carries neither `node` nor `history`.
 
 A `local` read reaches no package declaration and resolves no package. A `global` or `all` read
 sends the dependency context's `canonical` entries to the configured global REST API, which
-answers capabilities and package resolution, and a valid response serves the available package
-declarations from the global index. An entry no public registry serves never reaches the global
-API and answers `package_unavailable`.
+answers capabilities and package resolution, and a valid response serves the package declarations
+the global index holds for each entry. An entry no public registry serves never reaches the
+global API and answers `package_unavailable`.
+
+When the global index holds no release at the version an entry names, or none inside the range a
+declared requirement states, the nearest collected release answers, and the answer names the
+substitution in `package_substituted`. An entry whose package holds no collected release adds
+`package_absent` or `package_requirement_absent`, and the rest of the read answers as usual.
 
 When the REST API is unavailable, the read answers the project hits it has, carries no package
 facts, and adds `global_api_unavailable` with its bounded `failure_class`. Disabled access adds
-`global_access_disabled`; a valid resolution that names no collected release adds
-`package_absent` or `package_requirement_absent`. Callers still reach this route through the
-local `rift mcp` and `rift server` processes; they do not connect to a global MCP or server
-directly.
+`global_access_disabled`. Callers still reach this route through the local `rift mcp` and
+`rift server` processes; they do not connect to a global MCP or server directly.
 
 The server refuses `rev` together with a scope beyond `local` as `invalid_request`: package
 facts are served for the current tree alone.
 
-This lookup runs in the workspace the [search example](#search-scope) describes, whose
-`Cargo.lock` pins the `demo` crate the global index holds:
+This lookup runs in the workspace the [search example](#search-scope) describes, where the
+nearest collected release of the `demo` crate, 1.0.0, answers for the 1.0.1 its `Cargo.lock`
+pins:
 
 **Request:**
 
@@ -771,6 +798,16 @@ This lookup runs in the workspace the [search example](#search-scope) describes,
     {
       "code": "package_absent",
       "package": { "manager": "stdlib", "name": "rust", "version": "1.98.1" }
+    },
+    {
+      "code": "package_substituted",
+      "entry": {
+        "manager": "cargo",
+        "name": "demo",
+        "version": "1.0.1",
+        "availability": "canonical"
+      },
+      "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" }
     }
   ]
 }
@@ -894,11 +931,17 @@ carries no package facts and one of these warnings naming why:
 Package-scope answers can also carry these package warnings:
 
 - `global_page_warning` - a valid global page carried a bounded condition. `warning_code`
-  identifies it and optional `detail` explains it.
+  identifies it and optional `detail` explains it. `result_truncated` names a page the global API
+  stopped early, and the answer holds what that page held. `capability_unavailable` names a
+  feature the global API's capabilities do not advertise, such as `patterns` for a `pattern`
+  search, and the answer then holds the project hits alone.
 - `package_absent` - the global publication holds no release of the exact `package` the
   dependency context names, so nothing answers for it.
 - `package_requirement_absent` - the global publication holds no release the declared
   requirement in `entry` admits, so nothing answers for it.
+- `package_substituted` - the global publication holds no release at the version `entry` names,
+  or none inside the range its requirement states, so the nearest collected release, `package`,
+  answers in its place.
 - `package_unavailable` - the dependency context `entry` names a package no public registry
   serves, so no global package index answers for it. `reason` names the capability Rift does not
   have yet, by the entry's `availability`.
@@ -906,7 +949,11 @@ Package-scope answers can also carry these package warnings:
   standard library probe answered nothing, so the dependency context can miss packages or name a
   standard library by its static reading. `resolver` names which, by manager name - `cargo`,
   `uv`, `npm`, or `bun` - or by standard library entry - `stdlib/rust`, `stdlib/node`, or
-  `stdlib/python` - and `reason` says what it could not read.
+  `stdlib/python` - and `reason` says what it could not read. When the context passes the
+  entries one read sends - 20,000, or fewer when the global API advertises a smaller
+  `dependency_entries_max` - the entries sorted last leave, and `resolver` names their package
+  manager, such as `pypi`. The request's `packages` leave only after every other entry has, the
+  ones sorted last first, and `reason` then counts the requested packages not reported.
 
 <VersionBadge version="v0.0.46" />
 
@@ -923,11 +970,12 @@ A path dependency inside the workspace is project source: the local index covers
 dependency context names no entry for it.
 
 An answer carries at most eight `package_context_degraded`, `package_unavailable`,
-`package_absent`, and `package_requirement_absent` warnings together: the degraded resolvers
-first, in resolver order, then the entries no public registry serves, then the packages and
-requirements the global publication lacks. The global warning naming why the global API did not
-answer rides before them, outside that bound. The `source_unavailable` bound above is separate,
-so an answer can carry eight of each.
+`package_absent`, `package_requirement_absent`, and `package_substituted` warnings together: the
+degraded resolvers first, in resolver order, then the entries no public registry serves, then the
+packages and requirements the global publication lacks, then the entries a nearest release
+answers for. The global warning naming why the global API did not answer rides before them,
+outside that bound. The `source_unavailable` bound above is separate, so an answer can carry
+eight of each.
 
 Every read carries an optional `rev`, and reads the workspace tree when it is absent.
 
@@ -987,8 +1035,9 @@ optional exact `version`. The server applies the list to this read's dependency 
   from its newest collected release
 
 Each entry then routes like any context entry. A requested version the global publication lacks
-answers `package_absent`, and a requirement it cannot resolve answers
-`package_requirement_absent`.
+answers from the nearest collected release under `package_substituted`. A package with no
+collected release answers `package_absent`, or `package_requirement_absent` for an entry without
+`version`.
 
 This search reads Tokio 1.47.1 beside the project, in place of the version the workspace's
 `Cargo.lock` pins:

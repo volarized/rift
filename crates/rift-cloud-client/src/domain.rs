@@ -6,10 +6,10 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use crate::{
-    ClientError, HitLocation, PackageDocumentationHit, PackageIdentity, PackageSearchHit,
-    PackageSearchHitContributingField, PackageSearchItem, PackageSymbol, SourceKind,
-    SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange, TypeBinding,
-    TypeBindingOrigin, TypeBindingRole, TypeExpression,
+    ClientError, HitLocation, PackageDocumentationHit, PackageIdentity, PackagePatternDeclaration,
+    PackagePatternHit, PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem,
+    PackageSymbol, SourceKind, SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange,
+    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
 };
 
 /// One package declaration returned by global search in the local read model.
@@ -21,7 +21,8 @@ pub struct PackageSearchCandidate {
     pub identity: rift_ranking::DocumentIdentity,
     /// Search hit carrying declaration.
     pub hit: rift_protocol::read::SearchHit,
-    /// Identifier match class established by global index.
+    /// Identifier match class established by global index. Absent for a documentation
+    /// block, and for a declaration matching none of the requested identifiers.
     pub match_class: Option<rift_ranking::IdentifierMatchClass>,
 }
 
@@ -36,6 +37,89 @@ pub struct PackageSymbolCandidate {
     pub hit: rift_protocol::read::GetSymbolHit,
     /// Identifier match class established by global index.
     pub match_class: rift_ranking::IdentifierMatchClass,
+}
+
+/// One package pattern match in the local read model: the file hit for the match, and the
+/// symbol hit for the smallest declaration holding it, when one does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackagePatternMatch {
+    /// Package that owns the file.
+    pub package: rift_protocol::read::PackageIdentity,
+    /// File hit addressed by `unit`, whose `range` is the match's bytes.
+    pub file: rift_protocol::read::SearchHit,
+    /// Symbol hit at the range of the declaration holding the match.
+    pub declaration: Option<rift_protocol::read::SearchHit>,
+}
+
+impl TryFrom<&PackagePatternHit> for PackagePatternMatch {
+    type Error = ClientError;
+
+    fn try_from(value: &PackagePatternHit) -> Result<Self, Self::Error> {
+        crate::package_source_path(&value.package, &value.unit)?;
+        let line = u64::try_from(value.line).map_err(|_| invalid("location"))?;
+        let size = u64::try_from(value.size).map_err(|_| invalid("location"))?;
+        if line == 0 || value.range.end < value.range.start || size < value.range.end {
+            return Err(invalid("location"));
+        }
+        let file = rift_protocol::read::SearchHit {
+            hit: rift_protocol::read::SearchHitTarget::File {
+                size,
+                languages: Vec::new(),
+            },
+            score: None,
+            matched_by: vec![rift_protocol::read::MatchedField::Content],
+            source: value.source.clone(),
+            range: Some(text_range(&value.range)),
+            line: Some(line),
+            path: None,
+            unit: Some(protocol_unit(&value.unit)),
+            traversal_path: None,
+            distance: None,
+            change: None,
+        };
+        let declaration = value
+            .declaration
+            .as_ref()
+            .map(|declaration| declaration_hit(&value.package, &value.unit, declaration))
+            .transpose()?;
+        Ok(Self {
+            package: package_identity(&value.package),
+            file,
+            declaration,
+        })
+    }
+}
+
+/// The symbol hit for the declaration holding one pattern match, tagged `content` as a
+/// project declaration holding a match is.
+fn declaration_hit(
+    package: &PackageIdentity,
+    unit: &str,
+    declaration: &PackagePatternDeclaration,
+) -> Result<rift_protocol::read::SearchHit, ClientError> {
+    let (_, _, line) = validate_location(
+        package,
+        &declaration.symbol,
+        unit,
+        &declaration.range,
+        declaration.line,
+        declaration.source.as_deref(),
+    )?;
+    Ok(rift_protocol::read::SearchHit {
+        hit: rift_protocol::read::SearchHitTarget::Symbol {
+            symbol: Box::new(convert_symbol(&declaration.symbol)?),
+        },
+        score: None,
+        matched_by: vec![rift_protocol::read::MatchedField::Content],
+        source: declaration.source.clone(),
+        range: Some(text_range(&declaration.range)),
+        line: Some(line),
+        path: None,
+        unit: Some(protocol_unit(unit)),
+        traversal_path: None,
+        distance: None,
+        change: None,
+    })
 }
 
 impl TryFrom<PackageSearchHit> for PackageSearchCandidate {
@@ -73,7 +157,7 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
         let symbol = convert_symbol(&value.symbol)?;
         let identity = rift_ranking::DocumentIdentity::for_unit(&unit, &qualified_name)
             .map_err(|_| invalid("symbol_identity"))?;
-        let match_class = crate::ranking_match_class(&value.match_class)?;
+        let match_class = crate::search_match_class(&value.match_class)?;
         let hit = rift_protocol::read::SearchHit {
             hit: rift_protocol::read::SearchHitTarget::Symbol {
                 symbol: Box::new(symbol),
@@ -93,7 +177,7 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
             package,
             identity,
             hit,
-            match_class: Some(match_class),
+            match_class,
         })
     }
 }
@@ -591,7 +675,7 @@ fn matched_fields(
             PackageSearchHitContributingField::Signature => {
                 rift_protocol::read::MatchedField::Signature
             }
-            PackageSearchHitContributingField::DeclarationSource => {
+            PackageSearchHitContributingField::FileContent => {
                 rift_protocol::read::MatchedField::Content
             }
             PackageSearchHitContributingField::Unknown => rift_protocol::read::MatchedField::Ranked,
@@ -915,7 +999,8 @@ mod tests {
     }
 
     fn symbol(package: &PackageIdentity) -> Symbol {
-        let id = rift_core::symbol_identity("rust", "src/lib.rs", "helper_beacon");
+        let id =
+            rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon");
         Symbol {
             id: Some(id),
             language: "rust".to_owned(),
@@ -1146,7 +1231,7 @@ mod tests {
             line: 3,
             contributing_fields: vec![
                 PackageSearchHitContributingField::QualifiedName,
-                PackageSearchHitContributingField::DeclarationSource,
+                PackageSearchHitContributingField::Signature,
             ],
             match_class: crate::generated::IdentifierMatchClass::NameExact,
             source: Some("pub fn helper_beacon() {}".to_owned()),
@@ -1168,6 +1253,30 @@ mod tests {
             candidate.hit.hit,
             rift_protocol::read::SearchHitTarget::Symbol { .. }
         ));
+    }
+
+    /// A declaration matched inside its body reports `file_content` and the `unknown`
+    /// match class: it answers as a content match claiming no identifier class.
+    #[test]
+    fn search_candidate_maps_a_body_match_to_content() {
+        let package = package();
+        let hit = PackageSearchHit {
+            package: package.clone(),
+            symbol: symbol(&package),
+            unit: unit(),
+            range: TextRange { start: 8, end: 24 },
+            line: 3,
+            contributing_fields: vec![PackageSearchHitContributingField::FileContent],
+            match_class: crate::generated::IdentifierMatchClass::Unknown,
+            source: None,
+            additional_properties: HashMap::new(),
+        };
+        let candidate = PackageSearchCandidate::try_from(hit).expect("valid body match");
+        assert_eq!(
+            candidate.hit.matched_by,
+            [rift_protocol::read::MatchedField::Content]
+        );
+        assert_eq!(candidate.match_class, None);
     }
 
     #[test]

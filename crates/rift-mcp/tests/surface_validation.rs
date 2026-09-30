@@ -105,7 +105,8 @@ fn corpus() -> Vec<(&'static str, Value)> {
 }
 
 /// Regex `pattern` searches: file and symbol hits verified from the trigram candidates,
-/// the matched line as `source`, and a `force_include` file verified whole.
+/// the matched line as `source`, a `force_include` file verified whole, and the package
+/// matches a `scope` past `local` adds.
 fn pattern_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
         ("search", json!({ "pattern": "beacon" })),
@@ -123,6 +124,16 @@ fn pattern_search_corpus() -> Vec<(&'static str, Value)> {
                 "pattern": "phantom",
                 "target": "file",
                 "paths": { "force_include": ["hidden.rs"] }
+            }),
+        ),
+        ("search", json!({ "pattern": "beacon", "scope": "all" })),
+        (
+            "search",
+            json!({
+                "pattern": r"fn \w*beacon",
+                "scope": "global",
+                "target": "all",
+                "include": ["source"]
             }),
         ),
     ]
@@ -156,8 +167,9 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
 /// `packages` requests: one replacing the version of the fixture's path dependency
 /// `helper`, which then answers `package_absent` in place of `package_unavailable`, one
 /// adding `extra`, a package the context lacks, which answers
-/// `package_requirement_absent`, and one replacing the collected `demo` by the requirement
-/// `>=0`, which the fixture global API resolves to its collected release.
+/// `package_requirement_absent`, one replacing the collected `demo` by the requirement
+/// `>=0`, which the fixture global API resolves to its collected release, and a `pattern`
+/// matched over that release beside the project.
 fn package_argument_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -181,6 +193,14 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "query": "beacon",
                 "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "demo" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "pattern": "helper_beacon",
+                "scope": "all",
                 "packages": [{ "manager": "cargo", "name": "demo" }]
             }),
         ),
@@ -391,16 +411,16 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             .as_array()
             .is_some_and(|include| include.iter().any(|value| value == "score"));
         for hit in results {
-            // A symbol hit is addressed by exactly one of `path` and `unit`; a file hit
-            // by `path` alone.
+            // A hit is addressed by exactly one of `path` and `unit`; a file hit carries
+            // `unit` only for a package file, which a package scope alone reaches.
             assert!(
                 hit.get("path").is_some() != hit.get("unit").is_some(),
                 "a search hit carries exactly one of path and unit: {hit:#}"
             );
             if hit["hit"]["target"] == json!("file") {
                 assert!(
-                    hit.get("path").is_some(),
-                    "a file hit carries its project path: {hit:#}"
+                    hit.get("path").is_some() || reaches_dependencies,
+                    "a project-scoped file hit carries its project path: {hit:#}"
                 );
             }
             if source_requested {
@@ -445,6 +465,7 @@ fn assert_dependency_warnings_only(structured: &Value) {
                         | "global_page_warning"
                         | "package_absent"
                         | "package_requirement_absent"
+                        | "package_substituted"
                         | "package_unavailable"
                         | "package_context_degraded"
                 )
@@ -1008,9 +1029,9 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
 }
 
 /// A `pattern` the server refuses is a schema-valid request answered with the refusal the
-/// read path names: beside another result-set selector, a tree, or a scope the trigram
-/// index does not hold, out of syntax, and past the compiled-size bound it is
-/// `invalid_request`; beside `target: "documentation"` it is `capability_unavailable`.
+/// read path names: beside another result-set selector or a tree the trigram index does
+/// not hold, out of syntax, and past the compiled-size bound it is `invalid_request`;
+/// beside `target: "documentation"` it is `capability_unavailable`.
 #[tokio::test]
 async fn search_pattern_refusals_carry_their_codes() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
@@ -1021,18 +1042,6 @@ async fn search_pattern_refusals_carry_their_codes() -> TestResult {
         ),
         (
             json!({ "pattern": "beacon", "rev": "main" }),
-            "invalid_request",
-        ),
-        (
-            json!({ "pattern": "beacon", "scope": "all" }),
-            "invalid_request",
-        ),
-        (
-            json!({
-                "pattern": "beacon",
-                "scope": "all",
-                "packages": [{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]
-            }),
             "invalid_request",
         ),
         (json!({ "pattern": "beacon(" }), "invalid_request"),

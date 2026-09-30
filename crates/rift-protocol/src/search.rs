@@ -208,13 +208,13 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1_u64))]
     pub line: Option<u64>,
-    /// Project-relative path of the hit, present for a file hit and for a symbol hit whose
-    /// declaration belongs to the project. A dependency or standard-library declaration
-    /// carries `unit` in its place.
+    /// Project-relative path of the hit, present for a project file hit and for a symbol
+    /// hit whose declaration belongs to the project. A hit in a dependency or
+    /// standard-library file carries `unit` in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<ProjectPath>,
-    /// Source-catalog unit of a dependency or standard-library declaration. A symbol hit
-    /// carries exactly one of `path` and `unit`; a file hit carries `path`.
+    /// Source-catalog unit of a hit in a dependency or standard-library file: a
+    /// declaration, or a `pattern` match. A hit carries exactly one of `path` and `unit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<SourceUnitId>,
     /// Shortest relationship path to this hit, present when a traversal reached it,
@@ -454,22 +454,25 @@ pub struct SearchParams {
     /// case-insensitive. Every match becomes one file hit whose `range` is the match's
     /// bytes, and every declaration holding a match one symbol hit at its first match;
     /// each hit is tagged `content` and carries no score, and `relevance` orders the hits
-    /// by path, then offset. The server refuses `pattern` beside `query`, `traversal`,
-    /// `change`, and `rev`, with a `scope` past `local`, and with `target:
-    /// "documentation"`, and it refuses a pattern whose compiled size, candidate rows, or
-    /// verified bytes pass the `[search]` bounds, naming the bound.
+    /// by path, then offset. With a `scope` past `local`, the global index matches the
+    /// pattern over the dependency packages' source too, and those hits carry `unit` in
+    /// place of `path`. The server refuses `pattern` beside `query`, `traversal`,
+    /// `change`, and `rev`, and with `target: "documentation"`, and it refuses a pattern
+    /// whose compiled size, candidate rows, or verified bytes pass the `[search]` bounds,
+    /// naming the bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = SEARCH_PATTERN_CHARS_MAX))]
     pub pattern: Option<String>,
-    /// Which declarations `query` searches: the project tree, the public declarations of
-    /// the dependency packages, or both. Omitted, `local`. A package contributes symbol
-    /// hits alone. The server refuses a scope beyond `local` together with `rev`, since
-    /// package facts are served for the current tree alone, and `global` together with
-    /// `traversal`, since a walk runs over the project alone.
+    /// Which sources `query` and `pattern` search: the project tree, the dependency
+    /// packages, or both. Omitted, `local`. A package contributes symbol hits alone to
+    /// `query`, and file and symbol hits to `pattern`. The server refuses a scope beyond
+    /// `local` together with `rev`, since package facts are served for the current tree
+    /// alone, and `global` together with `traversal`, since a walk runs over the project
+    /// alone.
     #[serde(default)]
     pub scope: SearchScope,
-    /// Packages `query` searches beside the ones the workspace's manifests and lockfiles
-    /// name, at most 64. An entry naming a package the workspace depends on replaces that
+    /// Packages `query` and `pattern` search beside the ones the workspace's manifests and
+    /// lockfiles name, at most 64. An entry naming a package the workspace depends on replaces that
     /// package's versions for this search, and an entry naming another package adds it.
     /// The server refuses `packages` beside the `local` scope, since a project search
     /// consults no package, and beside `rev`, since package facts are served for the

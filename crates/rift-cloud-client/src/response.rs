@@ -1,11 +1,13 @@
 //! Generated response decoding after bounded body collection.
 
 use crate::{
-    Capabilities, ClientError, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackageResolutionResponse,
-    PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
+    Capabilities, ClientError, FindPackageDeclarationsRequest, FindPackageDeclarationsResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, ListPackageSymbolsRequest,
+    ListPackageSymbolsResponse, PackageDeclarationResponse, PackagePatternPage,
+    PackageResolutionResponse, PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
     ResolvePackageContextRequest, ResolvePackageContextResponse, ResponseMeta,
-    SearchPackagesRequest, SearchPackagesResponse,
+    SearchPackagePatternsRequest, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesResponse,
 };
 
 pub(crate) struct Parsed<T> {
@@ -114,6 +116,58 @@ pub(crate) async fn symbols(
         | ListPackageSymbolsResponse::ServiceUnavailable(problem)
         | ListPackageSymbolsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
         ListPackageSymbolsResponse::Unknown => Err(unknown_http_error(meta)),
+    }
+}
+
+pub(crate) async fn patterns(
+    response: RawResponse,
+) -> Result<Parsed<PackagePatternPage>, ClientError> {
+    let (response, meta) = generated_response(response)?;
+    let status = meta.status;
+    let response = SearchPackagePatternsRequest::parse_response(response)
+        .await
+        .map_err(|_| ClientError::Decode { status })?;
+    match response {
+        SearchPackagePatternsResponse::Ok(value) => Ok(Parsed { value, meta }),
+        SearchPackagePatternsResponse::BadRequest(problem)
+        | SearchPackagePatternsResponse::Unauthorized(problem)
+        | SearchPackagePatternsResponse::Forbidden(problem)
+        | SearchPackagePatternsResponse::NotAcceptable(problem)
+        | SearchPackagePatternsResponse::ContentTooLarge(problem)
+        | SearchPackagePatternsResponse::UnsupportedMediaType(problem)
+        | SearchPackagePatternsResponse::TooManyRequests(problem)
+        | SearchPackagePatternsResponse::InternalServerError(problem)
+        | SearchPackagePatternsResponse::BadGateway(problem)
+        | SearchPackagePatternsResponse::ServiceUnavailable(problem)
+        | SearchPackagePatternsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
+        SearchPackagePatternsResponse::Unknown => Err(unknown_http_error(meta)),
+    }
+}
+
+pub(crate) async fn declarations(
+    response: RawResponse,
+) -> Result<Parsed<PackageDeclarationResponse>, ClientError> {
+    let (response, meta) = generated_response(response)?;
+    let status = meta.status;
+    let response = FindPackageDeclarationsRequest::parse_response(response)
+        .await
+        .map_err(|_| ClientError::Decode { status })?;
+    match response {
+        FindPackageDeclarationsResponse::Ok(value) => Ok(Parsed { value, meta }),
+        FindPackageDeclarationsResponse::BadRequest(problem)
+        | FindPackageDeclarationsResponse::Unauthorized(problem)
+        | FindPackageDeclarationsResponse::Forbidden(problem)
+        | FindPackageDeclarationsResponse::NotAcceptable(problem)
+        | FindPackageDeclarationsResponse::ContentTooLarge(problem)
+        | FindPackageDeclarationsResponse::UnsupportedMediaType(problem)
+        | FindPackageDeclarationsResponse::TooManyRequests(problem)
+        | FindPackageDeclarationsResponse::InternalServerError(problem)
+        | FindPackageDeclarationsResponse::BadGateway(problem)
+        | FindPackageDeclarationsResponse::ServiceUnavailable(problem)
+        | FindPackageDeclarationsResponse::GatewayTimeout(problem) => {
+            Err(http_error(meta, problem))
+        }
+        FindPackageDeclarationsResponse::Unknown => Err(unknown_http_error(meta)),
     }
 }
 

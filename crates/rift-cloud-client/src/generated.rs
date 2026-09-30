@@ -21,6 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 use validator::Validate;
+static REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+regex::Regex::new("^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$").expect("invalid regex"));
 /// One package as its package manager identifies it.
 #[derive(
     Debug,
@@ -60,10 +62,12 @@ pub type SymbolId = String;
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct Symbol {
-    /// The symbol this one belongs to - the class that owns a method, the module that owns
-    /// a function. Ownership is not lexical: a Go method sits beside its type and a Rust
-    /// method inside an `impl` block, both naming the type here; absent at the top level.
-    pub container: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub container: Option<String>,
     /// Whether language semantics confine this symbol to the document that declares it. The
     /// provider classifies locality from its language model; absent when `false`.
     #[default(Some(false))]
@@ -80,10 +84,12 @@ pub struct Symbol {
     /// kinds `trait` and `interface` can both carry the `type` facet.
     #[default(Some(Default::default()))]
     pub facets: Option<Vec<SymbolFacet>>,
-    /// Unique identifier of this Symbol across the whole workspace. Absent for an
-    /// unestablished symbol: no accepted evidence, or more than one, established its
-    /// identity.
-    pub id: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub id: Option<String>,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
@@ -120,11 +126,11 @@ pub struct Symbol {
 /// package.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct SymbolOrigin {
-    /// Which of the four places the declaration belongs. Absent exactly when
-    /// `source_kind` is `synthetic`.
+    /// Which of the four places a declaration's source belongs, on `SymbolOrigin`. Package
+    /// ownership is the separate `package` field: a `project` declaration can carry one too,
+    /// and `dependency` always does.
     pub location: Option<SourceLocationKind>,
-    /// The package that owns the declaration: present for `dependency`, and optionally
-    /// for `project`. Absent for `stdlib`, `external`, and a synthetic declaration.
+    /// One package as its package manager identifies it.
     pub package: Option<PackageIdentity>,
     /// How source or a declaration came to exist.
     pub source_kind: SourceKind,
@@ -475,8 +481,9 @@ pub struct Signature {
     /// Declared parameters, in source order. Absent when empty.
     #[default(Some(Default::default()))]
     pub parameters: Option<Vec<Parameter>>,
-    /// The implicit first parameter - `self`, `this`. Absent for a free function, and for
-    /// languages that have no such thing.
+    /// One parameter of a `Signature`: what it is called, the types bound to it, and how a call
+    /// may pass it. A receiver is one of these too, held in its own field because it has no
+    /// position in the parameter list.
     pub receiver: Option<Parameter>,
     /// What the call yields, absent when empty. An array because a language may return
     /// several values, and because a declared and an inferred return are separate
@@ -506,8 +513,11 @@ pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
     /// a positional parameter in a function type.
     pub name: Option<String>,
-    /// Where this parameter is written in the source.
-    pub node: Option<NodeId>,
+    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
+    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
+    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
+    /// revision the response names.
+    pub node: Option<String>,
     /// Whether a call may leave it out.
     pub optional: bool,
     /// What it accepts, absent when empty. An array because a declared type and an
@@ -679,9 +689,12 @@ pub struct TypeExpression {
     pub extensions: Option<serde_json::Value>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: String,
-    /// The symbol that declares this type, where one does. Absent for a structural type,
-    /// which has a spelling and nothing to open.
-    pub resolved: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub resolved: Option<String>,
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     pub source: String,
 }
@@ -859,7 +872,7 @@ pub struct QueryTerm {
 pub struct Warning {
     /// Stable warning code.
     pub code: WarningCode,
-    /// Bounded explanation for the warning.
+    /// Bounded explanation for the warning. The bound holds the longest `requirement_unsatisfied` detail the package fields admit: a 128-byte manager, and a 4,096-byte name, requirement, and version.
     pub detail: Option<String>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
@@ -926,7 +939,7 @@ pub struct PackageResolutionRequest {
     #[validate(length(max = 20_000u64), nested)]
     pub entries: Vec<PackageContextEntry>,
 }
-/// One submitted requirement paired with its resolved package.
+/// One submitted entry paired with the package that answers it: a requirement with the release it resolves to, or an exact version with the nearest collected release.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct ResolvedRequirement {
     /// One package the workspace depends on, as its manifests and lockfiles state it.
@@ -945,12 +958,14 @@ pub struct ResolvedRequirement {
 pub struct PackageResolutionResponse {
     /// Exact packages available in the global index.
     pub available_exact: Vec<PackageIdentity>,
-    /// Requirements resolved to exact packages.
+    /// Requirements resolved to exact packages, and exact versions the global index answers from the nearest collected release.
     pub resolved_requirements: Vec<ResolvedRequirement>,
     /// Exact packages absent from the global index.
     pub missing_exact: Vec<PackageIdentity>,
     /// Requirements absent from the global index.
     pub missing_requirements: Vec<PackageContextEntry>,
+    /// Conditions the caller must account for, absent when none applies. A `requirement_unsatisfied` warning names a requirement of `resolved_requirements` whose package lies outside the range the requirement states, since no collected release satisfies it; its `detail` reads `<manager>/<name> <requirement> answered by <version>`, as in `npm/typescript ~5.7.2 answered by 5.9.3`.
+    pub warnings: Option<Vec<Warning>>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -987,7 +1002,7 @@ pub struct PackageSearchRequest {
     /// Which package results may be returned. Omitted, symbol.
     pub target: Option<PackageSearchRequestTarget>,
 }
-/// Match class established for one declaration identifier.
+/// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum IdentifierMatchClass {
     #[default]
@@ -1046,9 +1061,9 @@ pub struct PackageSearchHit {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// Fields that contributed to ranking.
+    /// Fields that contributed to ranking. `file_content` names a match inside the declaration, which the file's text holds.
     pub contributing_fields: Vec<PackageSearchHitContributingField>,
-    /// Match class established for one declaration identifier.
+    /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
@@ -1056,7 +1071,7 @@ pub struct PackageSearchHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One ranked page of package declarations.
+/// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchPage {
     /// Ranked package declarations.
@@ -1092,8 +1107,12 @@ pub struct PackageSymbolRequest {
     /// Declaration name to look up.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub name: String,
-    /// Optional language filter.
-    pub language: Option<Language>,
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    #[validate(
+        length(max = 129u64),
+        regex(path = "REGEX_PACKAGE_SYMBOL_REQUEST_LANGUAGE")
+    )]
+    pub language: Option<String>,
     /// Optional fields to include.
     #[validate(length(max = 2u64))]
     pub include: Option<Vec<PackageSymbolRequestInclude>>,
@@ -1123,17 +1142,17 @@ pub struct PackageSymbol {
     pub range: TextRange,
     /// One-based source line containing the declaration.
     pub line: i64,
-    /// Match class established for one declaration identifier.
+    /// Match class established for one declaration identifier. A search hit that matches none of the requested identifiers reports `unknown`; a symbol lookup hit never does.
     pub match_class: IdentifierMatchClass,
     /// Optional declaration source excerpt.
     pub source: Option<String>,
-    /// Exact documentation references, when requested.
+    /// Bounded documentation context requested for one exact declaration.
     pub documentation: Option<DocumentationContext>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One page of package declarations.
+/// One page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSymbolPage {
     /// Package declarations.
@@ -1150,6 +1169,162 @@ pub struct PackageSymbolPage {
     pub corpus_revision: String,
     /// Documentation revision used for this page.
     pub documentation_revision: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// Regular expression search over the source of selected exact package versions.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePatternRequest {
+    /// Regular expression in the syntax of the Rust `regex` crate. The server matches it line by line: `^` and `$` match at line boundaries, and no character class matches a line feed. The inline flag `(?i)` makes it case-insensitive.
+    #[validate(length(min = 1u64, max = 1_024u64))]
+    pub pattern: String,
+    /// Selected exact package versions.
+    #[validate(length(max = 20_000u64), nested)]
+    pub packages: Vec<PackageIdentity>,
+    /// Optional fields to include.
+    #[validate(length(max = 1u64))]
+    pub include: Option<Vec<String>>,
+}
+/// The smallest declaration whose range holds a match. A match no declaration holds carries none.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternDeclaration {
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// and is connected through Relationship.
+    pub symbol: Symbol,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One-based source line containing the declaration.
+    pub line: i64,
+    /// The declaration's source, when the request includes `source`.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One match of the pattern in one package file.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternHit {
+    /// One package as its package manager identifies it.
+    pub package: PackageIdentity,
+    /// Stable identity of one source unit in the source catalog: a resolver identity, then that
+    /// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
+    /// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
+    /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
+    /// where byte-identity is required.
+    pub unit: String,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: TextRange,
+    /// One-based source line where the match begins.
+    pub line: i64,
+    /// Size in bytes of the file holding the match.
+    pub size: i64,
+    /// The smallest declaration whose range holds a match. A match no declaration holds carries none.
+    pub declaration: Option<PackagePatternDeclaration>,
+    /// The line where the match begins, without its line ending, when the request includes `source`.
+    pub source: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackagePatternPage {
+    /// Matches in package, file path, and offset order.
+    pub items: Vec<PackagePatternHit>,
+    /// Opaque cursor for the next page.
+    pub next_cursor: Option<String>,
+    /// Warnings attached to this page.
+    pub warnings: Vec<Warning>,
+    /// Publication format used by the package index.
+    pub publication_format: PublicationFormat,
+    /// Analyzer revision used for this page.
+    pub analyzer_revision: String,
+    /// Corpus revision used for this page.
+    pub corpus_revision: String,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// Positions in files of exact package versions, each to name a declaration for.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDeclarationRequest {
+    /// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
+    pub position_encoding: PackageDeclarationRequestPositionEncoding,
+    /// Positions to answer, each at most once.
+    #[validate(length(min = 1u64, max = 1_000u64), nested)]
+    pub positions: Vec<PackagePosition>,
+}
+/// One position in one file of an exact package version.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct PackagePosition {
+    /// One package as its package manager identifies it.
+    #[validate(nested)]
+    pub package: PackageIdentity,
+    /// Path of the file below the package root, using forward slashes, as in `src/lib.rs`.
+    #[validate(length(min = 1u64, max = 1_000u64))]
+    pub path: String,
+    /// Zero-based line of the position.
+    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
+    pub line: i64,
+    /// Zero-based offset within the line, counted as `position_encoding` states.
+    #[validate(range(min = 0i64, max = 2_147_483_647i64))]
+    pub character: i64,
+}
+/// One submitted position and the declaration holding it, named by the identity package analysis mints in the position's package: `rift://symbol/<language>/<manager>/<name>@<version>/<path>/<qualified name>`.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackageDeclarationResult {
+    /// One position in one file of an exact package version.
+    pub position: PackagePosition,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub declaration: Option<String>,
+    /// Additional properties not defined in the schema.
+    #[serde(flatten)]
+    pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
+}
+/// One result per submitted position. A result without `declaration` names a position no declaration holds.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+pub struct PackageDeclarationResponse {
+    /// Results, one per submitted position.
+    pub results: Vec<PackageDeclarationResult>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -1197,8 +1372,12 @@ pub struct DocumentationBlock {
     pub range: TextRange,
     /// One content owner: a regular source or decoded notebook cell.
     pub source: DocumentationContentIdentity,
-    /// Owning declaration for an attached comment.
-    pub symbol: Option<SymbolId>,
+    /// Identity of one symbol. The name after the language is the provider's stable qualified
+    /// name for the declaration; where the language derives module identity from the file path,
+    /// as TypeScript does, that path is part of the name. A `~N` suffix separates declarations
+    /// the qualified name alone cannot, such as overloads that dispatch separately. A move can
+    /// change the identity when the language includes module path in that qualified name.
+    pub symbol: Option<String>,
 }
 /// The content a documentation block addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
@@ -1247,7 +1426,7 @@ pub struct DocumentationChunk {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationContentIdentity {
-    /// Decoded cell when the parent source is a notebook.
+    /// A selected cell addressed within its parent notebook.
     pub cell: Option<NotebookCell>,
     /// The selected source's canonical address.
     pub source: DocumentationSourceIdentity,
@@ -1455,9 +1634,9 @@ pub struct DocumentationSource {
     pub format: DocumentationSourceFormat,
     /// One content owner: a regular source or decoded notebook cell.
     pub identity: DocumentationContentIdentity,
-    /// Declared source language, when known.
-    pub language: Option<Language>,
-    /// License facts recorded by the source adapter.
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    pub language: Option<String>,
+    /// License metadata supplied by the source adapter.
     pub license: Option<DocumentationLicense>,
     /// Media type supplied by the source adapter.
     pub media_type: String,
@@ -1894,7 +2073,7 @@ pub enum GetCapabilitiesResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Classifies canonical exact versions and declared requirements against indexed package versions.
+/// Answers each canonical entry with a collected release of its package. An exact version answers with that release and a requirement with the newest release it admits; when the package holds no such release, the entry answers with the release nearest the version it names, for a requirement the lowest version it admits. An entry whose package holds no collected release answers as missing.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct ResolvePackageContextRequest {
     /// Canonical package context.
@@ -2036,7 +2215,7 @@ pub enum ResolvePackageContextResponse {
 )]
 pub struct SearchPackagesRequestQuery {
     /// Maximum entries in one page.
-    #[validate(range(min = 1i64, max = 200i64))]
+    #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,
     /// Opaque cursor for the next page.
@@ -2187,7 +2366,7 @@ pub enum SearchPackagesResponse {
 )]
 pub struct ListPackageSymbolsRequestQuery {
     /// Maximum entries in one page.
-    #[validate(range(min = 1i64, max = 200i64))]
+    #[validate(range(min = 1i64, max = 1_000i64))]
     #[default(Some(100i64))]
     pub limit: Option<i64>,
     /// Opaque cursor for the next page.
@@ -2327,6 +2506,288 @@ pub enum ListPackageSymbolsResponse {
     ///default: Unknown response
     Unknown,
 }
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+pub struct SearchPackagePatternsRequestQuery {
+    /// Maximum entries in one page.
+    #[validate(range(min = 1i64, max = 1_000i64))]
+    #[default(Some(100i64))]
+    pub limit: Option<i64>,
+    /// Opaque cursor for the next page.
+    #[validate(length(max = 4_096u64))]
+    pub cursor: Option<String>,
+}
+/// Returns the matches of one regular expression over the source files of selected exact package versions, in package order as the request lists them, then file path order, then match offset. The server verifies candidate files in that order and stops a page at `limit` hits, at `x-rift-page-files-max` files, or at `x-rift-page-text-bytes-max` bytes of verified text, whichever comes first; `next_cursor` continues where the page stopped, and a `result_truncated` warning names the bound.
+#[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
+pub struct SearchPackagePatternsRequest {
+    #[validate(nested)]
+    pub query: SearchPackagePatternsRequestQuery,
+    /// Pattern and selected package versions.
+    #[validate(nested)]
+    pub body: PackagePatternRequest,
+}
+impl SearchPackagePatternsRequest {
+    /// Parse the HTTP response into the response enum.
+    pub async fn parse_response(
+        req: reqwest::Response,
+    ) -> anyhow::Result<SearchPackagePatternsResponse> {
+        let status = req.status();
+        if status == http::StatusCode::OK {
+            let data = oas3_gen_support::Diagnostics::<
+                PackagePatternPage,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Ok(data));
+        }
+        if status == http::StatusCode::BAD_REQUEST {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::BadRequest(data));
+        }
+        if status == http::StatusCode::UNAUTHORIZED {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Unauthorized(data));
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::Forbidden(data));
+        }
+        if status == http::StatusCode::NOT_ACCEPTABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::NotAcceptable(data));
+        }
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::ContentTooLarge(data));
+        }
+        if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::UnsupportedMediaType(data));
+        }
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::TooManyRequests(data));
+        }
+        if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::InternalServerError(data));
+        }
+        if status == http::StatusCode::BAD_GATEWAY {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::BadGateway(data));
+        }
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::ServiceUnavailable(data));
+        }
+        if status == http::StatusCode::GATEWAY_TIMEOUT {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(SearchPackagePatternsResponse::GatewayTimeout(data));
+        }
+        let _ = req.bytes().await?;
+        return Ok(SearchPackagePatternsResponse::Unknown);
+    }
+}
+/// Response types for searchPackagePatterns
+#[derive(Debug, Clone)]
+pub enum SearchPackagePatternsResponse {
+    ///200: One page of pattern matches.
+    Ok(PackagePatternPage),
+    ///400: Request JSON, query parameters, or field relationships are invalid.
+    BadRequest(ProblemDetails),
+    ///401: Authentication is required or credentials are invalid.
+    Unauthorized(ProblemDetails),
+    ///403: Credentials do not permit this operation.
+    Forbidden(ProblemDetails),
+    ///406: The server cannot produce an accepted media type.
+    NotAcceptable(ProblemDetails),
+    ///413: The request body exceeds the request body bound.
+    ContentTooLarge(ProblemDetails),
+    ///415: The request media type is unsupported.
+    UnsupportedMediaType(ProblemDetails),
+    ///429: The request rate limit is exhausted.
+    TooManyRequests(ProblemDetails),
+    ///500: The server encountered an unexpected failure.
+    InternalServerError(ProblemDetails),
+    ///502: The server received an invalid upstream response.
+    BadGateway(ProblemDetails),
+    ///503: The service is temporarily unavailable.
+    ServiceUnavailable(ProblemDetails),
+    ///504: The upstream request timed out.
+    GatewayTimeout(ProblemDetails),
+    ///default: Unknown response
+    Unknown,
+}
+/// Names, for each position in a file of an exact package version, the smallest declaration whose range holds it. A position in a type stub, such as a `.pyi` or `.d.ts` file, answers the declaration the stub describes: the module's declaration when the stub pairs with a module file. A position answers no declaration when the global index holds no release at that exact version, no file at that path, or no declaration holding the position. The server **MUST NOT** answer from another version, and **MUST NOT** move a position past its line or the text, or one inside a character, to a neighboring one.
+#[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
+pub struct FindPackageDeclarationsRequest {
+    /// Positions in package files.
+    #[validate(nested)]
+    pub body: PackageDeclarationRequest,
+}
+impl FindPackageDeclarationsRequest {
+    /// Parse the HTTP response into the response enum.
+    pub async fn parse_response(
+        req: reqwest::Response,
+    ) -> anyhow::Result<FindPackageDeclarationsResponse> {
+        let status = req.status();
+        if status == http::StatusCode::OK {
+            let data = oas3_gen_support::Diagnostics::<
+                PackageDeclarationResponse,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Ok(data));
+        }
+        if status == http::StatusCode::BAD_REQUEST {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::BadRequest(data));
+        }
+        if status == http::StatusCode::UNAUTHORIZED {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Unauthorized(data));
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::Forbidden(data));
+        }
+        if status == http::StatusCode::NOT_ACCEPTABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::NotAcceptable(data));
+        }
+        if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::ContentTooLarge(data));
+        }
+        if status == http::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::UnsupportedMediaType(data));
+        }
+        if status == http::StatusCode::TOO_MANY_REQUESTS {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::TooManyRequests(data));
+        }
+        if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::InternalServerError(data));
+        }
+        if status == http::StatusCode::BAD_GATEWAY {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::BadGateway(data));
+        }
+        if status == http::StatusCode::SERVICE_UNAVAILABLE {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::ServiceUnavailable(data));
+        }
+        if status == http::StatusCode::GATEWAY_TIMEOUT {
+            let data = oas3_gen_support::Diagnostics::<
+                ProblemDetails,
+            >::json_with_diagnostics(req)
+                .await?;
+            return Ok(FindPackageDeclarationsResponse::GatewayTimeout(data));
+        }
+        let _ = req.bytes().await?;
+        return Ok(FindPackageDeclarationsResponse::Unknown);
+    }
+}
+/// Response types for findPackageDeclarations
+#[derive(Debug, Clone)]
+pub enum FindPackageDeclarationsResponse {
+    ///200: One answer per submitted position.
+    Ok(PackageDeclarationResponse),
+    ///400: Request JSON, query parameters, or field relationships are invalid.
+    BadRequest(ProblemDetails),
+    ///401: Authentication is required or credentials are invalid.
+    Unauthorized(ProblemDetails),
+    ///403: Credentials do not permit this operation.
+    Forbidden(ProblemDetails),
+    ///406: The server cannot produce an accepted media type.
+    NotAcceptable(ProblemDetails),
+    ///413: The request body exceeds the request body bound.
+    ContentTooLarge(ProblemDetails),
+    ///415: The request media type is unsupported.
+    UnsupportedMediaType(ProblemDetails),
+    ///429: The request rate limit is exhausted.
+    TooManyRequests(ProblemDetails),
+    ///500: The server encountered an unexpected failure.
+    InternalServerError(ProblemDetails),
+    ///502: The server received an invalid upstream response.
+    BadGateway(ProblemDetails),
+    ///503: The service is temporarily unavailable.
+    ServiceUnavailable(ProblemDetails),
+    ///504: The upstream request timed out.
+    GatewayTimeout(ProblemDetails),
+    ///default: Unknown response
+    Unknown,
+}
 /// Stable warning code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
 pub enum WarningCode {
@@ -2336,6 +2797,7 @@ pub enum WarningCode {
     PublicationChanged,
     CapabilityUnavailable,
     ResultTruncated,
+    RequirementUnsatisfied,
     Unknown,
 }
 impl core::fmt::Display for WarningCode {
@@ -2346,6 +2808,7 @@ impl core::fmt::Display for WarningCode {
             Self::PublicationChanged => write!(f, "publication_changed"),
             Self::CapabilityUnavailable => write!(f, "capability_unavailable"),
             Self::ResultTruncated => write!(f, "result_truncated"),
+            Self::RequirementUnsatisfied => write!(f, "requirement_unsatisfied"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -2362,6 +2825,7 @@ impl<'de> serde::Deserialize<'de> for WarningCode {
             "publication_changed" => Ok(WarningCode::PublicationChanged),
             "capability_unavailable" => Ok(WarningCode::CapabilityUnavailable),
             "result_truncated" => Ok(WarningCode::ResultTruncated),
+            "requirement_unsatisfied" => Ok(WarningCode::RequirementUnsatisfied),
             "unknown" => Ok(WarningCode::Unknown),
             _ => Ok(WarningCode::Unknown),
         }
@@ -2445,7 +2909,7 @@ pub enum PackageSearchHitContributingField {
     QualifiedName,
     Documentation,
     Signature,
-    DeclarationSource,
+    FileContent,
     Unknown,
 }
 impl core::fmt::Display for PackageSearchHitContributingField {
@@ -2455,7 +2919,7 @@ impl core::fmt::Display for PackageSearchHitContributingField {
             Self::QualifiedName => write!(f, "qualified_name"),
             Self::Documentation => write!(f, "documentation"),
             Self::Signature => write!(f, "signature"),
-            Self::DeclarationSource => write!(f, "declaration_source"),
+            Self::FileContent => write!(f, "file_content"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -2471,9 +2935,7 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
             "qualified_name" => Ok(PackageSearchHitContributingField::QualifiedName),
             "documentation" => Ok(PackageSearchHitContributingField::Documentation),
             "signature" => Ok(PackageSearchHitContributingField::Signature),
-            "declaration_source" => {
-                Ok(PackageSearchHitContributingField::DeclarationSource)
-            }
+            "file_content" => Ok(PackageSearchHitContributingField::FileContent),
             "unknown" => Ok(PackageSearchHitContributingField::Unknown),
             _ => Ok(PackageSearchHitContributingField::Unknown),
         }
@@ -2505,6 +2967,36 @@ impl<'de> serde::Deserialize<'de> for PackageSymbolRequestInclude {
             "source" => Ok(PackageSymbolRequestInclude::Source),
             "documentation" => Ok(PackageSymbolRequestInclude::Documentation),
             _ => Err(serde::de::Error::unknown_variant(&s, &["source", "documentation"])),
+        }
+    }
+}
+/// How `character` counts within a line: UTF-8 bytes or UTF-16 code units, as the language engine that reported the positions negotiated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
+pub enum PackageDeclarationRequestPositionEncoding {
+    #[serde(rename = "utf-8")]
+    #[default]
+    Utf8,
+    #[serde(rename = "utf-16")]
+    Utf16,
+}
+impl core::fmt::Display for PackageDeclarationRequestPositionEncoding {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Utf8 => write!(f, "utf-8"),
+            Self::Utf16 => write!(f, "utf-16"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for PackageDeclarationRequestPositionEncoding {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "utf-8" => Ok(PackageDeclarationRequestPositionEncoding::Utf8),
+            "utf-16" => Ok(PackageDeclarationRequestPositionEncoding::Utf16),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["utf-8", "utf-16"])),
         }
     }
 }

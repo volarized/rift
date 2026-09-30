@@ -1,6 +1,8 @@
 //! Bounded client for Rift global package data.
 
 pub mod contract;
+mod declaration;
+mod pattern;
 mod response;
 
 use std::{
@@ -46,23 +48,29 @@ pub use generated::{
     DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
+    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions,
+    FindPackageDeclarationsRequest, FindPackageDeclarationsResponse, GetCapabilitiesRequest,
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
-    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
-    PackageDocumentationHitContributingField, PackageIdentity, PackageResolutionRequest,
-    PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
-    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
-    PackageSymbolRequestInclude, Parameter, ProblemDetails, PublicationFormat, QueryTerm,
-    ResolvePackageContextRequest, ResolvePackageContextResponse, ResolvedRequirement,
-    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, Signature,
-    SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
-    Warning, WarningCode,
+    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDeclarationRequest,
+    PackageDeclarationRequestPositionEncoding, PackageDeclarationResponse,
+    PackageDeclarationResult, PackageDocumentationHit, PackageDocumentationHitContributingField,
+    PackageIdentity, PackagePatternDeclaration, PackagePatternHit, PackagePatternPage,
+    PackagePatternRequest, PackagePosition, PackageResolutionRequest, PackageResolutionResponse,
+    PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
+    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
+    ProblemDetails, PublicationFormat, QueryTerm, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
+    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
+    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
-pub use domain::{PackageSearchCandidate, PackageSymbolCandidate};
+pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
+pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
+pub use pattern::PATTERN_PAGE_FILES_MAX;
 
 /// Most bytes one encoded request body carries.
 pub const REQUEST_BODY_BYTES_MAX: usize = 4 * 1024 * 1024;
@@ -74,11 +82,29 @@ pub const ATTEMPTS_MIN: u32 = 1;
 pub const ATTEMPTS_MAX: u32 = 5;
 /// Most entries one dependency context carries.
 pub const DEPENDENCY_ENTRIES_MAX: usize = 20_000;
-/// Most UTF-8 bytes one query carries.
+/// Most characters one package manager name carries, the contract's `maxLength`.
+pub const PACKAGE_MANAGER_CHARS_MAX: usize = 128;
+/// Most characters one package name carries, the contract's `maxLength`.
+pub const PACKAGE_NAME_CHARS_MAX: usize = 4_096;
+/// Most characters one package version, or one version requirement, carries: the contract's
+/// `maxLength`.
+pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
+/// Most characters one capability name, package manager name, or revision label in the
+/// capabilities and page metadata carries.
+const LABEL_CHARS_MAX: usize = 128;
+/// The capability feature a server advertises when search answers documentation blocks.
+const DOCUMENTATION_SEARCH_FEATURE: &str = "documentation_search";
+/// The capability feature a server advertises when symbol reads attach documentation.
+const SYMBOL_DOCUMENTATION_FEATURE: &str = "symbol_documentation";
+/// Most characters one query or symbol `name` carries, the unit the contract's `maxLength`
+/// counts for both, and the ceiling of the advertised `query_bytes_max`, which counts UTF-8
+/// bytes.
 pub const QUERY_BYTES_MAX: usize = 4_096;
 /// Most terms one query carries.
 pub const QUERY_TERMS_MAX: usize = 32;
-/// Most UTF-8 bytes one query term carries.
+/// Most characters one query term carries, the unit the contract's `maxLength` counts for
+/// `text`, and the ceiling of the advertised `query_term_bytes_max`, which counts UTF-8
+/// bytes.
 pub const QUERY_TERM_BYTES_MAX: usize = 256;
 /// Most identifiers one query carries.
 pub const IDENTIFIERS_MAX: usize = 16;
@@ -91,9 +117,19 @@ pub const CURSOR_BYTES_MAX: usize = 4_096;
 /// Fewest entries one requested page carries.
 pub const PAGE_LIMIT_MIN: i64 = 1;
 /// Most entries one requested page carries.
-pub const PAGE_LIMIT_MAX: i64 = 200;
+///
+/// A paged read asks for the smaller of its limit and the advertised `page_limit_max`, so one
+/// client pages against a server advertising 200 and reads one page per search phase against a
+/// server advertising 1,000.
+pub const PAGE_LIMIT_MAX: i64 = 1_000;
 /// Most warnings one page assembly retains.
 pub const WARNINGS_MAX: usize = 32;
+/// Most characters one warning's `detail` carries, on a page or a resolution: room for the
+/// longest `requirement_unsatisfied` detail the package fields admit.
+pub const WARNING_DETAIL_CHARS_MAX: usize = rift_protocol::read::GLOBAL_WARNING_DETAIL_CHARS_MAX;
+/// What a `requirement_unsatisfied` detail writes between the requirement and the version
+/// that answers it.
+pub(crate) const ANSWERED_BY: &str = " answered by ";
 /// Most UTF-8 bytes one source payload carries.
 pub const SOURCE_BYTES_MAX: usize = 1024 * 1024;
 /// Most candidates one page assembly retains.
@@ -287,6 +323,12 @@ pub enum ClientError {
         /// Stable field name.
         field: &'static str,
     },
+    /// The capabilities do not advertise the feature the operation needs, so the client
+    /// sent no request for it.
+    FeatureUnavailable {
+        /// The feature as the capabilities spell it, such as `patterns`.
+        feature: &'static str,
+    },
     /// Endpoint returned a non-success response.
     Http {
         /// Bounded status and headers.
@@ -328,6 +370,9 @@ impl fmt::Display for ClientError {
             Self::InvalidResponseField { field } => {
                 write!(f, "global response violates contract: {field}")
             }
+            Self::FeatureUnavailable { feature } => {
+                write!(f, "global API does not advertise feature: {feature}")
+            }
             Self::Http { meta, .. } => write!(f, "global endpoint returned HTTP {}", meta.status),
         }
     }
@@ -351,7 +396,7 @@ struct Inner {
     capabilities_flight: Mutex<()>,
     resolutions: RwLock<HashMap<Vec<u8>, CachedResolution>>,
     resolutions_flight: Mutex<()>,
-    unavailable_until: RwLock<Option<Instant>>,
+    failure: RwLock<Option<CachedFailure>>,
 }
 
 #[derive(Clone)]
@@ -364,6 +409,13 @@ struct CachedCapabilities {
 #[derive(Clone)]
 struct CachedResolution {
     value: PackageResolutionResponse,
+    expires: Instant,
+}
+
+/// The failure that marked the endpoint unavailable, which every request answers until
+/// `expires`, so a later read reports the class the first one met.
+struct CachedFailure {
+    error: ClientError,
     expires: Instant,
 }
 
@@ -386,6 +438,9 @@ pub struct PackageSearchPages {
     pub corpus_revision: String,
     /// Documentation revision shared by every page that returns documentation.
     pub documentation_revision: Option<String>,
+    /// Cursor of the last page when the server stopped it at the response body bound. The
+    /// assembly does not follow it; a caller **MAY** pass it to `search_packages`.
+    pub next_cursor: Option<String>,
 }
 
 /// Symbol pages assembled under one capability and candidate bound.
@@ -401,6 +456,9 @@ pub struct PackageSymbolPages {
     pub corpus_revision: String,
     /// Documentation revision shared by every page that returns documentation.
     pub documentation_revision: Option<String>,
+    /// Cursor of the last page when the server stopped it at the response body bound. The
+    /// assembly does not follow it; a caller **MAY** pass it to `list_package_symbols`.
+    pub next_cursor: Option<String>,
 }
 
 impl GlobalClient {
@@ -458,7 +516,7 @@ impl GlobalClient {
                 capabilities_flight: Mutex::new(()),
                 resolutions: RwLock::new(HashMap::new()),
                 resolutions_flight: Mutex::new(()),
-                unavailable_until: RwLock::new(None),
+                failure: RwLock::new(None),
                 config,
             }),
         })
@@ -479,8 +537,8 @@ impl GlobalClient {
         if !self.inner.enabled {
             return Err(ClientError::Disabled);
         }
-        if self.is_unavailable().await {
-            return Err(ClientError::Connection);
+        if let Some(failure) = self.recorded_failure().await {
+            return Err(failure);
         }
         let _flight = self.inner.capabilities_flight.lock().await;
         if let Some(cached) = self.inner.capabilities.read().await.as_ref()
@@ -527,17 +585,14 @@ impl GlobalClient {
                         expires: Instant::now() + ttl,
                     };
                     *self.inner.capabilities.write().await = Some(cached);
-                    *self.inner.unavailable_until.write().await = None;
+                    *self.inner.failure.write().await = None;
                     Ok(value)
                 }
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
         };
-        if result.is_err() {
-            self.record_failure().await;
-        }
-        result
+        self.observed(result).await
     }
 
     /// Resolves one canonical dependency context into exact package identities.
@@ -581,20 +636,17 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value, meta } = match response::resolution(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_resolution_response(request, &value) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
         self.inner.resolutions.write().await.insert(
@@ -643,20 +695,17 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value: page, .. } = match response::search(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_search_page(request, &capabilities, &page, cursor) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         Ok(page)
     }
@@ -697,25 +746,26 @@ impl GlobalClient {
         {
             Ok(raw) => raw,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         let response::Parsed { value: page, .. } = match response::symbols(raw).await {
             Ok(parsed) => parsed,
             Err(error) => {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
         };
         if let Err(error) = validate_symbol_page(request, &capabilities, &page, cursor) {
-            self.record_failure().await;
-            return Err(error);
+            return self.observed(Err(error)).await;
         }
         Ok(page)
     }
 
-    /// Reads package search pages through the active candidate bound.
+    /// Reads package search pages through the active candidate bound, asking each page for the
+    /// smaller of `limit` and the advertised `page_limit_max`.
+    ///
+    /// A page the server stopped at the response body bound ends the assembly, and its cursor
+    /// lands in [`PackageSearchPages::next_cursor`] unfollowed.
     ///
     /// # Errors
     ///
@@ -729,6 +779,7 @@ impl GlobalClient {
         validate_search_request(request)?;
         validate_page(limit, None)?;
         let capabilities = self.get_capabilities().await?;
+        let limit = advertised_page_limit(limit, &capabilities);
         validate_search_request_for_capabilities(request, limit, None, &capabilities)?;
         let candidate_max = bounded_candidate_pool(&capabilities);
         let mut cursor = None;
@@ -747,37 +798,46 @@ impl GlobalClient {
                 &page.corpus_revision,
                 page.documentation_revision.as_deref(),
             ) {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
+            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
                 let identity = search_hit_identity(&hit)?;
                 if !seen_identities.insert(identity) {
-                    self.record_failure().await;
-                    return Err(ClientError::InvalidResponseField {
-                        field: "duplicate_item",
-                    });
+                    return self
+                        .observed(Err(ClientError::InvalidResponseField {
+                            field: "duplicate_item",
+                        }))
+                        .await;
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
-                    return Ok(search_pages(hits, warnings, revisions));
+                    return Ok(search_pages(hits, warnings, revisions, None));
                 }
             }
             let Some(next) = page.next_cursor else {
-                return Ok(search_pages(hits, warnings, revisions));
+                return Ok(search_pages(hits, warnings, revisions, None));
             };
+            if stopped {
+                return Ok(search_pages(hits, warnings, revisions, Some(next)));
+            }
             if !seen_cursors.insert(next.clone()) {
-                self.record_failure().await;
-                return Err(ClientError::InvalidResponseField {
-                    field: "cursor_progress",
-                });
+                return self
+                    .observed(Err(ClientError::InvalidResponseField {
+                        field: "cursor_progress",
+                    }))
+                    .await;
             }
             cursor = Some(next);
         }
     }
 
-    /// Reads package symbol pages through the active candidate bound.
+    /// Reads package symbol pages through the active candidate bound, asking each page for the
+    /// smaller of `limit` and the advertised `page_limit_max`.
+    ///
+    /// A page the server stopped at the response body bound ends the assembly, and its cursor
+    /// lands in [`PackageSymbolPages::next_cursor`] unfollowed.
     ///
     /// # Errors
     ///
@@ -791,6 +851,7 @@ impl GlobalClient {
         validate_symbol_request(request)?;
         validate_page(limit, None)?;
         let capabilities = self.get_capabilities().await?;
+        let limit = advertised_page_limit(limit, &capabilities);
         validate_symbol_request_for_capabilities(request, limit, None, &capabilities)?;
         let candidate_max = bounded_candidate_pool(&capabilities);
         let mut cursor = None;
@@ -808,9 +869,9 @@ impl GlobalClient {
                 &page.corpus_revision,
                 page.documentation_revision.as_deref(),
             ) {
-                self.record_failure().await;
-                return Err(error);
+                return self.observed(Err(error)).await;
             }
+            let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
             extend_warnings(&mut warnings, page.warnings);
             for hit in page.items {
                 let identity = symbol_hit_identity(&hit);
@@ -818,24 +879,29 @@ impl GlobalClient {
                     .iter()
                     .any(|item: &PackageSymbol| symbol_hit_identity(item) == identity)
                 {
-                    self.record_failure().await;
-                    return Err(ClientError::InvalidResponseField {
-                        field: "duplicate_item",
-                    });
+                    return self
+                        .observed(Err(ClientError::InvalidResponseField {
+                            field: "duplicate_item",
+                        }))
+                        .await;
                 }
                 hits.push(hit);
                 if hits.len() >= candidate_max {
-                    return Ok(symbol_pages(hits, warnings, revisions));
+                    return Ok(symbol_pages(hits, warnings, revisions, None));
                 }
             }
             let Some(next) = page.next_cursor else {
-                return Ok(symbol_pages(hits, warnings, revisions));
+                return Ok(symbol_pages(hits, warnings, revisions, None));
             };
+            if stopped {
+                return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
+            }
             if !seen_cursors.insert(next.clone()) {
-                self.record_failure().await;
-                return Err(ClientError::InvalidResponseField {
-                    field: "cursor_progress",
-                });
+                return self
+                    .observed(Err(ClientError::InvalidResponseField {
+                        field: "cursor_progress",
+                    }))
+                    .await;
             }
             cursor = Some(next);
         }
@@ -1048,16 +1114,27 @@ impl GlobalClient {
         })
     }
 
-    async fn is_unavailable(&self) -> bool {
+    /// Hands `result` back, first recording its failure as the one every request answers
+    /// for `failure_ttl`.
+    async fn observed<T>(&self, result: Result<T, ClientError>) -> Result<T, ClientError> {
+        if let Err(error) = &result {
+            *self.inner.failure.write().await = Some(CachedFailure {
+                error: error.clone(),
+                expires: Instant::now() + self.inner.config.failure_ttl,
+            });
+        }
+        result
+    }
+
+    /// The failure the endpoint answers while it is marked unavailable.
+    async fn recorded_failure(&self) -> Option<ClientError> {
         self.inner
-            .unavailable_until
+            .failure
             .read()
             .await
-            .is_some_and(|until| until > Instant::now())
-    }
-    async fn record_failure(&self) {
-        *self.inner.unavailable_until.write().await =
-            Some(Instant::now() + self.inner.config.failure_ttl);
+            .as_ref()
+            .filter(|failure| failure.expires > Instant::now())
+            .map(|failure| failure.error.clone())
     }
 }
 
@@ -1107,7 +1184,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         || value
             .supported_package_managers
             .iter()
-            .any(|manager| manager.is_empty() || manager.len() > 128)
+            .any(|manager| !within_characters(manager, LABEL_CHARS_MAX))
     {
         return Err(ClientError::InvalidResponseField {
             field: "supported_package_managers",
@@ -1119,7 +1196,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
         || value
             .supported_features
             .iter()
-            .any(|feature| feature.is_empty() || feature.len() > 128)
+            .any(|feature| !within_characters(feature, LABEL_CHARS_MAX))
         || required_features.iter().any(|required| {
             !value
                 .supported_features
@@ -1131,15 +1208,13 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
             field: "supported_features",
         });
     }
-    if value.analyzer_revision.is_empty()
-        || value.analyzer_revision.len() > 128
-        || value.corpus_revision.is_empty()
-        || value.corpus_revision.len() > 128
+    if !within_characters(&value.analyzer_revision, LABEL_CHARS_MAX)
+        || !within_characters(&value.corpus_revision, LABEL_CHARS_MAX)
     {
         return Err(ClientError::InvalidResponseField { field: "revision" });
     }
-    let documentation_supported = supports_feature(value, "documentation_search")
-        || supports_feature(value, "symbol_documentation");
+    let documentation_supported = supports_feature(value, DOCUMENTATION_SEARCH_FEATURE)
+        || supports_feature(value, SYMBOL_DOCUMENTATION_FEATURE);
     if documentation_supported
         != value
             .documentation_revision
@@ -1173,13 +1248,7 @@ fn validate_capabilities(value: &Capabilities) -> Result<(), ClientError> {
     if !bounds_ok {
         return Err(ClientError::InvalidResponseField { field: "bounds" });
     }
-    let known_fields = [
-        "name",
-        "qualified_name",
-        "documentation",
-        "signature",
-        "declaration_source",
-    ];
+    let known_fields = ["name", "qualified_name", "documentation", "signature"];
     if value.required_search_fields.len() != known_fields.len()
         || known_fields.iter().any(|required| {
             !value
@@ -1213,12 +1282,7 @@ fn validate_resolution_request_for_capabilities(
     request: &PackageResolutionRequest,
     capabilities: &Capabilities,
 ) -> Result<(), ClientError> {
-    if request.entries.len()
-        > smaller_bound(
-            capabilities.bounds.dependency_entries_max,
-            DEPENDENCY_ENTRIES_MAX,
-        )
-    {
+    if request.entries.len() > capabilities.dependency_entries_max() {
         return Err(ClientError::InvalidRequest { field: "entries" });
     }
     Ok(())
@@ -1237,9 +1301,11 @@ fn validate_search_request_for_capabilities(
     if matches!(
         target,
         PackageSearchRequestTarget::Documentation | PackageSearchRequestTarget::All
-    ) && !supports_feature(capabilities, "documentation_search")
+    ) && !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
     {
-        return Err(ClientError::InvalidRequest { field: "target" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: DOCUMENTATION_SEARCH_FEATURE,
+        });
     }
     let bounds = &capabilities.bounds;
     if request.query.len() > smaller_bound(bounds.query_bytes_max, QUERY_BYTES_MAX) {
@@ -1274,9 +1340,11 @@ fn validate_symbol_request_for_capabilities(
         .include
         .as_ref()
         .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation))
-        && !supports_feature(capabilities, "symbol_documentation")
+        && !supports_feature(capabilities, SYMBOL_DOCUMENTATION_FEATURE)
     {
-        return Err(ClientError::InvalidRequest { field: "include" });
+        return Err(ClientError::FeatureUnavailable {
+            feature: SYMBOL_DOCUMENTATION_FEATURE,
+        });
     }
     if request.name.len() > smaller_bound(capabilities.bounds.query_bytes_max, QUERY_BYTES_MAX) {
         return Err(ClientError::InvalidRequest { field: "name" });
@@ -1316,8 +1384,8 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
                 field: "availability",
             });
         }
-        bounded_nonempty(&entry.manager, 128, "manager")?;
-        bounded_nonempty(&entry.name, IDENTIFIER_BYTES_MAX, "name")?;
+        bounded_nonempty_characters(&entry.manager, PACKAGE_MANAGER_CHARS_MAX, "manager")?;
+        bounded_nonempty_characters(&entry.name, PACKAGE_NAME_CHARS_MAX, "name")?;
         if entry.version.is_some() == entry.requirement.is_some() {
             return Err(ClientError::InvalidRequest {
                 field: "version_or_requirement",
@@ -1325,12 +1393,9 @@ fn validate_resolution_request(request: &PackageResolutionRequest) -> Result<(),
         }
         if entry
             .version
-            .as_ref()
-            .is_some_and(|value| value.len() > IDENTIFIER_BYTES_MAX)
-            || entry
-                .requirement
-                .as_ref()
-                .is_some_and(|value| value.len() > IDENTIFIER_BYTES_MAX)
+            .iter()
+            .chain(&entry.requirement)
+            .any(|selector| selector.chars().count() > PACKAGE_VERSION_CHARS_MAX)
         {
             return Err(ClientError::InvalidRequest { field: "selector" });
         }
@@ -1377,11 +1442,7 @@ fn validate_resolution_response(
         }
     }
     for resolved in &response.resolved_requirements {
-        if resolved.package.manager != resolved.entry.manager
-            || resolved.package.name != resolved.entry.name
-            || resolved.entry.requirement.is_none()
-            || resolved.entry.version.is_some()
-        {
+        if !resolved.answers_its_entry() {
             return Err(ClientError::InvalidResponseField {
                 field: "resolved_requirement",
             });
@@ -1414,16 +1475,141 @@ fn validate_resolution_response(
             field: "resolution_accounting",
         });
     }
+    validate_resolution_warnings(response)
+}
+
+/// Checks the resolution's warnings: bounded like page warnings, and each
+/// `requirement_unsatisfied` naming, through its `detail`, one requirement of
+/// `resolved_requirements` beside the version that answers it, at most once.
+fn validate_resolution_warnings(response: &PackageResolutionResponse) -> Result<(), ClientError> {
+    let warnings = response.warnings.as_deref().unwrap_or_default();
+    if warnings.len() > DEPENDENCY_ENTRIES_MAX || !warning_details_within_bound(warnings) {
+        return Err(ClientError::InvalidResponseField { field: "warnings" });
+    }
+    let named: HashSet<String> = response
+        .resolved_requirements
+        .iter()
+        .filter_map(ResolvedRequirement::unsatisfied_detail)
+        .collect();
+    let mut seen = HashSet::new();
+    for warning in warnings {
+        if warning.code != WarningCode::RequirementUnsatisfied {
+            continue;
+        }
+        let detail = warning.detail.as_deref();
+        let names_a_requirement = detail.is_some_and(|detail| named.contains(detail));
+        if !names_a_requirement || !seen.insert(detail) {
+            return Err(ClientError::InvalidResponseField {
+                field: "resolution_warning",
+            });
+        }
+    }
     Ok(())
 }
 
+/// Whether every warning's `detail`, when present, holds 1 to `WARNING_DETAIL_CHARS_MAX`
+/// characters.
+fn warning_details_within_bound(warnings: &[Warning]) -> bool {
+    warnings.iter().all(|warning| {
+        warning
+            .detail
+            .as_ref()
+            .is_none_or(|detail| within_characters(detail, WARNING_DETAIL_CHARS_MAX))
+    })
+}
+
+impl ResolvedRequirement {
+    /// Whether the served package is the entry's package, answering a requirement at any
+    /// version or an exact version at another one. An exact entry answered at its own version
+    /// belongs in `available_exact`.
+    fn answers_its_entry(&self) -> bool {
+        let names_the_package =
+            self.package.manager == self.entry.manager && self.package.name == self.entry.name;
+        let selector_holds = match (&self.entry.version, &self.entry.requirement) {
+            (None, Some(_)) => true,
+            (Some(requested), None) => requested != &self.package.version,
+            _ => false,
+        };
+        names_the_package && selector_holds
+    }
+
+    /// The `detail` a `requirement_unsatisfied` warning carries for this requirement:
+    /// `<manager>/<name> <requirement> answered by <version>`. `None` for an exact entry.
+    fn unsatisfied_detail(&self) -> Option<String> {
+        let requirement = self.entry.requirement.as_ref()?;
+        Some(format!(
+            "{}/{} {requirement}{ANSWERED_BY}{}",
+            self.entry.manager, self.entry.name, self.package.version
+        ))
+    }
+}
+
+/// One entry the global index answers from a release other than the one it names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Substitution {
+    /// The entry as the dependency context states it.
+    pub requested: PackageContextEntry,
+    /// The collected release that answers it.
+    pub served: PackageIdentity,
+}
+
+impl Capabilities {
+    /// Most entries one resolution request carries under these capabilities: the smaller of
+    /// the advertised `dependency_entries_max` and [`DEPENDENCY_ENTRIES_MAX`]. The client
+    /// refuses a longer request naming `entries` before it reaches the network.
+    #[must_use]
+    pub fn dependency_entries_max(&self) -> usize {
+        smaller_bound(self.bounds.dependency_entries_max, DEPENDENCY_ENTRIES_MAX)
+    }
+}
+
+impl PackageResolutionResponse {
+    /// The substitutions this resolution names, in `resolved_requirements` order: each exact
+    /// entry answered at another version, and each requirement whose served version a
+    /// `requirement_unsatisfied` warning names in its `detail`.
+    ///
+    /// The resolution names an exact substitution by answering the exact entry in
+    /// `resolved_requirements` beside the served package. An `available_exact` package at a
+    /// version no entry requested is an unnamed substitution, and the client refuses that
+    /// whole resolution as `resolution_accounting`.
+    #[must_use]
+    pub fn substitutions(&self) -> Vec<Substitution> {
+        let unsatisfied: HashSet<&str> = self
+            .warnings
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|warning| warning.code == WarningCode::RequirementUnsatisfied)
+            .filter_map(|warning| warning.detail.as_deref())
+            .collect();
+        self.resolved_requirements
+            .iter()
+            .filter(|resolved| {
+                let exact_elsewhere = resolved
+                    .entry
+                    .version
+                    .as_ref()
+                    .is_some_and(|requested| requested != &resolved.package.version);
+                let outside_its_range = resolved
+                    .unsatisfied_detail()
+                    .is_some_and(|detail| unsatisfied.contains(detail.as_str()));
+                exact_elsewhere || outside_its_range
+            })
+            .map(|resolved| Substitution {
+                requested: resolved.entry.clone(),
+                served: resolved.package.clone(),
+            })
+            .collect()
+    }
+}
+
 fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.query, QUERY_BYTES_MAX, "query")?;
+    bounded_nonempty_characters(&request.query, QUERY_BYTES_MAX, "query")?;
     if request.terms.is_empty() || request.terms.len() > QUERY_TERMS_MAX {
         return Err(ClientError::InvalidRequest { field: "terms" });
     }
     for term in &request.terms {
-        bounded_nonempty(&term.text, QUERY_TERM_BYTES_MAX, "term")?;
+        bounded_nonempty_characters(&term.text, QUERY_TERM_BYTES_MAX, "term")?;
         if term.phrase && term.prefix {
             return Err(ClientError::InvalidRequest {
                 field: "phrase_prefix",
@@ -1469,7 +1655,7 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientE
 }
 
 fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientError> {
-    bounded_nonempty(&request.name, QUERY_BYTES_MAX, "name")?;
+    bounded_nonempty_characters(&request.name, QUERY_BYTES_MAX, "name")?;
     if request
         .include
         .as_ref()
@@ -1480,15 +1666,29 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     validate_packages(&request.packages)
 }
 
+/// Checks one package identity against the contract's bounds, which count characters: a
+/// package name the resolution answered in any script reaches the read that names it.
+fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
+    bounded_nonempty_characters(
+        &package.manager,
+        PACKAGE_MANAGER_CHARS_MAX,
+        "package_manager",
+    )?;
+    bounded_nonempty_characters(&package.name, PACKAGE_NAME_CHARS_MAX, "package_name")?;
+    bounded_nonempty_characters(
+        &package.version,
+        PACKAGE_VERSION_CHARS_MAX,
+        "package_version",
+    )
+}
+
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
     if packages.len() > PACKAGES_MAX {
         return Err(ClientError::InvalidRequest { field: "packages" });
     }
     let mut seen = HashSet::new();
     for package in packages {
-        bounded_nonempty(&package.manager, 128, "package_manager")?;
-        bounded_nonempty(&package.name, IDENTIFIER_BYTES_MAX, "package_name")?;
-        bounded_nonempty(&package.version, IDENTIFIER_BYTES_MAX, "package_version")?;
+        validate_package_identity(package)?;
         if !seen.insert((
             package.manager.as_str(),
             package.name.as_str(),
@@ -1500,6 +1700,12 @@ fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+/// The page size one paged read asks for: the caller's limit, cut to the advertised
+/// `page_limit_max`.
+fn advertised_page_limit(limit: i64, capabilities: &Capabilities) -> i64 {
+    limit.min(capabilities.bounds.page_limit_max)
 }
 
 fn validate_page(limit: i64, cursor: Option<&str>) -> Result<(), ClientError> {
@@ -1568,7 +1774,7 @@ fn validate_search_page(
                 documentation_bytes += hit.source.as_ref().map_or(0, String::len);
                 validate_documentation_bytes(documentation_bytes)?;
                 if !documentation_requested
-                    || !supports_feature(capabilities, "documentation_search")
+                    || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
                     || !packages.contains(&package_key(&hit.package))
                     || page.documentation_revision.as_deref()
                         != Some(hit.documentation.documentation_revision.as_str())
@@ -1719,8 +1925,7 @@ impl PageMetadata<'_> {
                 field: "publication_format",
             });
         }
-        if self.analyzer_revision.is_empty()
-            || self.analyzer_revision.len() > 128
+        if !within_characters(self.analyzer_revision, LABEL_CHARS_MAX)
             || self.corpus_revision != capabilities.corpus_revision
         {
             return Err(ClientError::InvalidResponseField { field: "revision" });
@@ -1746,12 +1951,7 @@ impl PageMetadata<'_> {
             return Err(ClientError::InvalidResponseField { field: "cursor" });
         }
         if self.warnings.len() > smaller_bound(capabilities.bounds.warnings_max, WARNINGS_MAX)
-            || self.warnings.iter().any(|warning| {
-                warning
-                    .detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.is_empty() || detail.len() > 1024)
-            })
+            || !warning_details_within_bound(self.warnings)
         {
             return Err(ClientError::InvalidResponseField { field: "warnings" });
         }
@@ -1794,25 +1994,7 @@ fn validate_hit_common(
     {
         return Err(ClientError::InvalidResponseField { field: "source" });
     }
-    let unit = rift_core::SourceUnitId::parse(location.unit).map_err(|_| {
-        ClientError::InvalidResponseField {
-            field: "source_identity",
-        }
-    })?;
-    let package_prefix = format!("{}@{}/", package.name, package.version);
-    let source_path = unit
-        .key()
-        .as_str()
-        .strip_prefix(&package_prefix)
-        .filter(|path| !path.is_empty())
-        .ok_or(ClientError::InvalidResponseField {
-            field: "source_identity",
-        })?;
-    if unit.resolver().as_str() != package.manager {
-        return Err(ClientError::InvalidResponseField {
-            field: "source_identity",
-        });
-    }
+    let source_path = package_source_path(package, location.unit)?;
     let Some(origin) = symbol.origin.as_ref() else {
         return Err(ClientError::InvalidResponseField { field: "origin" });
     };
@@ -1821,10 +2003,41 @@ fn validate_hit_common(
     {
         return Err(ClientError::InvalidResponseField { field: "origin" });
     }
-    validate_symbol_identity(symbol, source_path)
+    validate_symbol_identity(symbol, package, &source_path)
 }
 
-fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String, ClientError> {
+/// The package-relative path of `unit`, a file of `package`: its key after `name@version/`,
+/// under the package's manager as resolver.
+fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, ClientError> {
+    let invalid = ClientError::InvalidResponseField {
+        field: "source_identity",
+    };
+    let unit = rift_core::SourceUnitId::parse(unit).map_err(|_| invalid.clone())?;
+    if unit.resolver().as_str() != package.manager {
+        return Err(invalid);
+    }
+    let package_prefix = format!("{}@{}/", package.name, package.version);
+    unit.key()
+        .as_str()
+        .strip_prefix(&package_prefix)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .ok_or(invalid)
+}
+
+/// Checks that a package hit's symbol identity is the one its unit mints, and returns its
+/// qualified name.
+///
+/// Package analysis mints a package declaration's identity over its unit's resolver and key,
+/// `<manager>/<name>@<version>/<path>`, as `rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve`
+/// for `rift://source/cargo/beacon@1.0.0/src/lib.rs`. No producer mints the spelling over the
+/// package-relative path alone, `rift://symbol/rust/src/lib.rs/serve`, for a package
+/// declaration: it names a project file, and the client refuses it.
+fn validate_symbol_identity(
+    symbol: &Symbol,
+    package: &PackageIdentity,
+    source_path: &str,
+) -> Result<String, ClientError> {
     let id = symbol
         .id
         .as_deref()
@@ -1865,9 +2078,12 @@ fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String
         .map_err(|_| ClientError::InvalidResponseField {
             field: "symbol_identity",
         })?;
-    if qualified_name.is_empty()
-        || rift_core::symbol_identity(language, source_path, &qualified_name) != id
-    {
+    let unit_path = format!(
+        "{}/{}@{}/{source_path}",
+        package.manager, package.name, package.version
+    );
+    let minted = rift_core::symbol_identity(language, &unit_path, &qualified_name) == id;
+    if qualified_name.is_empty() || !minted {
         return Err(ClientError::InvalidResponseField {
             field: "symbol_identity",
         });
@@ -1875,13 +2091,16 @@ fn validate_symbol_identity(symbol: &Symbol, source_path: &str) -> Result<String
     Ok(qualified_name.into_owned())
 }
 
+/// Checks a search hit's class against the request's identifiers. A hit reporting `unknown`,
+/// found by its text or its vector, matches none of them; a hit claiming an identifier class
+/// carries the best class `rift_ranking::match_class` gives it.
 fn validate_search_match_class(
     request: &PackageSearchRequest,
     hit: &PackageSearchHit,
     qualified_name: &str,
 ) -> Result<(), ClientError> {
-    let actual = ranking_match_class(&hit.match_class)?;
-    if request.identifiers.is_empty() {
+    let claimed = search_match_class(&hit.match_class)?;
+    if claimed.is_some() && request.identifiers.is_empty() {
         return Ok(());
     }
     let name = hit.symbol.name.to_lowercase();
@@ -1893,7 +2112,7 @@ fn validate_search_match_class(
             rift_ranking::match_class(&candidate.to_lowercase(), &name, &qualified_name)
         })
         .min();
-    if expected != Some(actual) {
+    if expected != claimed {
         return Err(ClientError::InvalidResponseField {
             field: "match_class",
         });
@@ -1920,6 +2139,18 @@ fn validate_symbol_match_class(
     Ok(())
 }
 
+/// The identifier match class one search hit claims: `None` for `unknown`, which a hit
+/// matching none of the requested identifiers reports, such as a declaration matched by
+/// its body alone.
+fn search_match_class(
+    value: &IdentifierMatchClass,
+) -> Result<Option<rift_ranking::IdentifierMatchClass>, ClientError> {
+    match value {
+        IdentifierMatchClass::Unknown => Ok(None),
+        class => ranking_match_class(class).map(Some),
+    }
+}
+
 fn ranking_match_class(
     value: &IdentifierMatchClass,
 ) -> Result<rift_ranking::IdentifierMatchClass, ClientError> {
@@ -1936,11 +2167,23 @@ fn ranking_match_class(
     }
 }
 
-fn bounded_nonempty(value: &str, max: usize, field: &'static str) -> Result<(), ClientError> {
-    if value.is_empty() || value.len() > max {
-        return Err(ClientError::InvalidRequest { field });
+/// Refuses `value` naming `field` unless it holds 1 to `max` characters, the unit a
+/// contract `maxLength` counts.
+fn bounded_nonempty_characters(
+    value: &str,
+    max: usize,
+    field: &'static str,
+) -> Result<(), ClientError> {
+    if within_characters(value, max) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidRequest { field })
     }
-    Ok(())
+}
+
+/// Whether `value` holds 1 to `max` characters.
+fn within_characters(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= max
 }
 
 fn package_key(package: &PackageIdentity) -> (String, String, String) {
@@ -2024,10 +2267,22 @@ fn assembled_revisions(
     revisions.unwrap_or_default()
 }
 
+/// Whether a page ended short of `limit` at the response body bound. The server marks such a
+/// page with `result_truncated` beside a cursor at its first left-out item; a page carrying
+/// `limit` items ended at `limit`, whatever it warns.
+fn stopped_at_body_bound(warnings: &[Warning], item_count: usize, limit: i64) -> bool {
+    let short = i64::try_from(item_count).is_ok_and(|count| count < limit);
+    let marked = warnings
+        .iter()
+        .any(|warning| warning.code == WarningCode::ResultTruncated);
+    short && marked
+}
+
 fn search_pages(
     items: Vec<PackageSearchItem>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
+    next_cursor: Option<String>,
 ) -> PackageSearchPages {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
@@ -2037,6 +2292,7 @@ fn search_pages(
         analyzer_revision,
         corpus_revision,
         documentation_revision,
+        next_cursor,
     }
 }
 
@@ -2044,6 +2300,7 @@ fn symbol_pages(
     items: Vec<PackageSymbol>,
     warnings: Vec<Warning>,
     revisions: Option<(String, String, Option<String>)>,
+    next_cursor: Option<String>,
 ) -> PackageSymbolPages {
     let (analyzer_revision, corpus_revision, documentation_revision) =
         assembled_revisions(revisions);
@@ -2053,6 +2310,7 @@ fn symbol_pages(
         analyzer_revision,
         corpus_revision,
         documentation_revision,
+        next_cursor,
     }
 }
 

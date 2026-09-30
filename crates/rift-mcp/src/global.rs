@@ -9,24 +9,26 @@ use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
     ClientError, Config, ConfigError, GlobalClient, PackageAvailability as WireAvailability,
     PackageContextEntry as WireContextEntry, PackageIdentity as WirePackageIdentity,
-    PackageResolutionRequest, PackageSearchCandidate, PackageSearchRequest,
-    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbolCandidate,
-    PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
+    PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
+    PackageSymbolCandidate, PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning,
+    WarningCode,
 };
 use rift_core::{ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
-use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry};
+use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
-    ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchResult,
-    SearchScope, SymbolId,
+    ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
+    SearchParamsTarget, SearchResult, SearchScope, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
+use rift_server::{ReadError, ReadService};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -51,8 +53,54 @@ struct ClientSlot {
     client: GlobalClient,
 }
 
+/// The dependency context one current-tree read sends, beside the snapshot context and the
+/// request's `packages` it was derived from, so the route can derive it again under a
+/// smaller entry bound the global API advertises.
+#[derive(Debug)]
+pub(crate) struct ReadContext<'a> {
+    /// The context under the compiled entry bound, as `ReadService::read_context` answered it.
+    context: Arc<DependencyContext>,
+    /// The snapshot's own context.
+    snapshot: &'a Arc<DependencyContext>,
+    /// The request's `packages`.
+    requested: &'a [RequestedPackage],
+}
+
+impl<'a> ReadContext<'a> {
+    /// The context a read of `reads` sends for `requested` under `scope` and `rev`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming `packages` where `ReadService::read_context` refuses
+    /// the argument.
+    pub(crate) fn accepted(
+        reads: &'a ReadService,
+        scope: SearchScope,
+        rev: Option<&RevisionId>,
+        requested: &'a [RequestedPackage],
+    ) -> Result<Self, ReadError> {
+        Ok(Self {
+            context: reads.read_context(scope, rev, requested)?,
+            snapshot: reads.dependency_context(),
+            requested,
+        })
+    }
+
+    /// The context this read sends under `entries_max`: its own when it fits, otherwise the
+    /// snapshot's with the requested packages applied under that bound.
+    fn within(&self, entries_max: usize) -> Arc<DependencyContext> {
+        if self.context.entries().len() <= entries_max {
+            Arc::clone(&self.context)
+        } else {
+            Arc::new(self.snapshot.with_requested(self.requested, entries_max))
+        }
+    }
+}
+
 /// What the global API resolved for one read: the packages it serves, the context
-/// entries it holds no release for, and the service state the read met.
+/// entries it holds no release for, the entries a release other than the requested one
+/// answers, the service state the read met, and the feature its capabilities did not
+/// advertise for the read.
 ///
 /// A read whose route answers no client carries project hits alone, with the typed
 /// global warning naming why.
@@ -62,8 +110,19 @@ pub(crate) struct GlobalRoute {
     context: Arc<DependencyContext>,
     pub(crate) missing_exact: Vec<PackageIdentity>,
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
+    substituted: Vec<SubstitutedEntry>,
     pub(crate) state: RouteState,
+    unadvertised_feature: Option<&'static str>,
     observation: Arc<StdMutex<Option<ServiceState>>>,
+}
+
+/// One context entry the global index answers from a collected release other than the one
+/// the entry names: an exact version it holds no release of, or a requirement no collected
+/// release satisfies.
+#[derive(Clone, Debug, PartialEq)]
+struct SubstitutedEntry {
+    entry: PackageContextEntry,
+    package: PackageIdentity,
 }
 
 /// The global service state one read met.
@@ -93,22 +152,23 @@ enum ServiceState {
 }
 
 impl GlobalState {
-    /// Resolves the context's canonical entries through the global API.
+    /// Resolves the read's canonical entries through the global API, within the entry
+    /// bound its capabilities advertise.
     pub(crate) async fn route(
         &self,
         configuration: &GlobalConfiguration,
-        context: &Arc<DependencyContext>,
+        read: &ReadContext<'_>,
     ) -> GlobalRoute {
-        let route = self.route_inner(configuration, context).await;
+        let route = self.route_inner(configuration, read).await;
         route.record_observation();
         route
     }
 
     /// The route of a read whose enclosing MCP request deadline expired before the
     /// global API answered.
-    pub(crate) fn deadline_exceeded(&self, context: &Arc<DependencyContext>) -> GlobalRoute {
+    pub(crate) fn deadline_exceeded(&self, read: &ReadContext<'_>) -> GlobalRoute {
         let route = GlobalRoute::unanswered(
-            context,
+            &read.context,
             failure_state(&ClientError::Deadline),
             Arc::clone(&self.observation),
         );
@@ -116,11 +176,15 @@ impl GlobalState {
         route
     }
 
+    /// The route of one read. The capabilities come first, so the resolution request
+    /// holds the context cut at the entry bound they advertise; a read past it would
+    /// otherwise answer no package at all.
     async fn route_inner(
         &self,
         configuration: &GlobalConfiguration,
-        context: &Arc<DependencyContext>,
+        read: &ReadContext<'_>,
     ) -> GlobalRoute {
+        let context = &read.context;
         if !configuration.enabled {
             return GlobalRoute::unanswered(
                 context,
@@ -146,12 +210,28 @@ impl GlobalState {
                 );
             }
         };
+        let capabilities = match client.get_capabilities().await {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                return GlobalRoute::unanswered(
+                    context,
+                    failure_state(&error),
+                    Arc::clone(&self.observation),
+                );
+            }
+        };
+        let bounded = read.within(capabilities.dependency_entries_max());
+        let request = if Arc::ptr_eq(&bounded, context) {
+            request
+        } else {
+            resolution_request(&bounded)
+        };
         match client.resolve_package_context(&request).await {
             Ok(resolution) => {
-                resolved_route(context, client, resolution, Arc::clone(&self.observation))
+                resolved_route(&bounded, client, resolution, Arc::clone(&self.observation))
             }
             Err(error) => GlobalRoute::unanswered(
-                context,
+                &bounded,
                 failure_state(&error),
                 Arc::clone(&self.observation),
             ),
@@ -274,6 +354,51 @@ pub(crate) struct GlobalSearchCandidates {
     pub(crate) warnings: Vec<ReadWarning>,
 }
 
+/// Reads the package matches of one accepted `pattern` search: one page, asked for through
+/// the advertised page limit.
+///
+/// A page that stopped before the last match carries `result_truncated`, which reaches the
+/// caller as a `global_page_warning`, and its cursor is not followed.
+pub(crate) async fn package_patterns(
+    client: &GlobalClient,
+    params: &SearchParams,
+    packages: &[WirePackageIdentity],
+) -> Result<GlobalPatternMatches, ClientError> {
+    let Some(pattern) = params.pattern.clone() else {
+        return Ok(GlobalPatternMatches::default());
+    };
+    let request = PackagePatternRequest {
+        pattern,
+        packages: packages.to_vec(),
+        include: includes_source(params).then(|| vec!["source".to_owned()]),
+    };
+    let page = client
+        .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
+        .await?;
+    let warnings = page_warnings(page.warnings);
+    let matches = page
+        .items
+        .iter()
+        .map(PackagePatternMatch::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GlobalPatternMatches { matches, warnings })
+}
+
+/// Package pattern matches and page warnings returned by one remote read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct GlobalPatternMatches {
+    pub(crate) matches: Vec<PackagePatternMatch>,
+    pub(crate) warnings: Vec<ReadWarning>,
+}
+
+fn includes_source(params: &SearchParams) -> bool {
+    params
+        .include
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&SearchInclude::Source)
+}
+
 fn page_warnings(warnings: Vec<Warning>) -> Vec<ReadWarning> {
     let mut mapped = Vec::new();
     extend_page_warnings(&mut mapped, warnings);
@@ -292,7 +417,9 @@ fn extend_page_warnings(target: &mut Vec<ReadWarning>, warnings: Vec<Warning>) {
                 WarningCode::PublicationChanged => GlobalPageWarningCode::PublicationChanged,
                 WarningCode::CapabilityUnavailable => GlobalPageWarningCode::CapabilityUnavailable,
                 WarningCode::ResultTruncated => GlobalPageWarningCode::ResultTruncated,
-                WarningCode::Unknown => GlobalPageWarningCode::Unknown,
+                WarningCode::RequirementUnsatisfied | WarningCode::Unknown => {
+                    GlobalPageWarningCode::Unknown
+                }
             },
             detail: warning.detail,
         };
@@ -335,12 +462,7 @@ fn search_request(
             .into_iter()
             .map(|candidate| candidate.text().to_owned())
             .collect(),
-        include: params
-            .include
-            .as_deref()
-            .unwrap_or_default()
-            .contains(&SearchInclude::Source)
-            .then(|| vec!["source".to_owned()]),
+        include: includes_source(params).then(|| vec!["source".to_owned()]),
         packages: packages.to_vec(),
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
@@ -422,7 +544,8 @@ impl Fault for ProjectHitFault {
 /// A merge's refusal of one project hit.
 pub(crate) type ProjectHitError = rift_core::Error<ProjectHitFault>;
 
-/// Merges local and remote symbol hits, then applies requested pagination.
+/// Merges local and remote symbol hits, then pages them at `limit`, the request's accepted
+/// page size.
 ///
 /// # Errors
 ///
@@ -432,6 +555,7 @@ pub(crate) type ProjectHitError = rift_core::Error<ProjectHitFault>;
 /// read.
 pub(crate) fn merge_symbols(
     params: &GetSymbolParams,
+    limit: usize,
     mut local: GetSymbolResult,
     remote: Vec<PackageSymbolCandidate>,
 ) -> Result<GetSymbolResult, ProjectHitError> {
@@ -465,8 +589,7 @@ pub(crate) fn merge_symbols(
         .into_iter()
         .map(|entry| entry.hit)
         .collect::<Vec<_>>();
-    let page_limit = usize::try_from(params.limit).unwrap_or(usize::MAX);
-    let (hits, pagination) = page_window(hits, params.page_index, page_limit);
+    let (hits, pagination) = page_window(hits, params.page_index, limit);
     Ok(GetSymbolResult {
         hits,
         pagination,
@@ -538,7 +661,8 @@ fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
         .unwrap_or_default()
 }
 
-/// Merges package candidates into local search hits while retaining traversal-only hits.
+/// Merges package candidates into local search hits while retaining traversal-only hits,
+/// then pages them at `limit`, the request's accepted page size.
 ///
 /// # Errors
 ///
@@ -547,6 +671,7 @@ fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
 /// read answers none of these, so each is a broken invariant in that read.
 pub(crate) fn merge_search(
     params: &SearchParams,
+    limit: usize,
     mut local: SearchResult,
     remote: GlobalSearchCandidates,
 ) -> Result<SearchResult, ProjectHitError> {
@@ -626,18 +751,49 @@ pub(crate) fn merge_search(
         })
         .collect::<Vec<_>>();
     order_search_hits(&mut ordered, params.order);
-    let limit = usize::try_from(
-        params
-            .limit
-            .unwrap_or(rift_core::constants::SEARCH_RESULTS_DEFAULT as u64),
-    )
-    .unwrap_or(usize::MAX);
     let (results, pagination) = page_window(ordered, params.page_index, limit);
     Ok(SearchResult {
         results,
         pagination,
         warnings: local.warnings,
     })
+}
+
+/// Adds the package matches of a `pattern` search after the project's, then pages the
+/// answer at `limit`, the request's accepted page size.
+///
+/// Pattern hits carry no score, so `relevance` keeps the collected order: the project's
+/// matches by path, then offset, then the packages' in the order the global API answered
+/// them, by package, path, and offset. As in the project, a declaration answers once, at
+/// its first match, and `target` selects the file hits, the declaration hits, or both.
+pub(crate) fn merge_patterns(
+    params: &SearchParams,
+    limit: usize,
+    local: SearchResult,
+    remote: GlobalPatternMatches,
+) -> SearchResult {
+    let mut hits = local.results;
+    let mut declared = std::collections::BTreeSet::new();
+    for matched in remote.matches {
+        if params.target != SearchParamsTarget::File
+            && let Some(declaration) = matched.declaration
+            && declared.insert(search_hit_key(&declaration).to_owned())
+        {
+            hits.push(declaration);
+        }
+        if params.target != SearchParamsTarget::Symbol {
+            hits.push(matched.file);
+        }
+    }
+    order_search_hits(&mut hits, params.order);
+    let (results, pagination) = page_window(hits, params.page_index, limit);
+    let mut warnings = local.warnings;
+    warnings.extend(remote.warnings);
+    SearchResult {
+        results,
+        pagination,
+        warnings,
+    }
 }
 
 fn candidate_fields(hit: &SearchHit) -> FieldSet {
@@ -761,21 +917,32 @@ fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagi
 impl GlobalRoute {
     /// Discards a remote lane that failed after the resolution: the read answers project
     /// hits alone, with the typed global warning naming the failure.
+    ///
+    /// A lane the global API's capabilities do not advertise is no failure of the
+    /// service: the resolution's own warnings stand, and the read warns
+    /// `capability_unavailable` naming the feature.
     pub(crate) fn discard_remote(&mut self, error: &ClientError) {
         self.client = None;
         self.remote_packages.clear();
+        if let ClientError::FeatureUnavailable { feature } = error {
+            self.unadvertised_feature = Some(feature);
+            return;
+        }
         self.missing_exact.clear();
         self.missing_requirements.clear();
+        self.substituted.clear();
         self.state = failure_state(error);
         self.record_observation();
     }
 
     /// The warnings a read whose `scope` reaches packages carries: the typed global
-    /// warning when the global API did not answer, then at most `DEPENDENCY_WARNINGS_MAX`
-    /// package and dependency-context warnings together. Those name each degraded
-    /// resolver in resolver order, each context entry no public registry serves with the
-    /// missing capability its kind names, and each entry the global publication holds no
-    /// release for, in that order.
+    /// warning when the global API did not answer, or `capability_unavailable` when its
+    /// capabilities do not advertise the feature the read needs, then at most
+    /// `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings together. Those
+    /// name each degraded resolver in resolver order, each context entry no public registry
+    /// serves with the missing capability its kind names, each entry the global publication
+    /// holds no release for, and each entry a release other than the requested one answers,
+    /// in that order.
     pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
         let degraded = self.context.degradations().iter().map(|degradation| {
             ReadWarning::PackageContextDegraded {
@@ -801,12 +968,22 @@ impl GlobalRoute {
                     .cloned()
                     .map(|entry| ReadWarning::PackageRequirementAbsent { entry }),
             );
+        let substituted =
+            self.substituted
+                .iter()
+                .cloned()
+                .map(|substituted| ReadWarning::PackageSubstituted {
+                    entry: substituted.entry,
+                    package: substituted.package,
+                });
         self.state_warning()
             .into_iter()
+            .chain(self.unadvertised_feature.map(unadvertised_feature_warning))
             .chain(
                 degraded
                     .chain(unavailable)
                     .chain(absent)
+                    .chain(substituted)
                     .take(DEPENDENCY_WARNINGS_MAX),
             )
             .collect()
@@ -843,7 +1020,9 @@ impl GlobalRoute {
             context: Arc::clone(context),
             missing_exact: Vec::new(),
             missing_requirements: Vec::new(),
+            substituted: Vec::new(),
             state,
+            unadvertised_feature: None,
             observation,
         }
     }
@@ -865,6 +1044,18 @@ impl GlobalRoute {
         if transitioned {
             log_service_transition(self.state);
         }
+    }
+}
+
+/// The warning a read carries when the global API's capabilities do not advertise
+/// `feature`, which the read needs for its package facts.
+fn unadvertised_feature_warning(feature: &'static str) -> ReadWarning {
+    ReadWarning::GlobalPageWarning {
+        warning_code: GlobalPageWarningCode::CapabilityUnavailable,
+        detail: Some(format!(
+            "the global API does not advertise the `{feature}` feature, so no package \
+             answers this read"
+        )),
     }
 }
 
@@ -918,6 +1109,11 @@ fn failure_class_label(class: GlobalFailureClass) -> &'static str {
     }
 }
 
+// A read's context, its requested packages applied, holds at most the dependency
+// context's own bound, so every resolution request fits the compiled entry bound the
+// client holds it to; the route cuts it again at a smaller bound the capabilities advertise.
+const _: () = assert!(rift_dependency::PACKAGES_MAX <= rift_cloud_client::DEPENDENCY_ENTRIES_MAX);
+
 fn resolution_request(context: &DependencyContext) -> PackageResolutionRequest {
     PackageResolutionRequest {
         entries: context
@@ -939,9 +1135,8 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     }
 }
 
-/// One missing requirement the resolution named, as a context entry. The client sends
-/// canonical entries alone and refuses a missing requirement that is not one, so the
-/// entry is canonical.
+/// One entry the resolution named, as a context entry. The client sends canonical entries
+/// alone and refuses an answered entry it did not send, so the entry is canonical.
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
@@ -958,6 +1153,14 @@ fn resolved_route(
     resolution: rift_cloud_client::PackageResolutionResponse,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 ) -> GlobalRoute {
+    let substituted = resolution
+        .substitutions()
+        .into_iter()
+        .map(|substitution| SubstitutedEntry {
+            entry: protocol_context_entry(substitution.requested),
+            package: protocol_package_identity(substitution.served),
+        })
+        .collect();
     let mut remote_packages = Vec::new();
     for package in resolution.available_exact {
         push_distinct_package(&mut remote_packages, package);
@@ -981,7 +1184,9 @@ fn resolved_route(
         context: Arc::clone(context),
         missing_exact,
         missing_requirements,
+        substituted,
         state: RouteState::Available,
+        unadvertised_feature: None,
         observation,
     }
 }
@@ -1044,6 +1249,7 @@ fn failure_state(error: &ClientError) -> RouteState {
         ClientError::Http { .. } => (FailureKind::Api, GlobalFailureClass::NonSuccessResponse),
         ClientError::Config(_) => (FailureKind::Api, GlobalFailureClass::InvalidResponse),
         ClientError::RequestBodyTooLarge { .. }
+        | ClientError::FeatureUnavailable { .. }
         | ClientError::InvalidMediaType { .. }
         | ClientError::InvalidResponse { .. }
         | ClientError::Decode { .. }
@@ -1106,6 +1312,15 @@ mod tests {
             super::RouteState::Unavailable {
                 kind: FailureKind::Api,
                 class: GlobalFailureClass::Authentication,
+            }
+        );
+        assert_eq!(
+            failure_state(&ClientError::FeatureUnavailable {
+                feature: "patterns"
+            }),
+            super::RouteState::Unavailable {
+                kind: FailureKind::Response,
+                class: GlobalFailureClass::InvalidResponse,
             }
         );
     }
@@ -1180,6 +1395,24 @@ mod tests {
             .await
             .expect("file search does not call remote client");
         assert_eq!(candidates, super::GlobalSearchCandidates::default());
+    }
+
+    /// A search carrying no `pattern` has no package matches to ask for, so it answers none
+    /// without a request: the disabled client would refuse one.
+    #[tokio::test]
+    async fn a_search_without_a_pattern_returns_no_package_matches_with_a_disabled_client() {
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let params = serde_json::from_value(serde_json::json!({"query": "compass"}))
+            .expect("query search request");
+        let matches = super::package_patterns(&client, &params, &[])
+            .await
+            .expect("a search without a pattern does not call the remote client");
+        assert_eq!(matches, super::GlobalPatternMatches::default());
     }
 
     /// One documentation search hit per block a two-paragraph `guide.txt` holds, in block
@@ -1267,8 +1500,9 @@ mod tests {
         let example: GetSymbolResult = authored_example();
         let request = serde_json::json!({"name": "load_config"});
         let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+        let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
 
-        let merged = super::merge_symbols(&params, example.clone(), Vec::new())
+        let merged = super::merge_symbols(&params, limit, example.clone(), Vec::new())
             .expect("the project hit carries its identity and matches the name");
 
         assert_eq!(merged.hits, example.hits);
@@ -1297,10 +1531,11 @@ mod tests {
         for (name, identity, hit, violation) in cases {
             let request = serde_json::json!({"name": name});
             let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+            let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
             let mut local = example.clone();
             local.hits[0].symbol.id = identity.map(|identity| SymbolId(identity.to_owned()));
 
-            let error = super::merge_symbols(&params, local, Vec::new())
+            let error = super::merge_symbols(&params, limit, local, Vec::new())
                 .expect_err("the merge cannot place the project hit");
 
             assert_eq!(error.descriptor().code(), "internal_error");
@@ -1353,13 +1588,19 @@ mod tests {
         }
         let request = serde_json::json!({"query": "load_config", "limit": 10});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
+        let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         let local = SearchResult {
             results: hits.to_vec(),
             pagination: example.pagination.clone(),
             warnings: Vec::new(),
         };
-        let merged = super::merge_search(&params, local, super::GlobalSearchCandidates::default())
-            .expect("every project hit ranks");
+        let merged = super::merge_search(
+            &params,
+            limit,
+            local,
+            super::GlobalSearchCandidates::default(),
+        )
+        .expect("every project hit ranks");
         assert_eq!(merged.results.len(), hits.len());
     }
 
@@ -1433,6 +1674,7 @@ mod tests {
         ];
         let request = serde_json::json!({"query": "load_config"});
         let params: SearchParams = serde_json::from_value(request).expect("a search");
+        let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         for (hit, label, violation) in cases {
             let local = SearchResult {
                 results: vec![hit],
@@ -1440,13 +1682,26 @@ mod tests {
                 warnings: Vec::new(),
             };
 
-            let error =
-                super::merge_search(&params, local, super::GlobalSearchCandidates::default())
-                    .expect_err("the merge cannot place the project hit");
+            let error = super::merge_search(
+                &params,
+                limit,
+                local,
+                super::GlobalSearchCandidates::default(),
+            )
+            .expect_err("the merge cannot place the project hit");
 
             assert_eq!(error.descriptor().code(), "internal_error");
             let context = rift_core::Fault::context(error.fault());
             assert_eq!(context, refusal_context(label, violation));
+        }
+    }
+
+    /// A read that sends `context` as it stands, requesting no packages.
+    fn read_context(context: &Arc<DependencyContext>) -> super::ReadContext<'_> {
+        super::ReadContext {
+            context: Arc::clone(context),
+            snapshot: context,
+            requested: &[],
         }
     }
 
@@ -1458,7 +1713,7 @@ mod tests {
         let configuration = rift_protocol::configuration::GlobalConfiguration::default();
         let context = Arc::new(DependencyContext::default());
 
-        let route = state.route(&configuration, &context).await;
+        let route = state.route(&configuration, &read_context(&context)).await;
 
         assert_eq!(route.state, RouteState::Available);
         assert!(route.client.is_none());
@@ -1477,7 +1732,7 @@ mod tests {
         };
         let context = context_with_path_dependencies(0);
 
-        let route = state.route(&configuration, &context).await;
+        let route = state.route(&configuration, &read_context(&context)).await;
 
         let route_state = route.state;
         assert!(
@@ -1492,6 +1747,62 @@ mod tests {
         );
         assert!(route.client.is_none());
         assert!(route.remote_packages.is_empty());
+    }
+
+    /// Each page warning reaches the caller as a `global_page_warning` naming its code. A
+    /// code the page contract does not define, `requirement_unsatisfied` among them, is
+    /// `unknown`, and a warning repeated across pages lands once.
+    #[test]
+    fn page_warnings_name_each_code_once() {
+        use rift_cloud_client::{Warning, WarningCode};
+        use rift_protocol::read::{GlobalPageWarningCode, ReadWarning};
+
+        let codes = [
+            (
+                WarningCode::QueryNarrowed,
+                GlobalPageWarningCode::QueryNarrowed,
+            ),
+            (
+                WarningCode::SourceTruncated,
+                GlobalPageWarningCode::SourceTruncated,
+            ),
+            (
+                WarningCode::PublicationChanged,
+                GlobalPageWarningCode::PublicationChanged,
+            ),
+            (
+                WarningCode::CapabilityUnavailable,
+                GlobalPageWarningCode::CapabilityUnavailable,
+            ),
+            (
+                WarningCode::ResultTruncated,
+                GlobalPageWarningCode::ResultTruncated,
+            ),
+            (
+                WarningCode::RequirementUnsatisfied,
+                GlobalPageWarningCode::Unknown,
+            ),
+            (WarningCode::Unknown, GlobalPageWarningCode::Unknown),
+        ];
+        let received: Vec<Warning> = codes
+            .iter()
+            .map(|(code, _)| Warning {
+                code: code.clone(),
+                detail: Some(code.to_string()),
+                ..Warning::default()
+            })
+            .collect();
+        let mut repeated = received.clone();
+        repeated.extend(received);
+
+        let expected: Vec<ReadWarning> = codes
+            .into_iter()
+            .map(|(code, warning_code)| ReadWarning::GlobalPageWarning {
+                warning_code,
+                detail: Some(code.to_string()),
+            })
+            .collect();
+        assert_eq!(super::page_warnings(repeated), expected);
     }
 
     #[test]
@@ -1737,6 +2048,240 @@ mod tests {
             Some(reason.as_str()),
             rift_protocol::dependencies::PackageAvailability::Path.unavailable_reason()
         );
+    }
+
+    /// Each substitution the resolution names warns `package_substituted` after the absent
+    /// packages: an exact version answered at another release, and a requirement answered
+    /// outside its range. A requirement answered inside its range warns nothing, and a
+    /// remote lane discarded after the resolution drops the substitutions with it.
+    #[test]
+    fn resolved_substitutions_warn_until_the_remote_lane_is_discarded() {
+        use rift_protocol::dependencies::{
+            PackageAvailability, PackageContextEntry, PackageSelector,
+        };
+        use rift_protocol::read::{PackageIdentity, ReadWarning};
+
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let resolution: rift_cloud_client::PackageResolutionResponse =
+            serde_json::from_value(serde_json::json!({
+                "available_exact": [],
+                "resolved_requirements": [
+                    {
+                        "entry": {"manager": "cargo", "name": "demo", "version": "1.0.3",
+                                  "availability": "canonical"},
+                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.2"}
+                    },
+                    {
+                        "entry": {"manager": "npm", "name": "typescript", "requirement": "~5.7.2",
+                                  "availability": "canonical"},
+                        "package": {"manager": "npm", "name": "typescript", "version": "5.9.3"}
+                    },
+                    {
+                        "entry": {"manager": "npm", "name": "react", "requirement": "^19",
+                                  "availability": "canonical"},
+                        "package": {"manager": "npm", "name": "react", "version": "19.1.0"}
+                    }
+                ],
+                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_requirements": [],
+                "warnings": [{
+                    "code": "requirement_unsatisfied",
+                    "detail": "npm/typescript ~5.7.2 answered by 5.9.3"
+                }]
+            }))
+            .expect("resolution fixture");
+        let mut route = super::resolved_route(
+            &Arc::new(DependencyContext::default()),
+            client,
+            resolution,
+            Arc::new(Mutex::new(None)),
+        );
+
+        assert_eq!(
+            route.remote_packages.len(),
+            3,
+            "every answering release is read"
+        );
+        assert_eq!(
+            warning_codes(&route),
+            [
+                "package_absent",
+                "package_substituted",
+                "package_substituted"
+            ]
+        );
+        let package = |manager: &str, name: &str, version: &str| PackageIdentity {
+            manager: manager.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        };
+        let substituted = |entry, served| ReadWarning::PackageSubstituted {
+            entry,
+            package: served,
+        };
+        assert_eq!(
+            route.warnings()[1..],
+            [
+                substituted(
+                    PackageContextEntry::new(
+                        "cargo",
+                        "demo",
+                        PackageSelector::Version("1.0.3".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package("cargo", "demo", "1.0.2"),
+                ),
+                substituted(
+                    PackageContextEntry::new(
+                        "npm",
+                        "typescript",
+                        PackageSelector::Requirement("~5.7.2".to_owned()),
+                        PackageAvailability::Canonical,
+                    ),
+                    package("npm", "typescript", "5.9.3"),
+                ),
+            ]
+        );
+
+        route.discard_remote(&ClientError::Connection);
+        assert_eq!(warning_codes(&route), ["global_api_unavailable"]);
+    }
+
+    /// A remote lane the capabilities do not advertise drops the lane alone: the read warns
+    /// `capability_unavailable` naming the feature, the resolution's own warnings stand, and
+    /// the route reads no package.
+    #[test]
+    fn an_unadvertised_feature_keeps_the_resolution_warnings() {
+        use rift_protocol::read::ReadWarning;
+
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let resolution: rift_cloud_client::PackageResolutionResponse =
+            serde_json::from_value(serde_json::json!({
+                "available_exact": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "resolved_requirements": [],
+                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_requirements": []
+            }))
+            .expect("resolution fixture");
+        let mut route = super::resolved_route(
+            &Arc::new(DependencyContext::default()),
+            client,
+            resolution,
+            Arc::new(Mutex::new(None)),
+        );
+
+        route.discard_remote(&ClientError::FeatureUnavailable {
+            feature: "patterns",
+        });
+
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
+        assert_eq!(route.state, RouteState::Available);
+        assert_eq!(
+            warning_codes(&route),
+            ["global_page_warning", "package_absent"]
+        );
+        assert_eq!(
+            route.warnings()[0],
+            ReadWarning::GlobalPageWarning {
+                warning_code: rift_protocol::read::GlobalPageWarningCode::CapabilityUnavailable,
+                detail: Some(
+                    "the global API does not advertise the `patterns` feature, so no package \
+                     answers this read"
+                        .to_owned()
+                ),
+            }
+        );
+    }
+
+    /// A package declaration holding two matches answers once, at its first, and `target`
+    /// selects the file hits, the declaration hits, or both. The package matches follow the
+    /// project's, the page warnings follow the project's warnings, and the merged set pages
+    /// under the request's `limit`.
+    #[test]
+    fn merged_patterns_answer_each_package_declaration_once_after_the_project() {
+        use rift_protocol::read::{Pagination, ReadWarning, SearchHit, SearchParams, SearchResult};
+        use serde_json::json;
+
+        let unit = "rift://source/cargo/demo@1.0.0/src/lib.rs";
+        let package = json!({"manager": "cargo", "name": "demo", "version": "1.0.0"});
+        let hit = |value: serde_json::Value| -> SearchHit {
+            serde_json::from_value(value).expect("search hit fixture")
+        };
+        let file = |start: u64| {
+            hit(json!({
+                "hit": {"target": "file", "size": 45}, "matched_by": ["content"],
+                "range": {"start": start, "end": start + 4}, "line": 1, "unit": unit
+            }))
+        };
+        let declaration = hit(json!({
+            "hit": {"target": "symbol", "symbol": {
+                "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                "language": "rust", "name": "helper_beacon", "kind": "function",
+                "origin": {"location": "dependency", "package": package, "source_kind": "authored"}
+            }},
+            "matched_by": ["content"], "range": {"start": 0, "end": 25}, "line": 1, "unit": unit
+        }));
+        let project = hit(json!({
+            "hit": {"target": "file", "size": 10}, "matched_by": ["content"],
+            "range": {"start": 0, "end": 4}, "line": 1, "path": "src/lib.rs"
+        }));
+        let matched = |start: u64| rift_cloud_client::PackagePatternMatch {
+            package: rift_protocol::read::PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "demo".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            file: file(start),
+            declaration: Some(declaration.clone()),
+        };
+        let merged = |request: serde_json::Value| {
+            let params: SearchParams = serde_json::from_value(request).expect("search request");
+            let local = SearchResult {
+                results: vec![project.clone()],
+                pagination: Pagination {
+                    page_index: 0,
+                    total_pages: 1,
+                },
+                warnings: vec![ReadWarning::GlobalAccessDisabled],
+            };
+            let remote = super::GlobalPatternMatches {
+                matches: vec![matched(4), matched(14)],
+                warnings: vec![ReadWarning::GlobalPageWarning {
+                    warning_code: rift_protocol::read::GlobalPageWarningCode::ResultTruncated,
+                    detail: None,
+                }],
+            };
+            let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
+            super::merge_patterns(&params, limit, local, remote)
+        };
+
+        let all = merged(json!({"pattern": "beacon", "scope": "all", "target": "all"}));
+        assert_eq!(
+            all.results,
+            [project.clone(), declaration.clone(), file(4), file(14)]
+        );
+        assert_eq!(all.warnings.len(), 2, "{:?}", all.warnings);
+        assert_eq!(all.warnings[0], ReadWarning::GlobalAccessDisabled);
+        let symbols = merged(json!({"pattern": "beacon", "scope": "all", "target": "symbol"}));
+        assert_eq!(symbols.results, [project.clone(), declaration.clone()]);
+        let files = merged(json!({"pattern": "beacon", "scope": "all", "target": "file"}));
+        assert_eq!(files.results, [project.clone(), file(4), file(14)]);
+        let second_page = merged(json!({
+            "pattern": "beacon", "scope": "all", "target": "all", "limit": 2, "page_index": 1
+        }));
+        assert_eq!(second_page.results, [file(4), file(14)]);
+        assert_eq!(second_page.pagination.total_pages, 2);
     }
 
     /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides

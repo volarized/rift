@@ -52,10 +52,11 @@ each match and each declaration holding one, in place of `query` and `traversal`
 of `query` and `traversal`. `rev` searches a version-control revision instead of the
 current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
 reaches past the project tree: `global` answers `query` from the public declarations
-the global index holds for the workspace's dependencies alone, `all` from both,
-ordered together. `packages` names package versions `query` searches beside the
-workspace's own, such as an upgrade target or a package the project does not use yet.
-Use `get_symbol` when the declaration name is known.
+the global index holds for the workspace's dependencies alone and `pattern` from their
+source, `all` from both, ordered together. `packages` names package versions `query`
+and `pattern` search beside the workspace's own, such as an upgrade target or a
+package the project does not use yet. Use `get_symbol` when the declaration name is
+known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -68,8 +69,8 @@ Parameters:
 - `order` - Which total order the page comes back in.
 - `query` - Text to match against declaration names, qualified names, signatures, attached documentation, and file contents.
 - `pattern` - A regex matched against the text of every indexed file, in the syntax of the Rust `regex` crate that ripgrep reads.
-- `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
-- `packages` - Packages `query` searches beside the ones the workspace's manifests and lockfiles name, at most 64.
+- `scope` - Which sources `query` and `pattern` search: the project tree, the dependency packages, or both.
+- `packages` - Packages `query` and `pattern` search beside the ones the workspace's manifests and lockfiles name, at most 64.
 - `paths` - Files eligible for the search, selected by project-relative globs.
 - `include` - Extra payload to attach to every hit.
 - `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.

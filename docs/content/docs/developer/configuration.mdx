@@ -303,17 +303,20 @@ header to the configured endpoint. Empty or malformed values leave global access
 the client sends a request, and the token never enters logs, errors, metrics, or cache keys.
 
 The client does not contact the endpoint at server startup. A `local` read and a file-only search
-also make no global request. A connection failure, timeout, retry exhaustion, authentication
-failure, invalid response, or non-success response marks global access unavailable for
-`failure_ttl`; the affected package read then answers the project hits it has and reports a
-typed warning with the failure class.
-A valid remote page keeps its items and reports each bounded service condition as
-`global_page_warning`.
+also make no global request.
 
-A valid resolution answers package reads from the global index. A missing exact package reports
-`package_absent`, and a missing declared requirement reports `package_requirement_absent`. A
-package no public registry serves - a path outside the workspace, a git repository, a private
-registry, or a URL - never reaches the global API and reports `package_unavailable`.
+A connection failure, timeout, retry exhaustion, authentication failure, invalid response, or
+non-success response marks global access unavailable for `failure_ttl`. The package read that met
+it, and every package read until `failure_ttl` passes, answers the project hits it has and reports
+a typed warning with that failure's class. A valid remote page keeps its items and reports each
+bounded service condition as `global_page_warning`.
+
+A valid resolution answers package reads from the global index, and the nearest collected release
+answers an entry whose version it lacks, reporting `package_substituted`. A package with no
+collected release reports `package_absent`, or `package_requirement_absent` for a declared
+requirement. A package no public registry serves - a path outside the workspace, a git
+repository, a private registry, or a URL - never reaches the global API and reports
+`package_unavailable`.
 
 ## Languages and LSP
 

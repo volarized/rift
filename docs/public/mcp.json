@@ -1326,7 +1326,7 @@
               "src/lib.rs"
             ],
             "maxLength": 1000,
-            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
             "type": "string"
           },
           "ReadWarning": {
@@ -1928,20 +1928,20 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.\n`capability_unavailable` also names a feature the global API's capabilities do not\nadvertise, such as `patterns` for a `pattern` search, and the answer then carries the\nproject hits alone.",
                 "properties": {
                   "code": {
                     "const": "global_page_warning",
                     "type": "string"
                   },
                   "detail": {
-                    "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
-                    "description": "Stable condition code returned by the global package service."
+                    "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
                   }
                 },
                 "required": [
@@ -1990,6 +1990,30 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
                 "properties": {
                   "code": {
@@ -2015,7 +2039,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, so the\ndependency context may miss packages or name a standard library by its static\nreading. Rides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer,\nthis one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left:\nevery held entry before any the request's `packages` names. The dependency context\nmay then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -2027,7 +2051,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`,\nor a standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }
@@ -3031,7 +3055,7 @@
               "src/lib.rs"
             ],
             "maxLength": 1000,
-            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
             "type": "string"
           },
           "RevisionId": {
@@ -3773,7 +3797,7 @@
               "src/lib.rs"
             ],
             "maxLength": 1000,
-            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
             "type": "string"
           },
           "ReadWarning": {
@@ -4375,20 +4399,20 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.\n`capability_unavailable` also names a feature the global API's capabilities do not\nadvertise, such as `patterns` for a `pattern` search, and the answer then carries the\nproject hits alone.",
                 "properties": {
                   "code": {
                     "const": "global_page_warning",
                     "type": "string"
                   },
                   "detail": {
-                    "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
-                    "description": "Stable condition code returned by the global package service."
+                    "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
                   }
                 },
                 "required": [
@@ -4437,6 +4461,30 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
                 "properties": {
                   "code": {
@@ -4462,7 +4510,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, so the\ndependency context may miss packages or name a standard library by its static\nreading. Rides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer,\nthis one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left:\nevery held entry before any the request's `packages` names. The dependency context\nmay then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -4474,7 +4522,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`,\nor a standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }
@@ -4845,7 +4893,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone, `all` from both,\nordered together. `packages` names package versions `query` searches beside the\nworkspace's own, such as an upgrade target or a package the project does not use yet.\nUse `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol. `pattern` matches a regex\nagainst the text of every indexed file, line by line as ripgrep reads it, and answers\neach match and each declaration holding one, in place of `query` and `traversal`.\n`change` answers the declarations two committed revisions hold differently, in place\nof `query` and `traversal`. `rev` searches a version-control revision instead of the\ncurrent tree, and never combines with `pattern`, `traversal`, or `change`. `scope`\nreaches past the project tree: `global` answers `query` from the public declarations\nthe global index holds for the workspace's dependencies alone and `pattern` from their\nsource, `all` from both, ordered together. `packages` names package versions `query`\nand `pattern` search beside the workspace's own, such as an upgrade target or a\npackage the project does not use yet. Use `get_symbol` when the declaration name is\nknown.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "PathPattern": {
@@ -5420,7 +5468,7 @@
             "description": "Which total order the page comes back in. Omitted, relevance."
           },
           "packages": {
-            "description": "Packages `query` searches beside the ones the workspace's manifests and lockfiles\nname, at most 64. An entry naming a package the workspace depends on replaces that\npackage's versions for this search, and an entry naming another package adds it.\nThe server refuses `packages` beside the `local` scope, since a project search\nconsults no package, and beside `rev`, since package facts are served for the\ncurrent tree alone.",
+            "description": "Packages `query` and `pattern` search beside the ones the workspace's manifests and\nlockfiles name, at most 64. An entry naming a package the workspace depends on replaces that\npackage's versions for this search, and an entry naming another package adds it.\nThe server refuses `packages` beside the `local` scope, since a project search\nconsults no package, and beside `rev`, since package facts are served for the\ncurrent tree alone.",
             "items": {
               "$ref": "#/$defs/RequestedPackage"
             },
@@ -5439,7 +5487,7 @@
             "description": "Files eligible for the search, selected by project-relative globs. Omitted selects\nevery visible file."
           },
           "pattern": {
-            "description": "A regex matched against the text of every indexed file, in the syntax of the Rust\n`regex` crate that ripgrep reads. Matching runs line by line: `^` and `$` match at\nline boundaries, a `\\r` before a line feed belongs to its line, and no class matches\na line feed, so only a literal `\\n` crosses a line; `(?i)` makes the match\ncase-insensitive. Every match becomes one file hit whose `range` is the match's\nbytes, and every declaration holding a match one symbol hit at its first match;\neach hit is tagged `content` and carries no score, and `relevance` orders the hits\nby path, then offset. The server refuses `pattern` beside `query`, `traversal`,\n`change`, and `rev`, with a `scope` past `local`, and with `target:\n\"documentation\"`, and it refuses a pattern whose compiled size, candidate rows, or\nverified bytes pass the `[search]` bounds, naming the bound.",
+            "description": "A regex matched against the text of every indexed file, in the syntax of the Rust\n`regex` crate that ripgrep reads. Matching runs line by line: `^` and `$` match at\nline boundaries, a `\\r` before a line feed belongs to its line, and no class matches\na line feed, so only a literal `\\n` crosses a line; `(?i)` makes the match\ncase-insensitive. Every match becomes one file hit whose `range` is the match's\nbytes, and every declaration holding a match one symbol hit at its first match;\neach hit is tagged `content` and carries no score, and `relevance` orders the hits\nby path, then offset. With a `scope` past `local`, the global index matches the\npattern over the dependency packages' source too, and those hits carry `unit` in\nplace of `path`. The server refuses `pattern` beside `query`, `traversal`,\n`change`, and `rev`, and with `target: \"documentation\"`, and it refuses a pattern\nwhose compiled size, candidate rows, or verified bytes pass the `[search]` bounds,\nnaming the bound.",
             "maxLength": 1024,
             "minLength": 1,
             "type": "string"
@@ -5455,7 +5503,7 @@
           "scope": {
             "$ref": "#/$defs/SearchScope",
             "default": "local",
-            "description": "Which declarations `query` searches: the project tree, the public declarations of\nthe dependency packages, or both. Omitted, `local`. A package contributes symbol\nhits alone. The server refuses a scope beyond `local` together with `rev`, since\npackage facts are served for the current tree alone, and `global` together with\n`traversal`, since a walk runs over the project alone."
+            "description": "Which sources `query` and `pattern` search: the project tree, the dependency\npackages, or both. Omitted, `local`. A package contributes symbol hits alone to\n`query`, and file and symbol hits to `pattern`. The server refuses a scope beyond\n`local` together with `rev`, since package facts are served for the current tree\nalone, and `global` together with `traversal`, since a walk runs over the project\nalone."
           },
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
@@ -6486,7 +6534,7 @@
               "src/lib.rs"
             ],
             "maxLength": 1000,
-            "pattern": "^(?:$|(?!\\.rift(?:/|$))(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[^\\\\\\u0000-\\u001F\\u007F/]+(?:/[^\\\\\\u0000-\\u001F\\u007F/]+)*)$",
+            "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
             "type": "string"
           },
           "ReadWarning": {
@@ -7088,20 +7136,20 @@
               },
               {
                 "additionalProperties": false,
-                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.",
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.\n`capability_unavailable` also names a feature the global API's capabilities do not\nadvertise, such as `patterns` for a `pattern` search, and the answer then carries the\nproject hits alone.",
                 "properties": {
                   "code": {
                     "const": "global_page_warning",
                     "type": "string"
                   },
                   "detail": {
-                    "description": "Optional bounded explanation returned by the global package service.",
-                    "maxLength": 1024,
+                    "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
+                    "maxLength": 12431,
                     "type": "string"
                   },
                   "warning_code": {
                     "$ref": "#/$defs/GlobalPageWarningCode",
-                    "description": "Stable condition code returned by the global package service."
+                    "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
                   }
                 },
                 "required": [
@@ -7150,6 +7198,30 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
                 "properties": {
                   "code": {
@@ -7175,7 +7247,7 @@
               },
               {
                 "additionalProperties": false,
-                "description": "One resolver or standard library probe read less than the workspace states, so the\ndependency context may miss packages or name a standard library by its static\nreading. Rides only an answer whose `scope` reaches packages; at most\n`DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one answer,\nthis one first, in resolver order.",
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left:\nevery held entry before any the request's `packages` names. The dependency context\nmay then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
                 "properties": {
                   "code": {
                     "const": "package_context_degraded",
@@ -7187,7 +7259,7 @@
                     "type": "string"
                   },
                   "resolver": {
-                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`,\nor a standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`.",
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
                     "maxLength": 128,
                     "type": "string"
                   }
@@ -7514,7 +7586,7 @@
               },
               "path": {
                 "$ref": "#/$defs/ProjectPath",
-                "description": "Project-relative path of the hit, present for a file hit and for a symbol hit whose\ndeclaration belongs to the project. A dependency or standard-library declaration\ncarries `unit` in its place."
+                "description": "Project-relative path of the hit, present for a project file hit and for a symbol\nhit whose declaration belongs to the project. A hit in a dependency or\nstandard-library file carries `unit` in its place."
               },
               "range": {
                 "$ref": "#/$defs/TextRange",
@@ -7540,7 +7612,7 @@
               },
               "unit": {
                 "$ref": "#/$defs/SourceUnitId",
-                "description": "Source-catalog unit of a dependency or standard-library declaration. A symbol hit\ncarries exactly one of `path` and `unit`; a file hit carries `path`."
+                "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit carries exactly one of `path` and `unit`."
               }
             },
             "required": [

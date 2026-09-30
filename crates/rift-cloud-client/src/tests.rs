@@ -1,6 +1,10 @@
 use super::*;
 
+mod declaration;
 mod documentation;
+mod pages;
+mod pattern;
+mod resolution;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,6 +56,15 @@ enum OperationFixture {
     InvalidSource,
     InvalidSourceIdentity,
     InvalidMatchClass,
+    UnknownMatchClass,
+    PageLimitMax(i64),
+    NamedSubstitution,
+    UnnamedSubstitution,
+    SubstitutionAtRequestedVersion,
+    RequirementOutsideRange,
+    BodyBoundStop,
+    Patterns,
+    Declarations,
     Problem(StatusCode),
     AdditiveResponse,
 }
@@ -309,6 +322,9 @@ fn operation_response(
     if path.ends_with("/capabilities") {
         return operation_capabilities_response(mode);
     }
+    if let OperationFixture::Problem(status) = mode {
+        return problem_response(*status);
+    }
     if path.ends_with("/resolutions") {
         return operation_resolution_response(mode);
     }
@@ -316,10 +332,19 @@ fn operation_response(
         return operation_search_response(mode, query, request_number);
     }
     if path.ends_with("/symbols") {
-        return operation_symbol_response(query);
+        return operation_symbol_response(mode, query);
+    }
+    if path.ends_with("/declarations") {
+        return json_response(&declaration::declaration_response_json(), None);
+    }
+    if path.ends_with("/patterns") {
+        return json_response(&pattern::pattern_page_json(query_cursor(query)), None);
     }
     status_response(StatusCode::NOT_FOUND)
 }
+
+/// The `page_limit_max` the pattern fixture advertises, below the client's own bound.
+const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
@@ -347,11 +372,35 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::AdditiveResponse => {
             value["future_field"] = serde_json::json!("ignored by this client");
         }
+        OperationFixture::PageLimitMax(advertised) => {
+            value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
+        }
+        OperationFixture::Declarations => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "declarations"]);
+        }
+        OperationFixture::Patterns => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
+            value["bounds"]["page_limit_max"] = serde_json::json!(PATTERN_PAGE_LIMIT_ADVERTISED);
+        }
+        OperationFixture::Problem(_) => {
+            value["supported_features"] = serde_json::json!([
+                "resolutions",
+                "search",
+                "symbols",
+                "patterns",
+                "declarations"
+            ]);
+        }
         _ => {}
     })
 }
 
 fn operation_resolution_response(mode: &OperationFixture) -> Response {
+    if let Some(body) = resolution::substitution_response(mode) {
+        return json_response(&body, Some("max-age=60"));
+    }
     let body = match mode {
         OperationFixture::InvalidResolutionAccounting => serde_json::json!({
             "available_exact": [],
@@ -377,9 +426,6 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
-    if let OperationFixture::Problem(status) = mode {
-        return problem_response(*status);
-    }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -395,6 +441,11 @@ fn operation_search_response(
         | OperationFixture::InvalidSource
         | OperationFixture::InvalidSourceIdentity
         | OperationFixture::InvalidMatchClass => invalid_search_page(mode),
+        OperationFixture::UnknownMatchClass => {
+            let mut page = search_page_json("demo", None, "analyzer-v1", "first");
+            page["items"][0]["match_class"] = serde_json::json!("unknown");
+            page
+        }
         OperationFixture::TightSourceBound => {
             let mut page = search_page_json("demo", None, "analyzer-v1", "first");
             page["items"][0]["source"] = serde_json::json!("too large");
@@ -417,6 +468,11 @@ fn operation_search_response(
             if cursor.is_some() { "second" } else { "first" },
         ),
         OperationFixture::MismatchedCursor => mismatched_cursor_page(query),
+        OperationFixture::BodyBoundStop => pages::body_bound_page(
+            search_page_json("demo", Some("next"), "analyzer-v2", "first"),
+            search_page_json("demo", None, "analyzer-v2", "second"),
+            cursor,
+        ),
         OperationFixture::SearchPages
         | OperationFixture::CandidateBound
         | OperationFixture::PartialFailure
@@ -436,11 +492,39 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
     }
 }
 
-fn operation_symbol_response(query: Option<&str>) -> Response {
-    let body = if query_cursor(query).is_none() {
-        symbol_page_json("demo", Some("next"), "analyzer-v2", "first")
-    } else {
-        symbol_page_json("demo", None, "analyzer-v2", "second")
+fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Response {
+    let cursor = query_cursor(query);
+    let followed = cursor.is_some();
+    let body = match mode {
+        OperationFixture::BodyBoundStop => pages::body_bound_page(
+            symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
+            symbol_page_json("demo", None, "analyzer-v2", "second"),
+            cursor,
+        ),
+        OperationFixture::PageRevisionChange => symbol_page_json(
+            "demo",
+            Some("next"),
+            if followed {
+                "analyzer-v2"
+            } else {
+                "analyzer-v1"
+            },
+            if followed { "second" } else { "first" },
+        ),
+        OperationFixture::MismatchedCursor => symbol_page_json(
+            "demo",
+            (!followed).then_some("next"),
+            "analyzer-v2",
+            "first",
+        ),
+        OperationFixture::RepeatedCursor => symbol_page_json(
+            "demo",
+            Some("next"),
+            "analyzer-v2",
+            if followed { "second" } else { "first" },
+        ),
+        _ if followed => symbol_page_json("demo", None, "analyzer-v2", "second"),
+        _ => symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
     };
     json_response(&body, None)
 }
@@ -522,7 +606,7 @@ fn package_json(name: &str) -> serde_json::Value {
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "id":format!("rift://symbol/rust/src/{suffix}.rs/demo"),
+        "id":format!("rift://symbol/rust/cargo/{package}@1.0.0/src/{suffix}.rs/demo"),
         "kind":"function",
         "language":"rust",
         "name":"demo",
@@ -603,8 +687,7 @@ fn capabilities_json() -> String {
             "name",
             "qualified_name",
             "documentation",
-            "signature",
-            "declaration_source"
+            "signature"
         ],
         "bounds": {
             "request_body_bytes_max": REQUEST_BODY_BYTES_MAX,
@@ -779,6 +862,12 @@ fn test_client_errors_use_bounded_messages() {
             "global response violates contract: query",
         ),
         (
+            ClientError::FeatureUnavailable {
+                feature: "patterns",
+            },
+            "global API does not advertise feature: patterns",
+        ),
+        (
             ClientError::Http {
                 meta: Box::new(meta),
                 problem: None,
@@ -894,7 +983,9 @@ fn test_documentation_request_requires_advertised_capability() {
     request.target = Some(PackageSearchRequestTarget::Documentation);
     assert_eq!(
         validate_search_request_for_capabilities(&request, 20, None, &capabilities),
-        Err(ClientError::InvalidRequest { field: "target" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "documentation_search"
+        })
     );
 
     capabilities
@@ -908,7 +999,9 @@ fn test_documentation_request_requires_advertised_capability() {
     symbol.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
     assert_eq!(
         validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities),
-        Err(ClientError::InvalidRequest { field: "include" })
+        Err(ClientError::FeatureUnavailable {
+            feature: "symbol_documentation"
+        })
     );
     capabilities
         .supported_features
@@ -1312,6 +1405,124 @@ async fn test_fixture_documented_problem_statuses_decode() {
     }
 }
 
+/// The page limit `operation_failure` asks for, within every fixture's `page_limit_max`.
+const OPERATION_PAGE_LIMIT: i64 = 2;
+
+/// Sends one request to `endpoint` and keeps the failure it answers.
+async fn operation_failure(
+    client: &GlobalClient,
+    endpoint: crate::contract::Endpoint,
+) -> Option<ClientError> {
+    use crate::contract::Endpoint;
+    match endpoint {
+        Endpoint::Capabilities => client.get_capabilities().await.err(),
+        Endpoint::Resolutions => client
+            .resolve_package_context(&resolution_request())
+            .await
+            .err(),
+        Endpoint::Search => client
+            .search_packages(&search_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Symbols => client
+            .list_package_symbols(&symbol_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Patterns => client
+            .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Declarations => client
+            .find_package_declarations(&declaration::declaration_request())
+            .await
+            .err(),
+    }
+}
+
+/// The failure the client answers for the fixture's `status` problem: `Http` carrying the
+/// problem details when the contract documents `status`, and none when it does not.
+fn fixture_problem(status: StatusCode, documented: bool) -> ClientError {
+    let problem = serde_json::from_str::<ProblemDetails>(&problem_json(status)).ok();
+    ClientError::Http {
+        meta: Box::new(ResponseMeta {
+            status: status.as_u16(),
+            content_type: Some("application/problem+json".to_owned()),
+            etag: None,
+            cache_control: None,
+            www_authenticate: None,
+            retry_after: None,
+            rate_limit_limit: None,
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+        }),
+        problem: problem.filter(|_| documented).map(Box::new),
+    }
+}
+
+/// Every problem status an operation's contract documents, each decoded into its own
+/// response variant.
+const DOCUMENTED_PROBLEM_STATUSES: [StatusCode; 11] = [
+    StatusCode::BAD_REQUEST,
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::NOT_ACCEPTABLE,
+    StatusCode::PAYLOAD_TOO_LARGE,
+    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    StatusCode::TOO_MANY_REQUESTS,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
+
+/// Every operation answers a problem status as `Http`, with the problem details a documented
+/// status carries and without them for an undocumented one. The operation records the
+/// failure, so a later request answers it without reaching the endpoint. One attempt per
+/// request keeps the retried statuses to one request each.
+#[tokio::test]
+async fn test_fixture_every_operation_answers_problem_statuses() {
+    use crate::contract::Endpoint;
+    let operations = [
+        Endpoint::Resolutions,
+        Endpoint::Search,
+        Endpoint::Symbols,
+        Endpoint::Patterns,
+        Endpoint::Declarations,
+    ];
+    let statuses = DOCUMENTED_PROBLEM_STATUSES
+        .map(|status| (status, true))
+        .into_iter()
+        .chain([(StatusCode::CONFLICT, false)]);
+    for (status, documented) in statuses {
+        for endpoint in operations {
+            let mode = FixtureMode::Operations(OperationFixture::Problem(status));
+            let server = FixtureServer::start(mode).await.expect("fixture server");
+            let config = Config {
+                attempts: 1,
+                ..server.config()
+            };
+            let client = GlobalClient::new(config).expect("fixture client");
+            let expected = Some(fixture_problem(status, documented));
+            assert_eq!(
+                operation_failure(&client, endpoint).await,
+                expected,
+                "{endpoint:?} answers HTTP {status}"
+            );
+            assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                operation_failure(&client, Endpoint::Capabilities).await,
+                expected,
+                "{endpoint:?} records its failure"
+            );
+            assert_eq!(
+                server.state.requests.load(Ordering::SeqCst),
+                2,
+                "the recorded failure answers without a request"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_fixture_retry_after_beyond_deadline_does_not_repeat() {
     let server = FixtureServer::start(FixtureMode::RetryAfter {
@@ -1507,6 +1718,43 @@ fn package_request() -> PackageIdentity {
     }
 }
 
+/// The contract's `maxLength` for `query`, a query term's `text`, and a symbol `name` counts
+/// characters, so each field holding that many two-byte characters is accepted although it
+/// holds twice as many bytes, and one character more refuses naming the field.
+#[test]
+fn test_query_term_and_name_bounds_count_characters() {
+    let at_bound = |max: usize| "\u{e9}".repeat(max);
+    let past_bound = |max: usize| "\u{e9}".repeat(max + 1);
+    assert_eq!(at_bound(QUERY_BYTES_MAX).len(), 2 * QUERY_BYTES_MAX);
+
+    let mut search = search_request();
+    search.query = at_bound(QUERY_BYTES_MAX);
+    assert_eq!(validate_search_request(&search), Ok(()));
+    search.query = past_bound(QUERY_BYTES_MAX);
+    assert_eq!(
+        validate_search_request(&search),
+        Err(ClientError::InvalidRequest { field: "query" })
+    );
+
+    let mut search = search_request();
+    search.terms[0].text = at_bound(QUERY_TERM_BYTES_MAX);
+    assert_eq!(validate_search_request(&search), Ok(()));
+    search.terms[0].text = past_bound(QUERY_TERM_BYTES_MAX);
+    assert_eq!(
+        validate_search_request(&search),
+        Err(ClientError::InvalidRequest { field: "term" })
+    );
+
+    let mut symbol = symbol_request();
+    symbol.name = at_bound(QUERY_BYTES_MAX);
+    assert_eq!(validate_symbol_request(&symbol), Ok(()));
+    symbol.name = past_bound(QUERY_BYTES_MAX);
+    assert_eq!(
+        validate_symbol_request(&symbol),
+        Err(ClientError::InvalidRequest { field: "name" })
+    );
+}
+
 fn search_request() -> PackageSearchRequest {
     PackageSearchRequest {
         query: "demo".to_owned(),
@@ -1671,9 +1919,12 @@ async fn test_fixture_page_rejects_repeated_cursor_and_partial_failure() {
         Err(ClientError::Http { meta, .. }) if meta.status == 503
     ));
     let requests = server.state.requests.load(Ordering::SeqCst);
-    assert_eq!(
-        client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::Connection)
+    assert!(
+        matches!(
+            client.search_packages_pages(&search_request(), 20).await,
+            Err(ClientError::Http { meta, .. }) if meta.status == 503
+        ),
+        "a later request answers the failure that marked the endpoint unavailable"
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), requests);
 }
@@ -1750,6 +2001,94 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
     }
 }
 
+/// A hit found by its text or its vector reports `unknown`, and the page reaches the caller when
+/// the hit matches none of the requested identifiers; `unknown` on a hit spelling a requested
+/// identifier contradicts it (#389).
+#[tokio::test]
+async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifier() {
+    for identifiers in [Vec::new(), vec!["absent".to_owned()]] {
+        let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
+        let mut request = search_request();
+        request.identifiers = identifiers;
+        let page = client
+            .search_packages(&request, 20, None)
+            .await
+            .expect("an unknown hit matching no identifier is valid");
+        assert_eq!(page.items.len(), 1);
+    }
+
+    let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
+    assert_eq!(
+        client.search_packages(&search_request(), 20, None).await,
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
+}
+
+#[test]
+fn test_symbol_lookup_refuses_unknown_match_class() {
+    let hit: PackageSymbol = serde_json::from_value(serde_json::json!({
+        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
+        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "line": 1, "match_class": "unknown"
+    }))
+    .expect("symbol hit fixture");
+    let mut request = symbol_request();
+    request.name = "absent".to_owned();
+    assert_eq!(
+        validate_symbol_match_class(&request, &hit, "demo"),
+        Err(ClientError::InvalidResponseField {
+            field: "match_class"
+        })
+    );
+}
+
+/// Package analysis mints a package declaration's identity over its unit's resolver and key, so
+/// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
+/// `rift://source/cargo/demo@1.0.0/src/first.rs`. The package-relative spelling names a
+/// project file, and no producer mints it for a package declaration, so it is refused.
+#[test]
+fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
+    let hit = |id: &str| {
+        let mut value = search_hit_json("demo", "first");
+        value["symbol"]["id"] = serde_json::json!(id);
+        serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
+    };
+    let minted = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/first.rs", "demo");
+    let candidate = PackageSearchCandidate::try_from(&hit(&minted));
+    assert!(candidate.is_ok(), "{minted}: {candidate:?}");
+    let refused = [
+        "rift://symbol/rust/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo@2.0.0/src/first.rs/demo",
+        "rift://symbol/rust/npm/demo@1.0.0/src/first.rs/demo",
+        "rift://symbol/rust/cargo/demo@1.0.0/src/second.rs/demo",
+        "rift://symbol/rust/cargo/demo@1.0.0/demo",
+    ];
+    for id in refused {
+        assert_eq!(
+            PackageSearchCandidate::try_from(&hit(id)).err(),
+            Some(ClientError::InvalidResponseField {
+                field: "symbol_identity"
+            }),
+            "{id}"
+        );
+    }
+
+    let symbol: PackageSymbol = serde_json::from_value(serde_json::json!({
+        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
+        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
+        "line": 1, "match_class": "qualified_exact"
+    }))
+    .expect("symbol hit fixture");
+    let candidate = PackageSymbolCandidate::try_from(&symbol)
+        .unwrap_or_else(|error| panic!("package symbol identity: {error:?}"));
+    assert_eq!(
+        candidate.symbol_identity.0,
+        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo"
+    );
+}
+
 #[tokio::test]
 async fn test_fixture_rejects_invalid_capabilities() {
     let (_server, client) = operation_client(OperationFixture::InvalidPublication).await;
@@ -1769,6 +2108,28 @@ async fn test_fixture_rejects_invalid_capabilities() {
     );
 }
 
+/// The search fields are an exact set: a service whose `required_search_fields` still name
+/// `declaration_source` ranks over a field the client no longer merges, and is refused.
+#[test]
+fn test_capabilities_still_searching_declaration_source_are_refused() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+    let current: Capabilities =
+        serde_json::from_value(value.clone()).expect("current capabilities");
+    assert_eq!(validate_capabilities(&current), Ok(()));
+    value["required_search_fields"]
+        .as_array_mut()
+        .expect("required_search_fields is an array")
+        .push(serde_json::json!("declaration_source"));
+    let previous: Capabilities = serde_json::from_value(value).expect("previous capabilities");
+    assert_eq!(
+        validate_capabilities(&previous),
+        Err(ClientError::InvalidResponseField {
+            field: "required_search_fields"
+        })
+    );
+}
+
 #[tokio::test]
 async fn test_fixture_enforces_active_server_bounds() {
     let (_server, client) = operation_client(OperationFixture::TightBounds).await;
@@ -1780,6 +2141,22 @@ async fn test_fixture_enforces_active_server_bounds() {
         client.resolve_package_context(&resolution_request()).await,
         Err(ClientError::ResponseBodyTooLarge { .. })
     ));
+
+    // Each page read meets the advertised response body bound on its own request, refusing
+    // the page by its declared length, and records the failure a later request answers.
+    let search_page = search_page_json("demo", None, "analyzer-v2", "first").to_string();
+    let symbol_page = symbol_page_json("demo", Some("next"), "analyzer-v2", "first").to_string();
+    for (endpoint, page) in [
+        (crate::contract::Endpoint::Search, search_page),
+        (crate::contract::Endpoint::Symbols, symbol_page),
+    ] {
+        let (server, client) = operation_client(OperationFixture::TightBounds).await;
+        let expected = Some(ClientError::ResponseBodyTooLarge { bytes: page.len() });
+        assert_eq!(operation_failure(&client, endpoint).await, expected);
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(client.get_capabilities().await.err(), expected);
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+    }
 
     let (server, client) = operation_client(OperationFixture::TightRequestBound).await;
     assert!(matches!(

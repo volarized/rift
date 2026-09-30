@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 use rift_cloud_client::contract::{self, ContractError};
 use rift_cloud_client::{
-    Capabilities, PackageResolutionResponse, PackageSearchPage, PackageSymbolPage,
+    Capabilities, PackageDeclarationResponse, PackagePatternPage, PackageResolutionResponse,
+    PackageSearchCandidate, PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
 };
+use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Map, Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -51,6 +53,48 @@ fn assert_invalid(document: &Value, rule: &str) -> TestResult {
 #[test]
 fn committed_contract_is_valid() -> TestResult {
     contract::validate(&repository_root()?.join(contract::CONTRACT_PATH))?;
+    Ok(())
+}
+
+/// Every schema `pattern` compiles in the two dialects that read it: the ECMA-262 regular
+/// expressions a JSON Schema validator runs, and the `regex` crate the client generator
+/// compiles, which has no lookahead. A lookahead the validator accepts fails the contract.
+#[test]
+fn every_schema_pattern_compiles_for_the_validator_and_the_generator() -> TestResult {
+    let document = contract()?;
+    let mut pending = vec![&document];
+    let mut patterns = Vec::new();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(members) => {
+                if let Some(Value::String(pattern)) = members.get("pattern") {
+                    patterns.push(pattern.clone());
+                }
+                pending.extend(
+                    members
+                        .iter()
+                        .filter(|(member, _)| member.as_str() != "examples")
+                        .map(|(_, value)| value),
+                );
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    let project_path = &document["components"]["schemas"]["ProjectPath"]["pattern"];
+    assert!(
+        patterns.iter().any(|pattern| project_path == pattern),
+        "the project path pattern is among them: {patterns:#?}"
+    );
+    for pattern in &patterns {
+        jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
+            .map_err(|error| format!("{pattern}: {error}"))?;
+        regex::Regex::new(pattern).map_err(|error| format!("{pattern}: {error}"))?;
+    }
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["ProjectPath"]["pattern"] = json!(r"^(?!\.rift)[a-z]*$");
+    assert_invalid(&document, "must compile under the `regex` crate")?;
     Ok(())
 }
 
@@ -148,13 +192,104 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     assert_invalid(&document, "Limit/schema/default")?;
 
     let mut document = contract()?;
+    document["components"]["schemas"]["CapabilityBounds"]["properties"]["page_limit_max"]["maximum"] =
+        json!(200);
+    assert_invalid(
+        &document,
+        "CapabilityBounds/properties/page_limit_max/maximum",
+    )?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageSymbolPage"]["properties"]["items"]["maxItems"] =
+        json!(200);
+    assert_invalid(&document, "PackageSymbolPage/properties/items/maxItems")?;
+
+    let mut document = contract()?;
     document["components"]["parameters"]["Cursor"]["schema"]["maxLength"] = json!(4095);
     assert_invalid(&document, "Cursor/schema/maxLength")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackagePatternRequest"]["properties"]["pattern"]["maxLength"] =
+        json!(4096);
+    assert_invalid(
+        &document,
+        "PackagePatternRequest/properties/pattern/maxLength",
+    )?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/patterns"]["post"]["x-rift-page-files-max"] = json!(2000);
+    assert_invalid(&document, "x-rift-page-files-max")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageDeclarationRequest"]["properties"]["positions"]["maxItems"] =
+        json!(10000);
+    assert_invalid(
+        &document,
+        "PackageDeclarationRequest/properties/positions/maxItems",
+    )?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackagePosition"]["properties"]["character"]["maximum"] =
+        json!(65535);
+    assert_invalid(&document, "PackagePosition/properties/character/maximum")?;
 
     let mut document = contract()?;
     document["components"]["schemas"]["PackageIdentity"]["properties"]["name"]["maxLength"] =
         json!(4095);
     assert_invalid(&document, "PackageIdentity")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["Warning"]["properties"]["detail"]["maxLength"] = json!(1024);
+    assert_invalid(&document, "Warning/properties/detail/maxLength")?;
+
+    // A longer requirement makes a longer `requirement_unsatisfied` detail than the warning
+    // bound holds.
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageContextEntry"]["properties"]["requirement"]["maxLength"] =
+        json!(8192);
+    assert_invalid(&document, "Warning/properties/detail/maxLength")?;
+    Ok(())
+}
+
+/// The contract bounds a package `pattern` by the search pattern bound the local server
+/// enforces, and both count characters.
+#[test]
+fn the_pattern_max_length_is_the_search_pattern_bound() -> TestResult {
+    let document = contract()?;
+    let request = &document["components"]["schemas"]["PackagePatternRequest"];
+    let max_length = &request["properties"]["pattern"]["maxLength"];
+    assert_eq!(
+        max_length.as_u64(),
+        Some(u64::try_from(SEARCH_PATTERN_CHARS_MAX)?),
+        "{max_length}"
+    );
+    Ok(())
+}
+
+/// An optional property accepting `null` fails validation, in a shared schema and in one the
+/// contract alone defines: the service omits an absent field.
+#[test]
+fn an_optional_property_accepting_null_fails_validation() -> TestResult {
+    let mut document = contract()?;
+    document["components"]["schemas"]["PackageSearchPage"]["properties"]["next_cursor"]["type"] =
+        json!(["string", "null"]);
+    assert_invalid(&document, "schema `PackageSearchPage` accepts `null`")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["Symbol"]["properties"]["visibility"]["type"] =
+        json!(["string", "null"]);
+    assert_invalid(&document, "schema `Symbol` accepts `null`")?;
+    Ok(())
+}
+
+/// A boolean component schema holds no property, so the `null` rule has nothing to refuse
+/// in it and the contract stays valid.
+#[test]
+fn a_boolean_component_schema_passes_the_optional_null_rule() -> TestResult {
+    let mut document = contract()?;
+    document["components"]["schemas"]["AnyValue"] = json!(true);
+    let (_directory, path) = write_contract(&document)?;
+    contract::validate(&path)?;
     Ok(())
 }
 
@@ -167,7 +302,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 9,
+        checked, 15,
         "each request and success response carries an example"
     );
     Ok(())
@@ -179,7 +314,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 5,
+        checked, 8,
         "each success response carries a generated response type"
     );
     Ok(())
@@ -227,14 +362,28 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
             serde_json::from_value::<PackageResolutionResponse>(value)?;
         }
         "#/components/schemas/PackageSearchPage" => {
-            serde_json::from_value::<PackageSearchPage>(value)?;
+            let page = serde_json::from_value::<PackageSearchPage>(value)?;
+            for item in page.items {
+                PackageSearchCandidate::try_from(item)?;
+            }
         }
         "#/components/schemas/PackageSymbolPage" => {
-            serde_json::from_value::<PackageSymbolPage>(value)?;
+            let page = serde_json::from_value::<PackageSymbolPage>(value)?;
+            for item in page.items {
+                PackageSymbolCandidate::try_from(item)?;
+            }
+        }
+        "#/components/schemas/PackagePatternPage" => {
+            serde_json::from_value::<PackagePatternPage>(value)?;
+        }
+        "#/components/schemas/PackageDeclarationResponse" => {
+            serde_json::from_value::<PackageDeclarationResponse>(value)?;
         }
         "#/components/schemas/PackageResolutionRequest"
         | "#/components/schemas/PackageSearchRequest"
-        | "#/components/schemas/PackageSymbolRequest" => return Ok(false),
+        | "#/components/schemas/PackageSymbolRequest"
+        | "#/components/schemas/PackagePatternRequest"
+        | "#/components/schemas/PackageDeclarationRequest" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
     Ok(true)

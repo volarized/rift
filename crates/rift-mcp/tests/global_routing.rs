@@ -12,7 +12,11 @@ mod workspace_client;
 
 use std::{fs, time::Duration};
 
-use global_api::{COLLECTED_UNIT, GlobalFixture, Hold, SymbolFixture};
+use axum::http::StatusCode;
+use global_api::{
+    BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
+    SymbolFixture, UNSATISFIED_REQUIREMENT,
+};
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -343,6 +347,82 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     Ok(())
 }
 
+/// The collected `demo` release answers an entry the collection holds no release for, and
+/// the answer names the substitution: an exact version the collection lacks, and a
+/// requirement the collected release lies outside. The package hits still answer.
+#[tokio::test]
+async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
+    let cases = [
+        (
+            "version = \"1.0.3\"".to_owned(),
+            json!({"manager":"cargo","name":"demo","version":"1.0.3","availability":"canonical"}),
+        ),
+        (
+            format!("requirement = \"{UNSATISFIED_REQUIREMENT}\""),
+            json!({
+                "manager":"cargo",
+                "name":"demo",
+                "requirement":UNSATISFIED_REQUIREMENT,
+                "availability":"canonical"
+            }),
+        ),
+    ];
+    for (selector, entry) in cases {
+        let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+        let configuration = format!(
+            "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+             request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
+             [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\n{selector}\n",
+            fixture.endpoint
+        );
+        let (directory, client, server_task) = served_workspace(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                (
+                    "Cargo.lock",
+                    "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub fn local_beacon() {}\n"),
+            ],
+            Some(configuration),
+        )
+        .await?;
+        let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+        assert_eq!(
+            answer["hits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|hit| &hit["unit"])
+                .collect::<Vec<_>>(),
+            [&json!(COLLECTED_UNIT)],
+            "{answer:#}"
+        );
+        let substituted: Vec<&Value> = answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["code"] == "package_substituted")
+            .collect();
+        assert_eq!(
+            substituted,
+            [&json!({
+                "code": "package_substituted",
+                "entry": entry,
+                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+            })],
+            "{answer:#}"
+        );
+        drop(directory);
+        client.cancel().await?;
+        server_task.await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn successful_search_uses_remote_phases_without_local_request_fields() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
@@ -418,6 +498,303 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
         assert!(!rendered.contains("local_beacon"));
         assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The search requests `fixture` received, in order.
+async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.contains("/v1/search?"))
+        .collect()
+}
+
+/// A search asks each phase for one page at the smaller of the client's bound and the
+/// advertised `page_limit_max`: 200 against a service advertising 200, 1,000 against one
+/// advertising 1,000, and one request per phase either way.
+#[tokio::test]
+async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResult {
+    for (advertised, limit) in [(200, "limit=200"), (1_000, "limit=1000")] {
+        let fixture = GlobalFixture::start_with(FixtureOptions {
+            page_limit_max: advertised,
+            ..FixtureOptions::default()
+        })
+        .await?;
+        let configuration = format!(
+            "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+             request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+            fixture.endpoint
+        );
+        let workspace = served_dependent_workspace(Some(&configuration)).await?;
+        let (directory, client, server_task) = workspace.served;
+        let answer = call_tool(
+            &client,
+            "search",
+            json!({"query":"helper_beacon demo","scope":"global"}),
+        )
+        .await?;
+        assert!(
+            answer["results"]
+                .as_array()
+                .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+            "{answer:#}"
+        );
+        let searches = search_requests(&fixture).await;
+        assert_eq!(searches.len(), 2, "{searches:#?}");
+        for request in &searches {
+            assert!(
+                request.uri.ends_with(limit),
+                "{advertised}: {}",
+                request.uri
+            );
+        }
+        drop(directory);
+        client.cancel().await?;
+        server_task.await?;
+    }
+    Ok(())
+}
+
+/// A search page the service stopped at its response body bound answers what fit, with the
+/// page's `result_truncated` as a `global_page_warning`, and its cursor is not followed: the
+/// search stays at one request per phase.
+#[tokio::test]
+async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        stopped_at_body_bound: true,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query":"helper_beacon demo","scope":"global","include":["source"]}),
+    )
+    .await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let truncated: Vec<&Value> = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| {
+            warning["code"] == "global_page_warning"
+                && warning["warning_code"] == "result_truncated"
+        })
+        .collect();
+    assert_eq!(
+        truncated,
+        [&json!({
+            "code": "global_page_warning",
+            "warning_code": "result_truncated",
+            "detail": "the page stopped at response_body_bytes_max"
+        })],
+        "{answer:#}"
+    );
+    let searches = search_requests(&fixture).await;
+    assert_eq!(searches.len(), 2, "{searches:#?}");
+    assert!(
+        searches
+            .iter()
+            .all(|request| !request.uri.contains(BODY_BOUND_CURSOR)),
+        "the stopped page's cursor is never followed: {searches:#?}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The pattern requests `fixture` received, in order.
+async fn pattern_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
+    fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.contains("/v1/patterns?"))
+        .collect()
+}
+
+/// What a `global` search for `fn helper_\w+` with `target: "all"` and `source` answers: the
+/// collected declaration holding the match, then the match itself, both addressed by `unit`.
+fn helper_beacon_pattern_hits() -> Value {
+    json!([
+        {
+            "hit": {
+                "target": "symbol",
+                "symbol": {
+                    "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                    "language": "rust",
+                    "name": "helper_beacon",
+                    "kind": "function",
+                    "origin": {
+                        "location": "dependency",
+                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
+                        "source_kind": "authored"
+                    }
+                }
+            },
+            "matched_by": ["content"],
+            "source": "pub fn helper_beacon() {}",
+            "range": {"start": 0, "end": 25},
+            "line": 1,
+            "unit": COLLECTED_UNIT
+        },
+        {
+            "hit": {"target": "file", "size": 45},
+            "matched_by": ["content"],
+            "source": "pub fn helper_beacon() {}",
+            "range": {"start": 4, "end": 20},
+            "line": 1,
+            "unit": COLLECTED_UNIT
+        }
+    ])
+}
+
+/// A `pattern` whose `scope` reaches packages answers the package matches from one page of
+/// the global API's pattern search: `global` alone, `all` after the project's own. A package
+/// match answers a file hit addressed by `unit` and a symbol hit for the declaration holding
+/// it, each with its source when the request includes it.
+#[tokio::test]
+async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+
+    let global = call_tool(
+        &client,
+        "search",
+        json!({
+            "pattern": r"fn helper_\w+",
+            "scope": "global",
+            "target": "all",
+            "include": ["source"]
+        }),
+    )
+    .await?;
+    assert_eq!(
+        global["results"],
+        helper_beacon_pattern_hits(),
+        "{global:#}"
+    );
+
+    let all = call_tool(
+        &client,
+        "search",
+        json!({"pattern": r"fn \w*beacon", "scope": "all", "target": "file"}),
+    )
+    .await?;
+    let addressed: Vec<(&Value, &Value)> = all["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| (&hit["path"], &hit["unit"]))
+        .collect();
+    let project = json!("src/lib.rs");
+    let package = json!(COLLECTED_UNIT);
+    assert_eq!(
+        addressed,
+        [
+            (&project, &Value::Null),
+            (&project, &Value::Null),
+            (&Value::Null, &package),
+            (&Value::Null, &package),
+        ],
+        "the project's matches first, then the package's: {all:#}"
+    );
+
+    let local = call_tool(&client, "search", json!({"pattern": r"fn \w*beacon"})).await?;
+    assert!(
+        local["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|hit| hit["path"] == project),
+        "{local:#}"
+    );
+
+    let requests = pattern_requests(&fixture).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "one request per package-scoped search: {requests:#?}"
+    );
+    let bodies: Vec<&Value> = requests
+        .iter()
+        .filter_map(|request| request.body.as_ref())
+        .collect();
+    assert_eq!(
+        bodies,
+        [
+            &json!({
+                "pattern": r"fn helper_\w+",
+                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "include": ["source"]
+            }),
+            &json!({
+                "pattern": r"fn \w*beacon",
+                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            }),
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.uri.ends_with("limit=200")),
+        "{requests:#?}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A pattern the server refuses spends no global request: the project side reads, and
+/// refuses, before the package side is asked.
+#[tokio::test]
+async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let error = client
+        .call_tool(tool_request(
+            "search",
+            &json!({"pattern": "beacon(", "scope": "global"}),
+        ))
+        .await
+        .expect_err("a pattern that does not parse is refused");
+    let rmcp::ServiceError::McpError(error) = error else {
+        panic!("the refusal must arrive as an MCP error: {error}");
+    };
+    let wire = error.data.ok_or("a refusal carries its wire data")?;
+    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    assert!(fixture.requests().await.is_empty());
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -504,8 +881,9 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     client.cancel().await?;
     server_task.await?;
 
-    // The client answers every request as unavailable for `failure_ttl` after a failed
-    // one, so the search runs against a server of its own to meet the invalid page.
+    // Inside `failure_ttl` the client hands back the failure it recorded and asks the
+    // global API nothing, so the search runs against a server of its own to meet the
+    // invalid page.
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     let answer = call_tool(&client, "search", json!({"query":"beacon","scope":"all"})).await?;
@@ -523,6 +901,128 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
         "every search hit is a project hit: {answer:#}"
     );
     drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A failed global read marks the global API unavailable for `failure_ttl`, and a later
+/// read inside it answers from that failure: it carries the same typed warning and class
+/// the first read met, and sends the global API nothing.
+#[tokio::test]
+async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\nfailure_ttl = \"1h\"\n\n\
+         {DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let expected = json!({"code": "global_response_invalid", "failure_class": "invalid_response"});
+    let global_warnings = |answer: &Value| -> Vec<Value> {
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| {
+                warning["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("global_"))
+            })
+            .cloned()
+            .collect()
+    };
+
+    let first = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    assert_eq!(
+        global_warnings(&first),
+        std::slice::from_ref(&expected),
+        "{first:#}"
+    );
+    let sent = fixture.requests().await.len();
+
+    let later = call_tool(
+        &client,
+        "search",
+        json!({"query": "beacon", "scope": "all", "target": "symbol"}),
+    )
+    .await?;
+    assert_eq!(global_warnings(&later), [expected], "{later:#}");
+    assert_eq!(
+        fixture.requests().await.len(),
+        sent,
+        "a read inside failure_ttl sends the global API nothing"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A resolution the global API answers with a problem status leaves the route without
+/// packages: the read answers the project hits alone, with the warning naming the status
+/// class, and asks for no package page.
+#[tokio::test]
+async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        resolution_problem: Some(StatusCode::INTERNAL_SERVER_ERROR),
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let answer = get_symbol(&client, json!({"name": "local_beacon", "scope": "all"})).await?;
+    let warning = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == "global_api_unavailable")
+        .ok_or_else(|| format!("missing global API warning: {answer:#}"))?;
+    assert_eq!(
+        warning,
+        &json!({"code": "global_api_unavailable", "failure_class": "non_success_response"})
+    );
+    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let located: Vec<(&Value, &Value)> = hits
+        .iter()
+        .map(|hit| (&hit["symbol"]["name"], &hit["path"]))
+        .collect();
+    assert_eq!(
+        located,
+        [(&json!("local_beacon"), &json!("src/lib.rs"))],
+        "{answer:#}"
+    );
+    let requested: Vec<String> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .map(|request| request.uri)
+        .collect();
+    assert_eq!(
+        requested,
+        ["/rift/rest/v1/capabilities", "/rift/rest/v1/resolutions"],
+        "the refused resolution ends the read's global requests"
+    );
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -713,9 +1213,21 @@ fn demo_entries(entries: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// The versions of the `package_substituted` entries `answer` warns about.
+fn substituted_versions(answer: &Value) -> Vec<&Value> {
+    answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "package_substituted")
+        .map(|warning| &warning["entry"]["version"])
+        .collect()
+}
+
 /// A `packages` entry naming a package the context holds replaces its version for that
-/// read alone: the context pins `demo` at a release the collection lacks, and the lookup
-/// naming the collected release sends that version in its place and answers from it.
+/// read alone: the context pins `demo` at a release the collection lacks, which answers
+/// from the nearest release with `package_substituted`, and the lookup naming the
+/// collected release sends that version in its place and answers from it exactly.
 #[tokio::test]
 async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
@@ -728,13 +1240,9 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
     let pinned = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
-    assert_eq!(pinned["hits"], json!([]), "{pinned:#}");
-    assert!(
-        pinned["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "package_absent" && warning["package"]["version"] == "0.9.0"
-            })
-        }),
+    assert_eq!(
+        substituted_versions(&pinned),
+        [&json!("0.9.0")],
         "{pinned:#}"
     );
 
@@ -755,8 +1263,8 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         .collect();
     assert_eq!(units, [&json!(COLLECTED_UNIT)], "{replaced:#}");
     assert!(
-        !replaced.to_string().contains("package_absent"),
-        "the replaced release is not asked for: {replaced:#}"
+        substituted_versions(&replaced).is_empty(),
+        "the requested release answers exactly: {replaced:#}"
     );
 
     let resolutions = resolution_entries(&fixture).await;
@@ -779,8 +1287,8 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
 
     let again = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
     assert_eq!(
-        again["hits"],
-        json!([]),
+        substituted_versions(&again),
+        [&json!("0.9.0")],
         "the next read resolves the workspace's own version: {again:#}"
     );
     drop(directory);
@@ -840,6 +1348,552 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
             "the search reads the release the requirement resolved to"
         );
     }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A read the server refuses spends no global request, whichever route it takes: the page
+/// arguments are accepted and the project side reads before the package side is asked, so
+/// a zero `limit` is refused, never paged.
+#[tokio::test]
+async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let refused = [
+        (
+            "search",
+            json!({"query": "beacon", "pattern": "beacon", "scope": "all"}),
+            "pattern",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all", "traversal": {"depth": 1}}),
+            "seed",
+        ),
+        (
+            "search",
+            json!({"pattern": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+        (
+            "get_symbol",
+            json!({"name": "beacon", "scope": "all", "limit": 0}),
+            "limit",
+        ),
+    ];
+    for (tool, request, field) in refused {
+        let error = client
+            .call_tool(tool_request(tool, &request))
+            .await
+            .expect_err("the read refuses before any package is asked");
+        let rmcp::ServiceError::McpError(error) = error else {
+            panic!("the refusal must arrive as an MCP error: {error}");
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{request}: {wire:#}"
+        );
+        assert!(
+            error.message.contains(&format!("field {field}")),
+            "{request}: {}",
+            error.message
+        );
+    }
+    assert!(fixture.requests().await.is_empty());
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A global API advertising a smaller `dependency_entries_max` than the client's own bound
+/// still answers a read: the resolution request holds that many entries, the requested
+/// package among them, and the context entries sorted last leave with a
+/// `package_context_degraded` warning naming their package manager.
+#[tokio::test]
+async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> TestResult {
+    use std::fmt::Write as _;
+
+    let advertised = 3;
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        dependency_entries_max: advertised,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let mut lockfile =
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+    for index in 0..5 {
+        write!(
+            lockfile,
+            "\n[[package]]\nname = \"pkg-{index:05}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        )?;
+    }
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let sent = resolution_entries(&fixture).await;
+    assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
+    assert_eq!(sent[0].len(), usize::try_from(advertised)?, "{sent:#?}");
+    assert_eq!(demo_entries(&sent[0]).len(), 1, "{sent:#?}");
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] == "package_context_degraded" && warning["resolver"] == "cargo"
+        })
+        .collect();
+    assert_eq!(
+        degraded,
+        [&json!({
+            "code": "package_context_degraded",
+            "resolver": "cargo",
+            "reason": format!(
+                "3 of 5 packages were not reported: at most {advertised} are carried per \
+                 read, the requested packages first"
+            )
+        })],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A global API advertising fewer entries than a read requests still answers it: every
+/// lockfile entry leaves first, then the requested entries sorted last, and
+/// `package_context_degraded` names the bound and the requested packages not reported. The
+/// read answers the requested package that stayed, and no global warning says the global
+/// API failed.
+#[tokio::test]
+async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entries() -> TestResult
+{
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        dependency_entries_max: 1,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let registry = "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let lockfile = format!(
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
+         [[package]]\nname = \"pkg-00000\"\nversion = \"1.0.0\"\n{registry}\n\
+         [[package]]\nname = \"pkg-00001\"\nversion = \"1.0.0\"\n{registry}"
+    );
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [
+            {"manager": "cargo", "name": "zlib", "version": "1.3.1"},
+            {"manager": "cargo", "name": "demo", "version": "1.0.0"}
+        ]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let sent = resolution_entries(&fixture).await;
+    assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
+    assert_eq!(
+        sent[0],
+        [json!({
+            "availability": "canonical",
+            "manager": "cargo",
+            "name": "demo",
+            "version": "1.0.0"
+        })],
+        "{sent:#?}"
+    );
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] == "package_context_degraded" && warning["resolver"] == "cargo"
+        })
+        .collect();
+    assert_eq!(
+        degraded,
+        [
+            &json!({
+                "code": "package_context_degraded",
+                "resolver": "cargo",
+                "reason": "2 of 2 packages were not reported: at most 1 are carried per read, \
+                           the requested packages first"
+            }),
+            &json!({
+                "code": "package_context_degraded",
+                "resolver": "cargo",
+                "reason": "1 of 2 requested packages were not reported: at most 1 are carried \
+                           per read, and every other package left first"
+            })
+        ],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A workspace whose lockfile fills the dependency context to its bound still answers a
+/// read naming one more package: the requested package goes out, the context entry sorted
+/// last leaves with a `package_context_degraded` warning naming its package manager, and
+/// the resolution request stays within the entry bound the client holds it to.
+#[tokio::test]
+async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() -> TestResult {
+    use std::fmt::Write as _;
+
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let bound = rift_dependency::PACKAGES_MAX;
+    let mut lockfile =
+        "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+    for index in 0..bound {
+        write!(
+            lockfile,
+            "\n[[package]]\nname = \"pkg-{index:05}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+        )?;
+    }
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("Cargo.lock", lockfile.as_str()),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+
+    let request = json!({
+        "query": "helper_beacon",
+        "scope": "global",
+        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+    });
+    let answer = call_tool(&client, "search", request).await?;
+    assert!(
+        answer["results"]
+            .as_array()
+            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+        "{answer:#}"
+    );
+    let warnings = answer["warnings"]
+        .as_array()
+        .ok_or("warnings are an array")?;
+    let degraded: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| warning["code"] == "package_context_degraded")
+        .collect();
+    assert_eq!(
+        degraded,
+        [&json!({
+            "code": "package_context_degraded",
+            "resolver": "cargo",
+            "reason": format!(
+                "1 of {bound} packages were not reported: at most {bound} are carried per \
+                 read, the requested packages first"
+            )
+        })],
+        "{answer:#}"
+    );
+    let unanswered = [
+        "global_api_unavailable",
+        "global_publication_incompatible",
+        "global_response_invalid",
+    ];
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !unanswered.iter().any(|code| warning["code"] == *code)),
+        "the global API answered: {answer:#}"
+    );
+
+    let resolutions = resolution_entries(&fixture).await;
+    assert_eq!(resolutions.len(), 1);
+    let sent = &resolutions[0];
+    assert_eq!(sent.len(), rift_cloud_client::DEPENDENCY_ENTRIES_MAX);
+    assert_eq!(
+        demo_entries(sent).len(),
+        1,
+        "the requested package goes out"
+    );
+    let last = format!("pkg-{:05}", bound - 1);
+    assert!(
+        sent.iter().all(|entry| entry["name"] != last.as_str()),
+        "the entry sorted last leaves"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A global API whose capabilities advertise none of `patterns`, `documentation_search`,
+/// and `symbol_documentation` still answers the reads that need them: each carries the
+/// project hits and one `capability_unavailable` warning naming the feature, and the
+/// client asks the service for no read it does not serve.
+#[tokio::test]
+async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailable() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        withheld_features: &["patterns", "documentation_search", "symbol_documentation"],
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+
+    let reads = [
+        (
+            "search",
+            json!({"pattern": "beacon", "scope": "all"}),
+            "results",
+            "patterns",
+        ),
+        (
+            "search",
+            json!({"query": "beacon", "scope": "all"}),
+            "results",
+            "documentation_search",
+        ),
+        (
+            "get_symbol",
+            json!({"name": "beacon", "scope": "all", "include": ["documentation"]}),
+            "hits",
+            "symbol_documentation",
+        ),
+    ];
+    for (tool, request, hits, feature) in reads {
+        let answer = call_tool(&client, tool, request.clone()).await?;
+        let project_hits = answer[hits].as_array().ok_or("hits are an array")?;
+        assert!(!project_hits.is_empty(), "{request}: {answer:#}");
+        assert!(
+            project_hits.iter().all(|hit| hit.get("unit").is_none()),
+            "no package answers: {answer:#}"
+        );
+        let warnings = answer["warnings"]
+            .as_array()
+            .ok_or("warnings are an array")?;
+        let capability: Vec<&Value> = warnings
+            .iter()
+            .filter(|warning| warning["code"] == "global_page_warning")
+            .collect();
+        assert_eq!(
+            capability,
+            [&json!({
+                "code": "global_page_warning",
+                "warning_code": "capability_unavailable",
+                "detail": format!(
+                    "the global API does not advertise the `{feature}` feature, so no \
+                     package answers this read"
+                )
+            })],
+            "{request}: {answer:#}"
+        );
+        assert!(
+            !answer.to_string().contains("global_response_invalid"),
+            "{request}: {answer:#}"
+        );
+    }
+    let reads_asked: Vec<String> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .map(|request| request.uri)
+        .filter(|uri| !uri.ends_with("/v1/capabilities") && !uri.ends_with("/v1/resolutions"))
+        .collect();
+    assert!(reads_asked.is_empty(), "{reads_asked:#?}");
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A package declaration the global index matched inside its body, which the page names
+/// with the `file_content` field and the `unknown` match class, answers as a `content`
+/// match beside no global warning.
+#[tokio::test]
+async fn a_body_matched_package_declaration_answers_as_a_content_match() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({"query": BODY_MATCH_QUERY, "scope": "global"}),
+    )
+    .await?;
+    let package_hits: Vec<&Value> = answer["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit["unit"] == COLLECTED_UNIT)
+        .collect();
+    assert_eq!(package_hits.len(), 1, "{answer:#}");
+    assert_eq!(
+        package_hits[0]["matched_by"],
+        json!(["content"]),
+        "{answer:#}"
+    );
+    assert!(
+        !answer.to_string().contains("\"global_"),
+        "the page passes the client: {answer:#}"
+    );
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// `packages` beside a package-scoped `pattern` matches the pattern over the requested
+/// release: a workspace depending on nothing names `demo` for one search, and the pattern
+/// request carries it and answers its matches.
+#[tokio::test]
+async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
+        fixture.endpoint
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+
+    let answer = call_tool(
+        &client,
+        "search",
+        json!({
+            "pattern": r"fn helper_\w+",
+            "scope": "global",
+            "target": "all",
+            "include": ["source"],
+            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        }),
+    )
+    .await?;
+    assert_eq!(
+        answer["results"],
+        helper_beacon_pattern_hits(),
+        "{answer:#}"
+    );
+
+    let bodies: Vec<Value> = pattern_requests(&fixture)
+        .await
+        .into_iter()
+        .filter_map(|request| request.body)
+        .collect();
+    assert_eq!(
+        bodies,
+        [json!({
+            "pattern": r"fn helper_\w+",
+            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+            "include": ["source"]
+        })]
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;

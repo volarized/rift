@@ -23,10 +23,8 @@ use super::{
     populate_symbol_lines, text_file_hit_target,
 };
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, file_id, page, project_path,
-    results_truncation_warning,
+    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
 };
-use rift_core::constants::SEARCH_RESULTS_DEFAULT;
 
 /// The `[search]` bounds one `pattern` search runs under.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,8 +69,8 @@ impl Default for PatternBounds {
 }
 
 /// Why a `pattern` cannot stand beside a field the request also names: the fields that
-/// select another result set, and the ones naming a tree or an index the trigram index
-/// does not hold. `None` for a request naming no `pattern`.
+/// select another result set, and the ones naming a tree the trigram index does not hold.
+/// `None` for a request naming no `pattern`.
 pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
     params.pattern.as_ref()?;
     let conflicts = [
@@ -92,10 +90,6 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
             params.rev.is_some(),
             "the trigram index holds the current tree alone",
         ),
-        (
-            params.scope != SearchScope::Local,
-            "the trigram index holds the project alone, so `scope` stays `local`",
-        ),
     ];
     conflicts
         .into_iter()
@@ -108,7 +102,7 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<ReadError> {
 /// # Errors
 ///
 /// Returns `invalid_request` naming `pattern` for a pattern beside a field that selects
-/// another result set, tree, or index, for an empty pattern, one past
+/// another result set or tree, for an empty pattern, one past
 /// `SEARCH_PATTERN_CHARS_MAX` characters, the unit the schema's `maxLength` counts, one
 /// that does not parse, and one whose matcher passes
 /// the `[search]` key `pattern_compiled_size`; and `unsupported` for `target:
@@ -379,14 +373,15 @@ fn matches_truncation_warning(cut: &[ProjectPath], bounds: PatternBounds) -> Opt
 }
 
 impl ReadService {
-    /// Answers a `pattern` search.
+    /// Answers the project side of a `pattern` search.
     ///
     /// The store's candidates name the files and rows to verify; a notebook and a file
     /// holding a line longer than one chunk join them whole, and so does every
     /// `paths.force_include` file. A pattern with no prefilter, or a store that did not
     /// answer, verifies every held file whole under the same bounds. The hits carry no
     /// score, so `relevance` keeps them in path order, then by offset, a declaration at
-    /// its first match.
+    /// its first match. A `global` scope verifies no project file: its matches come from
+    /// the packages alone, which the caller adds.
     ///
     /// Rows the trigram index lacks are verified beside the ones it selected while both
     /// fit the `[search]` bounds, so the answer stays complete; past them the answer
@@ -397,11 +392,15 @@ impl ReadService {
         pattern: &Pattern,
         store: &StoreAnswer,
     ) -> Result<SearchResult, ReadError> {
+        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         let bounds = store.pattern_bounds();
-        let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+        let limit = super::search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
-        let (candidates, preparing) =
-            self.pattern_candidates(pattern, store.pattern_candidates(), &selected, bounds)?;
+        let (candidates, preparing) = if params.scope == SearchScope::Global {
+            (Vec::new(), None)
+        } else {
+            self.pattern_candidates(pattern, store.pattern_candidates(), &selected, bounds)?
+        };
         let results_max = self.index().results_max();
         let mut verification =
             Verification::new(params.target, HitPayloads::requested(params), bounds);

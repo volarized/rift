@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use rift_core::constants::SEARCH_RESULTS_DEFAULT;
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_history::Repository;
 use rift_index::{
@@ -26,11 +25,11 @@ use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadError, ReadFault, accepted_limit, page, project_path, results_truncation_warning,
-    source_warnings,
+    ReadError, ReadFault, page, project_path, results_truncation_warning, source_warnings,
 };
 use crate::search::{
-    HitPayloads, bound_hits, build_symbol_hit, order_hits, path_matcher, validate_search,
+    HitPayloads, bound_hits, build_symbol_hit, order_hits, path_matcher, search_page_limit,
+    validate_search,
 };
 
 /// Answers one `search` request that carries `change`: the declarations the two
@@ -52,7 +51,7 @@ pub fn search_change(
     (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
 ) -> Result<SearchResult, ReadError> {
     validate_search(params)?;
-    let limit = accepted_limit(params.limit.unwrap_or(SEARCH_RESULTS_DEFAULT as u64))?;
+    let limit = search_page_limit(params)?;
     let compared = ComparedRevisions::open(
         root,
         change,
