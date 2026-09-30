@@ -36,7 +36,7 @@ use semver::Version;
 
 use crate::election::{ServerPresence, StaleReason, probe};
 use crate::failure::WireFailure as _;
-use crate::http::{MCP_PATH, request_stop};
+use crate::http::{MCP_PATH, StopRequestFailure, request_stop};
 use crate::identity::BuildCheckout;
 use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
@@ -565,7 +565,10 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// A recorded server of another identity is weighed by [`ServerStanding`].
 /// One this process replaces is asked to stop first, and the spawn waits
 /// until that server has released the election, so the new server never
-/// opens the workspace beside the one leaving it.
+/// opens the workspace beside the one leaving it. A stop request that failed
+/// in transport decides nothing: the poll reads the election as it does after
+/// an accepted one, and refuses with the identity refusal only when the window
+/// closes on that same server still serving.
 ///
 /// # Cancel safety
 ///
@@ -594,11 +597,13 @@ async fn connect_upstream(
     }
     let opened = DatabaseActivity::observed(root).await;
     let mut building = false;
+    let mut still_serving = None;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
         let presence = probed(root).await;
         building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
+        still_serving = replacement.refusal_while_serving(&presence, identity);
         let adopted = adopt_presence(presence, identity, &mut replacement).await?;
         // The replaced server released the election, and no other starter
         // took it: this process starts the server it replaces it with.
@@ -616,6 +621,9 @@ async fn connect_upstream(
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+    }
+    if let Some(refusal) = still_serving {
+        return Err(refusal);
     }
     let closed = DatabaseActivity::observed(root).await;
     Err(start_window_refusal(building && opened != closed))
@@ -904,14 +912,19 @@ impl ServerStanding {
 }
 
 /// The one server a connect asked to stop, by the pid and token its lock
-/// records.
+/// records, and whether it accepted the request.
 ///
 /// A server mints its token when it starts, so the pair names one server:
 /// a later probe that reads it again sees that server leaving, and one that
 /// reads another pair sees a server started after it.
 #[derive(Debug, Default)]
 struct Replacement {
-    asked: Option<(u32, String)>,
+    /// The lock of the server this connect asked to stop.
+    asked: Option<ServerLock>,
+    /// Whether that server answered the stop request with acceptance. A
+    /// request that failed in transport leaves it unknown: a server already
+    /// stopping closes the connection as it exits.
+    accepted: bool,
 }
 
 impl Replacement {
@@ -927,11 +940,15 @@ impl Replacement {
     /// A second older server is refused rather than stopped: another process
     /// of an older release started it after the replaced one left, and
     /// stopping it in turn would only race that process for the election.
+    /// A stop request that failed in transport counts the server as asked:
+    /// the next reading of the election decides, since a server already
+    /// stopping closes the connection as it exits, which Windows reports as a
+    /// reset.
     ///
     /// # Errors
     ///
     /// Returns the identity refusal for a second server, and for a server
-    /// that did not accept the stop request.
+    /// that answered the stop request with a refusal.
     ///
     /// # Cancel safety
     ///
@@ -943,18 +960,27 @@ impl Replacement {
         identity: &ProductIdentity,
     ) -> Result<(), ErrorData> {
         match &self.asked {
-            Some((pid, token)) if *pid == lock.pid && *token == lock.token => return Ok(()),
+            Some(asked) if names_one_server(asked, lock) => return Ok(()),
             Some(_) => return Err(identity_refusal(identity, lock)),
             None => {}
         }
-        if let Err(failure) = request_stop(lock).await {
-            tracing::warn!(
+        match request_stop(lock).await {
+            Ok(()) => self.accepted = true,
+            Err(StopRequestFailure::Failed(failure)) => tracing::warn!(
                 component = "mcp",
                 pid = lock.pid,
                 failure = ?failure,
-                "the workspace server did not accept the stop request"
-            );
-            return Err(identity_refusal(identity, lock));
+                "the stop request to the workspace server failed in transport; the election decides"
+            ),
+            Err(failure @ StopRequestFailure::Refused(_)) => {
+                tracing::warn!(
+                    component = "mcp",
+                    pid = lock.pid,
+                    failure = ?failure,
+                    "the workspace server did not accept the stop request"
+                );
+                return Err(identity_refusal(identity, lock));
+            }
         }
         let server_version = lock.identity.version.as_str();
         tracing::info!(
@@ -964,9 +990,27 @@ impl Replacement {
             version = identity.version.as_str(),
             "asked the workspace server to stop so this rift process can serve the workspace"
         );
-        self.asked = Some((lock.pid, lock.token.clone()));
+        self.asked = Some(lock.clone());
         Ok(())
     }
+
+    /// The identity refusal for the server this connect asked to stop, while
+    /// `presence` shows it still serving and it never accepted the request.
+    fn refusal_while_serving(
+        &self,
+        presence: &ServerPresence,
+        identity: &ProductIdentity,
+    ) -> Option<ErrorData> {
+        let (Some(asked), ServerPresence::Serving(lock)) = (&self.asked, presence) else {
+            return None;
+        };
+        (!self.accepted && names_one_server(asked, lock)).then(|| identity_refusal(identity, lock))
+    }
+}
+
+/// Whether two locks name one server: its pid and the token it minted.
+fn names_one_server(asked: &ServerLock, lock: &ServerLock) -> bool {
+    asked.pid == lock.pid && asked.token == lock.token
 }
 
 /// The refusal for a serving process whose build or served tools differ
@@ -1562,6 +1606,102 @@ mod tests {
         assert!(!replacement.is_asked());
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 0);
         served.abort();
+        Ok(())
+    }
+
+    /// A recorded server that resets the connection of every stop request, the way a
+    /// server already stopping closes it as it exits, and keeps its port open. It counts
+    /// the stop requests it reset; a presence probe connects and sends nothing, so it is
+    /// not one.
+    async fn stop_resetting_server()
+    -> TestResult<(u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let reset = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reset);
+        let served = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = [0_u8; 64];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut head)
+                    .await
+                    .unwrap_or(0);
+                if head[..read].starts_with(b"POST /api/stop") {
+                    counted.fetch_add(1, AtomicOrdering::SeqCst);
+                    let _ = stream.set_zero_linger();
+                }
+            }
+        });
+        Ok((port, reset, served))
+    }
+
+    /// A stop request the server resets does not decide the outcome: a server already
+    /// stopping closes the connection as it exits, which Windows reports as
+    /// `ConnectionReset`. The connect counts the server as asked, so its next reading
+    /// of the election decides.
+    #[tokio::test]
+    async fn a_stop_the_server_resets_leaves_the_outcome_to_the_next_reading() -> TestResult {
+        let (port, reset, served) = stop_resetting_server().await?;
+        let mut replacement = Replacement::default();
+        replacement
+            .replace(&recorded_lock(port), &identity("0.0.12", SCHEMA_DIGEST_A))
+            .await?;
+        assert!(replacement.is_asked());
+        assert_eq!(reset.load(AtomicOrdering::SeqCst), 1);
+        served.abort();
+        Ok(())
+    }
+
+    /// The same older server still serving once the start window closed, after it reset
+    /// the stop request, is refused with the identity refusal: it never accepted the
+    /// request, and the operator's step is to stop it.
+    #[tokio::test]
+    async fn an_older_server_still_serving_after_a_reset_stop_is_refused_at_the_window()
+    -> TestResult {
+        let (port, reset, served) = stop_resetting_server().await?;
+        let directory = tempfile::tempdir()?;
+        let guard = claim(directory.path())?;
+        guard.publish(&recorded_lock(port))?;
+
+        let started = tokio::time::Instant::now();
+        let root = directory.path().to_path_buf();
+        let connect = tokio::spawn(async move {
+            connect_upstream(&root, &identity("0.0.12", SCHEMA_DIGEST_A))
+                .await
+                .err()
+        });
+        // The stop request runs on the real clock, since a paused clock would end its
+        // bound before the loopback answer arrives. The start window then runs paused.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reset.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_elapsed| "the connect never asked the older server to stop")?;
+        tokio::time::pause();
+        let refusal = connect
+            .await?
+            .ok_or("an older server that still serves must be refused")?;
+        assert!(
+            started.elapsed() >= crate::spawn::START_WAIT_MAX,
+            "the refusal waits out the start window: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            refusal
+                .message
+                .contains("workspace server identity differs from this rift process"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains(BUILD_A), "{}", refusal.message);
+        assert_eq!(
+            reset.load(AtomicOrdering::SeqCst),
+            1,
+            "the server is asked to stop once"
+        );
+        served.abort();
+        drop(guard);
         Ok(())
     }
 
