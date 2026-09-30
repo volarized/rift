@@ -1,6 +1,6 @@
 //! Global package routing for current-tree reads.
 
-use std::collections::{BTreeMap, HashSet};
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -13,6 +13,7 @@ use rift_cloud_client::{
     PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbolCandidate,
     PackageSymbolRequest, PackageSymbolRequestInclude, QueryTerm, Warning, WarningCode,
 };
+use rift_core::{ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
 use rift_dependency::DependencyContext;
 use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry};
@@ -20,18 +21,14 @@ use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
     GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
     ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchResult,
-    SearchScope,
+    SearchScope, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse, match_class,
 };
+use serde::Serialize;
 use tokio::sync::Mutex;
-
-/// Most package-manager summaries one read emits. Remaining managers are not logged.
-const FALLBACK_LOG_MANAGERS_MAX: usize = 8;
-/// Maximum UTF-8 bytes retained for one package-manager log label.
-const FALLBACK_LOG_MANAGER_BYTES_MAX: usize = 64;
 
 /// One client shared by reads under the same accepted configuration and credential value.
 #[derive(Default)]
@@ -54,18 +51,22 @@ struct ClientSlot {
     client: GlobalClient,
 }
 
-/// Global selection made before one local package read.
+/// What the global API resolved for one read: the packages it serves, the context
+/// entries it holds no release for, and the service state the read met.
+///
+/// A read whose route answers no client carries project hits alone, with the typed
+/// global warning naming why.
 pub(crate) struct GlobalRoute {
     pub(crate) client: Option<GlobalClient>,
     pub(crate) remote_packages: Vec<WirePackageIdentity>,
-    pub(crate) fallback_context: Arc<DependencyContext>,
+    context: Arc<DependencyContext>,
     pub(crate) missing_exact: Vec<PackageIdentity>,
     pub(crate) missing_requirements: Vec<PackageContextEntry>,
     pub(crate) state: RouteState,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 }
 
-/// Why one read selected its local package fallback.
+/// The global service state one read met.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
     Disabled,
@@ -92,7 +93,7 @@ enum ServiceState {
 }
 
 impl GlobalState {
-    /// Resolves canonical package entries and selects entries requiring local fallback.
+    /// Resolves the context's canonical entries through the global API.
     pub(crate) async fn route(
         &self,
         configuration: &GlobalConfiguration,
@@ -103,9 +104,10 @@ impl GlobalState {
         route
     }
 
-    /// Selects local fallback when the enclosing MCP request deadline expires.
+    /// The route of a read whose enclosing MCP request deadline expired before the
+    /// global API answered.
     pub(crate) fn deadline_exceeded(&self, context: &Arc<DependencyContext>) -> GlobalRoute {
-        let route = GlobalRoute::fallback(
+        let route = GlobalRoute::unanswered(
             context,
             failure_state(&ClientError::Deadline),
             Arc::clone(&self.observation),
@@ -120,7 +122,7 @@ impl GlobalState {
         context: &Arc<DependencyContext>,
     ) -> GlobalRoute {
         if !configuration.enabled {
-            return GlobalRoute::fallback(
+            return GlobalRoute::unanswered(
                 context,
                 RouteState::Disabled,
                 Arc::clone(&self.observation),
@@ -128,24 +130,16 @@ impl GlobalState {
         }
         let request = resolution_request(context);
         if request.entries.is_empty() {
-            return GlobalRoute {
-                client: None,
-                remote_packages: Vec::new(),
-                fallback_context: Arc::new(
-                    context.filter_entries(|entry| {
-                        entry.availability == PackageAvailability::LocalOnly
-                    }),
-                ),
-                missing_exact: Vec::new(),
-                missing_requirements: Vec::new(),
-                state: RouteState::Available,
-                observation: Arc::clone(&self.observation),
-            };
+            return GlobalRoute::unanswered(
+                context,
+                RouteState::Available,
+                Arc::clone(&self.observation),
+            );
         }
         let client = match self.client(configuration).await {
             Ok(client) => client,
             Err(error) => {
-                return GlobalRoute::fallback(
+                return GlobalRoute::unanswered(
                     context,
                     failure_state(&ClientError::Config(error)),
                     Arc::clone(&self.observation),
@@ -156,7 +150,7 @@ impl GlobalState {
             Ok(resolution) => {
                 resolved_route(context, client, resolution, Arc::clone(&self.observation))
             }
-            Err(error) => GlobalRoute::fallback(
+            Err(error) => GlobalRoute::unanswered(
                 context,
                 failure_state(&error),
                 Arc::clone(&self.observation),
@@ -363,23 +357,93 @@ fn search_request(
     }
 }
 
+/// The shares a merge fuses the project's own order and the global index's candidates
+/// under: equal parts for the two, no vector share, and the rank constant the
+/// reciprocal-rank fusion paper uses.
+const MERGE_WEIGHTS: RankingWeights = RankingWeights::fixed(0.5, 0.5, 0.0, 60);
+
+/// Why a merge with package hits could not place one project hit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectHitViolation {
+    /// The hit carries no identity: a symbol without `id`, or a file without `path`.
+    IdentityMissing,
+    /// The symbol address's final segment is not a percent-encoded UTF-8 name.
+    IdentityUndecodable,
+    /// The requested name matches neither the symbol's name nor its qualified name.
+    NameUnmatched,
+    /// The hit's `unit` is not a source unit address.
+    UnitInvalid,
+    /// The ranking refuses the hit's identity: empty, or past its byte bound.
+    IdentityRefused,
+}
+
+impl ProjectHitViolation {
+    /// The refusal naming `hit`, the project hit this violation was found on.
+    fn at(self, hit: &str) -> ProjectHitError {
+        rift_core::Error::new(ProjectHitFault {
+            hit: hit.to_owned(),
+            violation: self,
+        })
+    }
+}
+
+impl From<rift_ranking::RankingError> for ProjectHitViolation {
+    fn from(_: rift_ranking::RankingError) -> Self {
+        Self::IdentityRefused
+    }
+}
+
+/// A project hit a merge with package hits could not place, named by its wire identity or,
+/// lacking one, by its name, or by its kind when it carries no name either.
+///
+/// The project read builds every hit it answers with the identity the merge keys it by
+/// and a name the request matched, so this fault is a broken invariant in that read and
+/// classifies as the server's own internal error.
+#[derive(Debug)]
+pub(crate) struct ProjectHitFault {
+    hit: String,
+    violation: ProjectHitViolation,
+}
+
+impl Fault for ProjectHitFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::InternalError)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        vec![
+            ErrorContext::new("hit", self.hit.clone()),
+            ErrorContext::new("violation", fault_label(&self.violation)),
+        ]
+    }
+}
+
+/// A merge's refusal of one project hit.
+pub(crate) type ProjectHitError = rift_core::Error<ProjectHitFault>;
+
 /// Merges local and remote symbol hits, then applies requested pagination.
+///
+/// # Errors
+///
+/// Returns [`ProjectHitError`] naming a project hit that carries no identity, whose
+/// identity does not decode to a qualified name, or that the requested name does not
+/// match. The project read answers none of these, so each is a broken invariant in that
+/// read.
 pub(crate) fn merge_symbols(
     params: &GetSymbolParams,
     mut local: GetSymbolResult,
     remote: Vec<PackageSymbolCandidate>,
-) -> Result<GetSymbolResult, ClientError> {
+) -> Result<GetSymbolResult, ProjectHitError> {
     let mut entries = Vec::with_capacity(local.hits.len() + remote.len());
     for hit in local.hits.drain(..) {
         let symbol_id = hit
             .symbol
             .id
             .clone()
-            .ok_or(ClientError::InvalidResponseField {
-                field: "symbol_identity",
-            })?;
+            .ok_or_else(|| ProjectHitViolation::IdentityMissing.at(&hit.symbol.name))?;
         let package = hit.symbol.origin.package.clone();
-        let class = local_match_class(&params.name, &hit)?;
+        let class = local_match_class(&params.name, &hit, &symbol_id)?;
         entries.push(SymbolEntry {
             hit,
             symbol_id,
@@ -401,8 +465,7 @@ pub(crate) fn merge_symbols(
         .into_iter()
         .map(|entry| entry.hit)
         .collect::<Vec<_>>();
-    let page_limit = usize::try_from(params.limit)
-        .map_err(|_| ClientError::InvalidRequest { field: "limit" })?;
+    let page_limit = usize::try_from(params.limit).unwrap_or(usize::MAX);
     let (hits, pagination) = page_window(hits, params.page_index, page_limit);
     Ok(GetSymbolResult {
         hits,
@@ -420,31 +483,32 @@ struct SymbolEntry {
     remote: bool,
 }
 
+/// How `query` matches one project hit, read from the hit's name and the qualified name
+/// its identity encodes.
 fn local_match_class(
     query: &str,
     hit: &rift_protocol::read::GetSymbolHit,
-) -> Result<rift_ranking::IdentifierMatchClass, ClientError> {
-    let qualified_name = hit
-        .symbol
-        .id
-        .as_ref()
-        .and_then(|id| id.0.rsplit('/').next())
-        .ok_or(ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
-    let qualified_name = percent_decode_str(qualified_name)
-        .decode_utf8()
-        .map_err(|_| ClientError::InvalidResponseField {
-            field: "symbol_identity",
-        })?;
+    identity: &SymbolId,
+) -> Result<rift_ranking::IdentifierMatchClass, ProjectHitError> {
+    let qualified_name =
+        encoded_qualified_name(identity).map_err(|violation| violation.at(&identity.0))?;
     match_class(
         &query.to_lowercase(),
         &hit.symbol.name.to_lowercase(),
         &qualified_name.to_lowercase(),
     )
-    .ok_or(ClientError::InvalidResponseField {
-        field: "symbol_match",
-    })
+    .ok_or_else(|| ProjectHitViolation::NameUnmatched.at(&identity.0))
+}
+
+/// The qualified name a symbol address carries, percent-encoded, in its final segment.
+fn encoded_qualified_name(identity: &SymbolId) -> Result<Cow<'_, str>, ProjectHitViolation> {
+    let encoded = identity
+        .0
+        .rsplit_once('/')
+        .map_or(identity.0.as_str(), |(_, name)| name);
+    percent_decode_str(encoded)
+        .decode_utf8()
+        .map_err(|_| ProjectHitViolation::IdentityUndecodable)
 }
 
 fn symbol_order(left: &SymbolEntry, right: &SymbolEntry, scope: SearchScope) -> std::cmp::Ordering {
@@ -475,11 +539,17 @@ fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
 }
 
 /// Merges package candidates into local search hits while retaining traversal-only hits.
+///
+/// # Errors
+///
+/// Returns [`ProjectHitError`] naming a project hit that carries no identity, names a
+/// source unit that does not parse, or whose identity the ranking refuses. The project
+/// read answers none of these, so each is a broken invariant in that read.
 pub(crate) fn merge_search(
     params: &SearchParams,
     mut local: SearchResult,
     remote: GlobalSearchCandidates,
-) -> Result<SearchResult, ClientError> {
+) -> Result<SearchResult, ProjectHitError> {
     let mut payloads = std::collections::BTreeMap::new();
     let mut local_order = Vec::new();
     for hit in local.results.drain(..) {
@@ -517,14 +587,10 @@ pub(crate) fn merge_search(
             })
             .collect(),
     );
-    let weights =
-        RankingWeights::new(0.5, 0.5, 0.0, 60).map_err(|_| ClientError::InvalidResponseField {
-            field: "ranking_weights",
-        })?;
     let keep_max = payloads.len().max(1);
     let mut ranked = fuse(
         &[local_input, remote_input],
-        weights,
+        MERGE_WEIGHTS,
         QueryPhase::Precise,
         keep_max,
     );
@@ -541,7 +607,7 @@ pub(crate) fn merge_search(
                 })
                 .collect(),
         );
-        let broad_ranked = fuse(&[broad_input], weights, QueryPhase::Broad, keep_max);
+        let broad_ranked = fuse(&[broad_input], MERGE_WEIGHTS, QueryPhase::Broad, keep_max);
         ranked.append_phase(broad_ranked, keep_max);
     }
     let include_score = params
@@ -595,57 +661,52 @@ fn candidate_fields(hit: &SearchHit) -> FieldSet {
     }
 }
 
-fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ClientError> {
-    let identity =
-        match &hit.hit {
-            SearchHitTarget::Symbol { symbol } => {
-                let symbol_id = symbol
-                    .id
-                    .as_ref()
-                    .ok_or(ClientError::InvalidResponseField {
-                        field: "symbol_identity",
-                    })?;
-                if let Some(unit) = hit.unit.as_ref() {
-                    let encoded = symbol_id.0.rsplit('/').next().ok_or(
-                        ClientError::InvalidResponseField {
-                            field: "symbol_identity",
-                        },
-                    )?;
-                    let qualified_name =
-                        percent_decode_str(encoded).decode_utf8().map_err(|_| {
-                            ClientError::InvalidResponseField {
-                                field: "symbol_identity",
-                            }
-                        })?;
-                    DocumentIdentity::for_unit(
-                        &rift_core::SourceUnitId::parse(&unit.0).map_err(|_| {
-                            ClientError::InvalidResponseField {
-                                field: "source_identity",
-                            }
-                        })?,
-                        &qualified_name,
-                    )
-                } else {
-                    DocumentIdentity::new(symbol_id.0.clone())
-                }
-            }
-            SearchHitTarget::File { .. } => DocumentIdentity::new(
-                hit.path
-                    .as_ref()
-                    .ok_or(ClientError::InvalidResponseField {
-                        field: "file_identity",
-                    })?
-                    .0
-                    .clone(),
-            ),
-            SearchHitTarget::Node { node } => DocumentIdentity::new(node.0.clone()),
-            SearchHitTarget::Documentation { documentation } => {
-                DocumentIdentity::for_documentation_block(&documentation.block.identity.0)
-            }
-        };
-    identity.map_err(|_| ClientError::InvalidResponseField {
-        field: "search_identity",
+/// The ranking identity one project search hit is fused under, or the refusal naming the
+/// hit by its wire identity, or by its kind when it carries none.
+fn search_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitError> {
+    ranking_identity(hit).map_err(|violation| match search_hit_key(hit) {
+        "" => violation.at("file"),
+        key => violation.at(key),
     })
+}
+
+/// The identity a project search hit ranks under: its symbol address, or the source unit
+/// and qualified name for a hit that names a unit, its path for a file, its address for a
+/// node, and its block for documentation.
+fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, ProjectHitViolation> {
+    let identity = match (&hit.hit, hit.unit.as_ref(), hit.path.as_ref()) {
+        (SearchHitTarget::Symbol { symbol }, unit, _) => {
+            let symbol_id = symbol
+                .id
+                .as_ref()
+                .ok_or(ProjectHitViolation::IdentityMissing)?;
+            match unit {
+                Some(unit) => unit_identity(unit, symbol_id)?,
+                None => DocumentIdentity::new(symbol_id.0.clone())?,
+            }
+        }
+        (SearchHitTarget::File { .. }, _, path) => {
+            let path = path.ok_or(ProjectHitViolation::IdentityMissing)?;
+            DocumentIdentity::new(path.0.clone())?
+        }
+        (SearchHitTarget::Node { node }, ..) => DocumentIdentity::new(node.0.clone())?,
+        (SearchHitTarget::Documentation { documentation }, ..) => {
+            DocumentIdentity::for_documentation_block(&documentation.block.identity.0)?
+        }
+    };
+    Ok(identity)
+}
+
+/// A unit-addressed symbol hit's identity: its source unit and the qualified name its
+/// symbol address encodes.
+fn unit_identity(
+    unit: &rift_protocol::read::SourceUnitId,
+    symbol_id: &SymbolId,
+) -> Result<DocumentIdentity, ProjectHitViolation> {
+    let unit =
+        rift_core::SourceUnitId::parse(&unit.0).map_err(|_| ProjectHitViolation::UnitInvalid)?;
+    let qualified_name = encoded_qualified_name(symbol_id)?;
+    Ok(DocumentIdentity::for_unit(&unit, &qualified_name)?)
 }
 
 fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
@@ -698,51 +759,39 @@ fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagi
 }
 
 impl GlobalRoute {
-    /// Discards a failed remote lane and selects the complete dependency context locally.
-    pub(crate) fn discard_remote(&mut self, context: &Arc<DependencyContext>, error: &ClientError) {
+    /// Discards a remote lane that failed after the resolution: the read answers project
+    /// hits alone, with the typed global warning naming the failure.
+    pub(crate) fn discard_remote(&mut self, error: &ClientError) {
         self.client = None;
         self.remote_packages.clear();
-        self.fallback_context = Arc::clone(context);
         self.missing_exact.clear();
         self.missing_requirements.clear();
         self.state = failure_state(error);
         self.record_observation();
     }
 
-    /// Typed warning for this route's local fallback, when global access did not answer.
-    pub(crate) fn fallback_warning(&self, fallback_indexed: u64) -> Option<ReadWarning> {
-        let selected = bounded_count(self.fallback_context.entries().len());
-        let fallback_indexed = fallback_indexed.min(selected);
-        let fallback_unresolved = selected.saturating_sub(fallback_indexed);
-        match self.state {
-            RouteState::Disabled => Some(ReadWarning::GlobalAccessDisabled {
-                fallback_indexed,
-                fallback_unresolved,
-            }),
-            RouteState::Available => None,
-            RouteState::Unavailable { kind, class } => Some(match kind {
-                FailureKind::Api => ReadWarning::GlobalApiUnavailable {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-                FailureKind::Publication => ReadWarning::GlobalPublicationIncompatible {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-                FailureKind::Response => ReadWarning::GlobalResponseInvalid {
-                    failure_class: class,
-                    fallback_indexed,
-                    fallback_unresolved,
-                },
-            }),
-        }
-    }
-
-    /// Packages a valid global resolution selected for local fallback.
-    pub(crate) fn missing_warnings(&self) -> impl Iterator<Item = ReadWarning> + '_ {
-        self.missing_exact
+    /// The warnings a read whose `scope` reaches packages carries: the typed global
+    /// warning when the global API did not answer, then at most `DEPENDENCY_WARNINGS_MAX`
+    /// package and dependency-context warnings together. Those name each degraded
+    /// resolver in resolver order, each context entry no public registry serves with the
+    /// missing capability its kind names, and each entry the global publication holds no
+    /// release for, in that order.
+    pub(crate) fn warnings(&self) -> Vec<ReadWarning> {
+        let degraded = self.context.degradations().iter().map(|degradation| {
+            ReadWarning::PackageContextDegraded {
+                resolver: degradation.resolver.as_str().to_owned(),
+                reason: degradation.reason.clone(),
+            }
+        });
+        let unavailable = self.context.unavailable_entries().filter_map(|entry| {
+            let reason = entry.availability.unavailable_reason()?;
+            Some(ReadWarning::PackageUnavailable {
+                entry: entry.clone(),
+                reason: reason.to_owned(),
+            })
+        });
+        let absent = self
+            .missing_exact
             .iter()
             .cloned()
             .map(|package| ReadWarning::PackageAbsent { package })
@@ -751,11 +800,39 @@ impl GlobalRoute {
                     .iter()
                     .cloned()
                     .map(|entry| ReadWarning::PackageRequirementAbsent { entry }),
+            );
+        self.state_warning()
+            .into_iter()
+            .chain(
+                degraded
+                    .chain(unavailable)
+                    .chain(absent)
+                    .take(DEPENDENCY_WARNINGS_MAX),
             )
-            .take(DEPENDENCY_WARNINGS_MAX)
+            .collect()
     }
 
-    fn fallback(
+    /// The typed warning naming why the global API did not answer, absent when it did.
+    fn state_warning(&self) -> Option<ReadWarning> {
+        match self.state {
+            RouteState::Disabled => Some(ReadWarning::GlobalAccessDisabled),
+            RouteState::Available => None,
+            RouteState::Unavailable { kind, class } => Some(match kind {
+                FailureKind::Api => ReadWarning::GlobalApiUnavailable {
+                    failure_class: class,
+                },
+                FailureKind::Publication => ReadWarning::GlobalPublicationIncompatible {
+                    failure_class: class,
+                },
+                FailureKind::Response => ReadWarning::GlobalResponseInvalid {
+                    failure_class: class,
+                },
+            }),
+        }
+    }
+
+    /// A route no resolution answered: no client, and no package facts.
+    fn unanswered(
         context: &Arc<DependencyContext>,
         state: RouteState,
         observation: Arc<StdMutex<Option<ServiceState>>>,
@@ -763,7 +840,7 @@ impl GlobalRoute {
         Self {
             client: None,
             remote_packages: Vec::new(),
-            fallback_context: Arc::clone(context),
+            context: Arc::clone(context),
             missing_exact: Vec::new(),
             missing_requirements: Vec::new(),
             state,
@@ -788,11 +865,6 @@ impl GlobalRoute {
         if transitioned {
             log_service_transition(self.state);
         }
-    }
-
-    /// Records the result of one selected local fallback.
-    pub(crate) fn record_fallback(&self, fallback_indexed: u64) {
-        log_fallback_summary(self, fallback_indexed);
     }
 }
 
@@ -828,140 +900,6 @@ fn log_service_transition(state: RouteState) {
             "global service state changed"
         ),
     }
-}
-
-fn log_fallback_summary(route: &GlobalRoute, fallback_indexed: u64) {
-    if route.fallback_context.entries().is_empty() {
-        return;
-    }
-    let selected_count = bounded_count(route.fallback_context.entries().len());
-    let fallback_indexed = fallback_indexed.min(selected_count);
-    let fallback_unresolved = selected_count.saturating_sub(fallback_indexed);
-    let mut counts = BTreeMap::<&str, u64>::new();
-    for entry in route.fallback_context.entries() {
-        let count = counts.entry(entry.manager.as_str()).or_default();
-        *count = count.saturating_add(1);
-    }
-    let manager_count = u64::try_from(counts.len()).unwrap_or(u64::MAX);
-    let omitted_count = manager_count.saturating_sub(FALLBACK_LOG_MANAGERS_MAX as u64);
-    let missing_count = bounded_count(
-        route
-            .missing_exact
-            .len()
-            .saturating_add(route.missing_requirements.len()),
-    );
-    for (manager, count) in counts.into_iter().take(FALLBACK_LOG_MANAGERS_MAX) {
-        log_fallback_manager(
-            route.state,
-            bounded_manager(manager),
-            FallbackLogCounts {
-                selected: count.min(global_fallback_packages_max()),
-                missing: missing_count,
-                indexed: fallback_indexed,
-                unresolved: fallback_unresolved,
-                managers: manager_count.min(global_fallback_packages_max()),
-                omitted: omitted_count.min(global_fallback_packages_max()),
-            },
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FallbackLogCounts {
-    selected: u64,
-    missing: u64,
-    indexed: u64,
-    unresolved: u64,
-    managers: u64,
-    omitted: u64,
-}
-
-fn log_fallback_manager(state: RouteState, manager: &str, counts: FallbackLogCounts) {
-    let FallbackLogCounts {
-        selected,
-        missing,
-        indexed,
-        unresolved,
-        managers,
-        omitted,
-    } = counts;
-    let fallback_outcome = fallback_outcome(indexed, unresolved);
-    match state {
-        RouteState::Disabled => tracing::info!(
-            component = "global",
-            operation = "global.fallback",
-            state = "not_configured",
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-        RouteState::Available => tracing::info!(
-            component = "global",
-            operation = "global.fallback",
-            state = "available",
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-        RouteState::Unavailable { class, .. } => tracing::warn!(
-            component = "global",
-            operation = "global.fallback",
-            state = "unavailable",
-            failure_class = failure_class_label(class),
-            manager,
-            selected_count = selected,
-            missing_count = missing,
-            fallback_indexed = indexed,
-            fallback_unresolved = unresolved,
-            manager_count = managers,
-            omitted_count = omitted,
-            fallback_outcome,
-            "global package fallback selected"
-        ),
-    }
-}
-
-const fn fallback_outcome(fallback_indexed: u64, fallback_unresolved: u64) -> &'static str {
-    if fallback_unresolved == 0 {
-        "complete"
-    } else if fallback_indexed == 0 {
-        "unavailable"
-    } else {
-        "partial"
-    }
-}
-
-fn bounded_count(count: usize) -> u64 {
-    u64::try_from(count)
-        .unwrap_or(u64::MAX)
-        .min(global_fallback_packages_max())
-}
-
-fn global_fallback_packages_max() -> u64 {
-    rift_protocol::read::GLOBAL_FALLBACK_PACKAGES_MAX
-}
-
-fn bounded_manager(manager: &str) -> &str {
-    if manager.len() <= FALLBACK_LOG_MANAGER_BYTES_MAX {
-        return manager;
-    }
-    let end = manager
-        .char_indices()
-        .find(|(index, _)| *index >= FALLBACK_LOG_MANAGER_BYTES_MAX)
-        .map_or(manager.len(), |(index, _)| index);
-    &manager[..end]
 }
 
 fn failure_class_label(class: GlobalFailureClass) -> &'static str {
@@ -1001,16 +939,16 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     }
 }
 
+/// One missing requirement the resolution named, as a context entry. The client sends
+/// canonical entries alone and refuses a missing requirement that is not one, so the
+/// entry is canonical.
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
         name: entry.name,
         version: entry.version,
         requirement: entry.requirement,
-        availability: match entry.availability {
-            WireAvailability::Canonical => PackageAvailability::Canonical,
-            WireAvailability::LocalOnly => PackageAvailability::LocalOnly,
-        },
+        availability: PackageAvailability::Canonical,
     }
 }
 
@@ -1020,18 +958,11 @@ fn resolved_route(
     resolution: rift_cloud_client::PackageResolutionResponse,
     observation: Arc<StdMutex<Option<ServiceState>>>,
 ) -> GlobalRoute {
-    let mut served = HashSet::new();
     let mut remote_packages = Vec::new();
     for package in resolution.available_exact {
-        served.insert(EntryKey::exact(
-            &package.manager,
-            &package.name,
-            &package.version,
-        ));
         push_distinct_package(&mut remote_packages, package);
     }
     for resolved in resolution.resolved_requirements {
-        served.insert(EntryKey::from_wire(&resolved.entry));
         push_distinct_package(&mut remote_packages, resolved.package);
     }
     let missing_exact = resolution
@@ -1047,10 +978,7 @@ fn resolved_route(
     GlobalRoute {
         client: Some(client),
         remote_packages,
-        fallback_context: Arc::new(context.filter_entries(|entry| {
-            entry.availability == PackageAvailability::LocalOnly
-                || !served.contains(&EntryKey::from_protocol(entry))
-        })),
+        context: Arc::clone(context),
         missing_exact,
         missing_requirements,
         state: RouteState::Available,
@@ -1074,54 +1002,6 @@ fn protocol_package_identity(package: WirePackageIdentity) -> PackageIdentity {
         manager: package.manager,
         name: package.name,
         version: package.version,
-    }
-}
-
-#[derive(Hash, Eq, PartialEq)]
-struct EntryKey {
-    manager: String,
-    name: String,
-    selector: String,
-    exact: bool,
-}
-
-impl EntryKey {
-    fn from_protocol(entry: &PackageContextEntry) -> Self {
-        match (&entry.version, &entry.requirement) {
-            (Some(version), None) => Self::exact(&entry.manager, &entry.name, version),
-            (None, Some(requirement)) => {
-                Self::requirement(&entry.manager, &entry.name, requirement)
-            }
-            _ => unreachable!("accepted dependency context carries exactly one selector"),
-        }
-    }
-
-    fn from_wire(entry: &WireContextEntry) -> Self {
-        match (&entry.version, &entry.requirement) {
-            (Some(version), None) => Self::exact(&entry.manager, &entry.name, version),
-            (None, Some(requirement)) => {
-                Self::requirement(&entry.manager, &entry.name, requirement)
-            }
-            _ => unreachable!("validated global response carries exactly one selector"),
-        }
-    }
-
-    fn exact(manager: &str, name: &str, version: &str) -> Self {
-        Self {
-            manager: manager.to_owned(),
-            name: name.to_owned(),
-            selector: version.to_owned(),
-            exact: true,
-        }
-    }
-
-    fn requirement(manager: &str, name: &str, requirement: &str) -> Self {
-        Self {
-            manager: manager.to_owned(),
-            name: name.to_owned(),
-            selector: requirement.to_owned(),
-            exact: false,
-        }
     }
 }
 
@@ -1182,8 +1062,8 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        FailureKind, FallbackLogCounts, GlobalRoute, RouteState, ServiceState, failure_state,
-        log_fallback_manager, page_window, search_request,
+        DocumentIdentity, FailureKind, GlobalRoute, RouteState, SearchHit, SearchHitTarget,
+        ServiceState, failure_state, page_window, search_hit_key, search_request,
     };
     use rift_cloud_client::{ClientError, ResponseMeta};
     use rift_dependency::DependencyContext;
@@ -1302,8 +1182,9 @@ mod tests {
         assert_eq!(candidates, super::GlobalSearchCandidates::default());
     }
 
-    #[test]
-    fn documentation_order_uses_block_identity() {
+    /// One documentation search hit per block a two-paragraph `guide.txt` holds, in block
+    /// order.
+    fn documentation_hits() -> Vec<SearchHit> {
         let directory = tempfile::tempdir().expect("workspace");
         std::fs::write(directory.path().join("guide.txt"), "First.\n\nSecond.\n")
             .expect("documentation source");
@@ -1315,7 +1196,7 @@ mod tests {
         )
         .expect("workspace index");
         let metadata = index.documentation().index();
-        let mut hits = metadata
+        metadata
             .blocks
             .iter()
             .map(|block| {
@@ -1328,13 +1209,17 @@ mod tests {
                 }))
                 .expect("documentation hit")
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    #[test]
+    fn documentation_order_uses_block_identity() {
+        let mut hits = documentation_hits();
         assert_eq!(hits.len(), 2);
-        let mut expected = metadata
-            .blocks
+        let mut expected: Vec<String> = hits
             .iter()
-            .map(|block| block.identity.0.as_str())
-            .collect::<Vec<_>>();
+            .map(|hit| super::search_hit_key(hit).to_owned())
+            .collect();
         expected.sort_unstable();
         for order in [super::ResultOrder::Identity, super::ResultOrder::Path] {
             hits.reverse();
@@ -1344,6 +1229,247 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// The authored example `T`'s schema states, the value a caller sees documented.
+    fn authored_example<T: schemars::JsonSchema + serde::de::DeserializeOwned>() -> T {
+        let schema = schemars::schema_for!(T);
+        let example = schema
+            .get("examples")
+            .and_then(|examples| examples.get(0))
+            .cloned()
+            .expect("the model states an example");
+        serde_json::from_value(example).expect("the example is a value of the model")
+    }
+
+    /// The context a merge's refusal carries: the hit it names and the rule it broke.
+    fn refusal_context(hit: &str, violation: &str) -> [rift_core::ErrorContext; 2] {
+        [
+            rift_core::ErrorContext::new("hit", hit),
+            rift_core::ErrorContext::new("violation", violation),
+        ]
+    }
+
+    /// `hit` with its symbol address replaced; a hit of another kind comes back unchanged.
+    fn with_symbol_id(hit: &SearchHit, identity: Option<&str>) -> SearchHit {
+        let mut hit = hit.clone();
+        if let SearchHitTarget::Symbol { symbol } = &mut hit.hit {
+            symbol.id = identity.map(|identity| rift_protocol::read::SymbolId(identity.to_owned()));
+        }
+        hit
+    }
+
+    /// A project hit the lookup ranked merges beside no package hit into one page of its own.
+    #[test]
+    fn merge_symbols_pages_the_project_hits_it_can_place() {
+        use rift_protocol::read::{GetSymbolParams, GetSymbolResult};
+
+        let example: GetSymbolResult = authored_example();
+        let request = serde_json::json!({"name": "load_config"});
+        let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+
+        let merged = super::merge_symbols(&params, example.clone(), Vec::new())
+            .expect("the project hit carries its identity and matches the name");
+
+        assert_eq!(merged.hits, example.hits);
+        assert_eq!(merged.pagination.total_pages, 1);
+    }
+
+    /// A project hit the merge cannot key or order refuses the lookup as the server's own
+    /// internal error, naming the hit and the rule it broke.
+    #[test]
+    fn merge_symbols_refuses_a_project_hit_it_cannot_place() {
+        use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SymbolId};
+
+        let example: GetSymbolResult = authored_example();
+        let placed = "rift://symbol/rust/src/config.rs/load_config";
+        let undecodable = "rift://symbol/rust/src/config.rs/%FF";
+        let cases = [
+            ("load_config", None, "load_config", "identity_missing"),
+            (
+                "load_config",
+                Some(undecodable),
+                undecodable,
+                "identity_undecodable",
+            ),
+            ("parse_manifest", Some(placed), placed, "name_unmatched"),
+        ];
+        for (name, identity, hit, violation) in cases {
+            let request = serde_json::json!({"name": name});
+            let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
+            let mut local = example.clone();
+            local.hits[0].symbol.id = identity.map(|identity| SymbolId(identity.to_owned()));
+
+            let error = super::merge_symbols(&params, local, Vec::new())
+                .expect_err("the merge cannot place the project hit");
+
+            assert_eq!(error.descriptor().code(), "internal_error");
+            let context = rift_core::Fault::context(error.fault());
+            assert_eq!(context, refusal_context(hit, violation));
+        }
+    }
+
+    /// Each kind of project hit ranks under the identity the fusion keys it by, and a merge
+    /// beside no package candidate answers every one of them.
+    #[test]
+    fn merge_search_ranks_every_kind_of_project_hit() {
+        use rift_protocol::read::{SearchParams, SearchResult, SourceUnitId};
+
+        let example: SearchResult = authored_example();
+        let unit = "rift://source/rift.sources.project/src/lib.rs";
+        let mut unit_hit = example.results[0].clone();
+        unit_hit.path = None;
+        unit_hit.unit = Some(SourceUnitId(unit.to_owned()));
+        let node_hit: SearchHit = serde_json::from_value(serde_json::json!({
+            "hit": {"target": "node", "node": "rift://node/rust/src/lib.rs@0-10#dcbef6dd"},
+            "path": "src/lib.rs"
+        }))
+        .expect("a node hit");
+        let documentation_hit = documentation_hits().remove(0);
+        let block = search_hit_key(&documentation_hit).to_owned();
+        let parsed_unit = rift_core::SourceUnitId::parse(unit).expect("a source unit");
+        let unit_identity =
+            DocumentIdentity::for_unit(&parsed_unit, "load_config").expect("a unit identity");
+        let block_identity =
+            DocumentIdentity::for_documentation_block(&block).expect("a block identity");
+        let hits = [
+            example.results[0].clone(),
+            unit_hit,
+            example.results[1].clone(),
+            node_hit,
+            documentation_hit,
+        ];
+        let expected = [
+            "rift://symbol/rust/src/config.rs/load_config",
+            unit_identity.as_str(),
+            "src/lib.rs",
+            "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
+            block_identity.as_str(),
+        ];
+
+        for (hit, expected) in hits.iter().zip(expected) {
+            let identity = super::search_identity(hit).expect("a project hit ranks");
+            assert_eq!(identity.as_str(), expected);
+        }
+        let request = serde_json::json!({"query": "load_config", "limit": 10});
+        let params: SearchParams = serde_json::from_value(request).expect("a search");
+        let local = SearchResult {
+            results: hits.to_vec(),
+            pagination: example.pagination.clone(),
+            warnings: Vec::new(),
+        };
+        let merged = super::merge_search(&params, local, super::GlobalSearchCandidates::default())
+            .expect("every project hit ranks");
+        assert_eq!(merged.results.len(), hits.len());
+    }
+
+    /// A project search hit the merge cannot rank refuses the search as the server's own
+    /// internal error, naming the hit, or its kind when it carries no identity.
+    #[test]
+    fn merge_search_refuses_a_project_hit_it_cannot_place() {
+        use rift_protocol::read::{SearchParams, SearchResult, SourceUnitId};
+
+        let example: SearchResult = authored_example();
+        let symbol = &example.results[0];
+        let undecodable = "rift://symbol/rust/src/config.rs/%FF";
+        let oversized = format!(
+            "rift://symbol/rust/src/config.rs/{}",
+            "a".repeat(rift_ranking::IDENTITY_BYTES_MAX)
+        );
+        let placed = "rift://symbol/rust/src/config.rs/load_config";
+        let with_unit = |hit: SearchHit, unit: &str| SearchHit {
+            unit: Some(SourceUnitId(unit.to_owned())),
+            ..hit
+        };
+        let mut pathless = example.results[1].clone();
+        pathless.path = None;
+        let cases = [
+            (
+                with_symbol_id(symbol, None),
+                "load_config",
+                "identity_missing",
+            ),
+            (pathless, "file", "identity_missing"),
+            (
+                with_unit(symbol.clone(), "not-a-rift-source-uri"),
+                placed,
+                "unit_invalid",
+            ),
+            (
+                with_unit(
+                    with_symbol_id(symbol, Some(undecodable)),
+                    "rift://source/rift.sources.project/src/lib.rs",
+                ),
+                undecodable,
+                "identity_undecodable",
+            ),
+            (
+                with_symbol_id(symbol, Some(oversized.as_str())),
+                oversized.as_str(),
+                "identity_refused",
+            ),
+        ];
+        let request = serde_json::json!({"query": "load_config"});
+        let params: SearchParams = serde_json::from_value(request).expect("a search");
+        for (hit, label, violation) in cases {
+            let local = SearchResult {
+                results: vec![hit],
+                pagination: example.pagination.clone(),
+                warnings: Vec::new(),
+            };
+
+            let error =
+                super::merge_search(&params, local, super::GlobalSearchCandidates::default())
+                    .expect_err("the merge cannot place the project hit");
+
+            assert_eq!(error.descriptor().code(), "internal_error");
+            let context = rift_core::Fault::context(error.fault());
+            assert_eq!(context, refusal_context(label, violation));
+        }
+    }
+
+    /// A context with nothing to resolve sends nothing: the route answers the service as
+    /// available and builds no client.
+    #[tokio::test]
+    async fn a_context_with_nothing_to_resolve_routes_available_without_a_client() {
+        let state = super::GlobalState::default();
+        let configuration = rift_protocol::configuration::GlobalConfiguration::default();
+        let context = Arc::new(DependencyContext::default());
+
+        let route = state.route(&configuration, &context).await;
+
+        assert_eq!(route.state, RouteState::Available);
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
+        assert!(route.warnings().is_empty());
+    }
+
+    /// A configuration the client refuses leaves the route unanswered: no client, and the
+    /// API failure the read's warning names.
+    #[tokio::test]
+    async fn a_configuration_the_client_refuses_routes_unavailable_without_a_client() {
+        let state = super::GlobalState::default();
+        let configuration = rift_protocol::configuration::GlobalConfiguration {
+            endpoint: "ftp://global.example.test/rift/rest".to_owned(),
+            ..rift_protocol::configuration::GlobalConfiguration::default()
+        };
+        let context = context_with_path_dependencies(0);
+
+        let route = state.route(&configuration, &context).await;
+
+        let route_state = route.state;
+        assert!(
+            matches!(
+                route_state,
+                RouteState::Unavailable {
+                    kind: FailureKind::Api,
+                    ..
+                }
+            ),
+            "{route_state:?}"
+        );
+        assert!(route.client.is_none());
+        assert!(route.remote_packages.is_empty());
     }
 
     #[test]
@@ -1359,7 +1485,7 @@ mod tests {
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         let observation = Arc::new(Mutex::new(None::<ServiceState>));
-        let route = GlobalRoute::fallback(
+        let route = GlobalRoute::unanswered(
             &Arc::new(DependencyContext::default()),
             RouteState::Unavailable {
                 kind: FailureKind::Api,
@@ -1383,41 +1509,237 @@ mod tests {
         assert!(!records[0].fields().contains("private-package"));
     }
 
+    /// Inputs holding no file and running no program: every probe fails.
+    struct NothingInputs;
+
+    impl rift_dependency::StaticInputs for NothingInputs {
+        fn read_file(
+            &mut self,
+            _path: &std::path::Path,
+            _bytes_max: u64,
+        ) -> rift_dependency::FileObservation {
+            rift_dependency::FileObservation::Absent
+        }
+    }
+
+    impl rift_dependency::ContextInputs for NothingInputs {
+        fn run(
+            &mut self,
+            command: &rift_dependency::ToolchainCommand,
+        ) -> Result<rift_dependency::CommandOutput, rift_dependency::CommandFailure> {
+            Err(rift_dependency::CommandFailure {
+                program: command.program.to_owned(),
+                reason: "not on PATH".to_owned(),
+            })
+        }
+    }
+
     #[test]
-    fn fallback_summary_is_bounded_and_uses_manager_only() {
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let manager = "cargo";
+    fn resolution_request_carries_one_standard_library_entry_per_package() {
+        use rift_dependency::{StandardLibrary, StandardLibraryRequest, standard_library_answer};
+        use rift_protocol::dependencies::ConfiguredPackage;
 
-        tracing::subscriber::with_default(subscriber, || {
-            log_fallback_manager(
-                RouteState::Unavailable {
-                    kind: FailureKind::Api,
-                    class: GlobalFailureClass::RetryExhausted,
-                },
-                manager,
-                FallbackLogCounts {
-                    selected: 3,
-                    missing: 1,
-                    indexed: 2,
-                    unresolved: 1,
-                    managers: 1,
-                    omitted: 0,
-                },
-            );
-        });
+        // The operator's list stands in for a lockfile pinning `typescript`.
+        let configured = [ConfiguredPackage {
+            manager: "npm".to_owned(),
+            name: "typescript".to_owned(),
+            version: Some("5.9.3".to_owned()),
+            requirement: None,
+        }];
+        let mut context = rift_dependency::resolve_context(
+            std::path::Path::new("/workspace"),
+            &[],
+            &[],
+            &mut NothingInputs,
+            &configured,
+        );
+        let answer = standard_library_answer(
+            &StandardLibraryRequest {
+                root: std::path::Path::new("/workspace"),
+                libraries: &[StandardLibrary::Rust, StandardLibrary::Node],
+                execution: true,
+            },
+            &mut NothingInputs,
+        );
+        context.add_standard_libraries(answer);
 
-        let record = drain
-            .try_recv_record()
-            .expect("fallback summary is recorded");
-        assert_eq!(record.operation(), "global.fallback");
-        assert!(record.fields().contains("retry_exhausted"));
-        assert!(record.fields().contains("selected_count"));
-        assert!(record.fields().contains("fallback_indexed"));
-        assert!(record.fields().contains("fallback_unresolved"));
-        assert!(record.fields().contains("partial"));
-        assert!(record.fields().contains("fallback_outcome"));
-        assert!(record.fields().contains(manager));
-        assert!(!record.fields().contains("private-package"));
+        let request = super::resolution_request(&context);
+
+        let sent: Vec<(String, String, Option<String>, Option<String>)> = request
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.manager.clone(),
+                    entry.name.clone(),
+                    entry.version.clone(),
+                    entry.requirement.clone(),
+                )
+            })
+            .collect();
+        let any = Some(">=0".to_owned());
+        assert_eq!(
+            sent,
+            [
+                (
+                    "npm".to_owned(),
+                    "typescript".to_owned(),
+                    Some("5.9.3".to_owned()),
+                    None
+                ),
+                ("stdlib".to_owned(), "node".to_owned(), None, any.clone()),
+                ("stdlib".to_owned(), "rust".to_owned(), None, any),
+            ]
+        );
+        let degraded: Vec<&str> = context
+            .degradations()
+            .iter()
+            .map(|degradation| degradation.resolver.as_str())
+            .collect();
+        assert_eq!(degraded, ["stdlib/rust", "stdlib/node"]);
+    }
+
+    /// Inputs holding `files`, each under its absolute path, and running no program.
+    struct RecordedFiles(Vec<(std::path::PathBuf, String)>);
+
+    impl rift_dependency::StaticInputs for RecordedFiles {
+        fn read_file(
+            &mut self,
+            path: &std::path::Path,
+            _bytes_max: u64,
+        ) -> rift_dependency::FileObservation {
+            self.0.iter().find(|(held, _)| held == path).map_or(
+                rift_dependency::FileObservation::Absent,
+                |(_, content)| {
+                    rift_dependency::FileObservation::Bytes(content.clone().into_bytes())
+                },
+            )
+        }
+    }
+
+    /// A context whose manifest depends on `count` crates by paths outside the workspace,
+    /// and whose Rust standard library probe fails.
+    fn context_with_path_dependencies(count: usize) -> Arc<DependencyContext> {
+        use std::fmt::Write as _;
+
+        use rift_dependency::{StandardLibrary, StandardLibraryRequest, standard_library_answer};
+
+        let root = std::path::Path::new("/workspace");
+        let mut manifest =
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n\n[dependencies]\n".to_owned();
+        let mut lockfile =
+            "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n".to_owned();
+        for index in 0..count {
+            writeln!(
+                manifest,
+                "outside{index:02} = {{ path = \"../outside{index:02}\" }}"
+            )
+            .expect("a String takes every write");
+            write!(
+                lockfile,
+                "\n[[package]]\nname = \"outside{index:02}\"\nversion = \"0.1.0\"\n"
+            )
+            .expect("a String takes every write");
+        }
+        let mut inputs = RecordedFiles(vec![
+            (root.join("Cargo.toml"), manifest),
+            (root.join("Cargo.lock"), lockfile),
+        ]);
+        let visible = [
+            rift_protocol::read::ProjectPath("Cargo.lock".to_owned()),
+            rift_protocol::read::ProjectPath("Cargo.toml".to_owned()),
+        ];
+        let mut context = rift_dependency::resolve_context(
+            root,
+            &visible,
+            rift_dependency::resolvers(),
+            &mut inputs,
+            &[],
+        );
+        context.add_standard_libraries(standard_library_answer(
+            &StandardLibraryRequest {
+                root,
+                libraries: &[StandardLibrary::Rust],
+                execution: true,
+            },
+            &mut NothingInputs,
+        ));
+        Arc::new(context)
+    }
+
+    fn warning_codes(route: &GlobalRoute) -> Vec<String> {
+        route
+            .warnings()
+            .iter()
+            .map(|warning| {
+                serde_json::to_value(warning).expect("a warning serializes")["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The global warning opens the list, then the degraded probe, each entry no public
+    /// registry serves, and each package the publication lacks, in that order.
+    #[test]
+    fn route_warnings_order_the_global_state_then_degraded_unavailable_and_absent() {
+        let context = context_with_path_dependencies(2);
+        let mut route =
+            GlobalRoute::unanswered(&context, RouteState::Disabled, Arc::new(Mutex::new(None)));
+        route
+            .missing_exact
+            .push(rift_protocol::read::PackageIdentity {
+                manager: "cargo".to_owned(),
+                name: "absent".to_owned(),
+                version: "1.0.0".to_owned(),
+            });
+
+        assert_eq!(
+            warning_codes(&route),
+            [
+                "global_access_disabled",
+                "package_context_degraded",
+                "package_unavailable",
+                "package_unavailable",
+                "package_absent",
+            ]
+        );
+        let warnings = route.warnings();
+        let rift_protocol::read::ReadWarning::PackageUnavailable { entry, reason } = &warnings[2]
+        else {
+            panic!("the third warning names an unserved entry: {warnings:#?}");
+        };
+        assert_eq!(entry.name, "outside00");
+        assert_eq!(
+            Some(reason.as_str()),
+            rift_protocol::dependencies::PackageAvailability::Path.unavailable_reason()
+        );
+    }
+
+    /// The package warnings stop at `DEPENDENCY_WARNINGS_MAX`; the global warning rides
+    /// beside them and is never the one cut.
+    #[test]
+    fn route_warnings_stop_at_the_dependency_warnings_bound() {
+        let bound = rift_protocol::read::DEPENDENCY_WARNINGS_MAX;
+        let context = context_with_path_dependencies(bound + 2);
+        let answered =
+            GlobalRoute::unanswered(&context, RouteState::Available, Arc::new(Mutex::new(None)));
+        let refused = GlobalRoute::unanswered(
+            &context,
+            RouteState::Unavailable {
+                kind: FailureKind::Api,
+                class: GlobalFailureClass::Connection,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+
+        let answered_codes = warning_codes(&answered);
+        assert_eq!(answered_codes.len(), bound, "{answered_codes:?}");
+        assert_eq!(answered_codes[0], "package_context_degraded");
+        let refused_codes = warning_codes(&refused);
+        assert_eq!(refused_codes.len(), bound + 1, "{refused_codes:?}");
+        assert_eq!(refused_codes[0], "global_api_unavailable");
+        assert_eq!(refused_codes[1..], answered_codes[..]);
     }
 }

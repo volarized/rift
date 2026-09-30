@@ -154,6 +154,7 @@ mod tests {
             kinds,
             [
                 ("Route", "interface"),
+                ("path", "property"),
                 ("Mode", "enum"),
                 ("Alias", "type_alias"),
                 ("Registry", "namespace"),
@@ -165,6 +166,76 @@ mod tests {
             ]
         );
         assert!(!document.has_errors());
+    }
+
+    /// Method and property signatures declare inside an interface or a class
+    /// body, qualified by it, and a bodyless callable renders its own text as
+    /// its signature. A type literal's members declare nothing.
+    #[test]
+    fn test_member_signatures_declare_inside_interface_and_class_bodies() {
+        let text = "interface Array<T> {\n  length: number;\n  \
+                    map<U>(callbackfn: (value: T) => U): U[];\n  \
+                    reduce(callbackfn: (a: T, b: T) => T): T;\n  \
+                    reduce<U>(callbackfn: (a: U, b: T) => U, initial: U): U;\n}\n\
+                    declare class Reader {\n  read(size?: number): string;\n}\n\
+                    declare function readFile(path: string): string;\n\
+                    declare function readFile(path: string, encoding: null): Uint8Array;\n\
+                    function open(options: { flags: string; mode(): number }): void {}\n";
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        let symbols = document
+            .symbols()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.kind,
+                    symbol
+                        .signatures
+                        .first()
+                        .map(|signature| signature.display.as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            symbols,
+            [
+                ("Array", "interface", None),
+                ("Array.length", "property", None),
+                (
+                    "Array.map",
+                    "method",
+                    Some("map<U>(callbackfn: (value: T) => U): U[]")
+                ),
+                (
+                    "Array.reduce~1",
+                    "method",
+                    Some("reduce(callbackfn: (a: T, b: T) => T): T")
+                ),
+                (
+                    "Array.reduce~2",
+                    "method",
+                    Some("reduce<U>(callbackfn: (a: U, b: T) => U, initial: U): U")
+                ),
+                ("Reader", "class", None),
+                ("Reader.read", "method", Some("read(size?: number): string")),
+                (
+                    "readFile~1",
+                    "function",
+                    Some("function readFile(path: string): string")
+                ),
+                (
+                    "readFile~2",
+                    "function",
+                    Some("function readFile(path: string, encoding: null): Uint8Array")
+                ),
+                (
+                    "open",
+                    "function",
+                    Some("function open(options: { flags: string; mode(): number }): void")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -229,11 +300,77 @@ mod tests {
             facets,
             [
                 vec![SymbolFacet::Type, SymbolFacet::Public],
+                vec![SymbolFacet::Value],
                 vec![SymbolFacet::Type, SymbolFacet::Public],
                 vec![SymbolFacet::Type, SymbolFacet::Alias, SymbolFacet::Public],
                 vec![SymbolFacet::Namespace, SymbolFacet::Public],
                 vec![SymbolFacet::Type],
             ]
+        );
+    }
+
+    /// The TypeScript grammars share the export rules: a type-only clause
+    /// and a plain clause mark the interface, alias, and enum they name.
+    #[test]
+    fn test_an_export_clause_marks_typescript_declarations() {
+        let text = "interface Route { path: string }\ntype Alias = Route;\nenum Mode { Fast }\ninterface Hidden {}\nexport type { Route };\nexport { Alias, Mode };\n";
+        let document = analyze(text);
+        let facts = document
+            .symbols()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.facets.contains(&SymbolFacet::Public),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            [
+                ("Route", true),
+                ("Route.path", false),
+                ("Alias", true),
+                ("Mode", true),
+                ("Hidden", false),
+            ]
+        );
+    }
+
+    /// `export = X` marks the module-scope declaration `X`, and an object
+    /// literal behind it the declarations its properties name; `export as
+    /// namespace` exports nothing by name.
+    #[test]
+    fn test_an_export_assignment_marks_the_declaration_it_names() {
+        let public = |text: &str| {
+            analyze(text)
+                .symbols()
+                .iter()
+                .map(|symbol| {
+                    (
+                        symbol.qualified_name.clone(),
+                        symbol.facets.contains(&SymbolFacet::Public),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            public(
+                "class Runner {\n  run(): void {}\n}\nfunction helper(): void {}\nexport = Runner;\n"
+            ),
+            [
+                ("Runner".to_owned(), true),
+                ("Runner.run".to_owned(), false),
+                ("helper".to_owned(), false),
+            ]
+        );
+        assert_eq!(
+            public("function parse(): void {}\nfunction hidden(): void {}\nexport = { parse };\n"),
+            [("parse".to_owned(), true), ("hidden".to_owned(), false)]
+        );
+        assert_eq!(
+            public("function helper(): void {}\nexport as namespace helper;\n"),
+            [("helper".to_owned(), false)]
         );
     }
 
@@ -253,6 +390,7 @@ mod tests {
             spans,
             [
                 ("Route", true),
+                ("path", false),
                 ("Mode", true),
                 ("Alias", true),
                 ("Registry", true),
@@ -263,7 +401,7 @@ mod tests {
                 ("open", true),
             ]
         );
-        let alias = &document.symbols()[2];
+        let alias = &document.symbols()[3];
         let value = alias.body_range.expect("the alias holds a value");
         let start = usize::try_from(value.start).expect("fixture span fits usize");
         let end = usize::try_from(value.end).expect("fixture span fits usize");
@@ -303,6 +441,7 @@ mod tests {
             facts,
             [
                 ("BannerProps", "interface", true, None),
+                ("BannerProps.label", "property", false, None),
                 ("render", "variable", false, None),
                 ("Banner", "class", true, None),
                 ("Banner.draw", "method", false, Some("private")),

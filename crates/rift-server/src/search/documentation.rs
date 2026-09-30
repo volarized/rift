@@ -1,11 +1,11 @@
-//! Documentation projection over the request's captured project and package sources.
+//! Documentation projection over the request's captured project sources.
 
 use rift_index::{
     DocumentationError, DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
 use rift_protocol::documentation::{
-    DocumentationContentIdentity, DocumentationSource, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarning, DocumentationWarningKind,
+    DocumentationContentIdentity, DocumentationSourceIdentity, DocumentationStage,
+    DocumentationWarning, DocumentationWarningKind,
 };
 use rift_protocol::read::TextRange;
 
@@ -25,8 +25,8 @@ pub(super) struct SearchDocumentation<'a> {
 }
 
 impl<'a> SearchDocumentation<'a> {
-    /// Joins the documentation layers one search projects onto: the project's, the
-    /// `force_include` files', then the dependency packages'.
+    /// Joins the documentation layers one search projects onto: the project's, then the
+    /// `force_include` files'.
     ///
     /// Each layer was built once by the index that owns it, so joining one costs a
     /// reference. A layer whose build crossed a bound is left out and the answer warns
@@ -42,9 +42,6 @@ impl<'a> SearchDocumentation<'a> {
         }
         if let Some(extra) = resolution.force_include {
             joined.join("force_include", extra.documentation_layer());
-        }
-        if let Some(packages) = resolution.packages {
-            joined.join("dependency package", packages.documentation_layer());
         }
         Self {
             projection: joined.projection,
@@ -67,7 +64,7 @@ impl<'a> SearchDocumentation<'a> {
     ) -> Option<bool> {
         let source = self.projection.document_source(identity)?;
         Some(match &source.source {
-            DocumentationSourceIdentity::Package { .. } => true,
+            DocumentationSourceIdentity::Package { .. } => false,
             DocumentationSourceIdentity::Project { path } => {
                 let Ok(path) = ProjectPath::new(path.0.as_str()) else {
                     return Some(false);
@@ -95,8 +92,7 @@ impl<'a> SearchDocumentation<'a> {
         self.projection
             .project(inputs, target, |identity, source| {
                 let range = self.document_range(identity)?;
-                let facts = self.projection.source(source)?;
-                let content = captured_content(self.index, self.resolution, source, facts)?;
+                let content = captured_content(self.index, self.resolution, source)?;
                 let start = usize::try_from(range.start).ok()?;
                 let end = usize::try_from(range.end).ok()?;
                 let (_, found, _) = query_line(content.get(start..end)?, query)?;
@@ -114,7 +110,6 @@ impl<'a> SearchDocumentation<'a> {
         }
         let range = match resolve_candidate(self.index, self.resolution, identity)? {
             ResolvedCandidate::Declaration(_, found) => found.symbol.range,
-            ResolvedCandidate::Package(found) => found.matched.symbol.range,
             ResolvedCandidate::SourceFile(_) | ResolvedCandidate::TextFile(_) => return None,
         };
         Some(text_range(range))
@@ -180,21 +175,19 @@ impl<'a> JoinedLayers<'a> {
     }
 }
 
-/// Source lookup uses the already selected package identity and never acquires bytes.
+/// The captured bytes one documentation source names, from the project or the
+/// `force_include` files; the lookup never reads a file. A package source is held by the
+/// global index, so no local content answers it.
 fn captured_content<'a>(
     index: &'a WorkspaceIndex,
     resolution: Resolution<'a>,
     identity: &DocumentationContentIdentity,
-    source: &DocumentationSource,
 ) -> Option<&'a str> {
     match &identity.source {
         DocumentationSourceIdentity::Project { .. } => index
             .documentation_content(identity)
             .or_else(|| resolution.force_include?.documentation_content(identity)),
-        DocumentationSourceIdentity::Package { .. } => resolution
-            .packages?
-            .package(source.origin.package.as_ref()?)?
-            .documentation_content(identity),
+        DocumentationSourceIdentity::Package { .. } => None,
     }
 }
 
@@ -210,12 +203,7 @@ pub(super) fn populate_sources(
         let SearchHitTarget::Documentation { documentation } = &hit.hit else {
             continue;
         };
-        let Some(content) = captured_content(
-            index,
-            resolution,
-            &documentation.block.source,
-            &documentation.source,
-        ) else {
+        let Some(content) = captured_content(index, resolution, &documentation.block.source) else {
             warn(
                 &mut warnings,
                 &documentation.block.source,

@@ -4,7 +4,7 @@
 //! so the revision has to change whenever the analysis would. The manifest states what
 //! the analysis depends on - each shipped grammar's package version and checksum, and the
 //! content digest of the extraction, normalization, identity, and document-builder source
-//! - and [`analyzer_revision`] is the digest of that document.
+//! - and [`analyzer_revision`](crate::analyzer_revision) is the digest of that document.
 //!
 //! The document is generated beside the served schemas and committed, so a change to any
 //! named input that ships without a regenerated manifest fails `just generate-check`
@@ -15,13 +15,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use rift_analysis::analyzer_revision;
 use rift_protocol::canonical::canonical_json;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 #[cfg(test)]
-const ANALYZER_MANIFEST: &str = include_str!("../../../rift-analysis/src/analyzer-manifest.json");
+const ANALYZER_MANIFEST: &str = include_str!("../analyzer-manifest.json");
 
 /// The lockfile the grammar versions and checksums are read from, relative to the
 /// repository root.
@@ -35,14 +34,11 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 /// the whole crate: which node a grammar calls a declaration, which name it exports, and
 /// how a record is normalized and addressed.
 ///
-/// Naming single files here was not enough. A grammar rule set in `rift-syntax` and the
-/// export rule in `walk.rs` each change what a publication holds while `extract.rs` and
-/// `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 9] = [
+/// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
+/// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
+const ANALYZED_SOURCES: [&str; 7] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
-    "crates/rift-index/src/dependency/analyzer.rs",
-    "crates/rift-index/src/dependency/walk.rs",
     "crates/rift-index/src/lexical.rs",
     "crates/rift-provider/src",
     "crates/rift-protocol/src",
@@ -324,7 +320,8 @@ impl std::error::Error for ManifestError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ANALYZER_MANIFEST, ManifestError, analyzer_revision, grammar_pins};
+    use super::{ANALYZER_MANIFEST, ManifestError, grammar_pins};
+    use crate::analyzer_revision;
 
     #[test]
     fn test_analyzer_revision_is_the_wire_digest_of_the_committed_manifest() {
@@ -358,13 +355,12 @@ mod tests {
             .iter()
             .filter_map(|source| source["path"].as_str())
             .collect();
-        // A grammar rule set decides which node is a declaration, and the export rule
-        // decides which declaration is published: both change a publication while the
-        // extraction source stays byte-identical.
+        // A grammar rule set decides which node is a declaration, and changes a
+        // publication while the extraction source stays byte-identical.
         for expected in [
+            "crates/rift-analysis/src/revision/manifest.rs",
             "crates/rift-core/src/identity.rs",
-            "crates/rift-index/src/dependency/analyzer.rs",
-            "crates/rift-index/src/dependency/walk.rs",
+            "crates/rift-index/src/lexical.rs",
             "crates/rift-provider/src/normalization.rs",
             "crates/rift-syntax/src/extract.rs",
             "crates/rift-syntax/src/rust.rs",

@@ -1,12 +1,9 @@
-#:schema ../protocol/rift.schema.json
-
-hooks = []
+#:schema https://volar.sh/rift/rift.schema.json
 
 [execution]
-allow = []
-max_code = "16KiB"
+max_code = "16kb"
 max_timeout = "30s"
-max_output = "8KiB"
+max_output = "8kb"
 max_concurrent = 2
 
 [search]

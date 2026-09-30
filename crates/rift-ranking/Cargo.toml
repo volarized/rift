@@ -15,6 +15,3 @@ data-encoding.workspace = true
 rift-core.workspace = true
 serde.workspace = true
 sha2.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }

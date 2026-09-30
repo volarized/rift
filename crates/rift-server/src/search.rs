@@ -10,40 +10,34 @@ use documentation::SearchDocumentation;
 
 use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::RwLockReadGuard;
 
-use rift_core::constants::{
-    FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
-};
+use rift_core::ProjectPath;
+use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
-use rift_core::{ProjectPath, SourceUnitId};
-use rift_dependency::DependencyContext;
 use rift_index::{
-    DependencyIndex, DependencySymbolMatch, IndexedFile, LexicalChange, PathChanges, PathMatcher,
-    SymbolMatch, TextSourceFile, WorkspaceIndex,
+    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, SymbolMatch,
+    TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
     ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
     SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
-    SearchTraversal, SourceUnitId as WireSourceUnitId, Symbol, SymbolId,
+    SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, DocumentKind, DocumentLocation, FusedCandidate, IdentifierMatchClass,
     IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QueryPhase,
-    RankRequest, RankedCandidates, RankingInput, RankingInputKind, RankingWeights, SearchableField,
-    fuse,
+    RankedCandidates, RankingInput, RankingWeights, SearchableField, fuse,
 };
 use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
-use crate::packages::PackageFallback;
 use crate::read::parse_symbol_address;
 use crate::read::{
-    ReadError, ReadFault, ReadService, accepted_limit, dependency_symbol, excerpt,
-    package_warnings, page, project_path, results_truncation_warning, source_warnings, text_range,
-    validate_common, wire_symbol,
+    CURRENT_TREE_ALONE, ReadError, ReadFault, ReadService, accepted_limit, excerpt, page,
+    project_path, results_truncation_warning, source_warnings, text_range, validate_common,
+    validate_requested_packages, wire_symbol,
 };
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
@@ -79,10 +73,7 @@ impl StoreAnswer {
         }
     }
 
-    /// No store answer, under the operator's own shares.
-    ///
-    /// The project's full-text store contributed nothing, but a selected package index
-    /// answers that input from its own documents, so the shares stay what
+    /// No store answer, under the operator's own shares: the shares stay what
     /// `[search.ranking]` states rather than collapsing onto identifier matching.
     #[must_use]
     pub const fn without_store(weights: RankingWeights) -> Self {
@@ -93,9 +84,8 @@ impl StoreAnswer {
         }
     }
 
-    /// No store answer and no other index that could give one: the identifier ranking
-    /// is the only input there is, so it carries the whole share whatever the operator
-    /// configured.
+    /// No store answer at all: the identifier ranking is the only input there is, so it
+    /// carries the whole share whatever the operator configured.
     #[must_use]
     pub fn identifier_only() -> Self {
         Self {
@@ -156,21 +146,21 @@ impl ReadService {
     /// builds the identifier input over every selected index, fuses the three under one
     /// set of shares, and resolves the ordered identities into hits. A store that is
     /// unavailable, or whose stamped revision no longer matches what is published,
-    /// contributes no input and the identifier ranking answers alone. `params.scope`
-    /// selects which indexes take part: the project's own, the attached package indexes,
-    /// or both, ordered together by `params.order`.
+    /// contributes no input and the identifier ranking answers alone. The project's own
+    /// index answers `local` and `all`; package facts come from the global index, so a
+    /// `global` search answers no project hit.
     ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for an invalid `paths` glob, a `force_include` bound crossed,
-    /// a scope beyond `local` beside a revision, `global` beside `traversal`, a query the
-    /// bounded parser refuses, and a poisoned package branch.
+    /// a scope beyond `local` beside a revision, `global` beside `traversal`, a `packages`
+    /// argument the read cannot send, and a query the bounded parser refuses.
     pub fn search(
         &self,
         params: &SearchParams,
         store: &StoreAnswer,
     ) -> Result<SearchResult, ReadError> {
-        self.search_with_dependency_context(params, store, self.dependency_context())
+        self.search_with_references(params, store, &EngineReferences::default())
     }
 
     /// Searches one publication with references resolved by its configured engines.
@@ -183,49 +173,6 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
-    ) -> Result<SearchResult, ReadError> {
-        self.search_with_references_and_dependency_context(
-            params,
-            store,
-            references,
-            self.dependency_context(),
-        )
-    }
-
-    /// Searches one publication using `dependency_context` for package fallback selection.
-    ///
-    /// The service keeps project search unchanged. The supplied context only decides which
-    /// dependency packages the current-tree package branch may analyze and which context
-    /// warnings the answer carries.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same failures as [`Self::search`].
-    pub fn search_with_dependency_context(
-        &self,
-        params: &SearchParams,
-        store: &StoreAnswer,
-        dependency_context: &DependencyContext,
-    ) -> Result<SearchResult, ReadError> {
-        self.search_with_references_and_dependency_context(
-            params,
-            store,
-            &EngineReferences::default(),
-            dependency_context,
-        )
-    }
-
-    /// Searches one publication with references and a selected dependency context.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same failures as [`Self::search_with_references`].
-    pub fn search_with_references_and_dependency_context(
-        &self,
-        params: &SearchParams,
-        store: &StoreAnswer,
-        references: &EngineReferences,
-        dependency_context: &DependencyContext,
     ) -> Result<SearchResult, ReadError> {
         references.validate_revision(self)?;
         validate_search(params)?;
@@ -249,8 +196,6 @@ impl ReadService {
         // bound, so `pagination.total_pages` counts the full result set and every page is
         // one window of the same ordering.
         let fetch_limit = self.index().results_max();
-        let package_indexes =
-            self.search_package_indexes(params, query.is_some(), dependency_context)?;
 
         let mut results = Vec::new();
         let mut warnings = self.initial_search_warnings(&selected, params.target, references);
@@ -270,13 +215,6 @@ impl ReadService {
                 params.scope,
                 &selected,
                 (&parsed, store),
-                SearchDependencies {
-                    ranking: package_indexes.ranking.as_deref(),
-                    documentation: package_indexes
-                        .documentation
-                        .as_deref()
-                        .or(package_indexes.ranking.as_deref()),
-                },
                 (&mut results, &mut warnings),
             )?;
         }
@@ -313,10 +251,6 @@ impl ReadService {
                 self.index(),
                 Resolution {
                     force_include: selected.force_include.as_ref(),
-                    packages: package_indexes
-                        .documentation
-                        .as_deref()
-                        .or(package_indexes.ranking.as_deref()),
                 },
             ));
         }
@@ -328,47 +262,7 @@ impl ReadService {
         Ok(SearchResult {
             results,
             pagination,
-            warnings: search_package_warnings(
-                warnings,
-                params.scope,
-                dependency_context,
-                package_indexes,
-                traversal_report,
-                results_max_reached,
-            ),
-        })
-    }
-
-    /// Selects package indexes for ranking and documentation reads.
-    fn search_package_indexes<'service>(
-        &'service self,
-        params: &SearchParams,
-        has_query: bool,
-        dependency_context: &DependencyContext,
-    ) -> Result<SearchPackageIndexes<'service>, ReadError> {
-        let local_documentation = has_query
-            && params.scope == SearchScope::Local
-            && matches!(
-                params.target,
-                SearchParamsTarget::Documentation | SearchParamsTarget::All
-            )
-            && self.revision().is_none();
-        let fallback = if local_documentation {
-            self.fill_local_documentation_packages(dependency_context)?
-        } else {
-            self.fill_packages(params.scope, dependency_context)?
-        };
-        let ranking = self.dependency_index(params.scope)?;
-        let documentation = if local_documentation {
-            self.documentation_dependency_index()?
-        } else {
-            None
-        };
-        Ok(SearchPackageIndexes {
-            fallback,
-            ranking,
-            documentation,
-            local_documentation,
+            warnings: Self::search_warnings(warnings, traversal_report, results_max_reached),
         })
     }
 
@@ -415,23 +309,16 @@ impl ReadService {
                 &pattern_strings(&selector.force_include),
                 &[],
             )
-            .map_err(ReadFault::index)?;
+            .map_err(|error| ReadFault::index(error.index_error()))?;
         }
         Ok(())
     }
 
     /// The warnings one search answer carries: those the collection gathered - the
     /// snapshot's own and the force-included files it left out - then what the traversal
-    /// lane reported, the result bound when the pool reached it, and the package warnings
-    /// when `scope` reaches packages.
+    /// lane reported, and the result bound when the pool reached it.
     fn search_warnings(
         mut warnings: Vec<ReadWarning>,
-        scope: SearchScope,
-        (dependencies, dependency_context, fallback): (
-            Option<&DependencyIndex>,
-            &DependencyContext,
-            PackageFallback,
-        ),
         traversal: TraversalReport,
         results_max_reached: Option<usize>,
     ) -> Vec<ReadWarning> {
@@ -441,9 +328,6 @@ impl ReadService {
         }
         if let Some(results_max) = results_max_reached {
             warnings.push(results_truncation_warning(results_max));
-        }
-        if scope != SearchScope::Local {
-            warnings.extend(package_warnings(dependencies, dependency_context, fallback));
         }
         warnings
     }
@@ -493,7 +377,6 @@ impl ReadService {
         scope: SearchScope,
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
-        packages: SearchDependencies<'_>,
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, ReadError> {
         let index = self.index();
@@ -505,15 +388,9 @@ impl ReadService {
             force_include: (scope != SearchScope::Global)
                 .then_some(selected.force_include.as_ref())
                 .flatten(),
-            packages: packages.ranking,
         };
         let resolution = Resolution {
             force_include: sources.force_include,
-            packages: packages.ranking,
-        };
-        let documentation_resolution = Resolution {
-            force_include: sources.force_include,
-            packages: packages.documentation,
         };
         let documentation = matches!(
             criteria.target,
@@ -523,7 +400,7 @@ impl ReadService {
             rift_core::traced!(
                 component = "search",
                 operation = "search.documentation_projection",
-                { SearchDocumentation::new(index, scope, documentation_resolution) }
+                { SearchDocumentation::new(index, scope, resolution) }
             )
         });
         if let Some(documentation) = &documentation {
@@ -543,13 +420,6 @@ impl ReadService {
             { identifier_input(index, matcher, root, query, sources, fetch_limit) }
         )?];
         inputs.extend(store.precise().iter().cloned());
-        inputs.extend(package_inputs(
-            packages.documentation,
-            query,
-            QueryPhase::Precise,
-            fetch_limit,
-            criteria.target,
-        ));
         let screened = screen.projected(&inputs, query)?;
         let mut ranked = rift_core::traced!(
             component = "search",
@@ -557,19 +427,10 @@ impl ReadService {
             phase = "precise",
             { fuse(&screened, store.weights(), QueryPhase::Precise, fetch_limit) }
         );
-        // The widened inputs are built only when the precise phase came up short,
-        // because ranking every package's documents again is work the full pool
-        // would throw away.
+        // The widened inputs join only when the precise phase came up short: a full pool
+        // leaves no slot a broad match could take.
         if ranked.len() < fetch_limit {
-            let mut widened: Vec<RankingInput> = store.broad().to_vec();
-            widened.extend(package_inputs(
-                packages.documentation,
-                query,
-                QueryPhase::Broad,
-                fetch_limit,
-                criteria.target,
-            ));
-            let screened = screen.projected(&widened, query)?;
+            let screened = screen.projected(store.broad(), query)?;
             let broad = rift_core::traced!(
                 component = "search",
                 operation = "search.fusion",
@@ -755,6 +616,7 @@ impl SelectedPaths {
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_common(params.rev.is_some())?;
+    validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
@@ -808,8 +670,8 @@ fn validate_traversal_seed(
 ///
 /// The `change` block names both sides of the comparison itself, so `rev` has nothing left
 /// to address, and `query` selects a result set of its own. A `scope` past `local`
-/// follows the rule every revision-addressed read applies, since the package branch
-/// serves the current tree alone. A `traversal` is refused beside a comparison by
+/// follows the rule every revision-addressed read applies, since package facts are
+/// served for the current tree alone. A `traversal` is refused beside a comparison by
 /// [`validate_traversal_seed`], since no lane resolves references for a committed
 /// revision.
 fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), ReadError> {
@@ -826,10 +688,7 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
         ));
     }
     if params.scope != SearchScope::Local {
-        return Err(ReadFault::invalid(
-            "scope",
-            "package facts are served for the current tree alone",
-        ));
+        return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
     }
     let sides = [
         (CHANGE_BASE_FIELD, &change.base),
@@ -893,7 +752,7 @@ pub(crate) fn path_matcher(
         &pattern_strings(&selector.exclude),
     )
     .map(Some)
-    .map_err(ReadFault::index)
+    .map_err(|error| ReadFault::index(error.index_error()))
 }
 
 fn pattern_strings(patterns: &[PathPattern]) -> Vec<String> {
@@ -907,9 +766,8 @@ pub(crate) fn includes(matcher: Option<&PathMatcher>, root: &Path, path: &Projec
 
 /// The identifiers a caller's query carried, matched against every selected index.
 ///
-/// One input, whichever indexes answered it: the project's own declarations, the
-/// `force_include` files this request pulled in, and the cataloged packages when `scope`
-/// reaches them. Each extracted candidate is matched separately and an identity keeps its
+/// One input, whichever indexes answered it: the project's own declarations and the
+/// `force_include` files this request pulled in. Each extracted candidate is matched separately and an identity keeps its
 /// best class, so a question naming two identifiers ranks a declaration by the stronger
 /// of the two rather than by whichever was written first.
 ///
@@ -942,105 +800,7 @@ fn identifier_input(
             .observe_identifiers(query, bound, |_| true, &mut ranking)
             .map_err(ReadFault::index)?;
     }
-    if let Some(packages) = sources.packages {
-        for candidate in query.candidates() {
-            for found in packages.symbols(candidate.text(), bound) {
-                let Some(identity) = package_symbol_identity(&found) else {
-                    continue;
-                };
-                ranking.observe(identity, found.matched.rank, &candidate);
-            }
-        }
-    }
     Ok(ranking.into_input(bound))
-}
-
-/// The full-text ranking every held package answers, one input per package.
-///
-/// A package holds its documents in memory and ranks them through the shared
-/// reader contract, so a package declaration reaches an answer by its
-/// documentation and its source as well as by its name. Every package answers
-/// the same kind, so fusion splits what full-text matching is worth among
-/// them rather than letting a wide dependency outvote the project.
-///
-/// The work is two passes over each package's own documents, one deriving the
-/// members' inverse frequencies and one scoring, each bounded by the
-/// declarations that package published, and the answer is cut to `bound`.
-fn package_inputs(
-    dependencies: Option<&DependencyIndex>,
-    query: &ParsedQuery,
-    phase: QueryPhase,
-    bound: usize,
-    target: SearchParamsTarget,
-) -> Vec<RankingInput> {
-    let Some(dependencies) = dependencies else {
-        return Vec::new();
-    };
-    if phase == QueryPhase::Broad && !query.has_broad_phase() {
-        return Vec::new();
-    }
-    dependencies
-        .packages()
-        .map(|package| {
-            package.reader().ranked_where(
-                RankRequest::new(query, RankingInputKind::Lexical, phase, bound),
-                |document| match target {
-                    SearchParamsTarget::Symbol => document.kind() == DocumentKind::Symbol,
-                    SearchParamsTarget::File => false,
-                    SearchParamsTarget::Documentation | SearchParamsTarget::All => true,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Package indexes held for one search. Local documentation reads can see a static package
-/// index while identifier ranking remains project-only.
-struct SearchPackageIndexes<'service> {
-    fallback: PackageFallback,
-    ranking: Option<RwLockReadGuard<'service, DependencyIndex>>,
-    documentation: Option<RwLockReadGuard<'service, DependencyIndex>>,
-    local_documentation: bool,
-}
-
-/// The package lanes one candidate projection can read.
-#[derive(Clone, Copy)]
-struct SearchDependencies<'a> {
-    ranking: Option<&'a DependencyIndex>,
-    documentation: Option<&'a DependencyIndex>,
-}
-
-fn search_package_warnings(
-    warnings: Vec<ReadWarning>,
-    scope: SearchScope,
-    context: &DependencyContext,
-    packages: SearchPackageIndexes<'_>,
-    traversal: TraversalReport,
-    results_max_reached: Option<usize>,
-) -> Vec<ReadWarning> {
-    let mut warnings = ReadService::search_warnings(
-        warnings,
-        scope,
-        (
-            packages.ranking.as_deref(),
-            context,
-            packages.fallback.clone(),
-        ),
-        traversal,
-        results_max_reached,
-    );
-    if packages.local_documentation {
-        warnings.extend(
-            package_warnings(
-                packages.documentation.as_deref(),
-                context,
-                packages.fallback,
-            )
-            .into_iter()
-            .skip(1),
-        );
-    }
-    warnings
 }
 
 /// Which indexes the identifier ranking reads.
@@ -1048,14 +808,6 @@ fn search_package_warnings(
 struct IdentifierSources<'a> {
     project: bool,
     force_include: Option<&'a WorkspaceIndex>,
-    packages: Option<&'a DependencyIndex>,
-}
-
-/// One package declaration's ranking identity, in the one spelling the package index
-/// publishes its documents under.
-fn package_symbol_identity(found: &DependencySymbolMatch<'_>) -> Option<DocumentIdentity> {
-    let unit = found.package.unit_of(found.matched.file)?;
-    DocumentIdentity::for_unit(unit, &found.matched.symbol.qualified_name).ok()
 }
 
 /// The request's own filters, applied to a ranked identity before it is fused.
@@ -1129,9 +881,8 @@ impl CandidateScreen<'_> {
 /// Resolves every fused identity into a hit, in the order fusion produced.
 ///
 /// Resolution reads the identity alone: a `rift://symbol/` address names a project or
-/// `force_include` declaration, a `rift://source/` address names a package declaration,
-/// and anything else is a project path, optionally carrying the chunk index a large text
-/// file was split at. [`CandidateScreen`] resolved each identity once already, so the
+/// `force_include` declaration, and anything else is a project path, optionally carrying
+/// the chunk index a large text file was split at. [`CandidateScreen`] resolved each identity once already, so the
 /// identities that reach here are the ones this snapshot holds and this request answers.
 fn resolve_ranked_hits(
     index: &WorkspaceIndex,
@@ -1169,7 +920,6 @@ fn resolve_ranked_hits(
 #[derive(Clone, Copy)]
 struct Resolution<'a> {
     force_include: Option<&'a WorkspaceIndex>,
-    packages: Option<&'a DependencyIndex>,
 }
 
 /// What one fused identity turned out to name.
@@ -1180,8 +930,6 @@ enum ResolvedCandidate<'a> {
     /// reads the graph the declaration was indexed into, and the two indexes
     /// hold different graphs.
     Declaration(&'a WorkspaceIndex, SymbolMatch<'a>),
-    /// A declaration in a cataloged package.
-    Package(DependencySymbolMatch<'a>),
     /// A syntax-indexed file this request matched whole.
     SourceFile(&'a IndexedFile),
     /// A baseline text file this request matched whole.
@@ -1192,7 +940,7 @@ impl ResolvedCandidate<'_> {
     /// Whether the request's `target` asks for this kind of hit.
     const fn answers(&self, target: SearchParamsTarget) -> bool {
         match self {
-            Self::Declaration(..) | Self::Package(_) => {
+            Self::Declaration(..) => {
                 matches!(target, SearchParamsTarget::All | SearchParamsTarget::Symbol)
             }
             Self::SourceFile(_) | Self::TextFile(_) => {
@@ -1201,8 +949,7 @@ impl ResolvedCandidate<'_> {
         }
     }
 
-    /// Whether the request's path selector reaches this candidate. A package declaration
-    /// carries no project path, so a project glob never excludes one.
+    /// Whether the request's path selector reaches this candidate.
     fn reaches(
         &self,
         project: &WorkspaceIndex,
@@ -1217,7 +964,6 @@ impl ResolvedCandidate<'_> {
             }
             Self::SourceFile(file) => includes(matcher, root, file.path()),
             Self::TextFile(file) => includes(matcher, root, file.path()),
-            Self::Package(_) => true,
         }
     }
 
@@ -1228,7 +974,7 @@ impl ResolvedCandidate<'_> {
         match self {
             Self::SourceFile(file) => Some(file.path()),
             Self::TextFile(file) => Some(file.path()),
-            Self::Declaration(..) | Self::Package(_) => None,
+            Self::Declaration(..) => None,
         }
     }
 
@@ -1243,9 +989,6 @@ impl ResolvedCandidate<'_> {
         match self {
             Self::Declaration(held, found) => {
                 build_symbol_hit(held, found, score, matched_by, criteria.payloads)
-            }
-            Self::Package(found) => {
-                dependency_symbol_hit(found, score, matched_by, criteria.payloads)
             }
             Self::SourceFile(file) => {
                 let (line, range, text) = locate_query_line(file.source(), criteria.query);
@@ -1307,9 +1050,6 @@ fn resolve_candidate<'a>(
     if value.starts_with(SYMBOL_URI_PREFIX) {
         return resolve_declaration(index, resolution.force_include, value);
     }
-    if value.starts_with(SOURCE_UNIT_URI_PREFIX) {
-        return resolve_package_declaration(resolution.packages, identity);
-    }
     resolve_file(index, value)
 }
 
@@ -1346,18 +1086,6 @@ const fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> Symbol
     }
 }
 
-/// The package declaration one `rift://source/` identity names.
-fn resolve_package_declaration<'a>(
-    packages: Option<&'a DependencyIndex>,
-    identity: &DocumentIdentity,
-) -> Option<ResolvedCandidate<'a>> {
-    let (unit, qualified_name) = identity.as_unit()?;
-    let unit = SourceUnitId::parse(unit).ok()?;
-    packages?
-        .symbol_at(&unit, qualified_name)
-        .map(ResolvedCandidate::Package)
-}
-
 /// Separates a split text file's path from the index of one of its chunks.
 const CHUNK_SEPARATOR: char = '#';
 
@@ -1391,31 +1119,9 @@ fn held_file<'a>(index: &'a WorkspaceIndex, path: &str) -> Option<ResolvedCandid
     index.text_file(&path).map(ResolvedCandidate::TextFile)
 }
 
-/// Builds one dependency symbol hit's wire shape: the assembly [`build_symbol_hit`] gives
-/// a project declaration, addressed by `unit` in place of `path`, at the identifier
-/// rank's score.
-fn dependency_symbol_hit(
-    found: DependencySymbolMatch<'_>,
-    score: Option<f64>,
-    matched_by: Vec<MatchedField>,
-    payloads: HitPayloads,
-) -> Result<SearchHit, ReadError> {
-    let matched = found.matched;
-    let (symbol, unit) = dependency_symbol(found)?;
-    Ok(assembled_symbol_hit(
-        symbol,
-        matched,
-        (None, Some(unit)),
-        score,
-        matched_by,
-        payloads,
-    ))
-}
-
 /// Builds one symbol hit's wire shape. `symbol_search_hit` and `merge_symbol_hit` share
 /// this: both surface the same declaration, differing only in score and which indexed field
-/// produced the match; `dependency_symbol_hit` shares the assembly below it, addressed by
-/// `unit` rather than `path`.
+/// produced the match.
 pub(crate) fn build_symbol_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
@@ -1432,7 +1138,7 @@ pub(crate) fn build_symbol_hit(
     Ok(assembled_symbol_hit(
         symbol,
         matched,
-        (Some(project_path(matched.file.path())), None),
+        project_path(matched.file.path()),
         score,
         matched_by,
         payloads,
@@ -1440,17 +1146,17 @@ pub(crate) fn build_symbol_hit(
 }
 
 /// One symbol hit over `matched`'s declaration bytes: `symbol` already assembled, addressed
-/// by exactly one of `path` and `unit`. The excerpt behind `source` is sliced only when
-/// `payloads` asked for it, so a request that omits `include` never pays that lookup.
+/// by `path`. The excerpt behind `source` is sliced only when `payloads` asked for it, so a
+/// request that omits `include` never pays that lookup.
 fn assembled_symbol_hit(
     symbol: Symbol,
     matched: SymbolMatch<'_>,
-    (path, unit): (Option<WireProjectPath>, Option<WireSourceUnitId>),
+    path: WireProjectPath,
     score: Option<f64>,
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> SearchHit {
-    let line = (!payloads.defer_line || path.is_none())
+    let line = (!payloads.defer_line)
         .then(|| line::line_number_at(matched.file.source(), matched.symbol.range.start));
     SearchHit {
         hit: SearchHitTarget::Symbol {
@@ -1463,8 +1169,8 @@ fn assembled_symbol_hit(
             .then(|| excerpt(matched.file, matched.symbol.range)),
         range: Some(text_range(matched.symbol.range)),
         line,
-        path,
-        unit,
+        path: Some(path),
+        unit: None,
         traversal_path: None,
         distance: None,
         change: None,
@@ -1473,7 +1179,6 @@ fn assembled_symbol_hit(
 
 /// Resolves project symbol lines only for the returned page. Line numbers never take part
 /// in ordering or merging, and source comes from the same held index that supplied the hit.
-/// Dependency hits already carry their lines from their package's held source.
 fn populate_symbol_lines(
     results: &mut [SearchHit],
     index: &WorkspaceIndex,
@@ -1722,14 +1427,13 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
 
     use rift_core::{Fault as _, SourceVisibility};
     use rift_index::{LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{HistoryConfiguration, RankingConfiguration};
     use rift_protocol::read::{
-        MatchedField, NodeId, PackageIdentity, ReadWarning, ResultOrder, SearchParams,
-        SearchParamsTarget, SearchResult, SearchScope, SourceLocationKind, SourceUnitId,
+        MatchedField, NodeId, ReadWarning, ResultOrder, SearchParams, SearchParamsTarget,
+        SearchResult, SourceUnitId,
     };
     use rift_ranking::{
         DocumentIdentity, DocumentKind, FieldSet, PARSED_QUERY_MEMBERS_MAX, ParsedQuery,
@@ -1744,8 +1448,7 @@ mod tests {
         ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadFault, ReadService,
         Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
     };
-    use crate::packages::PackageBranch;
-    use crate::read::tests::{helper_store, helper_unit, project_fixture};
+    use crate::read::tests::project_fixture;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1858,7 +1561,6 @@ mod tests {
         let sources = IdentifierSources {
             project: true,
             force_include: None,
-            packages: None,
         };
         let input = super::identifier_input(index, None, index.root(), &parsed, sources, 32)?;
         let criteria = SearchCriteria {
@@ -1868,7 +1570,6 @@ mod tests {
         };
         let resolution = Resolution {
             force_include: None,
-            packages: None,
         };
         resolved_hits(service, &[input], criteria, resolution)
     }
@@ -3662,6 +3363,20 @@ impl Tower {
         Ok(())
     }
 
+    /// The check an engine-backed search runs before any engine starts refuses an invalid
+    /// `force_include` glob the way the search itself does.
+    #[test]
+    fn engine_search_validation_refuses_an_invalid_force_include_glob() -> TestResult {
+        let (_directory, service) = fixture()?;
+        let request = json!({"query": "Beacon", "paths": {"force_include": ["["]}});
+        let params: SearchParams = serde_json::from_value(request)?;
+        let error = service
+            .validate_engine_search(&params)
+            .expect_err("an invalid force_include glob must refuse");
+        assert!(matches!(error.fault(), ReadFault::Index(_)), "{error}");
+        Ok(())
+    }
+
     /// One committed source file, then uncommitted drift, so a revision
     /// search and a working-tree search answer differently.
     fn committed_fixture() -> TestResult<(TempDir, ReadService)> {
@@ -4062,7 +3777,6 @@ impl Tower {
         };
         let resolution = Resolution {
             force_include: None,
-            packages: None,
         };
         let results = resolved_hits(&unrelated, &[input], criteria, resolution)?;
         assert!(
@@ -4088,7 +3802,6 @@ impl Tower {
         };
         let resolution = Resolution {
             force_include: None,
-            packages: None,
         };
         let results = resolved_hits(&unrelated, &[input], criteria, resolution)?;
         assert!(
@@ -4098,21 +3811,20 @@ impl Tower {
         Ok(())
     }
 
-    /// A package declaration resolves back through its source unit and qualified name; a
-    /// project declaration resolves through its `rift://symbol/` address.
+    /// A project declaration resolves through its `rift://symbol/` address. A package
+    /// declaration's source unit names nothing the snapshot holds: package facts come
+    /// from the global index, so the identity is skipped.
     #[test]
-    fn resolve_ranked_hits_resolves_a_package_unit_and_a_project_declaration() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let packages = service
-            .dependency_index(SearchScope::Global)?
-            .ok_or("the fixture must attach a package index")?;
+    fn resolve_ranked_hits_resolves_a_project_declaration_and_skips_a_package_unit() -> TestResult {
+        let (_directory, service) = project_fixture("pub fn beacon() {}\n")?;
+        let package_unit = "rift://source/cargo/helper@0.1.0/src/lib.rs#helper_beacon";
         let input = lexical_input(vec![
             (
                 declaration_identity("src/lib.rs", "beacon")?,
                 FieldSet::of(SearchableField::Name),
             ),
             (
-                DocumentIdentity::new(format!("{}#helper_beacon", helper_unit().0))?,
+                DocumentIdentity::new(package_unit.to_owned())?,
                 FieldSet::of(SearchableField::QualifiedName),
             ),
         ]);
@@ -4123,17 +3835,14 @@ impl Tower {
         };
         let resolution = Resolution {
             force_include: None,
-            packages: Some(&packages),
         };
         let results = resolved_hits(&service, &[input], criteria, resolution)?;
-        assert_eq!(results.len(), 2, "{results:#?}");
+        assert_eq!(results.len(), 1, "{results:#?}");
         assert_eq!(
             results[0].path,
             Some(rift_protocol::read::ProjectPath("src/lib.rs".to_owned()))
         );
         assert_eq!(results[0].unit, None);
-        assert_eq!(results[1].unit, Some(helper_unit()));
-        assert_eq!(results[1].path, None);
         Ok(())
     }
 
@@ -4145,7 +3854,6 @@ impl Tower {
         let (_directory, service) = fixture()?;
         let resolution = Resolution {
             force_include: None,
-            packages: None,
         };
         let every_column = lexical_input(vec![(
             declaration_identity("src/lib.rs", "Beacon")?,
@@ -4628,11 +4336,9 @@ impl Tower {
         );
     }
 
-    /// The project `beacon` beside a store holding the built helper package: the fixture
-    /// `get_symbol`'s scope tests share.
-    fn dependency_fixture() -> TestResult<(TempDir, ReadService)> {
-        let (directory, service) = project_fixture("pub fn beacon() {}\n")?;
-        Ok((directory, service.with_packages(helper_store()?)))
+    /// The project `beacon` alone: the fixture the scope tests share.
+    fn beacon_fixture() -> TestResult<(TempDir, ReadService)> {
+        project_fixture("pub fn beacon() {}\n")
     }
 
     /// Each hit's declaration name and whether it is addressed by `unit`, in answer order.
@@ -4649,16 +4355,11 @@ impl Tower {
             .collect()
     }
 
-    /// An omitted `scope` runs the project index alone: the helper's declaration does not
-    /// answer, the project `beacon` answers by path, and no dependency warning rides.
+    /// An omitted `scope` runs the project index alone: the project `beacon` answers by
+    /// path, and no dependency warning rides.
     #[test]
     fn search_default_scope_answers_the_project_alone() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({"query": "helper_beacon"}))?;
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-        assert!(result.results.is_empty(), "{:?}", result.results);
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
-
+        let (_directory, service) = beacon_fixture()?;
         let params: SearchParams =
             serde_json::from_value(json!({"query": "beacon", "target": "symbol"}))?;
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
@@ -4667,146 +4368,35 @@ impl Tower {
             result.results[0].path,
             Some(rift_protocol::read::ProjectPath("src/lib.rs".to_owned()))
         );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         Ok(())
     }
 
+    /// Package facts come from the global index, so the snapshot answers a `global`
+    /// search with no hit and an `all` search with the project's own, and neither
+    /// carries a package warning of its own: the global route adds those.
     #[test]
-    fn search_global_scope_answers_the_helper_declaration_by_unit() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "helper_beacon",
-            "scope": "global",
-            "include": ["source", "score"]
-        }))?;
-
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-
-        assert_eq!(result.results.len(), 1, "{:?}", result.results);
-        let hit = &result.results[0];
-        assert_eq!(hit.unit, Some(helper_unit()));
-        assert_eq!(hit.path, None);
-        assert_eq!(hit.matched_by, [MatchedField::Name]);
-        assert_eq!(
-            hit.score,
-            Some(1.0),
-            "the only candidate leads the fused order"
-        );
-        assert_eq!(hit.line, Some(1));
-        assert!(
-            hit.source
-                .as_deref()
-                .is_some_and(|source| source.contains("pub fn helper_beacon")),
-            "{hit:?}"
-        );
-        assert!(hit.traversal_path.is_none() && hit.distance.is_none());
-        let SearchHitTarget::Symbol { symbol } = &hit.hit else {
-            panic!("a symbol hit was expected: {hit:?}");
+    fn search_global_scope_answers_no_project_hit_and_all_answers_the_project() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let request = |scope: &str| -> TestResult<SearchParams> {
+            let request = json!({"query": "beacon", "scope": scope, "target": "symbol"});
+            Ok(serde_json::from_value(request)?)
         };
-        assert_eq!(symbol.name, "helper_beacon");
-        assert_eq!(symbol.origin.location, Some(SourceLocationKind::Dependency));
-        assert!(
-            matches!(
-                result.warnings.as_slice(),
-                [ReadWarning::GlobalIndexUnavailable { indexed: 1, .. }]
-            ),
-            "{:?}",
-            result.warnings
-        );
-        Ok(())
-    }
 
-    /// `global` skips the project index: the project's own `beacon` never answers, the
-    /// helper's exact `beacon` orders above its substring `helper_beacon`, the two scores
-    /// fall with position, and a `file` target answers empty since a package contributes
-    /// declarations alone.
-    #[test]
-    fn search_global_scope_skips_the_project_index() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "beacon",
-            "scope": "global",
-            "include": ["score"]
-        }))?;
+        let global = service.search(&request("global")?, &StoreAnswer::identifier_only())?;
+        let all = service.search(&request("all")?, &StoreAnswer::identifier_only())?;
 
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-
-        assert_eq!(
-            located_names(&result),
-            [
-                ("beacon".to_owned(), true),
-                ("helper_beacon".to_owned(), true)
-            ]
-        );
-        assert!(result.results.iter().all(|hit| hit.path.is_none()));
-        let scores: Vec<Option<f64>> = result.results.iter().map(|hit| hit.score).collect();
-        assert_eq!(scores, [Some(1.0), Some(0.5)]);
-
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "beacon",
-            "scope": "global",
-            "target": "file"
-        }))?;
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-        assert!(result.results.is_empty(), "{:?}", result.results);
-        assert_eq!(result.pagination.total_pages, 0);
-        Ok(())
-    }
-
-    /// Under `all`, relevance orders both sides by match class: the helper's exact
-    /// `beacon` above the project's prefix match `beacon_tower`, above the helper's
-    /// substring match `helper_beacon`.
-    #[test]
-    fn search_all_scope_orders_project_and_package_hits_by_score() -> TestResult {
-        let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_packages(helper_store()?);
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "beacon",
-            "scope": "all",
-            "target": "symbol"
-        }))?;
-
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-
-        assert_eq!(
-            located_names(&result),
-            [
-                ("beacon".to_owned(), true),
-                ("beacon_tower".to_owned(), false),
-                ("helper_beacon".to_owned(), true),
-            ]
-        );
-        Ok(())
-    }
-
-    /// Under `all` with `path` order, the project hit lists first and the two helper hits
-    /// follow in identity order within their one unit.
-    #[test]
-    fn search_all_scope_path_order_lists_the_project_hit_before_the_package_hits() -> TestResult {
-        let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_packages(helper_store()?);
-        let params: SearchParams = serde_json::from_value(json!({
-            "query": "beacon",
-            "scope": "all",
-            "target": "symbol",
-            "order": "path"
-        }))?;
-
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-
-        assert_eq!(
-            located_names(&result),
-            [
-                ("beacon_tower".to_owned(), false),
-                ("beacon".to_owned(), true),
-                ("helper_beacon".to_owned(), true),
-            ]
-        );
+        assert!(global.results.is_empty(), "{:?}", global.results);
+        assert_eq!(global.pagination.total_pages, 0);
+        assert!(global.warnings.is_empty(), "{:?}", global.warnings);
+        assert_eq!(located_names(&all), [("beacon".to_owned(), false)]);
+        assert!(all.warnings.is_empty(), "{:?}", all.warnings);
         Ok(())
     }
 
     #[test]
     fn search_global_scope_with_traversal_refuses_naming_traversal() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
+        let (_directory, service) = beacon_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "scope": "global",
@@ -4881,9 +4471,49 @@ impl Tower {
         );
     }
 
+    /// `packages` reaches the global API alone, so beside the `local` scope and beside
+    /// `rev` the search refuses naming it, and beside a scope reaching packages it passes
+    /// the rule.
+    #[test]
+    fn search_packages_refuse_beside_the_local_scope_and_rev() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let packages = json!([{"manager": "cargo", "name": "serde"}]);
+        for (request, violation) in [
+            (
+                json!({"query": "beacon", "packages": packages}),
+                "the local scope reads the project alone",
+            ),
+            (
+                json!({"query": "beacon", "scope": "all", "rev": "main", "packages": packages}),
+                "package facts are served for the current tree alone",
+            ),
+            (
+                json!({"change": {"base": "main"}, "packages": packages}),
+                "the local scope reads the project alone",
+            ),
+        ] {
+            let params: SearchParams = serde_json::from_value(request.clone())?;
+            let error = service
+                .search(&params, &StoreAnswer::identifier_only())
+                .expect_err("the argument has nothing to change");
+            assert!(
+                matches!(
+                    error.fault(),
+                    ReadFault::Invalid { field: "packages", violation: found } if found == violation
+                ),
+                "{request}: {error}"
+            );
+        }
+        let request = json!({"query": "beacon", "scope": "all", "packages": packages});
+        let params: SearchParams = serde_json::from_value(request)?;
+        let answer = service.search(&params, &StoreAnswer::identifier_only())?;
+        assert!(!answer.results.is_empty(), "{answer:?}");
+        Ok(())
+    }
+
     #[test]
     fn search_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
+        let (_directory, service) = beacon_fixture()?;
         for scope in ["global", "all"] {
             let params: SearchParams =
                 serde_json::from_value(json!({"query": "beacon", "scope": scope, "rev": "main"}))?;
@@ -4897,64 +4527,6 @@ impl Tower {
                 "scope {scope}: {error}"
             );
             assert_eq!(error.descriptor().code(), "invalid_request");
-        }
-        Ok(())
-    }
-
-    /// Package warnings follow every search that includes dependency sources, including
-    /// local documentation search.
-    #[test]
-    fn search_global_scope_warns_a_skipped_package() -> TestResult {
-        let mut index =
-            rift_index::DependencyIndex::empty(rift_index::DependencyIndexLimits::default());
-        let zeta = PackageIdentity {
-            manager: "cargo".to_owned(),
-            name: "zeta".to_owned(),
-            version: "1.0.0".to_owned(),
-        };
-        index.skip(zeta.clone(), "zeta refused".to_owned());
-        let (_directory, service) = project_fixture("pub fn beacon() {}\n")?;
-        let service = service.with_packages(Arc::new(PackageBranch::from_index(index)));
-
-        for scope in ["global", "all"] {
-            let params: SearchParams =
-                serde_json::from_value(json!({"query": "beacon", "scope": scope}))?;
-            let result = service.search(&params, &StoreAnswer::identifier_only())?;
-            assert!(
-                matches!(
-                    result.warnings.first(),
-                    Some(ReadWarning::GlobalIndexUnavailable { .. })
-                ),
-                "scope {scope}: {:?}",
-                result.warnings
-            );
-            assert_eq!(
-                result.warnings[1..],
-                [ReadWarning::PackageSkipped {
-                    package: zeta.clone(),
-                    reason: "zeta refused".to_owned(),
-                }],
-                "scope {scope}"
-            );
-        }
-        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let result = service.search(&params, &StoreAnswer::identifier_only())?;
-        assert_eq!(
-            result.warnings,
-            [ReadWarning::PackageSkipped {
-                package: zeta,
-                reason: "zeta refused".to_owned(),
-            }]
-        );
-        for target in ["symbol", "file"] {
-            let params: SearchParams =
-                serde_json::from_value(json!({"query": "beacon", "target": target}))?;
-            let result = service.search(&params, &StoreAnswer::identifier_only())?;
-            assert!(
-                result.warnings.is_empty(),
-                "target {target}: {:?}",
-                result.warnings
-            );
         }
         Ok(())
     }

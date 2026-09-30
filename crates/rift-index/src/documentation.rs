@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use rift_analysis::DocumentationSelection;
 use rift_analysis::documentation::notebook::{
     NotebookCellContent, NotebookContent, decode_notebook,
 };
@@ -77,11 +78,13 @@ pub(crate) fn declarations(
     declarations
 }
 
-/// Builds a validated documentation collection and decoded notebook cells.
+/// Builds a validated documentation collection and decoded notebook cells from the text
+/// files `selection` collects as documentation.
 pub(crate) fn build(
     files: &BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
     declarations: &[DeclarationFacts],
+    selection: &DocumentationSelection,
     chunk_bytes_max: usize,
     previous: Option<(&DocumentationCollection, &NotebookFiles)>,
 ) -> Result<(DocumentationCollection, NotebookFiles), WorkspaceIndexError> {
@@ -90,10 +93,11 @@ pub(crate) fn build(
         operation = "documentation.collect",
         sources = text_files.len(),
         {
-            check_regular_source_count(text_files)?;
+            check_regular_source_count(text_files, selection)?;
             let mut omissions = Vec::new();
             let notebooks = decode_notebooks(
                 text_files,
+                selection,
                 previous.map(|(_, notebooks)| notebooks),
                 &mut omissions,
             )?;
@@ -103,7 +107,7 @@ pub(crate) fn build(
                 omissions,
             };
             for (path, file) in text_files {
-                let Some(source_format) = format(path) else {
+                let Some(source_format) = selection.format(path.as_str()) else {
                     continue;
                 };
                 if source_format == DocumentationSourceFormat::Notebook {
@@ -261,14 +265,14 @@ fn finish_collection(
 
 fn decode_notebooks(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
+    selection: &DocumentationSelection,
     previous: Option<&NotebookFiles>,
     omissions: &mut Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
 ) -> Result<NotebookFiles, WorkspaceIndexError> {
     let mut notebooks = NotebookFiles::new();
-    for (path, file) in text_files
-        .iter()
-        .filter(|(path, _)| format(path) == Some(DocumentationSourceFormat::Notebook))
-    {
+    for (path, file) in text_files.iter().filter(|(path, _)| {
+        selection.format(path.as_str()) == Some(DocumentationSourceFormat::Notebook)
+    }) {
         let identity = project_owner(path, None);
         let digest = content_digest(file.content().as_bytes());
         if let Some(previous) = previous
@@ -387,10 +391,12 @@ fn has_attached_declaration(
 
 fn check_regular_source_count(
     text_files: &BTreeMap<CoreProjectPath, Arc<TextSourceFile>>,
+    selection: &DocumentationSelection,
 ) -> Result<(), WorkspaceIndexError> {
     let mut count = 0_usize;
     for path in text_files.keys().filter(|path| {
-        format(path)
+        selection
+            .format(path.as_str())
             .is_some_and(|source_format| source_format != DocumentationSourceFormat::Notebook)
     }) {
         count = count.saturating_add(1);
@@ -612,18 +618,6 @@ fn project_origin() -> SymbolOrigin {
     }
 }
 
-fn format(path: &CoreProjectPath) -> Option<DocumentationSourceFormat> {
-    let extension = std::path::Path::new(path.as_str()).extension()?.to_str()?;
-    match extension {
-        "md" | "markdown" => Some(DocumentationSourceFormat::Markdown),
-        "mdx" => Some(DocumentationSourceFormat::Mdx),
-        "rst" => Some(DocumentationSourceFormat::RestructuredText),
-        "txt" => Some(DocumentationSourceFormat::Text),
-        "ipynb" => Some(DocumentationSourceFormat::Notebook),
-        _ => None,
-    }
-}
-
 fn media_type(format: DocumentationSourceFormat) -> &'static str {
     match format {
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::AttachedComment => {
@@ -725,12 +719,14 @@ mod tests {
             )),
         );
 
+        let selection = default_selection();
         let mut first_omissions = Vec::new();
-        let first = decode_notebooks(&files, None, &mut first_omissions).expect("first decode");
+        let first =
+            decode_notebooks(&files, &selection, None, &mut first_omissions).expect("first decode");
         assert_eq!(first_omissions.len(), 1);
         let mut next_omissions = Vec::new();
-        let next =
-            decode_notebooks(&files, Some(&first), &mut next_omissions).expect("cached decode");
+        let next = decode_notebooks(&files, &selection, Some(&first), &mut next_omissions)
+            .expect("cached decode");
 
         assert_eq!(next_omissions, first_omissions);
         for path in files.keys() {
@@ -765,13 +761,27 @@ mod tests {
         assert_eq!(error.fault().field(), "sources");
     }
 
+    fn default_selection() -> rift_analysis::DocumentationSelection {
+        rift_analysis::DocumentationSelection::new(
+            &rift_protocol::documentation::DocumentationConfiguration::default(),
+        )
+        .expect("the default selection compiles")
+    }
+
     #[test]
     fn malformed_notebook_build_keeps_omission_and_emits_no_cell_documents() {
         let path = rift_core::ProjectPath::new("broken.ipynb").expect("valid path");
         let text_file = Arc::new(TextSourceFile::from_content(path.clone(), "{".into()));
         let text_files = BTreeMap::from([(path.clone(), text_file)]);
-        let (collection, notebooks) = super::build(&BTreeMap::new(), &text_files, &[], 1_024, None)
-            .expect("malformed notebook remains a bounded omission");
+        let (collection, notebooks) = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            None,
+        )
+        .expect("malformed notebook remains a bounded omission");
 
         assert_eq!(collection.index().coverage.omitted, 1);
         assert_eq!(
@@ -810,8 +820,15 @@ mod tests {
             );
         }
 
-        let error = super::build(&BTreeMap::new(), &text_files, &[], 1_024, None)
-            .expect_err("source count over bound refuses collection");
+        let error = super::build(
+            &BTreeMap::new(),
+            &text_files,
+            &[],
+            &default_selection(),
+            1_024,
+            None,
+        )
+        .expect_err("source count over bound refuses collection");
 
         assert_eq!(
             error.fault().violation(),

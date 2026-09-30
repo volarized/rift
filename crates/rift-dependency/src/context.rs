@@ -2,29 +2,68 @@
 //!
 //! [`resolve_context`] runs every shipped resolver's [`DependencyResolver::context`]
 //! over one workspace and merges what they read into a [`DependencyContext`]. The pass
-//! reads static files alone: it takes a [`StaticInputs`], which offers a file read and
-//! nothing else, so no toolchain runs, no package cache is inspected, and no
-//! environment value is read. Keep its answer apart from
-//! [`DependencyCatalog`](crate::DependencyCatalog), whose entries may carry source
-//! roots this machine happens to hold.
+//! reads static files alone: it takes a [`StaticInputs`], which offers a file read and a
+//! directory listing and nothing else, so no toolchain runs and no environment value is
+//! read. The standard library pass adds its entries after, through
+//! [`DependencyContext::add_standard_libraries`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rift_protocol::dependencies::{ConfiguredPackage, PackageAvailability, PackageContextEntry};
-use rift_protocol::read::ProjectPath;
+use rift_protocol::dependencies::{
+    ConfiguredPackage, PackageAvailability, PackageContextEntry, RequestedPackage,
+};
+use rift_protocol::read::{PackageIdentity, ProjectPath};
 
-use crate::catalog::Degradation;
 use crate::manifest::claimed_manifests;
 use crate::resolver::{
     ContextRequest, DependencyResolver, PACKAGES_MAX, ResolverName, StaticInputs,
 };
+use crate::stdlib::{StandardLibrary, StandardLibraryAnswer};
+
+/// One thing a resolver or a standard library probe could not read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Degradation {
+    /// What degraded: a resolver, or a standard library entry's probe.
+    pub resolver: ResolverName,
+    /// What could not be read, and what the context carries instead.
+    pub reason: String,
+}
+
+/// Where one package the workspace depends on is installed on this machine.
+///
+/// The context keeps install folders off the wire: the request to the global API carries
+/// the entries alone. A caller maps a path below a folder to the package that owns it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallFolder {
+    /// The installed package, at the exact version the lockfile or the probe names.
+    pub package: PackageIdentity,
+    /// Where the package's files stand.
+    pub location: InstallLocation,
+}
+
+/// Where one installed package's files stand.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InstallLocation {
+    /// An absolute folder or single-file module: an npm package's `node_modules/<name>`
+    /// folder, nested copies included, a Python import folder or module the
+    /// distribution's `RECORD` lists, or the Rust standard library below the sysroot.
+    Path(PathBuf),
+    /// The `<name>-<version>` folder Cargo unpacks a registry package into, below each
+    /// registry source folder, `~/.cargo/registry/src/<index>/`. Cargo names the index
+    /// folder by a hash of the registry's URL, so the pass mints the folder name from the
+    /// lockfile's name and version and reads no package cache to find the index.
+    CargoRegistry(String),
+}
 
 /// What one resolver read from a workspace's manifests and lockfiles.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContextAnswer {
     /// The packages the resolver's manifests and lockfiles state.
     pub entries: Vec<PackageContextEntry>,
+    /// Where the pinned packages are installed on this machine, for those the answer
+    /// could locate.
+    pub install_folders: Vec<InstallFolder>,
     /// The visible workspace paths the resolver read. A change to any of them makes the
     /// answer stale.
     pub inputs: Vec<ProjectPath>,
@@ -32,8 +71,8 @@ pub struct ContextAnswer {
     pub degradations: Vec<String>,
 }
 
-/// The packages one workspace depends on, as its manifests, lockfiles, and the
-/// `[dependencies]` `packages` list state them.
+/// The packages one workspace depends on, as its manifests, lockfiles, the `[dependencies]`
+/// `packages` list, and its languages' standard libraries state them.
 ///
 /// Entries carry an exact version a lockfile pins or a requirement a manifest declares,
 /// never both and never neither. Two entries sharing a package manager, a name, and a
@@ -43,8 +82,10 @@ pub struct ContextAnswer {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DependencyContext {
     entries: Vec<PackageContextEntry>,
+    install_folders: Vec<InstallFolder>,
     inputs: BTreeSet<ProjectPath>,
     degradations: Vec<Degradation>,
+    libraries: BTreeSet<StandardLibrary>,
 }
 
 impl DependencyContext {
@@ -54,25 +95,26 @@ impl DependencyContext {
         &self.entries
     }
 
-    /// Clones this context while retaining entries accepted by `keep`.
-    ///
-    /// Inputs and degradations stay attached to the filtered context, so a fallback read keeps
-    /// the evidence that produced the original package set.
-    #[must_use]
-    pub fn filter_entries<F>(&self, mut keep: F) -> Self
-    where
-        F: FnMut(&PackageContextEntry) -> bool,
-    {
-        Self {
-            entries: self
-                .entries
-                .iter()
-                .filter(|entry| keep(entry))
-                .cloned()
-                .collect(),
-            inputs: self.inputs.clone(),
-            degradations: self.degradations.clone(),
-        }
+    /// The entries no public registry serves, in manager, name, then selector order.
+    pub fn unavailable_entries(&self) -> impl Iterator<Item = &PackageContextEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.availability != PackageAvailability::Canonical)
+    }
+
+    /// Where the packages this context names are installed on this machine, in package
+    /// then location order. The request to the global API never carries them.
+    pub fn install_folders(&self) -> impl Iterator<Item = &InstallFolder> {
+        self.install_folders.iter()
+    }
+
+    /// Takes `folders` beside the ones held, keeping each folder once, in package then
+    /// location order.
+    fn locate(&mut self, folders: impl IntoIterator<Item = InstallFolder>) {
+        self.install_folders.extend(folders);
+        self.install_folders
+            .sort_by(|left, right| install_order(left).cmp(&install_order(right)));
+        self.install_folders.dedup();
     }
 
     /// The visible workspace paths the context was read from, in path order.
@@ -86,7 +128,15 @@ impl DependencyContext {
         self.inputs.contains(path)
     }
 
-    /// Everything the resolvers could not read, in resolver order.
+    /// The standard libraries the workspace's languages named when the context was
+    /// read. A change that adds a language's first visible path or removes its last
+    /// makes the context stale.
+    #[must_use]
+    pub const fn standard_libraries(&self) -> &BTreeSet<StandardLibrary> {
+        &self.libraries
+    }
+
+    /// Everything the resolvers and probes could not read, in resolver order.
     #[must_use]
     pub fn degradations(&self) -> &[Degradation] {
         &self.degradations
@@ -96,6 +146,70 @@ impl DependencyContext {
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         !self.degradations.is_empty()
+    }
+
+    /// This context as one read sends it: every entry held for a package `requested`
+    /// names leaves, and each requested package joins as the entry
+    /// [`RequestedPackage::context_entry`] builds.
+    ///
+    /// A requested version therefore replaces every version the workspace pins for that
+    /// package, a `path` or `git` entry included, and a package the workspace lacks is
+    /// added. Two identical requested entries merge into one. The work is linear in the
+    /// entries held plus the ones requested, so the result may pass [`PACKAGES_MAX`] by
+    /// the requested count alone; the global API client refuses a request past its
+    /// entry bound, and the read then carries the typed global warning.
+    #[must_use]
+    pub fn with_requested(&self, requested: &[RequestedPackage]) -> Self {
+        let named: BTreeSet<(&str, &str)> = requested
+            .iter()
+            .map(|package| (package.manager.as_str(), package.name.as_str()))
+            .collect();
+        let mut entries: Vec<PackageContextEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| !named.contains(&(entry.manager.as_str(), entry.name.as_str())))
+            .cloned()
+            .chain(requested.iter().map(RequestedPackage::context_entry))
+            .collect();
+        entries.sort();
+        entries.dedup();
+        Self {
+            entries,
+            install_folders: self.install_folders.clone(),
+            inputs: self.inputs.clone(),
+            degradations: self.degradations.clone(),
+            libraries: self.libraries.clone(),
+        }
+    }
+
+    /// Adds the standard library entries, one per package: an entry whose manager and
+    /// name the context already holds is left out, so a lockfile's exact `typescript`
+    /// wins over the requirement `>=0`, and the service never meets two entries for
+    /// one package. Past [`PACKAGES_MAX`] an entry is dropped like any other.
+    pub fn add_standard_libraries(&mut self, answer: StandardLibraryAnswer) {
+        let held: BTreeSet<(String, String)> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.manager.clone(), entry.name.clone()))
+            .collect();
+        for entry in answer.entries {
+            if held.contains(&(entry.manager.clone(), entry.name.clone()))
+                || self.entries.len() >= PACKAGES_MAX
+            {
+                continue;
+            }
+            self.entries.push(entry);
+        }
+        self.entries.sort();
+        self.locate(answer.install_folders);
+        self.inputs.extend(answer.inputs);
+        self.libraries.extend(answer.libraries);
+        self.degradations.extend(
+            answer
+                .degradations
+                .into_iter()
+                .map(|(resolver, reason)| Degradation { resolver, reason }),
+        );
     }
 }
 
@@ -133,6 +247,17 @@ pub fn resolve_context(
     merge.build()
 }
 
+/// The order install folders keep: manager, name, version, then location.
+fn install_order(folder: &InstallFolder) -> (&str, &str, &str, &InstallLocation) {
+    let package = &folder.package;
+    (
+        &package.manager,
+        &package.name,
+        &package.version,
+        &folder.location,
+    )
+}
+
 /// The separators that open a version's pre-release and build metadata.
 const VERSION_METADATA: [char; 2] = ['-', '+'];
 /// The release numbers a whole version states: major, minor, and patch.
@@ -159,6 +284,7 @@ type EntryKey = (String, String, Option<String>, Option<String>);
 #[derive(Default)]
 struct ContextMerge {
     entries: BTreeMap<EntryKey, PackageContextEntry>,
+    install_folders: Vec<InstallFolder>,
     inputs: BTreeSet<ProjectPath>,
     degradations: Vec<Degradation>,
 }
@@ -194,6 +320,7 @@ impl ContextMerge {
                 dropped_count += 1;
             }
         }
+        self.install_folders.extend(answer.install_folders);
         self.inputs.extend(answer.inputs);
         self.degradations.extend(
             answer
@@ -248,22 +375,24 @@ impl ContextMerge {
                     || !pinned.contains(&(entry.manager.clone(), entry.name.clone()))
             })
             .collect();
-        DependencyContext {
+        let mut context = DependencyContext {
             entries,
+            install_folders: Vec::new(),
             inputs: self.inputs,
             degradations: self.degradations,
-        }
+            libraries: BTreeSet::new(),
+        };
+        context.locate(self.install_folders);
+        context
     }
 }
 
 #[cfg(test)]
 mod tests {
     use rift_protocol::dependencies::PackageSelector;
-    use rift_protocol::read::Language;
 
     use super::*;
     use crate::fixture::RecordedInspector;
-    use crate::resolver::ResolutionRequest;
 
     const ROOT: &str = "/workspace";
 
@@ -285,7 +414,7 @@ mod tests {
             "probe",
             name,
             PackageSelector::Requirement(requirement.to_owned()),
-            PackageAvailability::LocalOnly,
+            PackageAvailability::Path,
         )
     }
 
@@ -310,27 +439,8 @@ mod tests {
             ResolverName::Cargo
         }
 
-        fn manager(&self) -> &'static str {
-            "probe"
-        }
-
-        fn language(&self) -> Language {
-            Language {
-                name: "rust".to_owned(),
-                dialect: None,
-            }
-        }
-
         fn manifest_file_name(&self) -> &'static str {
             "probe.toml"
-        }
-
-        fn resolve(
-            &self,
-            _request: &ResolutionRequest<'_>,
-            _inspector: &mut dyn crate::Inspector,
-        ) -> crate::Resolution {
-            crate::Resolution::default()
         }
 
         fn context(
@@ -340,6 +450,24 @@ mod tests {
         ) -> ContextAnswer {
             ContextAnswer {
                 entries: self.entries.clone(),
+                install_folders: self
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let version = entry.version.clone()?;
+                        Some(InstallFolder {
+                            package: PackageIdentity {
+                                manager: entry.manager.clone(),
+                                name: entry.name.clone(),
+                                version,
+                            },
+                            location: InstallLocation::Path(PathBuf::from(format!(
+                                "/installed/{}",
+                                entry.name
+                            ))),
+                        })
+                    })
+                    .collect(),
                 inputs: request.manifests.to_vec(),
                 degradations: self.degradations.clone(),
             }
@@ -478,22 +606,35 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_entries_preserves_inputs_and_degradations() {
+    fn test_install_folders_merge_off_the_entries_and_unavailable_entries_filter() {
         let resolver = ProbeResolver {
-            entries: vec![pinned("serde", "1.0.228"), declared("itoa", "^1")],
-            degradations: vec!["probe.toml: incomplete".to_owned()],
+            entries: vec![
+                pinned("serde", "1.0.228"),
+                pinned("serde", "1.0.228"),
+                declared("helper", "^0.1"),
+            ],
+            degradations: Vec::new(),
         };
+
         let context = resolve(&resolver, &[]);
 
-        let filtered = context.filter_entries(|entry| entry.name == "serde");
-
-        assert_eq!(filtered.entries().len(), 1);
-        assert_eq!(filtered.entries()[0].name, "serde");
+        let folders: Vec<(&str, &InstallLocation)> = context
+            .install_folders()
+            .map(|folder| (folder.package.name.as_str(), &folder.location))
+            .collect();
         assert_eq!(
-            filtered.inputs().collect::<Vec<_>>(),
-            [&project("probe.toml")]
+            folders,
+            [(
+                "serde",
+                &InstallLocation::Path(PathBuf::from("/installed/serde"))
+            )],
+            "one folder per package, and a declared requirement locates nothing"
         );
-        assert_eq!(filtered.degradations(), context.degradations());
+        let unavailable: Vec<&str> = context
+            .unavailable_entries()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(unavailable, ["helper"]);
     }
 
     /// The configured list and the merged context share one ceiling. An operator who
@@ -557,5 +698,174 @@ mod tests {
         assert!(context.entries().is_empty());
         assert_eq!(context.inputs().count(), 0);
         assert!(!context.is_degraded());
+    }
+
+    #[test]
+    fn test_standard_library_entries_leave_a_package_the_lockfile_names() {
+        let lockfile_typescript = PackageContextEntry::new(
+            "npm",
+            "typescript",
+            PackageSelector::Version("5.9.3".to_owned()),
+            PackageAvailability::Canonical,
+        );
+        let resolver = ProbeResolver {
+            entries: vec![lockfile_typescript.clone()],
+            degradations: Vec::new(),
+        };
+        let mut context = resolve(&resolver, &[]);
+        let mut inputs = RecordedInspector::default();
+        let answer = crate::stdlib::standard_library_answer(
+            &crate::stdlib::StandardLibraryRequest {
+                root: Path::new(ROOT),
+                libraries: &[crate::StandardLibrary::Node, crate::StandardLibrary::Rust],
+                execution: false,
+            },
+            &mut inputs,
+        );
+
+        context.add_standard_libraries(answer.clone());
+        context.add_standard_libraries(answer);
+
+        let keys: Vec<(&str, &str, Option<&str>, Option<&str>)> = context
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.manager.as_str(),
+                    entry.name.as_str(),
+                    entry.version.as_deref(),
+                    entry.requirement.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("npm", "typescript", Some("5.9.3"), None),
+                ("stdlib", "node", None, Some(">=0")),
+                ("stdlib", "rust", None, Some(">=0")),
+            ]
+        );
+        assert!(context.depends_on(&project("rust-toolchain.toml")));
+        assert!(context.depends_on(&project(".nvmrc")));
+    }
+
+    fn requested(name: &str, version: Option<&str>) -> RequestedPackage {
+        RequestedPackage {
+            manager: "probe".to_owned(),
+            name: name.to_owned(),
+            version: version.map(str::to_owned),
+        }
+    }
+
+    /// Each entry as `name@selector availability`, in context order.
+    fn spelled(context: &DependencyContext) -> Vec<String> {
+        context
+            .entries()
+            .iter()
+            .map(|entry| {
+                let selector = entry
+                    .version
+                    .as_deref()
+                    .or(entry.requirement.as_deref())
+                    .unwrap_or_default();
+                format!("{}@{selector} {:?}", entry.name, entry.availability)
+            })
+            .collect()
+    }
+
+    /// A requested version replaces every version the context holds for the package, a
+    /// path entry included, and the entries of the packages the request leaves alone
+    /// stand as the context read them.
+    #[test]
+    fn test_a_requested_version_replaces_every_entry_of_its_package() {
+        let resolver = ProbeResolver {
+            entries: vec![
+                pinned("serde", "1.0.228"),
+                pinned("serde", "1.0.100"),
+                declared("helper", "^0.1"),
+                pinned("tokio", "1.53.1"),
+            ],
+            degradations: vec!["one manifest was unreadable".to_owned()],
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("serde", Some("1.0.200")),
+            requested("helper", Some("0.1.4")),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            [
+                "helper@0.1.4 Canonical",
+                "serde@1.0.200 Canonical",
+                "tokio@1.53.1 Canonical"
+            ]
+        );
+        assert_eq!(read.unavailable_entries().count(), 0);
+        assert_eq!(read.degradations(), context.degradations());
+        assert_eq!(
+            read.install_folders().collect::<Vec<_>>(),
+            context.install_folders().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spelled(&context),
+            [
+                "helper@^0.1 Path",
+                "serde@1.0.100 Canonical",
+                "serde@1.0.228 Canonical",
+                "tokio@1.53.1 Canonical"
+            ],
+            "the snapshot's own context is left as it was"
+        );
+    }
+
+    /// A package the context lacks joins, an entry without a version asks for `>=0`, and
+    /// two identical requested entries merge into one.
+    #[test]
+    fn test_a_requested_package_the_context_lacks_is_added() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("serde", "1.0.228")],
+            degradations: Vec::new(),
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("anyhow", None),
+            requested("itoa", Some("1.0.17")),
+            requested("itoa", Some("1.0.17")),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            [
+                "anyhow@>=0 Canonical",
+                "itoa@1.0.17 Canonical",
+                "serde@1.0.228 Canonical"
+            ]
+        );
+    }
+
+    /// Two requested versions of one package both go out, and an empty request leaves
+    /// the context as it was.
+    #[test]
+    fn test_requested_versions_of_one_package_each_go_out() {
+        let resolver = ProbeResolver {
+            entries: vec![pinned("serde", "1.0.228")],
+            degradations: Vec::new(),
+        };
+        let context = resolve(&resolver, &[]);
+
+        let read = context.with_requested(&[
+            requested("serde", Some("1.0.200")),
+            requested("serde", None),
+        ]);
+
+        assert_eq!(
+            spelled(&read),
+            ["serde@>=0 Canonical", "serde@1.0.200 Canonical"]
+        );
+        assert_eq!(context.with_requested(&[]), context);
     }
 }

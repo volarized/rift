@@ -1,10 +1,10 @@
 //! The contract every Rift index answers under.
 //!
 //! One reader runs one ranking input for one query phase and returns ordered
-//! identities. The project index, a local package index, an in-memory fixture,
-//! and a later database-backed global index implement the same three methods,
-//! so the coordination that runs precise before broad across selected indexes
-//! is written once. Storage-specific rows stay behind the implementation.
+//! identities. The project index and a later database-backed global index
+//! implement the same three methods, so the coordination that runs precise
+//! before broad across selected indexes is written once. Storage-specific rows
+//! stay behind the implementation.
 
 use std::pin::Pin;
 

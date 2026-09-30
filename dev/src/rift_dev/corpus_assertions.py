@@ -30,8 +30,7 @@ PROBE_PATH = "rift_corpus_probe.rs"
 PROBE_SOURCE = "pub fn corpus_probe(){}\n"
 MAP_MODULES_MAX = 100_000
 # The span startup opens while it reads the manifests and lockfiles, and the warning each
-# unread input is reported under. The catalog resolvers keep `dependency.resolve`, which no
-# startup opens: a package read is what runs them.
+# unread input is reported under.
 CONTEXT_SPAN = "dependency.context"
 CONTEXT_DEGRADED = "dependency context degraded"
 

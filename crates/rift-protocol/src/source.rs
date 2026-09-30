@@ -151,7 +151,7 @@ fn default_source_declarations() -> u64 {
 
 /// The first pattern in `patterns` breaking [`PathPattern`]'s forward-slash-only contract,
 /// patterns in list order.
-fn pattern_list_violation(
+pub(crate) fn pattern_list_violation(
     field: &'static str,
     patterns: &[PathPattern],
 ) -> Option<ConfigurationViolation> {

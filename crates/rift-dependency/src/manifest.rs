@@ -1,81 +1,29 @@
-//! What every lockfile-driven resolver shares about manifests and answers.
+//! What every lockfile-driven resolver shares about manifests.
 //!
 //! A resolver receives its manifests as project paths. From each it derives the
 //! directory the manifest stands in, the files beside it, and whether a listed
-//! manifest in an ancestor directory covers it; reads each of those files within
-//! [`LOCKFILE_BYTES_MAX`]; and assembles its catalog answer through a
-//! [`ResolutionBuilder`] that stops at [`PACKAGES_MAX`]. Each format's model and parse
-//! step stay with the resolver that owns the format: each maps its parser's error to
+//! manifest in an ancestor directory covers it, and reads each of those files within
+//! [`LOCKFILE_BYTES_MAX`]. Each format's model and parse step stay with the resolver
+//! that owns the format: each maps its parser's error to
 //! [`StaticFileFailure::unparsable`].
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use rift_protocol::read::{PackageIdentity, ProjectPath};
+use rift_protocol::read::ProjectPath;
 
-use crate::catalog::{CatalogEntry, Resolution};
-use crate::resolver::{
-    FileObservation, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, PACKAGES_MAX, StaticInputs,
-};
+use crate::resolver::{FileObservation, LOCKFILE_BYTES_MAX, MANIFESTS_MAX, StaticInputs};
 
 /// The separator between the segments of a project path.
 const PATH_SEPARATOR: char = '/';
 
-/// One resolution being assembled, refusing entries past `PACKAGES_MAX` and counting them.
-#[derive(Default)]
-pub(crate) struct ResolutionBuilder {
-    resolution: Resolution,
-    dropped_count: usize,
-}
-
-impl ResolutionBuilder {
-    /// Records one visible workspace path the answer depends on.
-    pub(crate) fn input(&mut self, path: ProjectPath) {
-        self.resolution.inputs.push(path);
-    }
-
-    /// Records one thing the resolver could not do.
-    pub(crate) fn degradation(&mut self, reason: String) {
-        self.resolution.degradations.push(reason);
-    }
-
-    /// Takes one entry, or counts it dropped once `PACKAGES_MAX` entries stand.
-    pub(crate) fn entry(&mut self, entry: CatalogEntry) {
-        if self.resolution.entries.len() < PACKAGES_MAX {
-            self.resolution.entries.push(entry);
-        } else {
-            self.dropped_count += 1;
-        }
-    }
-
-    /// Takes every entry in order, under the same bound as `entry`.
-    pub(crate) fn entries(&mut self, entries: impl IntoIterator<Item = CatalogEntry>) {
-        for entry in entries {
-            self.entry(entry);
-        }
-    }
-
-    /// The finished resolution: entries in identity order, the drop reported last.
-    #[must_use]
-    pub(crate) fn build(mut self) -> Resolution {
-        if self.dropped_count > 0 {
-            let total = self.resolution.entries.len() + self.dropped_count;
-            self.degradation(format!(
-                "{} of {total} packages were not cataloged: at most {PACKAGES_MAX} are \
-                 cataloged per workspace",
-                self.dropped_count
-            ));
-        }
-        self.resolution.entries.sort_by(|left, right| {
-            identity_order(left.identity()).cmp(&identity_order(right.identity()))
-        });
-        self.resolution
-    }
-}
-
-/// The order entries sort in: manager, then name, then version.
-fn identity_order(identity: &PackageIdentity) -> (&str, &str, &str) {
-    (&identity.manager, &identity.name, &identity.version)
+/// The last segment of a project path: the file name a resolver claims manifests by.
+#[must_use]
+pub(crate) fn file_name(path: &ProjectPath) -> &str {
+    path.0
+        .rsplit(PATH_SEPARATOR)
+        .next()
+        .unwrap_or(path.0.as_str())
 }
 
 /// The manifests one resolver reads, and what the manifest bound left out.
@@ -89,15 +37,15 @@ pub(crate) struct ClaimedManifests {
 
 /// The visible paths carrying `manifest_file_name`, cut to [`MANIFESTS_MAX`].
 ///
-/// Every pass over a workspace claims manifests the same way, so the catalog and the
-/// static context read one list and report one drop.
+/// Every resolver claims its manifests the same way, so the static context reads one
+/// list per resolver and reports one drop.
 pub(crate) fn claimed_manifests(
     visible: &[ProjectPath],
     manifest_file_name: &str,
 ) -> ClaimedManifests {
     let mut manifests: Vec<ProjectPath> = visible
         .iter()
-        .filter(|path| crate::catalog::file_name(path) == manifest_file_name)
+        .filter(|path| file_name(path) == manifest_file_name)
         .cloned()
         .collect();
     let claimed_count = manifests.len();
@@ -165,6 +113,54 @@ pub(crate) fn file_beside(manifest: &ProjectPath, file_name: &str) -> ProjectPat
         "" => ProjectPath(file_name.to_owned()),
         directory => ProjectPath(format!("{directory}{PATH_SEPARATOR}{file_name}")),
     }
+}
+
+/// The workspace root, lexical and resolved, that a path dependency compares against.
+///
+/// A path dependency inside the root is project source, which the local index already
+/// covers, so no resolver reports it.
+pub(crate) struct WorkspacePaths {
+    root: PathBuf,
+    resolved_root: Option<PathBuf>,
+}
+
+impl WorkspacePaths {
+    pub(crate) fn new(root: &Path, inputs: &mut dyn StaticInputs) -> Self {
+        Self {
+            root: lexical(root),
+            resolved_root: inputs.canonical_path(root),
+        }
+    }
+
+    /// Whether `path` lies below the root.
+    ///
+    /// Where the inputs resolve links, the resolved target decides, since the local
+    /// index follows no symlink: a link inside the root pointing outside it is not
+    /// project source, and neither is a path where nothing stands. Otherwise the
+    /// lexical path decides.
+    pub(crate) fn contains(&self, path: &Path, inputs: &mut dyn StaticInputs) -> bool {
+        match &self.resolved_root {
+            Some(root) => inputs
+                .canonical_path(path)
+                .is_some_and(|resolved| resolved.starts_with(root)),
+            None => lexical(path).starts_with(&self.root),
+        }
+    }
+}
+
+/// `path` with `.` dropped and each `..` taking its parent away, reading no link.
+fn lexical(path: &Path) -> PathBuf {
+    let mut kept = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                kept.pop();
+            }
+            other => kept.push(other),
+        }
+    }
+    kept
 }
 
 /// Why one static file beside a manifest answered nothing: which file, and what went
@@ -238,27 +234,57 @@ pub(crate) fn read_static_file(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use rift_protocol::read::Language;
-
     use super::*;
-    use crate::catalog::package_identity;
     use crate::fixture::RecordedInspector;
 
     fn project(path: &str) -> ProjectPath {
         ProjectPath(path.to_owned())
     }
 
-    fn entry(manager: &str, name: &str, version: &str) -> CatalogEntry {
-        let language = Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        };
-        CatalogEntry::dependency(
-            package_identity(manager, name, version),
-            language,
-            None,
-            false,
-        )
+    /// `count` claimed manifests, one per directory, beside one file no resolver claims.
+    fn probe_manifests(count: usize) -> Vec<ProjectPath> {
+        std::iter::once(project("src/lib.rs"))
+            .chain((0..count).map(|index| project(&format!("tools/{index:04}/probe.toml"))))
+            .collect()
+    }
+
+    #[test]
+    fn test_claimed_manifests_match_the_file_name_at_any_depth() {
+        let visible = [
+            project("probe.toml"),
+            project("src/lib.rs"),
+            project("tools/probe.toml"),
+            project("tools/probe.toml.bak"),
+        ];
+        let claimed = claimed_manifests(&visible, "probe.toml");
+        assert_eq!(
+            claimed.manifests,
+            [project("probe.toml"), project("tools/probe.toml")]
+        );
+        assert_eq!(claimed.dropped, None);
+        assert_eq!(file_name(&project("tools/probe.toml")), "probe.toml");
+        assert_eq!(file_name(&project("probe.toml")), "probe.toml");
+    }
+
+    #[test]
+    fn test_claimed_manifests_read_exactly_manifests_max_without_a_drop() {
+        let claimed = claimed_manifests(&probe_manifests(MANIFESTS_MAX), "probe.toml");
+        assert_eq!(claimed.manifests.len(), MANIFESTS_MAX);
+        assert_eq!(claimed.dropped, None);
+    }
+
+    #[test]
+    fn test_claimed_manifests_drop_the_manifest_past_the_bound_and_report_it() {
+        let claimed = claimed_manifests(&probe_manifests(MANIFESTS_MAX + 1), "probe.toml");
+        assert_eq!(claimed.manifests.len(), MANIFESTS_MAX);
+        assert_eq!(
+            claimed.dropped,
+            Some(format!(
+                "1 of {} probe.toml manifests were not read: at most {MANIFESTS_MAX} are read \
+                 per workspace",
+                MANIFESTS_MAX + 1
+            ))
+        );
     }
 
     #[test]
@@ -317,35 +343,17 @@ mod tests {
         );
     }
 
+    /// The lexical form drops a leading `.`, which `Path::components` keeps, and each
+    /// `..` takes its parent away.
     #[test]
-    fn test_build_sorts_by_identity_and_reports_entries_dropped_past_packages_max() {
-        let mut answer = ResolutionBuilder::default();
-        answer.entry(entry("pypi", "typer", "0.27.1"));
-        answer.entry(entry("cargo", "serde", "1.0.228"));
-        answer.entries(
-            (0..PACKAGES_MAX - 2).map(|index| entry("npm", &format!("pkg-{index:05}"), "1.0.0")),
-        );
-        answer.entry(entry("cargo", "dropped", "0.0.0"));
-
-        let resolution = answer.build();
-
-        assert_eq!(resolution.entries.len(), PACKAGES_MAX);
+    fn test_the_lexical_form_drops_current_and_parent_components() {
         assert_eq!(
-            resolution.entries[0].identity().name,
-            "serde",
-            "cargo sorts first, and the dropped cargo entry never joined"
+            lexical(Path::new("./packages/../api/./src")),
+            PathBuf::from("api/src")
         );
         assert_eq!(
-            resolution.entries[PACKAGES_MAX - 1].identity().name,
-            "typer"
-        );
-        assert_eq!(
-            resolution.degradations,
-            [format!(
-                "1 of {} packages were not cataloged: at most {PACKAGES_MAX} are cataloged per \
-                 workspace",
-                PACKAGES_MAX + 1
-            )]
+            lexical(Path::new("/workspace/crates/../../outside")),
+            PathBuf::from("/outside")
         );
     }
 

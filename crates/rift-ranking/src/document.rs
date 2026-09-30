@@ -1,9 +1,10 @@
 //! One searchable document, the fields it may carry, and the corpus revision
 //! that states what those fields mean.
 //!
-//! Project search, local package search, and a later global reader publish the
-//! same shape. A provider that starts emitting signatures fills a field that
-//! was already declared here; it does not introduce a second document type.
+//! Project search publishes this shape, and a package document takes the same
+//! one, addressed by its source unit. A provider that starts emitting signatures
+//! fills a field that was already declared here; it does not introduce a second
+//! document type.
 //!
 //! Absent facts stay absent. Nothing substitutes declaration source into the
 //! signature or documentation field, because a reader that weighs those fields
@@ -39,9 +40,9 @@ pub const DOCUMENTATION_BYTES_MAX: usize = 16_384;
 /// mixes languages whose identifiers stem badly, and the retrieval gate has no
 /// measurement supporting the change yet.
 ///
-/// Diacritic folding is off as well, so the in-memory adapter can tokenize the
-/// same text the same way without carrying a Unicode folding table of its own.
-/// A reader that folded on one side and not the other would rank the same
+/// Diacritic folding is off as well, so [`tokenize`](crate::tokenize) splits
+/// the same text the same way without carrying a Unicode folding table of its
+/// own. A reader that folded on one side and not the other would rank the same
 /// publication two ways.
 pub const CORPUS_TOKENIZER: &str = "unicode61 remove_diacritics 0";
 
@@ -366,14 +367,14 @@ impl std::fmt::Display for DocumentIdentity {
 /// Where the document's bytes live.
 ///
 /// A project document is addressed by its project-relative path; a package
-/// document is addressed by the source unit the dependency lane minted for it.
+/// document is addressed by the source unit package analysis minted for it.
 /// Neither spelling reaches the ranked text: a host-absolute root must not
 /// change a rank.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocumentLocation {
     /// A path inside the served project.
     Project(ProjectPath),
-    /// One file of a cataloged package.
+    /// One file of a package.
     Unit(SourceUnitId),
 }
 
@@ -447,15 +448,6 @@ impl DocumentFields {
             SearchableField::FileContent => &self.file_content,
         };
         slot.as_deref()
-    }
-
-    /// The fields this document filled.
-    #[must_use]
-    pub fn filled(&self) -> FieldSet {
-        SearchableField::ALL
-            .into_iter()
-            .filter(|field| self.get(*field).is_some())
-            .collect()
     }
 
     /// The digest of the fields this document filled, in declared column
@@ -834,8 +826,11 @@ mod tests {
     #[test]
     fn test_an_empty_field_value_leaves_the_field_absent() {
         let fields = DocumentFields::empty().with(SearchableField::Signature, "");
-        assert_eq!(fields.get(SearchableField::Signature), None);
-        assert!(fields.filled().is_empty());
+        assert!(
+            SearchableField::ALL
+                .into_iter()
+                .all(|field| fields.get(field).is_none())
+        );
     }
 
     #[test]
@@ -857,7 +852,6 @@ mod tests {
         for field in SearchableField::ALL {
             assert_eq!(fields.get(field), Some(field.column()));
         }
-        assert_eq!(fields.filled(), FieldSet::all());
     }
 
     #[test]

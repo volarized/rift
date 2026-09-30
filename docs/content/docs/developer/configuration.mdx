@@ -45,11 +45,20 @@ RIFT_PROVIDERS_SYNTAX_MAX_NODES=5000000 RIFT_PROVIDERS_SYNTAX_MAX_FILE=16mb rift
 - a variable that starts with a table's prefix, such as `RIFT_PROVIDERS_`, and names none of its
   keys fails the same way, listing the variables that table accepts - a misspelled key can't be
   silently ignored
-- the tables whose entries you name, `[languages.<name>]` and `[lsp.<name>]`, have no variables
+- `[lsp.<name>]` entries have no variables, and neither does a `[languages.<name>]` entry for a
+  language Rift doesn't ship
 
 The server reads the variables from the environment of the `rift server start` or `rift mcp`
 that started it. A running server keeps that environment, so a changed variable applies after
 `rift server stop` and the next start.
+
+<VersionBadge version="v0.0.46" />
+
+A `[languages.<name>]` entry for a language Rift ships takes variables too, spelled
+`RIFT_LANGUAGES_<NAME>_<KEY>`: `RIFT_LANGUAGES_PYTHON_STDLIB=false` sets the `stdlib` key of
+`[languages.python]`. A dialect's `:` becomes `_`, so `RIFT_LANGUAGES_TYPESCRIPT_TSX_<KEY>` sets a
+key of `[languages."typescript:tsx"]`, such as `RIFT_LANGUAGES_TYPESCRIPT_TSX_STDLIB`. A variable
+naming a language Rift doesn't ship fails with `configuration_invalid`, as a misspelled key does.
 
 ## Server
 
@@ -170,40 +179,75 @@ reach one such file on demand, through the request-side `force_include` override
 `paths` selector. The two differ in reach and lifetime: the request field pulls at most 256 files
 into one answer, while this table's `force_include` puts them in the index every read serves from.
 
+## Documentation
+
+<VersionBadge version="v0.0.46" />
+
+`documentation` describes which documentation files the index collects for
+[`search`](/docs/mcp#tool-search) with `target: "documentation"` and for the `documentation`
+field of a [`get_symbol`](/docs/mcp#tool-get_symbol) hit. By default the index collects every
+visible Markdown, MDX, reStructuredText, and notebook file, and the `.txt` files
+`[search.text].include` selects, except:
+
+- change logs, licenses, and codes of conduct, wherever they sit: `CHANGELOG.md`,
+  `CHANGELOG.mdx`, `LICENSE.md`, and `CODE_OF_CONDUCT.md`, each also spelled in lower case
+- archived and superseded copies: any folder named `old`, `docs/old`, and any folder whose name
+  holds `archive`, `deprecated`, `legacy`, `previous`, `outdated`, or `superseded`
+- translations: language folders below a root `i18n` folder, such as `i18n/zh-cn` or
+  `i18n/fr`, and folders named `zh-cn`, `zh-tw`, `zh-hk`, `zh-mo`, or `zh-sg`
+
+The table overrides that default:
+
+```toml
+[documentation]
+enabled = true
+exclude = []
+force_include = []
+```
+
+- `enabled` defaults to `true`; `false` collects no documentation file, while the documentation
+  comments attached to declarations stay
+- `exclude` leaves out what its globs match beside the default exclusions, at most 512 patterns
+- `force_include` collects what a default exclusion leaves out, at most 512 patterns; a match
+  `exclude` also names stays out
+
+The patterns match project-relative paths the way [`[source]`](#source) patterns do. A workspace
+whose change log belongs in search adds it back:
+
+```toml
+[documentation]
+force_include = ["CHANGELOG.md"]
+```
+
+A change to the table rebuilds the index, and the `RIFT_DOCUMENTATION_ENABLED`,
+`RIFT_DOCUMENTATION_EXCLUDE`, and `RIFT_DOCUMENTATION_FORCE_INCLUDE` variables override it like
+any other key.
+
 ## Dependencies
 
 <VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-`dependencies` shapes the [package index](/docs/developer/architecture#package-index): how
-the catalog is resolved, which packages you name beside the ones the workspace's own files state,
-and the bounds the index reads and holds under. The keys are shown at their defaults:
+`dependencies` shapes the [dependency context](/docs/developer/architecture#dependency-context) a
+`global` or `all` read sends to the global index: which packages you name beside the ones the
+workspace's own files state, and whether a standard library version probe runs. The keys are
+shown at their defaults:
 
 ```toml
 [dependencies]
 resolution = "auto"
 packages = []
-package_size = "4mb"
-index_size = "256mb"
-package_files = 2000
 command_timeout = "2m"
 ```
 
-- `resolution` selects how the resolvers reach a package graph: `auto` runs each toolchain and
-  answers from the lockfile when the run fails; `static` never runs a toolchain, so every
-  resolver answers from its lockfile and the machine's package cache alone. The Rust standard
-  library is cataloged from `rustc`, so under `static` it has no entry and the answer reports
-  the degradation
+- `resolution` selects whether a standard library version probe runs: `auto` runs
+  `rustc --version`, and `node --version` when no Node.js pin names a version, in the workspace
+  root; `static` runs no program, so every version comes from the pins and project files alone,
+  or goes out as the requirement `>=0`
 - `packages` names packages beside the ones the workspace's manifests and lockfiles state, at
   most 20000 of them. Each entry carries `manager`, `name`, and exactly one of `version` and
   `requirement`; an entry naming both, or neither, is refused
-- `package_size` bounds the selected source one package may hold, 64kb to 1gb; a package past
-  it is skipped
-- `index_size` bounds what every indexed package holds together, 1mb to 16gb; a package that
-  would cross it is skipped
-- `package_files` bounds the files one package's selection may hold, 1 to 100000; a package
-  past it is skipped
-- `command_timeout` bounds one toolchain run - `cargo metadata`, `rustc --print sysroot` - 1s
-  to 1h; a run past it is killed and the resolver answers from its static inputs
+- `command_timeout` bounds one version probe, 1s to 1h; a probe past it is killed and the entry
+  goes out with its static reading
 
 A configured entry looks like this:
 
@@ -218,9 +262,6 @@ manager = "npm"
 name = "typescript"
 requirement = "^5.9.0"
 ```
-
-A change to `package_size`, `index_size`, or `package_files` analyzes every package again on the
-next package read: each package the package index holds was read under the old bounds.
 
 ## Global
 
@@ -243,8 +284,8 @@ resolution_ttl = "15m"
 failure_ttl = "30s"
 ```
 
-- `enabled` defaults to `true`; `false` keeps package reads local and reports
-  `global_access_disabled` on package-scope reads
+- `enabled` defaults to `true`; `false` sends no package read to the global API, so a
+  package-scope read answers project hits alone and reports `global_access_disabled`
 - `endpoint` defaults to `https://api.volar.sh/rift/rest`; it must be an absolute base URL without
   user information, query, fragment, or trailing slash
 - `token_env` defaults to `RIFT_API_TOKEN` and names the environment variable holding the optional
@@ -264,15 +305,15 @@ the client sends a request, and the token never enters logs, errors, metrics, or
 The client does not contact the endpoint at server startup. A `local` read and a file-only search
 also make no global request. A connection failure, timeout, retry exhaustion, authentication
 failure, invalid response, or non-success response marks global access unavailable for
-`failure_ttl`; the affected package read then uses local indexing and reports a typed warning with
-the failure class and fallback counts.
+`failure_ttl`; the affected package read then answers the project hits it has and reports a
+typed warning with the failure class.
 A valid remote page keeps its items and reports each bounded service condition as
 `global_page_warning`.
 
-A valid resolution sends available packages to the global API and sends missing or local-only
-packages to local indexing. A missing exact package reports `package_absent`; a missing declared
-requirement reports `package_requirement_absent`; a package that local indexing cannot serve
-reports `package_unavailable`.
+A valid resolution answers package reads from the global index. A missing exact package reports
+`package_absent`, and a missing declared requirement reports `package_requirement_absent`. A
+package no public registry serves - a path outside the workspace, a git repository, a private
+registry, or a URL - never reaches the global API and reports `package_unavailable`.
 
 ## Languages and LSP
 
@@ -318,6 +359,24 @@ published revision keeps serving.
 A visible file no language claims remains available to generic reads, and joins lexical search as
 plain text when `[search.text].include` selects it. So does a file whose entry is disabled, or
 whose language ships no grammar: what those entries drop is syntax analysis, not the file.
+
+<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
+
+`stdlib` decides whether the [dependency context](/docs/developer/architecture#standard-libraries)
+names the language's standard library, so a `global` or `all` read can answer for it:
+`stdlib/rust` for `rust`, `stdlib/node` and the npm `typescript` package for `javascript`,
+`typescript`, and `typescript:tsx`, and `stdlib/python` for `python`. It defaults to `true`. A
+Rust repository whose Python is a few build scripts can leave Python's standard library out of
+package reads:
+
+```toml
+[languages.python]
+stdlib = false
+```
+
+A library stays in the context while any language the workspace uses that names it keeps the key
+on. A repository holding `.ts` and `.js` files therefore still names `stdlib/node` when only
+`[languages.typescript]` sets `stdlib = false`, because `javascript` names it too.
 
 `lsp` accepts an inline process table or the name of one shared top-level process. The inline
 table collapses to one key when the program takes no arguments:
@@ -533,8 +592,9 @@ busy_timeout = "5s"
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `pool_slots` bounds SQLite connections the workspace database may hold open at once, 1 to 16
-- `busy_timeout` bounds how long a connection waits for a database lock held by another
-  process before failing with `SQLITE_BUSY`, 100ms to 30s
+- `busy_timeout` bounds how long a read or write waits for one of those connections to come
+  free, and how long a connection waits for a database lock held by another process before
+  failing with `SQLITE_BUSY`, 100ms to 30s
 
 <VersionBadge
   version="v0.0.16"

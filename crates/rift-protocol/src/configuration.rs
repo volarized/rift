@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::dependencies::DependenciesConfiguration;
+use crate::documentation::DocumentationConfiguration;
 use crate::lock::{SERVER_PORT_FLOOR, SERVER_PORT_MAX, SERVER_PORT_MIN};
 use crate::read::{Language, PathPattern};
 use crate::retry::{
@@ -430,8 +431,11 @@ pub struct WorkspaceConfiguration {
     /// Which files below the workspace root the index and reads consider visible, and how
     /// many files and bytes the index holds together.
     pub source: SourceConfiguration,
-    /// Whether the dependency index runs, how the catalog is resolved, which
-    /// cataloged packages it indexes, and the bounds it indexes under.
+    /// Which documentation files the index collects beside the source.
+    pub documentation: DocumentationConfiguration,
+    /// Whether the dependency context runs the standard library version probes, how long
+    /// one probe may take, and which packages the context carries beside the ones the
+    /// workspace's manifests and lockfiles state.
     pub dependencies: DependenciesConfiguration,
     /// The server's own log records: how many the workspace database keeps,
     /// how many one read returns, and which targets are captured.
@@ -486,6 +490,7 @@ impl WorkspaceConfiguration {
             .or_else(|| self.providers.syntax.violation())
             .or_else(|| self.search.violation())
             .or_else(|| self.source.violation())
+            .or_else(|| self.documentation.violation())
             .or_else(|| self.dependencies.violation())
             .or_else(|| self.logs.violation())
             .or_else(|| languages_violation(&self.languages, &self.lsp))
@@ -1038,8 +1043,9 @@ pub struct SearchConfiguration {
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
-    /// Wall-clock budget one connection waits for a database lock held by
-    /// another process before `SQLITE_BUSY`, 100ms to 30s.
+    /// Wall-clock budget one caller waits for a free pooled connection, and
+    /// one connection waits for a database lock held by another process
+    /// before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
 }
@@ -2267,6 +2273,11 @@ pub struct LanguageConfiguration {
     pub exclude: Vec<PathPattern>,
     /// Whether caller-provided code may execute under this exact language.
     pub execution: bool,
+    /// Whether the package context names this language's standard library: `stdlib/rust`
+    /// for `rust`, `stdlib/node` and npm `typescript` for `javascript`, `typescript`, and
+    /// `typescript:tsx`, and `stdlib/python` for `python`. A library stays in the context
+    /// while any language the workspace uses that names it keeps this key on.
+    pub stdlib: bool,
     /// Inline LSP process or name of one shared process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lsp: Option<LanguageLspConfiguration>,
@@ -2279,6 +2290,7 @@ impl Default for LanguageConfiguration {
             include: None,
             exclude: Vec::new(),
             execution: false,
+            stdlib: true,
             lsp: None,
         }
     }
@@ -3091,7 +3103,6 @@ mod tests {
         assert!(configuration.source.exclude.is_empty());
         assert!(configuration.source.respect_gitignore);
         assert!(configuration.dependencies.packages.is_empty());
-        assert_eq!(configuration.dependencies.package_files, 2_000);
 
         assert!(configuration.languages.is_empty());
         assert!(configuration.lsp.is_empty());
@@ -4815,6 +4826,7 @@ mod tests {
         let history = &definitions["HistoryConfiguration"]["properties"];
         let search = &definitions["SearchConfiguration"]["properties"];
         let source = &definitions["SourceConfiguration"]["properties"];
+        let documentation = &definitions["DocumentationConfiguration"]["properties"];
         let cases = [
             (
                 "num workers min",
@@ -4875,6 +4887,16 @@ mod tests {
                 "source exclude max",
                 &source["exclude"]["maxItems"],
                 json!(SOURCE_PATTERNS_MAX),
+            ),
+            (
+                "documentation exclude max",
+                &documentation["exclude"]["maxItems"],
+                json!(crate::documentation::DOCUMENTATION_PATTERNS_MAX),
+            ),
+            (
+                "documentation force include max",
+                &documentation["force_include"]["maxItems"],
+                json!(crate::documentation::DOCUMENTATION_PATTERNS_MAX),
             ),
         ];
         assert_schema_bounds(&cases);
@@ -5124,7 +5146,17 @@ mod tests {
         assert!(language.include.is_none());
         assert!(language.exclude.is_empty());
         assert!(!language.execution);
+        assert!(
+            language.stdlib,
+            "a language names its standard library by default"
+        );
         assert!(language.lsp.is_none());
+        let off: LanguageConfiguration =
+            serde_json::from_value(json!({"stdlib": false})).expect("language");
+        assert!(!off.stdlib);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(LanguageConfiguration)).expect("schema");
+        assert_eq!(schema["properties"]["stdlib"]["default"], json!(true));
     }
 
     #[test]

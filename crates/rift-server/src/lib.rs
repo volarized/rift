@@ -8,7 +8,6 @@ mod engine;
 mod engine_read;
 mod history;
 mod map;
-mod packages;
 mod process;
 mod read;
 mod search;
@@ -20,7 +19,6 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{EngineReferences, resolve_engine_references, uses_engine_references};
-pub use packages::PackageBranch;
 pub use read::{ReadError, ReadFault, ReadService, wire_digest};
 pub use rift_core::CapturedStream;
 pub use search::StoreAnswer;

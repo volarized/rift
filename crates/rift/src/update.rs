@@ -93,9 +93,9 @@ pub(super) enum UpdateOutcome {
 pub(super) enum OldBinaryCleanup {
     /// Replacement was atomic; no old binary remains.
     Unnecessary,
-    /// A detached process deletes the old binary once this one exits.
+    /// A detached process at `pid` deletes the old binary once this one exits.
     #[cfg_attr(not(windows), allow(dead_code))]
-    Scheduled,
+    Scheduled { pid: u32 },
     /// The old binary still sits at the contained path.
     #[cfg_attr(not(windows), allow(dead_code))]
     Remaining(PathBuf),
@@ -144,7 +144,7 @@ impl fmt::Display for UpdateOutcome {
                 write!(formatter, "✅ Updated Rift from v{from} to v{to}.")?;
                 match cleanup {
                     OldBinaryCleanup::Unnecessary => Ok(()),
-                    OldBinaryCleanup::Scheduled => formatter.write_str(
+                    OldBinaryCleanup::Scheduled { .. } => formatter.write_str(
                         " Rift will automatically clean up the old binary after the update.",
                     ),
                     OldBinaryCleanup::Remaining(path) => write!(
@@ -672,7 +672,7 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
         }
     }
     let expected = expected.ok_or_else(checksum_invalid)?;
-    let actual = sha256(archive)?;
+    let actual = archive_sha256(archive)?;
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(UpdateError::new(
             ErrorName::Cli(CliCode::UpdateChecksumMismatch),
@@ -684,15 +684,25 @@ fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Resul
     Ok(())
 }
 
-fn sha256(path: &Path) -> Result<String, UpdateError> {
+/// The SHA-256 of a downloaded release archive, refusing a file past `RELEASE_ARCHIVE_BYTES_MAX`.
+fn archive_sha256(path: &Path) -> Result<String, UpdateError> {
     require_bounded_file(
         ErrorName::Cli(CliCode::UpdateArchiveInvalid),
         path,
         RELEASE_ARCHIVE_BYTES_MAX,
     )?;
-    let mut file = fs::File::open(path).map_err(checksum_error)?;
+    sha256(path).map_err(checksum_error)
+}
+
+/// The lowercase hex SHA-256 of a file's bytes, streamed from disk.
+///
+/// The work grows with the file's size and nothing here bounds it: the updater
+/// reaches this only through `archive_sha256`, which refuses a file past
+/// `RELEASE_ARCHIVE_BYTES_MAX` first.
+fn sha256(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
-    io::copy(&mut file, &mut digest).map_err(checksum_error)?;
+    io::copy(&mut file, &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
@@ -984,12 +994,10 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .is_ok();
-    Ok(if scheduled {
-        OldBinaryCleanup::Scheduled
-    } else {
-        OldBinaryCleanup::Remaining(backup)
+        .spawn();
+    Ok(match scheduled {
+        Ok(child) => OldBinaryCleanup::Scheduled { pid: child.id() },
+        Err(_) => OldBinaryCleanup::Remaining(backup),
     })
 }
 
@@ -1073,6 +1081,8 @@ mod tests {
     use std::fs;
 
     use semver::Version;
+    #[cfg(windows)]
+    use waitpid_any::WaitHandle;
 
     use super::{
         AtomicPublisher, OldBinaryCleanup, Publisher, ReleaseArtifact, UpdateError, UpdateOutcome,
@@ -1336,7 +1346,7 @@ mod tests {
         for (cleanup, suffix) in [
             (OldBinaryCleanup::Unnecessary, String::new()),
             (
-                OldBinaryCleanup::Scheduled,
+                OldBinaryCleanup::Scheduled { pid: 7 },
                 " Rift will automatically clean up the old binary after the update.".to_owned(),
             ),
             (
@@ -1409,6 +1419,39 @@ mod tests {
         assert!(validate_candidate(&candidate).is_err());
         fs::File::create(&candidate)?.set_len(super::RELEASE_BINARY_BYTES_MAX + 1)?;
         assert!(validate_candidate(&candidate).is_err());
+        Ok(())
+    }
+
+    /// The Windows update test digests a debug test binary larger than `RELEASE_ARCHIVE_BYTES_MAX`.
+    #[test]
+    fn sha256_digests_a_file_that_archive_sha256_refuses() -> TestResult {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Read as _;
+
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("rift-test-binary");
+        let length = super::RELEASE_ARCHIVE_BYTES_MAX + 1;
+        fs::File::create(&executable)?.set_len(length)?;
+        let mut expected = Sha256::new();
+        std::io::copy(&mut std::io::repeat(0).take(length), &mut expected)?;
+        assert_eq!(
+            super::sha256(&executable)?,
+            format!("{:x}", expected.finalize())
+        );
+
+        let refused = super::archive_sha256(&executable)
+            .expect_err("a file past RELEASE_ARCHIVE_BYTES_MAX must be refused");
+        assert_eq!(
+            refused.descriptor().code(),
+            "update_archive_invalid",
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("incorrect size of {length} bytes")),
+            "{refused}"
+        );
         Ok(())
     }
 
@@ -1563,6 +1606,10 @@ mod tests {
     const WINDOWS_UPDATE_TEST_BINARY_ENV: &str = "RIFT_UPDATE_TEST_BINARY";
     #[cfg(windows)]
     const WINDOWS_UPDATE_TEST_CURRENT_ENV: &str = "RIFT_UPDATE_TEST_CURRENT";
+    #[cfg(windows)]
+    const WINDOWS_UPDATE_TEST_CLEANUP_PID_ENV: &str = "RIFT_UPDATE_TEST_CLEANUP_PID";
+    #[cfg(windows)]
+    const WINDOWS_UPDATE_TEST_CLEANUP_ACK_ENV: &str = "RIFT_UPDATE_TEST_CLEANUP_ACK";
 
     #[cfg(windows)]
     async fn windows_wait_update_child(child: &mut tokio::process::Child) -> TestResult {
@@ -1585,8 +1632,160 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_update_io_error(
+        operation: &str,
+        path: &std::path::Path,
+        error: std::io::Error,
+    ) -> std::io::Error {
+        std::io::Error::new(
+            error.kind(),
+            format!("{operation} `{}` failed: {error}", path.display()),
+        )
+    }
+
+    #[cfg(windows)]
+    fn windows_path_exists(path: &std::path::Path, operation: &str) -> std::io::Result<bool> {
+        path.try_exists()
+            .map_err(|error| windows_update_io_error(operation, path, error))
+    }
+
+    /// Whether `directory` lists an entry named `name` without opening it.
+    ///
+    /// A backup marked for deletion stays listed until its last handle closes.
+    /// `Path::try_exists` opens the backup and can return `ERROR_ACCESS_DENIED`.
+    #[cfg(windows)]
+    fn windows_directory_lists(directory: &std::path::Path, name: &str) -> std::io::Result<bool> {
+        let entries = fs::read_dir(directory).map_err(|error| {
+            windows_update_io_error("listing update directory", directory, error)
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                windows_update_io_error("reading update directory", directory, error)
+            })?;
+            if entry.file_name() == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(windows)]
+    async fn windows_cleanup_pid(path: &std::path::Path) -> std::io::Result<u32> {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match fs::read_to_string(path) {
+                    Ok(text) => {
+                        return text.trim().parse::<u32>().map_err(|error| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "reading cleanup process id `{}` failed: {error}",
+                                    path.display()
+                                ),
+                            )
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+                    }
+                    Err(error) => {
+                        return Err(windows_update_io_error(
+                            "reading cleanup process id",
+                            path,
+                            error,
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "waiting for cleanup process id `{}` failed: {error}",
+                    path.display()
+                ),
+            )
+        })?
+    }
+
+    #[cfg(windows)]
+    fn windows_write_cleanup_pid(path: &std::path::Path, pid: u32) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cleanup process id `{}` has no parent directory",
+                    path.display()
+                ),
+            )
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| windows_update_io_error("creating cleanup process id", path, error))?;
+        temporary
+            .write_all(pid.to_string().as_bytes())
+            .map_err(|error| windows_update_io_error("writing cleanup process id", path, error))?;
+        temporary
+            .flush()
+            .map_err(|error| windows_update_io_error("flushing cleanup process id", path, error))?;
+        temporary.persist(path).map_err(|error| {
+            windows_update_io_error("publishing cleanup process id", path, error.error)
+        })?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn windows_wait_for_cleanup_acknowledgement(
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !windows_path_exists(path, "checking cleanup acknowledgement")? {
+                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "waiting for cleanup acknowledgement `{}` failed: {error}",
+                    path.display()
+                ),
+            )
+        })?
+    }
+
+    #[cfg(windows)]
+    fn windows_wait_cleanup_process(
+        mut cleanup: WaitHandle,
+        pid: u32,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        match cleanup.wait_timeout(timeout) {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("waiting for cleanup process {pid} timed out"),
+            )),
+            Err(error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("waiting for cleanup process {pid} failed: {error}"),
+            )),
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
+    // Windows publication failure: https://github.com/volarized/rift/issues/477
+    #[ignore = "https://github.com/volarized/rift/issues/477; requires RIFT_UPDATE_TEST_BINARY"]
     async fn windows_publish_replaces_running_binary_and_cleans_backup() -> TestResult {
         use std::io::Read as _;
         use std::process::Stdio;
@@ -1596,13 +1795,23 @@ mod tests {
             std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
                 .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?,
         )?;
-        let expected_digest = super::sha256(&candidate)?;
+        let expected_digest = super::sha256(&candidate).map_err(|error| {
+            windows_update_io_error("hashing candidate binary", &candidate, error)
+        })?;
         let original = std::env::current_exe()?;
-        assert_ne!(super::sha256(&original)?, expected_digest);
+        assert_ne!(
+            super::sha256(&original).map_err(|error| windows_update_io_error(
+                "hashing test binary",
+                &original,
+                error
+            ))?,
+            expected_digest
+        );
         let directory = tempfile::tempdir()?;
         let current = directory.path().join("rift.exe");
         let prepared = directory.path().join(super::WINDOWS_UPDATE_PREPARED_NAME);
-        let backup = directory.path().join(super::WINDOWS_UPDATE_BACKUP_NAME);
+        let cleanup_pid = directory.path().join("cleanup-pid");
+        let cleanup_acknowledgement = directory.path().join("cleanup-acknowledgement");
         fs::copy(&original, &current)?;
 
         let mut child = tokio::process::Command::new(&current)
@@ -1614,39 +1823,118 @@ mod tests {
             ])
             .env(WINDOWS_UPDATE_TEST_BINARY_ENV, &candidate)
             .env(WINDOWS_UPDATE_TEST_CURRENT_ENV, fs::canonicalize(&current)?)
+            .env(WINDOWS_UPDATE_TEST_CLEANUP_PID_ENV, &cleanup_pid)
+            .env(
+                WINDOWS_UPDATE_TEST_CLEANUP_ACK_ENV,
+                &cleanup_acknowledgement,
+            )
             .stdin(Stdio::null())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .map_err(|error| {
+                windows_update_io_error("launching published binary", &current, error)
+            })?;
+        let cleanup_pid = windows_cleanup_pid(&cleanup_pid).await?;
+        let cleanup_pid_i32 = i32::try_from(cleanup_pid).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("opening cleanup process {cleanup_pid} failed: {error}"),
+            )
+        })?;
+        let cleanup = WaitHandle::open(cleanup_pid_i32).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("opening cleanup process {cleanup_pid} failed: {error}"),
+            )
+        })?;
+        fs::write(&cleanup_acknowledgement, []).map_err(|error| {
+            windows_update_io_error(
+                "acknowledging cleanup process",
+                &cleanup_acknowledgement,
+                error,
+            )
+        })?;
         windows_wait_update_child(&mut child).await?;
 
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while backup.try_exists()? {
-                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
-            }
-            Ok::<(), std::io::Error>(())
-        })
-        .await??;
-        assert!(!prepared.try_exists()?);
-        assert_eq!(super::sha256(&current)?, expected_digest);
-        assert_eq!(super::sha256(&candidate)?, expected_digest);
+        // The published binary reads and launches at once, while the cleanup process running
+        // from it may still be removing the backup.
+        assert!(!windows_path_exists(
+            &prepared,
+            "checking staged binary after publish"
+        )?);
+        assert_eq!(
+            super::sha256(&current).map_err(|error| windows_update_io_error(
+                "hashing published binary",
+                &current,
+                error
+            ))?,
+            expected_digest
+        );
+        assert_eq!(
+            super::sha256(&candidate).map_err(|error| windows_update_io_error(
+                "hashing candidate binary",
+                &candidate,
+                error
+            ))?,
+            expected_digest
+        );
 
         let version_path = directory.path().join("version.txt");
         let mut version = tokio::process::Command::new(&current)
             .arg("--version")
             .stdin(Stdio::null())
-            .stdout(fs::File::create(&version_path)?)
+            .stdout(fs::File::create(&version_path).map_err(|error| {
+                windows_update_io_error("creating version output", &version_path, error)
+            })?)
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .map_err(|error| {
+                windows_update_io_error("launching version command", &current, error)
+            })?;
         windows_wait_update_child(&mut version).await?;
         let mut version_text = String::new();
-        fs::File::open(&version_path)?
+        fs::File::open(&version_path)
+            .map_err(|error| {
+                windows_update_io_error("opening version output", &version_path, error)
+            })?
             .take(256)
-            .read_to_string(&mut version_text)?;
-        assert_eq!(
-            version_text.trim(),
-            concat!("rift ", env!("CARGO_PKG_VERSION"))
+            .read_to_string(&mut version_text)
+            .map_err(|error| {
+                windows_update_io_error("reading version output", &version_path, error)
+            })?;
+        let (released, _build) = version_text
+            .trim()
+            .split_once('+')
+            .unwrap_or((version_text.trim(), ""));
+        assert_eq!(released, concat!("rift ", env!("CARGO_PKG_VERSION")));
+        assert!(
+            fs::metadata(&version_path)
+                .map_err(|error| windows_update_io_error(
+                    "reading version output size",
+                    &version_path,
+                    error
+                ))?
+                .len()
+                < 256
         );
-        assert!(fs::metadata(&version_path)?.len() < 256);
+
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        windows_wait_cleanup_process(
+            cleanup,
+            cleanup_pid,
+            cleanup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )?;
+
+        // The cleanup process removes the backup within its `CLEANUP_RETRY_COUNT_MAX` attempts.
+        // Windows can reject an open of a backup marked for deletion, so this reads the directory
+        // listing instead of opening the backup.
+        tokio::time::timeout_at(cleanup_deadline, async {
+            while windows_directory_lists(directory.path(), super::WINDOWS_UPDATE_BACKUP_NAME)? {
+                tokio::time::sleep(super::CLEANUP_RETRY_DELAY).await;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await??;
 
         // Bound temporary-file removal even if Windows retains an executable handle briefly.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1672,12 +1960,22 @@ mod tests {
         );
         let candidate = std::env::var_os(WINDOWS_UPDATE_TEST_BINARY_ENV)
             .ok_or("RIFT_UPDATE_TEST_BINARY must name the native release CLI")?;
-        assert_eq!(
-            AtomicPublisher
-                .publish(&current, std::path::Path::new(&candidate))
-                .await?,
-            OldBinaryCleanup::Scheduled
-        );
+        let cleanup = AtomicPublisher
+            .publish(&current, std::path::Path::new(&candidate))
+            .await?;
+        let OldBinaryCleanup::Scheduled { pid } = cleanup else {
+            return Err(std::io::Error::other(format!(
+                "Windows publisher did not start cleanup process: {cleanup:?}"
+            ))
+            .into());
+        };
+        let cleanup_pid = std::env::var_os(WINDOWS_UPDATE_TEST_CLEANUP_PID_ENV)
+            .ok_or("RIFT_UPDATE_TEST_CLEANUP_PID must name a temporary file")?;
+        windows_write_cleanup_pid(std::path::Path::new(&cleanup_pid), pid)?;
+        let cleanup_acknowledgement = std::env::var_os(WINDOWS_UPDATE_TEST_CLEANUP_ACK_ENV)
+            .ok_or("RIFT_UPDATE_TEST_CLEANUP_ACK must name a temporary file")?;
+        windows_wait_for_cleanup_acknowledgement(std::path::Path::new(&cleanup_acknowledgement))
+            .await?;
         assert!(
             !current
                 .with_file_name(super::WINDOWS_UPDATE_PREPARED_NAME)

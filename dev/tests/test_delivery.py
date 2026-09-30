@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,23 @@ DECLARED_WAIT = re.compile(r"Duration::from_(millis|secs|mins)\((\d[\d_]*)\)")
 # What one unit is worth in seconds.
 WAIT_SECONDS = {"millis": 0.001, "secs": 1.0, "mins": 60.0}
 
+# The shared end-to-end harness, the helper name a suite includes it by, the
+# bounds it puts on one proxied call and on one proxied engine call, and the
+# helper a case makes an engine call through.
+HARNESS = "crates/rift/tests/harness.rs"
+HARNESS_HELPER = "harness"
+PROXIED_CALL_BOUND = "PROXIED_CALL_MAX"
+PROXIED_ENGINE_CALL_BOUND = "PROXIED_ENGINE_CALL_MAX"
+PROXIED_ENGINE_CALL = "proxied_engine_call"
+
+# One test function in a suite, by name.
+TEST_FUNCTION = re.compile(
+    r"#\[(?:tokio::)?test[^\]]*\]\s*(?:pub\s+)?(?:async\s+)?fn\s+([a-z0-9_]+)"
+)
+
+# A nextest filterset names one test by its exact name as `test(=<name>)`.
+FILTERED_TEST = re.compile(r"test\(=([a-z0-9_]+)\)")
+
 # A nextest timeout is written as a count and a unit suffix.
 TIMEOUT_PERIOD = re.compile(r"^(\d+)(ms|s|m)$")
 TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
@@ -102,6 +120,21 @@ TIMEOUT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
 BUILD_CACHE_COMMAND = "rift-dev build-cache"
 BUILD_CACHE_SECRET = re.compile(r"secrets\.R2_BUILD_CACHE_[A-Z_]+")
 CARGO_COMMAND = re.compile(r"(?:^|\s)(?:cargo|just)\s")
+
+# The job that builds and runs the unit suite on each release target but x86-64
+# Linux, the profile its legs run under unless a leg names its own, and the one
+# leg that does: the slowest runner, whose run needs a longer global timeout.
+NATIVE_JOB = "native"
+CI_PROFILE = "ci"
+MACOS_INTEL_RUNNER = "macos-15-intel"
+MACOS_INTEL_PROFILE = "ci-macos-intel"
+
+# A workflow expression reading one matrix value, or the text after `||` when
+# the leg sets none: `${{ matrix.profile || 'ci' }}`.
+MATRIX_VALUE = re.compile(r"\$\{\{\s*matrix\.([a-z_]+)\s*\|\|\s*'([^']*)'\s*\}\}")
+
+# The upload action that carries a leg's test report out of its job.
+UPLOAD_ACTION = "actions/upload-artifact@"
 
 # The workflow that merges a dependency pull request without a human, the step
 # that decides whether a bump may take that path, and the output it decides it
@@ -124,6 +157,43 @@ def declared_waits(path: str) -> float:
     )
 
 
+def harness_bound(name: str) -> float:
+    """The seconds one bound the harness declares as a `Duration` constant holds."""
+    source = (REPOSITORY / HARNESS).read_text(encoding="utf-8")
+    declared = re.compile(
+        rf"const {name}: Duration =\s*Duration::from_(millis|secs|mins)\((\d[\d_]*)\)"
+    )
+    matched = declared.search(source)
+    assert matched, f"{HARNESS} declares no {name}"
+    unit, count = matched.groups()
+    return WAIT_SECONDS[unit] * int(count.replace("_", ""))
+
+
+def functions_calling(binary: str, call: str) -> set[str]:
+    """The test functions of `crates/rift/tests/<binary>.rs` whose body calls `call`.
+
+    A function's body runs from its own test attribute to the next one.
+    """
+    source = (REPOSITORY / f"crates/rift/tests/{binary}.rs").read_text(encoding="utf-8")
+    functions = list(TEST_FUNCTION.finditer(source))
+    calling: set[str] = set()
+    for index, function in enumerate(functions):
+        end = functions[index + 1].start() if index + 1 < len(functions) else len(source)
+        if f"{call}(" in source[function.end() : end]:
+            calling.add(function.group(1))
+    return calling
+
+
+def suites_including(helper: str) -> set[str]:
+    """Every test binary in `crates/rift/tests` that includes `helper`."""
+    including: set[str] = set()
+    for path in sorted((REPOSITORY / "crates/rift/tests").glob("*.rs")):
+        source = path.read_text(encoding="utf-8")
+        if TEST_ATTRIBUTE.search(source) and helper in INCLUDED_HELPER.findall(source):
+            including.add(path.stem)
+    return including
+
+
 def timeout_seconds(period: str) -> float:
     """One nextest timeout period in seconds."""
     matched = TIMEOUT_PERIOD.match(period)
@@ -132,19 +202,93 @@ def timeout_seconds(period: str) -> float:
 
 
 def suite_deadline(binary: str) -> float:
-    """The seconds nextest lets one test of `binary` run for.
+    """The seconds nextest lets any test of `binary` run for, overrides that
+    name single tests aside."""
+    return case_deadline(binary, None)
+
+
+def case_deadline(binary: str, test: str | None) -> float:
+    """The seconds nextest lets `test` of `binary` run for.
 
     The deadline is `slow-timeout.period` times `terminate-after`, taken from
-    the override that names the binary, or from the default profile when none
-    does.
+    the first override that names the binary and sets a slow timeout, or from
+    the default profile when none does, the precedence nextest applies to each
+    setting. An override that also names tests applies only to those tests.
     """
     configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
     profile = configuration["profile"]["default"]
     timeout = profile["slow-timeout"]
     for override in profile.get("overrides", []):
-        if f"binary(={binary})" in override["filter"] and "slow-timeout" in override:
+        selected = f"binary(={binary})" in override["filter"]
+        named = FILTERED_TEST.findall(override["filter"])
+        if selected and "slow-timeout" in override and (not named or test in named):
             timeout = override["slow-timeout"]
+            break
     return timeout_seconds(timeout["period"]) * timeout.get("terminate-after", 1)
+
+
+def nextest_profile_setting(name: str, *keys: str) -> Any:
+    """One setting of a nextest profile, read through its inheritance chain.
+
+    A profile names its parent with `inherits`, every chain ends at the
+    `default` profile, and nextest looks each setting up along the chain, so a
+    nested key such as `junit.path` comes from the nearest profile that sets it.
+    """
+    profiles = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))[
+        "profile"
+    ]
+    visited: list[str] = []
+    while name not in visited:
+        visited.append(name)
+        profile = profiles.get(name, {})
+        value: Any = profile
+        for key in keys:
+            value = value.get(key) if isinstance(value, dict) else None
+        if value is not None:
+            return value
+        if name == "default":
+            return None
+        name = profile.get("inherits", "default")
+    raise AssertionError(f"nextest profiles inherit in a cycle: {visited}")
+
+
+def native_legs() -> list[dict[str, Any]]:
+    """Each leg of the native job, as its matrix entry."""
+    job = workflow_documents()[COVERAGE_WORKFLOW]["jobs"][NATIVE_JOB]
+    return job["strategy"]["matrix"]["include"]
+
+
+def native_step(accepts: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    """The one native step `accepts` holds for."""
+    steps = workflow_documents()[COVERAGE_WORKFLOW]["jobs"][NATIVE_JOB]["steps"]
+    found = [step for step in steps if accepts(step)]
+    assert len(found) == 1, f"expected one such native step, found {len(found)}"
+    return found[0]
+
+
+def for_leg(text: str, leg: dict[str, Any]) -> str:
+    """`text` with every matrix expression replaced by the value `leg` gives it."""
+    return MATRIX_VALUE.sub(
+        lambda matched: str(leg.get(matched.group(1)) or matched.group(2)), text
+    )
+
+
+def leg_profile(leg: dict[str, Any]) -> str:
+    """The nextest profile one native leg runs the unit suite under."""
+    run = native_step(lambda step: "nextest run" in step.get("run", ""))["run"]
+    command = for_leg(run, leg)
+    matched = re.search(r"--profile\s+(\S+)", command)
+    assert matched, f"the native suite names no profile: {command}"
+    return matched.group(1)
+
+
+def leg_report(leg: dict[str, Any]) -> str:
+    """The path one native leg uploads its test report from."""
+    upload = native_step(
+        lambda step: step.get("uses", "").startswith(UPLOAD_ACTION)
+        and "native-tests" in (step.get("with") or {}).get("name", "")
+    )
+    return for_leg(upload["with"]["path"], leg)
 
 
 def automerge_step(step_id: str) -> dict[str, Any]:
@@ -498,6 +642,52 @@ class JobBudgets(unittest.TestCase):
         self.assertTrue(jobs_with_step_limits(), "no job bounds a step of its own")
 
 
+class NativeRunBounds(unittest.TestCase):
+    """The slowest native leg alone runs under a longer global timeout.
+
+    The macos-15-intel runner needs more than the `ci` profile's bound for the
+    same suite, so it runs under a profile of its own that changes that bound
+    and nothing else, while every other leg keeps `ci`. Nextest writes a run's
+    report under the folder of the profile it ran, so each leg's upload has to
+    name that same folder or the report never leaves the job.
+    """
+
+    def test_the_intel_profile_changes_only_the_global_timeout(self) -> None:
+        configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+        profile = configuration["profile"][MACOS_INTEL_PROFILE]
+        self.assertEqual(
+            profile.keys(),
+            {"inherits", "global-timeout"},
+            f"{MACOS_INTEL_PROFILE!r} must differ from {CI_PROFILE!r} in its "
+            "global timeout alone",
+        )
+        self.assertEqual(profile["inherits"], CI_PROFILE)
+        self.assertGreater(
+            timeout_seconds(profile["global-timeout"]),
+            timeout_seconds(nextest_profile_setting(CI_PROFILE, "global-timeout")),
+        )
+
+    def test_only_the_intel_leg_runs_under_the_intel_profile(self) -> None:
+        profiles = {leg["os"]: leg_profile(leg) for leg in native_legs()}
+        self.assertEqual(profiles.pop(MACOS_INTEL_RUNNER), MACOS_INTEL_PROFILE)
+        self.assertTrue(profiles, "the native job runs no other leg")
+        self.assertEqual(
+            set(profiles.values()),
+            {CI_PROFILE},
+            f"every leg but {MACOS_INTEL_RUNNER} runs under {CI_PROFILE!r}: {profiles}",
+        )
+
+    def test_every_leg_uploads_the_report_its_profile_writes(self) -> None:
+        configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+        store = configuration["store"]["dir"]
+        for leg in native_legs():
+            with self.subTest(runner=leg["os"]):
+                profile = leg_profile(leg)
+                report = nextest_profile_setting(profile, "junit", "path")
+                self.assertTrue(report, f"the {profile!r} profile writes no report")
+                self.assertEqual(leg_report(leg), f"{store}/{profile}/{report}")
+
+
 class MachineGlobalSuites(unittest.TestCase):
     """A machine-global resource is serialized by a nextest test group.
 
@@ -682,6 +872,51 @@ class HubSuitesOutliveTheWaitsTheyDeclare(unittest.TestCase):
                     declared,
                     f"{binary} can wait {declared}s and is ended at "
                     f"{suite_deadline(binary)}s, so its own failure never prints",
+                )
+
+
+class ProxiedCallsFailInsideTheDeadline(unittest.TestCase):
+    """A proxied call that never answers fails the case naming the call.
+
+    The harness bounds one proxied call, and one proxied engine call, and the
+    proxy's own forward budget ends inside the first. A bound at or past
+    nextest's deadline never trips: nextest ends the case first, and the report
+    is a timeout carrying nothing about the call that hung.
+    """
+
+    def test_the_proxied_call_bound_ends_inside_every_harness_suite_deadline(self) -> None:
+        bound = harness_bound(PROXIED_CALL_BOUND)
+        including = suites_including(HARNESS_HELPER)
+        self.assertTrue(including, f"no suite includes {HARNESS}")
+        for binary in sorted(including):
+            with self.subTest(binary=binary):
+                self.assertLess(
+                    bound,
+                    suite_deadline(binary),
+                    f"{binary} bounds one proxied call at {bound}s and is ended at "
+                    f"{suite_deadline(binary)}s, so a call that hangs never fails by name",
+                )
+
+    def test_every_engine_call_bound_ends_inside_its_case_deadline(self) -> None:
+        """A case making an engine call makes one proxied call before it, so its
+        deadline has to hold both bounds for the engine call's own to trip."""
+        call_bound = harness_bound(PROXIED_CALL_BOUND)
+        engine_bound = harness_bound(PROXIED_ENGINE_CALL_BOUND)
+        cases = [
+            (binary, test)
+            for binary in sorted(suites_including(HARNESS_HELPER))
+            for test in sorted(functions_calling(binary, PROXIED_ENGINE_CALL))
+        ]
+        self.assertTrue(cases, f"no harness suite calls {PROXIED_ENGINE_CALL}")
+        for binary, test in cases:
+            with self.subTest(binary=binary, test=test):
+                deadline = case_deadline(binary, test)
+                self.assertLess(
+                    call_bound + engine_bound,
+                    deadline,
+                    f"{binary}::{test} bounds its calls at {call_bound}s and "
+                    f"{engine_bound}s and is ended at {deadline}s, so an engine call "
+                    f"that hangs never fails by name",
                 )
 
 

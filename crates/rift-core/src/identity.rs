@@ -394,12 +394,12 @@ impl SourceUnitId {
         Ok(identity)
     }
 
-    /// The unit of one file inside a cataloged package.
+    /// The unit of one file inside a package.
     ///
     /// The resolver is the package's manager and the key is `<name>@<version>/<path>`,
-    /// so the unit renders as `rift://source/cargo/helper@0.1.0/src/lib.rs`. The
-    /// dependency lane and the engine tier both mint a package file's unit here: one
-    /// file has one unit wherever it is addressed from.
+    /// so the unit renders as `rift://source/cargo/helper@0.1.0/src/lib.rs`. Package
+    /// analysis mints every package file's unit here: one file has one unit wherever it
+    /// is addressed from.
     ///
     /// # Errors
     ///

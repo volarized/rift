@@ -138,8 +138,9 @@ impl LanguageDefinition for RustDefinition {
     }
 }
 
-/// JavaScript: `js` and `jsx` files; the pinned grammar parses JSX, so `jsx`
-/// needs no dialect of its own.
+/// JavaScript: `js` and `jsx` files, and the `mjs` and `cjs` module builds a
+/// package ships beside them; the pinned grammar parses JSX, so `jsx` needs no
+/// dialect of its own.
 #[derive(Debug)]
 struct JavaScriptDefinition;
 
@@ -149,7 +150,7 @@ impl LanguageDefinition for JavaScriptDefinition {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["js", "jsx"]
+        &["js", "jsx", "mjs", "cjs"]
     }
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
@@ -157,7 +158,8 @@ impl LanguageDefinition for JavaScriptDefinition {
     }
 }
 
-/// Plain TypeScript: `ts` files.
+/// Plain TypeScript: `ts` files, and the `mts` and `cts` files that declare
+/// or build those modules (`index.d.mts` beside `index.mjs`).
 #[derive(Debug)]
 struct TypeScriptDefinition;
 
@@ -167,7 +169,7 @@ impl LanguageDefinition for TypeScriptDefinition {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["ts"]
+        &["ts", "mts", "cts"]
     }
 
     fn syntax_provider(&self) -> Box<dyn SyntaxProvider> {
@@ -340,6 +342,22 @@ mod tests {
                 &definition.shipped().language(),
                 "provider and definition must spell one identity"
             );
+        }
+    }
+
+    /// A package's `mjs` and `cjs` builds, and the declaration files beside them,
+    /// parse under the language that claims their extension.
+    #[test]
+    fn test_module_builds_parse_under_their_language() {
+        for (extension, shipped) in [
+            ("mjs", ShippedLanguage::JavaScript),
+            ("cjs", ShippedLanguage::JavaScript),
+            ("mts", ShippedLanguage::TypeScript),
+            ("cts", ShippedLanguage::TypeScript),
+        ] {
+            let provider = crate::registry::provider_for_extension(extension)
+                .unwrap_or_else(|| panic!("a shipped language claims {extension}"));
+            assert_eq!(provider.language(), &shipped.language(), "{extension}");
         }
     }
 

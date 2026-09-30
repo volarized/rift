@@ -1,11 +1,13 @@
 //! Rust syntax facts from the pinned tree-sitter-rust grammar.
 
 mod attachment;
+mod blanking;
 
 use std::sync::OnceLock;
 
 use rift_core::Error;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
+use strum::VariantArray;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
 use crate::document::{ByteRange, SyntaxDocument};
@@ -34,10 +36,12 @@ enum RustSymbolKind {
     Module,
     /// Declarative macro.
     Macro,
+    /// Enum variant.
+    Variant,
 }
 
 impl RustSymbolKind {
-    /// The provider kind word behind the wire kind `rust.{word}`.
+    /// The kind word this declaration kind carries on the wire.
     const fn word(self) -> &'static str {
         match self {
             Self::Function => "function",
@@ -49,6 +53,7 @@ impl RustSymbolKind {
             Self::Static => "static",
             Self::Module => "module",
             Self::Macro => "macro",
+            Self::Variant => "variant",
         }
     }
 
@@ -61,6 +66,7 @@ impl RustSymbolKind {
             Self::Module => vec![SymbolFacet::Namespace, SymbolFacet::Module],
             Self::Macro => vec![SymbolFacet::Macro],
             Self::Constant | Self::Static => vec![SymbolFacet::Value],
+            Self::Variant => vec![SymbolFacet::Variant],
         }
     }
 
@@ -68,9 +74,12 @@ impl RustSymbolKind {
     /// for a kind whose grammar declares no body or value field.
     const fn body_field(self) -> Option<RustGrammarField> {
         match self {
-            Self::Function | Self::Struct | Self::Enum | Self::Trait | Self::Module => {
-                Some(RustGrammarField::Body)
-            }
+            Self::Function
+            | Self::Struct
+            | Self::Enum
+            | Self::Trait
+            | Self::Module
+            | Self::Variant => Some(RustGrammarField::Body),
             Self::Constant | Self::Static => Some(RustGrammarField::Value),
             Self::TypeAlias | Self::Macro => None,
         }
@@ -83,14 +92,19 @@ impl RustSymbolKind {
 /// tree-sitter-rust 0.24.2 grammar. The grammar defines many more kinds;
 /// only the ones this module reads are listed, so conversion from an
 /// arbitrary kind string is fallible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, VariantArray)]
 enum RustGrammarNodeKind {
     /// `const_item` declaration.
     ConstItem,
     /// `enum_item` declaration.
     EnumItem,
+    /// `enum_variant` inside an enum's variant list.
+    EnumVariant,
     /// `function_item` declaration.
     FunctionItem,
+    /// `function_signature_item`: a function without a body, in a trait or
+    /// an `extern` block.
+    FunctionSignatureItem,
     /// `impl_item` block.
     ImplItem,
     /// `macro_definition` declaration.
@@ -110,27 +124,14 @@ enum RustGrammarNodeKind {
 }
 
 impl RustGrammarNodeKind {
-    /// Every interpreted kind, ordered by grammar spelling.
-    const ALL: [Self; 11] = [
-        Self::ConstItem,
-        Self::EnumItem,
-        Self::FunctionItem,
-        Self::ImplItem,
-        Self::MacroDefinition,
-        Self::ModItem,
-        Self::StaticItem,
-        Self::StructItem,
-        Self::TraitItem,
-        Self::TypeItem,
-        Self::VisibilityModifier,
-    ];
-
     /// Returns grammar spelling from tree-sitter-rust `node-types.json`.
     const fn as_str(self) -> &'static str {
         match self {
             Self::ConstItem => "const_item",
             Self::EnumItem => "enum_item",
+            Self::EnumVariant => "enum_variant",
             Self::FunctionItem => "function_item",
+            Self::FunctionSignatureItem => "function_signature_item",
             Self::ImplItem => "impl_item",
             Self::MacroDefinition => "macro_definition",
             Self::ModItem => "mod_item",
@@ -144,16 +145,18 @@ impl RustGrammarNodeKind {
 
     /// Classifies grammar kinds the tree walk does not interpret as `None`.
     fn from_kind(kind: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
+        Self::VARIANTS
+            .iter()
+            .copied()
             .find(|candidate| candidate.as_str() == kind)
     }
 
     const fn symbol_kind(self) -> Option<RustSymbolKind> {
         match self {
-            Self::FunctionItem => Some(RustSymbolKind::Function),
+            Self::FunctionItem | Self::FunctionSignatureItem => Some(RustSymbolKind::Function),
             Self::StructItem => Some(RustSymbolKind::Struct),
             Self::EnumItem => Some(RustSymbolKind::Enum),
+            Self::EnumVariant => Some(RustSymbolKind::Variant),
             Self::TraitItem => Some(RustSymbolKind::Trait),
             Self::TypeItem => Some(RustSymbolKind::TypeAlias),
             Self::ConstItem => Some(RustSymbolKind::Constant),
@@ -300,8 +303,9 @@ impl RustQuery {
             }));
         }
         let mut parser = rust_parser()?;
+        let parsed = blanking::blank_const_trait_keywords(source);
         let tree = parser
-            .parse(source, None)
+            .parse(parsed.as_ref(), None)
             .ok_or_else(|| Error::new(SyntaxFault::ParseCancelled { path: None }))?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
@@ -349,7 +353,8 @@ impl SyntaxProvider for RustSyntaxProvider {
     ) -> Result<SyntaxDocument, SyntaxError> {
         limits.admit_source(source)?;
         let mut parser = rust_parser()?;
-        let tree = parser.parse(source.text, None).ok_or_else(|| {
+        let parsed = blanking::blank_const_trait_keywords(source.text);
+        let tree = parser.parse(parsed.as_ref(), None).ok_or_else(|| {
             Error::new(SyntaxFault::ParseCancelled {
                 path: Some(source.path.clone()),
             })
@@ -714,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_document_kind_words_cover_every_declaration_kind() {
-        let text = "fn f() {}\nstruct S;\nenum E {}\ntrait T {}\ntype A = u8;\n\
+        let text = "fn f() {}\nstruct S;\nenum E { V }\ntrait T {}\ntype A = u8;\n\
                     const C: u8 = 0;\nstatic G: u8 = 0;\nmod m {}\nmacro_rules! q { () => {}; }";
         let document = analyze(text);
         let kinds = document
@@ -728,6 +733,7 @@ mod tests {
                 "function",
                 "struct",
                 "enum",
+                "variant",
                 "trait",
                 "type_alias",
                 "constant",
@@ -771,6 +777,111 @@ mod tests {
             .map(|symbol| symbol.signatures[0].display.as_str())
             .collect();
         assert_eq!(signatures, ["pub fn one()", "pub fn two(x: u8) -> u8"]);
+    }
+
+    /// A trait method without a body and a function in an `extern` block are
+    /// declarations: each qualifies through its trait or the file, and renders
+    /// its signature from its own text without the closing `;`.
+    #[test]
+    fn test_a_bodyless_function_declares_and_renders_its_own_text_as_signature() {
+        let document = analyze(
+            "pub trait Iterator {\n    type Item;\n    \
+             fn next(&mut self) -> Option<Self::Item>;\n    \
+             fn count(self) -> usize { 0 }\n}\n\
+             unsafe extern \"C\" {\n    fn abs(x: i32) -> i32;\n}\n",
+        );
+        let functions = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind == "function")
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.body_range.is_some(),
+                    symbol.signatures[0].display.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions,
+            [
+                (
+                    "Iterator::next",
+                    false,
+                    "fn next(&mut self) -> Option<Self::Item>"
+                ),
+                ("Iterator::count", true, "fn count(self) -> usize"),
+                ("abs", false, "fn abs(x: i32) -> i32"),
+            ]
+        );
+    }
+
+    /// Each enum variant declares a `variant` qualified by its enum, with the
+    /// documentation attached to it and no signature.
+    #[test]
+    fn test_an_enum_variant_qualifies_through_its_enum() {
+        let document = analyze(
+            "pub enum Option<T> {\n    /// No value.\n    None,\n    \
+             #[stable]\n    Some(T),\n    Pair { left: T, right: T },\n}\n",
+        );
+        let variants = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind == "variant")
+            .collect::<Vec<_>>();
+        let names = variants
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Option::None", "Option::Some", "Option::Pair"]);
+        assert_eq!(variants[0].documentation[0].text, "No value.");
+        assert!(variants.iter().all(|symbol| symbol.signatures.is_empty()));
+        assert_eq!(variants[0].facets, [SymbolFacet::Variant]);
+    }
+
+    /// The const-trait forms the pinned grammar lacks parse without an error
+    /// once blanked, the methods inside them keep their container, and a
+    /// signature still shows the authored `[const]`.
+    #[test]
+    fn test_const_trait_forms_parse_and_keep_their_containers() {
+        let text = "pub struct Plain;\n\
+                    const impl Default for Plain {\n    fn default() -> Self { Plain }\n}\n\
+                    impl const Clone for Plain {\n    fn clone(&self) -> Self { Plain }\n}\n\
+                    const unsafe impl Send for Plain {}\n\
+                    pub const trait Measure {\n    fn size(&self) -> usize;\n}\n\
+                    pub fn call<F: [const] FnOnce() -> u8>(f: F) -> u8 { f() }\n\
+                    pub fn old<F: ~const FnOnce() -> u8>(f: F) -> u8 { f() }\n\
+                    pub fn closure() -> u8 { let f = const || 1; f() }\n";
+        let unblanked = rust_parser()
+            .expect("grammar loads")
+            .parse(text, None)
+            .expect("a tree");
+        assert!(unblanked.root_node().has_error());
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        let names = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Plain",
+                "Plain::default",
+                "Plain::clone",
+                "Measure",
+                "Measure::size",
+                "call",
+                "old",
+                "closure",
+            ]
+        );
+        let call = &document.symbols()[5];
+        assert_eq!(
+            call.signatures[0].display,
+            "pub fn call<F: [const] FnOnce() -> u8>(f: F) -> u8"
+        );
     }
 
     #[test]
@@ -856,7 +967,9 @@ mod tests {
                 ("S", true),
                 ("Unit", false),
                 ("E", true),
+                ("A", false),
                 ("T", true),
+                ("t", false),
                 ("m", true),
                 ("inner", true),
                 ("declared", false),
@@ -986,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_grammar_node_kind_round_trips_and_rejects_unknown() {
-        for kind in RustGrammarNodeKind::ALL {
+        for kind in RustGrammarNodeKind::VARIANTS.iter().copied() {
             assert_eq!(
                 kind.as_str()
                     .parse::<RustGrammarNodeKind>()

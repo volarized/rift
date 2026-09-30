@@ -171,8 +171,8 @@ mod tests {
         assert_eq!(
             source_file_extensions(),
             [
-                "rs", "js", "jsx", "ts", "tsx", "md", "markdown", "mdx", "json", "yaml", "yml",
-                "toml", "py", "pyi"
+                "rs", "js", "jsx", "mjs", "cjs", "ts", "mts", "cts", "tsx", "md", "markdown",
+                "mdx", "json", "yaml", "yml", "toml", "py", "pyi"
             ]
         );
     }

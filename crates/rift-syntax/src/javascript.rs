@@ -193,6 +193,182 @@ mod tests {
         );
     }
 
+    /// Every qualified name `document` declares, beside whether it carries the
+    /// `Public` facet.
+    fn public_facts(document: &SyntaxDocument) -> Vec<(&str, bool)> {
+        document
+            .symbols()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.facets.contains(&SymbolFacet::Public),
+                )
+            })
+            .collect()
+    }
+
+    /// An export clause marks the module-scope declarations it names, an
+    /// aliased one under its own name, and leaves the rest unmarked.
+    #[test]
+    fn test_an_export_clause_marks_the_local_declarations_it_names() {
+        let document = analyze(
+            "function open() {}\nconst limit = 1, spare = 2;\nclass Router {\n  route() {}\n}\nfunction hidden() {}\nexport { open, limit as max, Router as default };\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("open", true),
+                ("limit", true),
+                ("spare", false),
+                ("Router", true),
+                ("Router.route", false),
+                ("hidden", false),
+            ]
+        );
+    }
+
+    /// `export default` of an identifier marks the declaration it names; of
+    /// an object literal, the declarations its properties name and the
+    /// methods written in it.
+    #[test]
+    fn test_a_default_export_marks_the_declarations_it_names() {
+        let document = analyze("function main() {}\nfunction helper() {}\nexport default main;\n");
+        assert_eq!(public_facts(&document), [("main", true), ("helper", false)]);
+
+        let document = analyze(
+            "const answer = 1;\nfunction helper() {}\nfunction hidden() {}\nexport default { answer, run: helper, start() {} };\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("answer", true),
+                ("helper", true),
+                ("hidden", false),
+                ("start", true),
+            ]
+        );
+    }
+
+    /// A whole export of a computed value, such as a call's result or a
+    /// number, names no declaration, so it marks none.
+    #[test]
+    fn test_a_whole_export_of_a_computed_value_marks_nothing() {
+        let document = analyze("function create() {}\nexport default create();\n");
+        assert_eq!(public_facts(&document), [("create", false)]);
+
+        let document = analyze("function create() {}\nmodule.exports = create();\n");
+        assert_eq!(public_facts(&document), [("create", false)]);
+
+        let document = analyze("const answer = 1;\nexport default 42;\n");
+        assert_eq!(public_facts(&document), [("answer", false)]);
+    }
+
+    /// A re-export names another module's declarations, so a local
+    /// declaration of the same name stays unmarked.
+    #[test]
+    fn test_a_re_export_marks_no_local_declaration() {
+        let document = analyze(
+            "function open() {}\nexport { open } from './open.js';\nexport * from './more.js';\nexport * as tools from './tools.js';\n",
+        );
+        assert_eq!(public_facts(&document), [("open", false)]);
+    }
+
+    /// An export names a module-scope declaration: a nested declaration or a
+    /// class member sharing its name stays unmarked.
+    #[test]
+    fn test_an_exported_name_marks_only_the_module_scope_declaration() {
+        let document = analyze(
+            "function open() {}\nfunction outer() {\n  function open() {}\n  const limit = 2;\n}\nclass Router {\n  open() {}\n}\nconst limit = 1;\nexport { open, limit };\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("open~1", true),
+                ("outer", false),
+                ("open~2", false),
+                ("limit~1", false),
+                ("Router", false),
+                ("Router.open", false),
+                ("limit~2", true),
+            ]
+        );
+    }
+
+    /// `module.exports = { a, b: c }` marks `a`, `c`, and the methods written
+    /// in the object; `module.exports = X` marks `X`.
+    #[test]
+    fn test_a_module_exports_assignment_marks_the_declarations_it_names() {
+        let document = analyze(
+            "function helper() {}\nfunction start() {}\nfunction hidden() {}\nmodule.exports = { helper, run: start, stop() {}, ...hidden };\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("helper", true),
+                ("start", true),
+                ("hidden", false),
+                ("stop", true),
+            ]
+        );
+
+        let document = analyze(
+            "class Runner {\n  run() {}\n}\nfunction hidden() {}\nmodule.exports = Runner;\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [("Runner", true), ("Runner.run", false), ("hidden", false)]
+        );
+    }
+
+    /// A property export marks the declaration its value names:
+    /// `module.exports.a = a`, `exports.a = a`, and `exports.b = c`.
+    #[test]
+    fn test_a_property_export_marks_the_declaration_its_value_names() {
+        let document = analyze(
+            "function parse() {}\nfunction load() {}\nconst start = () => 1;\nfunction hidden() {}\nmodule.exports.parse = parse;\nexports.load = load;\nexports.run = start;\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("parse", true),
+                ("load", true),
+                ("start", true),
+                ("hidden", false),
+            ]
+        );
+    }
+
+    /// An assignment chain exports its value through the widest export target
+    /// it passes, as `exports = module.exports = create` does.
+    #[test]
+    fn test_an_assignment_chain_exports_through_its_widest_target() {
+        let document = analyze("function create() {}\nexports = module.exports = create;\n");
+        assert_eq!(public_facts(&document), [("create", true)]);
+
+        let document = analyze("function helper() {}\nmodule.exports = exports = { helper };\n");
+        assert_eq!(public_facts(&document), [("helper", true)]);
+    }
+
+    /// An assignment marks nothing when its value is a function or class
+    /// expression, a member access, or an object behind a property export,
+    /// when its target is no export, or when a block holds it.
+    #[test]
+    fn test_an_export_assignment_marks_nothing_it_does_not_name() {
+        let document = analyze(
+            "function helper() {}\nconst config = { load() {} };\nexports.extra = function extra() {};\nexports.Kind = class Kind {};\nexports.parse = config.parse;\nexports.config = { load() {} };\nexports = helper;\nmodule.helper = helper;\nif (typeof module === 'object') {\n  module.exports = helper;\n}\n",
+        );
+        assert_eq!(
+            public_facts(&document),
+            [
+                ("helper", false),
+                ("config", false),
+                ("load~1", false),
+                ("load~2", false),
+            ]
+        );
+    }
+
     #[test]
     fn test_document_facets_render_kind_categories() {
         let document = analyze(

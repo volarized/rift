@@ -12,6 +12,7 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -31,16 +32,37 @@ pub(crate) fn rift_binary() -> PathBuf {
         .into()
 }
 
-/// Bound on one proxied round trip that may include a server election. A
-/// refusal can wait out two start windows - the warmup's and the request's
-/// own - before it surfaces.
-pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_mins(1);
+/// Bound on one proxied round trip that may include a server election.
+///
+/// The bounds nest, each inside the next, so the innermost one that trips is
+/// the one a failing case reports: the proxy's forward budget, which
+/// [`FIXTURE_READINESS_TIMEOUT`] and [`FIXTURE_WORKER_QUEUE_TIMEOUT`] set,
+/// ends inside this bound, and this bound ends inside nextest's one-minute
+/// deadline. It also covers the proxy's start window, the longest a refusal to
+/// start takes. `mcp_proxy`'s `proxied_forward_budget_ends_inside_the_call_bound`
+/// pins the first relation and `dev/tests/test_delivery.py` the second.
+pub(crate) const PROXIED_CALL_MAX: Duration = Duration::from_secs(45);
 /// Bound on one proxied call that starts and settles a language engine.
 pub(crate) const PROXIED_ENGINE_CALL_MAX: Duration = Duration::from_mins(2);
 
 /// The declaration every non-engine fixture serves, and the file
 /// referencing it.
 pub(crate) const LIBRARY: &str = "pub fn beacon() {}\n";
+
+/// `[server] readiness_timeout` of every fixture but the engine one.
+///
+/// With [`FIXTURE_WORKER_QUEUE_TIMEOUT`] and the proxy's answer grace it makes
+/// the forward budget the proxy gives each request, which ends inside
+/// [`PROXIED_CALL_MAX`]. The shipped defaults make a budget past both that
+/// bound and nextest's deadline, so a server that stopped answering would end
+/// a case with no report. The fixture indexes a handful of files, far inside
+/// this bound.
+pub(crate) const FIXTURE_READINESS_TIMEOUT: rift_protocol::configuration::Duration =
+    rift_protocol::configuration::Duration::from_millis(15_000);
+/// `[server] worker_queue_timeout` of every fixture but the engine one; see
+/// [`FIXTURE_READINESS_TIMEOUT`].
+pub(crate) const FIXTURE_WORKER_QUEUE_TIMEOUT: rift_protocol::configuration::Duration =
+    rift_protocol::configuration::Duration::from_millis(5_000);
 
 /// A workspace fixture: one Rust source and a `rift.toml` whose
 /// `[server]` idle timeout reaps any orphaned server within a minute and
@@ -92,9 +114,14 @@ pub(crate) fn rust_project() -> Vec<(&'static str, &'static str)> {
 
 /// Cargo project fixture with real Rust language LSP configuration appended,
 /// serving `rust` through rust-analyzer.
+///
+/// It keeps the shipped `[server]` request bounds: a request here waits for
+/// rust-analyzer to be ready, which [`PROXIED_ENGINE_CALL_MAX`] covers and
+/// [`FIXTURE_READINESS_TIMEOUT`] does not.
 pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
-    laid_out_workspace(
+    fixture_workspace(
         &rust_project(),
+        "",
         &format!(
             "{}{}",
             assigned_port_key()?,
@@ -114,11 +141,27 @@ pub(crate) fn rust_engine_workspace() -> TestResult<tempfile::TempDir> {
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
 /// One fixture workspace holding `files` and a `rift.toml` carrying the disabled
-/// vector ranking, the orphan-safety idle timeout, and `extra_toml` - an
-/// LSP configuration, a `[source]` policy, or another
-/// table a case needs beyond the two every fixture already carries.
+/// vector ranking, the orphan-safety idle timeout, the request bounds
+/// [`FIXTURE_READINESS_TIMEOUT`] and [`FIXTURE_WORKER_QUEUE_TIMEOUT`], and
+/// `extra_toml` - an LSP configuration, a `[source]` policy, or another
+/// table a case needs beyond what every fixture already carries.
 pub(crate) fn laid_out_workspace(
     files: &[(&str, &str)],
+    extra_toml: &str,
+) -> TestResult<tempfile::TempDir> {
+    let request_bounds = format!(
+        "readiness_timeout = \"{}\"\nworker_queue_timeout = \"{}\"\n",
+        String::from(FIXTURE_READINESS_TIMEOUT),
+        String::from(FIXTURE_WORKER_QUEUE_TIMEOUT)
+    );
+    fixture_workspace(files, &request_bounds, extra_toml)
+}
+
+/// The fixture [`laid_out_workspace`] lays out, with `server_keys` in its
+/// `[server]` table ahead of `extra_toml`.
+fn fixture_workspace(
+    files: &[(&str, &str)],
+    server_keys: &str,
     extra_toml: &str,
 ) -> TestResult<tempfile::TempDir> {
     let directory = tempfile::tempdir()?;
@@ -131,12 +174,16 @@ pub(crate) fn laid_out_workspace(
     }
     fs::write(
         directory.path().join("rift.toml"),
-        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{extra_toml}"),
+        format!("{VECTOR_DISABLED}[server]\nidle_timeout = \"60s\"\n{server_keys}{extra_toml}"),
     )?;
     Ok(directory)
 }
 
 /// Stops the fixture's server when a test unwinds, best effort.
+///
+/// The stop's standard error reaches the test's own, so a stop that refuses or
+/// runs out its window says why in the case's report; its standard output, the
+/// one line a stop that worked prints, does not.
 pub(crate) struct StopOnDrop {
     root: PathBuf,
     binary: PathBuf,
@@ -158,7 +205,7 @@ impl Drop for StopOnDrop {
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .status();
     }
 }
@@ -204,24 +251,102 @@ pub(crate) async fn within<Value>(
 
 /// The base `rift mcp` child command for one fixture workspace, before either
 /// the rmcp transport wrapper or a raw-pipe session spawns it.
+///
+/// `NO_COLOR` keeps the traced lines plain, since they end up in a test's
+/// captured output rather than on a terminal; the server the proxy spawns
+/// inherits both variables.
 fn base_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(rift_binary());
     command
         .arg("mcp")
         .current_dir(root)
-        .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info");
+        .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info")
+        .env("NO_COLOR", "1");
     command
 }
 
 /// The `rift mcp` child command for one fixture workspace.
-pub(crate) fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
+fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
     TokioChildProcess::builder(base_command(root))
 }
 
-/// One connected `rift mcp` child with its stderr discarded.
+/// One connected `rift mcp` child whose stderr is relayed onto the test's own.
 pub(crate) async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let (transport, _stderr) = proxy_command(root).stderr(Stdio::null()).spawn()?;
-    Ok(().serve(transport).await?)
+    let (client, _stderr) = relayed_proxy_client(root).await?;
+    Ok(client)
+}
+
+/// One connected `rift mcp` child, and its stderr relayed onto the test's own.
+///
+/// The proxy's lifecycle lines, and the stderr of a server it spawned that
+/// exited before serving, are what explain a start that never answered, so
+/// every proxied case keeps them where a failure report shows them.
+pub(crate) async fn relayed_proxy_client(
+    root: &Path,
+) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
+    let (reader, writer) = std::io::pipe()?;
+    let (transport, _stderr) = proxy_command(root).stderr(writer).spawn()?;
+    let stderr = RelayedStderr::spawn(reader);
+    Ok((().serve(transport).await?, stderr))
+}
+
+/// Bytes of one child's stderr the relay writes and keeps; the rest is read
+/// and dropped, so the child never blocks on a full pipe.
+const RELAYED_STDERR_BYTES_MAX: usize = 1 << 20;
+
+/// A child's stderr, copied onto this test process's stderr as it arrives
+/// and kept for the test to assert on.
+///
+/// Nextest prints a test's captured output when the test fails or times
+/// out, and it ends a timed-out test by killing it - on Windows at once,
+/// with every descendant - so a copy printed after the fact would never
+/// run. The relay writes each read as it lands, through `std::io::stderr`,
+/// which no test harness capture intercepts.
+pub(crate) struct RelayedStderr {
+    relay: std::thread::JoinHandle<String>,
+}
+
+impl RelayedStderr {
+    /// Starts relaying `stream` on a thread of its own, which ends at the
+    /// stream's end-of-file.
+    ///
+    /// The relay stays off tokio's blocking pool: the runtime's shutdown
+    /// joins every blocking thread, so a read parked there would hold the
+    /// test's end until the stream closed.
+    fn spawn(stream: impl Read + Send + 'static) -> Self {
+        Self {
+            relay: std::thread::spawn(move || relay_until_closed(stream)),
+        }
+    }
+
+    /// The relayed text, once every holder of the stream's write end has
+    /// closed it.
+    ///
+    /// On Windows a detached server the child started inherits that end,
+    /// so the text arrives only when the server leaves too.
+    pub(crate) async fn text(self) -> TestResult<String> {
+        let relay = self.relay;
+        tokio::task::spawn_blocking(move || relay.join())
+            .await?
+            .map_err(|_panic| "the stderr relay panicked".into())
+    }
+}
+
+/// Copies `stream` onto this process's stderr until end-of-file, keeping
+/// what it copied, both bounded by [`RELAYED_STDERR_BYTES_MAX`].
+fn relay_until_closed(mut stream: impl Read) -> String {
+    let mut kept = Vec::new();
+    let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
+    loop {
+        let read_bytes = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read_bytes) => read_bytes,
+        };
+        let relayed = &buffer[..read_bytes.min(RELAYED_STDERR_BYTES_MAX - kept.len())];
+        let _ = std::io::stderr().write_all(relayed);
+        kept.extend_from_slice(relayed);
+    }
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 pub(crate) fn arguments(

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    DependencyIndexLimits, LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests,
+    LexicalIndexLimits, LogStore, PathChange, PathChanges, WorkspaceDigests, WorkspaceFingerprint,
     WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
@@ -27,12 +27,12 @@ use rift_protocol::workspace::{
 use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
-    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchIndex, SearchIndexLimits,
-    StoreRanking, VectorReadiness,
+    RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchError, SearchIndex,
+    SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, PackageBranch, ReadError, ReadFault, ReadService,
-    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault, ReadService, StoreAnswer,
+    resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -51,14 +51,15 @@ use crate::global::{
     GlobalRoute, GlobalSearchCandidates, GlobalState, merge_search, merge_symbols, package_search,
     package_symbols,
 };
+use crate::identity::BuildCheckout;
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
 use crate::validation::{
     ConfigurationFingerprint, ConfigurationState, INDEX_CAPTURE_ATTEMPTS_MAX, IndexState,
     IndexSupervisor, IndexSupervisorContext, IndexValidation, LexicalCommitState, LexicalLane,
-    LexicalWrite, PopulationLane, PublishedWorkspace, configuration_fingerprint, initial_workspace,
-    run_index_supervisor, workspace_watcher,
+    LexicalWrite, PopulationLane, PublishedWorkspace, WatchWorkspace, configuration_fingerprint,
+    initial_workspace, run_index_supervisor, workspace_watcher,
 };
 
 /// Vector candidates one file may contribute to a fused ranking.
@@ -599,6 +600,27 @@ impl ResolvedWorkspace {
             stale: None,
         }
     }
+
+    /// A publication served behind the tree the request-time capture read.
+    ///
+    /// The answer carries the `stale_index` warning `reason` renders for `captured`
+    /// whenever `moved` names something the warning can report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the publication's configuration refusal when its `rift.toml` was not
+    /// accepted.
+    fn stale(
+        published: Arc<PublishedWorkspace>,
+        captured: &WorkspaceDigests,
+        moved: Option<CaptureMovement>,
+        reason: &StaleIndexReason<'_>,
+        phase: wire::ErrorPhase,
+    ) -> Result<Self, ErrorData> {
+        published.configuration.accepted(phase)?;
+        let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
+        Ok(Self { published, stale })
+    }
 }
 
 /// A read result's warnings, so the one gate every current-tree read passes can add the
@@ -626,45 +648,6 @@ impl ReadAnswer for NodesResult {
     }
 }
 
-/// Replaces the local package branch's legacy global warning with routed client state.
-fn apply_global_warnings(warnings: &mut Vec<ReadWarning>, route: &GlobalRoute) {
-    let fallback_indexed = warnings
-        .iter()
-        .find_map(|warning| match warning {
-            ReadWarning::GlobalIndexUnavailable { indexed, .. } => Some(*indexed),
-            _ => None,
-        })
-        .unwrap_or(0);
-    *warnings = warnings
-        .drain(..)
-        .filter_map(|warning| match warning {
-            ReadWarning::GlobalIndexUnavailable { .. } => None,
-            ReadWarning::PackageSkipped { package, reason } => {
-                Some(ReadWarning::PackageUnavailable { package, reason })
-            }
-            warning => Some(warning),
-        })
-        .collect();
-    route.record_fallback(fallback_indexed);
-    if let Some(warning) = route.fallback_warning(fallback_indexed) {
-        warnings.push(warning);
-    }
-    let package_warnings = warnings
-        .iter()
-        .filter(|warning| {
-            matches!(
-                warning,
-                ReadWarning::PackageUnavailable { .. } | ReadWarning::PackageContextDegraded { .. }
-            )
-        })
-        .count();
-    warnings.extend(
-        route
-            .missing_warnings()
-            .take(rift_protocol::read::DEPENDENCY_WARNINGS_MAX.saturating_sub(package_warnings)),
-    );
-}
-
 /// Most bytes one read warning's `detail` carries: the bound the served schema advertises
 /// for it, applied to a failure's rendering before it reaches the wire.
 const WARNING_DETAIL_BYTES_MAX: usize = 4096;
@@ -677,10 +660,51 @@ const STALE_INDEX_PATHS_MAX: usize = 5;
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
-    /// Changed source waits for publication or a successful superseded capture.
-    Rebuild,
+    /// Changed source waits for publication, or for a successful capture superseded after
+    /// the read's last capture began.
+    Rebuild {
+        /// The latest superseded epoch recorded before that capture began.
+        superseded_seen: u64,
+    },
     /// Changed configuration waits for acceptance and publication.
     Configuration,
+}
+
+/// One read's previous request-time capture, and the rebuild it asked for.
+///
+/// A later capture that folds to the same tree and configuration found nothing that
+/// capture did not already ask for, so it asks for nothing again and proves no movement.
+struct PreviousCapture {
+    tree: WorkspaceFingerprint,
+    configuration: ConfigurationFingerprint,
+    /// The observation epoch the capture's rebuild request moved the counter to.
+    requested_epoch: u64,
+    /// The latest superseded epoch recorded before the capture began.
+    superseded_seen: u64,
+}
+
+impl PreviousCapture {
+    /// Whether a later capture folds to the tree and configuration this one did.
+    fn matches(
+        &self,
+        tree: &WorkspaceFingerprint,
+        configuration: ConfigurationFingerprint,
+    ) -> bool {
+        self.tree == *tree && self.configuration == configuration
+    }
+
+    /// Whether a later capture is owed this capture's rebuild and nothing more.
+    ///
+    /// It is when `tree` and `configuration` match this capture and `current` still
+    /// predates the rebuild this capture asked for.
+    fn awaits_publication(
+        &self,
+        current: &PublishedWorkspace,
+        tree: &WorkspaceFingerprint,
+        configuration: ConfigurationFingerprint,
+    ) -> bool {
+        self.matches(tree, configuration) && current.epoch < self.requested_epoch
+    }
 }
 
 /// Why an answer is served from a publication the request-time capture found behind the
@@ -688,7 +712,8 @@ enum ReadWait {
 enum StaleIndexReason<'a> {
     /// The rebuild recorded past that publication failed.
     RebuildFailed(&'a RecordedRebuildFailure),
-    /// A successful capture after the publication was superseded by later changes.
+    /// A successful capture was superseded while the request's own captures found the
+    /// tree moving.
     RebuildSuperseded {
         /// The successful candidate's filesystem epoch.
         epoch: u64,
@@ -916,23 +941,6 @@ struct RecordedRebuildFailure {
 }
 
 impl RecordedRebuildFailure {
-    /// The `stale_index` warning an answer served from `published` carries after this
-    /// failure, naming the tree revision `captured` folds to and, when that is the
-    /// published one, what `moved` instead.
-    fn stale_index(
-        &self,
-        published: &PublishedWorkspace,
-        captured: &WorkspaceDigests,
-        moved: CaptureMovement,
-    ) -> ReadWarning {
-        stale_index_warning(
-            published,
-            captured,
-            moved,
-            &StaleIndexReason::RebuildFailed(self),
-        )
-    }
-
     /// The failure's own rendering with its causes, naming the failed and observed
     /// epochs, what `served` says the answer came from, and the retry.
     ///
@@ -995,8 +1003,8 @@ struct SearchRanking {
 }
 
 impl SearchRanking {
-    /// No store ranking, for the reason `detail` states. The identifier ranking answers,
-    /// and so does any selected package index, under the shares `weights` carries.
+    /// No store ranking, for the reason `detail` states. The identifier ranking answers
+    /// alone, under the shares `weights` carries.
     fn unavailable(detail: &str, weights: RankingWeights) -> Self {
         Self {
             answer: StoreAnswer::without_store(weights),
@@ -1157,6 +1165,38 @@ async fn commit_landed(
     }
 }
 
+/// Why one read of the full-text store produced no ranking.
+#[derive(Debug)]
+enum StoreReadFailure {
+    /// The workspace database handed the read no pooled connection within
+    /// `[search] busy_timeout`, so the store answered nothing and the request
+    /// ranks without it.
+    ConnectionUnavailable,
+    /// The store refused, and the request refuses with it.
+    Refused(ErrorData),
+}
+
+impl From<SearchError> for StoreReadFailure {
+    fn from(error: SearchError) -> Self {
+        if error.fault().is_store_connection_unavailable() {
+            tracing::warn!(
+                component = "search",
+                operation = "search.store",
+                %error,
+                "the full-text store got no pooled connection; the answer ranks without it"
+            );
+            return Self::ConnectionUnavailable;
+        }
+        Self::Refused(error.tool_error(wire::ErrorPhase::Read))
+    }
+}
+
+/// The `lexical_ranking_unavailable` detail for a store read that got no
+/// pooled connection.
+const STORE_CONNECTION_UNAVAILABLE: &str = "the workspace search database handed this request no connection: every one of its \
+     `[search] pool_slots` stayed in use past `[search] busy_timeout`, so the answer was \
+     ranked by identifier matching alone; a resent request reads the store again";
+
 /// The warning a lexical ranking cut at `matches_max` carries: hits past that bound never
 /// reach a page, so the caller narrows `query` rather than paging on.
 fn lexical_truncated(matches_max: u32) -> ReadWarning {
@@ -1239,23 +1279,27 @@ fn ready_in(files: u64, prepared: u64, total: u64) -> WireDuration {
     }
 }
 
-/// The `[search.vector]` table every unit-test fixture in this crate declares.
+/// The `[search.vector]` and `[dependencies]` tables every unit-test fixture in this crate
+/// declares.
 ///
 /// Rift ships the vector ranking on, so a fixture carrying no `rift.toml` would acquire the
 /// default model from the hub. A hermetic suite must not write into the developer's own
 /// Hugging Face cache, and on a runner with no network a default-on tier would spend its
-/// whole retry budget inside a detached task nobody waits on. The integration suites
-/// declare the same table from `tests/hermetic_search.rs`: a unit test and an integration
-/// test are two crates, and one value shared between them would have to leave the
-/// library's public surface.
+/// whole retry budget inside a detached task nobody waits on. The standard library version
+/// probes run by default too, and answer from the machine's own `rustc` and `node`, so
+/// `resolution = "static"` keeps a fixture's package context on its pins alone. The
+/// integration suites declare the same tables from `tests/hermetic_search.rs`: a unit test
+/// and an integration test are two crates, and one value shared between them would have to
+/// leave the library's public surface.
 ///
 /// Three fixtures do not use it. Two drive `[search.vector]` themselves and neither
 /// reaches a network. The third serves a `rift.toml` acceptance refuses, where
 /// [`RiftMcp::build`]'s own gate is what holds the acquisition back.
 #[cfg(test)]
-pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
+pub(crate) const HERMETIC_TABLES: &str =
+    "[search.vector]\ndisabled = true\n\n[dependencies]\nresolution = \"static\"\n";
 
-/// Writes `root`'s `rift.toml`: the disabling table, then `configuration`.
+/// Writes `root`'s `rift.toml`: the hermetic tables, then `configuration`.
 ///
 /// A table header ends where the next one begins, so a fixture's own table follows
 /// unchanged and still proves whatever it carries.
@@ -1265,7 +1309,7 @@ pub(crate) const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 /// Returns the write's own failure.
 #[cfg(test)]
 pub(crate) fn hermetic_workspace(root: &Path, configuration: &str) -> std::io::Result<()> {
-    let contents = format!("{VECTOR_DISABLED}{configuration}");
+    let contents = format!("{HERMETIC_TABLES}{configuration}");
     std::fs::write(root.join("rift.toml"), contents)
 }
 
@@ -1299,10 +1343,6 @@ pub struct RiftMcp {
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
     /// through it before its snapshot becomes current.
     lexical: Option<LexicalLane>,
-    /// The package branch every published snapshot answers a `global` or `all` lookup
-    /// from. The first such read fills it.
-    #[cfg(test)]
-    dependencies: Arc<PackageBranch>,
     /// The workspace's recorded diagnostics, absent when the store could not be
     /// opened at startup; `rift://logs` then answers with that reason rather
     /// than refusing. The handle is the read side alone: the drain task that
@@ -1352,7 +1392,7 @@ impl AssembledServer {
     }
 }
 
-#[tool_router(router = tool_router, vis = "pub(crate)")]
+#[tool_router(router = declared_tool_router, vis = "pub(crate)")]
 impl RiftMcp {
     /// Builds server from one direct-workspace snapshot, applying the
     /// accepted `rift.toml`'s `[source]` policy to the initial index and its
@@ -1369,17 +1409,28 @@ impl RiftMcp {
     ///
     /// Dropping this future discards construction. An accepted blocking scan
     /// finishes in the bounded executor before releasing its capacity permit.
+    ///
+    /// The server names itself as [`BuildCheckout::Unversioned`]: no binary's
+    /// build script recorded a checkout for a server built in-process.
     pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
-        Self::build_at(absolute_root(root)?, limits, None).await
+        Self::build_at(
+            absolute_root(root)?,
+            limits,
+            None,
+            BuildCheckout::Unversioned,
+        )
+        .await
     }
 
-    /// Builds against storage already opened by the serving process.
+    /// Builds against storage already opened by the serving process, naming
+    /// the build `checkout` describes.
     pub(crate) async fn build_with_storage(
         root: &Path,
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
+        checkout: BuildCheckout,
     ) -> Result<Self, ReadError> {
-        Self::build_at(absolute_root(root)?, limits, Some(storage)).await
+        Self::build_at(absolute_root(root)?, limits, Some(storage), checkout).await
     }
 
     async fn resolve_storage(root: &Path, storage: Option<WorkspaceStorage>) -> WorkspaceStorage {
@@ -1402,21 +1453,34 @@ impl RiftMcp {
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        checkout: BuildCheckout,
     ) -> Result<Self, ReadError> {
-        let assembled = Self::assemble(root, limits, storage, LexicalLane::spawn).await?;
+        let assembled = Self::assemble(
+            root,
+            limits,
+            storage,
+            checkout,
+            workspace_watcher,
+            LexicalLane::spawn,
+        )
+        .await?;
         Ok(assembled.supervised().await)
     }
 
-    /// Builds every part of one server except its index supervisor task, with the lexical
-    /// lane `spawn_lexical` opens over the search index.
+    /// Builds every part of one server except its index supervisor task, with the watcher
+    /// `watch` starts over the root and the lexical lane `spawn_lexical` opens over the
+    /// search index. The server names the build `checkout` describes, and the lexical lane
+    /// keys the rows it derives on that build's product version.
     ///
     /// [`AssembledServer::supervised`] starts the supervisor. A test that drives the
-    /// published state itself holds the parts instead, and one that gates the lexical
-    /// store spawns the lane over that store.
+    /// published state itself holds the parts instead and watches no path, and one that
+    /// gates the lexical store spawns the lane over that store.
     async fn assemble(
         root: PathBuf,
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
+        checkout: BuildCheckout,
+        watch: impl WatchWorkspace,
         spawn_lexical: impl FnOnce(
             Arc<SearchIndex>,
             BlockingExecutor,
@@ -1424,19 +1488,18 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
     ) -> Result<AssembledServer, ReadError> {
-        let identity = crate::identity::product_identity()
+        let identity = crate::identity::product_identity(checkout)
             .await
             .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
-        let executable_digest: Arc<str> = Arc::from(identity.executable_digest.as_str());
+        let product_version: Arc<str> = Arc::from(identity.version.as_str());
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking =
             BlockingExecutor::for_configuration(&startup_configuration.server_configuration());
         let (validation, invalidations) =
             IndexValidation::new(startup_configuration.index_limits(limits)?.files_max());
-        let watcher = Self::start_watcher(&root, &validation, &blocking).await?;
-        let packages = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
+        let watcher = Self::start_watcher(&root, &validation, &blocking, watch).await?;
         let (published, lexical_write) =
-            initial_workspace(&root, limits, &validation, &blocking, &packages).await?;
+            initial_workspace(&root, limits, &validation, &blocking).await?;
         // Direct construction delays the database open until the initial scan proves the
         // workspace root. A serving process supplies the owner it opened for foreground log
         // capture; that path creates `.rift` only below an already-existing root.
@@ -1455,7 +1518,7 @@ impl RiftMcp {
             &published,
             lexical_write,
             |index, cancellation| {
-                spawn_lexical(index, blocking.clone(), cancellation, executable_digest)
+                spawn_lexical(index, blocking.clone(), cancellation, product_version)
             },
         );
         // The log store shares the database owner without depending on index readiness. Its
@@ -1474,7 +1537,6 @@ impl RiftMcp {
             blocking: blocking.clone(),
             population: population.clone(),
             lexical: lexical.clone(),
-            dependencies: Arc::clone(&packages),
         };
         if let (Some(index), Some(lane), Some(acquisition)) =
             (search_index.as_ref(), population.as_ref(), acquisition)
@@ -1502,8 +1564,6 @@ impl RiftMcp {
             ranking_weights,
             global: Arc::new(GlobalState::default()),
             lexical,
-            #[cfg(test)]
-            dependencies: packages,
             logs,
             engines,
             #[cfg(test)]
@@ -1518,17 +1578,18 @@ impl RiftMcp {
         })
     }
 
-    /// Starts the filesystem watcher over `root` on the worker pool.
+    /// Starts the filesystem watcher `watch` creates over `root`, on the worker pool.
     async fn start_watcher(
         root: &Path,
         validation: &Arc<IndexValidation>,
         blocking: &BlockingExecutor,
+        watch: impl WatchWorkspace,
     ) -> Result<notify::RecommendedWatcher, ReadError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
         blocking
             .run("workspace watch setup", move || {
-                workspace_watcher(&watch_root, &watch_validation)
+                watch(&watch_root, &watch_validation)
             })
             .instrument(tracing::info_span!(
                 "index.watch",
@@ -1617,9 +1678,11 @@ impl RiftMcp {
     /// `source`. `include: ["history"]` adds each hit's version-control timeline,
     /// walked from the served revision. `rev` serves the lookup from a
     /// version-control revision instead of the current tree. `scope` reaches
-    /// past the project tree: `global` answers from the public declarations of
-    /// the cataloged packages alone, `all` from both, project hits first. Use
-    /// `search` when the name is not exactly known.
+    /// past the project tree: `global` answers from the public declarations the
+    /// global index holds for the workspace's dependencies alone, `all` from both,
+    /// project hits first. `packages` names package versions the lookup reads beside the
+    /// workspace's own, such as an upgrade target or a package the project does not use
+    /// yet. Use `search` when the name is not exactly known.
     #[tool]
     async fn get_symbol(
         &self,
@@ -1633,7 +1696,11 @@ impl RiftMcp {
             .await
     }
 
-    /// Routes one current-tree package lookup through global data and selected local fallback.
+    /// Routes one current-tree lookup whose `scope` reaches packages: the project hits
+    /// come from the published snapshot, the package hits from the global index, which
+    /// resolves the snapshot's dependency context with the request's `packages` applied.
+    /// A route the global API did not answer, or a remote read that failed, leaves the
+    /// project hits alone with the typed global warning.
     async fn current_tree_get_symbol(
         &self,
         params: GetSymbolParams,
@@ -1642,7 +1709,11 @@ impl RiftMcp {
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let context = Arc::clone(resolved.published.reads.dependency_context());
+        let context = resolved
+            .published
+            .reads
+            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
@@ -1667,11 +1738,11 @@ impl RiftMcp {
                         remote.items
                     }
                     Ok(Err(error)) => {
-                        route.discard_remote(&context, &error);
+                        route.discard_remote(&error);
                         Vec::new()
                     }
                     Err(_) => {
-                        route.discard_remote(&context, &rift_cloud_client::ClientError::Deadline);
+                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
                         Vec::new()
                     }
                 }
@@ -1681,31 +1752,14 @@ impl RiftMcp {
         let mut collected = params.clone();
         collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
         collected.page_index = 0;
-        let fallback_context = Arc::clone(&route.fallback_context);
-        let answer = self
-            .current_tree_read(&resolved, move |reads| {
-                reads.get_symbol_with_dependency_context(&collected, &fallback_context)
-            })
-            .await?;
-        let mut answer = match merge_symbols(&params, answer.0, remote) {
-            Ok(mut answer) => {
-                answer.warnings.append(&mut remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&context, &error);
-                let mut collected = params.clone();
-                collected.limit = rift_protocol::read::PAGE_LIMIT_MAX;
-                collected.page_index = 0;
-                let fallback_context = Arc::clone(&route.fallback_context);
-                self.current_tree_read(&resolved, move |reads| {
-                    reads.get_symbol_with_dependency_context(&collected, &fallback_context)
-                })
-                .await?
-                .0
-            }
-        };
-        apply_global_warnings(&mut answer.warnings, &route);
+        let local = self
+            .current_tree_read(&resolved, move |reads| reads.get_symbol(&collected))
+            .await?
+            .0;
+        let mut answer = merge_symbols(&params, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.append(&mut remote_warnings);
+        answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
 
@@ -1715,9 +1769,11 @@ impl RiftMcp {
     /// declarations two committed revisions hold differently, in place of `query` and
     /// `traversal`. `rev` searches a version-control revision instead of the current tree,
     /// and never combines with `traversal` or `change`. `scope` reaches past the project
-    /// tree: `global` answers `query` from the public declarations of the cataloged
-    /// packages alone, `all` from both, ordered together. Use `get_symbol` when the
-    /// declaration name is known.
+    /// tree: `global` answers `query` from the public declarations the global index holds
+    /// for the workspace's dependencies alone, `all` from both, ordered together.
+    /// `packages` names package versions `query` searches beside the workspace's own, such
+    /// as an upgrade target or a package the project does not use yet. Use `get_symbol`
+    /// when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -1861,7 +1917,11 @@ impl RiftMcp {
             .await
     }
 
-    /// Routes one current-tree search through global data and selected local fallback.
+    /// Routes one current-tree search: the project hits come from the published snapshot,
+    /// and a `query` whose `scope` reaches packages adds the global index's package hits,
+    /// ordered together, for the snapshot's dependency context with the request's
+    /// `packages` applied. A route the global API did not answer, or a remote read that
+    /// failed, leaves the project hits alone with the typed global warning.
     async fn route_current_tree_search(
         &self,
         resolved: ResolvedWorkspace,
@@ -1871,22 +1931,7 @@ impl RiftMcp {
         references: EngineReferences,
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        if params.scope == SearchScope::Local {
-            let mut answer = self
-                .current_tree_search_selected(
-                    &resolved,
-                    params,
-                    answer,
-                    Arc::new(references),
-                    Arc::clone(resolved.published.reads.dependency_context()),
-                )
-                .await?;
-            answer.0.warnings.extend(warnings);
-            return Ok(answer);
-        }
-
         let references = Arc::new(references);
-        let context = Arc::clone(resolved.published.reads.dependency_context());
         let parsed = params
             .query
             .as_deref()
@@ -1894,21 +1939,21 @@ impl RiftMcp {
         let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
             .then_some(parsed)
             .flatten();
-        let Some(parsed) = remote_query else {
-            let selected = Arc::new(context.filter_entries(|_| false));
+        let (Some(parsed), false) = (remote_query, params.scope == SearchScope::Local) else {
             let mut answer = self
-                .current_tree_search_selected(&resolved, params, answer, references, selected)
+                .current_tree_search_selected(&resolved, params, answer, references)
                 .await?;
-            answer
-                .0
-                .warnings
-                .retain(|warning| !matches!(warning, ReadWarning::GlobalIndexUnavailable { .. }));
             answer.0.warnings.extend(warnings);
             return Ok(answer);
         };
 
+        let context = resolved
+            .published
+            .reads
+            .read_context(params.scope, params.rev.as_ref(), &params.packages)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         let configuration = resolved.published.configuration.global_configuration();
-        let (mut route, mut remote) = self
+        let (route, mut remote) = self
             .global_search_candidates(deadline, &configuration, &context, &params, &parsed)
             .await;
         let remote_warnings = std::mem::take(&mut remote.warnings);
@@ -1916,36 +1961,14 @@ impl RiftMcp {
         collected.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
         collected.page_index = 0;
         let mut local = self
-            .current_tree_search_selected(
-                &resolved,
-                collected.clone(),
-                answer.clone(),
-                Arc::clone(&references),
-                Arc::clone(&route.fallback_context),
-            )
-            .await?;
-        local.0.warnings.extend(warnings.clone());
-        let mut answer = match merge_search(&params, local.0, remote) {
-            Ok(mut answer) => {
-                answer.warnings.extend(remote_warnings);
-                answer
-            }
-            Err(error) => {
-                route.discard_remote(&context, &error);
-                let mut fallback = self
-                    .current_tree_search_selected(
-                        &resolved,
-                        collected,
-                        answer,
-                        references,
-                        Arc::clone(&route.fallback_context),
-                    )
-                    .await?;
-                fallback.0.warnings.extend(warnings);
-                fallback.0
-            }
-        };
-        apply_global_warnings(&mut answer.warnings, &route);
+            .current_tree_search_selected(&resolved, collected, answer, references)
+            .await?
+            .0;
+        local.warnings.extend(warnings);
+        let mut answer = merge_search(&params, local, remote)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        answer.warnings.extend(remote_warnings);
+        answer.warnings.extend(route.warnings());
         Ok(Json(answer))
     }
 
@@ -1982,11 +2005,11 @@ impl RiftMcp {
                 {
                     Ok(Ok(remote)) => remote,
                     Ok(Err(error)) => {
-                        route.discard_remote(context, &error);
+                        route.discard_remote(&error);
                         GlobalSearchCandidates::default()
                     }
                     Err(_) => {
-                        route.discard_remote(context, &rift_cloud_client::ClientError::Deadline);
+                        route.discard_remote(&rift_cloud_client::ClientError::Deadline);
                         GlobalSearchCandidates::default()
                     }
                 }
@@ -1996,23 +2019,17 @@ impl RiftMcp {
         (route, remote)
     }
 
-    /// Executes one search with package work limited to `dependency_context`.
+    /// Executes one search against the published snapshot `resolved` captured.
     async fn current_tree_search_selected(
         &self,
         resolved: &ResolvedWorkspace,
         params: SearchParams,
         answer: StoreAnswer,
         references: Arc<EngineReferences>,
-        dependency_context: Arc<rift_dependency::DependencyContext>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         rift_core::traced_async!(component = "search", operation = "search.read", {
             self.current_tree_read(resolved, move |reads| {
-                reads.search_with_references_and_dependency_context(
-                    &params,
-                    &answer,
-                    &references,
-                    &dependency_context,
-                )
+                reads.search_with_references(&params, &answer, &references)
             })
             .await
         })
@@ -2103,18 +2120,17 @@ impl RiftMcp {
     /// lexical lane is still committing this tree into once `deadline` passed, and one
     /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
     /// search to answer alone. A query-term limit the index refuses surfaces as this
-    /// request's own `limit_exceeded` error, never a silent degrade. A `dependencies`
-    /// scope never consults the index: the ranked lane serves the project alone, so
-    /// nothing about it rides that answer.
+    /// request's own `limit_exceeded` error, never a silent degrade. A `global` scope
+    /// never consults the index: the ranked lane serves the project alone, so nothing
+    /// about it rides that answer.
     async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
         deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
-        // A global scope never consults the project store, and a selected package index
-        // answers the full-text input from its own documents, so the shares stay what the
-        // operator configured.
+        // A global scope never consults the project store: the project answers no hit,
+        // and the package hits come from the global index.
         if params.scope == SearchScope::Global {
             return Ok(Some(SearchRanking::without_store(self.ranking_weights)));
         }
@@ -2137,12 +2153,21 @@ impl RiftMcp {
             return Ok(Some(SearchRanking::default()));
         };
         let tree_revision = published.reads.tree_revision();
-        let (searched, commit_state) =
-            rift_core::traced_async!(component = "search", operation = "search.store", {
-                self.store_answer(index, tree_revision, &parsed, deadline)
-                    .await
-            })
-            .await?;
+        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            self.store_answer(index, tree_revision, &parsed, deadline)
+                .await
+        })
+        .await;
+        let (searched, commit_state) = match stored {
+            Ok(stored) => stored,
+            Err(StoreReadFailure::ConnectionUnavailable) => {
+                return Ok(Some(SearchRanking::unavailable(
+                    STORE_CONNECTION_UNAVAILABLE,
+                    self.ranking_weights,
+                )));
+            }
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
         Ok(ranking_of(
             searched,
             published.reads.file_count(),
@@ -2164,7 +2189,7 @@ impl RiftMcp {
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-    ) -> Result<RevisionScoped<PhasedRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
         let precise = self
             .run_phase(index, tree_revision, query, QueryPhase::Precise)
             .await?;
@@ -2211,7 +2236,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         phase: QueryPhase,
-    ) -> Result<RevisionScoped<StoreRanking>, ErrorData> {
+    ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
         tracing::debug!(
             component = "search",
             operation = "search.rank",
@@ -2224,7 +2249,7 @@ impl RiftMcp {
         index
             .rank(tree_revision, query, phase, self.fetch_limit())
             .await
-            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+            .map_err(StoreReadFailure::from)
     }
 
     /// The store's answer for `tree_revision` and where that revision stands with the
@@ -2246,7 +2271,7 @@ impl RiftMcp {
         tree_revision: &str,
         query: &ParsedQuery,
         deadline: RequestDeadline,
-    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), ErrorData> {
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
         let searched = self.read_store(index, tree_revision, query).await?;
         let Some(lane) = self.lexical.as_ref() else {
             return Ok((searched, LexicalCommitState::Settled));
@@ -2354,7 +2379,7 @@ impl RiftMcp {
                 .index_limits(self.limits)
                 .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
             visibility: SourceVisibility::from(&configuration.source),
-            text_inclusion: rift_core::TextFileInclusion::from(&configuration.search),
+            text_inclusion: rift_core::TextFileInclusion::from(&configuration),
             languages: rift_core::LanguageFileSelections::from(&configuration),
             history: configuration.providers.history.clone(),
         })
@@ -2473,10 +2498,11 @@ impl RiftMcp {
     /// The capture reads every visible file to decide whether the publication still answers
     /// for this request, so it already knows which files moved. A request that finds the
     /// tree ahead of the publication names those files, and the rebuild it waits for
-    /// reparses them alone; only a moved `rift.toml` and a capture that failed ask for the
-    /// whole workspace. A read that finds the tree ahead of a publication whose rebuild
-    /// failed waits for nothing: it answers from that publication and says so, and the
-    /// next filesystem event retries the rebuild.
+    /// reparses them alone; a moved `rift.toml`, a capture that failed, and a file whose
+    /// inclusion an ignore file moved ask for the whole workspace (see
+    /// [`Self::rebuild_reaches_capture`]). A read that finds the tree ahead of a
+    /// publication whose rebuild failed waits for nothing: it answers from that publication
+    /// and says so, and the next filesystem event retries the rebuild.
     ///
     /// The first is the filesystem epoch, which counts observations rather than content.
     /// [`IndexValidation::observe_locked`] increments it for every classified event, and
@@ -2486,104 +2512,179 @@ impl RiftMcp {
     /// publication whenever the capture folds to its fingerprint under its configuration,
     /// whatever the epoch counter reads.
     ///
-    /// The second is the attempt budget. A successful superseded capture already proves
-    /// movement: a read checks the tree once and answers stale with that recorded epoch.
-    /// A read without that completed work that spends its capture budget answers from the
-    /// publication the last attempt resolved and carries a `stale_index` warning naming
-    /// what that attempt's capture found ahead. This keeps a workspace under back-to-back
-    /// rebuilds readable, and each attempt still asks for a rebuild. Configuration movement
-    /// waits for acceptance and publication before the next capture; the last capture
-    /// refuses if its configuration moved.
+    /// The second is the attempt budget. Each attempt that finds the tree ahead asks for a
+    /// rebuild and waits for its publication, and a read that spends the budget answers from
+    /// the publication the last attempt resolved, with a `stale_index` warning naming what
+    /// that attempt's capture found ahead. Configuration movement waits for acceptance and
+    /// publication before the next capture; the last capture refuses if its configuration
+    /// moved.
+    ///
+    /// A successful capture superseded after the read's last capture began wakes the read
+    /// before that publication, and the read captures again. A capture that differs from
+    /// the previous one proves the tree moved during the read, so the read answers stale
+    /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
+    /// readable.
+    ///
+    /// A capture that matches the previous one proves no movement. The observation that
+    /// superseded the rebuild reported what the read had already captured, such as the
+    /// watcher's late report of the `.gitignore` write the read found, so the read asks for
+    /// nothing again and spends no attempt. It waits again, and only a later supersession or
+    /// a publication wakes it, so the readiness deadline bounds how often that repeats.
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<ResolvedWorkspace, ErrorData> {
         let mut spent = None;
         let mut wait = ReadWait::Capture;
-        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+        let mut previous: Option<PreviousCapture> = None;
+        let mut attempts = 0;
+        while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
-            let capture = self.capture_tree(&current).await;
-            let (digests, configuration_fingerprint) = match capture {
-                Ok(capture) => capture,
-                Err(error) => {
-                    let _ = self.validation.observe_whole_workspace();
-                    return Err(error.tool_error(phase));
-                }
-            };
+            let superseded_seen = self.validation.superseded_epoch();
+            let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
+            let tree = digests.fingerprint();
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
-            let tree_matches =
-                digests.fingerprint() == current.fingerprint && configuration_matches;
-            if tree_matches {
+            if tree == current.fingerprint && configuration_matches {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
             let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
             let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
             if let Some(failure) = rebuild_failure {
-                current.configuration.accepted(phase)?;
-                let stale = moved.map(|moved| failure.stale_index(&current, &digests, moved));
-                return Ok(ResolvedWorkspace {
-                    published: current,
-                    stale,
-                });
+                let reason = StaleIndexReason::RebuildFailed(&failure);
+                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
             }
-            let observed = if configuration_matches {
-                self.validation
-                    .observe_paths(changes.iter().map(|(path, _)| path.clone()))
-            } else {
-                self.validation.observe_whole_workspace()
-            };
-            observed.map_err(|error| error.tool_error(phase))?;
+            let owed_publication = previous.as_ref().is_some_and(|previous| {
+                previous.awaits_publication(&current, &tree, configuration_fingerprint)
+            });
+            if configuration_matches && owed_publication {
+                wait = ReadWait::Rebuild { superseded_seen };
+                continue;
+            }
+            let moved_since_previous = previous
+                .as_ref()
+                .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
+            attempts += 1;
+            let requested_epoch = self
+                .request_rebuild(&current, &changes, configuration_matches, phase)
+                .await?;
             if configuration_matches
-                && let Some(epoch) = self.validation.superseded_after(current.epoch)
+                && let Some(previous) = moved_since_previous
+                && let Some(epoch) = self
+                    .validation
+                    .superseded_after(current.epoch.max(previous.superseded_seen))
             {
-                current.configuration.accepted(phase)?;
-                let stale = moved.map(|moved| {
-                    stale_index_warning(
-                        &current,
-                        &digests,
-                        moved,
-                        &StaleIndexReason::RebuildSuperseded {
-                            epoch,
-                            changes: &changes,
-                        },
-                    )
-                });
-                return Ok(ResolvedWorkspace {
-                    published: current,
-                    stale,
-                });
+                let reason = StaleIndexReason::RebuildSuperseded {
+                    epoch,
+                    changes: &changes,
+                };
+                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
             }
             wait = if configuration_matches {
-                ReadWait::Rebuild
+                ReadWait::Rebuild { superseded_seen }
             } else {
                 ReadWait::Configuration
             };
+            previous = Some(PreviousCapture {
+                tree,
+                configuration: configuration_fingerprint,
+                requested_epoch,
+                superseded_seen,
+            });
             spent = Some((current, digests, changes, moved));
         }
-        if matches!(wait, ReadWait::Rebuild)
+        if matches!(wait, ReadWait::Rebuild { .. })
             && let Some((current, digests, changes, moved)) = spent
         {
-            current.configuration.accepted(phase)?;
-            let stale = moved.map(|moved| {
-                stale_index_warning(
-                    &current,
-                    &digests,
-                    moved,
-                    &StaleIndexReason::TreeKeptMoving { changes: &changes },
-                )
-            });
-            return Ok(ResolvedWorkspace {
-                published: current,
-                stale,
-            });
+            let reason = StaleIndexReason::TreeKeptMoving { changes: &changes };
+            return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
         }
         Err(ReadFault::unavailable(
             "current workspace read",
             "workspace changed across bounded reconciliation attempts",
         )
         .tool_error(phase))
+    }
+
+    /// Captures the tree one reconciliation attempt compares with `current`.
+    ///
+    /// A capture that fails says nothing about which files moved, so it asks for the whole
+    /// workspace before the read refuses with the capture's own failure.
+    async fn capture_read(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ErrorData> {
+        self.capture_tree(current).await.map_err(|error| {
+            let _ = self.validation.observe_whole_workspace();
+            error.tool_error(phase)
+        })
+    }
+
+    /// Asks the index supervisor for the rebuild one capture found owed.
+    ///
+    /// The request names the paths in `changes` when a rebuild naming them reaches what the
+    /// capture read, and asks for the whole workspace otherwise. It answers the observation
+    /// epoch the request moved the counter to.
+    async fn request_rebuild(
+        &self,
+        current: &Arc<PublishedWorkspace>,
+        changes: &PathChanges,
+        configuration_matches: bool,
+        phase: wire::ErrorPhase,
+    ) -> Result<u64, ErrorData> {
+        let observed = if configuration_matches
+            && self
+                .rebuild_reaches_capture(current, changes, phase)
+                .await?
+        {
+            self.validation
+                .observe_paths(changes.iter().map(|(path, _)| path.clone()))
+        } else {
+            self.validation.observe_whole_workspace()
+        };
+        observed.map_err(|error| error.tool_error(phase))
+    }
+
+    /// Whether a rebuild naming the paths in `changes` reaches what the capture that found
+    /// them read, decided on the worker pool.
+    ///
+    /// The capture walks the tree under the `.gitignore` files on disk, while a rebuild
+    /// that names paths reads each one under the ignore files `current` compiled when it
+    /// was built. A file an ignore file started or stopped excluding therefore reads there
+    /// exactly as `current` holds it, so a rebuild naming it changes nothing. Only a rebuild
+    /// of the whole workspace compiles the ignore files again.
+    ///
+    /// The watcher asks for that rebuild when it reports the ignore file's write, but a
+    /// read cannot wait on the report: a slow runner delivers it after every capture
+    /// attempt has asked for the same no-op rebuild and the read has answered stale.
+    ///
+    /// An ignore file decides whether a file is recorded, never its bytes, so only the
+    /// files the capture found added or removed are read. A capture that found only
+    /// modified files reads nothing and enters no pool.
+    async fn rebuild_reaches_capture(
+        &self,
+        current: &Arc<PublishedWorkspace>,
+        changes: &PathChanges,
+        phase: wire::ErrorPhase,
+    ) -> Result<bool, ErrorData> {
+        let added_or_removed: BTreeSet<rift_core::ProjectPath> = changes
+            .iter()
+            .filter(|(_, change)| !matches!(change, PathChange::Modified))
+            .map(|(path, _)| path.clone())
+            .collect();
+        if added_or_removed.is_empty() {
+            return Ok(true);
+        }
+        let published = Arc::clone(current);
+        let root = self.root.clone();
+        self.blocking
+            .run("observed path read", move || {
+                Ok(published.rebuild_moves_every(&root, &added_or_removed))
+            })
+            .await
+            .map_err(|error| error.tool_error(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
@@ -2627,11 +2728,12 @@ impl RiftMcp {
     /// carries the failure.
     ///
     /// A read's first capture compares content even when observations are ahead. Changed
-    /// source then waits for publication, unless a successful capture after the current
-    /// publication was superseded. That completed work proves continued movement, so the
-    /// read reaches its bounded captures and stale answer without waiting for a publication
-    /// the moving tree keeps superseding. A later publication makes that exception
-    /// obsolete. Configuration movement keeps waiting for the epochs to agree.
+    /// source then waits for publication, unless a successful capture was superseded after
+    /// the current publication and after the read's last capture began. The read then
+    /// captures again rather than wait for a publication a moving tree keeps superseding,
+    /// and that capture decides whether the tree moved. A supersession recorded before the
+    /// read's last capture began wakes nothing: that capture already read what came after
+    /// it. Configuration movement keeps waiting for the epochs to agree.
     ///
     /// Every other job of this loop stands for a read: a watcher the backend reported
     /// broken refuses, a supervisor that stopped refuses while the epochs disagree, and a
@@ -2689,7 +2791,10 @@ impl RiftMcp {
             }
             let capture = match wait {
                 ReadWait::Capture => true,
-                ReadWait::Rebuild => self.validation.superseded_after(current.epoch).is_some(),
+                ReadWait::Rebuild { superseded_seen } => self
+                    .validation
+                    .superseded_after(current.epoch.max(superseded_seen))
+                    .is_some(),
                 ReadWait::Configuration => false,
             };
             if capture {
@@ -3292,14 +3397,14 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use crate::validation::RebuildRequest;
-    use crate::validation::tests::empty_package_branch;
 
     use super::{BlockingExecutor, Parameters, RequestDeadline, RiftMcp};
+    use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
         LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
         RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, rebuild_workspace,
-        record_rebuild_failure, workspace_capture,
+        record_rebuild_failure, unwatched, workspace_capture,
     };
     use rift_core::ProjectPath as CoreProjectPath;
 
@@ -3345,7 +3450,6 @@ mod tests {
             root,
             WorkspaceIndexLimits::default(),
             &RebuildRequest::initial(epoch),
-            &empty_package_branch(),
         )? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
@@ -3533,6 +3637,66 @@ mod tests {
                 .await?
                 .hits
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    /// The watcher here watches no path, so every observation comes from a read's own
+    /// capture: a read after a `.gitignore` write answers from the ignore files on disk
+    /// however late the watcher reports that write.
+    #[tokio::test]
+    async fn ignore_file_changes_reach_a_read_without_a_watcher_event() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("policy.rs"),
+            "pub fn policy_hidden() {}\n",
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let root = super::absolute_root(directory.path())?;
+        let limits = WorkspaceIndexLimits::default();
+        let assembled = RiftMcp::assemble(
+            root,
+            limits,
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            unwatched,
+            LexicalLane::spawn,
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::write(directory.path().join(".gitignore"), "policy.rs\n")?;
+        let hidden = get_symbol(&server, "policy_hidden").await?;
+        assert!(
+            hidden.hits.is_empty(),
+            "a read after the ignore file hid policy.rs must not answer from it: {hidden:?}"
+        );
+        assert!(
+            !hidden
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "a read after the ignore file changed must answer from a current publication: \
+             {hidden:?}"
+        );
+
+        fs::remove_file(directory.path().join(".gitignore"))?;
+        let shown = get_symbol(&server, "policy_hidden").await?;
+        assert_eq!(
+            shown.hits.len(),
+            1,
+            "a read after the ignore file was removed must answer from policy.rs again: \
+             {shown:?}"
+        );
+        assert!(
+            !shown
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "a read after the ignore file was removed must answer from a current \
+             publication: {shown:?}"
         );
         Ok(())
     }
@@ -4267,8 +4431,8 @@ mod tests {
     /// budget a waiting read spends is far longer.
     const UNWAITED_READ_MAX: Duration = Duration::from_secs(5);
 
-    /// A server whose index supervisor is not running and whose watcher is gone, so the
-    /// observations and the failure a test records are the only ones the published state
+    /// A server whose index supervisor is not running and whose watcher watches no path, so
+    /// the observations and the failure a test records are the only ones the published state
     /// sees. The invalidation receiver stays open so an observation still lands.
     struct UnsupervisedServer {
         server: RiftMcp,
@@ -4284,21 +4448,26 @@ mod tests {
         Ok((directory, assembled))
     }
 
-    /// Assembles a server over `root` and drops its watcher.
+    /// Assembles a server over `root` with a watcher on no path.
+    ///
+    /// A native watcher dropped after assembly would still have watched the initial build,
+    /// and on Windows its drop only asks the watch thread to stop, so a report of the
+    /// fixture's own writes could land in either window.
     async fn unsupervised_server(root: &std::path::Path) -> TestResult<UnsupervisedServer> {
         let super::AssembledServer {
             server,
-            watcher,
+            watcher: _,
             invalidations,
             context,
         } = RiftMcp::assemble(
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
+            crate::identity::BuildCheckout::Unversioned,
+            unwatched,
             LexicalLane::spawn,
         )
         .await?;
-        drop(watcher);
         Ok(UnsupervisedServer {
             server,
             context,
@@ -4711,7 +4880,7 @@ mod tests {
         stale_index_of(&run_search(server, "beacon").await?.warnings)?;
 
         let request = server.validation.take_pending();
-        let capture = workspace_capture(&assembled.context.dependencies);
+        let capture = workspace_capture();
         let outcome = rebuild_workspace(&assembled.context, request, capture).await?;
         assert_eq!(outcome, RebuildOutcome::Published);
 
@@ -4901,13 +5070,12 @@ mod tests {
     async fn supersede_rebuild(assembled: &UnsupervisedServer, next_source: String) -> TestResult {
         let server = &assembled.server;
         let validation = Arc::clone(&server.validation);
-        let dependencies = Arc::clone(&server.dependencies);
         let path = CoreProjectPath::new("lib.rs")?;
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
             move |root: &std::path::Path, limits, request: &RebuildRequest| {
-                let candidate = build_workspace_candidate(root, limits, request, &dependencies)?;
+                let candidate = build_workspace_candidate(root, limits, request)?;
                 assert!(matches!(candidate, WorkspaceCandidate::Stable { .. }));
                 fs::write(root.join("lib.rs"), &next_source)
                     .expect("the later source edit must land");
@@ -4920,11 +5088,13 @@ mod tests {
         Ok(())
     }
 
-    /// Successful captures can all be superseded before publication. The recorded
-    /// completed work lets a later read answer from the existing snapshot with its warning.
+    /// Captures superseded before a read began say nothing about the tree that read
+    /// captures, so the read waits for the rebuild it asked for and answers current.
     #[tokio::test]
-    async fn a_read_after_successful_superseded_rebuilds_answers_without_publication() -> TestResult
-    {
+    async fn a_read_after_superseded_rebuilds_waits_for_its_own_rebuild() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         let path = CoreProjectPath::new("lib.rs")?;
@@ -4934,51 +5104,126 @@ mod tests {
             supersede_rebuild(&assembled, format!("pub fn lantern{round}() {{}}\n")).await?;
             assert_eq!(server.published.read().await.current.epoch, 0);
         }
-        let (published, failure) = server.published.read().await.snapshot();
-        assert_eq!(published.epoch, 0);
-        assert!(
-            failure.is_none(),
-            "successful captures record no rebuild failure"
-        );
-        let (expected_capture, _) = captured_tree(directory.path(), &published)?;
-        let expected_revision = super::wire_digest(
-            expected_capture
-                .tree_revision()
-                .ok_or("captured tree revision")?,
-        );
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let rounds = Arc::clone(&calls);
+        let superseded = server
+            .validation
+            .superseded_after(0)
+            .ok_or("every round recorded its superseded capture")?;
         let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
         server.force_capture(move |current| {
-            let round = rounds.fetch_add(1, Ordering::Relaxed);
-            if round != 0 {
-                return Err(ReadFault::unavailable(
-                    "test capture",
-                    "a second capture repeats proven movement",
-                ));
-            }
+            rounds.fetch_add(1, Ordering::Relaxed);
             captured_tree(&root, current)
         });
 
-        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(server, "beacon"))
+        let latest = format!("lantern{}", super::INDEX_CAPTURE_ATTEMPTS_MAX);
+        let mut waiting = Box::pin(get_symbol(server, &latest));
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a capture superseded at epoch {superseded}, before the read began, must \
+                 not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
             .await
-            .map_err(
-                |_| "a read must not wait for a publication superseded builds cannot produce",
-            )??;
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the latest source answers: {fresh:?}");
         assert!(
-            !answer.results.is_empty(),
-            "the original publication answers"
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from the publication of what it captured: {:?}",
+            fresh.warnings
         );
-        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(index, published.reads.tree_revision());
-        assert_eq!(captured, expected_revision.0);
-        assert_ne!(index, captured);
-        assert!(detail.contains("lib.rs moved"), "{detail}");
-        assert!(detail.contains("superseded before publication"), "{detail}");
+        Ok(())
+    }
+
+    /// A rebuild superseded by an observation of what the read already captured, such as
+    /// the watcher's late report of a `.gitignore` write, proves no movement. The read's
+    /// next capture matches its previous one, so it asks for nothing again and answers
+    /// from the publication that follows.
+    #[tokio::test]
+    async fn a_rebuild_superseded_by_a_late_report_leaves_the_read_waiting() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "lantern"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        assert_eq!(server.validation.observed_epoch(), 1, "the read asked once");
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                validation.observe_whole_workspace()?;
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a supersession that moved nothing must not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the supersession woke the read"
+        );
+        assert_eq!(
+            server.validation.observed_epoch(),
+            2,
+            "a capture that matches the read's previous one asks for nothing again"
+        );
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the edited source answers: {fresh:?}");
         assert!(
-            !detail.contains("bounded reconciliation attempts"),
-            "{detail}"
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from a current publication: {:?}",
+            fresh.warnings
         );
         Ok(())
     }
@@ -5014,17 +5259,31 @@ mod tests {
             1,
             "the read reached its publication wait"
         );
+        let (published, _) = server.published.read().await.snapshot();
         supersede_rebuild(&assembled, "pub fn lantern1() {}\n".to_owned()).await?;
         let stale = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
             .await
             .map_err(|_| "a superseded capture must wake the waiting read")??;
         assert_eq!(stale.hits.len(), 1);
-        stale_index_of(&stale.warnings)?;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the woken read captured the tree that moved during it"
+        );
+        let (index, captured_revision, detail) = stale_index_of(&stale.warnings)?;
+        assert_eq!(index, published.reads.tree_revision());
+        assert_ne!(index, captured_revision);
+        assert!(detail.contains("lib.rs moved"), "{detail}");
+        assert!(detail.contains("superseded before publication"), "{detail}");
+        assert!(
+            !detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
 
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
-            workspace_capture(&server.dependencies),
+            workspace_capture(),
         )
         .await?;
         assert_eq!(outcome, RebuildOutcome::Published);
@@ -5053,7 +5312,7 @@ mod tests {
         let outcome = rebuild_workspace(
             &assembled.context,
             server.validation.take_pending(),
-            workspace_capture(&server.dependencies),
+            workspace_capture(),
         )
         .await?;
         assert_eq!(outcome, RebuildOutcome::Published);
@@ -5216,21 +5475,113 @@ mod tests {
             super::absolute_root(root)?,
             WorkspaceIndexLimits::default(),
             None,
-            move |index, blocking, cancellation, executable_digest| {
+            crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
+            move |index, blocking, cancellation, product_version| {
                 gate.attach(index);
                 LexicalLane::spawn_over(
                     gate,
                     crate::validation::lexical_double::UNBOUNDED,
                     blocking,
                     cancellation,
-                    executable_digest,
+                    product_version,
+                )
+            },
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        // The first write is a whole one, and a store holding nothing it can keep is cleared
+        // before a whole write lands, so the write is held once the apply follows the clear.
+        let revision = current_publication(&server)
+            .await
+            .reads
+            .tree_revision()
+            .to_owned();
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![("clear", String::new()), ("apply", revision)]
+        );
+        Ok((server, double))
+    }
+
+    /// A server whose workspace database pools one connection, waiting at most the least
+    /// `[search] busy_timeout` for it, with its lexical lane held at the gate so no write
+    /// takes that connection; returns the database to hold the connection through.
+    async fn server_over_one_slot(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        RiftMcp,
+        Arc<StoreDouble>,
+        Arc<rift_index::WorkspaceDatabase>,
+    )> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(
+            root,
+            "\n[search]\npool_slots = 1\nbusy_timeout = \"100ms\"\n",
+        )?;
+        let storage = WorkspaceStorage::open(root).await;
+        let database = storage
+            .database()
+            .ok_or("the one-slot workspace database must open")?;
+        let double = StoreDouble::new();
+        let gate = Arc::clone(&double);
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(root)?,
+            WorkspaceIndexLimits::default(),
+            Some(storage),
+            crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
+            move |index, blocking, cancellation, product_version| {
+                gate.attach(index);
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    product_version,
                 )
             },
         )
         .await?;
         let server = assembled.supervised().await;
         double.calls_within_bound(1).await?;
-        Ok((server, double))
+        Ok((server, double, database))
+    }
+
+    /// A search whose store read meets a pool with no free connection answers from its
+    /// other rankers, warning that the full-text ranking was unavailable and naming the
+    /// slot wait, instead of refusing the whole request.
+    #[tokio::test]
+    async fn a_search_that_gets_no_pooled_connection_ranks_without_the_store() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(&server, "beacon"))
+            .await
+            .map_err(|_elapsed| "the search waited past its bound for the held connection")?
+            .map_err(|refusal| format!("the search must answer without the store: {refusal:?}"))?;
+        drop(held);
+
+        assert!(
+            answer
+                .results
+                .iter()
+                .any(|hit| format!("{hit:?}").contains("beacon")),
+            "identifier matching answers while the store is out of reach: {:?}",
+            answer.results
+        );
+        let detail = answer
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .ok_or("the answer warns that the full-text ranking was unavailable")?;
+        assert!(detail.contains("pool_slots"), "{detail}");
+        assert!(detail.contains("busy_timeout"), "{detail}");
+        Ok(())
     }
 
     /// The publication `server` currently answers from.
@@ -5510,11 +5861,16 @@ mod tests {
         Ok(())
     }
 
+    /// The server watches no path, so the epoch the detail names is the one the initial
+    /// build published.
     #[tokio::test]
     async fn a_stall_after_the_epoch_settled_names_unfinished_validation() -> TestResult {
-        let (_directory, server) = fixture().await?;
+        let (_directory, assembled) = unsupervised_fixture().await?;
 
-        let detail = server.readiness_stall(Duration::from_millis(25)).await;
+        let detail = assembled
+            .server
+            .readiness_stall(Duration::from_millis(25))
+            .await;
 
         assert!(detail.contains("the index settled at epoch 0"), "{detail}");
         assert!(
@@ -5722,9 +6078,13 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
@@ -5761,6 +6121,10 @@ mod tests {
     /// The sink captures under the workspace's own `[logs] capture` default, the filter a
     /// served workspace records under. Without it the lane also takes the storage driver's own
     /// trace records, and the read then waits out its bound behind thousands of them.
+    ///
+    /// A second lane exists in the process before the read, as it does under `cargo test`,
+    /// where every test is a thread of one process and builds its own. The read waits for the
+    /// lane its own thread records into, never the one built last.
     #[tokio::test]
     async fn a_record_emitted_before_a_read_appears_in_that_read() -> TestResult {
         use tracing_subscriber::Layer as _;
@@ -5781,9 +6145,14 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
+        let (_other_sink, _other_drain) = crate::logs::log_capture();
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
@@ -5832,9 +6201,13 @@ mod tests {
         let store = storage.logs().ok_or("the log store must open")?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
-        let server =
-            RiftMcp::build_with_storage(directory.path(), WorkspaceIndexLimits::default(), storage)
-                .await?;
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
 
         let _answered = run_search(&server, SECRET_TERM).await?;
         let logs = server.read_logs("rift://logs/component/search").await?;
@@ -6491,8 +6864,8 @@ mod tests {
             warnings[0]["detail"],
             json!("the database could not be opened")
         );
-        // A selected package index still answers the full-text input, so an absent
-        // project store must not take that share away from it.
+        // The shares stay what `[search.ranking]` states: fusion normalizes them over
+        // the inputs that answered, so an absent store takes nothing from the rest.
         assert!(
             ranking
                 .answer

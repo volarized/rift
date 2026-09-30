@@ -1327,8 +1327,8 @@
         ],
         "x-enum-descriptions": [
           "Owned by the current workspace.",
-          "Owned by one resolved dependency.",
-          "Installed with the language toolchain.",
+          "Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong\nto the npm `typescript` package, whose `lib.*.d.ts` files declare them.",
+          "Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
           "Outside the project, dependency graph, and standard library."
         ]
       },
@@ -1826,15 +1826,21 @@
         "type": "object"
       },
       "PackageAvailability": {
-        "description": "Whether a global package index can answer for one package.",
+        "description": "Whether a global package index can answer for one package, and where the entry's\nsource comes from when none can.",
         "type": "string",
         "enum": [
           "canonical",
-          "local_only"
+          "path",
+          "git",
+          "private_registry",
+          "url"
         ],
         "x-enum-descriptions": [
-          "The entry names a package a public registry serves: crates.io, npm, or the\nPython Package Index.",
-          "The entry names a path, git, or custom-registry package only this machine can\nanswer for."
+          "The entry names a package a public registry serves, crates.io, npm, or the\nPython Package Index, or a standard library: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
+          "The entry names a path outside the workspace, or an archive at a path, that only\nthis machine can read.",
+          "The entry names a git repository.",
+          "The entry names a registry other than the public one its package manager reads.",
+          "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL."
         ]
       },
       "PublicationFormat": {

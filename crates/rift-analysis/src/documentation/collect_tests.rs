@@ -862,6 +862,99 @@ fn attached_comment_blocks_keep_original_bytes_and_exact_symbol() {
 }
 
 #[test]
+fn attached_comment_blocks_keep_each_source_declaration() {
+    let first_text = "/// First documentation.\npub fn first() {}\n";
+    let second_text = "/// Second documentation.\npub fn second() {}\n";
+    let first_path = rift_core::ProjectPath::new("src/first.rs").expect("first path");
+    let second_path = rift_core::ProjectPath::new("src/second.rs").expect("second path");
+    let first_syntax = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &first_path,
+                text: first_text,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("first Rust syntax");
+    let second_syntax = RustSyntaxProvider::default()
+        .analyze(
+            SyntaxSource {
+                path: &second_path,
+                text: second_text,
+            },
+            SyntaxLimits::default(),
+        )
+        .expect("second Rust syntax");
+    let first_symbol = &first_syntax.symbols()[0];
+    let second_symbol = &second_syntax.symbols()[0];
+    let first_symbol_id = SymbolId(rift_core::symbol_identity(
+        &first_syntax.language().identity_segment(),
+        first_path.as_str(),
+        &first_symbol.qualified_name,
+    ));
+    let second_symbol_id = SymbolId(rift_core::symbol_identity(
+        &second_syntax.language().identity_segment(),
+        second_path.as_str(),
+        &second_symbol.qualified_name,
+    ));
+    let first_identity = source("src/first.rs", first_text).identity;
+    let second_identity = source("src/second.rs", second_text).identity;
+    let first_declaration = DocumentationDeclaration::new(
+        &first_symbol_id,
+        first_syntax.language(),
+        &first_symbol.name,
+        &first_symbol.qualified_name,
+        &first_identity,
+        TextRange {
+            start: first_symbol.range.start,
+            end: first_symbol.range.end,
+        },
+    )
+    .expect("first declaration");
+    let second_declaration = DocumentationDeclaration::new(
+        &second_symbol_id,
+        second_syntax.language(),
+        &second_symbol.name,
+        &second_symbol.qualified_name,
+        &second_identity,
+        TextRange {
+            start: second_symbol.range.start,
+            end: second_symbol.range.end,
+        },
+    )
+    .expect("second declaration");
+    let sources = DocumentationSourceSet::new(vec![
+        input("src/first.rs", first_text)
+            .with_syntax(&first_syntax)
+            .expect("matching first syntax"),
+        input("src/second.rs", second_text)
+            .with_syntax(&second_syntax)
+            .expect("matching second syntax"),
+    ])
+    .expect("sources");
+
+    let collection = collect_documentation(&sources, &[first_declaration, second_declaration])
+        .expect("collection");
+    assert_eq!(collection.index().blocks.len(), 2);
+    assert_eq!(
+        collection.index().blocks[0].symbol.as_ref(),
+        Some(&first_symbol_id)
+    );
+    assert_eq!(
+        collection.index().blocks[1].symbol.as_ref(),
+        Some(&second_symbol_id)
+    );
+    assert_eq!(
+        exact_text(first_text, &collection.index().blocks[0].range),
+        "/// First documentation.\n"
+    );
+    assert_eq!(
+        exact_text(second_text, &collection.index().blocks[1].range),
+        "/// Second documentation.\n"
+    );
+}
+
+#[test]
 fn python_docstring_blocks_keep_exact_content_range_and_symbol() {
     let text = "def serve():\n    \"\"\"Answers one request.\"\"\"\n    return True\n";
     let path = rift_core::ProjectPath::new("src/app.py").expect("path");

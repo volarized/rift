@@ -18,6 +18,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | The target is unknown. | `search` |
 | The declaration name is known. | `get_symbol` |
 | A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "global"`, or `"all"` to answer the project's own too) |
+| A package version the project does not use, or a package it lacks, is needed. | `get_symbol`, `search` (with `packages` and `scope: "global"` or `"all"`) |
 | The syntax structure at one position is needed. | `nodes` |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with a `traversal` block) |
 | The declarations two committed revisions hold differently are needed. | `search` (with a `change` block) |

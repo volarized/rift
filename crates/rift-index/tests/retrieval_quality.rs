@@ -10,30 +10,29 @@
 //! `qualified_name` case answers through that column alone, and its near miss, a
 //! container and a member the corpus never pairs, answers nothing.
 //!
-//! Three properties are gated beside the metrics. Exact-name cases cannot regress: the
+//! Every query fuses the identifier input of the workspace index with the full-text input
+//! of the stored corpus the server searches, under the shipped shares.
+//!
+//! Properties are gated beside the metrics. Exact-name cases cannot regress: the
 //! declaration a caller named by its own name comes first. Indexing one tree below two
 //! different host roots produces the same documents and the same order, so a clone
-//! directory can never reach a rank. And the stored corpus and an in-memory adapter over
-//! one publication answer the same documents, first hit included.
-//!
-//! The in-memory adapter reimplements FTS5's own `bm25`, and
-//! `the_two_adapters_compute_one_value_at_every_column_weight` pins the two to one value
-//! over a corpus that exercises every column weight, not just the one weight at which the
-//! two arrangements of the formula happen to coincide.
+//! directory can never reach a rank. The stored corpus ranks a term by the weight of the
+//! column it lands in, and reads back every document it published.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
+use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_index::{
     DatabasePool, LexicalIndexLimits, LexicalSearchIndex, PublishedIndex, RevisionScoped,
     WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
 };
 use rift_ranking::{
-    DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument, IndexReader,
-    MemoryIndex, ParsedQuery, QueryPhase, RankRequest, RankedCandidates, RankingInput,
+    DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, FieldSet, IndexDocument,
+    IndexReader, ParsedQuery, QueryPhase, RankRequest, RankedCandidates, RankingInput,
     RankingInputKind, RankingWeights, SearchableField, fuse,
 };
 use tempfile::TempDir;
@@ -145,8 +144,8 @@ async fn stored(documents: &[IndexDocument], directory: &Path) -> TestResult<Lex
     Ok(store)
 }
 
-/// The full-text input one reader answers a phase with, asked through the shared
-/// contract so the stored corpus and the in-memory adapter are driven the same way.
+/// The full-text input the stored corpus answers a phase with: the store's `search` answer
+/// as a ranking input, the same one the server's search tier fuses.
 async fn reader_input(
     reader: &dyn IndexReader,
     query: &ParsedQuery,
@@ -490,29 +489,17 @@ async fn one_tree_below_two_host_roots_publishes_one_corpus_and_one_order() -> T
     Ok(())
 }
 
+/// The stored corpus reads back every document it published, digest and fields intact, and
+/// answers nothing for an identity it never held.
 #[tokio::test]
-async fn the_stored_corpus_and_the_in_memory_adapter_answer_one_order() -> TestResult {
+async fn the_stored_corpus_reads_back_every_document_it_published() -> TestResult {
     let directory = TempDir::new()?;
     let root = directory.path().join("one");
     plant(&root)?;
     let index = indexed(&root)?;
     let documents = index.index_documents();
-    let targets = targets(&documents);
     let store = stored(&documents, directory.path()).await?;
     let published = PublishedIndex::new(&store, "corpus", "retrieval-gate");
-    let memory = MemoryIndex::new(documents.clone(), "retrieval-gate");
-
-    assert_eq!(
-        memory.documents().count(),
-        documents.len(),
-        "both adapters hold one publication"
-    );
-    published
-        .capabilities()
-        .accepts(&memory.capabilities())
-        .map_err(|error| {
-            format!("two adapters over one publication must rank together: {error}")
-        })?;
     for document in &documents {
         let read = published
             .document(document.identity())
@@ -526,25 +513,11 @@ async fn the_stored_corpus_and_the_in_memory_adapter_answer_one_order() -> TestR
         assert_eq!(read.fields(), document.fields());
         assert_eq!(read.kind(), document.kind());
     }
-    let cases: QuerySet =
-        toml::from_str(&std::fs::read_to_string(fixtures().join("queries.toml"))?)?;
-    for case in &cases.case {
-        let parsed = ParsedQuery::parse(&case.query)?;
-        let (from_store, _, _) = ranked(&index, &parsed, |phase| {
-            reader_input(&published, &parsed, phase)
-        })
-        .await?;
-        let (from_memory, _, _) = ranked(&index, &parsed, |phase| {
-            reader_input(&memory, &parsed, phase)
-        })
-        .await?;
-        assert_eq!(
-            answered(&from_store, &targets),
-            answered(&from_memory, &targets),
-            "{}: both adapters must rank one order",
-            case.name
-        );
-    }
+    let unpublished = DocumentIdentity::new("src/absent.rs#absent")?;
+    assert!(
+        published.document(&unpublished).await?.is_none(),
+        "an identity the corpus never held reads back as nothing"
+    );
     Ok(())
 }
 
@@ -610,21 +583,16 @@ fn every_named_result_class_is_covered_once() -> TestResult {
     }
     Ok(())
 }
-#[tokio::test]
-async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResult {
-    use rift_core::ProjectPath;
-    use rift_ranking::{DocumentFields, DocumentIdentity, DocumentLocation, SearchableField};
-
-    let directory = TempDir::new()?;
+/// Documents holding one term once, in one searchable column each, beside fillers that
+/// keep the term in fewer than half the rows so its inverse document frequency stays above
+/// the floor FTS5 applies.
+fn column_carriers() -> TestResult<Vec<IndexDocument>> {
     let built = |identity: &str,
                  path: &str,
-                 columns: &[SearchableField],
+                 field: SearchableField,
                  value: &str|
      -> TestResult<IndexDocument> {
-        let mut fields = DocumentFields::empty();
-        for field in columns {
-            fields = fields.with(*field, value);
-        }
+        let fields = DocumentFields::empty().with(field, value);
         let digest = fields.digest();
         Ok(IndexDocument::new(
             DocumentIdentity::new(identity)?,
@@ -634,40 +602,38 @@ async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResu
             fields,
         )?)
     };
-    // One document per column, each carrying the term in that column alone, so a
-    // difference between weighting the saturated value and saturating the weighted
-    // one shows up as the weight itself. A corpus exercising one weight cannot
-    // separate the two forms: at weight one they are equal.
     let mut documents = Vec::new();
     for (index, field) in SearchableField::ALL.into_iter().enumerate() {
         documents.push(built(
             &format!("carrier-{index}"),
             &format!("src/{index}.rs"),
-            &[field],
+            field,
             "beacon",
         )?);
     }
-    // One document carrying the term in every column at once. FTS5 sums the
-    // weighted counts across the columns before it saturates, so a document that
-    // matched in several columns separates summing from taking the largest; the
-    // per-column documents above cannot.
-    documents.push(built(
-        "carrier-all",
-        "src/all.rs",
-        &SearchableField::ALL,
-        "beacon",
-    )?);
-    for index in 0..4 {
+    for index in 0..=SearchableField::ALL.len() {
         documents.push(built(
             &format!("filler-{index}"),
             &format!("src/filler-{index}.rs"),
-            &[SearchableField::Name],
+            SearchableField::Name,
             "unrelated",
         )?);
     }
-    let store = stored(&documents, directory.path()).await?;
-    let memory = MemoryIndex::new(documents, "weighted-corpus");
+    Ok(documents)
+}
 
+/// The stored corpus ranks a term by the weight [`SearchableField::rank_weight`] gives the
+/// column it lands in.
+///
+/// Every carrier holds the term once in one column and nothing else, so each row has the
+/// same term frequency and the same length, and FTS5's `bm25` then grows with the column
+/// weight alone. A heavier column therefore ranks strictly first and equal weights rank
+/// equal, and each carrier is placed through its own column: a weight bound to the wrong
+/// column breaks the order, and a column bound to the wrong field breaks the placement.
+#[tokio::test]
+async fn the_stored_corpus_ranks_a_term_by_the_weight_of_its_column() -> TestResult {
+    let directory = TempDir::new()?;
+    let store = stored(&column_carriers()?, directory.path()).await?;
     let parsed = ParsedQuery::parse("beacon")?;
     let ranking = match store
         .search("corpus", &parsed, QueryPhase::Precise, 20)
@@ -676,25 +642,50 @@ async fn the_two_adapters_compute_one_value_at_every_column_weight() -> TestResu
         RevisionScoped::Matched(ranking) => ranking,
         other => return Err(format!("the store must hold the corpus: {other:?}").into()),
     };
-    let scored = memory.scored(&parsed, QueryPhase::Precise);
     assert_eq!(
         ranking.matches().len(),
-        SearchableField::ALL.len() + 1,
-        "one document per column answers, and one carrying every column"
+        SearchableField::ALL.len(),
+        "one carrier per column answers, and no filler"
     );
-    assert_eq!(ranking.matches().len(), scored.len());
-    for (matched, (identity, score)) in ranking.matches().iter().zip(&scored) {
+    let mut placed = Vec::new();
+    for matched in ranking.matches() {
+        let fields: Vec<SearchableField> = matched.fields().fields().collect();
+        let [field] = fields.as_slice() else {
+            return Err(
+                format!("{:?} must be placed through one column", matched.identity()).into(),
+            );
+        };
+        let carrier = SearchableField::ALL
+            .into_iter()
+            .position(|declared| declared == *field)
+            .ok_or("every placed column is a searchable field")?;
         assert_eq!(
-            matched.identity(),
-            identity,
-            "both adapters must rank one order over every column weight"
+            matched.identity().as_str(),
+            format!("carrier-{carrier}"),
+            "a carrier is placed through the column that holds its term"
         );
-        assert!(
-            (matched.rank().abs() - score).abs() < 1e-9,
-            "the two adapters must compute one value for {identity}, store {} and \
-             memory {score}",
-            matched.rank().abs()
-        );
+        placed.push((*field, matched.rank()));
+    }
+    for pair in placed.windows(2) {
+        let [(heavier, better), (lighter, worse)] = pair else {
+            unreachable!("windows(2) yields pairs");
+        };
+        match heavier.rank_weight().total_cmp(&lighter.rank_weight()) {
+            Ordering::Greater => assert!(
+                better < worse,
+                "{heavier:?} outweighs {lighter:?}, so it must rank strictly first: {better} and {worse}"
+            ),
+            Ordering::Equal => assert!(
+                better.total_cmp(worse).is_eq(),
+                "{heavier:?} and {lighter:?} carry one weight, so they rank equal: {better} and {worse}"
+            ),
+            Ordering::Less => {
+                return Err(format!(
+                    "the answer orders {heavier:?} before the heavier {lighter:?}"
+                )
+                .into());
+            }
+        }
     }
     Ok(())
 }

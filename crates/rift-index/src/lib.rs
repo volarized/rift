@@ -3,10 +3,8 @@
 mod change_set;
 mod chunk;
 mod database;
-mod dependency;
 mod documentation;
 mod documentation_store;
-mod glob;
 mod language;
 mod lexical;
 mod log;
@@ -17,16 +15,10 @@ mod revision;
 mod vector;
 mod workspace;
 
-pub use change_set::{ChangeSet, FileDigest, PathChange, PathChanges, WorkspaceDigests};
-pub use database::{DatabasePool, WorkspaceDatabase};
-pub use dependency::{
-    AnalyzedFile, DIRECTORY_DEPTH_MAX_DEFAULT, DependencyIndex, DependencyIndexLimits,
-    DependencySymbolMatch, ManifestError, PackageAnalysis, PackageAnalyzer, PackageFiles,
-    PackageIndex, PackageIndexError, PackageIndexFault, PackageIndexViolation, SkippedPackage,
-    WALK_ENTRIES_MAX_DEFAULT, analyzer_manifest_path, analyzer_revision, package_files,
-    render_analyzer_manifest,
+pub use change_set::{
+    ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
-pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
+pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexError, LexicalIndexFault, LexicalIndexLimits, LexicalIndexViolation,
@@ -47,12 +39,16 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::documentation::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
+pub use rift_analysis::{
+    ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
+};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
-    IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint, WorkspaceIndex,
-    WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits, WorkspaceIndexViolation,
-    WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests, capture_digests_with_languages,
-    declaration_identity, source_line_matches, symbol_matches, text_line_matches,
+    IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,
+    WorkspaceIndex, WorkspaceIndexError, WorkspaceIndexFault, WorkspaceIndexLimits,
+    WorkspaceIndexViolation, WorkspaceIndexWarning, WorkspaceSourcePolicy, capture_digests,
+    capture_digests_with_languages, declaration_identity, relative_path, source_line_matches,
+    symbol_matches, text_line_matches,
 };
 
 /// Compile-time marker for index-layer ownership.

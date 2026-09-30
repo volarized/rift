@@ -1,9 +1,10 @@
 //! `rift server` lifecycle commands over the workspace election.
 //!
 //! `start` spawns a detached `rift server start --foreground` and waits for
-//! its published lock document, unless a server is already serving or still
-//! building; `stop` asks the recorded server to shut down over its own stop
-//! route; `restart` chains the two; `status` prints one probe's
+//! its published lock document, unless a server is already serving; a server
+//! still building gets the same wait with nothing spawned; `stop` asks the
+//! recorded server to shut down over its own stop route; `restart` chains
+//! the two; `status` prints one probe's
 //! classification and changes nothing. Every wait is a bounded poll over
 //! [`rift_mcp::probe`] and, when stopping, the original process handle.
 //! The election module itself never polls.
@@ -25,8 +26,9 @@ use rift_index::{
 };
 use rift_mcp::{
     ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
-    START_WAIT_MAX, ServerPresence, SpawnedServer, StaleReason, TokenCheck, WorkspaceStorage,
-    install_panic_hook, probe, read_serving, serve_elected_with_storage, spawn_detached_server,
+    START_WAIT_MAX, ServerPresence, SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns,
+    StartedServer, StopRequestFailure, TokenCheck, WorkspaceStorage, install_panic_hook, probe,
+    read_serving, serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use serde_json::{Map, Value};
@@ -35,13 +37,12 @@ use waitpid_any::WaitHandle;
 
 /// Longest wait for an asked server to leave the serving state.
 ///
-/// The stop poll runs `STOP_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 100
-/// bounded iterations.
+/// The stop poll runs at most `STOP_WAIT_MAX / PRESENCE_POLL_INTERVAL` = 100
+/// iterations, and stops at this span of elapsed time when its probes are
+/// slower than the interval.
 const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 /// Probe attempts one stop waits: `STOP_WAIT_MAX` over the interval.
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
-/// Bound on the whole stop request: connect, send, and read the answer.
-const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the whole server-side stop has, shared by every stage under it.
 ///
 /// The stop derives its deadline where the stop begins, never where the
@@ -462,7 +463,9 @@ pub(super) async fn run(
     let root = Path::new(".");
     match command {
         ServerCommand::Start { foreground, auth } => match start_mode(foreground) {
-            StartMode::Detached => start_detached(root).await.map(Some),
+            StartMode::Detached => start_detached(root, STOP_POLL_ATTEMPT_COUNT)
+                .await
+                .map(Some),
             StartMode::Foreground => {
                 serve_foreground(root, drain, retention_records, token_check(auth))
                     .await
@@ -527,38 +530,58 @@ fn stale_reason_phrase(reason: &StaleReason) -> String {
 /// waits for it.
 ///
 /// Repeats are idempotent: an already-serving workspace answers with the
-/// running server's address and starts nothing, and a workspace whose
-/// server is still building answers that it is starting. A server that
+/// running server's address and starts nothing. A workspace whose server
+/// another start elected and is still building spawns nothing either: the
+/// start waits for that server's document within the window a spawning start
+/// waits, answers with its address once it serves, and answers that it is
+/// starting when the window runs out first. Concurrent starts therefore name
+/// the same server, whichever of them spawned it. A server that
 /// stopped answering its port is on its way out: the start waits for it to
-/// release the election, bounded by [`STOP_WAIT_MAX`], before electing a
-/// fresh one.
-async fn start_detached(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
-    match probe(root) {
+/// release the election, bounded by `stop_attempt_count` probes and the
+/// [`poll_window`] they span, before electing a fresh one. The commands pass
+/// [`STOP_POLL_ATTEMPT_COUNT`], the probes [`STOP_WAIT_MAX`] spans.
+async fn start_detached(
+    root: &Path,
+    stop_attempt_count: u32,
+) -> Result<ServerOutcome, ServerCommandError> {
+    let holder_building = match probe(root) {
         ServerPresence::Serving(lock) => {
             return Ok(ServerOutcome::AlreadyListening {
                 port: lock.port,
                 pid: lock.pid,
             });
         }
-        ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
+        // A spawn under a held election only loses it.
+        ServerPresence::Starting => true,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
-            await_election_released(root, pid, STOP_POLL_ATTEMPT_COUNT).await?;
+            await_election_released(root, pid, stop_attempt_count).await?;
+            false
         }
-        ServerPresence::Stale(_) | ServerPresence::Absent => {}
-    }
+        ServerPresence::Stale(_) | ServerPresence::Absent => false,
+    };
     // A stale document keeps its bytes until the elected child scrubs it.
     // Remember them so the wait below never answers with the old document
     // read in the instant the child already holds the election.
     let stale_bytes = std::fs::read(rift_mcp::document_path(root)).ok();
-    let mut child = spawn_detached_server(root)
-        .map_err(|source| Error::new(ServerCommandFault::SpawnFailed { source }))?;
+    let mut spawns = StartSpawns::default();
+    if !holder_building {
+        spawns
+            .spawn(|| spawn_detached_server(root))
+            .map_err(spawn_failed)?;
+    }
     await_serving(
         root,
         START_POLL_ATTEMPT_COUNT,
         stale_bytes.as_deref(),
-        Some(&mut child),
+        &mut spawns,
+        || spawn_detached_server(root),
     )
     .await
+}
+
+/// The refusal for a detached server that could not be spawned.
+fn spawn_failed(source: io::Error) -> ServerCommandError {
+    Error::new(ServerCommandFault::SpawnFailed { source })
 }
 
 /// The child a start watches beside the published document.
@@ -582,7 +605,8 @@ impl ChildWatch for SpawnedServer {
     }
 }
 
-/// Polls until the workspace serves, bounded by `attempt_count` probes.
+/// Polls until the workspace serves, bounded by `attempt_count` probes and by
+/// the [`poll_window`] they span.
 ///
 /// The caller passes [`START_POLL_ATTEMPT_COUNT`], which derives from
 /// [`START_WAIT_MAX`] over the poll interval. A poll that finds the document
@@ -591,37 +615,53 @@ impl ChildWatch for SpawnedServer {
 /// pid, token, and port), so the leftover can only mean the child has not
 /// published yet.
 ///
-/// `child` is the server this command spawned, when it spawned one. A child
-/// that exited while no process holds the election ends the wait at once:
-/// nothing is left to publish. A wait that runs out while the child is
-/// still running, or while another process holds the election, is not a
-/// failure: the server is indexing, and the outcome says so.
-async fn await_serving(
+/// `spawns` holds the server this command spawned, when it spawned one, and
+/// [`StartSpawns::poll`] weighs its exit against the election each probe
+/// finds. A child that lost the election while no process holds it is
+/// replaced through `launch`, bounded by
+/// [`START_SPAWN_COUNT_MAX`](rift_mcp::START_SPAWN_COUNT_MAX); a child
+/// that exited for another reason while no process holds the election ends
+/// the wait at once, since nothing is left to publish. A wait that runs out
+/// while the child is still running, or while another process holds the
+/// election, is not a failure: the server is indexing, and the outcome says
+/// so.
+async fn await_serving<Spawned>(
     root: &Path,
     attempt_count: u32,
     stale_bytes: Option<&[u8]>,
-    mut child: Option<&mut dyn ChildWatch>,
-) -> Result<ServerOutcome, ServerCommandError> {
+    spawns: &mut StartSpawns<Spawned>,
+    mut launch: impl FnMut() -> io::Result<Spawned>,
+) -> Result<ServerOutcome, ServerCommandError>
+where
+    Spawned: ChildWatch + StartedServer<Failure = u32>,
+{
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
-        if !leftover_unscrubbed(root, stale_bytes)
-            && let Some(lock) = read_serving(root)
-        {
-            return Ok(ServerOutcome::Listening {
-                port: lock.port,
-                pid: lock.pid,
-            });
+        let presence = probe(root);
+        let election_held = presence.election_held();
+        let serving = match presence {
+            ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(lock),
+            _ => None,
+        };
+        match spawns.poll(serving, election_held) {
+            SpawnPollOutcome::Ready(lock) => {
+                return Ok(ServerOutcome::Listening {
+                    port: lock.port,
+                    pid: lock.pid,
+                });
+            }
+            SpawnPollOutcome::Failed(pid) => {
+                return Err(Error::new(ServerCommandFault::StartExited { pid }));
+            }
+            SpawnPollOutcome::ElectionUnheld => spawns.spawn(&mut launch).map_err(spawn_failed)?,
+            SpawnPollOutcome::Waiting => {}
         }
-        if let Some(child) = child.as_mut()
-            && !child.is_running()
-            && !probe(root).election_held()
-        {
-            return Err(Error::new(ServerCommandFault::StartExited {
-                pid: child.pid(),
-            }));
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
-    if let Some(child) = child.as_mut()
+    if let Some(child) = spawns.running()
         && child.is_running()
     {
         return Ok(ServerOutcome::Starting {
@@ -639,6 +679,19 @@ async fn await_serving(
     Err(Error::new(ServerCommandFault::StartTimedOut))
 }
 
+/// The elapsed time a poll of `attempt_count` probes at [`PRESENCE_POLL_INTERVAL`]
+/// may take: [`STOP_WAIT_MAX`] for [`STOP_POLL_ATTEMPT_COUNT`].
+///
+/// A poll counts its probes and also stops once this span has passed since it
+/// began. A probe is not instant: one that meets a port nothing accepts on
+/// spends its whole connect timeout, which on Windows is every refused port,
+/// because Winsock retries a refused connect instead of failing it. Counting
+/// alone, 100 such probes would run for about a minute against a ten-second
+/// bound; the span keeps the bound, and slow probes shorten the count.
+fn poll_window(attempt_count: u32) -> Duration {
+    PRESENCE_POLL_INTERVAL.saturating_mul(attempt_count)
+}
+
 /// Whether the document on disk is still byte-equal to the pre-spawn
 /// leftover, so a read of it would answer with the previous holder's facts.
 fn leftover_unscrubbed(root: &Path, stale_bytes: Option<&[u8]>) -> bool {
@@ -649,7 +702,8 @@ fn leftover_unscrubbed(root: &Path, stale_bytes: Option<&[u8]>) -> bool {
 }
 
 /// Polls until the named process exits or releases the election, bounded by
-/// `attempt_count` probes. A replacement still building must not extend this wait.
+/// `attempt_count` probes and by the [`poll_window`] they span. A replacement
+/// still building must not extend this wait.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval; `pid` names the holder in the
@@ -659,10 +713,14 @@ async fn await_election_released(
     pid: u32,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     let mut process = ProcessExit::open(pid);
     for _ in 0..attempt_count {
         if process.exited() || !probe(root).election_held() {
             return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
@@ -800,7 +858,15 @@ async fn serve_foreground(
         ))),
         _ => None,
     };
-    let server = match serve_elected_with_storage(root, shutdown.clone(), storage, check).await {
+    let server = match serve_elected_with_storage(
+        root,
+        shutdown.clone(),
+        storage,
+        check,
+        crate::BUILD_CHECKOUT,
+    )
+    .await
+    {
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
@@ -911,36 +977,27 @@ async fn stop(root: &Path, attempt_count: u32) -> Result<ServerOutcome, ServerCo
 }
 
 /// Delivers the authorized stop request, bounded by
-/// [`STOP_REQUEST_TIMEOUT`].
+/// [`rift_mcp::STOP_REQUEST_TIMEOUT`].
 ///
 /// Two answers mean the stop was delivered: `202`, the server accepting it,
 /// and a refused connect, nothing listening on the recorded port because
 /// serving has already ended. Neither says the process is gone, so the
 /// caller waits for the election either way.
 async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
-    let request_failed =
-        |source: reqwest::Error| Error::new(ServerCommandFault::StopRequestFailed { source });
-    let client = reqwest::Client::builder()
-        .timeout(STOP_REQUEST_TIMEOUT)
-        .build()
-        .map_err(request_failed)?;
-    let answer = client
-        .post(format!("http://127.0.0.1:{}/api/stop", lock.port))
-        .bearer_auth(&lock.token)
-        .send()
-        .await;
-    match answer {
-        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => Ok(()),
-        Ok(response) => Err(Error::new(ServerCommandFault::StopRefused {
-            status: response.status(),
-        })),
-        Err(error) if error.is_connect() => Ok(()),
-        Err(error) => Err(request_failed(error)),
-    }
+    rift_mcp::request_stop(lock)
+        .await
+        .map_err(|failure| match failure {
+            StopRequestFailure::Failed(source) => {
+                Error::new(ServerCommandFault::StopRequestFailed { source })
+            }
+            StopRequestFailure::Refused(status) => {
+                Error::new(ServerCommandFault::StopRefused { status })
+            }
+        })
 }
 
 /// Polls until the stopped server exits or releases the election, bounded by
-/// `attempt_count` probes.
+/// `attempt_count` probes and by the [`poll_window`] they span.
 ///
 /// The caller passes [`STOP_POLL_ATTEMPT_COUNT`], which derives from
 /// [`STOP_WAIT_MAX`] over the poll interval. The port closes before the
@@ -953,9 +1010,13 @@ async fn await_stopped(
     mut process: ProcessExit,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
         if process.exited() || !probe(root).election_held() {
             return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
     }
@@ -987,7 +1048,7 @@ fn discard_stale_document(root: &Path) {
 /// Stops the serving server, then starts a fresh detached one.
 async fn restart(root: &Path) -> Result<ServerOutcome, ServerCommandError> {
     stop(root, STOP_POLL_ATTEMPT_COUNT).await?;
-    start_detached(root).await
+    start_detached(root, STOP_POLL_ATTEMPT_COUNT).await
 }
 
 /// The store read one `rift server logs` run issues.
@@ -1253,18 +1314,19 @@ mod tests {
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
         SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
-        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, TailCount,
-        TokenCheck, await_election_released, await_serving, await_stopped, discard_stale_document,
-        foreground_refused, holder_evidence, label, level_glyph, logs_mode, logs_query,
-        logs_unavailable, now_ms, print_logs, rendered_fields, rendered_line, rendered_timestamp,
-        request_stop, stale_reason_phrase, start_detached, start_mode, status, stop,
-        stop_log_drain, token_check,
+        STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, StartSpawns,
+        StartedServer, TailCount, TokenCheck, await_election_released, await_serving,
+        await_stopped, discard_stale_document, foreground_refused, holder_evidence, label,
+        level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs, rendered_fields,
+        rendered_line, rendered_timestamp, request_stop, stale_reason_phrase, start_detached,
+        start_mode, status, stop, stop_log_drain, token_check,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
     use rift_index::{
         LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
     };
+    use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
 
     /// Milliseconds in one hour, for fixture instants only.
@@ -1279,7 +1341,6 @@ mod tests {
             pid: 4_242,
             identity: ProductIdentity {
                 version: "0.0.11".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         }
@@ -1313,10 +1374,126 @@ mod tests {
         Ok((listener, port))
     }
 
-    /// A stand-in for the spawned server: running until told otherwise.
+    /// Most connections [`unaccepting_port`] makes before one of them waits: well past the
+    /// backlog of 128 that std gives every listener on every platform.
+    const BACKLOG_FILL_MAX: usize = 1_024;
+    /// Bound on one of those connections; the first that outlasts it met a full backlog.
+    const BACKLOG_FILL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Probes the slow-probe cases allow: a one-second window at the poll interval.
+    const SLOW_PROBE_ATTEMPT_COUNT: u32 = 10;
+    /// Least one probe of an [`unaccepting_port`] costs for the slow-probe cases to measure
+    /// anything: most of the probe's connect timeout.
+    const SLOW_PROBE_COST_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// A loopback listener that accepts nothing, the connections holding its backlog full,
+    /// and its port.
+    ///
+    /// A connect to that port neither completes nor is refused at once: the full queue
+    /// leaves the handshake unanswered, so a probe spends its whole connect timeout. That is
+    /// the cost every probe of a refusing port pays on Windows, where a refused connect is
+    /// retried rather than failed.
+    fn unaccepting_port() -> TestResult<(std::net::TcpListener, Vec<std::net::TcpStream>, u16)> {
+        let (listener, port) = answering_port()?;
+        let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut queued = Vec::new();
+        for _ in 0..BACKLOG_FILL_MAX {
+            match std::net::TcpStream::connect_timeout(&address, BACKLOG_FILL_CONNECT_TIMEOUT) {
+                Ok(connection) => queued.push(connection),
+                Err(_full) => return Ok((listener, queued, port)),
+            }
+        }
+        Err(format!("the backlog took {BACKLOG_FILL_MAX} connections without filling").into())
+    }
+
+    /// A held election whose published document names an [`unaccepting_port`], with the
+    /// cost one probe of it takes, checked against [`SLOW_PROBE_COST_MIN`].
+    struct SlowProbeHolder {
+        guard: rift_mcp::ElectionGuard,
+        document: ServerLock,
+        probe_cost: std::time::Duration,
+        _listener: std::net::TcpListener,
+        _queued: Vec<std::net::TcpStream>,
+    }
+
+    impl SlowProbeHolder {
+        fn publish(root: &std::path::Path) -> TestResult<Self> {
+            let (listener, queued, port) = unaccepting_port()?;
+            let guard = rift_mcp::claim(root)?;
+            let document = ServerLock {
+                pid: std::process::id(),
+                ..holder_on(port)
+            };
+            guard.publish(&document)?;
+            let probed = std::time::Instant::now();
+            let presence = rift_mcp::probe(root);
+            let probe_cost = probed.elapsed();
+            assert!(
+                matches!(
+                    presence,
+                    rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { .. })
+                ),
+                "a port that accepts nothing is unreachable: {presence:?}"
+            );
+            assert!(
+                probe_cost >= SLOW_PROBE_COST_MIN,
+                "a probe of a port that accepts nothing spends its connect timeout: \
+                 probe_cost={probe_cost:?}, expected at least {SLOW_PROBE_COST_MIN:?}"
+            );
+            Ok(Self {
+                guard,
+                document,
+                probe_cost,
+                _listener: listener,
+                _queued: queued,
+            })
+        }
+
+        /// Asserts a wait over [`SLOW_PROBE_ATTEMPT_COUNT`] probes ended inside the window
+        /// they span, allowing the probes already under way when it closed.
+        fn assert_within_window(&self, what: &str, waited: std::time::Duration) {
+            let window = PRESENCE_POLL_INTERVAL * SLOW_PROBE_ATTEMPT_COUNT;
+            let allowed = window + self.probe_cost * 3;
+            assert!(
+                waited <= allowed,
+                "{what} must end inside its window however long each probe takes: \
+                 waited={waited:?}, window={window:?}, probe_cost={:?}, allowed={allowed:?}",
+                self.probe_cost
+            );
+        }
+    }
+
+    /// A stand-in for the spawned server: running until told otherwise, and
+    /// then exited the way `exit` names.
+    #[derive(Debug)]
     struct FakeChild {
         pid: u32,
         running: bool,
+        exit: FakeExit,
+    }
+
+    /// How a [`FakeChild`] that is not running ended.
+    #[derive(Debug, Clone, Copy)]
+    enum FakeExit {
+        LostElection,
+        Failed,
+    }
+
+    impl FakeChild {
+        fn running(pid: u32) -> Self {
+            Self {
+                pid,
+                running: true,
+                exit: FakeExit::Failed,
+            }
+        }
+
+        fn exited(pid: u32, exit: FakeExit) -> Self {
+            Self {
+                pid,
+                running: false,
+                exit,
+            }
+        }
     }
 
     impl ChildWatch for FakeChild {
@@ -1327,6 +1504,36 @@ mod tests {
         fn is_running(&mut self) -> bool {
             self.running
         }
+    }
+
+    impl StartedServer for FakeChild {
+        type Failure = u32;
+
+        fn observed_exit(&mut self) -> Option<StartExit<u32>> {
+            if self.running {
+                return None;
+            }
+            Some(match self.exit {
+                FakeExit::LostElection => StartExit::LostElection {
+                    stderr: String::new(),
+                },
+                FakeExit::Failed => StartExit::Failed(self.pid),
+            })
+        }
+    }
+
+    /// The spawns of a start that spawned `child` first.
+    fn spawned(child: FakeChild) -> StartSpawns<FakeChild> {
+        let mut spawns = StartSpawns::default();
+        spawns
+            .spawn(|| Ok(child))
+            .expect("a fake child always launches");
+        spawns
+    }
+
+    /// A launch for a wait that must not spawn again.
+    fn no_launch() -> std::io::Result<FakeChild> {
+        Err(std::io::Error::other("this wait must not spawn again"))
     }
 
     #[test]
@@ -1396,7 +1603,7 @@ mod tests {
 
         assert!(stopped.load(Ordering::Acquire));
         assert!(
-            started.elapsed() < super::STOP_REQUEST_TIMEOUT,
+            started.elapsed() < rift_mcp::STOP_REQUEST_TIMEOUT,
             "the final log drain must leave time for a five-second stop to observe process exit"
         );
     }
@@ -1727,7 +1934,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_times_out_against_an_empty_workspace() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let error = await_serving(directory.path(), 1, None, None)
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let error = await_serving(directory.path(), 1, None, &mut spawns, no_launch)
             .await
             .expect_err("a workspace nobody serves must time the wait out");
         assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
@@ -1753,11 +1961,13 @@ mod tests {
                 tokio::time::sleep(PRESENCE_POLL_INTERVAL * 2).await;
                 guard.publish(&fresh).expect("the holder must publish");
             };
+            let mut spawns = StartSpawns::<FakeChild>::default();
             let wait = await_serving(
                 directory.path(),
                 START_POLL_ATTEMPT_COUNT,
                 Some(&leftover),
-                None,
+                &mut spawns,
+                no_launch,
             );
             let (outcome, ()) = tokio::join!(wait, publish);
             outcome?
@@ -1778,7 +1988,9 @@ mod tests {
         let _guard = rift_mcp::claim(directory.path())?;
         let leftover = serde_json::to_vec(&holder())?;
         std::fs::write(rift_mcp::document_path(directory.path()), &leftover)?;
-        let outcome = await_serving(directory.path(), 2, Some(&leftover), None).await?;
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let wait = await_serving(directory.path(), 2, Some(&leftover), &mut spawns, no_launch);
+        let outcome = wait.await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: None });
         Ok(())
     }
@@ -1788,11 +2000,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_reports_the_running_child_as_starting_at_the_bound() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: true,
-        };
-        let outcome = await_serving(directory.path(), 2, None, Some(&mut child)).await?;
+        let mut spawns = spawned(FakeChild::running(77));
+        let outcome = await_serving(directory.path(), 2, None, &mut spawns, no_launch).await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: Some(77) });
         Ok(())
     }
@@ -1802,18 +2011,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn await_serving_fails_at_once_when_the_child_exited_and_nobody_holds() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: false,
-        };
-        let error = await_serving(
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::Failed));
+        let wait = await_serving(
             directory.path(),
             START_POLL_ATTEMPT_COUNT,
             None,
-            Some(&mut child),
-        )
-        .await
-        .expect_err("an exited child under a free election must fail the start");
+            &mut spawns,
+            no_launch,
+        );
+        let error = wait
+            .await
+            .expect_err("an exited child under a free election must fail the start");
         assert!(
             matches!(error.fault(), ServerCommandFault::StartExited { pid: 77 }),
             "{error:?}"
@@ -1827,12 +2035,53 @@ mod tests {
     async fn await_serving_waits_for_another_holder_when_the_child_lost() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
-        let mut child = FakeChild {
-            pid: 77,
-            running: false,
-        };
-        let outcome = await_serving(directory.path(), 2, None, Some(&mut child)).await?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let outcome = await_serving(directory.path(), 2, None, &mut spawns, no_launch).await?;
         assert_eq!(outcome, ServerOutcome::Starting { pid: None });
+        Ok(())
+    }
+
+    /// The child lost an election nobody holds - a lock no serving process holds met its
+    /// claim - so the wait spawns again, once, and reports the new child starting.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_spawns_again_when_the_child_lost_an_election_nobody_holds() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let mut launches = 0_u32;
+        let launch = || {
+            launches += 1;
+            Ok(FakeChild::running(78))
+        };
+        let outcome = await_serving(directory.path(), 5, None, &mut spawns, launch).await?;
+        assert_eq!(outcome, ServerOutcome::Starting { pid: Some(78) });
+        assert_eq!(launches, 1, "one respawn replaces the lost child");
+        Ok(())
+    }
+
+    /// Every child loses an election nobody holds: the wait spawns until the count is
+    /// spent, then waits out its bound and reports the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn await_serving_stops_spawning_at_the_spawn_count() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
+        let mut launches = 0_u32;
+        let launch = || {
+            launches += 1;
+            Ok(FakeChild::exited(78, FakeExit::LostElection))
+        };
+        let wait = await_serving(
+            directory.path(),
+            START_POLL_ATTEMPT_COUNT,
+            None,
+            &mut spawns,
+            launch,
+        );
+        let error = wait
+            .await
+            .expect_err("a start whose every child loses must time the wait out");
+        assert!(matches!(error.fault(), ServerCommandFault::StartTimedOut));
+        assert_eq!(launches, START_SPAWN_COUNT_MAX - 1);
         Ok(())
     }
 
@@ -2051,6 +2300,85 @@ mod tests {
         Ok(())
     }
 
+    /// A stop wait whose every probe spends its connect timeout still ends at its window,
+    /// as it does on Windows, where every probe of the port a stopping server closed pays
+    /// that cost.
+    #[tokio::test]
+    async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let process = ProcessExit::open(holder.document.pid);
+        let started = std::time::Instant::now();
+        let error = await_stopped(
+            directory.path(),
+            holder.document.clone(),
+            process,
+            SLOW_PROBE_ATTEMPT_COUNT,
+        )
+        .await
+        .expect_err("a holder that keeps the election times the stop wait out");
+        holder.assert_within_window("the stop wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::StopTimedOut { .. }),
+            "{error:?}"
+        );
+        drop(holder.guard);
+        Ok(())
+    }
+
+    /// The wait for a holder to release its election ends at its window under slow probes.
+    #[tokio::test]
+    async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let started = std::time::Instant::now();
+        let error = await_election_released(
+            directory.path(),
+            holder.document.pid,
+            SLOW_PROBE_ATTEMPT_COUNT,
+        )
+        .await
+        .expect_err("a holder that keeps the election times the wait out");
+        holder.assert_within_window("the election wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::ElectionUnreleased { .. }),
+            "{error:?}"
+        );
+        drop(holder.guard);
+        Ok(())
+    }
+
+    /// The start wait ends at its window under slow probes, and its closing probe is the
+    /// one probe it adds past the window.
+    #[tokio::test]
+    async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let holder = SlowProbeHolder::publish(directory.path())?;
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let started = std::time::Instant::now();
+        let error = await_serving(
+            directory.path(),
+            SLOW_PROBE_ATTEMPT_COUNT,
+            None,
+            &mut spawns,
+            no_launch,
+        )
+        .await
+        .expect_err("a holder whose port accepts nothing never serves this start");
+        holder.assert_within_window("the start wait", started.elapsed());
+        assert!(
+            matches!(error.fault(), ServerCommandFault::StartTimedOut),
+            "{error:?}"
+        );
+        drop(holder.guard);
+        Ok(())
+    }
+
+    /// Probes the start makes of a holder whose port refuses. The clock is paused, but a
+    /// probe's connect is not: on Windows each refused connect spends the whole connect
+    /// timeout, so the stop window's 100 probes would hold this case for most of a minute.
+    const REFUSING_HOLDER_ATTEMPT_COUNT: u32 = 3;
+
     /// A holder that stopped answering its port is on its way out: the start waits for
     /// it to release the election and refuses with its pid when it keeps the election.
     #[tokio::test(start_paused = true)]
@@ -2063,7 +2391,7 @@ mod tests {
             ..holder_on(dead_port()?)
         };
         guard.publish(&document)?;
-        let error = start_detached(directory.path())
+        let error = start_detached(directory.path(), REFUSING_HOLDER_ATTEMPT_COUNT)
             .await
             .expect_err("a holder that keeps the election past the stop window refuses the start");
         let fault = error.fault();
@@ -2074,15 +2402,48 @@ mod tests {
         Ok(())
     }
 
-    /// A holder that has not published yet is a server still building: the start
-    /// answers that it is starting and spawns nothing.
-    #[tokio::test]
-    async fn start_reports_a_building_holder_as_starting() -> TestResult {
+    /// A holder that has not published yet is a server another start elected, still
+    /// building: the start spawns nothing and waits for that server's document, as the
+    /// start that spawned it does, then answers with the published address. The start's
+    /// first probe runs before the paused clock moves, so it always finds the holder
+    /// unpublished.
+    #[tokio::test(start_paused = true)]
+    async fn start_waits_for_a_building_holder_and_answers_with_its_address() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let (_listener, port) = answering_port()?;
+        let published = holder_on(port);
+        let publish = async {
+            tokio::time::sleep(PRESENCE_POLL_INTERVAL * 2).await;
+            guard.publish(&published).expect("the holder must publish");
+        };
+        let start = start_detached(directory.path(), STOP_POLL_ATTEMPT_COUNT);
+        let (outcome, ()) = tokio::join!(start, publish);
+        let expected = ServerOutcome::Listening {
+            port,
+            pid: published.pid,
+        };
+        assert_eq!(outcome?, expected);
+        Ok(())
+    }
+
+    /// A holder that publishes nothing within the start window is still building when
+    /// the window runs out: the start answers that it is starting, with no pid of its
+    /// own, and only once the whole window has passed.
+    #[tokio::test(start_paused = true)]
+    async fn start_reports_a_building_holder_as_starting_once_the_window_runs_out() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
+        let began = tokio::time::Instant::now();
         assert_eq!(
-            start_detached(directory.path()).await?,
+            start_detached(directory.path(), STOP_POLL_ATTEMPT_COUNT).await?,
             ServerOutcome::Starting { pid: None }
+        );
+        let waited = began.elapsed();
+        assert!(
+            waited >= START_WAIT_MAX,
+            "the start must wait the whole start window before answering: waited={waited:?}, \
+             start_wait_max={START_WAIT_MAX:?}"
         );
         Ok(())
     }

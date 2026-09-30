@@ -14,8 +14,8 @@
 
 use std::fmt::{self, Write as _};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rift_core::causes;
@@ -162,25 +162,20 @@ impl LogSettlement {
     }
 }
 
-/// The settlement of the lane this process installed, when it installed one.
+/// Waits for the calling thread's log lane to write through what it has stamped.
 ///
-/// The sink is one process-wide `tracing` layer, so its settlement is process-wide too. A
-/// process that records nothing - every command but the foreground server - leaves this empty
-/// and its log reads wait for nothing.
-static INSTALLED_SETTLEMENT: Mutex<Option<Arc<LogSettlement>>> = Mutex::new(None);
-
-/// Waits for this process's log lane to write through the sequence it has stamped, if it has a
-/// lane. Every `rift://logs` read calls this before it opens the store.
-///
-/// # Panics
-///
-/// Panics when the installed lane's lock is poisoned, which needs a panic while it is held:
-/// the guard covers one `Arc` clone and nothing that can fail.
+/// Every `rift://logs` read calls this before it opens the store. The lane is the
+/// [`LogSink`] layer of the thread's current `tracing` dispatcher. A process
+/// can build more than one lane - under `cargo test` every test is a thread of one process and
+/// builds its own - and the dispatcher is what decides where a thread's records go. A process
+/// that records nothing - every command but the foreground server - installs no sink, and its
+/// log reads wait for nothing.
 pub async fn settle_for_read() {
-    let installed = INSTALLED_SETTLEMENT
-        .lock()
-        .expect("the installed settlement is not poisoned")
-        .clone();
+    let installed = tracing::dispatcher::get_default(|dispatch| {
+        dispatch
+            .downcast_ref::<LogSink>()
+            .map(|sink| Arc::clone(&sink.settlement))
+    });
     if let Some(settlement) = installed {
         settlement.settle_for_read().await;
     }
@@ -383,10 +378,7 @@ impl LogDrain {
 
 /// Builds the layer and its drain, sharing one bounded queue and one settlement.
 ///
-/// # Panics
-///
-/// Panics when the installed lane's lock is poisoned, which needs a panic while it is held:
-/// the guard covers one `Arc` replacement and nothing that can fail.
+/// A `rift://logs` read finds the settlement through the dispatcher the layer is installed in.
 #[must_use]
 pub fn log_capture() -> (LogSink, LogDrain) {
     let (sender, receiver) = mpsc::channel(LOG_QUEUE_RECORDS);
@@ -397,13 +389,6 @@ pub fn log_capture() -> (LogSink, LogDrain) {
         flush: Notify::new(),
         draining: AtomicBool::new(false),
     });
-    // A `rift://logs` read reaches the lane through this, because the sink is installed as one
-    // process-wide layer and the reading server never holds it. The newest lane wins, which is
-    // what a test building a second one means.
-    INSTALLED_SETTLEMENT
-        .lock()
-        .expect("the installed settlement is not poisoned")
-        .replace(Arc::clone(&settlement));
     (
         LogSink {
             sender,
@@ -945,6 +930,48 @@ mod tests {
             tokio::time::Instant::now() - started,
             LOG_SETTLE_TIMEOUT,
             "nine records finished with does not mean sequence ten was written"
+        );
+    }
+
+    /// A read waits for the lane its thread's dispatcher records into, found through the
+    /// filtered, optional layer a serving process installs it as. A lane built later in the
+    /// same process is not that lane, and a thread whose dispatcher holds no sink waits for
+    /// nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waits_for_the_lane_its_dispatcher_records_into() {
+        use tracing_subscriber::Layer as _;
+
+        let (sink, _drain) = log_capture();
+        sink.settlement.draining.store(true, Ordering::SeqCst);
+        sink.send(record("the beacon engine did not start"));
+        let (_later_sink, _later_drain) = log_capture();
+
+        let started = tokio::time::Instant::now();
+        {
+            let _without_sink = tracing::subscriber::set_default(tracing_subscriber::registry());
+            super::settle_for_read().await;
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "a thread whose dispatcher holds no sink waits for nothing"
+        );
+
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with(Some(
+                sink.with_filter(tracing_subscriber::EnvFilter::new("info")),
+            ));
+        let _with_sink = tracing::subscriber::set_default(subscriber);
+        super::settle_for_read().await;
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            LOG_SETTLE_TIMEOUT,
+            "the read waits for its own lane's unwritten record, not the later lane"
         );
     }
     use tracing::field::Visit;

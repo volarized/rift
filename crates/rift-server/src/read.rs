@@ -1,39 +1,36 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::{Arc, RwLockReadGuard};
+use std::sync::Arc;
 
 use rift_core::ProjectPath as CoreProjectPath;
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::{
     Error, ErrorCode, ErrorContext, ErrorName, Fault, LanguageFileSelections, LimitEvidence,
-    SourceVisibility, TextFileInclusion, line,
+    SourceVisibility, TextFileInclusion, fault_label, line,
 };
-use rift_dependency::DependencyContext;
+use rift_dependency::{DependencyContext, StandardLibrary};
 use rift_history::{HistoryError, Repository};
 use rift_index::{
-    DependencyIndex, DependencyIndexLimits, DependencySymbolMatch, FileDigest, IndexedFile,
-    PackageIndexError, PathChanges, ReadableSymbol, RelationshipStore, SkippedPackage, SymbolMatch,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexError,
-    WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
+    FileDigest, FileRecord, IndexedFile, PathChange, PathChanges, ReadableSymbol,
+    RelationshipStore, SymbolMatch, WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndex,
+    WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexWarning, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::HistoryConfiguration;
-use rift_protocol::dependencies::{DependenciesConfiguration, DependencyResolution};
+use rift_protocol::dependencies::{
+    DependenciesConfiguration, DependencyResolution, REQUESTED_PACKAGES_MAX, RequestedPackage,
+};
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
-    DEPENDENCY_WARNINGS_MAX, Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude,
-    GetSymbolParams, GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult,
-    PAGE_LIMIT_MAX, PackageIdentity, Pagination, ProjectPath, ReadWarning, RevisionId,
-    SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
-    TextRange,
+    Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams,
+    GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PAGE_LIMIT_MAX,
+    Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolId, TextRange,
 };
-use rift_ranking::IdentifierMatchClass;
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
 
-use crate::dependency::ResolutionPolicy;
 use crate::history::SymbolTimelines;
-use crate::packages::{PackageBranch, PackageFallback, PackageFill};
 
 /// One read-service failure: what was asked, and why it cannot be served.
 ///
@@ -60,16 +57,8 @@ pub enum ReadFault {
         detail: String,
     },
 
-    /// A cataloged package's index could not assemble the declaration a lookup matched.
-    Dependency(Box<PackageIndexError>),
     /// Documentation metadata could not answer the requested projection.
     Documentation(Box<rift_index::DocumentationError>),
-    /// A thread panicked while holding one of the service's locks, so what the lock
-    /// guards may be half-written and no holder takes it again.
-    LockPoisoned {
-        /// The lock that was poisoned.
-        lock: &'static str,
-    },
     /// Request uses functionality this release does not serve, where configuring the
     /// workspace could serve it.
     Unsupported {
@@ -139,7 +128,6 @@ impl Fault for ReadFault {
             Self::History(source) => source.descriptor().name(),
             Self::Engine(source) => source.name(),
 
-            Self::Dependency(source) => source.name(),
             Self::Documentation(source) => source.name(),
             Self::Unsupported { .. } | Self::UnclaimedExtension { .. } => {
                 ErrorName::Wire(ErrorCode::CapabilityUnavailable)
@@ -150,9 +138,7 @@ impl Fault for ReadFault {
                 ErrorName::Wire(ErrorCode::ContentUnavailable)
             }
             Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::Task { .. } | Self::LockPoisoned { .. } => {
-                ErrorName::Wire(ErrorCode::InternalError)
-            }
+            Self::Task { .. } => ErrorName::Wire(ErrorCode::InternalError),
             Self::Unavailable { .. } | Self::CapacityTimeout { .. } => {
                 ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
             }
@@ -165,12 +151,7 @@ impl Fault for ReadFault {
             Self::History(source) => source.context(),
             Self::Engine(source) => source.context(),
 
-            Self::Dependency(source) => source.context(),
             Self::Documentation(source) => source.context(),
-            Self::LockPoisoned { lock } => vec![
-                ErrorContext::new("lock", *lock),
-                ErrorContext::new("detail", format!("{lock} lock poisoned")),
-            ],
             Self::Unsupported { capability } => {
                 vec![ErrorContext::new("capability", capability.clone())]
             }
@@ -215,7 +196,6 @@ impl Fault for ReadFault {
             Self::History(source) => source.fault().limit_evidence(),
             Self::Engine(source) => source.fault().limit_evidence(),
 
-            Self::Dependency(source) => source.fault().limit_evidence(),
             Self::Documentation(source) => source.fault().limit_evidence(),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
@@ -226,8 +206,7 @@ impl Fault for ReadFault {
             | Self::Task { .. }
             | Self::Unavailable { .. }
             | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. }
-            | Self::LockPoisoned { .. } => None,
+            | Self::CapacityTimeout { .. } => None,
         }
     }
 
@@ -237,7 +216,6 @@ impl Fault for ReadFault {
             Self::History(source) => Some(source),
             Self::Engine(source) => Some(source),
 
-            Self::Dependency(source) => Some(source.as_ref()),
             Self::Documentation(source) => Some(source.as_ref()),
             Self::Unsupported { .. }
             | Self::UnclaimedExtension { .. }
@@ -248,8 +226,7 @@ impl Fault for ReadFault {
             | Self::Task { .. }
             | Self::Unavailable { .. }
             | Self::EngineAnswer { .. }
-            | Self::CapacityTimeout { .. }
-            | Self::LockPoisoned { .. } => None,
+            | Self::CapacityTimeout { .. } => None,
         }
     }
 
@@ -329,19 +306,8 @@ impl ReadFault {
         Error::new(Self::History(source))
     }
 
-    /// Classifies a package index failure, keeping the fault's own wire classification.
-    /// The failure is boxed so the read fault stays small on every `Result` it rides.
-    pub(crate) fn dependency(source: PackageIndexError) -> ReadError {
-        Error::new(Self::Dependency(Box::new(source)))
-    }
-
     pub(crate) fn documentation(source: rift_index::DocumentationError) -> ReadError {
         Error::new(Self::Documentation(Box::new(source)))
-    }
-
-    /// Classifies a lock a holder panicked under.
-    pub(crate) fn lock_poisoned(lock: &'static str) -> ReadError {
-        Error::new(Self::LockPoisoned { lock })
     }
 
     /// Classifies a Tokio blocking-executor failure.
@@ -400,15 +366,12 @@ pub struct ReadService {
     /// tree, `None` for a revision snapshot, which has no filesystem tree to be
     /// visible in.
     source_policy: Option<Arc<WorkspaceSourcePolicy>>,
-    /// The packages the workspace's manifests and lockfiles name, read from those files
-    /// alone and shared across incremental rebuilds until one of them changes. Empty for
-    /// a revision snapshot, which has no working tree to read.
+    /// The packages the workspace's manifests, lockfiles, and languages name, read from
+    /// those files and shared across incremental rebuilds until one of them changes.
+    /// Empty for a revision snapshot, which has no working tree to read.
     context: Arc<DependencyContext>,
-    /// The packages a `global` or `all` read answers from. Absent, those scopes answer as
-    /// from an empty branch.
-    packages: Option<Arc<PackageBranch>>,
-    /// The accepted `[dependencies]` table: whether a scope beyond `project` is
-    /// served, and how the catalog is resolved.
+    /// The accepted `[dependencies]` table: the configured packages, and whether the
+    /// standard library version probes run.
     dependency_configuration: DependenciesConfiguration,
 }
 
@@ -416,7 +379,9 @@ impl ReadService {
     /// Builds one in-memory snapshot from real workspace files, applying
     /// `visibility`'s `.gitignore` and `[source]` policy on top of the hard
     /// floor. `history` gates and bounds later symbol-history reads served
-    /// from this snapshot.
+    /// from this snapshot. The dependency context reads the static inputs alone,
+    /// as `[dependencies] resolution = "static"` does, so no version probe runs and
+    /// the snapshot answers the same on every machine.
     ///
     /// # Errors
     ///
@@ -435,14 +400,17 @@ impl ReadService {
             text_inclusion,
             &LanguageFileSelections::default(),
             history,
-            DependenciesConfiguration::default(),
+            DependenciesConfiguration {
+                resolution: DependencyResolution::Static,
+                ..DependenciesConfiguration::default()
+            },
         )
     }
 
     /// Builds one current-tree snapshot with configured language entries.
     ///
-    /// `dependencies` decides how the catalog is resolved and how long one
-    /// resolver run may take.
+    /// `dependencies` names the configured packages, whether the standard library
+    /// version probes run, and how long one probe may take.
     ///
     /// # Errors
     ///
@@ -503,7 +471,6 @@ impl ReadService {
             history,
             source_policy: Some(Arc::new(source_policy)),
             context,
-            packages: None,
             dependency_configuration: dependencies,
         })
     }
@@ -576,6 +543,13 @@ impl ReadService {
     #[must_use]
     pub fn file_digest(&self, path: &CoreProjectPath) -> Option<FileDigest> {
         self.index.digest(path)
+    }
+
+    /// What this snapshot records at `path`, as a change set compares it: the digest of
+    /// the bytes it read, or the warning naming a file it left out before reading one.
+    #[must_use]
+    pub fn file_record(&self, path: &CoreProjectPath) -> Option<FileRecord> {
+        self.index.record(path)
     }
 
     /// The exact warning this snapshot holds for a file it left out, before wire warning
@@ -658,7 +632,6 @@ impl ReadService {
             history: self.history.clone(),
             source_policy: Some(Arc::new(source_policy)),
             context,
-            packages: self.packages.clone(),
             dependency_configuration: self.dependency_configuration.clone(),
         })
     }
@@ -672,8 +645,11 @@ impl ReadService {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when a named path cannot be read or indexed within bounds.
+    /// Returns [`ReadError`] when this is a revision snapshot, which has no filesystem tree
+    /// to read the named paths from, or when a named path cannot be read or indexed within
+    /// bounds.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, ReadError> {
+        let source_policy = self.filesystem_policy("incremental rebuild")?;
         let span = tracing::info_span!(
             "index.build",
             component = "index",
@@ -688,7 +664,7 @@ impl ReadService {
             ReadFault::index(source)
         })?;
         let revisions = captured_revisions(&index);
-        let context = self.context_after(changes)?;
+        let context = self.context_after(source_policy, changes, &index)?;
         span.record("files_count", index.file_count());
         span.record("tree_revision", revisions.wire_tree_revision());
         span.record("outcome", "ok");
@@ -699,32 +675,65 @@ impl ReadService {
             history: self.history.clone(),
             source_policy: self.source_policy.clone(),
             context,
-            packages: self.packages.clone(),
             dependency_configuration: self.dependency_configuration.clone(),
         })
     }
 
     /// The dependency context an incremental rebuild over `changes` carries: the standing
-    /// one while no changed path is one of its inputs or a manifest a resolver claims, a
-    /// fresh read otherwise. Reading it costs one pass over the workspace's manifests and
-    /// lockfiles, so a rebuild that touches none of them keeps what it holds.
-    fn context_after(&self, changes: &PathChanges) -> Result<Arc<DependencyContext>, ReadError> {
+    /// one while no changed path is one of its inputs or a manifest a resolver claims, and
+    /// no change adds a language's first visible path or removes its last; a fresh read
+    /// otherwise. Reading it costs one pass over the workspace's manifests and lockfiles,
+    /// so a rebuild that touches none of them keeps what it holds.
+    ///
+    /// `index` is the rebuilt index: a removed path's language counts as gone only when
+    /// no file it still holds is of that language.
+    fn context_after(
+        &self,
+        source_policy: &WorkspaceSourcePolicy,
+        changes: &PathChanges,
+        index: &WorkspaceIndex,
+    ) -> Result<Arc<DependencyContext>, ReadError> {
         let touches_input = changes.paths().any(|path| {
             let path = project_path(path);
             self.context.depends_on(&path) || rift_dependency::is_claimed_manifest(&path)
         });
-        if !touches_input {
+        if !touches_input && !self.changes_standard_libraries(source_policy, changes, index) {
             return Ok(Arc::clone(&self.context));
         }
-        let source_policy = self.source_policy.as_deref().unwrap_or_else(|| {
-            unreachable!("a current-tree read service always compiles its source policy")
-        });
         let context = resolved_context(
             self.index.root(),
             source_policy,
             &self.dependency_configuration,
         )?;
         Ok(Arc::new(context))
+    }
+
+    /// Whether `changes` adds the first visible path of a language whose standard
+    /// library the standing context does not name, or removes the last path of one it
+    /// does. A Rust workspace gaining `scripts/tool.py` then names `stdlib/python` on
+    /// the next read.
+    fn changes_standard_libraries(
+        &self,
+        source_policy: &WorkspaceSourcePolicy,
+        changes: &PathChanges,
+        index: &WorkspaceIndex,
+    ) -> bool {
+        let named = self.context.standard_libraries();
+        changes.iter().any(|(path, change)| {
+            let Some(library) = path_library(source_policy, path.as_str()) else {
+                return false;
+            };
+            match change {
+                PathChange::Added => !named.contains(&library),
+                PathChange::Removed => {
+                    named.contains(&library)
+                        && !index.files().any(|file| {
+                            path_library(source_policy, file.path().as_str()) == Some(library)
+                        })
+                }
+                PathChange::Modified => false,
+            }
+        })
     }
 
     /// Builds one in-memory snapshot of the workspace at a version-control
@@ -793,7 +802,6 @@ impl ReadService {
             history,
             source_policy: None,
             context: Arc::new(DependencyContext::default()),
-            packages: None,
             dependency_configuration: DependenciesConfiguration::default(),
         })
     }
@@ -819,14 +827,6 @@ impl ReadService {
         self.source_policy.clone()
     }
 
-    /// Attaches the package branch a `global` or `all` read answers from. An incremental
-    /// rebuild carries the handle forward.
-    #[must_use]
-    pub fn with_packages(mut self, branch: Arc<PackageBranch>) -> Self {
-        self.packages = Some(branch);
-        self
-    }
-
     /// The packages the workspace's manifests and lockfiles name, as this snapshot read
     /// them.
     #[must_use]
@@ -834,17 +834,33 @@ impl ReadService {
         &self.context
     }
 
+    /// The dependency context one current-tree read resolves through the global API:
+    /// this snapshot's own, with the request's `packages` applied through
+    /// [`DependencyContext::with_requested`]. A request naming no package reads the
+    /// snapshot's context as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] naming `packages` for an argument the read cannot send:
+    /// beside the `local` scope, beside `rev`, past `REQUESTED_PACKAGES_MAX` entries, or
+    /// with an entry outside its advertised lengths.
+    pub fn read_context(
+        &self,
+        scope: SearchScope,
+        rev: Option<&RevisionId>,
+        packages: &[RequestedPackage],
+    ) -> Result<Arc<DependencyContext>, ReadError> {
+        validate_requested_packages(scope, rev.is_some(), packages)?;
+        if packages.is_empty() {
+            return Ok(Arc::clone(&self.context));
+        }
+        Ok(Arc::new(self.context.with_requested(packages)))
+    }
+
     /// The accepted `[dependencies]` table this snapshot was built under.
     #[must_use]
     pub const fn dependency_configuration(&self) -> &DependenciesConfiguration {
         &self.dependency_configuration
-    }
-
-    /// Replaces the dependency context, so a test can hand the service a degraded one.
-    #[cfg(test)]
-    fn with_context(mut self, context: DependencyContext) -> Self {
-        self.context = Arc::new(context);
-        self
     }
 
     /// Returns the warnings every answer from this service carries: one
@@ -1023,53 +1039,36 @@ impl ReadService {
     }
 
     /// Finds declarations by name, with each hit's version-control timeline
-    /// when the request asks for history. `scope` selects the project index, the
-    /// attached package branch, or both with project hits first; a scope beyond
-    /// `local` refuses `rev`, since package facts are served for the current tree
-    /// alone.
+    /// when the request asks for history. The project index answers `local` and
+    /// `all`; package facts come from the global index, so a `global` lookup
+    /// answers no project hit. A scope beyond `local` refuses `rev`, since package
+    /// facts are served for the current tree alone.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for a scope beyond `project` under `[dependencies]`
-    /// `enabled = false` or beside `rev`, for a poisoned dependency index, and for
-    /// symbol history the workspace's version control cannot serve.
+    /// Returns [`ReadError`] for a scope beyond `local` beside `rev`, a `packages`
+    /// argument the read cannot send, and symbol history the workspace's version control
+    /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, ReadError> {
-        self.get_symbol_with_dependency_context(params, &self.context)
-    }
-
-    /// Finds declarations using `dependency_context` for package fallback selection.
-    ///
-    /// The service keeps project reads unchanged. The supplied context only decides which
-    /// dependency packages the current-tree package branch may analyze and which context
-    /// warnings the answer carries.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same failures as [`Self::get_symbol`].
-    pub fn get_symbol_with_dependency_context(
-        &self,
-        params: &GetSymbolParams,
-        dependency_context: &DependencyContext,
-    ) -> Result<GetSymbolResult, ReadError> {
         validate_common(params.rev.is_some())?;
         let limit = accepted_limit(params.limit)?;
+        validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
         self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
-        let reaches_dependencies = params.scope != SearchScope::Local;
-        // Each index's whole ranked match set is collected up to the project index's
-        // own `results_max` bound, so `pagination.total_pages` counts the full result
-        // set the pages divide.
+        // The whole ranked match set is collected up to the project index's own
+        // `results_max` bound, so `pagination.total_pages` counts the full result set the
+        // pages divide.
         let results_max = self.index.results_max();
-        let fallback = self.fill_packages(params.scope, dependency_context)?;
-        let dependencies = self.dependency_index(params.scope)?;
-        let (mut candidates, bound_reached) =
-            self.ranked_candidates(params, dependencies.as_deref(), results_max)?;
-        if params.scope == SearchScope::All {
-            // A stable sort: each side keeps its own order inside one rank.
-            candidates.sort_by_key(|candidate| (candidate.rank(), candidate.is_dependency()));
-        }
+        let mut candidates = if params.scope == SearchScope::Global {
+            Vec::new()
+        } else {
+            self.index
+                .symbols(&params.name, results_max)
+                .map_err(ReadFault::index)?
+        };
+        let bound_reached = candidates.len() >= results_max;
         if let Some(language) = &params.language {
             candidates
-                .retain(|matched| language_selects(language, matched.file().syntax().language()));
+                .retain(|matched| language_selects(language, matched.file.syntax().language()));
         }
         let (window, pagination) = page(candidates, params.page_index, limit);
         let include_source = params.include.contains(&GetSymbolInclude::Source);
@@ -1084,35 +1083,18 @@ impl ReadService {
         };
         let mut hits = Vec::with_capacity(window.len());
         let mut disagreements = Vec::new();
-        for ranked in window {
-            let hit = match ranked {
-                RankedMatch::Project(matched) => {
-                    let (mut hit, disagreement) =
-                        self.project_hit(matched, include_source, timelines.as_mut())?;
-                    disagreements.extend(disagreement);
-                    if include_documentation && let Some(symbol) = &hit.symbol.id {
-                        hit.documentation = Some(rift_index::documentation_context_with_budget(
-                            self.index.documentation(),
-                            symbol,
-                            |source| self.index.documentation_content(source),
-                            &mut documentation_bytes_left,
-                        ));
-                    }
-                    hit
-                }
-                RankedMatch::Dependency(found) => {
-                    let mut hit = dependency_hit(found, include_source)?;
-                    if include_documentation && let Some(symbol) = &hit.symbol.id {
-                        hit.documentation = Some(rift_index::documentation_context_with_budget(
-                            found.package.documentation(),
-                            symbol,
-                            |source| found.package.documentation_content(source),
-                            &mut documentation_bytes_left,
-                        ));
-                    }
-                    hit
-                }
-            };
+        for matched in window {
+            let (mut hit, disagreement) =
+                self.project_hit(matched, include_source, timelines.as_mut())?;
+            disagreements.extend(disagreement);
+            if include_documentation && let Some(symbol) = &hit.symbol.id {
+                hit.documentation = Some(rift_index::documentation_context_with_budget(
+                    self.index.documentation(),
+                    symbol,
+                    |source| self.index.documentation_content(source),
+                    &mut documentation_bytes_left,
+                ));
+            }
             hits.push(hit);
         }
         let mut warnings = self.warnings();
@@ -1120,45 +1102,11 @@ impl ReadService {
         if bound_reached {
             warnings.push(results_truncation_warning(results_max));
         }
-        if reaches_dependencies {
-            warnings.extend(package_warnings(
-                dependencies.as_deref(),
-                dependency_context,
-                fallback,
-            ));
-        }
         Ok(GetSymbolResult {
             hits,
             pagination,
             warnings,
         })
-    }
-
-    /// Every ranked match the project index and the attached dependency index hold for
-    /// `params.name` under `params.scope`, each set collected up to `results_max`, and
-    /// whether either set reached that bound.
-    fn ranked_candidates<'a>(
-        &'a self,
-        params: &GetSymbolParams,
-        dependencies: Option<&'a DependencyIndex>,
-        results_max: usize,
-    ) -> Result<(Vec<RankedMatch<'a>>, bool), ReadError> {
-        let mut candidates: Vec<RankedMatch<'a>> = Vec::new();
-        let mut bound_reached = false;
-        if params.scope != SearchScope::Global {
-            let project = self
-                .index
-                .symbols(&params.name, results_max)
-                .map_err(ReadFault::index)?;
-            bound_reached |= project.len() >= results_max;
-            candidates.extend(project.into_iter().map(RankedMatch::Project));
-        }
-        if let Some(index) = dependencies {
-            let found = index.symbols(&params.name, results_max);
-            bound_reached |= found.len() >= results_max;
-            candidates.extend(found.into_iter().map(RankedMatch::Dependency));
-        }
-        Ok((candidates, bound_reached))
     }
 
     /// Refuses a `scope` that reaches packages on a revision read - one the request's
@@ -1178,126 +1126,9 @@ impl ReadService {
             return Ok(());
         }
         if rev.is_some() || self.revision.is_some() {
-            return Err(ReadFault::invalid(
-                "scope",
-                "package facts are served for the current tree alone",
-            ));
+            return Err(ReadFault::invalid("scope", CURRENT_TREE_ALONE));
         }
         Ok(())
-    }
-
-    /// Fills the package branch for an answer whose `scope` reaches packages, and reports
-    /// what the fill produced. A `local` read fills nothing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panicked with a branch lock held, or when the
-    /// workspace's visible paths cannot be read.
-    pub(crate) fn fill_packages(
-        &self,
-        scope: SearchScope,
-        dependency_context: &DependencyContext,
-    ) -> Result<PackageFallback, ReadError> {
-        let (Some(branch), Some(source_policy)) = (&self.packages, self.source_policy.as_deref())
-        else {
-            return Ok(PackageFallback::default());
-        };
-        if scope == SearchScope::Local {
-            return Ok(PackageFallback::default());
-        }
-        let visible: Vec<ProjectPath> = source_policy
-            .visible_paths()
-            .map_err(ReadFault::index)?
-            .iter()
-            .map(project_path)
-            .collect();
-        branch.fill(&PackageFill {
-            root: self.index.root(),
-            visible: &visible,
-            resolution: ResolutionPolicy::from(&self.dependency_configuration),
-            limits: DependencyIndexLimits {
-                syntax: self.index.limits().syntax(),
-                ..DependencyIndexLimits::from(&self.dependency_configuration)
-            },
-            context: dependency_context,
-        })
-    }
-
-    /// Fills on-disk dependency sources for local documentation search without running a
-    /// toolchain. Revision snapshots carry no current dependency sources.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panics with a branch lock held, or when the
-    /// workspace's visible paths cannot be read.
-    pub(crate) fn fill_local_documentation_packages(
-        &self,
-        dependency_context: &DependencyContext,
-    ) -> Result<PackageFallback, ReadError> {
-        let (Some(branch), Some(source_policy)) = (&self.packages, self.source_policy.as_deref())
-        else {
-            return Ok(PackageFallback::default());
-        };
-        if self.revision.is_some() {
-            return Ok(PackageFallback::default());
-        }
-        let held = branch.read()?;
-        if branch_matches_exact_context(&held, dependency_context) {
-            return Ok(PackageFallback::default());
-        }
-        drop(held);
-        let visible: Vec<ProjectPath> = source_policy
-            .visible_paths()
-            .map_err(ReadFault::index)?
-            .iter()
-            .map(project_path)
-            .collect();
-        let configuration = DependenciesConfiguration {
-            resolution: DependencyResolution::Static,
-            ..self.dependency_configuration.clone()
-        };
-        branch.fill(&PackageFill {
-            root: self.index.root(),
-            visible: &visible,
-            resolution: ResolutionPolicy::from(&configuration),
-            limits: DependencyIndexLimits {
-                syntax: self.index.limits().syntax(),
-                ..DependencyIndexLimits::from(&configuration)
-            },
-            context: dependency_context,
-        })
-    }
-
-    /// The package branch an answer whose `scope` reaches packages reads, held on the read
-    /// side for the life of the answer. None for the local scope, and for a service with
-    /// no branch attached, which answers as an empty branch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panicked with the lock held.
-    pub(crate) fn dependency_index(
-        &self,
-        scope: SearchScope,
-    ) -> Result<Option<RwLockReadGuard<'_, DependencyIndex>>, ReadError> {
-        match &self.packages {
-            Some(branch) if scope != SearchScope::Local => branch.read().map(Some),
-            _ => Ok(None),
-        }
-    }
-
-    /// The package branch selected for documentation search, including local on-disk
-    /// packages filled under static resolution.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReadError`] when a holder panicked with the lock held.
-    pub(crate) fn documentation_dependency_index(
-        &self,
-    ) -> Result<Option<RwLockReadGuard<'_, DependencyIndex>>, ReadError> {
-        match &self.packages {
-            Some(branch) => branch.read().map(Some),
-            None => Ok(None),
-        }
     }
 
     /// One `get_symbol` hit from the project index, with the `symbol_disagreement`
@@ -1347,33 +1178,6 @@ impl ReadService {
     }
 }
 
-/// Whether one held package branch exactly matches a context made of locked versions.
-fn branch_matches_exact_context(index: &DependencyIndex, context: &DependencyContext) -> bool {
-    let mut selected = std::collections::BTreeSet::new();
-    for entry in context.entries() {
-        let (Some(version), None) = (&entry.version, &entry.requirement) else {
-            return false;
-        };
-        selected.insert((
-            entry.manager.as_str(),
-            entry.name.as_str(),
-            version.as_str(),
-        ));
-    }
-    let held = index
-        .packages()
-        .map(|package| {
-            let identity = package.identity();
-            (
-                identity.manager.as_str(),
-                identity.name.as_str(),
-                identity.version.as_str(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    held.len() == selected.len() && held.iter().all(|identity| selected.contains(identity))
-}
-
 /// Accepts a caller-supplied result limit: positive and at most `PAGE_LIMIT_MAX`. The
 /// maximum fits `usize` on every platform, so the conversion below cannot fail.
 pub(crate) fn accepted_limit(requested: u64) -> Result<usize, ReadError> {
@@ -1407,144 +1211,55 @@ pub(crate) fn validate_common(_rev: bool) -> Result<(), ReadError> {
     Ok(())
 }
 
-/// One ranked declaration match a `get_symbol` page holds: from the project index, or
-/// from one cataloged package.
-enum RankedMatch<'a> {
-    Project(SymbolMatch<'a>),
-    Dependency(DependencySymbolMatch<'a>),
-}
+/// Why a read refuses a `scope` past `local`, or a `packages` argument, beside a revision.
+pub(crate) const CURRENT_TREE_ALONE: &str = "package facts are served for the current tree alone";
 
-impl<'a> RankedMatch<'a> {
-    /// The file the matched declaration sits in.
-    const fn file(&self) -> &'a IndexedFile {
-        match self {
-            Self::Project(matched) => matched.file,
-            Self::Dependency(found) => found.matched.file,
-        }
-    }
+/// Why a `local` read refuses a `packages` argument.
+const LOCAL_SCOPE_ALONE: &str = "the local scope reads the project alone";
 
-    /// The rank the match carries; the project index and a package index share one
-    /// ranking, so an `all` answer merges the two sides by it.
-    const fn rank(&self) -> IdentifierMatchClass {
-        match self {
-            Self::Project(matched) => matched.rank,
-            Self::Dependency(found) => found.matched.rank,
-        }
-    }
-
-    /// Whether the match comes from a cataloged package; at equal rank the project side
-    /// orders first.
-    const fn is_dependency(&self) -> bool {
-        matches!(self, Self::Dependency(_))
-    }
-}
-
-/// One dependency match's wire symbol and the source unit its file is served under: the
-/// symbol assembled through the package graph, the unit read from the package.
-/// `assembled_symbol` refuses a match whose file the package does not hold, so the unit
-/// read after it always answers. `get_symbol` and `search` share this assembly.
-pub(crate) fn dependency_symbol(
-    found: DependencySymbolMatch<'_>,
-) -> Result<(Symbol, SourceUnitId), ReadError> {
-    let matched = found.matched;
-    let readable = found
-        .package
-        .assembled_symbol(matched)
-        .map_err(ReadFault::dependency)?;
-    let unit = found.package.unit_of(matched.file).unwrap_or_else(|| {
-        unreachable!(
-            "a package serves the unit of every file it assembled a symbol from: path={}",
-            matched.file.path().as_str()
-        )
-    });
-    Ok((
-        assembled_wire_symbol(&readable),
-        SourceUnitId(unit.to_string()),
-    ))
-}
-
-/// One `get_symbol` hit from a cataloged package: the symbol assembled through the
-/// package graph, addressed by its source unit alone, with no node identity and no
-/// history.
-fn dependency_hit(
-    found: DependencySymbolMatch<'_>,
-    include_source: bool,
-) -> Result<GetSymbolHit, ReadError> {
-    let matched = found.matched;
-    let (symbol, unit) = dependency_symbol(found)?;
-    Ok(GetSymbolHit {
-        symbol,
-        path: None,
-        unit: Some(unit),
-        range: text_range(matched.symbol.range),
-        line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
-        node: None,
-        source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
-        history: None,
-        documentation: None,
-    })
-}
-
-/// The catalog's identity order: manager, then name, then version.
-fn identity_key(identity: &PackageIdentity) -> (&str, &str, &str) {
-    (&identity.manager, &identity.name, &identity.version)
-}
-
-/// The warnings an answer whose `scope` reaches packages carries: the
-/// `global_index_unavailable` entry every such answer rides with, then at most
-/// [`DEPENDENCY_WARNINGS_MAX`] of `package_skipped` in identity order,
-/// `package_context_degraded` in resolver order, and `package_unavailable` in identity
-/// order together, in that order. A workspace can name thousands of packages this machine
-/// holds no source for; their count rides `global_index_unavailable`, so the bound cuts
-/// the per-package entries rather than the fact.
+/// Refuses a `packages` argument no read can send: `get_symbol` and `search` share the
+/// rule.
 ///
-/// No global package index exists, so the first warning states what the local fallback
-/// produced rather than promising a service that is not there.
-pub(crate) fn package_warnings(
-    index: Option<&DependencyIndex>,
-    context: &DependencyContext,
-    fallback: PackageFallback,
-) -> Vec<ReadWarning> {
-    let mut warnings = vec![ReadWarning::GlobalIndexUnavailable {
-        indexed: fallback.indexed,
-        detail: format!(
-            "no global package index answered; {} of the workspace's packages were \
-             analyzed on this machine, and {} named no source this machine holds",
-            fallback.indexed, fallback.unresolved
-        ),
-    }];
-    let skipped_packages: &[SkippedPackage] = index.map_or(&[], DependencyIndex::skipped);
-    let mut skipped: Vec<&SkippedPackage> = skipped_packages.iter().collect();
-    skipped.sort_by(|left, right| identity_key(&left.identity).cmp(&identity_key(&right.identity)));
-    let skipped = skipped
-        .into_iter()
-        .map(|skipped| ReadWarning::PackageSkipped {
-            package: skipped.identity.clone(),
-            reason: skipped.reason.clone(),
-        });
-    let degraded =
-        context
-            .degradations()
-            .iter()
-            .map(|degradation| ReadWarning::PackageContextDegraded {
-                resolver: degradation.resolver.as_str().to_owned(),
-                reason: degradation.reason.clone(),
-            });
-    let unavailable =
-        fallback
-            .unavailable
-            .into_iter()
-            .map(|package| ReadWarning::PackageUnavailable {
-                package,
-                reason: "package source is unavailable on this machine".to_owned(),
-            });
-    warnings.extend(
-        skipped
-            .chain(degraded)
-            .chain(unavailable)
-            .take(DEPENDENCY_WARNINGS_MAX),
-    );
-    warnings
+/// A `local` scope reads the project alone, and a revision read serves no package fact,
+/// so either leaves the argument nothing to change. The list is bounded by
+/// [`REQUESTED_PACKAGES_MAX`], and each entry is classified against the lengths its
+/// schema advertises before it can reach the global API.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] naming `packages` for the first rule the argument breaks.
+pub(crate) fn validate_requested_packages(
+    scope: SearchScope,
+    rev: bool,
+    packages: &[RequestedPackage],
+) -> Result<(), ReadError> {
+    match requested_packages_violation(scope, rev, packages) {
+        Some(violation) => Err(ReadFault::invalid("packages", violation)),
+        None => Ok(()),
+    }
+}
+
+/// The first rule a `packages` argument breaks, in precedence order: the read it rides
+/// on, then the list bound, then each entry in list order.
+fn requested_packages_violation(
+    scope: SearchScope,
+    rev: bool,
+    packages: &[RequestedPackage],
+) -> Option<String> {
+    match packages {
+        [] => None,
+        _ if rev => Some(CURRENT_TREE_ALONE.to_owned()),
+        _ if scope == SearchScope::Local => Some(LOCAL_SCOPE_ALONE.to_owned()),
+        _ if packages.len() > REQUESTED_PACKAGES_MAX => Some(format!(
+            "{} entries exceed the maximum {REQUESTED_PACKAGES_MAX}",
+            packages.len()
+        )),
+        _ => packages.iter().enumerate().find_map(|(index, package)| {
+            package
+                .violation()
+                .map(|violation| format!("entry {index} breaks {}", fault_label(&violation)))
+        }),
+    }
 }
 
 /// Cuts one page out of a fully collected result set and states where the page sits.
@@ -1900,8 +1615,9 @@ impl CapturedRevisions {
 
 /// Reads the dependency context over every path `source_policy` makes visible.
 ///
-/// The pass reads manifests and lockfiles alone: no toolchain runs and no package cache
-/// is inspected, so a workspace that never asks for a package read never pays for one.
+/// The resolvers read manifests and lockfiles, and the Python `RECORD` lists that name
+/// install folders; the one program the pass runs is a standard library version probe,
+/// under `[dependencies] resolution = "auto"` alone and bounded by `command_timeout`.
 /// The walk is the policy's own, so a manifest the `[source]` policy or `.gitignore`
 /// hides reaches no resolver.
 fn resolved_context(
@@ -1915,11 +1631,45 @@ fn resolved_context(
         .iter()
         .map(project_path)
         .collect();
+    let libraries = standard_libraries(source_policy, &visible);
     Ok(crate::dependency::read_workspace_context(
         root,
         &visible,
         &configuration.packages,
+        crate::dependency::ResolutionPolicy::from(configuration),
+        &libraries,
     ))
+}
+
+/// The standard libraries the workspace's languages rely on: one per library whose
+/// language the `[languages]` policy selects, enabled and with its `stdlib` key on, for
+/// at least one visible path. A Rust workspace holding one `.py` file therefore names
+/// `stdlib/python` too, and a library two languages name goes out while either keeps
+/// the key on. A path two language entries claim names neither; the index refuses it on
+/// its own.
+fn standard_libraries(
+    source_policy: &WorkspaceSourcePolicy,
+    visible: &[ProjectPath],
+) -> Vec<StandardLibrary> {
+    let mut libraries: Vec<StandardLibrary> = visible
+        .iter()
+        .filter_map(|path| path_library(source_policy, &path.0))
+        .collect();
+    libraries.sort_unstable();
+    libraries.dedup();
+    libraries
+}
+
+/// The standard library the language `[languages]` selects, enabled and with its
+/// `stdlib` key on, for one path relies on; `None` for a path of no such language.
+fn path_library(source_policy: &WorkspaceSourcePolicy, path: &str) -> Option<StandardLibrary> {
+    source_policy
+        .language_policy()
+        .language_for_path(Path::new(path))
+        .ok()
+        .flatten()
+        .filter(|language| language.enabled() && language.stdlib())
+        .and_then(|language| StandardLibrary::for_language(language.identity()))
 }
 
 /// The revisions one read service captures at build time. The captured tree
@@ -2051,25 +1801,21 @@ fn decoded(encoded: &str) -> Option<String> {
 pub(crate) mod tests {
     use std::error::Error;
     use std::fs;
-    use std::sync::Arc;
 
     use rift_core::{LanguageFileSelections, SourceVisibility};
-    use rift_dependency::CatalogEntry;
-    use rift_index::{DependencyIndexLimits, PackageIndex, package_files};
     use rift_protocol::configuration::{LanguageConfiguration, WorkspaceConfiguration};
     use rift_protocol::read::{
-        DEPENDENCY_WARNINGS_MAX, GetSymbolInclude, GetSymbolParams, Language, NodeFacet,
-        NodesParams, NodesResult, PAGE_LIMIT_MAX, PackageIdentity, Pagination, ProjectPath,
-        ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind,
-        SourceUnitId,
+        GetSymbolInclude, GetSymbolParams, Language, NodeFacet, NodesParams, NodesResult,
+        PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX,
+        SearchScope,
     };
-    use rift_syntax::ShippedLanguage;
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
-        DependenciesConfiguration, HistoryConfiguration, PackageBranch, ReadFault, ReadService,
-        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id,
+        Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
+        REQUESTED_PACKAGES_MAX, ReadError, ReadFault, ReadService, RequestedPackage,
+        WorkspaceIndex, WorkspaceIndexLimits, accepted_limit, file_id, validate_requested_packages,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -2105,7 +1851,10 @@ pub(crate) mod tests {
             text_inclusion,
             languages,
             HistoryConfiguration::default(),
-            DependenciesConfiguration::default(),
+            DependenciesConfiguration {
+                resolution: DependencyResolution::Static,
+                ..DependenciesConfiguration::default()
+            },
         )
     }
 
@@ -2155,8 +1904,9 @@ pub(crate) mod tests {
             )
         };
 
-        let kept = service.context_after(&changed("src/lib.rs"))?;
-        let reread = service.context_after(&changed("Cargo.toml"))?;
+        let policy = service.filesystem_policy("read the dependency context")?;
+        let kept = service.context_after(policy, &changed("src/lib.rs"), &service.index)?;
+        let reread = service.context_after(policy, &changed("Cargo.toml"), &service.index)?;
 
         assert!(
             std::sync::Arc::ptr_eq(&kept, &service.context),
@@ -2166,6 +1916,141 @@ pub(crate) mod tests {
             !std::sync::Arc::ptr_eq(&reread, &service.context),
             "a manifest change reads the context again"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_context_is_reread_when_a_language_gains_its_first_path_or_loses_its_last() -> TestResult
+    {
+        let directory = TempDir::new()?;
+        let manifest = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        fs::write(directory.path().join("Cargo.toml"), manifest)?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("src/extra.rs"), "pub fn extra() {}\n")?;
+        let (limits, visibility) = (WorkspaceIndexLimits::default(), SourceVisibility::default());
+        let text = rift_core::TextFileInclusion::default();
+        let history = HistoryConfiguration::default();
+        let service = ReadService::build(directory.path(), limits, &visibility, &text, history)?;
+        let digests = |paths: &[(&str, &[u8])]| {
+            rift_index::WorkspaceDigests::new(paths.iter().map(|(path, bytes)| {
+                (
+                    rift_core::ProjectPath::new(*path).expect("fixture path"),
+                    rift_index::FileDigest::of(bytes),
+                )
+            }))
+        };
+        let python = |service: &ReadService| {
+            service
+                .context
+                .standard_libraries()
+                .contains(&rift_dependency::StandardLibrary::Python)
+        };
+        assert!(
+            !python(&service),
+            "a Rust workspace names no Python library"
+        );
+
+        let tool: &[u8] = b"print('probe')\n";
+        fs::write(directory.path().join("tool.py"), tool)?;
+        let gained = service.rebuilt(&rift_index::PathChanges::between(
+            &digests(&[]),
+            &digests(&[("tool.py", tool)]),
+        ))?;
+        assert!(
+            !std::sync::Arc::ptr_eq(&gained.context, &service.context) && python(&gained),
+            "the first Python path reads the context again and names `stdlib/python`"
+        );
+
+        fs::remove_file(directory.path().join("src/extra.rs"))?;
+        let kept = gained.rebuilt(&rift_index::PathChanges::between(
+            &digests(&[("src/extra.rs", b"pub fn extra() {}\n".as_slice())]),
+            &digests(&[]),
+        ))?;
+        assert!(
+            std::sync::Arc::ptr_eq(&kept.context, &gained.context),
+            "removing one Rust path of two keeps the standing context"
+        );
+
+        fs::remove_file(directory.path().join("tool.py"))?;
+        let lost = kept.rebuilt(&rift_index::PathChanges::between(
+            &digests(&[("tool.py", tool)]),
+            &digests(&[]),
+        ))?;
+        assert!(
+            !std::sync::Arc::ptr_eq(&lost.context, &kept.context) && !python(&lost),
+            "removing the last Python path reads the context again without it"
+        );
+        Ok(())
+    }
+
+    /// `[languages.<name>] stdlib = false` leaves that language's library out of the
+    /// context, while a library another present language names with the key on stays: a
+    /// `.ts` and a `.js` file with the key off on `typescript` still name `stdlib/node`.
+    #[test]
+    fn the_stdlib_key_leaves_a_library_out_unless_another_present_language_names_it() -> TestResult
+    {
+        use rift_dependency::StandardLibrary::{Node, Python};
+
+        let directory = TempDir::new()?;
+        fs::write(directory.path().join("tool.py"), "print('probe')\n")?;
+        fs::write(directory.path().join("app.ts"), "export const a = 1;\n")?;
+        fs::write(directory.path().join("app.js"), "export const b = 2;\n")?;
+        let read = |switches: &[(&str, bool)]| -> TestResult<ReadService> {
+            let mut configuration = WorkspaceConfiguration::default();
+            for (name, stdlib) in switches {
+                configuration.languages.insert(
+                    (*name).to_owned(),
+                    LanguageConfiguration {
+                        stdlib: *stdlib,
+                        ..LanguageConfiguration::default()
+                    },
+                );
+            }
+            let languages = LanguageFileSelections::from(&configuration);
+            let text_inclusion = rift_core::TextFileInclusion::default();
+            let limits = WorkspaceIndexLimits::default();
+            let reads = reads_with(directory.path(), limits, &text_inclusion, &languages)?;
+            Ok(reads)
+        };
+        let named = |service: &ReadService| -> Vec<String> {
+            service
+                .context
+                .entries()
+                .iter()
+                .map(|entry| format!("{}/{}", entry.manager, entry.name))
+                .collect()
+        };
+
+        let defaults = read(&[])?;
+        let python_off = read(&[("python", false)])?;
+        let typescript_off = read(&[("typescript", false)])?;
+        let both_off = read(&[("typescript", false), ("javascript", false)])?;
+
+        assert_eq!(
+            named(&defaults),
+            ["npm/typescript", "stdlib/node", "stdlib/python"]
+        );
+        assert_eq!(
+            python_off
+                .context
+                .standard_libraries()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [Node]
+        );
+        assert_eq!(
+            typescript_off
+                .context
+                .standard_libraries()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [Node, Python],
+            "`javascript` names the Node.js library with its key on"
+        );
+        assert_eq!(named(&both_off), ["stdlib/python"]);
         Ok(())
     }
 
@@ -3251,76 +3136,6 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    fn identity(manager: &str, name: &str, version: &str) -> PackageIdentity {
-        PackageIdentity {
-            manager: manager.to_owned(),
-            name: name.to_owned(),
-            version: version.to_owned(),
-        }
-    }
-
-    fn helper_identity() -> PackageIdentity {
-        identity("cargo", "helper", "0.1.0")
-    }
-
-    pub(crate) fn helper_unit() -> SourceUnitId {
-        SourceUnitId("rift://source/cargo/helper@0.1.0/src/lib.rs".to_owned())
-    }
-
-    /// The `helper` package as a manifest would declare it directly, rooted at `root`.
-    fn helper_entry(root: &std::path::Path) -> CatalogEntry {
-        CatalogEntry::dependency(
-            helper_identity(),
-            ShippedLanguage::Rust.language(),
-            Some(root.to_path_buf()),
-            true,
-        )
-    }
-
-    /// The helper package indexed from a tempdir holding `src/lib.rs`: one public
-    /// `helper_beacon`, one private `helper_private`, and a public `beacon` sharing the
-    /// project's name. The files are read before the tempdir drops.
-    fn helper_package() -> TestResult<PackageIndex> {
-        let root = tempfile::tempdir()?;
-        fs::create_dir(root.path().join("src"))?;
-        let source = "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
-        fs::write(root.path().join("src/lib.rs"), source)?;
-        let entry = helper_entry(root.path());
-        let files = package_files(&entry, &DependencyIndexLimits::default())?;
-        Ok(PackageIndex::build(&entry, &files, 1)?)
-    }
-
-    pub(crate) fn empty_package_branch() -> PackageBranch {
-        PackageBranch::new(DependencyIndexLimits::default())
-    }
-
-    /// Inputs that refuse every read as over its bound, so a context read over them
-    /// degrades every resolver that claims a manifest.
-    struct RefusedInputs;
-
-    impl rift_dependency::StaticInputs for RefusedInputs {
-        fn read_file(
-            &mut self,
-            _path: &std::path::Path,
-            bytes_max: u64,
-        ) -> rift_dependency::FileObservation {
-            rift_dependency::FileObservation::OverBound {
-                bytes: bytes_max + 1,
-            }
-        }
-    }
-
-    /// A dependency context whose one claimed manifest could not be read.
-    fn degraded_context() -> rift_dependency::DependencyContext {
-        rift_dependency::resolve_context(
-            std::path::Path::new("/workspace"),
-            &[ProjectPath("Cargo.toml".to_owned())],
-            rift_dependency::resolvers(),
-            &mut RefusedInputs,
-            &[],
-        )
-    }
-
     /// One project whose `src/lib.rs` holds `source` alone.
     pub(crate) fn project_fixture(source: &str) -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -3340,68 +3155,16 @@ pub fn compute() -> i32 {
         project_fixture("pub fn beacon() {}\n")
     }
 
-    /// A store holding the built helper package alone.
-    pub(crate) fn helper_store() -> TestResult<Arc<PackageBranch>> {
-        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
-        index.insert(helper_package()?)?;
-        Ok(Arc::new(PackageBranch::from_index(index)))
-    }
-
-    /// The project `beacon` beside a store holding the built helper package.
-    fn dependency_fixture() -> TestResult<(TempDir, ReadService)> {
-        let (directory, service) = beacon_fixture()?;
-        let service = service.with_packages(helper_store()?);
-        Ok((directory, service))
-    }
-
-    #[test]
-    fn held_packages_match_only_the_same_exact_dependency_context() -> TestResult {
-        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
-        index.insert(helper_package()?)?;
-        for (version, requirement, expected) in [
-            (Some("0.1.0"), None, true),
-            (Some("0.2.0"), None, false),
-            (None, Some("^0.1"), false),
-        ] {
-            let package = rift_protocol::dependencies::ConfiguredPackage {
-                manager: "cargo".to_owned(),
-                name: "helper".to_owned(),
-                version: version.map(str::to_owned),
-                requirement: requirement.map(str::to_owned),
-            };
-            let context = rift_dependency::resolve_context(
-                std::path::Path::new("/workspace"),
-                &[],
-                &[],
-                &mut RefusedInputs,
-                &[package],
-            );
-            assert_eq!(context.entries().len(), 1);
-            assert_eq!(
-                super::branch_matches_exact_context(&index, &context),
-                expected
-            );
-        }
-        assert!(!super::branch_matches_exact_context(
-            &index,
-            &rift_dependency::DependencyContext::default(),
-        ));
-        Ok(())
-    }
-
     fn scoped(name: &str, scope: &str) -> TestResult<GetSymbolParams> {
         let request = json!({"name": name, "scope": scope, "limit": 10});
         Ok(serde_json::from_value(request)?)
     }
 
-    /// An omitted `scope` answers the project index alone: the helper's declaration does
-    /// not answer, the project `beacon` answers by path, and no dependency warning rides.
+    /// An omitted `scope` answers the project index alone, by path, and no dependency
+    /// warning rides.
     #[test]
     fn get_symbol_default_scope_answers_the_project_alone() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let params: GetSymbolParams = serde_json::from_value(json!({"name": "helper_beacon"}))?;
-        assert!(service.get_symbol(&params)?.hits.is_empty());
-
+        let (_directory, service) = beacon_fixture()?;
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "beacon"}))?;
         let result = service.get_symbol(&params)?;
 
@@ -3419,216 +3182,34 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    /// A `local` read resolves nothing: no resolver pass runs and the branch stays
-    /// unfilled, while the same service under `global` resolves once.
+    /// Package facts come from the global index, so the snapshot answers a `global`
+    /// lookup with no hit and an `all` lookup with the project's own, and neither
+    /// carries a package warning of its own: the global route adds those.
     #[test]
-    fn a_local_read_resolves_no_dependency_context() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        use crate::packages::tests::{RESOLVE_SPAN, RecordedSpans, context_naming_one_package};
-
+    fn get_symbol_global_scope_answers_no_project_hit_and_all_answers_the_project() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
-        let branch = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
-        let service = service
-            .with_packages(Arc::clone(&branch))
-            .with_context(context_naming_one_package());
 
-        let local = RecordedSpans::default();
-        {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(local.clone()),
-            );
-            service.fill_packages(SearchScope::Local, service.dependency_context())?;
-        }
-        assert_eq!(local.named(RESOLVE_SPAN), 0, "{local:?}");
+        let global = service.get_symbol(&scoped("beacon", "global")?)?;
+        let all = service.get_symbol(&scoped("beacon", "all")?)?;
 
-        let global = RecordedSpans::default();
-        {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(global.clone()),
-            );
-            service.fill_packages(SearchScope::Global, service.dependency_context())?;
-        }
-        assert_eq!(global.named(RESOLVE_SPAN), 1, "{global:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn get_symbol_with_an_empty_dependency_context_skips_package_work() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        use crate::packages::tests::{RESOLVE_SPAN, RecordedSpans, context_naming_one_package};
-
-        let (_directory, service) = beacon_fixture()?;
-        let branch = Arc::new(PackageBranch::new(DependencyIndexLimits::default()));
-        let service = service
-            .with_packages(Arc::clone(&branch))
-            .with_context(context_naming_one_package());
-        let selected = Arc::new(service.dependency_context().filter_entries(|_| false));
-        let recorded = RecordedSpans::default();
-        let result = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(recorded.clone()),
-            );
-            service.get_symbol_with_dependency_context(
-                &scoped("helper_beacon", "global")?,
-                &selected,
-            )?
-        };
-
-        assert!(result.hits.is_empty());
-        assert_eq!(recorded.named(RESOLVE_SPAN), 0, "{recorded:?}");
-        assert_eq!(branch.read()?.indexed_count(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn get_symbol_global_scope_answers_the_helper_public_declaration() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-
-        let result = service.get_symbol(&scoped("helper_beacon", "global")?)?;
-
-        assert_eq!(result.hits.len(), 1);
-        let hit = &result.hits[0];
-        assert_eq!(hit.unit, Some(helper_unit()));
-        assert_eq!(hit.path, None);
-        assert_eq!(hit.node, None);
-        assert_eq!(hit.history, None);
-        assert_eq!(hit.line, 1);
-        assert_eq!(hit.range.start, 0);
-        assert_eq!(hit.symbol.name, "helper_beacon");
+        assert!(global.hits.is_empty(), "{global:?}");
         assert_eq!(
-            hit.symbol.origin.location,
-            Some(SourceLocationKind::Dependency)
-        );
-        assert_eq!(hit.symbol.origin.package, Some(helper_identity()));
-        assert_eq!(hit.source.as_deref(), Some("pub fn helper_beacon() {}"));
-        assert_eq!(
-            result.warnings,
-            [ReadWarning::GlobalIndexUnavailable {
-                indexed: 1,
-                detail: "no global package index answered; 1 of the workspace's packages \
-                         were analyzed on this machine, and 0 named no source this machine \
-                         holds"
-                    .to_owned(),
-            }],
-            "a fully built branch warns only that no global index answered"
-        );
-
-        let request = json!({"name": "helper_beacon", "scope": "global", "include": []});
-        let params: GetSymbolParams = serde_json::from_value(request)?;
-        let without_source = service.get_symbol(&params)?;
-        assert_eq!(without_source.hits[0].source, None);
-        Ok(())
-    }
-
-    /// The private declaration never answers; `beacon` answers the helper's exact `beacon`
-    /// first, then `helper_beacon` as a qualified-name substring, both by unit.
-    #[test]
-    fn get_symbol_global_scope_hides_the_private_declaration_and_the_project() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-
-        let private = service.get_symbol(&scoped("helper_private", "global")?)?;
-        let beacon = service.get_symbol(&scoped("beacon", "global")?)?;
-
-        assert!(private.hits.is_empty(), "{:?}", private.hits);
-        let names: Vec<&str> = beacon
-            .hits
-            .iter()
-            .map(|hit| hit.symbol.name.as_str())
-            .collect();
-        assert_eq!(names, ["beacon", "helper_beacon"]);
-        assert!(
-            beacon
-                .hits
-                .iter()
-                .all(|hit| hit.unit == Some(helper_unit())),
-            "the project's beacon does not answer a dependency scope: {:?}",
-            beacon.hits
-        );
-        Ok(())
-    }
-
-    /// `all` merges by rank, the project side first at equal rank, and the page is cut
-    /// after the merge: the project `beacon` and the helper's `beacon` tie as exact
-    /// matches, then `helper_beacon` follows as a substring match.
-    #[test]
-    fn get_symbol_all_scope_lists_the_project_beacon_before_the_helper_beacon() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-
-        let result = service.get_symbol(&scoped("beacon", "all")?)?;
-
-        assert_eq!(result.hits.len(), 3, "{:?}", result.hits);
-        assert_eq!(
-            result.hits[0].path,
-            Some(ProjectPath("src/lib.rs".to_owned()))
-        );
-        assert_eq!(result.hits[1].unit, Some(helper_unit()));
-        assert_eq!(result.hits[1].symbol.name, "beacon");
-        assert_eq!(result.hits[2].unit, Some(helper_unit()));
-        assert_eq!(result.hits[2].symbol.name, "helper_beacon");
-        let request = json!({"name": "beacon", "scope": "all", "limit": 1, "page_index": 1});
-        let params: GetSymbolParams = serde_json::from_value(request)?;
-        let second = service.get_symbol(&params)?;
-        assert_eq!(
-            second.pagination,
+            global.pagination,
             Pagination {
-                page_index: 1,
-                total_pages: 3
+                page_index: 0,
+                total_pages: 0
             }
         );
-        assert_eq!(second.hits.len(), 1);
-        assert_eq!(second.hits[0].unit, Some(helper_unit()));
-        assert_eq!(second.hits[0].symbol.name, "beacon");
-        Ok(())
-    }
-
-    /// Rank decides across the two sides: the helper's exact `beacon` orders above the
-    /// project's `beacon_tower`, a name-prefix match, which orders above the helper's
-    /// `helper_beacon`, a substring match.
-    #[test]
-    fn get_symbol_all_scope_ranks_a_helper_exact_match_above_a_project_prefix_match() -> TestResult
-    {
-        let (_directory, service) = project_fixture("pub fn beacon_tower() {}\n")?;
-        let service = service.with_packages(helper_store()?);
-
-        let result = service.get_symbol(&scoped("beacon", "all")?)?;
-
-        let ordered: Vec<(&str, bool)> = result
-            .hits
-            .iter()
-            .map(|hit| (hit.symbol.name.as_str(), hit.unit.is_some()))
-            .collect();
-        assert_eq!(
-            ordered,
-            [
-                ("beacon", true),
-                ("beacon_tower", false),
-                ("helper_beacon", true)
-            ]
-        );
-        Ok(())
-    }
-
-    /// `language` narrows both sides of an `all` answer: `rust` keeps the helper's hits
-    /// beside the project's, and a language neither side is filed under answers empty.
-    #[test]
-    fn get_symbol_language_narrows_the_package_hits_too() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
-        let rust = json!({"name": "beacon", "scope": "all", "language": "rust"});
-        let python = json!({"name": "beacon", "scope": "all", "language": "python"});
-
-        let selected = service.get_symbol(&serde_json::from_value(rust)?)?;
-        let filtered = service.get_symbol(&serde_json::from_value(python)?)?;
-
-        assert_eq!(selected.hits.len(), 3, "{:?}", selected.hits);
-        assert!(filtered.hits.is_empty(), "{:?}", filtered.hits);
+        assert!(global.warnings.is_empty(), "{:?}", global.warnings);
+        assert_eq!(all.hits.len(), 1);
+        assert_eq!(all.hits[0].path, Some(ProjectPath("src/lib.rs".to_owned())));
+        assert!(all.warnings.is_empty(), "{:?}", all.warnings);
         Ok(())
     }
 
     #[test]
     fn get_symbol_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
-        let (_directory, service) = dependency_fixture()?;
+        let (_directory, service) = beacon_fixture()?;
         for scope in ["global", "all"] {
             let params: GetSymbolParams =
                 serde_json::from_value(json!({"name": "beacon", "scope": scope, "rev": "main"}))?;
@@ -3646,266 +3227,129 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
-    #[test]
-    fn get_symbol_global_scope_warns_each_skipped_package_in_identity_order() -> TestResult {
-        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
-        index.skip(
-            identity("cargo", "zeta", "1.0.0"),
-            "zeta refused".to_owned(),
-        );
-        index.skip(
-            identity("cargo", "alpha", "1.0.0"),
-            "alpha refused".to_owned(),
-        );
-        let (_directory, service) = beacon_fixture()?;
-        let service = service.with_packages(Arc::new(PackageBranch::from_index(index)));
-
-        let result = service.get_symbol(&scoped("beacon", "global")?)?;
-
-        assert!(result.hits.is_empty());
-        assert_eq!(
-            result.warnings[1..],
-            [
-                ReadWarning::PackageSkipped {
-                    package: identity("cargo", "alpha", "1.0.0"),
-                    reason: "alpha refused".to_owned(),
-                },
-                ReadWarning::PackageSkipped {
-                    package: identity("cargo", "zeta", "1.0.0"),
-                    reason: "zeta refused".to_owned(),
-                },
-            ],
-            "the global-index warning leads every package answer"
-        );
-        Ok(())
-    }
-
-    /// A service with no branch answers a package scope as an empty branch; the
-    /// context's degradations still ride the answer, after the global-index warning.
-    #[test]
-    fn get_symbol_global_scope_warns_a_degraded_context_without_a_branch() -> TestResult {
-        let (_directory, service) = beacon_fixture()?;
-        let service = service.with_context(degraded_context());
-
-        let result = service.get_symbol(&scoped("beacon", "global")?)?;
-
-        assert!(result.hits.is_empty());
-        assert!(
-            matches!(
-                result.warnings.first(),
-                Some(ReadWarning::GlobalIndexUnavailable { indexed: 0, .. })
-            ),
-            "{:?}",
-            result.warnings
-        );
-        assert!(
-            result.warnings[1..].iter().all(|warning| matches!(
-                warning,
-                ReadWarning::PackageContextDegraded { resolver, .. } if resolver == "cargo"
-            )),
-            "{:?}",
-            result.warnings
-        );
-        assert!(result.warnings.len() > 1, "{:?}", result.warnings);
-        Ok(())
-    }
-
-    /// Six skipped packages and four degradations cut to eight: every skipped package in
-    /// identity order, then the first two degradations in resolver order.
-    #[test]
-    fn get_symbol_global_scope_caps_skipped_and_degraded_warnings_together() -> TestResult {
-        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
-        for name in ["f", "e", "d", "c", "b", "a"] {
-            index.skip(identity("cargo", name, "1.0.0"), format!("{name} refused"));
+    /// One `get_symbol` request, `arguments` laid over `name: "beacon"`.
+    fn lookup(arguments: &serde_json::Value) -> TestResult<GetSymbolParams> {
+        let mut request = json!({"name": "beacon"});
+        for (key, value) in arguments.as_object().ok_or("arguments are an object")? {
+            request[key] = value.clone();
         }
+        Ok(serde_json::from_value(request)?)
+    }
+
+    fn packages_violation(error: &ReadError) -> Option<&str> {
+        match error.fault() {
+            ReadFault::Invalid {
+                field: "packages",
+                violation,
+            } => Some(violation.as_str()),
+            _ => None,
+        }
+    }
+
+    /// A `local` read consults no package, so `packages` beside it, spelled or omitted,
+    /// refuses naming the field.
+    #[test]
+    fn get_symbol_packages_beside_the_local_scope_refuses_naming_packages() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
-        let service = service
-            .with_packages(Arc::new(PackageBranch::from_index(index)))
-            .with_context(degraded_context());
-
-        let result = service.get_symbol(&scoped("beacon", "global")?)?;
-
-        assert_eq!(result.warnings.len(), DEPENDENCY_WARNINGS_MAX + 1);
-        let rendered: Vec<String> = result.warnings[1..]
-            .iter()
-            .map(|warning| match warning {
-                ReadWarning::PackageSkipped { package, .. } => {
-                    format!("skipped {}", package.name)
-                }
-                ReadWarning::PackageContextDegraded { resolver, .. } => {
-                    format!("degraded {resolver}")
-                }
-                other => format!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(rendered.len(), DEPENDENCY_WARNINGS_MAX);
-        assert_eq!(
-            rendered[..6],
-            [
-                "skipped a",
-                "skipped b",
-                "skipped c",
-                "skipped d",
-                "skipped e",
-                "skipped f",
-            ],
-            "every skipped package leads, in identity order"
-        );
-        assert!(
-            rendered[6..]
-                .iter()
-                .all(|entry| entry.starts_with("degraded")),
-            "the degraded resolvers fill what the bound leaves: {rendered:?}"
-        );
+        let packages = json!([{"manager": "cargo", "name": "serde"}]);
+        for request in [
+            json!({"packages": packages}),
+            json!({"packages": packages, "scope": "local"}),
+        ] {
+            let error = service
+                .get_symbol(&lookup(&request)?)
+                .expect_err("a local read names no package");
+            assert_eq!(
+                packages_violation(&error),
+                Some("the local scope reads the project alone"),
+                "{request}: {error}"
+            );
+            assert_eq!(error.descriptor().code(), "invalid_request");
+        }
         Ok(())
     }
 
-    /// Twelve packages with no source on this machine ride as eight `package_unavailable`
-    /// warnings in identity order, while `global_index_unavailable` keeps the full count
-    /// (#364: a Bun workspace carried 3,155 of them on every documentation answer).
+    /// Package facts follow the current tree alone, so `packages` beside `rev` refuses
+    /// naming the field, whatever the scope.
     #[test]
-    fn package_warnings_cap_unavailable_packages_and_keep_their_count() {
-        let unavailable: Vec<PackageIdentity> = (0..12)
-            .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
-            .collect();
-        let fallback = crate::packages::PackageFallback {
-            indexed: 0,
-            unresolved: 12,
-            unavailable: unavailable.clone(),
+    fn get_symbol_packages_beside_rev_refuses_naming_packages() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        for scope in ["local", "global", "all"] {
+            let request = json!({
+                "scope": scope,
+                "rev": "main",
+                "packages": [{"manager": "cargo", "name": "serde", "version": "1.0.228"}]
+            });
+            let error = service
+                .get_symbol(&lookup(&request)?)
+                .expect_err("a revision read names no package");
+            assert_eq!(
+                packages_violation(&error),
+                Some("package facts are served for the current tree alone"),
+                "scope {scope}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The argument holds at most `REQUESTED_PACKAGES_MAX` entries, and the first entry
+    /// outside its advertised lengths is named by position and rule.
+    #[test]
+    fn requested_packages_refuse_past_the_bound_and_name_a_malformed_entry() {
+        let package = |name: &str| RequestedPackage {
+            manager: "cargo".to_owned(),
+            name: name.to_owned(),
+            version: None,
         };
+        let at_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX];
+        assert!(validate_requested_packages(SearchScope::All, false, &at_bound).is_ok());
+        assert!(validate_requested_packages(SearchScope::Local, true, &[]).is_ok());
 
-        let warnings = super::package_warnings(
-            None,
-            &rift_dependency::DependencyContext::default(),
-            fallback,
+        let past_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX + 1];
+        let error = validate_requested_packages(SearchScope::Global, false, &past_bound)
+            .expect_err("one entry past the bound refuses");
+        assert_eq!(
+            packages_violation(&error),
+            Some("65 entries exceed the maximum 64")
         );
 
-        assert_eq!(warnings.len(), DEPENDENCY_WARNINGS_MAX + 1, "{warnings:?}");
-        assert!(
-            matches!(
-                &warnings[0],
-                ReadWarning::GlobalIndexUnavailable { detail, .. } if detail.contains("12 named no source")
-            ),
-            "{:?}",
-            warnings[0]
+        let error = validate_requested_packages(
+            SearchScope::All,
+            false,
+            &[package("serde"), package(""), package("")],
+        )
+        .expect_err("an empty name refuses");
+        assert_eq!(
+            packages_violation(&error),
+            Some("entry 1 breaks name_length")
         );
-        let named: Vec<&PackageIdentity> = warnings[1..]
-            .iter()
-            .filter_map(|warning| match warning {
-                ReadWarning::PackageUnavailable { package, .. } => Some(package),
-                _ => None,
-            })
-            .collect();
-        let expected: Vec<&PackageIdentity> =
-            unavailable.iter().take(DEPENDENCY_WARNINGS_MAX).collect();
-        assert_eq!(named, expected);
     }
 
-    /// Skipped packages and degraded resolvers take the bound before unavailable packages:
-    /// a refusal or a failed resolver is what an operator acts on, and the unavailable
-    /// count already rides `global_index_unavailable`.
+    /// A read naming packages resolves a context of its own, and one naming none reads
+    /// the snapshot's context itself.
     #[test]
-    fn package_warnings_order_skipped_then_degraded_then_unavailable() {
-        let mut index = rift_index::DependencyIndex::empty(DependencyIndexLimits::default());
-        index.skip(identity("cargo", "refused", "1.0.0"), "refused".to_owned());
-        let context = degraded_context();
-        let degradations = context.degradations().len();
-        let fallback = crate::packages::PackageFallback {
-            indexed: 0,
-            unresolved: 12,
-            unavailable: (0..12)
-                .map(|position| identity("npm", &format!("package-{position:02}"), "1.0.0"))
-                .collect(),
-        };
+    fn read_context_applies_the_requested_packages_for_one_read() -> TestResult {
+        let (_directory, service) = beacon_fixture()?;
+        let unchanged = service.read_context(SearchScope::Global, None, &[])?;
+        assert!(Arc::ptr_eq(&unchanged, service.dependency_context()));
 
-        let warnings = super::package_warnings(Some(&index), &context, fallback);
+        let requested = [RequestedPackage {
+            manager: "cargo".to_owned(),
+            name: "serde".to_owned(),
+            version: Some("1.0.228".to_owned()),
+        }];
+        let held = service.dependency_context().entries().to_vec();
+        let mut expected = held.clone();
+        expected.push(requested[0].context_entry());
+        expected.sort();
+        let read = service.read_context(SearchScope::All, None, &requested)?;
+        assert_eq!(read.entries(), expected);
+        assert_eq!(service.dependency_context().entries(), held);
 
-        let kinds: Vec<&str> = warnings[1..]
-            .iter()
-            .map(|warning| match warning {
-                ReadWarning::PackageSkipped { .. } => "skipped",
-                ReadWarning::PackageContextDegraded { .. } => "degraded",
-                ReadWarning::PackageUnavailable { .. } => "unavailable",
-                _ => "other",
-            })
-            .collect();
-        let expected: Vec<&str> = std::iter::once("skipped")
-            .chain(std::iter::repeat_n("degraded", degradations))
-            .chain(std::iter::repeat("unavailable"))
-            .take(DEPENDENCY_WARNINGS_MAX)
-            .collect();
-        assert!(
-            degradations >= 1,
-            "the fixture degrades one resolver at least"
-        );
-        assert_eq!(kinds, expected);
-    }
-
-    /// A holder that panics with the write side held poisons the store; the next reader
-    /// gets a typed internal error naming the lock instead of a panic of its own.
-    #[test]
-    fn a_poisoned_package_branch_refuses_with_an_internal_error_naming_the_lock() {
-        let store = Arc::new(empty_package_branch());
-        let holder = Arc::clone(&store);
-        let panicked = std::thread::spawn(move || {
-            let _held = holder.write().expect("the fresh lock is clean");
-            panic!("poison the dependency index lock");
-        })
-        .join();
-        assert!(
-            panicked.is_err(),
-            "the holder must panic with the lock held"
-        );
-
-        let error = store
-            .read()
-            .expect_err("a poisoned lock refuses its reader");
-
-        assert!(
-            matches!(
-                error.fault(),
-                ReadFault::LockPoisoned {
-                    lock: "package index"
-                }
-            ),
-            "{error}"
-        );
-        assert_eq!(error.descriptor().code(), "internal_error");
-        let context = error.context();
-        assert_eq!(context[0].key(), "lock");
-        assert_eq!(context[0].value(), "package index");
-        assert_eq!(context[1].key(), "detail");
-        assert_eq!(context[1].value(), "package index lock poisoned");
-        assert!(
-            std::error::Error::source(&error).is_none(),
-            "a poisoned lock carries no source"
-        );
-        assert!(store.write().is_err(), "the write side is poisoned too");
-    }
-
-    /// A package index failure keeps its own wire identity and evidence through the read
-    /// fault, and stays reachable as the fault's source. An absent root is an unreadable
-    /// walk, so the identity carried through is `storage_failure`.
-    #[test]
-    fn a_dependency_fault_keeps_the_package_failure_as_its_source() -> TestResult {
-        let root = tempfile::tempdir()?;
-        let entry = helper_entry(&root.path().join("absent"));
-        let failure = package_files(&entry, &DependencyIndexLimits::default())
-            .err()
-            .ok_or("a missing root refuses the walk")?;
-        let expected_name = failure.name();
-        let expected_context = failure.context();
-        let expected_text = failure.to_string();
-
-        let error = ReadFault::dependency(failure);
-
-        assert!(matches!(error.fault(), ReadFault::Dependency(_)));
-        assert_eq!(error.name(), expected_name);
-        assert_eq!(error.descriptor().code(), "storage_failure");
-        assert_eq!(error.context(), expected_context);
-        let source =
-            std::error::Error::source(&error).ok_or("a dependency fault carries a source")?;
-        assert_eq!(source.to_string(), expected_text);
+        let error = service
+            .read_context(SearchScope::Local, None, &requested)
+            .expect_err("a local read names no package");
+        assert!(packages_violation(&error).is_some(), "{error}");
         Ok(())
     }
 
@@ -4301,7 +3745,7 @@ pub fn compute() -> i32 {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, an id escaping the heading text,
+    /// provider's kind word, empty facets, an id escaping the heading text,
     /// and the whole section as the source excerpt.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
@@ -4406,7 +3850,7 @@ pub fn compute() -> i32 {
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, an id escaping the key, and the
+    /// provider's kind word, empty facets, an id escaping the key, and the
     /// whole pair as the source excerpt.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
@@ -4655,6 +4099,30 @@ pub fn compute() -> i32 {
                 ReadFault::Task { operation, .. } if *operation == "capture visible workspace digests"
             ),
             "unexpected fault {digests_fault:?}"
+        );
+        Ok(())
+    }
+
+    /// A revision snapshot has no filesystem tree to read changed paths from, so an
+    /// incremental rebuild refuses before it reads one, naming the operation.
+    #[test]
+    fn a_revision_snapshot_refuses_an_incremental_rebuild() -> TestResult {
+        let directory = committed_fixture()?;
+        let service = revision_service(directory.path(), "main")?;
+        let path = rift_core::ProjectPath::new("src/lib.rs")?;
+        let edited = rift_index::FileDigest::of(b"pub fn beacon() -> u8 {\n    7\n}\n");
+        let before = rift_index::WorkspaceDigests::new([]);
+        let after = rift_index::WorkspaceDigests::new([(path, edited)]);
+
+        let error = service
+            .rebuilt(&rift_index::PathChanges::between(&before, &after))
+            .expect_err("a revision snapshot has no filesystem tree to rebuild from");
+
+        let context = rift_core::Fault::context(error.fault());
+        assert_eq!(error.descriptor().code(), "internal_error");
+        assert_eq!(
+            context[0],
+            rift_core::ErrorContext::new("operation", "incremental rebuild")
         );
         Ok(())
     }

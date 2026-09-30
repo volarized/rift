@@ -26,7 +26,7 @@ The server stores searchable provider output in an embedded index under `.rift`.
 `rift.toml` selects an embedding model, a local model adds vector ranking.
 
 <FlatDiagram
-  alt="An agent launches rift mcp, which forwards requests to one local server. Source resolvers catalog source files, providers supply code facts, and the server builds a searchable index."
+  alt="An agent launches rift mcp, which forwards requests to one local server. Source resolvers catalog project files and read the dependency context, providers supply code facts, the server builds a searchable index, and package reads reach the global index through its API."
   chart={`
     flowchart LR
       agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp"]:::rift
@@ -37,7 +37,9 @@ The server stores searchable provider output in an embedded index under `.rift`.
       server -- "discover" --> resolvers["source resolvers"]:::provider
       server -- "facts" --> providers["providers"]:::provider
       resolvers -- "inspect" --> workspace["workspace tree"]:::store
-      resolvers -- "units" --> catalog["source catalog<br/>project + dependencies"]:::store
+      resolvers -- "units" --> catalog["source catalog<br/>project files"]:::store
+      resolvers -- "manifests + lockfiles" --> dependencies["dependency context<br/>packages + versions"]:::store
+      dependencies -- "package context" --> globalindex["global index<br/>REST API"]:::store
       providers -- "analyze" --> catalog
       providers -- "Contributions" --> normalization["normalization<br/>SymbolRecord graph"]:::rift
       normalization -- "readable Symbols" --> search["search index<br/>lexical + vectors"]:::store
@@ -60,8 +62,7 @@ process the port and token it needs to reach that server. For example:
   "token": "Zk3mQ8xW1vY5uT9rN2bH7cJ4dL6fP0sA8gE5iK2oM7q",
   "pid": 4242,
   "identity": {
-    "version": "0.0.25",
-    "executable_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34",
     "schema_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 }
@@ -73,9 +74,18 @@ publishes the file, and the rest connect to it. The winner holds the lock from i
 onward, so a `rift mcp` or `rift server start` that arrives while it is still indexing waits
 for its file instead of starting another server.
 
-The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
-SHA-256 match its own identity. A mismatch is stale state, even when the recorded process and port
-are live, so requests never cross between binaries or tool schemas that interpret them differently.
+The proxy adopts that server only when its identity matches the proxy's own: the package version
+with the git commit the binary was built from, and the served MCP schema's SHA-256. Requests
+therefore never cross between binaries or tool schemas that interpret them differently.
+
+When the identities differ, the version decides:
+
+- A server of an older version is asked to stop, and the proxy starts one from its own binary once
+  the election releases. Every release bumps the version, so the first request after an update
+  moves the workspace to the new binary.
+- A server of the same version from another build, or of a newer version, refuses each request,
+  so two development builds never displace each other and an older binary never displaces a
+  newer server. Stopping the running server lets the next request start one that matches.
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next
@@ -133,132 +143,144 @@ writes its standard error to `.rift/server.stderr`, truncated at each start.
 
 ## Source discovery
 
-Before Rift analyzes code, source resolvers discover what belongs to the project and what its
-toolchain already resolved. The built-in project resolver catalogs workspace files.
+Before Rift analyzes code, source resolvers discover what belongs to the project and which
+packages it depends on. The built-in project resolver catalogs workspace files.
 
-Dependency resolvers catalog what the workspace's package managers resolved. Each resolver
-claims one manifest file name, and every visible manifest with that name reaches it:
+Dependency resolvers read what the workspace's package managers resolved. Each resolver claims
+one manifest file name, and every visible manifest with that name reaches it:
 
-- the Cargo resolver claims `Cargo.toml`, runs `cargo metadata --locked --offline` for each
-  top-level manifest, and catalogs every package outside the workspace members with the
-  directory its source was unpacked to; it also asks `rustc` for its sysroot and catalogs the
-  standard library source there
-- the uv resolver claims `pyproject.toml`, reads the `uv.lock` beside it, and finds each
-  distribution's installed source through the project environment: the `.venv` beside the
-  manifest, or the directory `UV_PROJECT_ENVIRONMENT` names; it catalogs the interpreter's
-  standard library from the environment's `pyvenv.cfg`
-- the npm resolver claims `package.json`, reads the `package-lock.json` beside it, and finds
-  each package under `node_modules`; when the lockfile pins `typescript`, it catalogs that
-  compiler's `lib.*.d.ts` set as the TypeScript standard library
+- the Cargo resolver claims `Cargo.toml` and reads the `Cargo.lock` beside it
+- the uv resolver claims `pyproject.toml` and reads the `uv.lock` beside it
+- the npm resolver claims `package.json` and reads the `package-lock.json` beside it
 - the Bun resolver claims `package.json` too and reads `bun.lock` the same way, so a manifest
   reaches whichever of the two has a lockfile beside it
 
-A resolver never downloads a package and never writes to the tree. The uv, npm, and Bun
-resolvers read lockfiles and probe directories, and run nothing. The Cargo resolver is the one
-that runs a toolchain, under `--locked`, which refuses to rewrite the lockfile, and `--offline`,
-which refuses the network. When `cargo` is not on the server's `PATH`, or exits with an error
-because `Cargo.lock` no longer matches `Cargo.toml`, it answers from the lockfile alone and
-probes the machine's package cache for each package's source. That answer lists what the
-lockfile pins, so it can over-approximate what the active feature set compiles; a package the
-cache does not hold is cataloged without a source root, whichever resolver cataloged it.
-
-The catalog keys each package by its
-[`PackageIdentity`](/docs/developer/protocol/reference#PackageIdentity): the package manager, the name,
-and the resolved version. Two versions of one package are two entries. Its inputs are the
-manifests and lockfiles the resolvers read, so a change to any of them re-catalogs on the next
-publication while every other file change leaves the catalog untouched. `rift://map` lists the
-packages the manifests declare directly.
+A resolver reads manifests and lockfiles, never a package's source, and it never downloads a
+package or writes to the tree. What the resolvers read becomes the
+[dependency context](#dependency-context), and a read that needs a package's declarations asks
+the [global index](#global-index) for them.
 
 Each resolver reads at most 256 manifests per workspace, taken in path order from the visible
 paths carrying its manifest file name. Selecting the top-level manifests compares every manifest
 pair, so that work grows with the square of the manifest count.
 
-A workspace holding more manifests catalogs the packages those 256 resolve, and the resolver
+A workspace holding more manifests names the packages those 256 declare, and the resolver
 reports the rest as a degradation. A read whose `scope` reaches packages carries it as a
-`package_context_degraded` warning: the next.js repository holds 876 `package.json` files,
-so the warning reads `620 of 876 package.json manifests were not read: at most 256 are read
-per workspace`.
+`package_context_degraded` warning: the next.js repository holds 876 `package.json` files, so
+the warning reads `620 of 876 package.json manifests were not read: at most 256 are read per
+workspace`.
 
-Each readable file becomes a [`SourceUnit`](/docs/developer/protocol/reference#SourceUnit) in the
-source catalog. Its `location` says whether it belongs to the project, a dependency, the standard
-library, or an external source. Its `source_kind` separately says whether a human authored it or a
-tool generated it.
+Each readable project file becomes a source unit in the source catalog, named by a
+[`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) such as
+`rift://source/project/src/lib.rs`; a package file the global index answers from takes the same
+form. Its
+`location` says whether it belongs to the project, a dependency, the standard library, or an
+external source. Its `source_kind` separately says whether a human authored it or a tool
+generated it.
 
 Generated project code and generated dependency code therefore keep both facts. Declarations
 invented by a language tool have `source_kind: "synthetic"` and no source unit.
 
-A resolver publishes a new catalog revision when its inputs change: workspace files, manifests,
-lockfiles, toolchains, installed packages, or generated-source metadata. Fact providers consume
-that catalog. A parser such as tree-sitter can describe syntax in a supplied file, but cannot infer
-which package owns it or which generator produced it.
+The project resolver publishes a new catalog revision when workspace files or generated-source
+metadata change. Fact providers consume that catalog. A parser such as tree-sitter can describe
+syntax in a supplied file, but cannot infer which package owns it or which generator produced it.
 
 ### Dependency context
 
 <VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
-Beside the catalog the resolvers build, each resolver reads a second, cheaper answer: the
-packages the workspace's manifests and lockfiles name. That pass reads those files alone.
-It runs no toolchain, inspects no package cache, and reads no environment value, because
-it reaches the workspace through a reader that offers a file read and nothing else. A
-workspace that never asks for a package read therefore never pays for one.
+The dependency context lists the packages the workspace depends on. The resolvers reach the
+workspace through a reader that offers a file read and a directory listing and nothing else, so
+they run no toolchain and read no environment value.
 
 Each entry carries the package manager, the name, and exactly one selector: the exact
 version a lockfile pins, or the version requirement a manifest declares. A manifest value
 is reported as a requirement unless its form pins one exact version - Cargo's `1.2.3` is a
 caret requirement and `=1.2.3` a pin - so a manifest-only project never invents a resolved
-version. An entry a public registry serves is `canonical`; a path, git, or
-custom-registry entry is `local_only`. Entries merge by manager, name, and selector, and
-a requirement is dropped where some input pins that package's version. The
+version. Entries merge by manager, name, and selector, and a requirement is dropped where some
+input pins that package's version. The
 [`[dependencies]`](/docs/developer/configuration#dependencies) `packages` list merges with
 what the files state, under the same rules.
 
-`rift://map` lists this context, and its inputs are the manifests and lockfiles the
-resolvers read, so a change to any of them reads the context again on the next
-publication while every other file change leaves it untouched.
+`rift://map` lists this context. The server reads it when it builds the index, and again when a
+change touches a manifest, lockfile, or version pin it read, or when a language with a standard
+library gains its first visible file or loses its last. Every other file change leaves it
+untouched.
 
-### Package index
+<VersionBadge version="v0.0.46" />
+
+An entry's `availability` says whether a public registry serves the package. An entry
+crates.io, npm, or the Python Package Index serves is `canonical`, as is every standard library
+entry, and the global index answers for it. Every other source has a value of its own, and no
+global package index answers for it:
+
+- `path` - a path outside the workspace, or an archive at a path, such as
+  `helper = { path = "../helper" }`
+- `git` - a git repository
+- `private_registry` - a registry other than the public one its package manager reads
+- `url` - a URL no registry serves, such as a uv wheel URL or an npm tarball URL
+
+A path dependency inside the workspace, such as a Cargo workspace member or an npm `workspaces`
+member, is project source. The local index already covers it, so the context names no entry for
+it.
+
+#### Standard libraries
+
+<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
+
+Code in every language calls its standard library, and no manifest names it. The context
+therefore adds one entry for each standard library a language the workspace uses relies on, under
+the manager `stdlib`. A language counts when the
+[`[languages]`](/docs/developer/configuration#languages-and-lsp) policy selects it for at least one
+visible file, so a Rust repository holding one `tool.py` names `stdlib/python` too:
+
+| Language | Entries | Version, in the order it is read |
+| --- | --- | --- |
+| Rust | `stdlib/rust` | `rustc --version`, then the channel `rust-toolchain.toml` or `rust-toolchain` names |
+| JavaScript, TypeScript | `stdlib/node`, npm `typescript` | `.nvmrc`, `.node-version`, `volta.node` in `package.json`, `.tool-versions`, `mise.toml`, then `node --version`, then `engines.node` |
+| Python | `stdlib/python` | the project environment's `.venv/pyvenv.cfg`, then `.python-version`, then `requires-python` in `pyproject.toml` |
+
+The npm `typescript` package ships the `lib.*.d.ts` files that declare the ECMAScript built-ins,
+such as `Array` and `Promise`. It goes out at the version the lockfile pins, and otherwise as the
+requirement `>=0`, which the global index answers from its newest collected release.
+
+A whole version goes out exact and a partial one as a requirement: `1.98` in
+`rust-toolchain.toml` goes out as `~1.98`, and `3.12` in `.python-version` as `==3.12.*`. A named
+channel or alias, such as `stable` or `lts/iron`, goes out as `>=0`, and so does a library no
+source names.
+
+`rustc --version` and `node --version` run under
+[`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"` alone, each
+bounded by `command_timeout`, and neither installs a toolchain a pin names but the machine lacks.
+A probe that answers nothing leaves the static reading and a `package_context_degraded` warning
+naming the entry. When `rust-toolchain.toml` pins `1.80.0` and the machine lacks that
+toolchain, the entry goes out as `stdlib/rust@1.80.0`, and the warning carries
+`rustc --version: error: toolchain '1.80.0-aarch64-apple-darwin' is not installed`.
+
+The [`[languages.<name>] stdlib`](/docs/developer/configuration#languages-and-lsp) key turns a
+language's entries off. The entries join the request to the global index alone: nothing is
+installed, downloaded, or written.
+
+### Global index
 
 <VersionBadge version="v0.0.43" languages={["Rust", "Python", "TypeScript"]} />
 
-No package is analyzed until a read asks for one. A `global` or `all` read first resolves
-the dependency context, then the local server asks the configured global REST API for
-capabilities and package resolution. A valid response sends available packages to remote
-pages and keeps missing or `local_only` packages on the local package index.
+A package's declarations come from the [global index](/docs/vision#index), which holds facts for
+collected OSS package versions. A `global` or `all` read sends the dependency context's
+`canonical` entries to the global API, and the answer carries the package hits the global index
+holds for them beside the project's. A package declaration is a
+[`Symbol`](/docs/developer/protocol/reference#Symbol) like any other, and answers a
+[`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches packages.
 
-When global access is disabled or the REST API cannot answer, the server selects affected
-packages for local indexing. The answer distinguishes `global_access_disabled`,
-`global_api_unavailable`, `global_publication_incompatible`, and `global_response_invalid`.
-A valid remote page can also report `global_page_warning` without discarding its items.
-A valid resolution reports `package_absent` for an exact package or
-`package_requirement_absent` for a declared requirement; local fallback reports
-`package_unavailable` when it still cannot serve a package. Package reads reach the global service
-through this local server route; `rift mcp` and `rift server` do not expose a direct global MCP
-route.
+The local server analyzes no package source itself.
+[Package analysis](/docs/developer/implementation#package-analysis) describes how one package's
+files become the declarations the global index answers from.
 
-For each package the local index analyzes, the walk selects files that spell the package's API
-and keeps declarations a caller outside the package can use:
-
-- Rust - every `.rs` file below the root; `pub` declarations, and the items of a `pub` trait
-- Python - every `.pyi` stub when the package ships any, else every `.py` module; names
-  without a leading underscore
-- TypeScript - every `.d.ts` declaration file; every member but `private` and `protected`
-  ones
-
-Directories named `tests`, `benches`, `examples`, `target`, `node_modules`, `__pycache__`,
-and `.git`, and any whose name ends in `tests`, are left out of every walk, and so is every
-symlink. The same syntax providers that parse the project's files parse these, so a
-package declaration is a [`Symbol`](/docs/developer/protocol/reference#Symbol) like any other and
-answers a [`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches packages.
-
-The package index is bounded per package and in total: the `package_size`, `package_files`,
-and `index_size` keys of the [`[dependencies]`](/docs/developer/configuration#dependencies) table
-set the bounds, and the walk below one source root stops at a directory depth and an entry
-count of its own. A package that crosses a bound is skipped, and a read reports it as
-`package_skipped` naming the bound that refused it. Raising a bound in `rift.toml` analyzes
-the packages again on the next read, since every package the package index holds was read
-under the old bounds. `resolution = "static"` keeps the resolvers off the toolchains, so the
-catalog comes from the lockfiles and package caches alone, and `command_timeout` bounds each
-run `auto` makes.
+When global access is disabled or the global API cannot answer, the read answers the project hits
+it has, and one typed warning names why package facts are missing. A package the global
+publication lacks answers `package_absent` or `package_requirement_absent`, and an entry no
+public registry serves answers `package_unavailable`. The
+[MCP reference](/docs/developer/protocol/mcp#reads) states each warning.
 
 ## Providers
 
@@ -433,8 +455,9 @@ Both tiers answer under one tree revision: the full-text store reads its stamp a
 one transaction, and the vectors a pass published carry the tree they were described for. A store
 that has moved past the tree a request captured returns nothing, and the request captures the
 publication the store already answers for. What `lexical_ranking_unavailable` tells a caller
-about is a store that has not yet committed the captured tree, one that missed a commit, or one
-that will not answer at all because it refused to load or holds no indexed tree.
+about is a store that has not yet committed the captured tree, one that missed a commit, one
+whose every database connection stayed in use past `[search] busy_timeout`, or one that will not
+answer at all because it refused to load or holds no indexed tree.
 
 <VersionBadge version="v0.0.32" />
 
@@ -457,8 +480,8 @@ from the index.
 
 #### The document shape
 
-Every index publishes the same document shape, whether it holds the served project, a
-cataloged package, or a fixture a test built in memory. A document carries a stable identity,
+Every index publishes the same document shape, whether it holds the served project or a package
+version the global index collected. A document carries a stable identity,
 the project path or source unit it lives at, its language, its package when it came from one,
 a content digest, and the searchable fields below:
 
@@ -494,6 +517,12 @@ write clears it before it writes.
 Workspace selection includes `.md`, `.markdown`, `.mdx`, `.rst`, and `.ipynb`, plus `.txt`
 selected by `[search.text].include`. Source visibility applies before collection.
 
+<VersionBadge version="v0.0.46" />
+
+The selection leaves out change logs, licenses, codes of conduct, and archived, deprecated, or
+translated copies by default. The [`[documentation]`](/docs/developer/configuration#documentation)
+table overrides that default for the workspace.
+
 Each regular source keeps its existing text chunks. Notebook markdown and code cells receive
 separate content owners; outputs and raw notebook JSON stay outside ranking. Collection records
 block ranges, headings, links, source digests, and exact-symbol references beside those owners.
@@ -510,8 +539,7 @@ when the selected declaration set establishes one exact target. Ambiguous names 
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page, with typed warnings for missing bytes or reached bounds.
 
-Local package collection reads already-present installed sources or verified cached archives.
-It does not download missing package sources. Global documentation requests use the existing
+A package's documentation comes from the global index. Global documentation requests use the
 package REST client only after the service advertises the corresponding capability. Workspace
 paths and source bytes remain local.
 
@@ -559,10 +587,10 @@ sets how sharply a top rank counts, and `identifier_weight`, `lexical_weight`, a
 `vector_weight` set each input's share. Only the inputs that answered take part, so an
 unavailable vector ranking contributes nothing and leaves the order the other two state.
 Several selected indexes may each contribute one kind; that kind's share then splits among
-them, so reaching for a package index does not double what full-text matching is worth.
+them, so reaching for the global index does not double what full-text matching is worth.
 
 Fusion holds no project path and resolves no symbol. It answers ordered identities, and the
-read path resolves them afterwards, which is what lets a package index rank source units
+read path resolves them afterwards, which is what lets package hits from the global index rank
 through the same code. A hit's `score` is derived from its place in the final order: it is
 comparable inside one answer and nowhere else.
 

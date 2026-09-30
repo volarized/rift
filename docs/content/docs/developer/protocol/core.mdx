@@ -24,46 +24,46 @@ outermost first. Each node carries its grammar kind and byte range.
 
 ## Source discovery
 
-Source resolvers run before syntax or semantic analysis. They inspect workspace files and resolved
-toolchain state, then publish a source catalog made of
-[`SourceUnit`](/docs/developer/protocol/reference#SourceUnit) records. A resolver discovers installed
-dependencies; it does not download packages or change the environment.
+Source resolvers run before syntax or semantic analysis. They inspect workspace files, manifests,
+and lockfiles, then publish a source catalog of the project's source units and the packages the
+project depends on. A resolver reads no package source, downloads no package, and does not change
+the environment.
 
-[`SourceLocation`](/docs/developer/protocol/reference#SourceLocation) names a unit's owner: project,
-dependency, standard library, or external source.
+[`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) names one unit in that catalog,
+and a package file the global index answers from takes the same form:
+`rift://source/pypi/pydantic@2.8.2/pydantic/main.py`. After `rift://source/`, an id is two parts:
+the resolver identity (`pypi`), then that resolver's own human-readable key for the unit
+(`pydantic@2.8.2/pydantic/main.py`).
+
+The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Digest) reaches the
+wire only as a short witness where byte identity matters: the first eight hex characters of a
+SHA-256, the same convention `NodeId`'s witness uses. The server computes and compares the full
+digest internally, so it never travels whole.
+
+[`SourceLocationKind`](/docs/developer/protocol/reference#SourceLocationKind) names where a
+declaration's source belongs: project, dependency, standard library, or external source.
 [`SourceKind`](/docs/developer/protocol/reference#SourceKind) names how the source came to exist:
-authored or generated. The two stay separate because generated code can belong to the project or
-to a dependency.
+authored, generated, or synthetic for a declaration with no source unit. The two stay separate
+because generated code can belong to the project or to a dependency.
 
-A generated unit names its generator and can carry
-[`SourceMapping`](/docs/developer/protocol/reference#SourceMapping) records back to its inputs. A
-synthetic declaration has no source unit.
+A declaration in that pydantic file carries both in its
+[`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin), beside the package that owns
+it:
 
 ```json
 {
-  "id": "rift://source/pypi/pydantic@2.8.2/pydantic/main.py",
-  "location": {
-    "kind": "dependency",
-    "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" }
-  },
-  "path": "pydantic/main.py",
-  "source_kind": "authored",
-  "languages": [{ "name": "python" }],
-  "digest": "6f2a9c31",
-  "mappings": []
+  "location": "dependency",
+  "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" },
+  "source_kind": "authored"
 }
 ```
 
-An id is two parts: the resolver identity (`pypi`), then that resolver's own human-readable key
-for the unit (`pydantic@2.8.2/pydantic/main.py`). `digest` is the short form every content
-digest takes on the wire - the first eight hex characters of a SHA-256, the same convention
-`NodeId`'s witness uses; the server computes and compares the full digest internally, so it
-never travels whole.
-
-[`SourceResolverSummary`](/docs/developer/protocol/reference#SourceResolverSummary) reports each resolver's
-identity, locations, catalog revision, and lifecycle state. Resolver revisions change with files,
-manifests, lockfiles, toolchains, installed packages, or generated-source metadata. Fact-provider
-revisions change after providers analyze a catalog revision.
+A resolver publishes a new catalog revision when files, manifests, lockfiles, version pins, or
+generated-source metadata change, and fact providers publish a new revision after they analyze
+one. A read whose `scope` reaches packages reports a resolver that read less than the workspace
+states as a `package_context_degraded`
+[`ReadWarning`](/docs/developer/protocol/reference#ReadWarning), naming the resolver by its
+manager name, such as `cargo` or `npm`.
 
 ## Semantic facts
 

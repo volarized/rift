@@ -166,9 +166,35 @@ For example, a project using Tokio can search its dependency declarations for `s
 { "query": "spawn_blocking", "scope": "global", "target": "symbol", "limit": 5 }
 ```
 
-Rift uses the project's manifests and lockfiles to select packages. A package result identifies
-its package and version, and carries `unit` instead of a local `path`.
-See [package scope](/docs/developer/protocol/mcp#search-scope) for resolution and fallback behavior.
+Rift uses the project's manifests and lockfiles to select packages, adds the standard library of
+each language the project uses, and asks the global index for their declarations. A package
+result identifies its package and version, and carries `unit` instead of a local `path`.
+
+Sometimes the agent needs a version other than the one the project resolves, such as an upgrade
+target, or a package the project does not use yet. `packages` names package versions for one
+read: an entry naming a dependency replaces its version, and an entry naming another package adds
+it. This request searches Tokio 1.47.1 beside the project code:
+
+```json
+{
+  "query": "spawn_blocking",
+  "scope": "all",
+  "target": "symbol",
+  "limit": 10,
+  "packages": [{ "manager": "cargo", "name": "tokio", "version": "1.47.1" }]
+}
+```
+
+An entry without `version` reads the newest release the global index has collected. `packages`
+takes effect with `scope` set to `global` or `all` on the current tree, and the server refuses it
+beside the `local` scope or `rev`.
+
+A dependency no public registry serves, such as a path outside the project or a git repository,
+has no declarations in the global index, and the answer names it in a `package_unavailable`
+warning. See [package scope](/docs/developer/protocol/mcp#search-scope) for package results,
+[requested packages](/docs/developer/protocol/mcp#requested-packages) for the argument's
+constraints, and the [read reference](/docs/developer/protocol/mcp#reads) for the warnings a
+package read carries.
 
 </Accordion>
 <Accordion title="Relationship traversal" id="search-traversal">
@@ -254,6 +280,7 @@ If omitted, `include` defaults to `["source"]`. An explicit list replaces that d
 
 The same `scope` values used by search apply here. Use `global` or `all` to retrieve a dependency
 declaration; package results identify their origin and do not carry local node addresses or history.
+`packages` names the package versions to read, as it does for search.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for optional fields and matching behavior.
 
 ## Nodes [#tool-nodes]

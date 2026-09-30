@@ -10,8 +10,8 @@
 
 use rift_protocol::configuration::ConfigurationViolation;
 use rift_protocol::schema::{
-    DeclaredKey, DocumentStep, ExpectedShape, declared_keys, declared_tables, document_steps,
-    expected_shape, named_member,
+    DeclaredKey, DocumentStep, ExpectedShape, declared_keys, declared_named_keys, declared_tables,
+    document_steps, expected_shape, named_member,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -280,13 +280,26 @@ impl<Model> AcceptedConfiguration<Model> {
 }
 
 /// The variable naming one declared key: the prefix, then the key's members
-/// joined by `_` and uppercased.
+/// joined by `_` and uppercased. A member's `:`, as in the language name
+/// `typescript:tsx`, becomes `_`, since a shell variable name holds none.
 #[must_use]
 pub fn variable_name(key: &DeclaredKey) -> String {
     format!(
         "{ENVIRONMENT_PREFIX}_{}",
-        key.path().join("_").to_ascii_uppercase()
+        key.path().join("_").replace(':', "_").to_ascii_uppercase()
     )
+}
+
+/// The member names one table whose members the caller names accepts from the
+/// environment, such as the shipped language names for `[languages]`. A variable
+/// naming one of them, in any case, reaches that member's keys; a variable naming
+/// any other member stays unknown.
+#[derive(Clone, Copy, Debug)]
+pub struct NamedMembers<'a> {
+    /// The table, such as `languages`.
+    pub table: &'a str,
+    /// The member names, such as `python`.
+    pub names: &'a [&'a str],
 }
 
 /// Accepts one configuration: `document`, when present, then every variable
@@ -313,8 +326,25 @@ pub fn accept_configuration<Model>(
 where
     Model: DeserializeOwned + JsonSchema + Default,
 {
+    accept_configuration_naming(document, environment, &[])
+}
+
+/// [`accept_configuration`], where the variables also reach the keys of each
+/// `named` table's listed members, such as `RIFT_LANGUAGES_PYTHON_ENABLED`.
+///
+/// # Errors
+///
+/// As [`accept_configuration`].
+pub fn accept_configuration_naming<Model>(
+    document: Option<&str>,
+    environment: &ConfigurationEnvironment,
+    named: &[NamedMembers<'_>],
+) -> Result<AcceptedConfiguration<Model>, ConfigurationError>
+where
+    Model: DeserializeOwned + JsonSchema + Default,
+{
     let schema = schemars::schema_for!(Model).to_value();
-    let overrides = matched_overrides(&schema, environment)?;
+    let overrides = matched_overrides(&schema, environment, named)?;
     let accepted = match document {
         Some(raw) => accept_document::<Model>(raw, &schema)?,
         None => Model::default(),
@@ -355,8 +385,12 @@ struct Override {
 fn matched_overrides(
     schema: &Value,
     environment: &ConfigurationEnvironment,
+    named: &[NamedMembers<'_>],
 ) -> Result<Vec<Override>, ConfigurationError> {
-    let keys = declared_keys(schema);
+    let mut keys = declared_keys(schema);
+    for members in named {
+        keys.extend(declared_named_keys(schema, members.table, members.names));
+    }
     let tables = table_prefixes(schema);
     let mut overrides = Vec::new();
     for (variable, value) in &environment.variables {
@@ -569,8 +603,8 @@ mod tests {
     use rift_protocol::schema::{configuration_schema, declared_keys};
 
     use super::{
-        ConfigurationEnvironment, ConfigurationError, ConfigurationFault, accept_configuration,
-        variable_name,
+        ConfigurationEnvironment, ConfigurationError, ConfigurationFault, NamedMembers,
+        accept_configuration, accept_configuration_naming, variable_name,
     };
     use crate::error::{ErrorContext, Fault};
 
@@ -647,6 +681,55 @@ mod tests {
         );
     }
 
+    /// The `[documentation]` table reads its variables through the same overlay every
+    /// table does, and a variable prevails over the document's key.
+    #[test]
+    fn test_documentation_variables_override_the_document_and_the_default() {
+        let document = "[documentation]\nexclude = [\"docs/old/**\"]\n";
+        let (configuration, variables) = accept(
+            Some(document),
+            &[
+                ("RIFT_DOCUMENTATION_ENABLED", "false"),
+                ("RIFT_DOCUMENTATION_FORCE_INCLUDE", r#"["CHANGELOG.md"]"#),
+            ],
+        )
+        .expect("each value is its key's shape");
+
+        assert!(!configuration.documentation.enabled);
+        let force_included: Vec<&str> = configuration
+            .documentation
+            .force_include
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(force_included, ["CHANGELOG.md"]);
+        let excluded: Vec<&str> = configuration
+            .documentation
+            .exclude
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(
+            excluded,
+            ["docs/old/**"],
+            "a key no variable names keeps the document's"
+        );
+        assert_eq!(
+            variables,
+            [
+                "RIFT_DOCUMENTATION_ENABLED",
+                "RIFT_DOCUMENTATION_FORCE_INCLUDE"
+            ]
+        );
+
+        let error = accept(None, &[("RIFT_DOCUMENTATION_INCLUDE", r#"["docs/**"]"#)])
+            .expect_err("the table declares no include key");
+        assert!(
+            matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn test_a_value_outside_the_key_shape_refuses_naming_the_variable() {
         for (variable, value) in [
@@ -684,6 +767,7 @@ mod tests {
     fn test_a_variable_naming_a_table_and_no_key_refuses() {
         for variable in [
             "RIFT_PROVIDERS_SYNTAX_MAX_NODE",
+            // Without the shipped names, no language member is known.
             "RIFT_LANGUAGES_PYTHON_ENABLED",
         ] {
             let error = accept(None, &[(variable, "1")]).expect_err(variable);
@@ -806,5 +890,73 @@ mod tests {
         assert_eq!(super::position_of(raw, 6), "line 2 column 1");
         assert_eq!(super::position_of(raw, 9), "line 2 column 4");
         assert_eq!(super::position_of(raw, raw.len()), "line 4 column 1");
+    }
+
+    /// Shipped language names as the server passes them.
+    const LANGUAGE_NAMES: [&str; 3] = ["python", "rust", "typescript:tsx"];
+
+    fn accept_naming(
+        variables: &[(&str, &str)],
+    ) -> Result<(WorkspaceConfiguration, Vec<String>), ConfigurationError> {
+        let environment = ConfigurationEnvironment::from_variables(variables.iter().copied());
+        let named = [NamedMembers {
+            table: "languages",
+            names: &LANGUAGE_NAMES,
+        }];
+        accept_configuration_naming::<WorkspaceConfiguration>(None, &environment, &named)
+            .map(super::AcceptedConfiguration::into_parts)
+    }
+
+    #[test]
+    fn test_a_variable_naming_a_shipped_language_sets_its_key() {
+        let (configuration, variables) = accept_naming(&[
+            ("RIFT_LANGUAGES_PYTHON_ENABLED", "false"),
+            ("RIFT_LANGUAGES_PYTHON_STDLIB", "false"),
+            ("RIFT_LANGUAGES_TYPESCRIPT_TSX_EXECUTION", "true"),
+            ("RIFT_LANGUAGES_TYPESCRIPT_TSX_STDLIB", "false"),
+        ])
+        .expect("shipped names accept");
+        assert!(!configuration.languages["python"].enabled);
+        assert!(!configuration.languages["python"].stdlib);
+        assert!(configuration.languages["typescript:tsx"].execution);
+        assert!(!configuration.languages["typescript:tsx"].stdlib);
+        assert!(
+            !configuration.languages.contains_key("rust"),
+            "a language no variable names keeps no entry"
+        );
+        assert_eq!(
+            variables,
+            [
+                "RIFT_LANGUAGES_PYTHON_ENABLED",
+                "RIFT_LANGUAGES_PYTHON_STDLIB",
+                "RIFT_LANGUAGES_TYPESCRIPT_TSX_EXECUTION",
+                "RIFT_LANGUAGES_TYPESCRIPT_TSX_STDLIB"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_variable_naming_an_unshipped_language_or_key_stays_unknown() {
+        for variable in [
+            "RIFT_LANGUAGES_COBOL_ENABLED",
+            "RIFT_LANGUAGES_COBOL_STDLIB",
+            "RIFT_LANGUAGES_PYTHON_ENABLE",
+        ] {
+            let error = accept_naming(&[(variable, "false")]).expect_err(variable);
+            assert!(
+                matches!(error.fault(), ConfigurationFault::VariableUnknown { .. }),
+                "{error:?}"
+            );
+            assert!(
+                context_value(&error, "accepted")
+                    .is_some_and(|accepted| accepted.contains("RIFT_LANGUAGES_PYTHON_ENABLED"))
+            );
+        }
+        let error = accept_naming(&[("RIFT_LANGUAGES_RUST_ENABLED", "maybe")])
+            .expect_err("a bool key refuses text");
+        assert!(matches!(
+            error.fault(),
+            ConfigurationFault::VariableMalformed { .. }
+        ));
     }
 }

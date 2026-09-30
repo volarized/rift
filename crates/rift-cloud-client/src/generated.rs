@@ -178,9 +178,11 @@ pub enum SourceLocationKind {
     /// Owned by the current workspace.
     #[default]
     Project,
-    /// Owned by one resolved dependency.
+    /// Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong
+    /// to the npm `typescript` package, whose `lib.*.d.ts` files declare them.
     Dependency,
-    /// Installed with the language toolchain.
+    /// Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or
+    /// `stdlib/python`.
     Stdlib,
     /// Outside the project, dependency graph, and standard library.
     External,
@@ -729,7 +731,8 @@ pub struct TextRange {
 )]
 #[serde(deny_unknown_fields)]
 pub struct PackageContextEntry {
-    /// Whether a global package index can answer for one package.
+    /// Whether a global package index can answer for one package, and where the entry's
+    /// source comes from when none can.
     pub availability: PackageAvailability,
     /// Package manager or ecosystem name.
     #[validate(length(max = 128u64))]
@@ -745,24 +748,39 @@ pub struct PackageContextEntry {
     #[validate(length(max = 4_096u64))]
     pub version: Option<String>,
 }
-/// Whether a global package index can answer for one package.
+/// Whether a global package index can answer for one package, and where the entry's
+/// source comes from when none can.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageAvailability {
-    /// The entry names a package a public registry serves: crates.io, npm, or the
-    /// Python Package Index.
+    /// The entry names a package a public registry serves, crates.io, npm, or the
+    /// Python Package Index, or a standard library: `stdlib/rust`, `stdlib/node`, or
+    /// `stdlib/python`.
     #[serde(rename = "canonical")]
     #[default]
     Canonical,
-    /// The entry names a path, git, or custom-registry package only this machine can
-    /// answer for.
-    #[serde(rename = "local_only")]
-    LocalOnly,
+    /// The entry names a path outside the workspace, or an archive at a path, that only
+    /// this machine can read.
+    #[serde(rename = "path")]
+    Path,
+    /// The entry names a git repository.
+    #[serde(rename = "git")]
+    Git,
+    /// The entry names a registry other than the public one its package manager reads.
+    #[serde(rename = "private_registry")]
+    PrivateRegistry,
+    /// The entry names a package fetched from a URL no registry serves, such as a uv
+    /// wheel URL or an npm tarball URL.
+    #[serde(rename = "url")]
+    Url,
 }
 impl core::fmt::Display for PackageAvailability {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Canonical => write!(f, "canonical"),
-            Self::LocalOnly => write!(f, "local_only"),
+            Self::Path => write!(f, "path"),
+            Self::Git => write!(f, "git"),
+            Self::PrivateRegistry => write!(f, "private_registry"),
+            Self::Url => write!(f, "url"),
         }
     }
 }
@@ -774,8 +792,18 @@ impl<'de> serde::Deserialize<'de> for PackageAvailability {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
             "canonical" => Ok(PackageAvailability::Canonical),
-            "local_only" => Ok(PackageAvailability::LocalOnly),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["canonical", "local_only"])),
+            "path" => Ok(PackageAvailability::Path),
+            "git" => Ok(PackageAvailability::Git),
+            "private_registry" => Ok(PackageAvailability::PrivateRegistry),
+            "url" => Ok(PackageAvailability::Url),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["canonical", "path", "git", "private_registry", "url"],
+                    ),
+                )
+            }
         }
     }
 }

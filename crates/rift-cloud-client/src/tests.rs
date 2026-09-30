@@ -794,7 +794,7 @@ fn test_client_errors_use_bounded_messages() {
 #[test]
 fn test_request_relationships_are_validated_before_transport() {
     let mut resolution = resolution_request();
-    resolution.entries[0].availability = PackageAvailability::LocalOnly;
+    resolution.entries[0].availability = PackageAvailability::Path;
     assert_eq!(
         validate_resolution_request(&resolution),
         Err(ClientError::InvalidRequest {

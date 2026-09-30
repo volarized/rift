@@ -58,10 +58,7 @@
         },
         "language": {
           "description": "Authored code language, when supplied by the format.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "line": {
           "description": "One-based line where the block starts.",
@@ -78,14 +75,7 @@
           "description": "Source record containing revision, format, origin, and license facts."
         },
         "symbol": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolId"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SymbolId",
           "description": "Owning declaration for an attached comment."
         }
       },
@@ -138,14 +128,7 @@
       "description": "One content owner: a regular source or decoded notebook cell.",
       "properties": {
         "cell": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/NotebookCell"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/NotebookCell",
           "description": "Decoded cell when the parent source is a notebook."
         },
         "source": {
@@ -319,10 +302,7 @@
       "properties": {
         "expression": {
           "description": "Declared expression; collection does not infer a license from source text.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "files": {
           "description": "License files whose bytes the adapter verified.",
@@ -477,14 +457,7 @@
           "description": "Block containing the candidate."
         },
         "language": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Language"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Language",
           "description": "Declared language limiting candidate declarations, when present."
         },
         "range": {
@@ -577,25 +550,11 @@
           "description": "Canonical address of the bytes block ranges use."
         },
         "language": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Language"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Language",
           "description": "Declared source language, when known."
         },
         "license": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DocumentationLicense"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/DocumentationLicense",
           "description": "License facts recorded by the source adapter."
         },
         "media_type": {
@@ -1127,10 +1086,7 @@
         "declaration_source": {
           "description": "The declaration's own source. Absent on a file document.",
           "maxLength": 1048576,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "digest": {
           "$ref": "#/$defs/Digest",
@@ -1138,18 +1094,12 @@
         },
         "documentation": {
           "description": "The attached documentation body, when the grammar attaches any.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "file_content": {
           "description": "The file's content. Absent on a symbol document.",
           "maxLength": 1048576,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "identifier_terms": {
           "description": "The words `name` and `qualified_name` split into on case and separator boundaries,\nlowercased, deduplicated, in first-seen order, at most\n[`PACKAGE_IDENTIFIER_TERMS_MAX`] of them. Kept apart from the names so a ranking\ncounts each term once.",
@@ -1181,17 +1131,11 @@
         },
         "qualified_name": {
           "description": "The container-qualified name. Absent on a file document.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "signature": {
           "description": "The rendered signature, when the declaration has one.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "unit": {
           "$ref": "#/$defs/SourceUnitId",
@@ -1306,19 +1250,12 @@
           "description": "The digest of this record's canonical content."
         },
         "documentation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Documentation"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Documentation",
           "description": "The documentation attached to the declaration, when the grammar attaches any."
         },
         "kind": {
           "$ref": "#/$defs/ExactKind",
-          "description": "The provider's own kind word, composed as `{language}.{kind}`."
+          "description": "What the declaration is in the provider's vocabulary, such as `function` or\n`class`. The language rides beside it in `presentation.language`."
         },
         "line": {
           "description": "The one-based line the declaration starts on.",
@@ -1351,14 +1288,7 @@
           "description": "The declaration's byte range inside its unit."
         },
         "signature": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Signature"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Signature",
           "description": "The rendered signature, when the declaration has one."
         },
         "source": {
@@ -1401,10 +1331,7 @@
       "properties": {
         "default": {
           "description": "The default value as written in the source. Absent where there is none.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "extensions": {
           "$ref": "#/$defs/Extensions",
@@ -1413,20 +1340,10 @@
         },
         "name": {
           "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "node": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/NodeId"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/NodeId",
           "description": "Where this parameter is written in the source."
         },
         "optional": {
@@ -1502,14 +1419,7 @@
           "type": "array"
         },
         "receiver": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Parameter"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/Parameter",
           "description": "The implicit first parameter - `self`, `this`. Absent for a free function, and for\nlanguages that have no such thing."
         },
         "returns": {
@@ -1591,12 +1501,12 @@
         },
         {
           "const": "dependency",
-          "description": "Owned by one resolved dependency.",
+          "description": "Owned by one resolved dependency. The ECMAScript built-ins, such as `Array`, belong\nto the npm `typescript` package, whose `lib.*.d.ts` files declare them.",
           "type": "string"
         },
         {
           "const": "stdlib",
-          "description": "Installed with the language toolchain.",
+          "description": "Installed with the language toolchain: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
           "type": "string"
         },
         {
@@ -1617,14 +1527,7 @@
       "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
       "properties": {
         "container": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolId"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SymbolId",
           "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
         },
         "document_local": {
@@ -1654,14 +1557,7 @@
           "type": "array"
         },
         "id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolId"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SymbolId",
           "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
         },
         "kind": {
@@ -1711,10 +1607,7 @@
         },
         "visibility": {
           "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       },
       "required": [
@@ -1893,25 +1786,11 @@
       "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
       "properties": {
         "location": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SourceLocationKind"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SourceLocationKind",
           "description": "Which of the four places the declaration belongs. Absent exactly when\n`source_kind` is `synthetic`."
         },
         "package": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PackageIdentity"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/PackageIdentity",
           "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
         },
         "source_kind": {
@@ -2069,14 +1948,7 @@
           "description": "The language the spelling is in, and so which provider produced it."
         },
         "resolved": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SymbolId"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SymbolId",
           "description": "The symbol that declares this type, where one does. Absent for a structural type,\nwhich has a spelling and nothing to open."
         },
         "source": {

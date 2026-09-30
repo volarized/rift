@@ -521,7 +521,7 @@ pub enum LexicalIndexViolation {
     /// A stored row's kind failed to parse as a known [`DocumentKind`].
     StoredKindInvalid,
     /// A write carried a document addressed by a source unit. This store
-    /// holds project documents; a package document belongs to a package
+    /// holds project documents; a package document belongs to the global
     /// index.
     DocumentLocationUnsupported,
     /// A `replace_all` batch repeated one identity across documents.
@@ -592,6 +592,18 @@ impl LexicalIndexFault {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Whether the operation got no pooled connection: every slot stayed
+    /// checked out past the pool's busy-wait budget, or a new connection could
+    /// not be opened. The store itself answered nothing, so a caller with
+    /// another way to answer can use it.
+    #[must_use]
+    pub fn is_connection_unavailable(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<toasty::Error>())
+            .is_some_and(toasty::Error::is_connection_pool)
     }
 }
 
@@ -1584,10 +1596,10 @@ impl<'a> StoredUnits<'a> {
 /// `SQLite` FTS5-backed lexical search index.
 ///
 /// [`IndexDocument`] is the one shape every Rift index publishes, so a
-/// project row, a package row, and an in-memory fixture carry the same fields
-/// and the same identity spelling. This store holds project documents: a
-/// document addressed by a source unit belongs to a package index, and the
-/// write path refuses it rather than filing a unit URI in the path column.
+/// project row and a package row carry the same fields and the same identity
+/// spelling. This store holds project documents: a document addressed by a
+/// source unit belongs to a package index, and the write path refuses it
+/// rather than filing a unit URI in the path column.
 #[derive(Debug)]
 pub struct LexicalSearchIndex {
     database: Arc<WorkspaceDatabase>,

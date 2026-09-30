@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::Duration;
 
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use rift_core::ProjectPath;
 use rift_core::constants::{
@@ -17,8 +17,8 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileDigest, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
-    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    ChangeSet, FileRecord, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
@@ -32,8 +32,8 @@ use rift_protocol::source::SourceConfiguration;
 use rift_ranking::IndexDocument;
 use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
 use rift_server::{
-    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, PackageBranch, ReadError,
-    ReadFault, ReadService, load_configuration,
+    CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
+    ReadService, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -153,8 +153,8 @@ impl RebuildRequest {
     /// Changed source, language, or text-search configuration reads the whole workspace.
     /// Other accepted configuration carries forward the same source files under an empty
     /// incremental change. A path whose bytes cannot be read for any reason other than its
-    /// absence asks for a whole scan, because that scan decides whether the path is a
-    /// refusal or a removal.
+    /// absence, a directory, or the per-file byte bound asks for a whole scan, because that
+    /// scan decides whether the path is a refusal or a removal.
     fn change_set(&self, root: &Path, configuration: &ConfigurationState) -> ChangeSet {
         let Some(previous) = self.previous.as_ref() else {
             return ChangeSet::Full;
@@ -171,35 +171,68 @@ impl RebuildRequest {
             }
             return ChangeSet::Incremental(PathChanges::default());
         }
-        let Some(observed) = observed_digests(root, &self.work.paths, &previous.source_policy)
+        if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
+            return ChangeSet::Full;
+        }
+        let Some(observed) = observed_records(root, &self.work.paths, &previous.source_policy)
         else {
             return ChangeSet::Full;
         };
         ChangeSet::Incremental(PathChanges::resolve(observed, |path| {
-            previous.reads.file_digest(path)
+            previous.reads.file_record(path)
         }))
     }
 }
 
-/// Reads each observed path's current bytes into the digest one change set compares
-/// against, or nothing when a read failed for a reason other than the path being gone.
+/// Reads each observed path's current bytes into the record one change set compares
+/// against, or nothing when a read failed for a reason other than the path being gone, a
+/// directory, or past the per-file byte bound.
 ///
 /// A path the workspace's policy no longer includes reads as absent, so an excluded file
 /// leaves the index exactly as a deleted one does.
-fn observed_digests(
+fn observed_records(
     root: &Path,
     paths: &BTreeSet<ProjectPath>,
     policy: &WorkspaceSourcePolicy,
-) -> Option<Vec<(ProjectPath, Option<FileDigest>)>> {
+) -> Option<Vec<(ProjectPath, Option<FileRecord>)>> {
     let mut observed = Vec::with_capacity(paths.len());
     for path in paths {
-        let absolute = root.join(path.as_str());
-        match policy.visible_digest(&absolute) {
-            Ok(digest) => observed.push((path.clone(), digest)),
+        match observed_record(policy, root, path) {
+            Ok(record) => observed.push((path.clone(), record)),
             Err(_) => return None,
         }
     }
     Some(observed)
+}
+
+/// One observed path's record under `policy`: the digest of its bytes, the warning of a
+/// file past the per-file byte bound, or none for a path the policy excludes, one gone from
+/// the disk, or a directory, because none of them holds a file.
+///
+/// A file past the bound is still on disk, and its warning is what a publication that left
+/// it out records too, so the two compare equal while a deleted one compares as removed.
+/// A directory reaches here as a path a modify event named, which Windows reports for a
+/// directory whenever an entry inside it changes. Reading it as a file fails, and that
+/// failure would otherwise ask for the whole workspace; the disk probe runs only once the
+/// read has failed.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when the read fails for any other reason.
+fn observed_record(
+    policy: &WorkspaceSourcePolicy,
+    root: &Path,
+    path: &ProjectPath,
+) -> Result<Option<FileRecord>, WorkspaceIndexError> {
+    let absolute = root.join(path.as_str());
+    match policy.visible_digest(&absolute) {
+        Ok(digest) => Ok(digest.map(FileRecord::Digest)),
+        Err(_) if absolute.is_dir() => Ok(None),
+        Err(error) => match error.fault().left_out_file(path.clone()) {
+            Some(warning) => Ok(Some(FileRecord::LeftOut(warning))),
+            None => Err(error),
+        },
+    }
 }
 
 /// Read index and configuration policy published as one immutable value.
@@ -230,6 +263,43 @@ impl PublishedWorkspace {
             map: Arc::clone(&self.map),
             epoch,
         }
+    }
+
+    /// Whether this publication already holds what every one of `paths` holds on disk,
+    /// read under its own policy, which reads a path it excludes as absent.
+    ///
+    /// A file left out under the per-file byte bound matches only a publication that left
+    /// it out the same way; an I/O error matches nothing.
+    fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
+            PathChanges::resolve(observed, |path| self.reads.file_record(path)).is_empty()
+        })
+    }
+
+    /// Whether a rebuild naming `paths` moves every one of them: each reads, under this
+    /// publication's own policy, as something other than what this publication holds.
+    ///
+    /// This is the comparison [`RebuildRequest::change_set`] makes, so a path that fails it
+    /// is one a rebuild naming it leaves as it is. A read that fails asks for the whole
+    /// workspace there, and answers `false` here.
+    pub(crate) fn rebuild_moves_every(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
+            PathChanges::resolve(observed, |path| self.reads.file_record(path)).len() == paths.len()
+        })
+    }
+
+    /// Whether this publication holds files below one of `paths` that is no longer a
+    /// directory on disk.
+    ///
+    /// Such a path is a directory renamed or removed by an event classified before this
+    /// publication held its files: before the first publication, or against an earlier
+    /// one. Reading the path finds nothing, so only a scan of the whole workspace drops
+    /// the files it held. Work is one ordered-map probe per path, and a disk probe only for
+    /// a path this publication holds files below.
+    fn holds_files_below_a_gone_path(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        paths
+            .iter()
+            .any(|path| self.reads.holds_files_below(path) && !root.join(path.as_str()).is_dir())
     }
 }
 
@@ -293,7 +363,8 @@ pub(crate) struct IndexValidation {
 
     /// The current publication as event classification sees it: the inclusion policy
     /// the index was built under, and the index itself for what it holds. Absent before
-    /// the first publication, when every event asks for the whole workspace anyway.
+    /// the first publication, when an event names its path by its spelling below the root
+    /// and the startup candidate's own policy decides what that path holds.
     pub(crate) published: SyncRwLock<Option<Arc<PublishedWorkspace>>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) task: AsyncMutex<Option<JoinHandle<()>>>,
@@ -328,8 +399,6 @@ pub(crate) struct IndexSupervisorContext {
     /// exactly when the population lane is: with no index open there is no store to
     /// commit to, and `search` reports the tier unavailable for the life of this server.
     pub(crate) lexical: Option<LexicalLane>,
-    /// The package branch every candidate's read service answers a package read from.
-    pub(crate) dependencies: Arc<PackageBranch>,
 }
 
 /// The last acceptance of the workspace's `rift.toml`, kept with the file
@@ -427,13 +496,12 @@ impl ConfigurationState {
         )
     }
 
-    /// The `[search.text]` inclusion from the last acceptance, or the default inclusion while
-    /// `rift.toml` is invalid.
+    /// The `[search.text]` inclusion and `[documentation]` table from the last acceptance, or
+    /// the defaults while `rift.toml` is invalid.
     pub(crate) fn text_inclusion(&self) -> TextFileInclusion {
-        self.accepted.as_ref().map_or_else(
-            |_| TextFileInclusion::default(),
-            |configuration| TextFileInclusion::from(&configuration.search),
-        )
+        self.accepted
+            .as_ref()
+            .map_or_else(|_| TextFileInclusion::default(), TextFileInclusion::from)
     }
 
     /// Effective language file entries from the last acceptance.
@@ -446,12 +514,13 @@ impl ConfigurationState {
 
     /// Whether index-owned configuration differs from another acceptance.
     ///
-    /// The `[dependencies]` table counts as index-owned: the read service resolves its
-    /// catalog under the table's resolution policy and gates dependency-scoped lookups on
-    /// its switch.
+    /// The `[dependencies]` table counts as index-owned: the read service reads its
+    /// dependency context under the table's packages and resolution policy.
     ///
     /// `[providers.syntax]` counts too: its bounds decide which declarations a file's parse
-    /// keeps, so a publication built under other bounds holds other units.
+    /// keeps, so a publication built under other bounds holds other units. The
+    /// `[documentation]` table rides the text inclusion: it decides which text files the
+    /// index collects as documentation.
     fn index_configuration_differs(&self, other: &Self) -> bool {
         self.source_configuration() != other.source_configuration()
             || self.text_inclusion() != other.text_inclusion()
@@ -461,16 +530,18 @@ impl ConfigurationState {
     }
 
     /// Digest of every configuration table the index derives its content under: the
-    /// `[source]`, `[search.text]`, `[languages]`, `[dependencies]`, and `[providers.syntax]`
-    /// tables [`Self::index_configuration_differs`] compares, and the `[search.lexical]`
-    /// bounds the lexical lane writes under. An invalid `rift.toml` digests the defaults,
-    /// the configuration every accessor here answers while acceptance refuses the file.
+    /// `[source]`, `[search.text]`, `[documentation]`, `[languages]`, `[dependencies]`, and
+    /// `[providers.syntax]` tables [`Self::index_configuration_differs`] compares, and the
+    /// `[search.lexical]` bounds the lexical lane writes under. An invalid `rift.toml`
+    /// digests the defaults, the configuration every accessor here answers while
+    /// acceptance refuses the file.
     pub(crate) fn index_configuration_digest(&self) -> String {
         let defaults = WorkspaceConfiguration::default();
         let configuration = self.accepted.as_ref().unwrap_or(&defaults);
         let tables = serde_json::json!({
             "source": configuration.source,
             "text": configuration.search.text,
+            "documentation": configuration.documentation,
             "lexical": configuration.search.lexical,
             "languages": configuration.languages,
             "dependencies": configuration.dependencies,
@@ -699,8 +770,15 @@ impl IndexValidation {
 
     /// Latest successful capture superseded after this publication was built, if any.
     pub(crate) fn superseded_after(&self, published_epoch: u64) -> Option<u64> {
-        let epoch = self.superseded_epoch.load(Ordering::SeqCst);
+        let epoch = self.superseded_epoch();
         (epoch > published_epoch).then_some(epoch)
+    }
+
+    /// Epoch of the latest successful capture superseded at publication.
+    ///
+    /// Zero before the first one.
+    pub(crate) fn superseded_epoch(&self) -> u64 {
+        self.superseded_epoch.load(Ordering::SeqCst)
     }
 
     /// Installs one publication under publication linearization.
@@ -751,11 +829,15 @@ impl IndexValidation {
     }
 
     /// The project path one event path names, under the current inclusion policy.
-    fn source_project_path(&self, path: &Path) -> Option<ProjectPath> {
-        self.current_publication()
-            .as_ref()?
-            .source_policy
-            .project_path(path)
+    ///
+    /// Before the first publication there is no policy to ask, so the path's spelling below
+    /// the canonical root names it. The startup candidate digests that path under its own
+    /// policy before it publishes, which reads a path the policy excludes as absent.
+    fn source_project_path(&self, roots: &WatchRoots, path: &Path) -> Option<ProjectPath> {
+        self.current_publication().as_ref().map_or_else(
+            || roots.project_path(path),
+            |published| published.source_policy.project_path(path),
+        )
     }
 
     /// Returns whether current policy includes one source event path.
@@ -775,7 +857,9 @@ impl IndexValidation {
     /// Whether the current publication holds at least one file below one event path.
     ///
     /// A path outside the policy's root, or one observed before the first publication,
-    /// holds nothing the index knows about.
+    /// holds nothing the index knows about. Before that publication the startup candidate
+    /// answers the same question for the paths it is observed with, through
+    /// [`PublishedWorkspace::holds_files_below_a_gone_path`].
     fn published_holds_files_below(&self, path: &Path) -> bool {
         let current = self.current_publication();
         let Some(published) = current.as_ref() else {
@@ -906,6 +990,12 @@ impl WatchRoots {
             .ok()
     }
 
+    /// The project path `path` spells below either root spelling, or nothing when it lies
+    /// under neither or spells no valid project path.
+    fn project_path(&self, path: &Path) -> Option<ProjectPath> {
+        rift_index::relative_path(self.relative(path)?).ok()
+    }
+
     /// `path` under the canonical root, or nothing when it lies under neither spelling.
     fn placed<'a>(&self, path: &'a Path) -> Option<std::borrow::Cow<'a, Path>> {
         if path.strip_prefix(&self.canonical).is_ok() {
@@ -914,6 +1004,22 @@ impl WatchRoots {
         let relative = path.strip_prefix(&self.watched).ok()?;
         Some(std::borrow::Cow::Owned(self.canonical.join(relative)))
     }
+}
+
+/// One watcher start over a workspace root: the native watcher production runs, or a test's
+/// watcher on no path.
+pub(crate) trait WatchWorkspace:
+    FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+    + Send
+    + 'static
+{
+}
+
+impl<Watch> WatchWorkspace for Watch where
+    Watch: FnOnce(&Path, &Arc<IndexValidation>) -> Result<notify::RecommendedWatcher, ReadError>
+        + Send
+        + 'static
+{
 }
 
 /// Creates one native watcher rooted before the initial index scan.
@@ -932,6 +1038,25 @@ pub(crate) fn workspace_watcher(
         .watch(roots.canonical(), RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
     Ok(watcher)
+}
+
+/// A watcher on no path, for a test that moves the epoch itself.
+///
+/// A native watcher over the test's directory can report a write the test made before the
+/// watcher started: `FSEvents` did on macOS, and Windows detects a last-write change "only
+/// when the file is written to the disk" (`ReadDirectoryChangesW`). Each report moves the
+/// epoch past the one the test asserts.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] when the platform refuses to create a watcher.
+#[cfg(test)]
+pub(crate) fn unwatched(
+    _root: &Path,
+    _validation: &Arc<IndexValidation>,
+) -> Result<notify::RecommendedWatcher, ReadError> {
+    notify::recommended_watcher(|_: notify::Result<Event>| {})
+        .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))
 }
 
 /// Observes one watcher callback: a delivered event enters the inclusion filter, and a
@@ -1068,14 +1193,25 @@ pub(crate) fn hard_floor_includes_watch_path(roots: &WatchRoots, path: &Path) ->
 ///
 /// A policy file rewrites what the workspace includes and a directory event can add or
 /// drop many files at once, so both ask for the whole workspace. Only a path that is
-/// itself a visible file narrows the next rebuild to that file.
+/// itself a visible file narrows the next rebuild to that file. Before the first
+/// publication no policy decides visibility yet, so every such path names itself, and the
+/// startup candidate's own policy decides what it holds.
 ///
-/// A name event on an extensionless path asks for the whole workspace only when the
-/// path names a directory the index can hold files under: one on disk right now, or one
-/// the publication holds files below, as a directory renamed away is. External writes can
-/// stage each file as an extensionless temporary file beside its target and
-/// rename it over the target; the publication holds nothing under that staging name, so
-/// its name event takes the per-path route a file event takes.
+/// A name event, and a create or remove event whose kind does not say it names a file,
+/// asks for the whole workspace only when its path names a directory the index can hold
+/// files under: one on disk right now, or one the publication holds files below, as a
+/// directory renamed or removed is. notify reports every create and remove on Windows as
+/// `Create(Any)` and `Remove(Any)`, so a directory moved in or out arrives in that shape,
+/// with no event for the files it carries. External writes can stage each file as an
+/// extensionless temporary file beside its target and rename it over the target; the
+/// publication holds nothing under that staging name, so its name event takes the
+/// per-path route a file event takes.
+///
+/// A modify event on a directory adds nothing: Windows reports a directory's last-write
+/// time moving whenever an entry inside it is added or removed, and the entries report
+/// their own events. One the publication holds files below is known a directory without a
+/// disk probe and has no impact; any other directory reaches the rebuild as a path, where
+/// [`observed_record`] reads it as holding no file.
 pub(crate) fn watch_path_impact(
     roots: &WatchRoots,
     validation: &IndexValidation,
@@ -1111,14 +1247,27 @@ pub(crate) fn watch_path_impact(
             WatchImpact::None
         };
     }
+    let folder_modified = matches!(
+        kind,
+        EventKind::Modify(
+            ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other,
+        )
+    ) && validation.published_holds_files_below(path);
+    if folder_modified {
+        return WatchImpact::None;
+    }
     let reshapes_tree = match kind {
-        EventKind::Modify(ModifyKind::Name(_)) | EventKind::Any | EventKind::Other => {
-            names_a_directory(validation, path)
-        }
+        EventKind::Create(CreateKind::File)
+        | EventKind::Remove(RemoveKind::File)
+        | EventKind::Modify(
+            ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other,
+        )
+        | EventKind::Access(_) => false,
         EventKind::Create(_)
         | EventKind::Remove(_)
-        | EventKind::Modify(_)
-        | EventKind::Access(_) => false,
+        | EventKind::Modify(ModifyKind::Name(_))
+        | EventKind::Any
+        | EventKind::Other => names_a_directory(validation, kind, path),
     };
     if reshapes_tree {
         return WatchImpact::WholeWorkspace;
@@ -1127,25 +1276,31 @@ pub(crate) fn watch_path_impact(
         return WatchImpact::None;
     }
     validation
-        .source_project_path(path)
+        .source_project_path(roots, path)
         .map_or(WatchImpact::WholeWorkspace, |path| {
             WatchImpact::Paths(vec![path])
         })
 }
 
-/// Whether one event path names a directory the index can hold files under: an
-/// extensionless path the policy may include descendants of, that is a directory on
-/// disk right now or that the current publication holds files below.
+/// Whether one event path names a directory the index can hold files under: a path the
+/// policy may include descendants of, that the publication holds files below or, unless the
+/// event reports the side a removal or a rename left, that is a directory on disk now.
 ///
-/// The disk probe is the one filesystem read event classification makes: a renamed
-/// directory's new spelling is known to the disk alone, and its old spelling to the
-/// publication alone.
-fn names_a_directory(validation: &IndexValidation, path: &Path) -> bool {
-    let extensionless = path.extension().is_none();
-    if !extensionless || !validation.source_directory_is_relevant(path) {
+/// The side decides which fact is read, whatever the path's spelling. A path that left is
+/// gone from the disk, so only the publication knows what it held, and asking it is an
+/// ordered-map probe. Only a path an event may have created or renamed into place costs a
+/// disk probe, the one filesystem read event classification makes, so a file's content
+/// write costs none. A directory's name may carry a dot like a file's, which is why the
+/// spelling decides nothing.
+fn names_a_directory(validation: &IndexValidation, kind: EventKind, path: &Path) -> bool {
+    if !validation.source_directory_is_relevant(path) {
         return false;
     }
-    path.is_dir() || validation.published_holds_files_below(path)
+    let left = matches!(
+        kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+    );
+    validation.published_holds_files_below(path) || (!left && path.is_dir())
 }
 
 /// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
@@ -1159,10 +1314,8 @@ pub(crate) async fn initial_workspace(
     limits: WorkspaceIndexLimits,
     validation: &IndexValidation,
     blocking: &BlockingExecutor,
-    dependencies: &Arc<PackageBranch>,
 ) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    let capture = workspace_capture(dependencies);
-    initial_workspace_with(root, limits, validation, blocking, capture).await
+    initial_workspace_with(root, limits, validation, blocking, workspace_capture()).await
 }
 
 /// One candidate capture: the whole-workspace scan, or a test's stand-in for it.
@@ -1177,14 +1330,9 @@ impl<Capture> CaptureWorkspace for Capture where
 {
 }
 
-/// The capture production runs: the whole-workspace scan over the dependency index.
-pub(crate) fn workspace_capture(
-    dependencies: &Arc<PackageBranch>,
-) -> impl CaptureWorkspace + Clone + Send + 'static {
-    let dependencies = Arc::clone(dependencies);
-    move |root: &Path, limits: WorkspaceIndexLimits, request: &RebuildRequest| {
-        build_workspace_candidate(root, limits, request, &dependencies)
-    }
+/// The capture production runs: the whole-workspace scan.
+pub(crate) fn workspace_capture() -> impl CaptureWorkspace + Clone + Send + 'static {
+    build_workspace_candidate
 }
 
 /// What one startup attempt's scan folded, kept so the next attempt compares content
@@ -1237,11 +1385,14 @@ impl ScannedTree {
 /// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, under one `rift.toml`
 /// state - publish, whatever the counter reads and whatever the pending work escalated to.
 ///
-/// [`answered_candidate`] keeps its branch for the case it covers, but it cannot be the
-/// startup answer: [`IndexValidation::source_project_path`] returns `None` while no
-/// publication is installed, so before the first one every non-floored event classifies
-/// [`WatchImpact::WholeWorkspace`], and `answered_candidate` refuses a candidate whose
-/// pending work covers the whole workspace.
+/// A change observed while an attempt scans is taken the way a change after the first
+/// publication is. Before that publication an event names its own path, and
+/// [`CandidateAnswer::published_at_startup`] publishes the candidate and leaves every path it
+/// does not hold to the supervisor's first rebuild. Only an observation that asks for the
+/// whole workspace - a written `.gitignore`, a directory event, more paths than the
+/// workspace may hold files - a path the candidate holds files below that is gone from the
+/// disk, or a `rift.toml` that moved under the candidate captures the workspace again,
+/// within [`INDEX_CAPTURE_ATTEMPTS_MAX`] attempts.
 ///
 /// A capture that comes back [`WorkspaceCandidate::ConfigurationChanged`] folds no tree at
 /// all, so it contributes no scan to compare; the span records it and the refusal names it
@@ -1316,16 +1467,18 @@ pub(crate) async fn initial_workspace_with(
                 ))
             } else {
                 answered_candidate(root, &built, &publication, observed_epoch)
+                    .published_at_startup(&built)
             };
             if let Some(answering) = answering {
                 validation.replace_publication_locked(&answering);
                 drop(publication);
                 recorded.record("outcome", "published");
+                let published_epoch = answering.epoch;
                 tracing::info!(
                     component = "index",
                     operation = "index.publish",
                     trigger = "startup",
-                    epoch = observed_epoch,
+                    epoch = published_epoch,
                     "index snapshot published"
                 );
                 return Ok((answering, write));
@@ -1365,13 +1518,11 @@ pub(crate) enum WorkspaceCandidate {
 /// file, its `[source]` policy, and its acceptance with the publication it was resolved
 /// against; a full request scans the workspace. Either way the acceptance is verified
 /// against `rift.toml` after the read, so a candidate built under configuration that moved
-/// underneath it is reported as changed rather than published. Either way the candidate's
-/// read service answers a `global` or `all` lookup from `dependencies`, the package branch.
+/// underneath it is reported as changed rather than published.
 pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
-    dependencies: &Arc<PackageBranch>,
 ) -> Result<WorkspaceCandidate, ReadError> {
     tracing::debug!(
         component = "index",
@@ -1389,14 +1540,7 @@ pub(crate) fn build_workspace_candidate(
                     .configuration
                     .index_configuration_differs(&configuration)
             });
-            whole_workspace_candidate(
-                root,
-                limits,
-                configuration,
-                request.epoch,
-                dependencies,
-                sharing,
-            )?
+            whole_workspace_candidate(root, limits, configuration, request.epoch, sharing)?
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
@@ -1446,7 +1590,6 @@ fn whole_workspace_candidate(
     limits: WorkspaceIndexLimits,
     configuration: ConfigurationState,
     epoch: u64,
-    dependencies: &Arc<PackageBranch>,
     sharing: Option<&PublishedWorkspace>,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
@@ -1469,8 +1612,7 @@ fn whole_workspace_candidate(
             configuration.history_configuration(),
             dependencies_configuration,
         )?,
-    }
-    .with_packages(Arc::clone(dependencies));
+    };
     let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
     });
@@ -1603,20 +1745,23 @@ pub(crate) fn commit_deadline(unit_count: usize) -> Duration {
         .clamp(LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX)
 }
 
-/// What besides a file's bytes decides the lexical rows one publication derives: the
-/// executable that derives them, the corpus shape they are written in, and the index-owned
+/// What besides a file's bytes decides the lexical rows one publication derives: the build
+/// that derives them, the corpus shape they are written in, and the index-owned
 /// configuration.
 ///
-/// The store keeps rows only under the value it stamped them with, so a new binary, a
+/// The store keeps rows only under the value it stamped them with, so a new build, a
 /// changed tokenizer or field set, or an edited index-owned table reloads the store once
-/// instead of trusting rows another derivation wrote. The executable's own digest is what
-/// covers derivation code no manifest names.
+/// instead of trusting rows another derivation wrote. The build is named by
+/// `product_version`, the product identity's version: the package version, the commit the
+/// binary was built from, and a dirty build's executable stamp. Every derivation source is
+/// in that build, so a store is derived again once per release or commit and never kept
+/// past a change to the code that derives it.
 pub(crate) fn derivation_revision(
-    executable_digest: &str,
+    product_version: &str,
     configuration: &ConfigurationState,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(executable_digest.as_bytes());
+    hasher.update(product_version.as_bytes());
     hasher.update([0]);
     hasher.update(rift_ranking::CorpusRevision::current().as_str().as_bytes());
     hasher.update([0]);
@@ -1985,8 +2130,8 @@ pub(crate) struct LexicalLane {
 
 impl LexicalLane {
     /// Spawns the lane's task over `index` and returns the handle a publication hands its
-    /// write to. `executable_digest` names the binary deriving the rows, which the
-    /// derivation revision the store stamps covers.
+    /// write to. `product_version` names the build deriving the rows, which the derivation
+    /// revision the store stamps covers.
     ///
     /// The task ends when the server does, racing the same cancellation token the index
     /// supervisor runs under. A write handed over after that is dropped with a debug line:
@@ -1995,10 +2140,10 @@ impl LexicalLane {
         index: Arc<SearchIndex>,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        executable_digest: Arc<str>,
+        product_version: Arc<str>,
     ) -> Self {
         let bounds = LexicalLaneBounds::of(index.lexical_limits());
-        Self::spawn_over(index, bounds, blocking, cancellation, executable_digest)
+        Self::spawn_over(index, bounds, blocking, cancellation, product_version)
     }
 
     /// Spawns the lane's task over any [`LexicalStore`], writing under `bounds`. Units the
@@ -2008,7 +2153,7 @@ impl LexicalLane {
         bounds: LexicalLaneBounds,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        executable_digest: Arc<str>,
+        product_version: Arc<str>,
     ) -> Self {
         let queue = Arc::new(LexicalQueue::default());
         let task = LexicalTask {
@@ -2017,7 +2162,7 @@ impl LexicalLane {
             queue: Arc::clone(&queue),
             bounds,
             cancellation,
-            executable_digest,
+            product_version,
         };
         tokio::spawn(task.run());
         Self { queue }
@@ -2118,7 +2263,7 @@ struct LexicalTask<Store> {
     queue: Arc<LexicalQueue>,
     bounds: LexicalLaneBounds,
     cancellation: CancellationToken,
-    executable_digest: Arc<str>,
+    product_version: Arc<str>,
 }
 
 impl<Store: LexicalStore> LexicalTask<Store> {
@@ -2182,7 +2327,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             write, published, ..
         } = commit;
         let tree_revision = published.reads.tree_revision().to_owned();
-        let derivation = derivation_revision(&self.executable_digest, &published.configuration);
+        let derivation = derivation_revision(&self.product_version, &published.configuration);
         let documentation = published.reads.documentation_snapshot();
         let write = if whole_owed {
             LexicalWrite::Whole
@@ -2517,8 +2662,8 @@ pub(crate) enum RebuildOutcome {
 
 /// Owns native watcher and reconciles coalesced invalidations until shutdown.
 ///
-/// A published rebuild hands its catalog to the dependency lane and its snapshot to the
-/// population lane, then moves on to the next batch. The supervisor awaiting a pass itself
+/// A published rebuild hands its snapshot to the population lane, then moves on to the
+/// next batch. The supervisor awaiting a pass itself
 /// would hold the whole reconciliation loop for as long as that pass ran, and the filesystem
 /// does not stop moving meanwhile.
 pub(crate) async fn run_index_supervisor(
@@ -2526,7 +2671,7 @@ pub(crate) async fn run_index_supervisor(
     invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
 ) {
-    let capture = workspace_capture(&context.dependencies);
+    let capture = workspace_capture();
     run_index_supervisor_with(watcher, invalidations, context, capture).await;
 }
 
@@ -2643,8 +2788,9 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// hands nothing to the lanes.
 ///
 /// A superseded candidate hands nothing to the lane. A successful capture superseded at
-/// publication records its epoch and wakes reads, so they can check the tree and answer
-/// stale while changes keep waiting for a current publication.
+/// publication records its epoch and wakes reads, so a read captures the tree again and
+/// answers stale when it moved since that read's previous capture, while changes keep
+/// waiting for a current publication.
 ///
 /// Each blocking operation races the supervisor's cancellation token. A stop that lands
 /// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once
@@ -2926,7 +3072,8 @@ pub(crate) fn publish_rebuild_after(
 ) -> RebuildOutcome {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    let candidate = answered_candidate(root, candidate, &publication, observed_epoch);
+    let candidate =
+        answered_candidate(root, candidate, &publication, observed_epoch).into_current();
     let mut state = published.blocking_write();
     after_state_lock();
     if validation.cancellation.is_cancelled() {
@@ -2958,65 +3105,88 @@ pub(crate) fn publish_rebuild_after(
     }
 }
 
-/// The candidate to publish under `observed_epoch`, or nothing when the observation
-/// genuinely moved past it.
+/// Where one captured candidate stands against the observation made since its capture.
+#[derive(Debug)]
+enum CandidateAnswer {
+    /// The candidate answers the observed epoch: as itself when nothing was observed since
+    /// its capture, or as its twin under that epoch when it already holds what every
+    /// observed path holds.
+    Current(Arc<PublishedWorkspace>),
+    /// The observation names a path whose bytes the candidate does not hold, or could not
+    /// read under its own policy; a rebuild reading the named paths answers it.
+    Behind,
+    /// The observation asks for the whole workspace, names a path the candidate holds
+    /// files below that is gone from the disk, or was made while `rift.toml` moved since
+    /// the candidate accepted it; only a capture of the whole workspace answers it.
+    Rescan,
+}
+
+impl CandidateAnswer {
+    /// The publication a running supervisor makes: the candidate answers the observation,
+    /// or it is superseded.
+    fn into_current(self) -> Option<Arc<PublishedWorkspace>> {
+        match self {
+            Self::Current(answering) => Some(answering),
+            Self::Behind | Self::Rescan => None,
+        }
+    }
+
+    /// The publication startup makes, or nothing when the workspace has to be captured
+    /// again.
+    ///
+    /// A candidate behind the observation still publishes, under the epoch its own capture
+    /// took. The paths it does not hold stay the publication lane's pending work, so the
+    /// supervisor's first rebuild reads them as an incremental change, through the same
+    /// lexical lane and epoch sequence as every later change, and a read meets the startup
+    /// snapshot first and that change right after.
+    fn published_at_startup(
+        self,
+        candidate: &Arc<PublishedWorkspace>,
+    ) -> Option<Arc<PublishedWorkspace>> {
+        match self {
+            Self::Current(answering) => Some(answering),
+            Self::Behind => Some(Arc::clone(candidate)),
+            Self::Rescan => None,
+        }
+    }
+}
+
+/// Where `candidate` stands against the observation `pending` holds under
+/// `observed_epoch`.
 ///
 /// A candidate answers the epoch its capture took. When the observation moved while the
 /// capture ran, the paths that moved are still the lane's pending work, so the same
 /// comparison a rebuild makes - [`PathChanges::resolve`] against the candidate's own
 /// digests - says whether the candidate already holds what they name. A candidate that
-/// holds all of them answers the later observation too and publishes as its twin under
-/// that epoch: a change's own write reaches the watcher after the change captured it,
-/// and reading the same bytes a second time is the work this drops. An observation that
-/// names a path the candidate does not hold, one that asks for the whole workspace, or
-/// one made while `rift.toml` moved, supersedes the candidate.
+/// holds all of them answers the later observation too, as its twin under that epoch: a
+/// change's own write reaches the watcher after the change captured it, and reading the
+/// same bytes a second time is the work this drops. An observation that names a path the
+/// candidate does not hold leaves it behind; one that asks for the whole workspace, one
+/// naming a path the candidate holds files below that is gone from the disk, or one made
+/// while `rift.toml` moved, asks for a rescan.
 ///
 /// Work is one digest per observed path, bounded by how many paths one observation
-/// retains, and it runs under the publication lane alone. A bounded read that left a file
-/// out answers only a candidate with no digest and the same recorded warning; another
-/// omission or an I/O error still supersedes it.
+/// retains, and it runs under the publication lane alone.
 fn answered_candidate(
     root: &Path,
     candidate: &Arc<PublishedWorkspace>,
     pending: &PendingWork,
     observed_epoch: u64,
-) -> Option<Arc<PublishedWorkspace>> {
+) -> CandidateAnswer {
     if candidate.epoch == observed_epoch {
-        return Some(Arc::clone(candidate));
+        return CandidateAnswer::Current(Arc::clone(candidate));
     }
     if pending.covers_whole_workspace()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
+        || candidate.holds_files_below_a_gone_path(root, &pending.paths)
     {
-        return None;
+        return CandidateAnswer::Rescan;
     }
-    let mut observed = Vec::with_capacity(pending.paths.len());
-    for path in &pending.paths {
-        let digest = match candidate
-            .source_policy
-            .visible_digest(&root.join(path.as_str()))
-        {
-            Ok(digest) => digest,
-            Err(error)
-                if candidate.reads.file_digest(path).is_none()
-                    && error
-                        .fault()
-                        .left_out_file(path.clone())
-                        .is_some_and(|warning| {
-                            candidate.reads.file_warning(path) == Some(&warning)
-                        }) =>
-            {
-                None
-            }
-            Err(_) => return None,
-        };
-        observed.push((path.clone(), digest));
-    }
-    let changes = PathChanges::resolve(observed, |path| candidate.reads.file_digest(path));
-    if !changes.is_empty() {
-        return None;
+    if !candidate.holds_observed(root, &pending.paths) {
+        return CandidateAnswer::Behind;
     }
     let twin = candidate.under(candidate.configuration.clone(), observed_epoch);
-    Some(Arc::new(twin))
+    CandidateAnswer::Current(Arc::new(twin))
 }
 
 /// Records failure under same observation linearization as publication.
@@ -3074,8 +3244,8 @@ pub(crate) mod lexical_double {
         transaction_units_max: usize::MAX,
         transaction_bytes_max: usize::MAX,
     };
-    /// The executable digest a test lane derives its rows under.
-    pub(crate) const EXECUTABLE_DIGEST: &str = "test-executable";
+    /// The product version a test lane derives its rows under.
+    pub(crate) const PRODUCT_VERSION: &str = "0.0.45";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
     /// one permit before it answers, refusing changes or recorded-digest reads when told to,
@@ -3328,14 +3498,6 @@ impl ConfigurationState {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// A package branch holding nothing, for a test that publishes a workspace without
-    /// asking for a package read.
-    pub(crate) fn empty_package_branch() -> std::sync::Arc<rift_server::PackageBranch> {
-        std::sync::Arc::new(rift_server::PackageBranch::new(
-            rift_index::DependencyIndexLimits::default(),
-        ))
-    }
-
     use super::ConfigurationState;
     use rift_core::SourceVisibility;
     use rift_server::LspProcessKey;
@@ -3401,7 +3563,7 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{GlobalConfiguration, ServerConfiguration};
@@ -3422,7 +3584,7 @@ pub(crate) mod tests {
         LEXICAL_HELD_REVISIONS_MAX, LEXICAL_UNIT_COMMIT_BUDGET, LexicalCommitState, LexicalLane,
         LexicalWrite, PathChanges, PopulationLane, PublishedWorkspace, RebuildOutcome,
         RebuildRequest, WorkspaceCandidate, build_workspace_candidate, commit_deadline,
-        publish_rebuild, publish_rebuild_after, record_rebuild_failure,
+        publish_rebuild, publish_rebuild_after, record_rebuild_failure, unwatched,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -3464,12 +3626,7 @@ pub(crate) mod tests {
         epoch: u64,
         limits: WorkspaceIndexLimits,
     ) -> TestResult<Arc<PublishedWorkspace>> {
-        match build_workspace_candidate(
-            root,
-            limits,
-            &RebuildRequest::initial(epoch),
-            &empty_package_branch(),
-        )? {
+        match build_workspace_candidate(root, limits, &RebuildRequest::initial(epoch))? {
             WorkspaceCandidate::Stable { published, .. } => Ok(published),
             WorkspaceCandidate::ConfigurationChanged => {
                 Err("fixture configuration must remain stable".into())
@@ -3946,13 +4103,18 @@ pub(crate) mod tests {
             "new bounded source must supersede the old omission"
         );
         fs::remove_file(&absolute)?;
-        fs::create_dir(&absolute)?;
-        assert!(published.source_policy.visible_digest(&absolute).is_err());
-        assert_eq!(
-            publish_rebuild(directory.path(), &state, &validation, &published),
-            RebuildOutcome::Superseded,
-            "an I/O failure must not be accepted as the earlier file bound"
-        );
+        // A link to itself fails every read with a loop error: an I/O failure that is
+        // neither a missing file nor a directory, which both hold no file.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&absolute, &absolute)?;
+            assert!(published.source_policy.visible_digest(&absolute).is_err());
+            assert_eq!(
+                publish_rebuild(directory.path(), &state, &validation, &published),
+                RebuildOutcome::Superseded,
+                "an I/O failure must not be accepted as the earlier file bound"
+            );
+        }
         Ok(())
     }
 
@@ -4069,6 +4231,89 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Before the first publication no policy decides what an event path holds, so a file
+    /// event names its own path in the spelling the index keys files by, and the startup
+    /// candidate's policy decides what it holds. An event that rewrites what the workspace
+    /// includes or reshapes the tree asks for the whole workspace, as it does after that
+    /// publication.
+    #[test]
+    fn an_event_before_the_first_publication_names_its_own_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let watched_root = directory.path().join(".");
+        let event_root = directory.path().canonicalize()?;
+        fs::create_dir_all(directory.path().join("src/nested"))?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let roots = super::WatchRoots::resolve(&watched_root)?;
+        let event = |kind, path: &str| Event::new(kind).add_path(event_root.join(path));
+        let named = |path: &str| -> TestResult<super::WatchImpact> {
+            Ok(super::WatchImpact::Paths(vec![
+                rift_core::ProjectPath::new(path)?,
+            ]))
+        };
+        let renamed = EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any));
+        let expectations: Vec<(EventKind, &str, super::WatchImpact, &str)> = vec![
+            (
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                "src/lib.rs",
+                named("src/lib.rs")?,
+                "an edited file names itself",
+            ),
+            (
+                EventKind::Create(CreateKind::File),
+                "src/generated/code.rs",
+                named("src/generated/code.rs")?,
+                "a created file names itself, whatever policy later excludes it",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                "rift.toml",
+                named("rift.toml")?,
+                "a written configuration file names itself, and the candidate's acceptance \
+                 decides whether the scan answers it",
+            ),
+            (
+                EventKind::Modify(ModifyKind::Any),
+                ".gitignore",
+                super::WatchImpact::WholeWorkspace,
+                "the workspace's ignore file decides what is included",
+            ),
+            (
+                EventKind::Create(CreateKind::Folder),
+                "src/fresh",
+                super::WatchImpact::WholeWorkspace,
+                "a directory that appears brings an unknown set of files with it",
+            ),
+            (
+                renamed,
+                "src/nested",
+                super::WatchImpact::WholeWorkspace,
+                "a directory renamed into place holds files no event named",
+            ),
+            (
+                renamed,
+                "src/departed",
+                named("src/departed")?,
+                "a path renamed away names itself, and the startup candidate decides whether \
+                 it held files below it",
+            ),
+            (
+                renamed,
+                "src/departed.rs",
+                named("src/departed.rs")?,
+                "a file renamed away names itself",
+            ),
+        ];
+        for (kind, path, expected, reason) in expectations {
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &event(kind, path)),
+                expected,
+                "{path}: {reason}"
+            );
+        }
+        Ok(())
+    }
+
     /// A server does not index its own state. The walk's hard floor prunes `.rift` by
     /// name before either lane sees it, so neither the syntax-indexed files nor the
     /// recorded set holds the workspace database, whose bytes move for as long as SQLite
@@ -4089,7 +4334,6 @@ pub(crate) mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &super::RebuildRequest::initial(0),
-            &empty_package_branch(),
         )?;
         let WorkspaceCandidate::Stable { published, .. } = candidate else {
             return Err("the fixture capture must be stable".into());
@@ -4109,12 +4353,12 @@ pub(crate) mod tests {
     /// A server does not observe its own state either, under any spelling of its root.
     ///
     /// No publication is installed, which is the startup window the initial build runs
-    /// in: `source_path_is_relevant` is wide open there and `source_project_path` answers
-    /// nothing, so every path the floor admits escalates to the whole workspace. The
-    /// floor is the only guard left, and it places the event path against both spellings
-    /// before reading it, so the database writes that run for the life of the server move
-    /// no filesystem epoch. The last assertion is what makes dropping an unplaceable path
-    /// safe: a source write under the symlinked spelling is still observed.
+    /// in: `source_path_is_relevant` is wide open there, so every path the floor admits
+    /// names itself. The floor is the only guard left, and it places the event path
+    /// against both spellings before reading it, so the database writes that run for the
+    /// life of the server move no filesystem epoch. The last assertion is what makes
+    /// dropping an unplaceable path safe: a source write under the symlinked spelling is
+    /// still observed, under the path the index keys it by.
     #[test]
     fn a_state_file_event_reaches_no_impact_under_every_root_spelling() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4158,7 +4402,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 super::watch_event_impact(&roots, &validation, &written(&linked.join("lib.rs"))),
-                super::WatchImpact::WholeWorkspace,
+                super::WatchImpact::Paths(vec![rift_core::ProjectPath::new("lib.rs")?]),
                 "a source write through a symlinked root is still observed, which is what \
                  makes dropping an unplaceable path safe"
             );
@@ -4304,6 +4548,396 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One event whose kind does not say what it names, as notify reports every
+    /// `FILE_ACTION_ADDED` and `FILE_ACTION_REMOVED` on Windows.
+    fn event_at(kind: EventKind, path: &std::path::Path) -> Event {
+        Event::new(kind).add_path(path.to_path_buf())
+    }
+
+    /// One publication over `root`, installed for `validation`'s event classification, and
+    /// the state a rebuild publishes into.
+    fn installed_state(
+        root: &std::path::Path,
+        validation: &IndexValidation,
+    ) -> TestResult<Arc<RwLock<IndexState>>> {
+        let current = stable_candidate(root, 0)?;
+        validation.install_publication(&current);
+        Ok(Arc::new(RwLock::new(IndexState {
+            current,
+            failure: None,
+        })))
+    }
+
+    /// Folder names a directory event carries: one plain, and one with a dot the way a file
+    /// name's extension has one.
+    const FOLDER_SPELLINGS: [&str; 2] = ["pkg", "pkg.v2"];
+
+    /// A directory moved into the workspace reaches the watcher as one `Create(Any)` on
+    /// Windows, with no event for the files it carries. It names a directory on disk, so
+    /// the rebuild reads the whole workspace and indexes those files, whatever the folder's
+    /// name looks like, and also under a policy whose globs name only the files below it.
+    #[tokio::test]
+    async fn a_directory_moved_in_as_create_any_is_read_whole() -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            moved_in_as_create_any(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Moves `folder` into the workspace, reports it as `Create(Any)`, and proves the
+    /// rebuild indexes the files it carried.
+    async fn moved_in_as_create_any(folder: &str) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[source]\ninclude = [\"src/**/*.rs\"]\n",
+        )?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        fs::create_dir_all(elsewhere.path().join(folder))?;
+        fs::write(
+            elsewhere.path().join(folder).join("mod.rs"),
+            "pub fn arrived() {}\n",
+        )?;
+        let moved_in = directory.path().join("src").join(folder);
+        fs::rename(elsewhere.path().join(folder), &moved_in)?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let event_path = roots.canonical().join("src").join(folder);
+        let created = event_at(EventKind::Create(CreateKind::Any), &event_path);
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+
+        let whole = validation.locked_pending().covers_whole_workspace();
+        assert!(
+            whole,
+            "{folder}: a directory on disk carries files no event named"
+        );
+        let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
+        assert_eq!(outcome, RebuildOutcome::Published, "{folder}");
+        let current = Arc::clone(&state.read().await.current);
+        assert_eq!(declarations_named(&current, "arrived")?, 1, "{folder}");
+        assert_eq!(declarations_named(&current, "beacon")?, 1, "{folder}");
+        Ok(())
+    }
+
+    /// A directory removed, or moved out, reaches the watcher as one `Remove(Any)` on
+    /// Windows when none of its files were reported first. The publication holds files
+    /// below that path, whatever its name looks like, so the rebuild reads the whole
+    /// workspace and they leave the index.
+    #[tokio::test]
+    async fn a_directory_removed_as_remove_any_is_read_whole() -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            removed_as_remove_any(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes `folder` from the workspace, reports it as `Remove(Any)`, and proves its
+    /// files leave the index.
+    async fn removed_as_remove_any(folder: &str) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let removed_folder = directory.path().join("src").join(folder);
+        fs::create_dir_all(&removed_folder)?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(removed_folder.join("mod.rs"), "pub fn departed() {}\n")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        fs::remove_dir_all(&removed_folder)?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let event_path = roots.canonical().join("src").join(folder);
+        let removed = event_at(EventKind::Remove(RemoveKind::Any), &event_path);
+        super::report_watch_outcome(&roots, &validation, Ok(removed));
+
+        let whole = validation.locked_pending().covers_whole_workspace();
+        assert!(
+            whole,
+            "{folder}: the publication holds files below the removed path"
+        );
+        let outcome = rebuilt_through(directory.path(), &state, &validation, None).await?;
+        assert_eq!(outcome, RebuildOutcome::Published, "{folder}");
+        let current = Arc::clone(&state.read().await.current);
+        assert_eq!(declarations_named(&current, "departed")?, 0, "{folder}");
+        assert_eq!(declarations_named(&current, "beacon")?, 1, "{folder}");
+        Ok(())
+    }
+
+    /// A file created or removed with a kind that does not say it is a file is still one
+    /// file: it names no directory on disk and the publication holds nothing below it, so
+    /// the event names that path alone, extensionless or not.
+    #[test]
+    fn a_file_created_or_removed_as_any_names_that_path() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("src/gone.rs"), "pub fn gone() {}\n")?;
+        fs::write(directory.path().join("LICENSE"), "beacon\n")?;
+        let (validation, _current) = installed_publication(directory.path())?;
+        fs::write(directory.path().join("NOTICE"), "beacon\n")?;
+        fs::remove_file(directory.path().join("src/gone.rs"))?;
+        fs::remove_file(directory.path().join("LICENSE"))?;
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let created = EventKind::Create(CreateKind::Any);
+        let removed = EventKind::Remove(RemoveKind::Any);
+        for (kind, path) in [
+            (created, "src/lib.rs"),
+            (created, "NOTICE"),
+            (removed, "src/gone.rs"),
+            (removed, "LICENSE"),
+        ] {
+            let event = event_at(kind, &roots.canonical().join(path));
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &event),
+                super::WatchImpact::Paths(vec![rift_core::ProjectPath::new(path)?]),
+                "{kind:?} {path} names that file alone"
+            );
+        }
+        Ok(())
+    }
+
+    /// The change set one taken observation resolves to against `previous`.
+    fn change_set_of(
+        root: &std::path::Path,
+        validation: &IndexValidation,
+        previous: &Arc<PublishedWorkspace>,
+    ) -> ChangeSet {
+        let mut request = validation.take_pending();
+        request.previous = Some(Arc::clone(previous));
+        request.change_set(root, &ConfigurationState::accept(root))
+    }
+
+    /// The paths an incremental change set names, or nothing for a whole one.
+    fn changed_paths(change_set: &ChangeSet) -> Option<Vec<String>> {
+        match change_set {
+            ChangeSet::Full => None,
+            ChangeSet::Incremental(changes) => Some(
+                changes
+                    .iter()
+                    .map(|(path, _)| path.as_str().to_owned())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Windows reports a directory's last-write time moving as `Modify(Any)` on the
+    /// directory whenever an entry inside it is added or removed. A directory the
+    /// publication holds files below is known one without a disk probe, so that report has
+    /// no impact, and the file created in it is the rebuild's one change.
+    #[test]
+    fn a_directory_modified_beside_a_file_created_in_it_rebuilds_that_file_alone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        let previous = Arc::clone(&state.blocking_read().current);
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let folder_modified = event_at(
+            EventKind::Modify(ModifyKind::Any),
+            &roots.canonical().join("src"),
+        );
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &folder_modified),
+            super::WatchImpact::None,
+            "a directory's own modify report names nothing to read"
+        );
+
+        fs::write(directory.path().join("src/fresh.rs"), "pub fn fresh() {}\n")?;
+        let created = event_at(
+            EventKind::Create(CreateKind::File),
+            &roots.canonical().join("src/fresh.rs"),
+        );
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified));
+        let change_set = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(
+            changed_paths(&change_set),
+            Some(vec!["src/fresh.rs".to_owned()]),
+            "{change_set:?}"
+        );
+        Ok(())
+    }
+
+    /// A directory the publication holds nothing below reaches the rebuild as a path when
+    /// its own modify report arrives, and reading a directory as a file fails. It holds no
+    /// file, so it adds nothing to the change set: alone it changes nothing, and beside a
+    /// file created in it the change names that file alone.
+    #[test]
+    fn a_directory_modified_with_nothing_indexed_below_adds_nothing_to_the_change_set() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        fs::create_dir_all(directory.path().join("docs"))?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = installed_state(directory.path(), &validation)?;
+        let previous = Arc::clone(&state.blocking_read().current);
+        let roots = super::WatchRoots::resolve(directory.path())?;
+        let folder = roots.canonical().join("docs");
+        let folder_modified = event_at(EventKind::Modify(ModifyKind::Any), &folder);
+
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified.clone()));
+        let alone = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(changed_paths(&alone), Some(Vec::new()), "{alone:?}");
+
+        fs::write(folder.join("first.rs"), "pub fn first() {}\n")?;
+        let created = event_at(
+            EventKind::Create(CreateKind::File),
+            &folder.join("first.rs"),
+        );
+        super::report_watch_outcome(&roots, &validation, Ok(created));
+        super::report_watch_outcome(&roots, &validation, Ok(folder_modified));
+        let beside = change_set_of(directory.path(), &validation, &previous);
+        assert_eq!(
+            changed_paths(&beside),
+            Some(vec!["docs/first.rs".to_owned()]),
+            "{beside:?}"
+        );
+        Ok(())
+    }
+
+    /// A per-file byte bound small enough that [`LEFT_OUT_FILES`]'s oversized file passes it.
+    const SMALL_MAX_FILE: &str = "[providers.syntax]\nmax_file = \"60b\"\n";
+
+    /// Files the catalog leaves out before digesting their bytes: one past
+    /// [`SMALL_MAX_FILE`], and one holding a NUL byte.
+    const LEFT_OUT_FILES: [(&str, &[u8]); 2] = [
+        (
+            "oversized.rs",
+            b"// oversized source past the sixty byte bound of this workspace\n",
+        ),
+        ("binary.rs", b"source\0bytes\n"),
+    ];
+
+    /// A publication over a workspace holding `lib.rs` and the left-out file `name`,
+    /// under [`SMALL_MAX_FILE`].
+    fn left_out_publication(
+        root: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> TestResult<Arc<PublishedWorkspace>> {
+        fs::write(root.join("rift.toml"), SMALL_MAX_FILE)?;
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join(name), bytes)?;
+        let previous = stable_candidate(root, 0)?;
+        let path = rift_core::ProjectPath::new(name)?;
+        assert!(
+            previous.reads.file_digest(&path).is_none()
+                && previous.reads.file_warning(&path).is_some(),
+            "{name} is left out with a warning and no digest"
+        );
+        Ok(previous)
+    }
+
+    /// The candidate one rebuild naming `path` builds over `previous`, with its change set.
+    fn rebuilt_naming(
+        root: &std::path::Path,
+        previous: &Arc<PublishedWorkspace>,
+        path: &rift_core::ProjectPath,
+    ) -> TestResult<(Arc<PublishedWorkspace>, ChangeSet)> {
+        let request = RebuildRequest {
+            epoch: previous.epoch + 1,
+            work: super::PendingWork::naming([path.clone()]),
+            previous: Some(Arc::clone(previous)),
+        };
+        match build_workspace_candidate(root, WorkspaceIndexLimits::default(), &request)? {
+            WorkspaceCandidate::Stable {
+                published,
+                change_set,
+            } => Ok((published, change_set)),
+            WorkspaceCandidate::ConfigurationChanged => {
+                Err("fixture configuration must remain stable".into())
+            }
+        }
+    }
+
+    /// A file left out before its bytes were digested has no digest, and a deleted path
+    /// has none either. The warning the publication records tells them apart, so the
+    /// rebuild that observes the deletion removes the path and its warning with it.
+    #[test]
+    fn a_deleted_left_out_file_leaves_no_warning_behind() -> TestResult {
+        for (name, bytes) in LEFT_OUT_FILES {
+            let directory = tempfile::tempdir()?;
+            let previous = left_out_publication(directory.path(), name, bytes)?;
+            let path = rift_core::ProjectPath::new(name)?;
+            fs::remove_file(directory.path().join(name))?;
+            let (published, change_set) = rebuilt_naming(directory.path(), &previous, &path)?;
+
+            assert_eq!(
+                changed_paths(&change_set),
+                Some(vec![name.to_owned()]),
+                "{name}: the deletion is a change"
+            );
+            assert_eq!(
+                published.reads.file_warning(&path),
+                None,
+                "{name}: the deleted file's warning leaves the index"
+            );
+        }
+        Ok(())
+    }
+
+    /// A left-out file written again with the same bytes is still on disk and still left
+    /// out, so it keeps its warning. A file past the byte bound records that warning on both
+    /// sides and changes nothing; one holding a NUL byte has no recorded digest to compare,
+    /// so the rebuild reads it again and leaves it out again.
+    #[test]
+    fn a_left_out_file_written_with_the_same_bytes_keeps_its_warning() -> TestResult {
+        for (name, bytes) in LEFT_OUT_FILES {
+            let directory = tempfile::tempdir()?;
+            let previous = left_out_publication(directory.path(), name, bytes)?;
+            let path = rift_core::ProjectPath::new(name)?;
+            fs::write(directory.path().join(name), bytes)?;
+            let (published, change_set) = rebuilt_naming(directory.path(), &previous, &path)?;
+
+            let expected = previous.reads.file_warning(&path).cloned();
+            assert_eq!(
+                published.reads.file_warning(&path).cloned(),
+                expected,
+                "{name}: the warning stays"
+            );
+            let read_again = if name == "binary.rs" {
+                vec![name.to_owned()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(changed_paths(&change_set), Some(read_again), "{name}");
+        }
+        Ok(())
+    }
+
+    /// A path observed before a publication held files below it can name a directory that
+    /// has left the disk since. Reading the path finds nothing, so the change set reads the
+    /// whole workspace instead of keeping the files the publication holds below it.
+    #[test]
+    fn a_change_set_naming_a_directory_gone_from_the_disk_reads_whole() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("pkg"))?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("pkg/mod.rs"),
+            "pub fn departed() {}\n",
+        )?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::remove_dir_all(directory.path().join("pkg"))?;
+        let request = RebuildRequest {
+            epoch: 1,
+            work: super::PendingWork::naming([rift_core::ProjectPath::new("pkg")?]),
+            previous: Some(previous),
+        };
+        let configuration = ConfigurationState::accept(directory.path());
+        assert_eq!(
+            request.change_set(directory.path(), &configuration),
+            ChangeSet::Full
+        );
+        Ok(())
+    }
+
     #[test]
     fn retained_paths_past_the_workspace_file_bound_become_a_whole_rebuild() -> TestResult {
         const PATHS_MAX: usize = 2;
@@ -4352,7 +4986,7 @@ pub(crate) mod tests {
             &state,
             &validation,
             request,
-            super::workspace_capture(&empty_package_branch()),
+            super::workspace_capture(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
 
@@ -4378,14 +5012,13 @@ pub(crate) mod tests {
         fs::create_dir_all(directory.path().join("fresh"))?;
         fs::write(directory.path().join("fresh/mod.rs"), "pub fn fresh() {}\n")?;
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let rebuild = |epoch: u64| -> TestResult<Arc<PublishedWorkspace>> {
             let request = super::RebuildRequest {
                 epoch,
                 work: super::PendingWork::whole_workspace(),
                 previous: Some(Arc::clone(&previous)),
             };
-            match build_workspace_candidate(directory.path(), limits, &request, &store)? {
+            match build_workspace_candidate(directory.path(), limits, &request)? {
                 WorkspaceCandidate::Stable {
                     published,
                     change_set,
@@ -4437,11 +5070,10 @@ pub(crate) mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -4470,11 +5102,10 @@ pub(crate) mod tests {
         };
 
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: candidate,
             ..
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -4511,7 +5142,6 @@ pub(crate) mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4559,7 +5189,6 @@ pub(crate) mod tests {
                 directory.path(),
                 WorkspaceIndexLimits::default(),
                 &request,
-                &empty_package_branch(),
             )?
             else {
                 return Err("a stable configuration change must build a candidate".into());
@@ -4698,7 +5327,7 @@ pub(crate) mod tests {
             &state,
             &validation,
             RebuildRequest::initial(7),
-            super::workspace_capture(&empty_package_branch()),
+            super::workspace_capture(),
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Superseded));
         assert!(
@@ -4751,10 +5380,9 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
         let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         blocking.operations.close();
-        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4767,7 +5395,6 @@ pub(crate) mod tests {
                 blocking,
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4813,8 +5440,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
-        let dependencies = empty_package_branch();
+        let watcher = unwatched(directory.path(), &validation)?;
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -4827,7 +5453,6 @@ pub(crate) mod tests {
                 blocking: crate::server::BlockingExecutor::isolated(2, 60_000),
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
         let notified = validation.changed.notified();
@@ -4874,7 +5499,7 @@ pub(crate) mod tests {
                 // Every capture observes one more filesystem event, so no attempt ever
                 // sees a stable epoch, and none of those events changes a byte.
                 moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, request, &empty_package_branch())
+                super::build_workspace_candidate(root, limits, request)
             },
         )
         .await?;
@@ -4917,12 +5542,7 @@ pub(crate) mod tests {
             &validation,
             &blocking,
             move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(
-                    root,
-                    limits,
-                    request,
-                    &empty_package_branch(),
-                )?;
+                let candidate = super::build_workspace_candidate(root, limits, request)?;
                 let mut seen = seen.lock().expect("the fixture lock is clean");
                 if let WorkspaceCandidate::Stable { published, .. } = &candidate {
                     seen.push(published.reads.tree_revision().to_owned());
@@ -5004,12 +5624,7 @@ pub(crate) mod tests {
             &validation,
             &blocking,
             move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(
-                    root,
-                    limits,
-                    request,
-                    &empty_package_branch(),
-                )?;
+                let candidate = super::build_workspace_candidate(root, limits, request)?;
                 // The next scan reads bytes this one never held.
                 fs::write(
                     written.join("lib.rs"),
@@ -5049,6 +5664,311 @@ pub(crate) mod tests {
         .await
         .expect_err("a configuration that keeps moving must exhaust capture attempts");
         assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        Ok(())
+    }
+
+    /// One file event, as the watcher reports a write to `path`.
+    fn file_written(path: &std::path::Path) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(path.into())
+    }
+
+    /// A capture that scans as production does and, on its first scan only, then runs
+    /// `change` under the canonical root and reports the event it answers to `validation`
+    /// the way the watcher does, before that scan publishes. Answers the capture and the
+    /// count of scans it ran.
+    fn changed_during_first_scan(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        change: impl Fn(&std::path::Path) -> Event + Clone + Send + 'static,
+    ) -> TestResult<(
+        impl super::CaptureWorkspace + Clone + Send + 'static,
+        Arc<std::sync::atomic::AtomicU64>,
+    )> {
+        let roots = super::WatchRoots::resolve(root)?;
+        let watching = Arc::clone(validation);
+        let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&scans);
+        let capture = move |root: &std::path::Path,
+                            limits: WorkspaceIndexLimits,
+                            request: &RebuildRequest|
+              -> Result<WorkspaceCandidate, rift_server::ReadError> {
+            let candidate = build_workspace_candidate(root, limits, request)?;
+            if counted.fetch_add(1, Ordering::Relaxed) == 0 {
+                let event = change(roots.canonical());
+                super::report_watch_outcome(&roots, &watching, Ok(event));
+            }
+            Ok(candidate)
+        };
+        Ok((capture, scans))
+    }
+
+    /// A capture that writes `bytes` to `path` after its first scan, as
+    /// [`changed_during_first_scan`] runs a change.
+    fn written_during_first_scan(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        path: &'static str,
+        bytes: &'static str,
+    ) -> TestResult<(
+        impl super::CaptureWorkspace + Clone + Send + 'static,
+        Arc<std::sync::atomic::AtomicU64>,
+    )> {
+        changed_during_first_scan(root, validation, move |root| {
+            let written = root.join(path);
+            fs::write(&written, bytes).expect("the fixture write lands");
+            file_written(&written)
+        })
+    }
+
+    /// Polls `published` until its snapshot answers `epoch`, and answers that snapshot.
+    async fn published_within_bound(
+        published: &RwLock<IndexState>,
+        epoch: u64,
+    ) -> TestResult<Arc<PublishedWorkspace>> {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let current = Arc::clone(&published.read().await.current);
+            if current.epoch == epoch {
+                return Ok(current);
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        let reached = published.read().await.current.epoch;
+        Err(format!("the supervisor never published epoch {epoch}, only {reached}").into())
+    }
+
+    /// How many declarations named `name` one snapshot answers.
+    fn declarations_named(published: &PublishedWorkspace, name: &str) -> TestResult<usize> {
+        let params = serde_json::from_value(serde_json::json!({ "name": name }))?;
+        Ok(published.reads.get_symbol(&params)?.hits.len())
+    }
+
+    /// Starts the supervisor over `startup`, handing `lane` its rebuilds, as a served
+    /// workspace does once its startup snapshot published.
+    fn supervised_after_startup(
+        root: &std::path::Path,
+        validation: &Arc<IndexValidation>,
+        invalidations: tokio::sync::mpsc::Receiver<()>,
+        startup: &Arc<PublishedWorkspace>,
+        lane: &LexicalLane,
+    ) -> TestResult<(Arc<RwLock<IndexState>>, tokio::task::JoinHandle<()>)> {
+        let published = Arc::new(RwLock::new(IndexState {
+            current: Arc::clone(startup),
+            failure: None,
+        }));
+        let context = super::IndexSupervisorContext {
+            root: root.to_path_buf(),
+            limits: WorkspaceIndexLimits::default(),
+            published: Arc::clone(&published),
+            validation: Arc::clone(validation),
+            blocking: BlockingExecutor::isolated(2, 60_000),
+            population: None,
+            lexical: Some(lane.clone()),
+        };
+        let supervisor = tokio::spawn(super::run_index_supervisor_with(
+            unwatched(root, validation)?,
+            invalidations,
+            context,
+            super::workspace_capture(),
+        ));
+        Ok((published, supervisor))
+    }
+
+    /// A file edited while the startup scan runs is taken as a change after that scan, as
+    /// one after any publication is: the scan publishes under the epoch its capture took,
+    /// the edited path stays the pending work, and the supervisor's first rebuild reads that
+    /// file alone. The lexical lane meets the startup snapshot's whole write first and a
+    /// change naming the edited file right after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_file_edited_during_the_startup_scan_is_the_first_incremental_change() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let lib = rift_core::ProjectPath::new("lib.rs")?;
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let (validation, invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let (capture, scans) = written_during_first_scan(
+            directory.path(),
+            &validation,
+            "lib.rs",
+            "pub fn edited() {}\n",
+        )?;
+        let limits = WorkspaceIndexLimits::default();
+        let (startup, write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(scans.load(Ordering::Relaxed), 1, "the first scan publishes");
+        assert_eq!(
+            startup.epoch, 0,
+            "the snapshot answers the epoch its capture took"
+        );
+        assert_eq!(validation.observed_epoch(), 1);
+        assert_eq!(declarations_named(&startup, "beacon")?, 1);
+        assert!(matches!(write, LexicalWrite::Whole), "{write:?}");
+        let (whole, named) = {
+            let pending = validation.locked_pending();
+            let named: Vec<_> = pending.paths().cloned().collect();
+            (pending.covers_whole_workspace(), named)
+        };
+        assert!(!whole, "the edit named its own path");
+        assert_eq!(named, vec![lib.clone()]);
+
+        let double = StoreDouble::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            blocking,
+            validation.cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        lane.request(write, Arc::clone(&startup));
+        double.release_one();
+        let startup_revision = startup.reads.tree_revision();
+        commit_state_within_bound(&lane, startup_revision, LexicalCommitState::Settled).await?;
+        let (published, supervisor) = supervised_after_startup(
+            directory.path(),
+            &validation,
+            invalidations,
+            &startup,
+            &lane,
+        )?;
+        double.release_one();
+        let current = published_within_bound(&published, 1).await?;
+
+        assert_eq!(declarations_named(&current, "edited")?, 1);
+        assert_eq!(declarations_named(&current, "beacon")?, 0);
+        assert_eq!(
+            current.reads.file_digest(&other),
+            startup.reads.file_digest(&other)
+        );
+        let current_revision = current.reads.tree_revision();
+        commit_state_within_bound(&lane, current_revision, LexicalCommitState::Settled).await?;
+        let calls = double.calls();
+        assert_eq!(
+            calls.last(),
+            Some(&("apply", current_revision.to_owned())),
+            "the change commits under the rebuilt tree revision: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|(form, _)| *form == "clear").count(),
+            1,
+            "only the startup snapshot's whole write clears the store: {calls:?}"
+        );
+        assert_eq!(
+            double.applied().last(),
+            Some(&vec![lib]),
+            "the change names the edited file alone"
+        );
+        validation.cancellation.cancel();
+        supervisor.await?;
+        Ok(())
+    }
+
+    /// A `rift.toml` written while the startup scan runs replaces the policy that scan read
+    /// under, so the scan cannot answer it: startup captures the workspace again, and the
+    /// second scan publishes under the configuration now on disk.
+    #[tokio::test]
+    async fn a_configuration_written_during_the_startup_scan_captures_the_workspace_again()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let lib = rift_core::ProjectPath::new("lib.rs")?;
+        let other = rift_core::ProjectPath::new("other.rs")?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let excluding = "[source]\nexclude = [\"other.rs\"]\n";
+        let (capture, scans) =
+            written_during_first_scan(directory.path(), &validation, "rift.toml", excluding)?;
+        let limits = WorkspaceIndexLimits::default();
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            2,
+            "the first scan read under the configuration the write replaced"
+        );
+        assert_eq!(published.epoch, validation.observed_epoch());
+        assert_eq!(
+            published.configuration.fingerprint,
+            super::configuration_fingerprint(directory.path())
+        );
+        assert!(published.reads.file_digest(&lib).is_some());
+        assert!(
+            published.reads.file_digest(&other).is_none(),
+            "the written policy excludes other.rs"
+        );
+        Ok(())
+    }
+
+    /// A directory renamed out of the workspace while the startup scan runs leaves one name
+    /// event and no file event for what it held, whatever its name looks like. Before the
+    /// first publication no index says what the scan read below it, and the scan holds files
+    /// below a path gone from the disk: startup captures the workspace again, and the
+    /// publication holds none of them.
+    #[tokio::test]
+    async fn a_directory_renamed_away_during_the_startup_scan_captures_the_workspace_again()
+    -> TestResult {
+        for folder in FOLDER_SPELLINGS {
+            renamed_away_during_the_startup_scan(folder).await?;
+        }
+        Ok(())
+    }
+
+    /// Renames `folder` out of the workspace during the startup scan, and proves the
+    /// publication that startup makes holds none of its files.
+    async fn renamed_away_during_the_startup_scan(folder: &str) -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::create_dir_all(directory.path().join(folder))?;
+        fs::write(
+            directory.path().join(folder).join("mod.rs"),
+            "pub fn departed() {}\n",
+        )?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let destination = elsewhere.path().join(folder);
+        let renamed = folder.to_owned();
+        let rename_away = move |root: &std::path::Path| {
+            fs::rename(root.join(&renamed), &destination).expect("the fixture rename lands");
+            name_event(root, &renamed)
+        };
+        let (capture, scans) =
+            changed_during_first_scan(directory.path(), &validation, rename_away)?;
+        let limits = WorkspaceIndexLimits::default();
+        let (published, _write) = super::initial_workspace_with(
+            directory.path(),
+            limits,
+            &validation,
+            &blocking,
+            capture,
+        )
+        .await?;
+
+        assert_eq!(
+            scans.load(Ordering::Relaxed),
+            2,
+            "{folder}: the first scan read files below the directory that left"
+        );
+        assert_eq!(declarations_named(&published, "departed")?, 0, "{folder}");
+        assert_eq!(declarations_named(&published, "beacon")?, 1, "{folder}");
         Ok(())
     }
 
@@ -5092,7 +6012,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -5127,7 +6047,6 @@ pub(crate) mod tests {
         lexical: Option<LexicalLane>,
     ) -> Result<RebuildOutcome, rift_server::ReadError> {
         let request = validation.take_pending();
-        let dependencies = empty_package_branch();
         let context = super::IndexSupervisorContext {
             root: root.to_path_buf(),
             limits: WorkspaceIndexLimits::default(),
@@ -5137,9 +6056,8 @@ pub(crate) mod tests {
             blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
             population: None,
             lexical,
-            dependencies: Arc::clone(&dependencies),
         };
-        let capture = super::workspace_capture(&dependencies);
+        let capture = super::workspace_capture();
         super::rebuild_workspace(&context, request, capture).await
     }
 
@@ -5155,7 +6073,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         let write = super::lexical_write(&published, &ChangeSet::Full);
@@ -5196,7 +6114,7 @@ pub(crate) mod tests {
                 super::lexical_double::UNBOUNDED,
                 BlockingExecutor::isolated(2, 60_000),
                 cancellation.clone(),
-                Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+                Arc::from(super::lexical_double::PRODUCT_VERSION),
             );
             if whole_owed {
                 lane.queue
@@ -5233,7 +6151,11 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        // The store lives outside the captured tree, as `.rift/db` does: the second capture
+        // runs after the open, and a file the open writes beside the database would join
+        // the tree as a moved file.
+        let state = tempfile::tempdir()?;
+        let index = Arc::new(search_index(&state.path().join("search.db")).await?);
         let double = StoreDouble::new();
         double.attach(Arc::clone(&index));
         let cancellation = CancellationToken::new();
@@ -5243,7 +6165,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         lane.request(
@@ -5425,7 +6347,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -5489,7 +6411,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -5509,11 +6431,10 @@ pub(crate) mod tests {
             previous: Some(Arc::clone(&first)),
         };
         let limits = WorkspaceIndexLimits::default();
-        let store = empty_package_branch();
         let WorkspaceCandidate::Stable {
             published: second,
             change_set,
-        } = build_workspace_candidate(directory.path(), limits, &request, &store)?
+        } = build_workspace_candidate(directory.path(), limits, &request)?
         else {
             return Err("a stable fixture must build a stable candidate".into());
         };
@@ -5812,7 +6733,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         committed_through(
@@ -5879,7 +6800,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         double.refuse_reads();
@@ -5936,7 +6857,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -6020,7 +6941,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -6081,13 +7002,21 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,
@@ -6125,13 +7054,21 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
             Arc::clone(&published),
         );
-        double.calls_within_bound(1).await?;
+        // A store holding nothing it can keep is cleared before a whole write lands, so the
+        // transaction waits at the gate once the apply follows the clear.
+        assert_eq!(
+            double.calls_within_bound(2).await?,
+            vec![
+                ("clear", String::new()),
+                ("apply", published.reads.tree_revision().to_owned()),
+            ]
+        );
         assert_eq!(
             double.dropped_while_held(),
             0,
@@ -6194,7 +7131,7 @@ pub(crate) mod tests {
             ONE_FILE_PER_PART,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -6246,7 +7183,7 @@ pub(crate) mod tests {
         let published = three_file_publication(directory.path())?;
         let revision = published.reads.tree_revision().to_owned();
         let derivation = super::derivation_revision(
-            super::lexical_double::EXECUTABLE_DIGEST,
+            super::lexical_double::PRODUCT_VERSION,
             &published.configuration,
         );
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -6258,7 +7195,7 @@ pub(crate) mod tests {
             ONE_FILE_PER_PART,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -6289,7 +7226,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         restarted.release_one();
         lane.request(
@@ -6323,9 +7260,84 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One build of 0.0.45, and a dirty rebuild of the same commit.
+    const BUILD_A: &str = "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34";
+    const BUILD_B: &str =
+        "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789";
+
+    /// Spawns a lane over `index` deriving under `product_version`, hands it one
+    /// whole write of `published`, and returns the store double once the write settled.
+    async fn whole_write_under(
+        index: &Arc<SearchIndex>,
+        published: &Arc<PublishedWorkspace>,
+        product_version: &str,
+    ) -> TestResult<Arc<StoreDouble>> {
+        let revision = published.reads.tree_revision().to_owned();
+        let store = StoreDouble::new();
+        store.attach(Arc::clone(index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&store),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(product_version),
+        );
+        store.release_one();
+        lane.request(
+            super::lexical_write(published, &ChangeSet::Full),
+            Arc::clone(published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        Ok(store)
+    }
+
+    /// A restart of the same build derives under the same revision, so it keeps every
+    /// stored row. Another build - another commit, or a dirty build's new stamp - names
+    /// another product version: the next start clears the store and derives every file
+    /// again.
+    #[tokio::test]
+    async fn a_restart_keeps_rows_under_one_build_and_rederives_under_another() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = three_file_publication(directory.path())?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+
+        let first = whole_write_under(&index, &published, BUILD_A).await?;
+        let first_written = first.applied().concat();
+        assert_eq!(first_written.len(), 3, "the first start derives every file");
+
+        let restarted = whole_write_under(&index, &published, BUILD_A).await?;
+        assert!(
+            restarted.calls().iter().all(|(form, _)| *form != "clear"),
+            "the same build keeps the store: {:?}",
+            restarted.calls()
+        );
+        assert!(
+            restarted.applied().concat().is_empty(),
+            "no stored row is derived again: {:?}",
+            restarted.applied()
+        );
+
+        let changed = whole_write_under(&index, &published, BUILD_B).await?;
+        assert!(
+            changed.calls().iter().any(|(form, _)| *form == "clear"),
+            "another build clears the store: {:?}",
+            changed.calls()
+        );
+        let mut rederived = changed.applied().concat();
+        rederived.sort();
+        let mut expected = first_written;
+        expected.sort();
+        assert_eq!(
+            rederived, expected,
+            "another build derives every file again"
+        );
+        Ok(())
+    }
+
     #[test]
-    fn the_derivation_revision_moves_with_the_executable_and_each_index_owned_table() -> TestResult
-    {
+    fn the_derivation_revision_moves_with_the_build_and_each_index_owned_table() -> TestResult {
         let directory = tempfile::tempdir()?;
         let accepted = |text: Option<&str>| -> TestResult<super::ConfigurationState> {
             let path = directory.path().join("rift.toml");
@@ -6338,9 +7350,9 @@ pub(crate) mod tests {
             Ok(super::ConfigurationState::accept(directory.path()))
         };
         let base = accepted(None)?;
-        let revision = super::derivation_revision("executable-a", &base);
-        assert_eq!(revision, super::derivation_revision("executable-a", &base));
-        assert_ne!(revision, super::derivation_revision("executable-b", &base));
+        let revision = super::derivation_revision(BUILD_A, &base);
+        assert_eq!(revision, super::derivation_revision(BUILD_A, &base));
+        assert_ne!(revision, super::derivation_revision(BUILD_B, &base));
         for table in [
             "[source]\nfiles = 1000\n",
             "[search.text]\nmax_chunk = \"2kb\"\n",
@@ -6351,7 +7363,7 @@ pub(crate) mod tests {
             let state = accepted(Some(table))?;
             assert!(state.accepted.is_ok(), "{table} must be accepted");
             assert_ne!(
-                super::derivation_revision("executable-a", &state),
+                super::derivation_revision(BUILD_A, &state),
                 revision,
                 "{table} decides the rows"
             );
@@ -6359,7 +7371,7 @@ pub(crate) mod tests {
         let server = accepted(Some("[server]\nnum_workers = 2\n"))?;
         assert!(server.accepted.is_ok());
         assert_eq!(
-            super::derivation_revision("executable-a", &server),
+            super::derivation_revision(BUILD_A, &server),
             revision,
             "a table that derives nothing keeps the stored rows"
         );
@@ -6391,7 +7403,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -6456,7 +7468,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(change_naming_lib()?, Arc::clone(&published));
         double.calls_within_bound(1).await?;
@@ -6495,7 +7507,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
         double.calls_within_bound(1).await?;
@@ -6533,7 +7545,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -6578,7 +7590,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -6623,7 +7635,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         let empty =
@@ -6658,7 +7670,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         cancellation.cancel();
         ended_within_bound(&lane).await?;
@@ -6948,7 +7960,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -7006,7 +8018,7 @@ pub(crate) mod tests {
             current,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
 
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
         // epoch 1 is forced to queue behind it - a deterministic gate between the
@@ -7031,7 +8043,6 @@ pub(crate) mod tests {
             .await
             .expect("held placeholder must occupy the one blocking slot");
 
-        let dependencies = empty_package_branch();
         let supervisor = tokio::spawn(super::run_index_supervisor(
             watcher,
             invalidations,
@@ -7044,7 +8055,6 @@ pub(crate) mod tests {
                 blocking: blocking.clone(),
                 population: None,
                 lexical: None,
-                dependencies: Arc::clone(&dependencies),
             },
         ));
 
@@ -7092,17 +8102,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A watcher on no path, for a supervisor test that moves the epoch itself.
-    ///
-    /// A watcher on the test's directory can report the file the test wrote just before
-    /// it started - `FSEvents` did on macOS - and that report moves the epoch past the one
-    /// the test observes.
-    fn unwatched() -> TestResult<notify::RecommendedWatcher> {
-        Ok(notify::recommended_watcher(
-            |_: notify::Result<notify::Event>| {},
-        )?)
-    }
-
     /// The supervisor context the cancellation tests drive, over `blocking` sized to one
     /// slot so a sentinel run through it proves the held capture's thread has ended.
     fn cancellation_context(
@@ -7110,7 +8109,6 @@ pub(crate) mod tests {
         validation: &Arc<IndexValidation>,
         published: &Arc<RwLock<IndexState>>,
         blocking: &BlockingExecutor,
-        dependencies: &Arc<super::PackageBranch>,
     ) -> super::IndexSupervisorContext {
         super::IndexSupervisorContext {
             root: root.to_path_buf(),
@@ -7121,7 +8119,6 @@ pub(crate) mod tests {
             blocking: blocking.clone(),
             population: None,
             lexical: None,
-            dependencies: Arc::clone(dependencies),
         }
     }
 
@@ -7130,9 +8127,7 @@ pub(crate) mod tests {
     ///
     /// The release is a rendezvous: it succeeds only while the capture still waits in
     /// it, so a successful release proves the capture was blocking at that moment.
-    fn held_capture(
-        dependencies: &Arc<super::PackageBranch>,
-    ) -> (
+    fn held_capture() -> (
         impl super::CaptureWorkspace + Clone + Send + 'static,
         tokio::sync::mpsc::UnboundedReceiver<()>,
         std::sync::mpsc::SyncSender<()>,
@@ -7140,7 +8135,7 @@ pub(crate) mod tests {
         let (started, started_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
         let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
-        let scan = super::workspace_capture(dependencies);
+        let scan = super::workspace_capture();
         let capture = move |root: &std::path::Path,
                             limits: WorkspaceIndexLimits,
                             request: &RebuildRequest| {
@@ -7166,15 +8161,8 @@ pub(crate) mod tests {
             failure: None,
         }));
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_package_branch();
-        let context = cancellation_context(
-            directory.path(),
-            &validation,
-            &published,
-            &blocking,
-            &dependencies,
-        );
-        let (capture, mut started, release) = held_capture(&dependencies);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let (capture, mut started, release) = held_capture();
         validation.observe_whole_workspace()?;
         let request = validation.take_pending();
 
@@ -7225,17 +8213,10 @@ pub(crate) mod tests {
             current: stable_candidate(directory.path(), 0)?,
             failure: None,
         }));
-        let watcher = unwatched()?;
+        let watcher = unwatched(directory.path(), &validation)?;
         let blocking = BlockingExecutor::isolated(1, 60_000);
-        let dependencies = empty_package_branch();
-        let context = cancellation_context(
-            directory.path(),
-            &validation,
-            &published,
-            &blocking,
-            &dependencies,
-        );
-        let (capture, mut started, release) = held_capture(&dependencies);
+        let context = cancellation_context(directory.path(), &validation, &published, &blocking);
+        let (capture, mut started, release) = held_capture();
         let supervisor = tokio::spawn(super::run_index_supervisor_with(
             watcher,
             invalidations,
@@ -7320,7 +8301,7 @@ pub(crate) mod tests {
             request,
             move |root, limits, request| {
                 cancelling.cancellation.cancel();
-                build_workspace_candidate(root, limits, request, &empty_package_branch())
+                build_workspace_candidate(root, limits, request)
             },
         )?;
         assert!(matches!(outcome, super::CapturedRebuild::Cancelled));

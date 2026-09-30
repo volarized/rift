@@ -13,9 +13,16 @@ pub fn configuration_schema_document() -> String {
 }
 
 /// Renders the JSON Schema for one package publication.
+///
+/// A publication is a wire document, so its optional fields advertise no `null` arm
+/// ([`strip_optional_null_arms`]).
 #[must_use]
 pub fn package_index_schema_document() -> String {
-    render_schema::<crate::index::PackagePublication>()
+    let mut document = schemars::schema_for!(crate::index::PackagePublication).to_value();
+    if let Some(schema) = document.as_object_mut() {
+        strip_optional_null_arms(schema);
+    }
+    render_json_document(document)
 }
 
 fn render_schema<Model: schemars::JsonSchema>() -> String {
@@ -80,6 +87,9 @@ mod keyword {
     pub(super) const DEFS: &str = "$defs";
     pub(super) const REF: &str = "$ref";
     pub(super) const ITEMS: &str = "items";
+    pub(super) const PREFIX_ITEMS: &str = "prefixItems";
+    pub(super) const CONTAINS: &str = "contains";
+    pub(super) const PATTERN_PROPERTIES: &str = "patternProperties";
     pub(super) const EXAMPLES: &str = "examples";
     pub(super) const NULL: &str = "null";
     pub(super) const STRING: &str = "string";
@@ -128,8 +138,43 @@ impl DeclaredKey {
 /// members from the root and returns at most `DECLARED_KEYS_MAX` keys.
 #[must_use]
 pub fn declared_keys(schema: &Value) -> Vec<DeclaredKey> {
+    walked_keys(schema, vec![(resolved(schema, schema), Vec::new())])
+}
+
+/// The keys each of `names` declares as a member of `table`, a table whose members
+/// the caller names, such as `["languages", "python", "enabled"]` for `[languages]`
+/// and `python`. A table with fixed members, or none named `table`, declares none.
+/// The walk and its bounds are [`declared_keys`]'s.
+#[must_use]
+pub fn declared_named_keys(schema: &Value, table: &str, names: &[&str]) -> Vec<DeclaredKey> {
+    let Some(member) = resolved(schema, schema)
+        .get(keyword::PROPERTIES)
+        .and_then(|members| members.get(table))
+    else {
+        return Vec::new();
+    };
+    let Some(value) = resolved(schema, member)
+        .get(keyword::ADDITIONAL_PROPERTIES)
+        .filter(|value| value.is_object())
+    else {
+        return Vec::new();
+    };
+    let value = resolved(schema, value);
+    walked_keys(
+        schema,
+        names
+            .iter()
+            .map(|name| (value, vec![table.to_owned(), (*name).to_owned()]))
+            .collect(),
+    )
+}
+
+/// Every key below the `pending` starting nodes, each paired with its path.
+fn walked_keys<'schema>(
+    schema: &'schema Value,
+    mut pending: Vec<(&'schema Value, Vec<String>)>,
+) -> Vec<DeclaredKey> {
     let mut keys = Vec::new();
-    let mut pending = vec![(resolved(schema, schema), Vec::new())];
     while let Some((node, path)) = pending.pop() {
         if keys.len() == DECLARED_KEYS_MAX {
             break;
@@ -440,6 +485,156 @@ fn string_values<'value>(values: impl Iterator<Item = &'value Value>) -> Vec<Str
     values
         .filter_map(|value| value.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Keywords whose value is one subschema.
+const SINGLE_SUBSCHEMA_KEYWORDS: [&str; 8] = [
+    keyword::ITEMS,
+    keyword::CONTAINS,
+    keyword::ADDITIONAL_PROPERTIES,
+    keyword::PROPERTY_NAMES,
+    keyword::NOT,
+    keyword::IF,
+    keyword::THEN,
+    keyword::ELSE,
+];
+/// Keywords whose value is a list of subschemas.
+const LISTED_SUBSCHEMA_KEYWORDS: [&str; 4] = [
+    keyword::ALL_OF,
+    keyword::ANY_OF,
+    keyword::ONE_OF,
+    keyword::PREFIX_ITEMS,
+];
+/// Keywords whose value maps names to subschemas.
+const NAMED_SUBSCHEMA_KEYWORDS: [&str; 3] = [
+    keyword::PROPERTIES,
+    keyword::PATTERN_PROPERTIES,
+    keyword::DEFS,
+];
+
+/// Strips the `null` arm from every property its object schema does not require, at every
+/// depth of `schema`.
+///
+/// schemars gives every `Option<T>` field a `null` arm, while a wire model omits an absent
+/// optional field (`skip_serializing_if = "Option::is_none"`), so the arm advertises a value
+/// no answer carries. A required property keeps its arm: required-but-nullable is the form
+/// reserved for a field whose `null` is a signal distinct from absence.
+///
+/// The walk descends through subschema keywords alone. `examples`, `default`, `const`, and
+/// `enum` hold values rather than schemas and stay as they are. Each subschema is visited
+/// once, so the work is bounded by the size of `schema`.
+pub fn strip_optional_null_arms(schema: &mut Map<String, Value>) {
+    let mut pending = vec![schema];
+    while let Some(node) = pending.pop() {
+        strip_unrequired_null_arms(node);
+        pending.extend(subschemas(node));
+    }
+}
+
+/// The subschemas one schema object holds directly.
+fn subschemas(node: &mut Map<String, Value>) -> Vec<&mut Map<String, Value>> {
+    let mut found = Vec::new();
+    for (name, value) in node {
+        let name = name.as_str();
+        if SINGLE_SUBSCHEMA_KEYWORDS.contains(&name) {
+            found.extend(value.as_object_mut());
+        } else if LISTED_SUBSCHEMA_KEYWORDS.contains(&name) {
+            let children = value.as_array_mut().into_iter().flatten();
+            found.extend(children.filter_map(Value::as_object_mut));
+        } else if NAMED_SUBSCHEMA_KEYWORDS.contains(&name) {
+            let children = value.as_object_mut().into_iter().flat_map(Map::values_mut);
+            found.extend(children.filter_map(Value::as_object_mut));
+        }
+    }
+    found
+}
+
+/// Strips the `null` arm from each property `object` declares and does not require.
+fn strip_unrequired_null_arms(object: &mut Map<String, Value>) {
+    let required = string_values(
+        object
+            .get(keyword::REQUIRED)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten(),
+    );
+    let Some(properties) = object
+        .get_mut(keyword::PROPERTIES)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    properties
+        .iter_mut()
+        .filter(|(name, _)| !required.contains(name))
+        .filter_map(|(_, property)| property.as_object_mut())
+        .for_each(strip_null_arm);
+}
+
+/// Removes the `null` arm from one property schema, in each form schemars writes it: a
+/// `null` entry in a `type` list, a `null` value in an `enum`, and a `{"type": "null"}`
+/// branch of an `anyOf`. A schema that accepts `null` alone keeps it.
+fn strip_null_arm(property: &mut Map<String, Value>) {
+    strip_null_type(property);
+    strip_null_value(property);
+    strip_null_branch(property);
+}
+
+/// Drops `null` from a `type` list naming another type, and writes a single remaining type
+/// as the plain string schemars writes for a required field.
+fn strip_null_type(property: &mut Map<String, Value>) {
+    let Some(Value::Array(kinds)) = property.get_mut(keyword::TYPE) else {
+        return;
+    };
+    let is_null = |kind: &Value| kind.as_str() == Some(keyword::NULL);
+    if kinds.iter().all(is_null) {
+        return;
+    }
+    kinds.retain(|kind| !is_null(kind));
+    if kinds.len() == 1 {
+        let kind = kinds.remove(0);
+        property.insert(keyword::TYPE.to_owned(), kind);
+    }
+}
+
+/// Drops `null` from an `enum` holding another value.
+fn strip_null_value(property: &mut Map<String, Value>) {
+    let Some(Value::Array(values)) = property.get_mut(keyword::ENUM) else {
+        return;
+    };
+    if values.iter().all(Value::is_null) {
+        return;
+    }
+    values.retain(|value| !value.is_null());
+}
+
+/// Drops the `null` branch from an `anyOf` holding another branch. A single remaining
+/// branch merges into the property the way schemars writes a required reference, as
+/// `$ref` beside the property's `description`, unless the two share a keyword.
+fn strip_null_branch(property: &mut Map<String, Value>) {
+    let Some(Value::Array(branches)) = property.get(keyword::ANY_OF) else {
+        return;
+    };
+    let kept: Vec<Value> = branches
+        .iter()
+        .filter(|branch| !is_null_schema(branch))
+        .cloned()
+        .collect();
+    if kept.is_empty() || kept.len() == branches.len() {
+        return;
+    }
+    match <[Value; 1]>::try_from(kept) {
+        Ok([Value::Object(branch)]) if branch.keys().all(|key| !property.contains_key(key)) => {
+            property.remove(keyword::ANY_OF);
+            property.extend(branch);
+        }
+        Ok(kept) => {
+            property.insert(keyword::ANY_OF.to_owned(), Value::Array(kept.into()));
+        }
+        Err(kept) => {
+            property.insert(keyword::ANY_OF.to_owned(), Value::Array(kept));
+        }
+    }
 }
 
 /// The serde property name of one model field, proven against the model:
@@ -872,42 +1067,24 @@ pub fn declare_source_ranges(schema: &mut Schema) {
 }
 
 /// A [`DependenciesConfiguration`](crate::dependencies::DependenciesConfiguration) states
-/// its `ByteSize` and `Duration` bounds as `rift:range` on each key: schema validation
-/// alone cannot compare `"4mb"` against a ceiling, so the server enforces the bounds at
-/// load and the schema carries them for readers.
+/// its `command_timeout` bounds as `rift:range` on the key: schema validation alone cannot
+/// compare `"2m"` against a ceiling, so the server enforces the bounds at load and the
+/// schema carries them for readers.
 pub fn declare_dependencies_ranges(schema: &mut Schema) {
-    use crate::configuration::{ByteSize, Duration};
+    use crate::configuration::Duration;
     use crate::dependencies::{
         DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX, DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN,
-        DEPENDENCIES_INDEX_BYTES_MAX, DEPENDENCIES_INDEX_BYTES_MIN, DEPENDENCIES_PACKAGE_BYTES_MAX,
-        DEPENDENCIES_PACKAGE_BYTES_MIN, DependenciesConfiguration,
+        DependenciesConfiguration,
     };
-    let ranges = [
-        (
-            property!(DependenciesConfiguration, package_size),
-            range(
-                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MIN),
-                &ByteSize::from_bytes(DEPENDENCIES_PACKAGE_BYTES_MAX),
-            ),
+    annotate_property(
+        schema,
+        property!(DependenciesConfiguration, command_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
+            &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
         ),
-        (
-            property!(DependenciesConfiguration, index_size),
-            range(
-                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MIN),
-                &ByteSize::from_bytes(DEPENDENCIES_INDEX_BYTES_MAX),
-            ),
-        ),
-        (
-            property!(DependenciesConfiguration, command_timeout),
-            range(
-                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MIN),
-                &Duration::from_millis(DEPENDENCIES_COMMAND_TIMEOUT_MS_MAX),
-            ),
-        ),
-    ];
-    for (name, range) in ranges {
-        annotate_property(schema, name, RIFT_RANGE, range);
-    }
+    );
 }
 
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration)
@@ -1365,6 +1542,241 @@ mod tests {
         assert_eq!(
             rendered,
             "{\n  \"a\": 0,\n  \"z\": {\n    \"a\": 2,\n    \"b\": 1\n  }\n}\n"
+        );
+    }
+
+    /// Applies [`strip_optional_null_arms`] to one schema literal.
+    fn stripped(mut schema: Value) -> Value {
+        let object = schema
+            .as_object_mut()
+            .expect("test schema literal must be an object");
+        strip_optional_null_arms(object);
+        schema
+    }
+
+    #[test]
+    fn an_optional_scalar_loses_its_null_type_and_keeps_its_bounds() {
+        let schema = stripped(json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 10_000},
+                "kinds": {"type": ["string", "number", "null"]}
+            }
+        }));
+        assert_eq!(
+            schema["properties"]["limit"],
+            json!({"type": "integer", "minimum": 1, "maximum": 10_000})
+        );
+        assert_eq!(
+            schema["properties"]["kinds"],
+            json!({"type": ["string", "number"]})
+        );
+    }
+
+    #[test]
+    fn an_optional_reference_merges_into_its_property_beside_the_description() {
+        let schema = stripped(json!({
+            "properties": {
+                "rev": {
+                    "anyOf": [{"$ref": "#/$defs/RevisionId"}, {"type": "null"}],
+                    "description": "The revision to read."
+                }
+            }
+        }));
+        assert_eq!(
+            schema["properties"]["rev"],
+            json!({"$ref": "#/$defs/RevisionId", "description": "The revision to read."})
+        );
+    }
+
+    #[test]
+    fn a_branch_sharing_a_keyword_with_its_property_stays_a_union() {
+        let schema = stripped(json!({
+            "properties": {
+                "one": {
+                    "anyOf": [{"description": "inner", "type": "string"}, {"type": "null"}],
+                    "description": "outer"
+                },
+                "two": {
+                    "anyOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]
+                }
+            }
+        }));
+        assert_eq!(
+            schema["properties"]["one"],
+            json!({"anyOf": [{"description": "inner", "type": "string"}], "description": "outer"})
+        );
+        assert_eq!(
+            schema["properties"]["two"],
+            json!({"anyOf": [{"type": "string"}, {"type": "integer"}]})
+        );
+    }
+
+    #[test]
+    fn an_optional_closed_set_loses_its_null_value() {
+        let schema = stripped(json!({
+            "properties": {
+                "order": {"type": ["string", "null"], "enum": ["relevance", "path", null]}
+            }
+        }));
+        assert_eq!(
+            schema["properties"]["order"],
+            json!({"type": "string", "enum": ["relevance", "path"]})
+        );
+    }
+
+    /// Required-but-nullable is the form reserved for a `null` the server treats apart
+    /// from absence, so a required property keeps its arm; a schema accepting `null`
+    /// alone has no other arm to keep.
+    #[test]
+    fn a_required_property_and_a_null_only_schema_keep_their_null() {
+        let original = json!({
+            "required": ["next_cursor"],
+            "properties": {
+                "next_cursor": {"type": ["string", "null"]},
+                "unit": {"type": "null"},
+                "listed": {"type": ["null"]},
+                "marker": {"enum": [null]},
+                "absent": {"anyOf": [{"type": "null"}]}
+            }
+        });
+        assert_eq!(stripped(original.clone()), original);
+    }
+
+    #[test]
+    fn nested_definitions_items_and_union_arms_are_stripped() {
+        let schema = stripped(json!({
+            "properties": {
+                "hits": {"type": "array", "items": {"$ref": "#/$defs/Hit"}}
+            },
+            "$defs": {
+                "Hit": {
+                    "properties": {"score": {"type": ["number", "null"]}},
+                    "required": []
+                },
+                "Warning": {
+                    "oneOf": [{
+                        "properties": {
+                            "kind": {"const": "stale"},
+                            "detail": {"type": ["string", "null"]}
+                        },
+                        "required": ["kind"]
+                    }]
+                },
+                "Page": {
+                    "type": "array",
+                    "items": {"properties": {"cursor": {"type": ["string", "null"]}}}
+                }
+            }
+        }));
+        assert_eq!(
+            schema["$defs"]["Hit"]["properties"]["score"],
+            json!({"type": "number"})
+        );
+        assert_eq!(
+            schema["$defs"]["Warning"]["oneOf"][0]["properties"]["detail"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            schema["$defs"]["Page"]["items"]["properties"]["cursor"],
+            json!({"type": "string"})
+        );
+    }
+
+    /// `examples`, `default`, and `const` hold values, so a value shaped like a schema is
+    /// left as the author wrote it.
+    #[test]
+    fn values_shaped_like_schemas_are_left_untouched() {
+        let original = json!({
+            "examples": [{"properties": {"query": {"type": ["string", "null"]}}}],
+            "default": {"properties": {"query": {"type": ["string", "null"]}}},
+            "const": {"properties": {"query": {"type": ["string", "null"]}}}
+        });
+        assert_eq!(stripped(original.clone()), original);
+    }
+
+    #[test]
+    fn stripping_twice_changes_nothing_more() {
+        let once = stripped(json!({
+            "properties": {
+                "rev": {"anyOf": [{"$ref": "#/$defs/RevisionId"}, {"type": "null"}]},
+                "limit": {"type": ["integer", "null"]}
+            }
+        }));
+        assert_eq!(stripped(once.clone()), once);
+    }
+
+    /// Whether one property schema accepts `null` beside another value.
+    fn has_null_arm(property: &Value) -> bool {
+        let null_type = property["type"]
+            .as_array()
+            .is_some_and(|kinds| kinds.len() > 1 && kinds.contains(&json!("null")));
+        let null_branch = property["anyOf"].as_array().is_some_and(|branches| {
+            branches.len() > 1 && branches.contains(&json!({"type": "null"}))
+        });
+        null_type || null_branch
+    }
+
+    /// Every property below `node` that its object does not require and whose schema
+    /// accepts `null` beside another value, named by the path to it.
+    fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
+        match node {
+            Value::Object(object) => {
+                let required = object.get("required").and_then(Value::as_array);
+                let properties = object.get("properties").and_then(Value::as_object);
+                found.extend(
+                    properties
+                        .into_iter()
+                        .flatten()
+                        .filter(|(name, property)| {
+                            has_null_arm(property)
+                                && !required.is_some_and(|names| names.contains(&json!(name)))
+                        })
+                        .map(|(name, _)| format!("{path}/{name}")),
+                );
+                for (key, child) in object {
+                    optional_null_properties(child, &format!("{path}/{key}"), found);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    optional_null_properties(item, &format!("{path}/{index}"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The walk the wire document gate runs finds an optional property that accepts
+    /// `null`, in either spelling, and passes a required one.
+    #[test]
+    fn the_optional_null_walk_finds_both_null_spellings_and_skips_required_ones() {
+        let document = json!({
+            "properties": {
+                "rev": {"anyOf": [{"$ref": "#/$defs/RevisionId"}, {"type": "null"}]},
+                "limit": {"type": ["integer", "null"]},
+                "cursor": {"type": ["string", "null"]},
+                "name": {"type": "string"}
+            },
+            "required": ["cursor"]
+        });
+        let mut found = Vec::new();
+        optional_null_properties(&document, "", &mut found);
+        found.sort();
+        assert_eq!(found, ["/limit", "/rev"]);
+    }
+
+    /// The package index document is a wire document: every optional field is omitted
+    /// when absent, so no property it does not require advertises `null`.
+    #[test]
+    fn the_package_index_document_advertises_no_optional_null() {
+        let document: Value = serde_json::from_str(&package_index_schema_document())
+            .expect("the package index document must be JSON");
+        let mut found = Vec::new();
+        optional_null_properties(&document, "", &mut found);
+        assert!(
+            found.is_empty(),
+            "optional properties must not advertise null: {found:#?}"
         );
     }
 
@@ -2118,5 +2530,31 @@ mod tests {
         dotted.sort();
         dotted.dedup();
         assert_eq!(dotted.len(), listed, "every key appears once");
+    }
+
+    /// A table whose members the caller names declares each named member's keys; a table
+    /// with fixed members, or a table the schema lacks, declares none.
+    #[test]
+    fn test_declared_named_keys_answer_only_a_table_whose_members_the_caller_names() {
+        let schema = super::configuration_schema();
+        let dotted = |table: &str| -> Vec<String> {
+            super::declared_named_keys(&schema, table, &["python"])
+                .iter()
+                .map(|key| key.path().join("."))
+                .collect()
+        };
+        let languages = dotted("languages");
+        assert!(
+            languages.contains(&"languages.python.enabled".to_owned()),
+            "{languages:?}"
+        );
+        assert!(
+            languages
+                .iter()
+                .all(|key| key.starts_with("languages.python.")),
+            "{languages:?}"
+        );
+        assert_eq!(dotted("server"), Vec::<String>::new());
+        assert_eq!(dotted("absent"), Vec::<String>::new());
     }
 }

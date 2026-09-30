@@ -47,14 +47,16 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::change_set::{FileDigest, PathChanges, WorkspaceDigests, tree_revision_of};
+use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::documentation::NotebookFiles;
-use crate::glob::{ForceIncludeReach, PathMatcher, PathVerdict};
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::LimitBreach;
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemanticError, WorkspaceSemantics};
+use rift_analysis::{
+    DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError,
+};
 
 #[derive(Debug)]
 pub(crate) struct WorkspaceFiles;
@@ -475,6 +477,28 @@ pub(crate) fn index_error_over_limit(
     })
 }
 
+/// The documentation selection the `[documentation]` table `inclusion` carries compiles
+/// to, under the same `[source]` glob semantics every other index pattern matches with.
+fn documentation_selection(
+    inclusion: &TextFileInclusion,
+) -> Result<DocumentationSelection, WorkspaceIndexError> {
+    DocumentationSelection::new(inclusion.documentation()).map_err(IndexFailure::index_error)
+}
+
+/// A refusal from a layer below the index, classified as the index failure it reports.
+pub trait IndexFailure {
+    /// This refusal as the [`WorkspaceIndexError`] a build or a read reports, the
+    /// refusal kept as its cause.
+    fn index_error(self) -> WorkspaceIndexError;
+}
+
+impl IndexFailure for SourcePatternError {
+    /// A `[source]` or `paths` glob that does not compile: `source_pattern_invalid`.
+    fn index_error(self) -> WorkspaceIndexError {
+        index_error_caused_by(WorkspaceIndexViolation::SourcePatternInvalid, None, self)
+    }
+}
+
 pub(crate) fn index_error_caused_by(
     violation: WorkspaceIndexViolation,
     path: Option<&Path>,
@@ -739,7 +763,8 @@ impl WorkspaceSourcePolicy {
             visibility.include(),
             visibility.exclude(),
             visibility.force_include(),
-        )?;
+        )
+        .map_err(IndexFailure::index_error)?;
         let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
@@ -1437,6 +1462,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
@@ -1508,6 +1534,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(&self.text_inclusion)?,
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             Some((&self.documentation, &self.notebooks)),
         )?;
@@ -1598,6 +1625,7 @@ impl WorkspaceIndex {
             &files,
             &text_files,
             &declarations,
+            &documentation_selection(&text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             None,
         )?;
@@ -1775,6 +1803,22 @@ impl WorkspaceIndex {
             .map(|file| file.digest())
             .or_else(|| self.text_files.get(path).map(|file| file.digest()))
             .or_else(|| self.left_out.get(path).map(|state| state.content))
+    }
+
+    /// What this index records at `path`: the digest of the bytes it read there, the
+    /// files it left out after reading them included, or the warning naming a file it left
+    /// out before reading a digest.
+    ///
+    /// Warnings sit in project-path order, so the lookup is one binary search after the
+    /// map probes [`Self::digest`] makes.
+    #[must_use]
+    pub fn record(&self, path: &ProjectPath) -> Option<FileRecord> {
+        self.digest(path).map(FileRecord::Digest).or_else(|| {
+            self.warnings
+                .binary_search_by(|warning| warning.path().cmp(path))
+                .ok()
+                .map(|position| FileRecord::LeftOut(self.warnings[position].clone()))
+        })
     }
 
     /// Whether this index holds at least one file below `directory`, the files it left
@@ -2091,7 +2135,8 @@ impl WorkspaceIndex {
         if force_include.is_empty() {
             return Ok(Vec::new());
         }
-        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let matcher = PathMatcher::build(&self.root, force_include, &[])
+            .map_err(IndexFailure::index_error)?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
         let walker = source_walk(
@@ -2155,7 +2200,8 @@ impl WorkspaceIndex {
         if force_include.is_empty() {
             return Ok(Vec::new());
         }
-        let matcher = PathMatcher::build(&self.root, force_include, &[])?;
+        let matcher = PathMatcher::build(&self.root, force_include, &[])
+            .map_err(IndexFailure::index_error)?;
         let mut extra_bytes = 0_usize;
         let mut files = Vec::new();
         let mut match_count = 0_usize;
@@ -2269,20 +2315,6 @@ pub fn symbol_matches<'a>(
     query: &str,
     limit: usize,
 ) -> Vec<SymbolMatch<'a>> {
-    symbol_matches_where(files, query, limit, |_, _| true)
-}
-
-/// The ranking kernel behind [`symbol_matches`], over the declarations `included` accepts.
-///
-/// The predicate runs before ranking and truncation, so a filtered answer fills
-/// `limit` from what it includes; the dependency index passes its public-declaration
-/// rule here.
-pub(crate) fn symbol_matches_where<'a>(
-    files: impl IntoIterator<Item = &'a IndexedFile>,
-    query: &str,
-    limit: usize,
-    included: impl Fn(&IndexedFile, &SyntaxSymbol) -> bool,
-) -> Vec<SymbolMatch<'a>> {
     let query = query.to_lowercase();
     let mut matches = files
         .into_iter()
@@ -2292,7 +2324,6 @@ pub(crate) fn symbol_matches_where<'a>(
                 .iter()
                 .map(move |symbol| (file, symbol))
         })
-        .filter(|(file, symbol)| included(file, symbol))
         .filter_map(|(file, symbol)| {
             Some(SymbolMatch {
                 file,
@@ -2589,7 +2620,8 @@ fn discover(
         visibility.include(),
         visibility.exclude(),
         visibility.force_include(),
-    )?;
+    )
+    .map_err(IndexFailure::index_error)?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
@@ -3382,7 +3414,14 @@ fn project_path_below(root: &Path, absolute: &Path) -> Result<ProjectPath, Works
     relative_path(relative)
 }
 
-pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
+/// The [`ProjectPath`] one path relative to the workspace root spells, its components joined
+/// with `/` on every platform.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] when a component is not UTF-8 or the joined spelling is not
+/// a valid project path.
+pub fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexError> {
     let value = path
         .components()
         .map(|component| component.as_os_str().to_str())
@@ -3396,8 +3435,8 @@ pub(crate) fn relative_path(path: &Path) -> Result<ProjectPath, WorkspaceIndexEr
 
 /// The class one declaration's names reach against a lowercase query.
 ///
-/// The classing itself lives in `rift-ranking`, so a package index, an
-/// in-memory fixture, and this index all order a declaration the same way.
+/// The classing itself lives in `rift-ranking`, so the global API client checks a
+/// package hit's class under the same rule this index orders by.
 fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClass> {
     match_class(
         query,
@@ -3459,11 +3498,8 @@ fn symbol_document(
     )
 }
 
-/// The searchable fields one declaration fills, wherever it was read from.
-///
-/// A package index publishes the same fields for its own declarations; only the identity
-/// and the address differ. Sharing the derivation is what makes the two comparable:
-/// equal bytes produce equal fields and one digest, whichever index published them.
+/// The searchable fields one declaration fills: equal bytes produce equal fields and one
+/// digest.
 #[must_use]
 pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> DocumentFields {
     let source = declaration_source(file, symbol.range);
@@ -3542,8 +3578,7 @@ fn bounded_field(value: &str, bytes_max: usize) -> String {
 /// Percent-encoding can widen a path or a qualified name past the wire's own address
 /// ceiling, so this is reachable from a legal workspace rather than a programmer error.
 /// The file keeps answering `get_symbol` and identifier search; only its place in the
-/// searchable corpus is absent, and the log says which path lost it. A package index
-/// leaves an oversized document out the same way.
+/// searchable corpus is absent, and the log says which path lost it.
 pub(crate) fn document(
     identity: String,
     path: &ProjectPath,
@@ -3800,10 +3835,10 @@ mod tests {
             let path = ProjectPath::new(*name).expect("fixture path must be valid");
             let digest = fs::read(root.join(name))
                 .ok()
-                .map(|bytes| FileDigest::of(&bytes));
+                .map(|bytes| FileRecord::Digest(FileDigest::of(&bytes)));
             (path, digest)
         });
-        PathChanges::resolve(observed, |path| index.digest(path))
+        PathChanges::resolve(observed, |path| index.record(path))
     }
 
     #[test]
@@ -3878,6 +3913,86 @@ mod tests {
         )
         .expect("fixture workspace must capture");
         assert_eq!(index.fingerprint(), &captured);
+    }
+
+    /// The documentation sources one index collected, by project path.
+    fn documentation_paths(index: &WorkspaceIndex) -> Vec<String> {
+        index
+            .documentation()
+            .index()
+            .sources
+            .iter()
+            .filter_map(|source| match &source.identity.source {
+                DocumentationSourceIdentity::Project { path } => Some(path.0.clone()),
+                DocumentationSourceIdentity::Package { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The index collects a workspace's documentation through the one documentation
+    /// selection package analysis uses, and the `[documentation]` table the text
+    /// inclusion carries overrides its defaults on every build path.
+    #[test]
+    fn test_documentation_follows_the_selection_the_text_inclusion_carries() {
+        use rift_protocol::documentation::DocumentationConfiguration;
+        use rift_protocol::read::PathPattern;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path();
+        fs::create_dir_all(root.join("docs/archive")).expect("fixture directory");
+        fs::write(root.join("README.md"), "# Beacon\n").expect("fixture readme");
+        fs::write(root.join("CHANGELOG.md"), "# Changes\n").expect("fixture change log");
+        fs::write(root.join("docs/guide.md"), "# Guide\n").expect("fixture guide");
+        fs::write(root.join("docs/archive/v1.md"), "# Version one\n").expect("fixture page");
+
+        let index = indexed(root, &TextFileInclusion::default());
+        assert_eq!(documentation_paths(&index), ["README.md", "docs/guide.md"]);
+
+        let overridden =
+            TextFileInclusion::default().with_documentation(DocumentationConfiguration {
+                enabled: true,
+                exclude: vec![PathPattern("README.md".to_owned())],
+                force_include: vec![PathPattern("CHANGELOG.md".to_owned())],
+            });
+        let index = indexed(root, &overridden);
+        assert_eq!(
+            documentation_paths(&index),
+            ["CHANGELOG.md", "docs/guide.md"]
+        );
+
+        fs::write(root.join("docs/guide.md"), "# Guide\n\nEdited.\n").expect("edited guide");
+        let changes = resolved(&index, root, &["docs/guide.md"]);
+        let next = index.rebuilt(&changes).expect("the rebuild must land");
+        assert_eq!(
+            documentation_paths(&next),
+            ["CHANGELOG.md", "docs/guide.md"],
+            "a rebuild keeps the table the index was built under"
+        );
+    }
+
+    #[test]
+    fn test_a_documentation_pattern_that_is_no_glob_refuses_the_build() {
+        use rift_protocol::documentation::DocumentationConfiguration;
+        use rift_protocol::read::PathPattern;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(directory.path().join("README.md"), "# Beacon\n").expect("fixture readme");
+        let inclusion =
+            TextFileInclusion::default().with_documentation(DocumentationConfiguration {
+                exclude: vec![PathPattern("docs/[guide".to_owned())],
+                ..DocumentationConfiguration::default()
+            });
+        let error = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &inclusion,
+        )
+        .expect_err("an unclosed character class refuses the build");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::SourcePatternInvalid
+        );
     }
 
     #[test]
@@ -5814,7 +5929,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect("workspace index");
@@ -5876,7 +5991,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &visibility,
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect("workspace index");
@@ -5920,7 +6035,7 @@ mod tests {
             directory.path(),
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
-            &TextFileInclusion::from(&configuration.search),
+            &TextFileInclusion::from(&configuration),
             &LanguageFileSelections::from(&configuration),
         )
         .expect_err("a path two entries claim must refuse the candidate");
@@ -6527,8 +6642,8 @@ mod tests {
         let changes = PathChanges::resolve(
             observed
                 .iter()
-                .map(|(path, digest)| (path.clone(), Some(digest))),
-            |path| index.digests().get(path),
+                .map(|(path, digest)| (path.clone(), Some(FileRecord::Digest(digest)))),
+            |path| index.digests().get(path).map(FileRecord::Digest),
         );
         let rebuilt = index.rebuilt(&changes).expect("metadata rebuild");
         assert!(

@@ -203,7 +203,7 @@ fn check_fails_when_the_package_index_schema_is_stale() -> TestResult {
 /// repository so the grammar pins are the shipped ones.
 fn analyzer_root(repository: &std::path::Path) -> TestResult<tempfile::TempDir> {
     let committed: Value = serde_json::from_str(&fs::read_to_string(
-        repository.join(rift_index::analyzer_manifest_path()),
+        repository.join(rift_analysis::analyzer_manifest_path()),
     )?)?;
     let root = tempfile::tempdir()?;
     fs::copy(
@@ -246,7 +246,7 @@ fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult 
 
     export::run(&written)?;
 
-    let path = root.path().join(rift_index::analyzer_manifest_path());
+    let path = root.path().join(rift_analysis::analyzer_manifest_path());
     let rendered = fs::read_to_string(&path)?;
     assert!(rendered.ends_with('\n'), "{rendered}");
     let document: Value = serde_json::from_str(&rendered)?;
@@ -279,7 +279,7 @@ fn the_analyzer_manifest_writes_below_its_root_and_checks_clean() -> TestResult 
 fn the_analyzer_manifest_names_a_path_it_cannot_write() -> TestResult {
     let repository = repository_root()?;
     let root = analyzer_root(&repository)?;
-    fs::create_dir_all(root.path().join(rift_index::analyzer_manifest_path()))?;
+    fs::create_dir_all(root.path().join(rift_analysis::analyzer_manifest_path()))?;
     let request = export::parse_arguments([
         "--analyzer-manifest".to_owned(),
         root.path().display().to_string(),

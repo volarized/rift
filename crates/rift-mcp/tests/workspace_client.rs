@@ -103,7 +103,7 @@ fn laid_out_workspace_in(
         }
         fs::write(path, source)?;
     }
-    let mut configuration = crate::hermetic_search::VECTOR_DISABLED.to_owned();
+    let mut configuration = crate::hermetic_search::HERMETIC_TABLES.to_owned();
     if !lsp_configuration
         .as_deref()
         .is_some_and(|value| value.contains("[global]"))
@@ -165,9 +165,8 @@ pub(crate) fn tool_request(name: &'static str, arguments: &Value) -> CallToolReq
 const ACCEPTANCE_ATTEMPTS_MAX: usize = 8;
 
 /// Calls the tool, retrying the refusal the server advertises as
-/// `retry: same_request`: a suite's own write to the served workspace -
-/// `dependency_index` rewrites `rift.toml` while the server runs - can move
-/// the index between one request's snapshot and its acceptance.
+/// `retry: same_request`: a write to the served workspace while the server
+/// runs can move the index between one request's snapshot and its acceptance.
 pub(crate) async fn call_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,

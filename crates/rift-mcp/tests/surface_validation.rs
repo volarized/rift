@@ -1,11 +1,17 @@
 //! Served read requests and responses validate against their advertised schemas.
 
+#[allow(
+    dead_code,
+    reason = "shared fixture global API exposes helpers this suite does not use"
+)]
+mod global_api;
 mod hermetic_search;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 
+use global_api::{GlobalFixture, SymbolFixture};
 use jsonschema::Validator;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
@@ -30,8 +36,8 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ("get_symbol", json!({ "name": "beacon_one" })),
         ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
         ("get_symbol", json!({ "name": "beacon", "include": [] })),
-        // The fixture's path dependency `helper` answers these: a hit served from
-        // the dependency index carries `unit` in place of `path`.
+        // The fixture global API's collected package answers these: a package hit
+        // carries `unit` in place of `path`.
         (
             "get_symbol",
             json!({ "name": "helper_beacon", "scope": "global" }),
@@ -89,6 +95,7 @@ fn corpus() -> Vec<(&'static str, Value)> {
         ),
     ];
     requests.extend(dependency_scope_search_corpus());
+    requests.extend(package_argument_corpus());
     requests.extend(revision_read_corpus());
     requests.extend(change_search_corpus());
     requests.extend(lexical_search_corpus());
@@ -96,9 +103,9 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests
 }
 
-/// `scope` on `search` reaches the same helper `get_symbol`'s scoped requests reach: a
-/// dependency hit carries `unit` in place of `path`, `all` merges it with the project
-/// hits, and a `file` target answers empty from the package side since a package
+/// `scope` on `search` reaches the same collected package `get_symbol`'s scoped requests
+/// reach: a package hit carries `unit` in place of `path`, `all` merges it with the
+/// project hits, and a `file` target answers empty from the package side since a package
 /// contributes declarations alone.
 fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
     vec![
@@ -116,6 +123,40 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
                 "query": "beacon",
                 "scope": "global",
                 "target": "file"
+            }),
+        ),
+    ]
+}
+
+/// `packages` requests: one replacing the version of the fixture's path dependency
+/// `helper`, which then answers `package_absent` in place of `package_unavailable`, one
+/// adding `extra`, a package the context lacks, which answers
+/// `package_requirement_absent`, and one replacing the collected `demo` by the requirement
+/// `>=0`, which the fixture global API resolves to its collected release.
+fn package_argument_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "get_symbol",
+            json!({
+                "name": "helper_beacon",
+                "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "helper", "version": "0.1.0" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "helper_beacon",
+                "scope": "all",
+                "packages": [{ "manager": "cargo", "name": "extra" }]
+            }),
+        ),
+        (
+            "search",
+            json!({
+                "query": "beacon",
+                "scope": "global",
+                "packages": [{ "manager": "cargo", "name": "demo" }]
             }),
         ),
     ]
@@ -252,16 +293,16 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// `search` does consult it, and the search tier is prepared behind the answers, so this
 /// fixture's default `[search.vector]` table legitimately produces
 /// `vector_index_preparing` while the corpus runs. What it must never produce is
-/// `lexical_ranking_unavailable`: that warning is reserved for a tier that will not answer
-/// without operator action, and one that fired in ordinary operation would be one every
-/// caller learned to ignore.
+/// `lexical_ranking_unavailable`: a search waits out a commit in flight within
+/// `[server] readiness_timeout` and a busy connection pool within `[search] busy_timeout`,
+/// so ordinary operation meets none of that warning's causes, and one that fired here
+/// would be one every caller learned to ignore.
 ///
-/// A `get_symbol` or `search` request whose `scope` reaches dependencies runs after the
-/// lane has indexed the fixture's helper, so no warning names the helper. The machine's
-/// toolchain decides what else the catalog holds: a standard library cataloged with a
-/// source root is reported pending while the lane walks it and skipped once the walk
-/// crosses the index's bounds, so such a request may carry the dependency warnings and no
-/// other.
+/// A `get_symbol` or `search` request whose `scope` reaches packages carries the package
+/// warnings and no other: the fixture's path dependency `helper` answers
+/// `package_unavailable`, the standard library entry the fixture global API cannot
+/// resolve answers `package_requirement_absent`, and the global API's own page warnings
+/// arrive as `global_page_warning`.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
     let reaches_dependencies = matches!(request["scope"].as_str(), Some("global" | "all"));
@@ -288,7 +329,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 expects_source,
                 "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
             );
-            // A dependency hit carries its package source location.
+            // A package hit carries `unit` and no node address.
             let addressable = hit.get("unit").is_none();
             assert_eq!(
                 hit.get("node").is_some(),
@@ -310,7 +351,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             assert_ne!(
                 warning["code"],
                 json!("lexical_ranking_unavailable"),
-                "an ordinary search must never spend the operator-action warning: \
+                "an ordinary search must never rank without the full-text tier: \
                  {structured:#}"
             );
         }
@@ -365,8 +406,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
 }
 
-/// Every warning on a package-scoped answer is one of the package warnings, and none
-/// reports the fixture's helper skipped.
+/// Every warning on a package-scoped answer is one of the package warnings.
 fn assert_dependency_warnings_only(structured: &Value) {
     for warning in structured["warnings"].as_array().into_iter().flatten() {
         assert!(
@@ -381,23 +421,17 @@ fn assert_dependency_warnings_only(structured: &Value) {
                         | "package_absent"
                         | "package_requirement_absent"
                         | "package_unavailable"
-                        | "package_skipped"
                         | "package_context_degraded"
                 )
             ),
-            "a package-scoped answer warns of the package branch alone: {warning:#}"
-        );
-        assert_ne!(
-            warning["package"]["name"],
-            json!("helper"),
-            "the indexed helper is never reported skipped: {warning:#}"
+            "a package-scoped answer warns of the packages alone: {warning:#}"
         );
     }
 }
 
 /// Walks `value`, proving every `rift://source/` identity uses a resolver the request can
 /// reach: the project resolver always, and the Cargo resolver when the request's `scope`
-/// reaches the cataloged packages.
+/// reaches the packages the global API serves.
 fn assert_source_unit_ids_use_served_resolvers(
     value: &Value,
     context: &str,
@@ -428,21 +462,14 @@ fn assert_source_unit_ids_use_served_resolvers(
     }
 }
 
-/// The fixture's directories: the served workspace and, beside it, the helper crate its
-/// manifest depends on by path.
-struct FixtureDirectories {
+/// What one served fixture holds for the life of its server: the workspace and the
+/// fixture global API its `[global]` table names.
+struct Fixture {
     _workspace: tempfile::TempDir,
-    /// Held for the life of the server: the catalog roots the helper here.
-    _helper: tempfile::TempDir,
+    _global: GlobalFixture,
 }
 
-/// The helper crate the fixture depends on: two public declarations and a private one,
-/// so the corpus can prove a hit answered from the dependency index.
-const HELPER_SOURCE: &str =
-    "pub fn helper_beacon() {}\nfn helper_private() {}\npub fn beacon() {}\n";
-
-/// A v4 lockfile naming the fixture and its path dependency, which
-/// `cargo metadata --locked --offline` accepts as it stands.
+/// A v4 lockfile naming the fixture and its path dependency.
 const LOCK_WITH_HELPER: &str = "\
 # This file is automatically @generated by Cargo.
 # It is not intended for manual editing.
@@ -462,28 +489,18 @@ version = \"0.1.0\"
 
 /// Builds the shared fixture workspace and serves it to one client.
 async fn served_fixture() -> TestResult<(
-    FixtureDirectories,
+    Fixture,
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
-    let helper = tempfile::tempdir()?;
-    fs::create_dir_all(helper.path().join("src"))?;
-    fs::write(
-        helper.path().join("Cargo.toml"),
-        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )?;
-    fs::write(helper.path().join("src/lib.rs"), HELPER_SOURCE)?;
+    let global = GlobalFixture::start(SymbolFixture::Valid).await?;
     let directory = tempfile::tempdir()?;
-    // The manifest names the helper by path, spelled as a TOML literal string so no
-    // separator needs escaping; `cargo metadata` catalogs it as a direct dependency
-    // rooted in its own directory.
+    // The manifest names the helper by a path outside the workspace, which no index
+    // serves, so every package-scoped answer names it `package_unavailable`.
     fs::write(
         directory.path().join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
-             [lib]\npath = \"lib.rs\"\n\n[dependencies]\nhelper = {{ path = '{}' }}\n",
-            helper.path().display()
-        ),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+         [lib]\npath = \"lib.rs\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\n",
     )?;
     fs::write(directory.path().join("Cargo.lock"), LOCK_WITH_HELPER)?;
     fs::write(
@@ -534,9 +551,14 @@ async fn served_fixture() -> TestResult<(
     // `hidden.rs` stays gitignored and uncommitted, everything else lands in
     // the fixture's one commit on `main`.
     //
+    // The package list names the collected release, so the fixture global API serves
+    // the package hits every `global` and `all` request in the corpus reaches.
     let configuration = format!(
-        "{}\n[global]\nenabled = false\n{ENGINE}",
-        hermetic_search::VECTOR_DISABLED
+        "{}\n[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
+         [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+         {ENGINE}",
+        hermetic_search::HERMETIC_TABLES,
+        global.endpoint
     );
     fs::write(directory.path().join("rift.toml"), configuration)?;
     rift_history::fixture::init(directory.path());
@@ -562,9 +584,9 @@ async fn served_fixture() -> TestResult<(
     });
     let client = ().serve(client_transport).await?;
     Ok((
-        FixtureDirectories {
+        Fixture {
             _workspace: directory,
-            _helper: helper,
+            _global: global,
         },
         client,
         server_task,
@@ -581,16 +603,35 @@ struct CorpusArms {
 
     dependency_units: usize,
     search_dependency_units: usize,
+    unavailable_entries: usize,
+    replaced_entries: usize,
+    added_entries: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
 }
 
 impl CorpusArms {
-    /// Records how many hits
-    /// answered from the dependency index, on a `get_symbol` and a `search` answer alike.
+    /// Records how many hits the global API answered, on a `get_symbol` and a `search`
+    /// answer alike, and how many entries the answer names `package_unavailable`.
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["hits"]);
         self.search_dependency_units += dependency_unit_count(&structured["results"]);
+        self.unavailable_entries += structured["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning["code"] == "package_unavailable")
+            .count();
+        for warning in structured["warnings"].as_array().into_iter().flatten() {
+            if warning["code"] == "package_absent" && warning["package"]["name"] == "helper" {
+                self.replaced_entries += 1;
+            }
+            if warning["code"] == "package_requirement_absent"
+                && warning["entry"]["name"] == "extra"
+            {
+                self.added_entries += 1;
+            }
+        }
         for identity in node_identities(structured) {
             if identity.contains('@') && !identity.contains("%40") {
                 self.literal_at_identities += 1;
@@ -612,13 +653,26 @@ impl CorpusArms {
         );
         assert!(
             self.dependency_units > 0,
-            "the corpus must prove a get_symbol hit answered from the dependency index, \
+            "the corpus must prove a get_symbol hit answered by the global API, \
              carrying unit in place of path"
         );
         assert!(
             self.search_dependency_units > 0,
-            "the corpus must prove a search hit answered from the dependency index, \
+            "the corpus must prove a search hit answered by the global API, \
              carrying unit in place of path"
+        );
+        assert!(
+            self.unavailable_entries > 0,
+            "the corpus must prove a package_unavailable warning naming the fixture's \
+             path dependency"
+        );
+        assert!(
+            self.replaced_entries > 0 && self.added_entries > 0,
+            "the corpus must prove a `packages` entry replacing the path dependency's \
+             version and one adding a package the context lacks: replaced_entries={}, \
+             added_entries={}",
+            self.replaced_entries,
+            self.added_entries
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
@@ -716,41 +770,9 @@ async fn call_tool_retrying_acceptance(
     Err("the server kept refusing a retryable corpus request".into())
 }
 
-/// Most lookups the walk issues while the dependency lane still indexes the helper.
-const INDEX_ATTEMPTS_MAX: usize = 60;
-/// Pause between two of those lookups.
-const INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Waits until the dependency lane has indexed the fixture's helper, so the corpus's
-/// dependency-scoped requests answer from a held package rather than a pending one.
-async fn helper_indexed(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-) -> TestResult {
-    let request = json!({ "name": "helper_beacon", "scope": "global" });
-    for _attempt in 0..INDEX_ATTEMPTS_MAX {
-        let result = call_tool_retrying_acceptance(
-            client,
-            CallToolRequestParams::new("get_symbol").with_arguments(arguments(&request)?),
-        )
-        .await?;
-        let structured = result
-            .structured_content
-            .ok_or("get_symbol must return structured content")?;
-        if structured["hits"]
-            .as_array()
-            .is_some_and(|hits| !hits.is_empty())
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(INDEX_POLL).await;
-    }
-    Err("the dependency lane never indexed the fixture's helper within the poll bound".into())
-}
-
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
-    let (_directory, client, server_task) = served_fixture().await?;
-    helper_indexed(&client).await?;
+    let (_fixture, client, server_task) = served_fixture().await?;
     let tools = client.list_all_tools().await?;
 
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -903,6 +925,63 @@ async fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResul
     Ok(())
 }
 
+/// `packages` beside the `local` scope and beside `rev` are schema-valid, runtime-refused
+/// requests on both reads: a project read consults no package, and package facts follow
+/// the current tree alone, so the server refuses `invalid_request` naming `packages`.
+/// A refusal carries no structured content, so the corpus above cannot hold them.
+#[tokio::test]
+async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let validators = tool_validators(&client.list_all_tools().await?)?;
+    let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let requests = [
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "packages": packages }),
+        ),
+        (
+            "get_symbol",
+            json!({ "name": "helper_beacon", "scope": "all", "rev": "main", "packages": packages }),
+        ),
+        (
+            "search",
+            json!({ "query": "helper_beacon", "scope": "local", "packages": packages }),
+        ),
+        (
+            "search",
+            json!({ "query": "helper_beacon", "scope": "global", "rev": "main", "packages": packages }),
+        ),
+    ];
+    for (name, request) in requests {
+        let (input_validator, _) = validators
+            .get(name)
+            .ok_or_else(|| format!("{name} is advertised"))?;
+        assert_validates(input_validator, &request, &format!("{name} request"));
+        let error = client
+            .call_tool(tools_call_request(name, &request)?)
+            .await
+            .expect_err("the argument has nothing to change on this read");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        assert_eq!(
+            wire["code"],
+            json!("invalid_request"),
+            "{request}: {wire:#}"
+        );
+        assert!(
+            error.message.contains("field packages"),
+            "the refusal names the field: {request}: {}",
+            error.message
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolRequestParams> {
     Ok(CallToolRequestParams::new(name).with_arguments(arguments(value)?))
 }
@@ -955,6 +1034,75 @@ async fn every_advertised_output_schema_declares_the_object_type() -> TestResult
     assert!(
         missing.is_empty(),
         "tools/list advertises output schemas without `type: object`: {missing:?}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// Whether one property schema accepts `null` beside another value.
+fn has_null_arm(property: &Value) -> bool {
+    let null_type = property["type"]
+        .as_array()
+        .is_some_and(|kinds| kinds.len() > 1 && kinds.contains(&json!("null")));
+    let null_branch = property["anyOf"]
+        .as_array()
+        .is_some_and(|branches| branches.len() > 1 && branches.contains(&json!({"type": "null"})));
+    null_type || null_branch
+}
+
+/// Every property below `node` that its object does not require and whose schema
+/// accepts `null` beside another value, named by the path to it.
+fn optional_null_properties(node: &Value, path: &str, found: &mut Vec<String>) {
+    match node {
+        Value::Object(object) => {
+            let required = object.get("required").and_then(Value::as_array);
+            let properties = object.get("properties").and_then(Value::as_object);
+            found.extend(
+                properties
+                    .into_iter()
+                    .flatten()
+                    .filter(|(name, property)| {
+                        has_null_arm(property)
+                            && !required.is_some_and(|names| names.contains(&json!(name)))
+                    })
+                    .map(|(name, _)| format!("{path}/{name}")),
+            );
+            for (key, child) in object {
+                optional_null_properties(child, &format!("{path}/{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                optional_null_properties(item, &format!("{path}/{index}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A wire model omits an absent optional field, so no property a served schema does not
+/// require accepts `null`: the arm would advertise a value no request needs and no answer
+/// carries. A required property may keep it, the form reserved for a `null` the server
+/// treats apart from absence.
+#[tokio::test]
+async fn no_advertised_optional_property_accepts_null() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let tools = client.list_all_tools().await?;
+    let mut found = Vec::new();
+    for tool in &tools {
+        let input = Value::Object(tool.input_schema.as_ref().clone());
+        optional_null_properties(&input, &format!("{}/input_schema", tool.name), &mut found);
+        let output = tool
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object(schema.as_ref().clone()))
+            .ok_or_else(|| format!("tool {} must advertise an output schema", tool.name))?;
+        optional_null_properties(&output, &format!("{}/output_schema", tool.name), &mut found);
+    }
+    assert!(
+        found.is_empty(),
+        "tools/list advertises optional properties that accept null: {found:#?}"
     );
     client.cancel().await?;
     server_task.await?;

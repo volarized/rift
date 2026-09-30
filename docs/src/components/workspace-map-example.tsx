@@ -31,6 +31,12 @@ const exampleMap = {
       requirement: "^1.53.1",
       availability: "canonical",
     },
+    {
+      manager: "stdlib",
+      name: "rust",
+      version: "1.98.1",
+      availability: "canonical",
+    },
   ],
   pagination: { page_index: 0, total_pages: 1 },
 };
@@ -139,7 +145,8 @@ export async function WorkspaceMapExample() {
                     </Badge>
                   </div>
                   <p className="mt-2 text-xs">
-                    Version requirement: <span className="font-mono">{pkg.requirement}</span>
+                    {pkg.version === undefined ? "Version requirement" : "Version"}:{" "}
+                    <span className="font-mono">{pkg.version ?? pkg.requirement}</span>
                   </p>
                 </div>
               ))}

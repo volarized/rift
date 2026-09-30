@@ -2,16 +2,21 @@
 
 use std::path::Path;
 
-use rift_protocol::dependencies::PackageContextEntry;
+use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 use rift_protocol::read::ProjectPath;
 
-use super::{BUN_LOCK_FILE_NAME, Pin, parse_lockfile};
+use super::{BUN_LOCK_FILE_NAME, LockedPackage, Pin, install_path, parse_lockfile};
 use crate::context::ContextAnswer;
-use crate::manifest::{file_beside, manifest_directory_path, read_static_file};
-use crate::node::{NPM_MANAGER, npm_selector, version_availability};
+use crate::manifest::{WorkspacePaths, file_beside, manifest_directory_path, read_static_file};
+use crate::node::{NPM_MANAGER, installed_folder, npm_selector, version_availability};
 use crate::resolver::{ContextRequest, StaticInputs};
 
-/// Reports the packages every `bun.lock` beside a listed manifest pins.
+/// The default registry a Bun tuple may name, trailing separator dropped. Bun leaves the
+/// registry element empty for it; every other registry is a private one.
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+/// Reports the packages every `bun.lock` beside a listed manifest pins, each exact one
+/// with the install folder its key spells.
 ///
 /// The npm resolver claims the same `package.json` and owns its declarations, so this
 /// pass reads lockfiles alone; a requirement for a package pinned here is dropped where
@@ -23,8 +28,9 @@ pub(super) fn bun_context(
     inputs: &mut dyn StaticInputs,
 ) -> ContextAnswer {
     let mut answer = ContextAnswer::default();
+    let workspace = WorkspacePaths::new(request.root, inputs);
     for manifest in request.manifests {
-        pin_lockfile(request.root, manifest, inputs, &mut answer);
+        pin_lockfile(request.root, manifest, &workspace, inputs, &mut answer);
     }
     answer
 }
@@ -33,6 +39,7 @@ pub(super) fn bun_context(
 fn pin_lockfile(
     root: &Path,
     manifest: &ProjectPath,
+    workspace: &WorkspacePaths,
     inputs: &mut dyn StaticInputs,
     answer: &mut ContextAnswer,
 ) {
@@ -56,33 +63,62 @@ fn pin_lockfile(
             return;
         }
     };
-    let pinned = lockfile
-        .packages
-        .values()
-        .filter_map(|package| match package.pin() {
-            Pin::Package { name, version, .. } => Some(PackageContextEntry::new(
-                NPM_MANAGER,
-                name,
-                npm_selector(version),
-                version_availability(version),
-            )),
-            Pin::Malformed | Pin::Workspace => None,
-        });
-    answer.entries.extend(pinned);
+    for (key, package) in &lockfile.packages {
+        let Pin::Package { name, version } = package.pin() else {
+            continue;
+        };
+        let Some(availability) = pin_availability(package, version, &directory, workspace, inputs)
+        else {
+            continue;
+        };
+        let selector = npm_selector(version);
+        if let (PackageSelector::Version(exact), Some(path)) = (&selector, install_path(key)) {
+            answer
+                .install_folders
+                .push(installed_folder(&directory, &path, name, exact));
+        }
+        answer.entries.push(PackageContextEntry::new(
+            NPM_MANAGER,
+            name,
+            selector,
+            availability,
+        ));
+    }
+}
+
+/// Whether a global package index can answer for one pinned tuple: its version text
+/// decides, and a registry package fetched from a registry the tuple names other than
+/// npm's is a private one. `None` for project source.
+fn pin_availability(
+    package: &LockedPackage,
+    version: &str,
+    directory: &Path,
+    workspace: &WorkspacePaths,
+    inputs: &mut dyn StaticInputs,
+) -> Option<PackageAvailability> {
+    let availability = version_availability(version, directory, workspace, inputs)?;
+    let private = package
+        .registry()
+        .is_some_and(|registry| registry.trim_end_matches('/') != NPM_REGISTRY_URL);
+    if availability == PackageAvailability::Canonical && private {
+        Some(PackageAvailability::PrivateRegistry)
+    } else {
+        Some(availability)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use rift_protocol::dependencies::PackageAvailability;
-
     use super::*;
     use crate::BunResolver;
+    use crate::context::InstallLocation;
     use crate::fixture::RecordedInspector;
     use crate::resolver::{DependencyResolver, LOCKFILE_BYTES_MAX};
 
     const ROOT: &str = "/workspace";
 
-    /// A lockfile pinning one registry package, one repository package, and the
+    /// A lockfile pinning one registry package, one package from a private registry, one
+    /// nested copy, one repository package, a directory inside the root, and the
     /// workspace's own member.
     const LOCKFILE: &str = r#"{
   "lockfileVersion": 1,
@@ -91,8 +127,12 @@ mod tests {
   },
   "packages": {
     "typescript": ["typescript@5.9.3", "", {}, "sha512-jl1"],
-    "tool": ["tool@git+https://example.test/tool.git#abc1234", "", {}, ""],
+    "internal": ["internal@2.0.0", "https://npm.example.test/", {}, "sha512-in"],
+    "public": ["public@1.0.0", "https://registry.npmjs.org/", {}, "sha512-pu"],
+    "typescript/@types/node": ["@types/node@24.3.1", "", {}, "sha512-tn"],
+    "tool": ["tool@git+https://example.test/tool.git#abc1234", {}, "abc1234"],
     "api": ["api@workspace:packages/api"],
+    "local": ["local@file:packages/local", {}],
     "broken": ["no-separator"],
   }
 }
@@ -112,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_lockfile_pins_exact_versions_and_marks_local_only_references() {
+    fn test_a_lockfile_pins_exact_versions_and_sorts_every_reference_by_kind() {
         let mut inspector =
             RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), LOCKFILE);
 
@@ -137,10 +177,33 @@ mod tests {
         assert_eq!(
             spelled,
             [
-                "tool: requirement git+https://example.test/tool.git#abc1234 (LocalOnly)",
-                "typescript: version 5.9.3 (Canonical)"
+                "internal: version 2.0.0 (PrivateRegistry)",
+                "public: version 1.0.0 (Canonical)",
+                "tool: requirement git+https://example.test/tool.git#abc1234 (Git)",
+                "typescript: version 5.9.3 (Canonical)",
+                "@types/node: version 24.3.1 (Canonical)"
             ],
-            "a workspace package and a malformed tuple pin nothing"
+            "a workspace package, a directory inside the root, and a malformed tuple pin \
+             nothing"
+        );
+        let folders: Vec<(String, &InstallLocation)> = answer
+            .install_folders
+            .iter()
+            .map(|folder| (folder.package.name.clone(), &folder.location))
+            .collect();
+        let at = |path: &str| InstallLocation::Path(Path::new(ROOT).join(path));
+        assert_eq!(
+            folders,
+            [
+                ("internal".to_owned(), &at("node_modules/internal")),
+                ("public".to_owned(), &at("node_modules/public")),
+                ("typescript".to_owned(), &at("node_modules/typescript")),
+                (
+                    "@types/node".to_owned(),
+                    &at("node_modules/typescript/node_modules/@types/node")
+                ),
+            ],
+            "every exact pin gets the folder its key spells; a repository pins no version"
         );
         assert!(
             answer
@@ -151,7 +214,7 @@ mod tests {
         assert_eq!(answer.inputs, [project("bun.lock")]);
         assert!(answer.degradations.is_empty());
         assert_eq!(
-            answer.entries[1].availability,
+            answer.entries[3].availability,
             PackageAvailability::Canonical
         );
     }

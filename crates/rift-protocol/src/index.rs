@@ -1,9 +1,8 @@
 //! The canonical package publication: the logical package index one analyzer run emits.
 //!
 //! A [`PackagePublication`] is what a package analyzer produces from one package's source
-//! bytes and nothing else. The local package index stores or derives its searchable rows
-//! from it, and a later global ingestion consumes the same shape, so physical storage may
-//! differ between the two while this model does not.
+//! bytes and nothing else. Global ingestion derives the global index's searchable rows
+//! from it, so physical storage may change while this model does not.
 //!
 //! Every collection is in stable identity order and every stored record carries a digest
 //! over its own canonical content, so two publications are comparable record by record.
@@ -123,7 +122,8 @@ pub struct PackageSymbol {
     pub name: String,
     /// The container-qualified name, unique within the unit's symbol space.
     pub qualified_name: String,
-    /// The provider's own kind word, composed as `{language}.{kind}`.
+    /// What the declaration is in the provider's vocabulary, such as `function` or
+    /// `class`. The language rides beside it in `presentation.language`.
     pub kind: ExactKind,
     /// The declaration's byte range inside its unit.
     pub range: TextRange,

@@ -4389,6 +4389,8 @@ name = "rift-analysis"
 version = "0.0.45"
 dependencies = [
  "flate2",
+ "ignore",
+ "jsonschema",
  "percent-encoding",
  "rayon",
  "rift-core",
@@ -4401,6 +4403,7 @@ dependencies = [
  "sha2",
  "strum",
  "tar",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-json",
  "tree-sitter-rst",
@@ -4458,6 +4461,7 @@ dependencies = [
 name = "rift-dependency"
 version = "0.0.45"
 dependencies = [
+ "ignore",
  "rift-core",
  "rift-protocol",
  "serde",
@@ -4482,12 +4486,10 @@ dependencies = [
 name = "rift-index"
 version = "0.0.45"
 dependencies = [
- "flate2",
  "ignore",
  "rayon",
  "rift-analysis",
  "rift-core",
- "rift-dependency",
  "rift-history",
  "rift-protocol",
  "rift-provider",
@@ -4497,7 +4499,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "strum",
- "tar",
  "tempfile",
  "toasty",
  "toasty-core",
@@ -4544,6 +4545,7 @@ dependencies = [
  "rift-server",
  "rmcp",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -4561,6 +4563,7 @@ version = "0.0.45"
 dependencies = [
  "jsonschema",
  "schemars 1.2.2",
+ "semver",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -4586,7 +4589,6 @@ dependencies = [
  "rift-core",
  "serde",
  "sha2",
- "tokio",
 ]
 
 [[package]]
@@ -4594,9 +4596,9 @@ name = "rift-schema-export"
 version = "0.0.45"
 dependencies = [
  "jsonschema",
+ "rift-analysis",
  "rift-cloud-client",
  "rift-core",
- "rift-index",
  "rift-mcp",
  "rift-protocol",
  "serde_json",
@@ -4631,6 +4633,7 @@ dependencies = [
 name = "rift-server"
 version = "0.0.45"
 dependencies = [
+ "ignore",
  "lsp-types",
  "percent-encoding",
  "rayon",

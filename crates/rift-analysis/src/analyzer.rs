@@ -3,8 +3,7 @@
 //! [`PackageAnalyzer`] holds no I/O. It takes the bytes a caller already read, parses
 //! them with the shipped syntax providers, places each file under the package's own
 //! identity, assembles the declarations through [`WorkspaceSemantics`], and renders the
-//! result as a [`PackagePublication`]. The local package index consumes that publication,
-//! and a later global ingestion consumes the same shape, so one extraction serves both.
+//! result as a [`PackagePublication`], the shape global ingestion consumes.
 //!
 //! Every record carries the digest of its own canonical content, and the publication as a
 //! whole renders as RFC 8785 canonical JSON, so two runs over the same bytes under the
@@ -21,6 +20,7 @@ use crate::documentation::{
 };
 use crate::input::ExactPackageInput;
 use crate::revision::analyzer_revision;
+use crate::selection::documentation_format;
 use crate::semantic::{PlacedDocument, WorkspaceSemantics};
 use crate::source::{FileDigest, IndexedFile};
 use rift_core::constants::DIGEST_WIRE_CHARS;
@@ -45,7 +45,7 @@ use rift_protocol::index::{
 };
 use rift_protocol::read::{
     Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceLocationKind, SourceUnitId,
-    SymbolId, SymbolOrigin, TextRange,
+    SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxSymbol};
@@ -53,6 +53,15 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use rift_ranking::split_identifier_words;
+
+#[cfg(test)]
+mod fixture;
+mod join;
+#[cfg(test)]
+mod join_tests;
+
+use join::ModuleRole;
+pub use join::StubForm;
 
 /// Package analysis failure classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -167,13 +176,14 @@ impl Fault for PackageAnalysisFault {
 /// Opaque package analysis failure.
 pub type PackageAnalysisError = Error<PackageAnalysisFault>;
 
-/// One package file as the analyzer holds it: the parsed document, where it is filed, and
-/// the public declarations it carries.
+/// One package file as the analyzer holds it: the parsed document, where it is filed, the
+/// public declarations it carries, and what the stub and module join decided for it.
 #[derive(Debug)]
 pub struct AnalyzedFile {
     file: IndexedFile,
     placement: DocumentPlacement,
     public_names: BTreeSet<String>,
+    role: ModuleRole,
 }
 
 impl AnalyzedFile {
@@ -194,14 +204,22 @@ impl AnalyzedFile {
     pub fn is_public(&self, qualified_name: &str) -> bool {
         self.public_names.contains(qualified_name)
     }
+
+    /// The stub declarations the declaration spelled by `qualified_name` answers for, in the
+    /// stub's source order: each one's identity, stub path, and range. Empty unless this
+    /// file is an implementation whose declaration joined its stub.
+    #[must_use]
+    pub fn stub_forms(&self, qualified_name: &str) -> &[StubForm] {
+        self.role.stub_forms(qualified_name)
+    }
 }
 
 /// What one analyzer run produced: the canonical publication, and the parsed material the
 /// same pass built it from.
 ///
 /// The publication is the artifact a consumer stores and compares. The parsed files and
-/// the assembled graph are the same pass's working values, handed on so the local package
-/// index answers reads without parsing the package a second time.
+/// the assembled graph are the same pass's working values, handed on so a consumer reads
+/// them without parsing the package a second time.
 #[derive(Debug)]
 pub struct PackageAnalysis {
     publication: PackagePublication,
@@ -252,8 +270,11 @@ impl PackageAnalyzer {
     /// Each file is placed under `rift://source/<manager>/<name>@<version>/<path>` with
     /// the identity path `<manager>/<name>@<version>/<path>`, and its origin is the
     /// input origin: a dependency carrying the package identity, or the standard library.
-    /// Records are emitted in unit, symbol, and document identity order, and a
-    /// collection that reaches its bound stops there and reports the stop as a warning.
+    /// A stub and the module it declares (`mod.pyi` and `mod.py`, `index.d.ts` and
+    /// `index.js`) join: each name both declare answers once, at the module, with the
+    /// stub's signatures and types. Records are emitted in unit, symbol, and document
+    /// identity order, and a collection that reaches its bound stops there and reports the
+    /// stop as a warning.
     ///
     /// The work is proportional to the selected bytes: one parse per file, one scan per
     /// file for its line starts, one assembly pass over the parsed declarations, and one
@@ -278,9 +299,11 @@ impl PackageAnalyzer {
                 file: parsed,
                 placement,
                 public_names,
+                role: ModuleRole::Unpaired,
             });
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
+        join::join_modules(&mut analyzed);
         let placed: Vec<PlacedDocument<'_>> = analyzed
             .iter()
             .map(|held| PlacedDocument {
@@ -1057,6 +1080,9 @@ impl Records {
             path,
             line_starts,
         } = *context;
+        if held.role.answers_elsewhere(&declaration.qualified_name) {
+            return Ok(());
+        }
         if self.symbols.len() >= bound(PACKAGE_SYMBOLS_MAX) {
             if !self.symbols_truncated {
                 self.symbols_truncated = true;
@@ -1077,7 +1103,7 @@ impl Records {
             held.placement.identity_path(),
             &declaration.qualified_name,
         ));
-        let presentation = semantics
+        let mut presentation = semantics
             .assembled(&symbol.0)
             .and_then(|assembled| {
                 assembled
@@ -1089,6 +1115,11 @@ impl Records {
                     .at(held.file.path())
                     .into_error()
             })?;
+        let signature = if join::lay_join(&mut presentation, semantics, &held.role, declaration) {
+            presentation.signatures.first().cloned()
+        } else {
+            declaration.signatures.first().cloned()
+        };
         let mut record = PackageSymbol {
             symbol,
             presentation,
@@ -1096,17 +1127,13 @@ impl Records {
             unit: unit.clone(),
             name: declaration.name.clone(),
             qualified_name: declaration.qualified_name.clone(),
-            kind: ExactKind(format!(
-                "{}.{}",
-                language.identity_segment(),
-                declaration.kind
-            )),
+            kind: ExactKind(declaration.kind.to_owned()),
             range: TextRange {
                 start: declaration.range.start,
                 end: declaration.range.end,
             },
             line: line_of(line_starts, declaration.range.start),
-            signature: declaration.signatures.first().cloned(),
+            signature,
             documentation: declaration.documentation.first().cloned(),
             source: retained.text,
             source_complete: retained.complete,
@@ -1255,7 +1282,7 @@ fn identifier_terms(names: &[&str]) -> Vec<String> {
     terms
 }
 
-/// The origin every declaration of one cataloged package carries.
+/// The origin every declaration of one analyzed package carries.
 fn symbol_origin(
     package: &PackageIdentity,
     origin: &ContributionOrigin,
@@ -1404,20 +1431,6 @@ fn source_language(extension: &str, package_language: &Language) -> Language {
     }
 }
 
-/// Returns the documentation format selected by a supported package source extension.
-#[must_use]
-pub fn documentation_format(file_name: &str) -> Option<DocumentationSourceFormat> {
-    let extension = Path::new(file_name).extension()?.to_str()?;
-    match extension {
-        "md" | "markdown" => Some(DocumentationSourceFormat::Markdown),
-        "mdx" => Some(DocumentationSourceFormat::Mdx),
-        "rst" => Some(DocumentationSourceFormat::RestructuredText),
-        "txt" => Some(DocumentationSourceFormat::Text),
-        "ipynb" => Some(DocumentationSourceFormat::Notebook),
-        _ => None,
-    }
-}
-
 /// The placement of one package file: its unit, identity path, and origin.
 fn placement_of(
     package: &PackageIdentity,
@@ -1431,26 +1444,44 @@ fn placement_of(
     Ok(DocumentPlacement::new(origin.clone(), unit, identity_path))
 }
 
-/// The languages the package index reads an API from, and each one's rules.
+/// The languages package analysis reads an API from, and each one's rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageLanguage {
-    /// Rust declarations use `pub`; items of a public trait also count.
+    /// Rust declarations use `pub`; items of a public trait and variants of a public enum
+    /// also count.
     Rust,
     /// Python names without a leading underscore count.
     Python,
-    /// TypeScript declarations exclude private and protected members.
+    /// TypeScript declarations exclude private and protected members. A TypeScript package
+    /// ships its JavaScript builds beside its declaration files.
     TypeScript,
+}
+
+/// Rust container kinds whose private members a `pub` container exports: a trait's
+/// items and an enum's variants carry no visibility of their own.
+const PUBLIC_MEMBER_CONTAINERS: [&str; 2] = ["trait", "enum"];
+
+/// JavaScript container kinds whose members an exported container exports: a class's
+/// methods carry no `export` of their own.
+const JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS: [&str; 1] = ["class"];
+
+/// The prefix of an ES private element's name (`#secret`), which nothing outside its
+/// class reaches.
+const PRIVATE_ELEMENT_PREFIX: char = '#';
+
+/// The shipped language a definition serves `language` under.
+fn shipped_language(language: &Language) -> Option<ShippedLanguage> {
+    rift_syntax::definitions()
+        .iter()
+        .map(|definition| definition.shipped())
+        .find(|shipped| &shipped.language() == language)
 }
 
 impl PackageLanguage {
     /// Rules for one language, when a shipped definition serves it.
     #[must_use]
     pub fn for_language(language: &Language) -> Option<Self> {
-        let shipped = rift_syntax::definitions()
-            .iter()
-            .map(|definition| definition.shipped())
-            .find(|shipped| &shipped.language() == language)?;
-        match shipped {
+        match shipped_language(language)? {
             ShippedLanguage::Rust => Some(Self::Rust),
             ShippedLanguage::Python => Some(Self::Python),
             ShippedLanguage::TypeScript | ShippedLanguage::TypeScriptTsx => Some(Self::TypeScript),
@@ -1462,22 +1493,16 @@ impl PackageLanguage {
         }
     }
 
-    /// Whether one file name is a source candidate for this package language.
-    #[must_use]
-    pub fn is_candidate(self, file_name: &str) -> bool {
-        let path = std::path::Path::new(file_name);
-        let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    /// The shipped languages whose files a package in this language holds as source.
+    pub(crate) const fn source_languages(self) -> &'static [ShippedLanguage] {
         match self {
-            Self::Rust => extension.is_some_and(|value| value.eq_ignore_ascii_case("rs")),
-            Self::Python => extension.is_some_and(|value| {
-                value.eq_ignore_ascii_case("py") || value.eq_ignore_ascii_case("pyi")
-            }),
-            Self::TypeScript => {
-                extension.is_some_and(|value| value.eq_ignore_ascii_case("ts"))
-                    && path.file_stem().is_some_and(|stem| {
-                        stem.to_string_lossy().to_ascii_lowercase().ends_with(".d")
-                    })
-            }
+            Self::Rust => &[ShippedLanguage::Rust],
+            Self::Python => &[ShippedLanguage::Python],
+            Self::TypeScript => &[
+                ShippedLanguage::JavaScript,
+                ShippedLanguage::TypeScript,
+                ShippedLanguage::TypeScriptTsx,
+            ],
         }
     }
 
@@ -1490,7 +1515,8 @@ impl PackageLanguage {
                     .as_deref()
                     .and_then(|container| by_name.get(container))
                     .is_some_and(|container| {
-                        container.kind == "trait" && container.visibility.as_deref() == Some("pub")
+                        PUBLIC_MEMBER_CONTAINERS.contains(&container.kind)
+                            && container.visibility.as_deref() == Some("pub")
                     }),
                 _ => false,
             },
@@ -1503,11 +1529,64 @@ impl PackageLanguage {
     }
 }
 
-/// Qualified names of declarations a package language exposes.
+/// The rule deciding which declarations of one package file are public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportRule {
+    /// A package language's own rule.
+    Language(PackageLanguage),
+    /// A JavaScript module exports a declaration the provider marks `Public`, one an
+    /// `export` wraps or an export names (`export { a }`, `module.exports = { a }`), and a
+    /// member of a class so marked other than an ES private element.
+    JavaScriptModule,
+}
+
+impl ExportRule {
+    /// The rule for files in `language`. Absent for a language with no export rule, whose
+    /// every declaration is public.
+    fn for_language(language: &Language) -> Option<Self> {
+        if shipped_language(language)? == ShippedLanguage::JavaScript {
+            return Some(Self::JavaScriptModule);
+        }
+        PackageLanguage::for_language(language).map(Self::Language)
+    }
+
+    fn is_public(self, symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+        match self {
+            Self::Language(rules) => rules.is_public(symbol, by_name),
+            Self::JavaScriptModule => is_javascript_export(symbol, by_name),
+        }
+    }
+}
+
+/// Whether a JavaScript module exports `symbol`: the provider marks it `Public`, or it is a
+/// member of a class so marked and no ES private element.
+fn is_javascript_export(symbol: &SyntaxSymbol, by_name: &BTreeMap<&str, &SyntaxSymbol>) -> bool {
+    let exported = is_exported(symbol);
+    let private_element = symbol.name.starts_with(PRIVATE_ELEMENT_PREFIX);
+    let member_of_exported_class = symbol
+        .container
+        .as_deref()
+        .and_then(|container| by_name.get(container))
+        .is_some_and(|container| {
+            JAVASCRIPT_PUBLIC_MEMBER_CONTAINERS.contains(&container.kind) && is_exported(container)
+        });
+    exported || (member_of_exported_class && !private_element)
+}
+
+/// Whether the provider marks `symbol` public, as an export of it does.
+fn is_exported(symbol: &SyntaxSymbol) -> bool {
+    symbol.facets.contains(&SymbolFacet::Public)
+}
+
+/// Qualified names of declarations a package file exposes under its language's export
+/// rule.
+///
+/// A paired module's set is replaced afterwards by the one its stub defines, so this rule
+/// decides an unpaired file alone.
 #[must_use]
 pub fn public_qualified_names(language: &Language, document: &SyntaxDocument) -> BTreeSet<String> {
     let symbols = document.symbols();
-    let Some(rules) = PackageLanguage::for_language(language) else {
+    let Some(rule) = ExportRule::for_language(language) else {
         return symbols
             .iter()
             .map(|symbol| symbol.qualified_name.clone())
@@ -1519,7 +1598,7 @@ pub fn public_qualified_names(language: &Language, document: &SyntaxDocument) ->
         .collect();
     symbols
         .iter()
-        .filter(|symbol| rules.is_public(symbol, &by_name))
+        .filter(|symbol| rule.is_public(symbol, &by_name))
         .map(|symbol| symbol.qualified_name.clone())
         .collect()
 }
@@ -1543,18 +1622,16 @@ mod tests {
         PACKAGE_IDENTIFIER_TERMS_MAX, PACKAGE_PUBLICATION_FORMAT_REVISION,
         PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning, PackageDocumentKind,
     };
-    use rift_protocol::read::{Language, PackageIdentity};
+    use rift_protocol::schema::package_index_schema_document;
     use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
-    use super::{PackageAnalysis, PackageAnalyzer, bound};
+    use super::fixture::{analyzed, identity, language, package_analysis, package_result};
+    use super::{PackageAnalyzer, bound};
     use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
 
-    fn identity() -> PackageIdentity {
-        PackageIdentity {
-            manager: "cargo".to_owned(),
-            name: "beacon".to_owned(),
-            version: "1.0.0".to_owned(),
-        }
+    /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
+    fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
+        package_analysis(shipped, files)
     }
 
     #[test]
@@ -1673,68 +1750,6 @@ mod tests {
         let documentation = &publication.documentation;
         assert_eq!(documentation.sources[0].media_type, "text/plain");
         assert_eq!(documentation.blocks.len(), 1);
-    }
-
-    fn language(shipped: ShippedLanguage) -> Language {
-        shipped.language()
-    }
-
-    fn package_analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> PackageAnalysis {
-        package_result(shipped, files, None).expect("the package analyzes")
-    }
-
-    /// One package of `files` in `shipped`, analyzed under `syntax` bounds when set.
-    fn package_result(
-        shipped: ShippedLanguage,
-        files: Vec<(&str, &str)>,
-        syntax: Option<rift_syntax::SyntaxLimits>,
-    ) -> Result<PackageAnalysis, super::PackageAnalysisError> {
-        let package = identity();
-        let language = language(shipped);
-        let origin = ContributionOrigin::new(
-            Some(SourceLocation::Dependency {
-                package: package.clone(),
-            }),
-            SourceKind::Authored,
-        )
-        .expect("origin");
-        let files: Vec<(ProjectPath, &str)> = files
-            .into_iter()
-            .map(|(path, text)| (ProjectPath::new(path).expect("path"), text))
-            .collect();
-        let sources: Vec<PackageSource<'_>> = files
-            .iter()
-            .map(|(path, text)| PackageSource::new(path, text))
-            .collect();
-        let files_max = u32::try_from(files.len()).expect("test file count");
-        let bytes_max = files
-            .iter()
-            .map(|(_, text)| u64::try_from(text.len()).expect("test byte count"))
-            .sum();
-        let input = ExactPackageInput::new(
-            &package,
-            &language,
-            &origin,
-            &sources,
-            syntax.map_or(ExactPackageLimits::new(files_max, bytes_max), |limits| {
-                ExactPackageLimits::new(files_max, bytes_max).with_syntax(limits)
-            }),
-        )
-        .expect("bounded package input");
-        PackageAnalyzer::analyze(input, 1)
-    }
-
-    /// One package of `files` in `shipped`, analyzed.
-    fn analyzed(
-        shipped: ShippedLanguage,
-        files: Vec<(&str, &str)>,
-    ) -> rift_protocol::index::PackagePublication {
-        package_analysis(shipped, files).publication().clone()
-    }
-
-    /// One package of `files` in `shipped`, analyzed, keeping every part of the analysis.
-    fn analysis(shipped: ShippedLanguage, files: Vec<(&str, &str)>) -> super::PackageAnalysis {
-        package_analysis(shipped, files)
     }
 
     /// The `identity` of every document of one kind, in publication order.
@@ -1866,8 +1881,8 @@ mod tests {
     }
 
     /// Every shipped package language reaches the publication through the same pass,
-    /// each under its own export rule: JavaScript ships none, so every declaration is
-    /// public, while TypeScript and TSX drop a `private` member.
+    /// each under its own export rule: JavaScript exports what `export` wraps, while
+    /// TypeScript and TSX drop a `private` member.
     #[test]
     fn test_every_package_language_publishes_its_public_declarations() {
         let cases = [
@@ -1875,7 +1890,7 @@ mod tests {
                 ShippedLanguage::JavaScript,
                 "index.js",
                 "export function open() {}\nfunction helper() {}\n",
-                vec!["helper", "open"],
+                vec!["open"],
             ),
             (
                 ShippedLanguage::TypeScript,
@@ -1901,6 +1916,178 @@ mod tests {
             assert_eq!(public, expected, "{path}");
             assert_eq!(publication.units.len(), 1, "{path}");
         }
+    }
+
+    /// A dialect's identity segment carries a colon (`typescript:tsx`), which `ExactKind`'s
+    /// pattern refuses, so a declaration's kind is the provider's own word and the language
+    /// rides in `presentation.language`. The whole publication then validates against the
+    /// package index schema Rift serves.
+    #[test]
+    fn test_a_tsx_declaration_kind_is_the_provider_word_the_schema_accepts() {
+        let publication = analyzed(
+            ShippedLanguage::TypeScriptTsx,
+            vec![(
+                "index.tsx",
+                "export class Panel {\n  render(): null {\n    return null;\n  }\n}\n\
+                 export function mount(): void {}\n",
+            )],
+        );
+
+        let kinds: Vec<(&str, &str)> = publication
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind.0.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("Panel", "class"),
+                ("Panel.render", "method"),
+                ("mount", "function")
+            ]
+        );
+        for symbol in &publication.symbols {
+            assert_eq!(
+                symbol.kind, symbol.presentation.kind,
+                "the record and its presentation carry one kind: {}",
+                symbol.qualified_name
+            );
+            assert_eq!(
+                symbol.presentation.language,
+                language(ShippedLanguage::TypeScriptTsx)
+            );
+        }
+        let schema: serde_json::Value = serde_json::from_str(&package_index_schema_document())
+            .expect("the package index schema parses");
+        let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+        let instance = serde_json::to_value(&publication).expect("the publication serializes");
+        let refusals: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|refusal| format!("{}: {refusal}", refusal.instance_path()))
+            .collect();
+        assert!(
+            refusals.is_empty(),
+            "a TSX publication validates against the package index schema: {refusals:#?}"
+        );
+    }
+
+    /// The public names of the one file `path` holds, analyzed alone under `shipped`.
+    fn public_names(shipped: ShippedLanguage, path: &str, source: &str) -> Vec<String> {
+        analyzed(shipped, vec![(path, source)])
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.public)
+            .map(|symbol| symbol.qualified_name.clone())
+            .collect()
+    }
+
+    /// An unpaired JavaScript module exports what an ES `export` wraps or names, a default
+    /// export included, and the members of an exported class other than a `#` private
+    /// element. A helper no export wraps or names stays private.
+    #[test]
+    fn test_an_unpaired_javascript_module_exports_what_export_wraps_or_names() {
+        let source = "export function open() {}\n\
+                      function helper() {}\n\
+                      export class Client {\n  connect() {}\n  static make() {}\n  #hidden() {}\n}\n\
+                      class Internal {\n  run() {}\n}\n\
+                      export const answer = 42, other = 1;\n\
+                      export default function main() {}\n\
+                      function later() {}\n\
+                      class Session {\n  close() {}\n  #token() {}\n}\n\
+                      export { later, Session as Connection };\n";
+        let mut public = public_names(ShippedLanguage::JavaScript, "index.js", source);
+        public.sort();
+        assert_eq!(
+            public,
+            [
+                "Client",
+                "Client.connect",
+                "Client.make",
+                "Session",
+                "Session.close",
+                "answer",
+                "later",
+                "main",
+                "open",
+                "other"
+            ]
+        );
+        for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
+            let publication = analyzed(shipped, vec![("lib/index.mjs", source)]);
+            let module_public = publication
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.public)
+                .count();
+            assert_eq!(
+                module_public,
+                public.len(),
+                "a TypeScript package's JavaScript build takes the same rule"
+            );
+        }
+    }
+
+    /// A module exporting through `module.exports` and `exports.name` assignments exports
+    /// the declarations they name, the members of an exported class other than a `#`
+    /// private element, and a method written in the exported object. The provider declares
+    /// nothing for an `exports.name = function` assignment, so it adds no record.
+    #[test]
+    fn test_a_module_exports_assignment_exports_the_declarations_it_names() {
+        let source = "function helper() {}\n\
+                      class Runner {\n  run() {}\n  #secret() {}\n}\n\
+                      function internal() {}\n\
+                      function load() {}\n\
+                      module.exports = { helper, Runner, start() {} };\n\
+                      exports.read = load;\n\
+                      exports.extra = function extra() {};\n";
+        let publication = analyzed(ShippedLanguage::JavaScript, vec![("index.cjs", source)]);
+        let mut declared: Vec<(&str, bool)> = publication
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.public))
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            [
+                ("Runner", true),
+                ("Runner.#secret", false),
+                ("Runner.run", true),
+                ("helper", true),
+                ("internal", false),
+                ("load", true),
+                ("start", true),
+            ]
+        );
+    }
+
+    /// A paired JavaScript module keeps the public set its declaration file defines: an
+    /// `export` the stub does not declare leaves the set.
+    #[test]
+    fn test_a_paired_javascript_module_keeps_the_stub_public_set() {
+        let publication = analyzed(
+            ShippedLanguage::TypeScript,
+            vec![
+                ("index.d.ts", "export declare function open(): void;\n"),
+                (
+                    "index.js",
+                    "export function open() {}\nexport function internal() {}\n",
+                ),
+            ],
+        );
+        let public: Vec<&str> = publication
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.public)
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect();
+        assert_eq!(public, ["open"]);
+        assert!(
+            publication
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name == "internal" && !symbol.public)
+        );
     }
 
     #[test]
@@ -2053,8 +2240,8 @@ mod tests {
         assert!(rendered.contains("src/lib.rs"));
     }
 
-    /// The analysis hands back the parsed files beside the publication, so the local
-    /// package index reads what the publication was built from rather than parsing again.
+    /// The analysis hands back the parsed files beside the publication, so a consumer
+    /// reads what the publication was built from rather than parsing again.
     #[test]
     fn test_analysis_carries_the_parsed_files_beside_the_publication() {
         let analysis = analysis(

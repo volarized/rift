@@ -1,4 +1,4 @@
-//! The server's filesystem-backed inspector, and workspace dependency resolution through it.
+//! The server's filesystem-backed context inputs, and the dependency context read through them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,8 +6,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use rift_dependency::{
-    CommandFailure, CommandOutput, DependencyCatalog, DependencyContext, FileObservation,
-    Inspector, StaticInputs, TOOLCHAIN_OUTPUT_BYTES_MAX, ToolchainCommand,
+    CommandFailure, CommandOutput, ContextInputs, DependencyContext, FileObservation,
+    StandardLibrary, StandardLibraryRequest, StaticInputs, TOOLCHAIN_OUTPUT_BYTES_MAX,
+    ToolchainCommand,
 };
 use rift_protocol::dependencies::{
     ConfiguredPackage, DependenciesConfiguration, DependencyResolution,
@@ -16,16 +17,16 @@ use rift_protocol::read::ProjectPath;
 
 use crate::process::{BoundedRun, run_bounded};
 
-/// The reason every toolchain run is refused under `resolution = "static"`.
+/// The reason every probe is refused under `resolution = "static"`.
 const STATIC_RESOLUTION_REASON: &str = "resolution = static: toolchains are not run";
 
-/// How the inspector answers a toolchain run: whether one runs at all, and how long it
-/// may take. Read from the `[dependencies]` table's `resolution` and `command_timeout`.
+/// How the inputs answer a version probe: whether one runs at all, and how long it may
+/// take. Read from the `[dependencies]` table's `resolution` and `command_timeout`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResolutionPolicy {
-    /// Whether a toolchain runs. `false` refuses every run before anything spawns.
+    /// Whether a probe runs. `false` refuses every run before anything spawns.
     execution: bool,
-    /// Wall clock one run may take before the inspector kills it.
+    /// Wall clock one run may take before the inputs kill it.
     command_timeout: Duration,
 }
 
@@ -45,20 +46,20 @@ impl Default for ResolutionPolicy {
     }
 }
 
-/// The inspector that answers from this machine: its files, environment, and `PATH`.
+/// The context inputs that answer from this machine: its files and its `PATH`.
 #[derive(Debug)]
-pub(crate) struct FilesystemInspector {
+pub(crate) struct FilesystemInputs {
     policy: ResolutionPolicy,
 }
 
-impl FilesystemInspector {
-    /// An inspector running toolchains under `policy`.
+impl FilesystemInputs {
+    /// Inputs running the version probes under `policy`.
     pub(crate) const fn new(policy: ResolutionPolicy) -> Self {
         Self { policy }
     }
 }
 
-impl StaticInputs for FilesystemInspector {
+impl StaticInputs for FilesystemInputs {
     /// The regular file at `path` when it fits `bytes_max`. A larger file
     /// answers its size, and anything else answers absent.
     fn read_file(&mut self, path: &Path, bytes_max: u64) -> FileObservation {
@@ -71,11 +72,9 @@ impl StaticInputs for FilesystemInspector {
             Err(_) => FileObservation::Absent,
         }
     }
-}
 
-impl Inspector for FilesystemInspector {
-    fn directory_exists(&mut self, path: &Path) -> bool {
-        fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    fn canonical_path(&mut self, path: &Path) -> Option<PathBuf> {
+        fs::canonicalize(path).ok()
     }
 
     /// The UTF-8 entry names below `path`, in name order, at most `entries_max`.
@@ -94,11 +93,14 @@ impl Inspector for FilesystemInspector {
         names.truncate(entries_max);
         names
     }
+}
 
+impl ContextInputs for FilesystemInputs {
     /// Runs the program from `PATH` under the policy's bounds.
     ///
     /// The run is cut at the policy's `command_timeout` and its standard output
-    /// at [`TOOLCHAIN_OUTPUT_BYTES_MAX`]. A program spelled as a path, and every
+    /// at [`TOOLCHAIN_OUTPUT_BYTES_MAX`]; the command's environment overlay wins over
+    /// the inherited value. A program spelled as a path, and every
     /// program while the policy runs no toolchain, is refused before anything
     /// spawns.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure> {
@@ -115,7 +117,11 @@ impl Inspector for FilesystemInspector {
         let mut process = Command::new(program);
         process
             .args(&command.arguments)
-            .current_dir(&command.working_directory);
+            .current_dir(&command.working_directory)
+            .envs(command.environment.iter().copied());
+        for name in &command.environment_removed {
+            process.env_remove(name);
+        }
         let run = run_bounded(
             &mut process,
             self.policy.command_timeout,
@@ -123,14 +129,6 @@ impl Inspector for FilesystemInspector {
         )
         .map_err(|io| failure(program, format!("failed to launch: {io}")))?;
         output_of(program, run, self.policy.command_timeout)
-    }
-
-    fn environment(&mut self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
-    }
-
-    fn home_directory(&mut self) -> Option<PathBuf> {
-        std::env::home_dir()
     }
 }
 
@@ -180,53 +178,20 @@ fn failure(program: &str, reason: impl Into<String>) -> CommandFailure {
     }
 }
 
-/// Resolves the dependency catalog of one workspace through the shipped resolvers.
+/// Reads the dependency context of one workspace through the shipped resolvers, then
+/// adds the standard library entries `libraries` names.
 ///
-/// Every file read and toolchain run goes through a [`FilesystemInspector`] under
-/// `policy`. The span records the entry count and whether the answer degraded, and
-/// each degradation is logged once as a warning.
-pub(crate) fn resolve_workspace_catalog(
-    root: &Path,
-    visible: &[ProjectPath],
-    policy: ResolutionPolicy,
-) -> DependencyCatalog {
-    let span = tracing::info_span!(
-        "dependency.resolve",
-        component = "dependency",
-        entries = tracing::field::Empty,
-        degraded = tracing::field::Empty,
-    );
-    let _entered = span.enter();
-    let catalog = rift_dependency::resolve_catalog(
-        root,
-        visible,
-        rift_dependency::resolvers(),
-        &mut FilesystemInspector::new(policy),
-    );
-    span.record("entries", catalog.entries().len());
-    span.record("degraded", catalog.is_degraded());
-    for degradation in catalog.degradations() {
-        tracing::warn!(
-            component = "dependency",
-            resolver = %degradation.resolver,
-            reason = %degradation.reason,
-            "dependency resolution degraded"
-        );
-    }
-    catalog
-}
-
-/// Reads the static dependency context of one workspace through the shipped resolvers.
-///
-/// The pass reads manifests and lockfiles alone: the inspector reaches it as a
-/// [`StaticInputs`], which offers a file read and nothing else, so no toolchain runs and
-/// no package cache is inspected whatever the `[dependencies]` table says. The span
-/// records the entry count and whether an input went unread, and each degradation is
-/// logged once as a warning.
+/// The resolvers read manifests and lockfiles alone: they reach the inputs as a
+/// [`StaticInputs`], which offers a file read and a directory listing and nothing else.
+/// The one program the pass runs is a standard library version probe, under `policy`'s
+/// `command_timeout` and only while `policy` allows execution. The span records the entry count and
+/// whether an input went unread, and each degradation is logged once as a warning.
 pub(crate) fn read_workspace_context(
     root: &Path,
     visible: &[ProjectPath],
     configured: &[ConfiguredPackage],
+    policy: ResolutionPolicy,
+    libraries: &[StandardLibrary],
 ) -> DependencyContext {
     let span = tracing::info_span!(
         "dependency.context",
@@ -235,13 +200,23 @@ pub(crate) fn read_workspace_context(
         degraded = tracing::field::Empty,
     );
     let _entered = span.enter();
-    let context = rift_dependency::resolve_context(
+    let mut inputs = FilesystemInputs::new(policy);
+    let mut context = rift_dependency::resolve_context(
         root,
         visible,
         rift_dependency::resolvers(),
-        &mut FilesystemInspector::new(ResolutionPolicy::default()),
+        &mut inputs,
         configured,
     );
+    let request = StandardLibraryRequest {
+        root,
+        libraries,
+        execution: policy.execution,
+    };
+    context.add_standard_libraries(rift_dependency::standard_library_answer(
+        &request,
+        &mut inputs,
+    ));
     span.record("entries", context.entries().len());
     span.record("degraded", context.is_degraded());
     for degradation in context.degradations() {
@@ -267,11 +242,13 @@ mod tests {
                 .map(|argument| (*argument).to_owned())
                 .collect(),
             working_directory: directory.to_path_buf(),
+            environment: Vec::new(),
+            environment_removed: Vec::new(),
         }
     }
 
-    fn inspector() -> FilesystemInspector {
-        FilesystemInspector::new(ResolutionPolicy::default())
+    fn inputs() -> FilesystemInputs {
+        FilesystemInputs::new(ResolutionPolicy::default())
     }
 
     /// The policy `resolution = "static"` compiles to.
@@ -322,32 +299,21 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let manifest = directory.path().join("Cargo.toml");
         std::fs::write(&manifest, b"[package]\n").expect("write manifest");
-        let mut inspector = inspector();
-        let missing = inspector.read_file(&directory.path().join("missing"), 64);
+        let mut inputs = inputs();
+        let missing = inputs.read_file(&directory.path().join("missing"), 64);
         assert_eq!(missing, FileObservation::Absent);
-        let not_a_file = inspector.read_file(directory.path(), 64);
+        let not_a_file = inputs.read_file(directory.path(), 64);
         assert_eq!(
             not_a_file,
             FileObservation::Absent,
             "a directory is not a file"
         );
-        let within = inspector.read_file(&manifest, 64);
+        let within = inputs.read_file(&manifest, 64);
         assert_eq!(within, FileObservation::Bytes(b"[package]\n".to_vec()));
-        let exact = inspector.read_file(&manifest, 10);
+        let exact = inputs.read_file(&manifest, 10);
         assert_eq!(exact, FileObservation::Bytes(b"[package]\n".to_vec()));
-        let over = inspector.read_file(&manifest, 9);
+        let over = inputs.read_file(&manifest, 9);
         assert_eq!(over, FileObservation::OverBound { bytes: 10 });
-    }
-
-    #[test]
-    fn test_directory_exists_tells_a_directory_from_a_file_and_nothing() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let file = directory.path().join("file");
-        std::fs::write(&file, b"").expect("write file");
-        let mut inspector = inspector();
-        assert!(inspector.directory_exists(directory.path()));
-        assert!(!inspector.directory_exists(&file));
-        assert!(!inspector.directory_exists(&directory.path().join("missing")));
     }
 
     #[test]
@@ -356,27 +322,21 @@ mod tests {
         for name in ["c", "a", "b"] {
             std::fs::write(directory.path().join(name), b"").expect("write entry");
         }
-        let mut inspector = inspector();
-        assert_eq!(
-            inspector.list_directory(directory.path(), 10),
-            ["a", "b", "c"]
-        );
-        assert_eq!(
-            inspector.list_directory(directory.path(), 3),
-            ["a", "b", "c"]
-        );
-        assert_eq!(inspector.list_directory(directory.path(), 2), ["a", "b"]);
-        assert!(inspector.list_directory(directory.path(), 0).is_empty());
-        let missing = inspector.list_directory(&directory.path().join("missing"), 10);
+        let mut inputs = inputs();
+        assert_eq!(inputs.list_directory(directory.path(), 10), ["a", "b", "c"]);
+        assert_eq!(inputs.list_directory(directory.path(), 3), ["a", "b", "c"]);
+        assert_eq!(inputs.list_directory(directory.path(), 2), ["a", "b"]);
+        assert!(inputs.list_directory(directory.path(), 0).is_empty());
+        let missing = inputs.list_directory(&directory.path().join("missing"), 10);
         assert!(missing.is_empty());
     }
 
     #[test]
     fn test_run_captures_stdout_and_a_zero_exit() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
+        let mut inputs = inputs();
         let probe = command("sh", &["-c", "printf ok"], directory.path());
-        let output = inspector.run(&probe).expect("sh runs");
+        let output = inputs.run(&probe).expect("sh runs");
         let expected = CommandOutput {
             exit_code: Some(0),
             stdout: "ok".to_owned(),
@@ -390,9 +350,9 @@ mod tests {
     #[test]
     fn test_run_reports_a_nonzero_exit_code_and_stderr() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
+        let mut inputs = inputs();
         let probe = command("sh", &["-c", "printf err >&2; exit 3"], directory.path());
-        let output = inspector.run(&probe).expect("sh runs");
+        let output = inputs.run(&probe).expect("sh runs");
         assert_eq!(output.exit_code, Some(3));
         assert_eq!(output.stderr, "err");
         assert!(!output.succeeded());
@@ -401,8 +361,8 @@ mod tests {
     #[test]
     fn test_run_starts_in_the_working_directory() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
-        let output = inspector
+        let mut inputs = inputs();
+        let output = inputs
             .run(&command("pwd", &[], directory.path()))
             .expect("pwd runs");
         let printed = std::fs::canonicalize(output.stdout.trim_end()).expect("printed resolves");
@@ -413,13 +373,13 @@ mod tests {
     #[test]
     fn test_run_reports_a_missing_program_as_a_launch_failure() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
+        let mut inputs = inputs();
         let probe = command(
             "rift-test-binary-that-does-not-exist",
             &[],
             directory.path(),
         );
-        let failure = inspector
+        let failure = inputs
             .run(&probe)
             .expect_err("a missing program cannot launch");
         assert_eq!(failure.program, "rift-test-binary-that-does-not-exist");
@@ -429,9 +389,9 @@ mod tests {
     #[test]
     fn test_run_refuses_a_program_spelled_as_a_path_before_spawning() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
+        let mut inputs = inputs();
         for program in ["/bin/sh", "bin/sh"] {
-            let failure = inspector
+            let failure = inputs
                 .run(&command(program, &["-c", "printf ran"], directory.path()))
                 .expect_err("a path is not a bare program name");
             assert_eq!(failure.program, program);
@@ -449,8 +409,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let marker = directory.path().join("ran");
         let touch = format!("touch {}", marker.display());
-        let mut inspector = FilesystemInspector::new(static_policy());
-        let failure = inspector
+        let mut inputs = FilesystemInputs::new(static_policy());
+        let failure = inputs
             .run(&command("sh", &["-c", &touch], directory.path()))
             .expect_err("a static policy runs nothing");
         assert_eq!(failure.program, "sh");
@@ -461,103 +421,11 @@ mod tests {
     #[test]
     fn test_run_inherits_the_server_environment() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut inspector = inspector();
+        let mut inputs = inputs();
         let probe = command("sh", &["-c", r#"printf "%s" "$PATH""#], directory.path());
-        let output = inspector.run(&probe).expect("sh runs");
+        let output = inputs.run(&probe).expect("sh runs");
         let expected = std::env::var("PATH").expect("the test process has a PATH");
         assert_eq!(output.stdout, expected);
-    }
-
-    #[test]
-    fn test_environment_and_home_directory_answer_from_the_process() {
-        let mut inspector = inspector();
-        assert_eq!(inspector.environment("PATH"), std::env::var("PATH").ok());
-        assert_eq!(inspector.environment("RIFT_DEPENDENCY_PROBE_UNSET"), None);
-        assert_eq!(inspector.home_directory(), std::env::home_dir());
-    }
-
-    #[test]
-    fn test_resolve_workspace_catalog_reads_the_manifest_and_lockfile() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path();
-        std::fs::create_dir(root.join("src")).expect("create src");
-        std::fs::write(root.join("src/lib.rs"), "").expect("write lib.rs");
-        let manifest = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
-        std::fs::write(root.join("Cargo.toml"), manifest).expect("write manifest");
-        let lockfile = "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n";
-        std::fs::write(root.join("Cargo.lock"), lockfile).expect("write lockfile");
-        let visible = [
-            ProjectPath("Cargo.lock".to_owned()),
-            ProjectPath("Cargo.toml".to_owned()),
-            ProjectPath("src/lib.rs".to_owned()),
-        ];
-
-        let catalog = resolve_workspace_catalog(root, &visible, ResolutionPolicy::default());
-
-        let inputs: Vec<&str> = catalog.inputs().map(|path| path.0.as_str()).collect();
-        assert_eq!(
-            inputs,
-            ["Cargo.lock", "Cargo.toml"],
-            "{:?}",
-            catalog.degradations()
-        );
-        assert!(!catalog.is_degraded(), "{:?}", catalog.degradations());
-    }
-
-    /// Under `resolution = "static"` the Cargo resolver answers from `Cargo.lock` and
-    /// the standard library entry, which only `rustc` can name, is a degradation.
-    #[test]
-    fn test_resolve_workspace_catalog_static_reads_the_lockfile_and_degrades_the_toolchain() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let root = directory.path();
-        let visible = write_locked_project(root);
-
-        let catalog = resolve_workspace_catalog(root, &visible, static_policy());
-
-        let inputs: Vec<&str> = catalog.inputs().map(|path| path.0.as_str()).collect();
-        assert_eq!(inputs, ["Cargo.lock", "Cargo.toml"]);
-        let names: Vec<String> = catalog
-            .entries()
-            .iter()
-            .map(|entry| format!("{}/{}", entry.identity().manager, entry.identity().name))
-            .collect();
-        assert_eq!(
-            names,
-            ["cargo/serde"],
-            "the lockfile's package is cataloged"
-        );
-        assert!(catalog.is_degraded());
-        let reasons: Vec<&str> = catalog
-            .degradations()
-            .iter()
-            .map(|degradation| degradation.reason.as_str())
-            .collect();
-        assert_eq!(reasons.len(), 2, "{reasons:?}");
-        assert!(
-            reasons[0].starts_with("Cargo.toml: ")
-                && reasons[0].contains(STATIC_RESOLUTION_REASON)
-                && reasons[0].ends_with("; answered from Cargo.lock"),
-            "{}",
-            reasons[0]
-        );
-        assert!(
-            reasons[1].starts_with("rustc unavailable (")
-                && reasons[1].contains(STATIC_RESOLUTION_REASON)
-                && reasons[1].ends_with("; no standard library entry"),
-            "{}",
-            reasons[1]
-        );
-    }
-
-    #[test]
-    fn test_resolve_workspace_catalog_without_manifests_is_empty() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let visible = [ProjectPath("src/lib.rs".to_owned())];
-        let catalog =
-            resolve_workspace_catalog(directory.path(), &visible, ResolutionPolicy::default());
-        assert!(catalog.entries().is_empty());
-        assert_eq!(catalog.inputs().count(), 0);
-        assert!(!catalog.is_degraded());
     }
 
     #[test]
@@ -590,5 +458,127 @@ mod tests {
             .expect_err("an unobserved run has no output");
 
         assert_eq!(failure.reason, "waiting on the process: lost the child");
+    }
+
+    #[test]
+    fn test_run_lays_the_command_overlay_over_the_inherited_environment() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut overlaid = command("printenv", &["RUSTUP_AUTO_INSTALL"], directory.path());
+        overlaid.environment = vec![("RUSTUP_AUTO_INSTALL", "0")];
+        let output = inputs().run(&overlaid).expect("printenv runs");
+        assert_eq!(output.stdout, "0\n");
+    }
+
+    #[test]
+    fn test_run_removes_the_named_variables_from_the_inherited_environment() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut removed = command("printenv", &["HOME"], directory.path());
+        removed.environment_removed = vec!["HOME"];
+        let output = inputs().run(&removed).expect("printenv runs");
+        assert_eq!(output.stdout, "");
+        assert_ne!(
+            output.exit_code,
+            Some(0),
+            "printenv exits nonzero on an unset name"
+        );
+    }
+
+    /// Every file below `root` with its bytes, in path order.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).expect("read");
+                    files.push((path, bytes));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// The installed toolchain names under `RUSTUP_HOME`, or `~/.rustup`.
+    fn installed_toolchains() -> Vec<String> {
+        let home = std::env::var_os("RUSTUP_HOME").map_or_else(
+            || std::env::home_dir().unwrap_or_default().join(".rustup"),
+            PathBuf::from,
+        );
+        let mut names: Vec<String> = std::fs::read_dir(home.join("toolchains"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_context_read_under_an_absent_pinned_toolchain_changes_no_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let mut visible = write_locked_project(root);
+        std::fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.80.0\"\n",
+        )
+        .expect("write toolchain file");
+        std::fs::write(root.join(".nvmrc"), "22.3.0\n").expect("write nvmrc");
+        std::fs::write(root.join("tool.py"), "").expect("write tool.py");
+        visible.push(ProjectPath("tool.py".to_owned()));
+        let files_before = snapshot(root);
+        let toolchains_before = installed_toolchains();
+
+        let context = read_workspace_context(
+            root,
+            &visible,
+            &[],
+            ResolutionPolicy::default(),
+            &[
+                StandardLibrary::Rust,
+                StandardLibrary::Node,
+                StandardLibrary::Python,
+            ],
+        );
+
+        assert_eq!(snapshot(root), files_before);
+        assert_eq!(installed_toolchains(), toolchains_before);
+        let named: Vec<String> = context
+            .entries()
+            .iter()
+            .map(|entry| format!("{}/{}", entry.manager, entry.name))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "cargo/serde",
+                "npm/typescript",
+                "stdlib/node",
+                "stdlib/python",
+                "stdlib/rust"
+            ]
+        );
+        let selector = |name: &str| {
+            context
+                .entries()
+                .iter()
+                .find(|entry| entry.manager == "stdlib" && entry.name == name)
+                .map(|entry| (entry.version.clone(), entry.requirement.clone()))
+        };
+        assert_eq!(
+            selector("rust"),
+            Some((Some("1.80.0".to_owned()), None)),
+            "the pin goes out whether or not rustc could run it: {:?}",
+            context.degradations()
+        );
+        assert_eq!(selector("node"), Some((Some("22.3.0".to_owned()), None)));
+        assert_eq!(selector("python"), Some((None, Some(">=0".to_owned()))));
     }
 }

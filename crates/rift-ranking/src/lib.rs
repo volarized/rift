@@ -4,9 +4,8 @@
 //!
 //! Nothing here opens a database, loads a model, or resolves a project path. A
 //! reader hands this crate ordered identities and receives ordered identities
-//! back, so the project index, a local package index, an in-memory fixture, and
-//! a later database-backed global index all rank through one implementation
-//! instead of four that drift.
+//! back, so the project index and a later database-backed global index rank
+//! through one implementation instead of two that drift.
 //!
 //! The boundary is deliberate. Resolving an identity to a declaration needs the
 //! store that published it; deciding which identities win does not.
@@ -15,9 +14,9 @@ mod document;
 mod error;
 mod fusion;
 mod identifier;
-mod memory;
 mod query;
 mod reader;
+mod tokenizer;
 
 pub use document::{
     CORPUS_TOKENIZER, CorpusRevision, DOCUMENTATION_BYTES_MAX, DocumentFields, DocumentIdentity,
@@ -33,7 +32,6 @@ pub use identifier::{
     IDENTIFIER_CANDIDATES_MAX, IdentifierCandidate, IdentifierMatchClass, IdentifierRanking,
     identifier_candidates, identifier_terms, match_class, split_identifier_words,
 };
-pub use memory::{MemoryIndex, MemoryQueryVector, tokenize};
 pub use query::{
     PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QUERY_BYTES_MAX, QUERY_BYTES_MIN,
     QUERY_PREFIX_ALPHANUMERIC_MIN, QUERY_TERM_BYTES_MAX, QueryMember, QueryPhase,
@@ -42,6 +40,7 @@ pub use reader::{
     CapabilityMismatch, IndexCapabilities, IndexReader, PublicationFormat, RankRequest,
     ReaderFuture,
 };
+pub use tokenizer::tokenize;
 
 /// Compile-time marker for ranking-layer ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

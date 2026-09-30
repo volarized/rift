@@ -1,13 +1,13 @@
-//! A recorded inspector for resolver tests: every answer is scripted, every question logged.
+//! Recorded inputs for resolver tests: every answer is scripted, every question logged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::resolver::{
-    CommandFailure, CommandOutput, FileObservation, Inspector, StaticInputs, ToolchainCommand,
+    CommandFailure, CommandOutput, ContextInputs, FileObservation, StaticInputs, ToolchainCommand,
 };
 
-/// An inspector answering from scripted files, directories, commands, and environment.
+/// Inputs answering from scripted files, directories, resolved paths, and commands.
 ///
 /// Every question a resolver asks lands in `asked`, so a test can assert what the
 /// resolver read and, as important, what it never touched. A path in a question is
@@ -19,8 +19,7 @@ pub(crate) struct RecordedInspector {
     files: BTreeMap<PathBuf, Vec<u8>>,
     directories: BTreeSet<PathBuf>,
     commands: BTreeMap<String, Result<CommandOutput, CommandFailure>>,
-    environment: BTreeMap<String, String>,
-    home: Option<PathBuf>,
+    canonical: BTreeMap<PathBuf, PathBuf>,
     /// Every question asked, rendered one line each, in order.
     pub(crate) asked: Vec<String>,
 }
@@ -63,19 +62,13 @@ impl RecordedInspector {
         self
     }
 
-    /// Scripts one environment variable.
-    pub(crate) fn with_environment(
+    /// Scripts one path's resolved form; an unscripted path resolves to nothing.
+    pub(crate) fn with_canonical(
         mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
+        path: impl Into<PathBuf>,
+        resolved: impl Into<PathBuf>,
     ) -> Self {
-        self.environment.insert(name.into(), value.into());
-        self
-    }
-
-    /// Scripts the home directory.
-    pub(crate) fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
-        self.home = Some(home.into());
+        self.canonical.insert(path.into(), resolved.into());
         self
     }
 
@@ -134,12 +127,10 @@ impl StaticInputs for RecordedInspector {
             Some(bytes) => FileObservation::Bytes(bytes.clone()),
         }
     }
-}
 
-impl Inspector for RecordedInspector {
-    fn directory_exists(&mut self, path: &Path) -> bool {
-        self.asked.push(format!("exists {}", spelled(path)));
-        self.directories.contains(path)
+    fn canonical_path(&mut self, path: &Path) -> Option<PathBuf> {
+        self.asked.push(format!("canonical {}", spelled(path)));
+        self.canonical.get(path).cloned()
     }
 
     fn list_directory(&mut self, path: &Path, entries_max: usize) -> Vec<String> {
@@ -154,26 +145,32 @@ impl Inspector for RecordedInspector {
         }
         names.into_iter().take(entries_max).collect()
     }
+}
 
+impl ContextInputs for RecordedInspector {
+    /// Answers the scripted run keyed by the rendered invocation. The environment
+    /// overlay lands in `asked` after the working directory, so a test sees each
+    /// variable the run carried.
     fn run(&mut self, command: &ToolchainCommand) -> Result<CommandOutput, CommandFailure> {
         let rendered = command.rendered();
+        let overlay: String = command
+            .environment
+            .iter()
+            .map(|(name, value)| format!(" with {name}={value}"))
+            .chain(
+                command
+                    .environment_removed
+                    .iter()
+                    .map(|name| format!(" without {name}")),
+            )
+            .collect();
         self.asked.push(format!(
-            "run {rendered} in {}",
+            "run {rendered} in {}{overlay}",
             spelled(&command.working_directory)
         ));
         self.commands
             .get(&rendered)
             .cloned()
             .unwrap_or_else(|| Self::unavailable(command.program))
-    }
-
-    fn environment(&mut self, name: &str) -> Option<String> {
-        self.asked.push(format!("environment {name}"));
-        self.environment.get(name).cloned()
-    }
-
-    fn home_directory(&mut self) -> Option<PathBuf> {
-        self.asked.push("home".to_owned());
-        self.home.clone()
     }
 }

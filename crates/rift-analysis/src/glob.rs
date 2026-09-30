@@ -1,13 +1,49 @@
 //! Shared project-relative glob matching: one compiled matcher, reused by workspace-visibility
-//! loading (the `[source]` table) and by search's `paths` selector, so both apply identical
-//! glob semantics - `*` never crosses `/`, `**` does, character classes work the same way.
+//! loading (the `[source]` table), by search's `paths` selector, and by package file selection,
+//! so all three apply identical glob semantics - `*` never crosses `/`, `**` does, character
+//! classes work the same way.
 
 use std::path::{Path, PathBuf};
 
 use ignore::Match;
 use ignore::overrides::{Override, OverrideBuilder};
+use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
 
-use crate::workspace::{WorkspaceIndexError, WorkspaceIndexViolation, index_error_caused_by};
+/// One glob list that does not compile: the pattern that broke it, when one pattern alone
+/// did, and the glob compiler's own refusal.
+#[derive(Debug)]
+pub struct SourcePatternFault {
+    pattern: Option<String>,
+    source: ignore::Error,
+}
+
+impl SourcePatternFault {
+    /// The pattern the glob compiler refused, when one pattern alone caused the failure.
+    #[must_use]
+    pub fn pattern(&self) -> Option<&str> {
+        self.pattern.as_deref()
+    }
+}
+
+impl Fault for SourcePatternFault {
+    fn name(&self) -> ErrorName {
+        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+    }
+
+    fn context(&self) -> Vec<ErrorContext> {
+        self.pattern
+            .iter()
+            .map(|pattern| ErrorContext::new("pattern", pattern.clone()))
+            .collect()
+    }
+
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A glob list that does not compile.
+pub type SourcePatternError = Error<SourcePatternFault>;
 
 /// What the `[source]` globs say about one path, in the table's own precedence order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,12 +105,12 @@ impl PathMatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] when a pattern is not a valid glob.
+    /// Returns [`SourcePatternError`] when a pattern is not a valid glob.
     pub fn build(
         root: &Path,
         include: &[String],
         exclude: &[String],
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, SourcePatternError> {
         Self::build_with_force_include(root, include, exclude, &[])
     }
 
@@ -84,13 +120,13 @@ impl PathMatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceIndexError`] when a pattern is not a valid glob.
+    /// Returns [`SourcePatternError`] when a pattern is not a valid glob.
     pub fn build_with_force_include(
         root: &Path,
         include: &[String],
         exclude: &[String],
         force_include: &[String],
-    ) -> Result<Self, WorkspaceIndexError> {
+    ) -> Result<Self, SourcePatternError> {
         Ok(Self {
             root: root.to_path_buf(),
             include: compiled_override(root, include)?,
@@ -212,18 +248,24 @@ fn plain_root_relative_pattern(pattern: &str) -> Option<&str> {
 fn compiled_override(
     root: &Path,
     patterns: &[String],
-) -> Result<Option<Override>, WorkspaceIndexError> {
+) -> Result<Option<Override>, SourcePatternError> {
     if patterns.is_empty() {
         return Ok(None);
     }
     let mut builder = OverrideBuilder::new(root);
     for pattern in patterns {
-        builder.add(pattern).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::SourcePatternInvalid, None, error)
+        builder.add(pattern).map_err(|source| {
+            Error::new(SourcePatternFault {
+                pattern: Some(pattern.clone()),
+                source,
+            })
         })?;
     }
-    builder.build().map(Some).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::SourcePatternInvalid, None, error)
+    builder.build().map(Some).map_err(|source| {
+        Error::new(SourcePatternFault {
+            pattern: None,
+            source,
+        })
     })
 }
 
@@ -402,24 +444,52 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_force_include_glob_refuses_with_source_pattern_invalid() {
+    fn test_invalid_force_include_glob_refuses_naming_the_pattern() {
         let root = Path::new("/workspace");
         let error = PathMatcher::build_with_force_include(root, &[], &[], &["[".to_owned()])
             .expect_err("an unclosed character class must be refused");
+        assert_eq!(error.fault().pattern(), Some("["));
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::SourcePatternInvalid
+            error.name(),
+            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
         );
     }
 
     #[test]
-    fn test_invalid_glob_refuses_with_source_pattern_invalid() {
+    fn test_invalid_glob_refuses_naming_the_pattern_and_its_cause() {
+        use std::error::Error as _;
+
         let root = Path::new("/workspace");
-        let error = PathMatcher::build(root, &["[".to_owned()], &[])
+        let error = PathMatcher::build(root, &["src/**".to_owned(), "[".to_owned()], &[])
             .expect_err("an unclosed character class must be refused");
-        assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::SourcePatternInvalid
+        assert_eq!(error.fault().pattern(), Some("["));
+        assert_eq!(error.context(), [ErrorContext::new("pattern", "[")]);
+        assert!(
+            error.source().is_some(),
+            "the glob compiler's refusal is the cause"
+        );
+    }
+
+    /// Wildcards one glob may carry and still parse, past what the matcher they compile
+    /// to fits in: globset caps the compiled matcher at 10 MiB, and each `?` compiles to
+    /// its own byte class.
+    const OVERSIZED_GLOB_WILDCARDS: usize = 1_000_000;
+
+    /// Each pattern parses, and the list refuses only when it compiles as a whole, so the
+    /// refusal names no single pattern and keeps the compiler's cause.
+    #[test]
+    fn test_a_glob_list_past_the_compiled_size_limit_refuses_naming_no_pattern() {
+        use std::error::Error as _;
+
+        let root = Path::new("/workspace");
+        let oversized = "?".repeat(OVERSIZED_GLOB_WILDCARDS);
+        let error = PathMatcher::build(root, &[oversized], &[])
+            .expect_err("a matcher past the compiled size limit must be refused");
+        assert_eq!(error.fault().pattern(), None);
+        assert!(error.context().is_empty());
+        assert!(
+            error.source().is_some(),
+            "the glob compiler's refusal is the cause"
         );
     }
 }

@@ -82,7 +82,7 @@ pub(crate) trait GrammarRules {
 pub(crate) struct Declaration {
     /// Declared short name.
     pub(crate) name: String,
-    /// The provider's kind word behind the wire kind `{language}.{kind}`.
+    /// The provider's kind word, carried on the wire unchanged.
     pub(crate) kind: &'static str,
     /// Portable categories, in the grammar's declared order.
     pub(crate) facets: Vec<SymbolFacet>,
@@ -226,12 +226,27 @@ fn qualified_symbol(
     })
 }
 
+/// The terminator a bodyless declaration ends its item text with in every
+/// grammar that spells one: `fn next(&mut self) -> Option<Self::Item>;`,
+/// `map<U>(callbackfn: (value: T) => U): U[];`.
+const DECLARATION_TERMINATOR: char = ';';
+
+/// A bodyless declaration's own item text as its signature, without its
+/// closing `DECLARATION_TERMINATOR` and the whitespace around it.
+fn bodyless_display(item: &str) -> &str {
+    let item = item.trim_end();
+    item.strip_suffix(DECLARATION_TERMINATOR)
+        .unwrap_or(item)
+        .trim_end()
+}
+
 /// One rendered callable form for a declaration the grammar marks
-/// [`SymbolFacet::Callable`] and gives an implementation: the source text
-/// from the declaration's own item start to where that implementation
-/// begins, trimmed of trailing whitespace. `None` for a declaration that is
-/// not callable, or one with no implementation - a trait method with no
-/// body, an interface method signature.
+/// [`SymbolFacet::Callable`]: the source text from the declaration's own item
+/// start to where its implementation begins, trimmed of trailing whitespace.
+/// A declaration with no implementation - a trait method with no body, an
+/// interface method signature, a TypeScript overload - renders its whole item
+/// text without the closing `;`. `None` for a declaration that is not
+/// callable.
 ///
 /// This is the one place `signatures` is derived: every provider's grammar
 /// already states whether a kind is callable (`Declaration::facets`) and
@@ -246,14 +261,18 @@ fn callable_signature(
     if !declaration.facets.contains(&SymbolFacet::Callable) {
         return None;
     }
-    let body_range = declaration.body_range?;
     let start = node.start_byte();
-    let end = usize::try_from(body_range.start)
-        .unwrap_or(text.len())
-        .min(text.len());
-    let display = text.get(start..end)?.trim_end().to_owned();
+    let display = match declaration.body_range {
+        Some(body_range) => {
+            let end = usize::try_from(body_range.start)
+                .unwrap_or(text.len())
+                .min(text.len());
+            text.get(start..end)?.trim_end()
+        }
+        None => bodyless_display(text.get(start..node.end_byte())?),
+    };
     Some(Signature {
-        display,
+        display: display.to_owned(),
         links: Vec::new(),
         language: language.clone(),
         receiver: None,

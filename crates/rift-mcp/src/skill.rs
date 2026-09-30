@@ -103,6 +103,12 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: Some("with `scope: \"global\"`, or `\"all\"` to answer the project's own too"),
     },
     DecisionRow {
+        situation: "A package version the project does not use, or a package it lacks, is \
+                    needed.",
+        tools: &["get_symbol", "search"],
+        note: Some("with `packages` and `scope: \"global\"` or `\"all\"`"),
+    },
+    DecisionRow {
         situation: "The syntax structure at one position is needed.",
         tools: &["nodes"],
         note: None,
@@ -419,6 +425,21 @@ mod tests {
             assert!(
                 rendered
                     .contains("Rift writes no source: apply a change with your own edit tools."),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_table_routes_a_package_the_project_lacks_to_packages() {
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            assert!(
+                rendered.contains(
+                    "| A package version the project does not use, or a package it lacks, is \
+                     needed. | `get_symbol`, `search` (with `packages` and `scope: \"global\"` \
+                     or `\"all\"`) |"
+                ),
                 "{rendered}"
             );
         }

@@ -7,6 +7,9 @@
 //! Export orchestration lives in `rift-schema-export`; this module owns only
 //! the schema for the MCP surface served by [`RiftMcp`].
 
+use std::sync::Arc;
+
+use rmcp::handler::server::router::tool::ToolRouter;
 use serde_json::json;
 
 use crate::RiftMcp;
@@ -14,6 +17,28 @@ use crate::RiftMcp;
 /// One-line summary rendered at the top of the exported document.
 const DOCUMENT_DESCRIPTION: &str =
     "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.";
+
+impl RiftMcp {
+    /// The tool router the server serves and [`schema_document`] exports: the routes the
+    /// `#[tool]` methods declare, with no optional property advertising a `null` arm.
+    ///
+    /// rmcp derives every tool schema through its own `SchemaSettings::draft2020_12()`
+    /// generator, which takes no transform, and schemars gives each `Option<T>` field a
+    /// `null` arm. The wire models omit an absent optional field, so every served schema
+    /// passes [`rift_protocol::schema::strip_optional_null_arms`] here, the one path from
+    /// the declared routes to a caller.
+    pub(crate) fn tool_router() -> ToolRouter<Self> {
+        let mut router = Self::declared_tool_router();
+        for route in router.map.values_mut() {
+            let tool = &mut route.attr;
+            rift_protocol::schema::strip_optional_null_arms(Arc::make_mut(&mut tool.input_schema));
+            if let Some(output) = tool.output_schema.as_mut() {
+                rift_protocol::schema::strip_optional_null_arms(Arc::make_mut(output));
+            }
+        }
+        router
+    }
+}
 
 /// Renders the document the docs site publishes: one entry per served tool
 /// with its name, description, input schema, and output schema, sorted by

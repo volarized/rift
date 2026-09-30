@@ -87,7 +87,7 @@ const DIFFERENCES: {
   {
     statement: "Source from the project and its dependencies.",
     title: "Dependency discovery",
-    body: "Rift finds installed dependencies and makes their public declarations and docs discoverable together with project source.",
+    body: "Rift works in accordance with your project context and dependencies, providing details about them for your agents.",
     line: "shimizu",
     // The butterfly stands in the x - z plane; turn it to face the camera.
     tilt: 1.5,

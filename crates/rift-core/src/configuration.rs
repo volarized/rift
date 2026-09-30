@@ -13,9 +13,9 @@
 
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
-    ConfigurationViolation, LanguageConfiguration, SearchConfiguration, UnitParseError,
-    WorkspaceConfiguration,
+    ConfigurationViolation, LanguageConfiguration, UnitParseError, WorkspaceConfiguration,
 };
+use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
 use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
@@ -104,6 +104,7 @@ pub struct LanguageFileSelection {
     enabled: bool,
     include: Option<Vec<String>>,
     exclude: Vec<String>,
+    stdlib: bool,
 }
 
 impl LanguageFileSelection {
@@ -131,6 +132,13 @@ impl LanguageFileSelection {
         &self.exclude
     }
 
+    /// Whether the dependency context names this language's standard library for the
+    /// paths it matches.
+    #[must_use]
+    pub const fn stdlib(&self) -> bool {
+        self.stdlib
+    }
+
     fn from_entry(identity: &str, configuration: &LanguageConfiguration) -> Self {
         let patterns = |list: &[rift_protocol::read::PathPattern]| {
             list.iter().map(|pattern| pattern.0.clone()).collect()
@@ -140,6 +148,7 @@ impl LanguageFileSelection {
             enabled: configuration.enabled,
             include: configuration.include.as_deref().map(patterns),
             exclude: patterns(&configuration.exclude),
+            stdlib: configuration.stdlib,
         }
     }
 }
@@ -170,21 +179,32 @@ impl From<&WorkspaceConfiguration> for LanguageFileSelections {
     }
 }
 
-/// Resolved `[search.text]` path selection and chunk bound.
+/// Resolved `[search.text]` path selection and chunk bound, and the `[documentation]`
+/// table deciding which of the text files the index reads it collects as documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFileInclusion {
     include: Vec<String>,
     chunk_bytes_max: u64,
+    documentation: DocumentationConfiguration,
 }
 
 impl TextFileInclusion {
-    /// Builds one text-file policy from its patterns and chunk bound.
+    /// Builds one text-file policy from its patterns and chunk bound, collecting
+    /// documentation under the `[documentation]` defaults.
     #[must_use]
-    pub const fn new(include: Vec<String>, chunk_bytes_max: u64) -> Self {
+    pub fn new(include: Vec<String>, chunk_bytes_max: u64) -> Self {
         Self {
             include,
             chunk_bytes_max,
+            documentation: DocumentationConfiguration::default(),
         }
+    }
+
+    /// This policy collecting documentation under `documentation` instead of the defaults.
+    #[must_use]
+    pub fn with_documentation(mut self, documentation: DocumentationConfiguration) -> Self {
+        self.documentation = documentation;
+        self
     }
 
     /// Patterns selecting plain text when no language claims a path.
@@ -198,26 +218,32 @@ impl TextFileInclusion {
     pub const fn chunk_bytes_max(&self) -> u64 {
         self.chunk_bytes_max
     }
-}
 
-impl Default for TextFileInclusion {
-    /// Uses default `[search.text]` chunk bound.
-    fn default() -> Self {
-        Self::from(&SearchConfiguration::default())
+    /// Which text files the index collects as documentation.
+    #[must_use]
+    pub const fn documentation(&self) -> &DocumentationConfiguration {
+        &self.documentation
     }
 }
 
-impl From<&SearchConfiguration> for TextFileInclusion {
-    fn from(search: &SearchConfiguration) -> Self {
+impl Default for TextFileInclusion {
+    /// Uses the default `[search.text]` chunk bound and `[documentation]` table.
+    fn default() -> Self {
+        Self::from(&WorkspaceConfiguration::default())
+    }
+}
+
+impl From<&WorkspaceConfiguration> for TextFileInclusion {
+    fn from(configuration: &WorkspaceConfiguration) -> Self {
+        let text = &configuration.search.text;
         Self::new(
-            search
-                .text
-                .include
+            text.include
                 .iter()
                 .map(|pattern| pattern.0.clone())
                 .collect(),
-            search.text.max_chunk.bytes(),
+            text.max_chunk.bytes(),
         )
+        .with_documentation(configuration.documentation.clone())
     }
 }
 
@@ -274,20 +300,28 @@ mod tests {
     }
 
     #[test]
-    fn test_text_file_inclusion_converts_from_wire_search_configuration() {
-        let mut search = rift_protocol::configuration::SearchConfiguration::default();
-        search.text.max_chunk = ByteSize::from_bytes(2 << 20);
-        let inclusion = TextFileInclusion::from(&search);
+    fn test_text_file_inclusion_converts_from_wire_configuration() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.max_chunk = ByteSize::from_bytes(2 << 20);
+        configuration.documentation.enabled = false;
+        configuration.documentation.exclude = vec![PathPattern("docs/internal/**".to_owned())];
+        let inclusion = TextFileInclusion::from(&configuration);
         assert_eq!(inclusion.chunk_bytes_max(), 2 << 20);
+        assert_eq!(inclusion.documentation(), &configuration.documentation);
     }
 
     #[test]
-    fn test_text_file_inclusion_default_matches_default_search_configuration() {
+    fn test_text_file_inclusion_default_matches_default_configuration() {
         let inclusion = TextFileInclusion::default();
         assert_eq!(inclusion.chunk_bytes_max(), 1 << 20);
+        assert!(inclusion.documentation().enabled);
         assert_eq!(
             inclusion,
-            TextFileInclusion::from(&rift_protocol::configuration::SearchConfiguration::default())
+            TextFileInclusion::from(&WorkspaceConfiguration::default())
+        );
+        assert_eq!(
+            TextFileInclusion::new(Vec::new(), 1 << 20).documentation(),
+            &DocumentationConfiguration::default()
         );
     }
 
