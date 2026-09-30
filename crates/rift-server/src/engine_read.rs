@@ -134,20 +134,15 @@ impl EngineReferences {
         mut named: impl FnMut(&PackageCallee) -> Option<CalleeDeclaration>,
     ) {
         for callee in std::mem::take(&mut self.package_callees) {
-            let declaration = named(&callee).and_then(|declaration| {
-                Some(PackageDeclaration {
+            let answered = named(&callee).and_then(|declaration| {
+                let end = CoreSymbolId::new(declaration.id.0.clone()).ok()?;
+                let held = PackageDeclaration {
                     symbol: callee.symbol(&declaration)?,
                     unit: callee.unit(&declaration.package)?,
-                })
+                };
+                Some((declaration.id, end, held))
             });
-            let Some(declaration) = declaration else {
-                self.dropped_callees = self.dropped_callees.saturating_add(1);
-                continue;
-            };
-            let Some(id) = declaration.symbol.id.clone() else {
-                continue;
-            };
-            let Ok(end) = CoreSymbolId::new(id.0.clone()) else {
+            let Some((id, end, declaration)) = answered else {
                 self.dropped_callees = self.dropped_callees.saturating_add(1);
                 continue;
             };
