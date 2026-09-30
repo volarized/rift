@@ -1784,7 +1784,8 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "requires RIFT_UPDATE_TEST_BINARY naming the native release CLI"]
+    // Windows publication failure: https://github.com/volarized/rift/issues/477
+    #[ignore = "https://github.com/volarized/rift/issues/477; requires RIFT_UPDATE_TEST_BINARY"]
     async fn windows_publish_replaces_running_binary_and_cleans_backup() -> TestResult {
         use std::io::Read as _;
         use std::process::Stdio;

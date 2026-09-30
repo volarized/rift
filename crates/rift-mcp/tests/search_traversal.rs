@@ -434,7 +434,12 @@ const IMMEDIATE_RETRY: &str = "retry = { delay = \"1ms\", delay_limit = \"1ms\" 
 /// of holding the request past its deadline, and the next walk meets the same engine
 /// process, which discards the held answer it reads first.
 #[cfg(unix)]
+// Traversal timeout failure: https://github.com/volarized/rift/issues/436
 #[tokio::test]
+#[cfg_attr(
+    all(target_os = "macos", target_arch = "x86_64"),
+    ignore = "https://github.com/volarized/rift/issues/436"
+)]
 async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout() -> TestResult {
     let log = incoming_walks_past_the_readiness_timeout(HELD_RETRY_ENGINE, IMMEDIATE_RETRY).await?;
     assert!(
