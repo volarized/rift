@@ -19,7 +19,7 @@ fn position(line: i64) -> PackagePosition {
     }
 }
 
-fn declaration_request() -> PackageDeclarationRequest {
+pub(super) fn declaration_request() -> PackageDeclarationRequest {
     PackageDeclarationRequest {
         position_encoding: PackageDeclarationRequestPositionEncoding::Utf16,
         positions: vec![position(3), position(0)],
