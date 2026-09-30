@@ -86,7 +86,10 @@ which leaves build metadata aside, so two builds of `0.0.45` stand level whateve
 The stop request carries the token the lock records, and every server mints its own, so it stops
 the one server the proxy read and never a server another proxy started after it. A proxy stops at
 most one server per connect: when another older server takes the election after the first one
-left, the proxy refuses rather than race the process that started it.
+left, the proxy refuses rather than race the process that started it. A stop request that fails
+in transport decides nothing, since a server another proxy already stopped closes the connection
+as it exits. The proxy reads the election again, as after an accepted request, and refuses only
+when its 30-second wait for publication ends with that same server still serving.
 
 ### rift server
 

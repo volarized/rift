@@ -47,7 +47,8 @@ use harness::{
     rust_engine_workspace, within, workspace,
 };
 use rift_mcp::{
-    BuildCheckout, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe,
+    BuildCheckout, ElectionGuard, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim,
+    probe,
 };
 use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::lock::{
@@ -363,8 +364,9 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
 /// A workspace server this test holds in place of a `rift server` of another release.
 ///
 /// It holds the election, publishes its lock document, and answers an authorized
-/// `POST /api/stop` the way a server does - `202 Accepted` - then closes its port and
-/// releases the election, so another server can be elected.
+/// `POST /api/stop` the way a server does - `202 Accepted`, or a reset connection from
+/// one already stopping - then closes its port and releases the election, so another
+/// server can be elected.
 struct RecordedServer {
     accepted: Arc<AtomicUsize>,
     stop: Arc<Notify>,
@@ -372,9 +374,13 @@ struct RecordedServer {
 }
 
 impl RecordedServer {
-    /// Starts a server whose lock records `version`, in the shape a release that
-    /// digested its executable wrote: `executable_digest` beside the version.
-    async fn start(root: &Path, version: &str) -> TestResult<Self> {
+    /// Holds the election, binds a port, and publishes a lock recording `version`, in the
+    /// shape a release that digested its executable wrote: `executable_digest` beside the
+    /// version. Answers the guard, the bound port, and the token the lock records.
+    async fn published(
+        root: &Path,
+        version: &str,
+    ) -> TestResult<(ElectionGuard, tokio::net::TcpListener, String)> {
         let guard = claim(root)?;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let token = "r".repeat(SERVER_TOKEN_LENGTH);
@@ -389,6 +395,12 @@ impl RecordedServer {
             },
         });
         fs::write(document_path(root), serde_json::to_vec(&document)?)?;
+        Ok((guard, listener, token))
+    }
+
+    /// Starts a server whose lock records `version` and that accepts a stop request.
+    async fn start(root: &Path, version: &str) -> TestResult<Self> {
+        let (guard, listener, token) = Self::published(root, version).await?;
         let accepted = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(Notify::new());
         let expected = format!("Bearer {token}");
@@ -427,7 +439,47 @@ impl RecordedServer {
         })
     }
 
-    /// How many authorized stop requests the server accepted.
+    /// Starts a server whose lock records `version` and that is already stopping when the
+    /// stop request arrives: it resets that request's connection without an answer, which
+    /// reaches the proxy as a transport failure, as the exit of a stopping server does on
+    /// Windows. Then it closes its port and releases the election.
+    async fn start_resetting_stop(root: &Path, version: &str) -> TestResult<Self> {
+        let (guard, listener, token) = Self::published(root, version).await?;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(Notify::new());
+        let expected = format!("authorization: bearer {token}");
+        let (counted, shutdown) = (Arc::clone(&accepted), Arc::clone(&stop));
+        let served = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    () = shutdown.notified() => break,
+                    connection = listener.accept() => connection?,
+                };
+                // A presence probe connects and sends nothing; only the stop request
+                // arrives with a head.
+                let mut head = vec![0_u8; 4_096];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut head)
+                    .await
+                    .unwrap_or(0);
+                let head = String::from_utf8_lossy(&head[..read]).to_ascii_lowercase();
+                if head.starts_with("post /api/stop") && head.contains(&expected) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    stream.set_zero_linger()?;
+                    break;
+                }
+            }
+            drop(listener);
+            drop(guard);
+            Ok::<(), std::io::Error>(())
+        });
+        Ok(Self {
+            accepted,
+            stop,
+            served,
+        })
+    }
+
+    /// How many authorized stop requests the server acted on.
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
@@ -457,6 +509,31 @@ async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
     assert!(
         older.accepted() >= 1,
         "the proxy asks the older server to stop"
+    );
+    older.stopped().await?;
+    let serving = serving_document(root).ok_or("a server of this build must serve")?;
+    assert_eq!(serving.identity, rift_binary_identity()?);
+    assert_ne!(serving.pid, std::process::id());
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A stop request that meets an older server already stopping fails in transport, and
+/// does not decide the outcome: the proxy reads the election again, finds it released,
+/// starts a server from its own binary, and serves the request.
+#[tokio::test]
+async fn a_stop_reset_by_a_leaving_older_server_still_ends_with_a_new_server() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let older = RecordedServer::start_resetting_stop(root, "0.0.1").await?;
+
+    let client = proxy_client(root).await?;
+    assert_beacon(&beacon_lookup(&client).await?);
+    assert_eq!(
+        older.accepted(),
+        1,
+        "the proxy asks the older server to stop once"
     );
     older.stopped().await?;
     let serving = serving_document(root).ok_or("a server of this build must serve")?;
