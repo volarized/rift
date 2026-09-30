@@ -7,7 +7,7 @@ use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 use crate::lock::{LIVE_LOCK_ATTEMPTS_MAX, lock_live_checked};
 use crate::{
     ChangedPath, CommitRecord, DeclarationChange, HistoryStore, MovedDeclaration, RenamedPath,
-    StoreFault, StoreLocation,
+    STORE_FOLDER_NAME, StoreFault, StoreLocation,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -231,7 +231,7 @@ fn a_second_filler_is_refused_while_readers_read() -> TestResult {
 #[test]
 fn sweep_deletes_only_revisions_no_live_server_holds() -> TestResult {
     let folder = tempfile::tempdir()?;
-    let rift = folder.path().join("rift");
+    let rift = folder.path().join(STORE_FOLDER_NAME);
     let held = HistoryStore::open(&StoreLocation::new(folder.path(), "bb"))?;
     drop(filled(folder.path(), "aa")?);
     let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
@@ -344,7 +344,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
     let fallback = store
         .worktree_fallback()
         .ok_or("the store names the refusal")?;
-    assert_eq!(fallback.refused(), git.join("rift"));
+    assert_eq!(fallback.refused(), git.join(STORE_FOLDER_NAME));
     let cause = fallback
         .cause()
         .fault()
@@ -353,7 +353,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(store.location().folder(), worktree_state);
     assert!(worktree_state.join("store-aa.db").exists());
-    assert!(!git.join("rift").exists());
+    assert!(!git.join(STORE_FOLDER_NAME).exists());
 
     let mut filler = store.filler()?.ok_or("the filler takes the lock")?;
     filler.write_batch(&[commit("c1", None, 10, "Add lexical search")])?;
@@ -396,7 +396,7 @@ fn a_folder_refusal_other_than_access_keeps_the_refusal_without_a_fallback() -> 
 #[test]
 fn sweep_skips_a_live_lock_it_cannot_open() -> TestResult {
     let folder = tempfile::tempdir()?;
-    let rift = folder.path().join("rift");
+    let rift = folder.path().join(STORE_FOLDER_NAME);
     drop(filled(folder.path(), "aa")?);
     std::fs::create_dir_all(rift.join("store-zz.live.lock"))?;
     let current = HistoryStore::open(&StoreLocation::new(folder.path(), "cc"))?;
@@ -412,7 +412,7 @@ fn sweep_skips_a_live_lock_it_cannot_open() -> TestResult {
 #[test]
 fn sweep_reports_a_file_it_cannot_delete_and_keeps_the_revisions_live_lock() -> TestResult {
     let folder = tempfile::tempdir()?;
-    let rift = folder.path().join("rift");
+    let rift = folder.path().join(STORE_FOLDER_NAME);
     std::fs::create_dir_all(rift.join("store-aa.db"))?;
     std::fs::write(rift.join("store-aa.db/held"), b"")?;
     std::fs::write(rift.join("store-aa.live.lock"), b"")?;
@@ -449,7 +449,7 @@ fn a_writable_common_git_directory_keeps_the_store_there() -> TestResult {
 
     assert!(store.worktree_fallback().is_none());
     assert_eq!(store.location().revision(), "aa");
-    assert!(checkout.path().join(".git/rift/store-aa.db").exists());
+    assert!(checkout.path().join(".git/.rift/store-aa.db").exists());
     assert!(!worktree_state.exists());
     Ok(())
 }

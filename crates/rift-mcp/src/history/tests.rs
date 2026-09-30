@@ -214,7 +214,7 @@ async fn a_lane_fills_the_store_in_the_background_and_each_build_its_own_file() 
     wait_until_held(root, BUILD_A, &head).await?;
     wait_until_held(root, BUILD_B, &head).await?;
 
-    let files: Vec<String> = fs::read_dir(root.join(".git/rift"))?
+    let files: Vec<String> = fs::read_dir(root.join(".git/.rift"))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<Result<_, _>>()?;
     let databases = files
@@ -360,7 +360,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_on
 
     let opened = opened.ok_or("the worktree's state directory takes the store")?;
     assert_eq!(opened.store.location().folder(), root.join(".rift"));
-    assert!(!root.join(".git/rift").exists());
+    assert!(!root.join(".git").join(STORE_FOLDER_NAME).exists());
     let recorded = drain.try_recv_record().map_err(|error| error.to_string())?;
     assert_eq!(recorded.level(), "warn");
     assert_eq!(recorded.operation(), "history.open");
@@ -385,7 +385,8 @@ async fn a_disabled_history_provider_opens_no_store() -> TestResult {
     .await;
 
     assert!(lane.is_none());
-    assert!(!directory.path().join(".git/rift").exists());
+    let folder = directory.path().join(".git").join(STORE_FOLDER_NAME);
+    assert!(!folder.exists());
     Ok(())
 }
 

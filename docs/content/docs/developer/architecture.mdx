@@ -357,9 +357,9 @@ the commit's author, time, and message, the paths it changed, the files it renam
 changed byte, and the declarations whose shape changed. Git stays the source of truth, and a
 stored commit id names the git object it came from.
 
-One store serves every worktree of a repository. It lives in the common git directory, so
-worktrees analyze the commits they share once; when that directory refuses writes, the store sits
-in the worktree's own `.rift/` folder instead.
+One store serves every worktree of a repository. It lives in the `.rift/` folder of the common git
+directory, `.git/.rift/` in a plain checkout, so worktrees analyze the commits they share once; when
+that directory refuses writes, the store sits in the worktree's own `.rift/` folder instead.
 
 A history task fills the store. The server spawns it at start, and it analyzes newest first, so
 recent history answers soon, writing bounded batches at the share of one core `cpu_share` sets.

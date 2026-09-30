@@ -5,13 +5,15 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use rift_core::Error;
+use rift_core::constants::RIFT_STATE_DIRECTORY;
 
 use crate::database::{StoreFiller, StoreReader, create_schema};
 use crate::error::{StoreError, StoreFault, folder_error};
 use crate::lock::{lock_live, open_lock};
 
-/// The folder inside the common git directory that holds every store file.
-pub const STORE_FOLDER_NAME: &str = "rift";
+/// The folder inside the common git directory that holds every store file:
+/// `.rift`, the spelling of every Rift state directory.
+pub const STORE_FOLDER_NAME: &str = RIFT_STATE_DIRECTORY;
 
 /// The file-name prefix every store file of one repository shares.
 const STORE_FILE_PREFIX: &str = "store-";
@@ -24,7 +26,7 @@ const LIVE_LOCK_SUFFIX: &str = ".live.lock";
 /// The suffix of the lock the one filler holds exclusively.
 const FILL_LOCK_SUFFIX: &str = ".fill.lock";
 
-/// Where one derivation revision's store lives: the `rift/` folder of the
+/// Where one derivation revision's store lives: the `.rift/` folder of the
 /// common git directory, with the worktree's state directory as the folder a
 /// refusal falls back to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +37,7 @@ pub struct StoreLocation {
 }
 
 impl StoreLocation {
-    /// The store for `revision` inside `<common_git_directory>/rift/`.
+    /// The store for `revision` inside `<common_git_directory>/.rift/`.
     #[must_use]
     pub fn new(common_git_directory: &Path, revision: &str) -> Self {
         Self {

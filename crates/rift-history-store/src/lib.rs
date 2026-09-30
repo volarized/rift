@@ -5,7 +5,7 @@
 //! `[providers.history]` strategy selects: one row per analyzed commit, the
 //! paths it changed against the commit it was compared with, the pure renames
 //! among them, and the declarations whose shape changed. It lives in the
-//! `rift/` folder of the common git directory, one database file per
+//! `.rift/` folder of the common git directory, one database file per
 //! derivation revision, so two builds sharing a repository each fill and read
 //! their own file. When the common git directory refuses that folder, the
 //! store sits in the worktree's own state directory instead, and
