@@ -178,6 +178,11 @@ is the exception: the published index still applies the ignore files it was buil
 rebuilding that one file changes nothing, and the read asks for the whole workspace without
 waiting for the watcher to report the `.gitignore` write.
 
+The watcher can report that `.gitignore` write after the read's capture already found it. The
+report asks for the whole workspace, so it supersedes the rebuild the read asked for, and the
+read captures again: a capture that matches its previous one waits for the next rebuild, and only
+a capture that differs, a tree still moving, answers from the published index with `stale_index`.
+
 <VersionBadge version="v0.0.46" />
 
 The capture records each file's stat beside its digests: the length and modification time, and

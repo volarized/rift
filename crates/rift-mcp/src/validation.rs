@@ -785,8 +785,15 @@ impl IndexValidation {
 
     /// Latest successful capture superseded after this publication was built, if any.
     pub(crate) fn superseded_after(&self, published_epoch: u64) -> Option<u64> {
-        let epoch = self.superseded_epoch.load(Ordering::SeqCst);
+        let epoch = self.superseded_epoch();
         (epoch > published_epoch).then_some(epoch)
+    }
+
+    /// Epoch of the latest successful capture superseded at publication.
+    ///
+    /// Zero before the first one.
+    pub(crate) fn superseded_epoch(&self) -> u64 {
+        self.superseded_epoch.load(Ordering::SeqCst)
     }
 
     /// Installs one publication under publication linearization.
@@ -2877,8 +2884,9 @@ async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, e
 /// hands nothing to the lanes.
 ///
 /// A superseded candidate hands nothing to the lane. A successful capture superseded at
-/// publication records its epoch and wakes reads, so they can check the tree and answer
-/// stale while changes keep waiting for a current publication.
+/// publication records its epoch and wakes reads, so a read captures the tree again and
+/// answers stale when it moved since that read's previous capture, while changes keep
+/// waiting for a current publication.
 ///
 /// Each blocking operation races the supervisor's cancellation token. A stop that lands
 /// while the capture scans a large tree answers [`RebuildOutcome::Cancelled`] at once

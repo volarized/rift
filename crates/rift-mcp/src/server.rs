@@ -7,7 +7,7 @@ use std::time::Duration;
 use rift_core::SourceVisibility;
 use rift_index::{
     ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges,
-    WorkspaceDigests, WorkspaceIndexLimits, capture_digests_with_languages,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -622,6 +622,27 @@ impl ResolvedWorkspace {
             stale: None,
         }
     }
+
+    /// A publication served behind the tree the request-time capture read.
+    ///
+    /// The answer carries the `stale_index` warning `reason` renders for `captured`
+    /// whenever `moved` names something the warning can report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the publication's configuration refusal when its `rift.toml` was not
+    /// accepted.
+    fn stale(
+        published: Arc<PublishedWorkspace>,
+        captured: &WorkspaceDigests,
+        moved: Option<CaptureMovement>,
+        reason: &StaleIndexReason<'_>,
+        phase: wire::ErrorPhase,
+    ) -> Result<Self, ErrorData> {
+        published.configuration.accepted(phase)?;
+        let stale = moved.map(|moved| stale_index_warning(&published, captured, moved, reason));
+        Ok(Self { published, stale })
+    }
 }
 
 /// A read result's warnings, so the one gate every current-tree read passes can add the
@@ -661,10 +682,51 @@ const STALE_INDEX_PATHS_MAX: usize = 5;
 enum ReadWait {
     /// The first capture checks content even when observations are ahead.
     Capture,
-    /// Changed source waits for publication or a successful superseded capture.
-    Rebuild,
+    /// Changed source waits for publication, or for a successful capture superseded after
+    /// the read's last capture began.
+    Rebuild {
+        /// The latest superseded epoch recorded before that capture began.
+        superseded_seen: u64,
+    },
     /// Changed configuration waits for acceptance and publication.
     Configuration,
+}
+
+/// One read's previous request-time capture, and the rebuild it asked for.
+///
+/// A later capture that folds to the same tree and configuration found nothing that
+/// capture did not already ask for, so it asks for nothing again and proves no movement.
+struct PreviousCapture {
+    tree: WorkspaceFingerprint,
+    configuration: ConfigurationFingerprint,
+    /// The observation epoch the capture's rebuild request moved the counter to.
+    requested_epoch: u64,
+    /// The latest superseded epoch recorded before the capture began.
+    superseded_seen: u64,
+}
+
+impl PreviousCapture {
+    /// Whether a later capture folds to the tree and configuration this one did.
+    fn matches(
+        &self,
+        tree: &WorkspaceFingerprint,
+        configuration: ConfigurationFingerprint,
+    ) -> bool {
+        self.tree == *tree && self.configuration == configuration
+    }
+
+    /// Whether a later capture is owed this capture's rebuild and nothing more.
+    ///
+    /// It is when `tree` and `configuration` match this capture and `current` still
+    /// predates the rebuild this capture asked for.
+    fn awaits_publication(
+        &self,
+        current: &PublishedWorkspace,
+        tree: &WorkspaceFingerprint,
+        configuration: ConfigurationFingerprint,
+    ) -> bool {
+        self.matches(tree, configuration) && current.epoch < self.requested_epoch
+    }
 }
 
 /// Why an answer is served from a publication the request-time capture found behind the
@@ -672,7 +734,8 @@ enum ReadWait {
 enum StaleIndexReason<'a> {
     /// The rebuild recorded past that publication failed.
     RebuildFailed(&'a RecordedRebuildFailure),
-    /// A successful capture after the publication was superseded by later changes.
+    /// A successful capture was superseded while the request's own captures found the
+    /// tree moving.
     RebuildSuperseded {
         /// The successful candidate's filesystem epoch.
         epoch: u64,
@@ -900,23 +963,6 @@ struct RecordedRebuildFailure {
 }
 
 impl RecordedRebuildFailure {
-    /// The `stale_index` warning an answer served from `published` carries after this
-    /// failure, naming the tree revision `captured` folds to and, when that is the
-    /// published one, what `moved` instead.
-    fn stale_index(
-        &self,
-        published: &PublishedWorkspace,
-        captured: &WorkspaceDigests,
-        moved: CaptureMovement,
-    ) -> ReadWarning {
-        stale_index_warning(
-            published,
-            captured,
-            moved,
-            &StaleIndexReason::RebuildFailed(self),
-        )
-    }
-
     /// The failure's own rendering with its causes, naming the failed and observed
     /// epochs, what `served` says the answer came from, and the retry.
     ///
@@ -2760,104 +2806,98 @@ impl RiftMcp {
     /// publication whenever the capture folds to its fingerprint under its configuration,
     /// whatever the epoch counter reads.
     ///
-    /// The second is the attempt budget. A successful superseded capture already proves
-    /// movement: a read checks the tree once and answers stale with that recorded epoch.
-    /// A read without that completed work that spends its capture budget answers from the
-    /// publication the last attempt resolved and carries a `stale_index` warning naming
-    /// what that attempt's capture found ahead. This keeps a workspace under back-to-back
-    /// rebuilds readable, and each attempt still asks for a rebuild. Configuration movement
-    /// waits for acceptance and publication before the next capture; the last capture
-    /// refuses if its configuration moved.
+    /// The second is the attempt budget. Each attempt that finds the tree ahead asks for a
+    /// rebuild and waits for its publication, and a read that spends the budget answers from
+    /// the publication the last attempt resolved, with a `stale_index` warning naming what
+    /// that attempt's capture found ahead. Configuration movement waits for acceptance and
+    /// publication before the next capture; the last capture refuses if its configuration
+    /// moved.
+    ///
+    /// A successful capture superseded after the read's last capture began wakes the read
+    /// before that publication, and the read captures again. A capture that differs from
+    /// the previous one proves the tree moved during the read, so the read answers stale
+    /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
+    /// readable.
+    ///
+    /// A capture that matches the previous one proves no movement. The observation that
+    /// superseded the rebuild reported what the read had already captured, such as the
+    /// watcher's late report of the `.gitignore` write the read found, so the read asks for
+    /// nothing again and spends no attempt. It waits again, and only a later supersession or
+    /// a publication wakes it, so the readiness deadline bounds how often that repeats.
     async fn reconcile_workspace(
         &self,
         phase: wire::ErrorPhase,
     ) -> Result<ResolvedWorkspace, ErrorData> {
         let mut spent = None;
         let mut wait = ReadWait::Capture;
-        for _attempt in 0..INDEX_CAPTURE_ATTEMPTS_MAX {
+        let mut previous: Option<PreviousCapture> = None;
+        let mut attempts = 0;
+        while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
-            let capture = self.capture_tree(&current).await;
-            let (digests, configuration_fingerprint) = match capture {
-                Ok(capture) => capture,
-                Err(error) => {
-                    let _ = self.validation.observe_whole_workspace();
-                    return Err(error.tool_error(phase));
-                }
-            };
+            let superseded_seen = self.validation.superseded_epoch();
+            let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
+            let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+                digests.fingerprint()
+            });
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
-            let tree_matches =
-                rift_core::traced!(component = "index", operation = "fingerprint.fold", {
-                    digests.fingerprint() == current.fingerprint
-                }) && configuration_matches;
-            if tree_matches && !self.project_environment_moved(&current, phase).await? {
+            if tree == current.fingerprint
+                && configuration_matches
+                && !self.project_environment_moved(&current, phase).await?
+            {
                 current.configuration.accepted(phase)?;
                 return Ok(ResolvedWorkspace::current(current));
             }
             let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
             let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
             if let Some(failure) = rebuild_failure {
-                current.configuration.accepted(phase)?;
-                let stale = moved.map(|moved| failure.stale_index(&current, &digests, moved));
-                return Ok(ResolvedWorkspace {
-                    published: current,
-                    stale,
-                });
+                let reason = StaleIndexReason::RebuildFailed(&failure);
+                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
             }
-            let observed = if configuration_matches
-                && self
-                    .rebuild_reaches_capture(&current, &changes, phase)
-                    .await?
-            {
-                self.validation
-                    .observe_paths(changes.iter().map(|(path, _)| path.clone()))
-            } else {
-                self.validation.observe_whole_workspace()
-            };
-            observed.map_err(|error| error.tool_error(phase))?;
+            let owed_publication = previous.as_ref().is_some_and(|previous| {
+                previous.awaits_publication(&current, &tree, configuration_fingerprint)
+            });
+            if configuration_matches && owed_publication {
+                wait = ReadWait::Rebuild { superseded_seen };
+                continue;
+            }
+            let moved_since_previous = previous
+                .as_ref()
+                .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
+            attempts += 1;
+            let requested_epoch = self
+                .request_rebuild(&current, &changes, configuration_matches, phase)
+                .await?;
             if configuration_matches
-                && let Some(epoch) = self.validation.superseded_after(current.epoch)
+                && let Some(previous) = moved_since_previous
+                && let Some(epoch) = self
+                    .validation
+                    .superseded_after(current.epoch.max(previous.superseded_seen))
             {
-                current.configuration.accepted(phase)?;
-                let stale = moved.map(|moved| {
-                    stale_index_warning(
-                        &current,
-                        &digests,
-                        moved,
-                        &StaleIndexReason::RebuildSuperseded {
-                            epoch,
-                            changes: &changes,
-                        },
-                    )
-                });
-                return Ok(ResolvedWorkspace {
-                    published: current,
-                    stale,
-                });
+                let reason = StaleIndexReason::RebuildSuperseded {
+                    epoch,
+                    changes: &changes,
+                };
+                return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
             }
             wait = if configuration_matches {
-                ReadWait::Rebuild
+                ReadWait::Rebuild { superseded_seen }
             } else {
                 ReadWait::Configuration
             };
+            previous = Some(PreviousCapture {
+                tree,
+                configuration: configuration_fingerprint,
+                requested_epoch,
+                superseded_seen,
+            });
             spent = Some((current, digests, changes, moved));
         }
-        if matches!(wait, ReadWait::Rebuild)
+        if matches!(wait, ReadWait::Rebuild { .. })
             && let Some((current, digests, changes, moved)) = spent
         {
-            current.configuration.accepted(phase)?;
-            let stale = moved.map(|moved| {
-                stale_index_warning(
-                    &current,
-                    &digests,
-                    moved,
-                    &StaleIndexReason::TreeKeptMoving { changes: &changes },
-                )
-            });
-            return Ok(ResolvedWorkspace {
-                published: current,
-                stale,
-            });
+            let reason = StaleIndexReason::TreeKeptMoving { changes: &changes };
+            return ResolvedWorkspace::stale(current, &digests, moved, &reason, phase);
         }
         Err(ReadFault::unavailable(
             "current workspace read",
@@ -2892,6 +2932,46 @@ impl RiftMcp {
             })
             .await
             .map_err(|error| error.tool_error(phase))
+    }
+
+    /// Captures the tree one reconciliation attempt compares with `current`.
+    ///
+    /// A capture that fails says nothing about which files moved, so it asks for the whole
+    /// workspace before the read refuses with the capture's own failure.
+    async fn capture_read(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ErrorData> {
+        self.capture_tree(current).await.map_err(|error| {
+            let _ = self.validation.observe_whole_workspace();
+            error.tool_error(phase)
+        })
+    }
+
+    /// Asks the index supervisor for the rebuild one capture found owed.
+    ///
+    /// The request names the paths in `changes` when a rebuild naming them reaches what the
+    /// capture read, and asks for the whole workspace otherwise. It answers the observation
+    /// epoch the request moved the counter to.
+    async fn request_rebuild(
+        &self,
+        current: &Arc<PublishedWorkspace>,
+        changes: &PathChanges,
+        configuration_matches: bool,
+        phase: wire::ErrorPhase,
+    ) -> Result<u64, ErrorData> {
+        let observed = if configuration_matches
+            && self
+                .rebuild_reaches_capture(current, changes, phase)
+                .await?
+        {
+            self.validation
+                .observe_paths(changes.iter().map(|(path, _)| path.clone()))
+        } else {
+            self.validation.observe_whole_workspace()
+        };
+        observed.map_err(|error| error.tool_error(phase))
     }
 
     /// Whether a rebuild naming the paths in `changes` reaches what the capture that found
@@ -2992,11 +3072,12 @@ impl RiftMcp {
     /// carries the failure.
     ///
     /// A read's first capture compares content even when observations are ahead. Changed
-    /// source then waits for publication, unless a successful capture after the current
-    /// publication was superseded. That completed work proves continued movement, so the
-    /// read reaches its bounded captures and stale answer without waiting for a publication
-    /// the moving tree keeps superseding. A later publication makes that exception
-    /// obsolete. Configuration movement keeps waiting for the epochs to agree.
+    /// source then waits for publication, unless a successful capture was superseded after
+    /// the current publication and after the read's last capture began. The read then
+    /// captures again rather than wait for a publication a moving tree keeps superseding,
+    /// and that capture decides whether the tree moved. A supersession recorded before the
+    /// read's last capture began wakes nothing: that capture already read what came after
+    /// it. Configuration movement keeps waiting for the epochs to agree.
     ///
     /// Every other job of this loop stands for a read: a watcher the backend reported
     /// broken refuses, a supervisor that stopped refuses while the epochs disagree, and a
@@ -3054,7 +3135,10 @@ impl RiftMcp {
             }
             let capture = match wait {
                 ReadWait::Capture => true,
-                ReadWait::Rebuild => self.validation.superseded_after(current.epoch).is_some(),
+                ReadWait::Rebuild { superseded_seen } => self
+                    .validation
+                    .superseded_after(current.epoch.max(superseded_seen))
+                    .is_some(),
                 ReadWait::Configuration => false,
             };
             if capture {
@@ -5542,11 +5626,13 @@ done
         Ok(())
     }
 
-    /// Successful captures can all be superseded before publication. The recorded
-    /// completed work lets a later read answer from the existing snapshot with its warning.
+    /// Captures superseded before a read began say nothing about the tree that read
+    /// captures, so the read waits for the rebuild it asked for and answers current.
     #[tokio::test]
-    async fn a_read_after_successful_superseded_rebuilds_answers_without_publication() -> TestResult
-    {
+    async fn a_read_after_superseded_rebuilds_waits_for_its_own_rebuild() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
         let (directory, assembled) = unsupervised_fixture().await?;
         let server = &assembled.server;
         let path = CoreProjectPath::new("lib.rs")?;
@@ -5556,51 +5642,126 @@ done
             supersede_rebuild(&assembled, format!("pub fn lantern{round}() {{}}\n")).await?;
             assert_eq!(server.published.read().await.current.epoch, 0);
         }
-        let (published, failure) = server.published.read().await.snapshot();
-        assert_eq!(published.epoch, 0);
-        assert!(
-            failure.is_none(),
-            "successful captures record no rebuild failure"
-        );
-        let (expected_capture, _) = captured_tree(directory.path(), &published)?;
-        let expected_revision = super::wire_digest(
-            expected_capture
-                .tree_revision()
-                .ok_or("captured tree revision")?,
-        );
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let rounds = Arc::clone(&calls);
+        let superseded = server
+            .validation
+            .superseded_after(0)
+            .ok_or("every round recorded its superseded capture")?;
         let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
         server.force_capture(move |current| {
-            let round = rounds.fetch_add(1, Ordering::Relaxed);
-            if round != 0 {
-                return Err(ReadFault::unavailable(
-                    "test capture",
-                    "a second capture repeats proven movement",
-                ));
-            }
+            rounds.fetch_add(1, Ordering::Relaxed);
             captured_tree(&root, current)
         });
 
-        let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(server, "beacon"))
+        let latest = format!("lantern{}", super::INDEX_CAPTURE_ATTEMPTS_MAX);
+        let mut waiting = Box::pin(get_symbol(server, &latest));
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a capture superseded at epoch {superseded}, before the read began, must \
+                 not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
             .await
-            .map_err(
-                |_| "a read must not wait for a publication superseded builds cannot produce",
-            )??;
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the latest source answers: {fresh:?}");
         assert!(
-            !answer.results.is_empty(),
-            "the original publication answers"
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from the publication of what it captured: {:?}",
+            fresh.warnings
         );
-        let (index, captured, detail) = stale_index_of(&answer.warnings)?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(index, published.reads.tree_revision());
-        assert_eq!(captured, expected_revision.0);
-        assert_ne!(index, captured);
-        assert!(detail.contains("lib.rs moved"), "{detail}");
-        assert!(detail.contains("superseded before publication"), "{detail}");
+        Ok(())
+    }
+
+    /// A rebuild superseded by an observation of what the read already captured, such as
+    /// the watcher's late report of a `.gitignore` write, proves no movement. The read's
+    /// next capture matches its previous one, so it asks for nothing again and answers
+    /// from the publication that follows.
+    #[tokio::test]
+    async fn a_rebuild_superseded_by_a_late_report_leaves_the_read_waiting() -> TestResult {
+        use std::future::{Future as _, poll_fn};
+        use std::task::Poll;
+
+        let (directory, assembled) = unsupervised_fixture().await?;
+        let server = &assembled.server;
+        fs::write(directory.path().join("lib.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path().to_path_buf();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rounds = Arc::clone(&captures);
+        server.force_capture(move |current| {
+            rounds.fetch_add(1, Ordering::Relaxed);
+            captured_tree(&root, current)
+        });
+
+        let mut waiting = Box::pin(get_symbol(server, "lantern"));
+        poll_fn(|context| {
+            assert!(waiting.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+        assert_eq!(server.validation.observed_epoch(), 1, "the read asked once");
+
+        let validation = Arc::clone(&server.validation);
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                validation.observe_whole_workspace()?;
+                Ok(candidate)
+            },
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+
+        poll_fn(|context| {
+            assert!(
+                waiting.as_mut().poll(context).is_pending(),
+                "a supersession that moved nothing must not answer the read"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the supersession woke the read"
+        );
+        assert_eq!(
+            server.validation.observed_epoch(),
+            2,
+            "a capture that matches the read's previous one asks for nothing again"
+        );
+
+        let outcome = rebuild_workspace(
+            &assembled.context,
+            server.validation.take_pending(),
+            workspace_capture(),
+        )
+        .await?;
+        assert_eq!(outcome, RebuildOutcome::Published);
+        let fresh = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
+            .await
+            .map_err(|_| "the publication must wake the read")??;
+        assert_eq!(fresh.hits.len(), 1, "the edited source answers: {fresh:?}");
         assert!(
-            !detail.contains("bounded reconciliation attempts"),
-            "{detail}"
+            stale_index_of(&fresh.warnings).is_err(),
+            "the read answers from a current publication: {:?}",
+            fresh.warnings
         );
         Ok(())
     }
@@ -5636,12 +5797,26 @@ done
             1,
             "the read reached its publication wait"
         );
+        let (published, _) = server.published.read().await.snapshot();
         supersede_rebuild(&assembled, "pub fn lantern1() {}\n".to_owned()).await?;
         let stale = tokio::time::timeout(UNWAITED_READ_MAX, waiting)
             .await
             .map_err(|_| "a superseded capture must wake the waiting read")??;
         assert_eq!(stale.hits.len(), 1);
-        stale_index_of(&stale.warnings)?;
+        assert_eq!(
+            captures.load(Ordering::Relaxed),
+            2,
+            "the woken read captured the tree that moved during it"
+        );
+        let (index, captured_revision, detail) = stale_index_of(&stale.warnings)?;
+        assert_eq!(index, published.reads.tree_revision());
+        assert_ne!(index, captured_revision);
+        assert!(detail.contains("lib.rs moved"), "{detail}");
+        assert!(detail.contains("superseded before publication"), "{detail}");
+        assert!(
+            !detail.contains("bounded reconciliation attempts"),
+            "{detail}"
+        );
 
         let outcome = rebuild_workspace(
             &assembled.context,
