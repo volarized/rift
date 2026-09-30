@@ -652,6 +652,35 @@ fn a_file_past_the_matches_bound_is_cut_and_warned_apart_from_the_result_bound()
     Ok(())
 }
 
+/// Once the hits reach the index's result bound no further file is verified, and the
+/// answer cut at the bound warns `results_truncated`.
+#[test]
+fn verification_stops_at_the_result_bound_and_warns() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("a.txt"), "x;\nx;\nx;\n")?;
+    fs::write(directory.path().join("b.txt"), "x;\n")?;
+    let include = TextFileInclusion::default().include().to_vec();
+    let service = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::new(10, 4_096, 8_192, 8, 2)?,
+        &SourceVisibility::default(),
+        &TextFileInclusion::new(include, CHUNK_BYTES),
+        HistoryConfiguration::default(),
+    )?;
+    let request = params(json!({"pattern": "x;", "limit": 10}))?;
+    let result = service.search(&request, &StoreAnswer::identifier_only())?;
+    let paths: Vec<String> = located(&result)
+        .into_iter()
+        .map(|(path, ..)| path)
+        .collect();
+    assert_eq!(paths, ["a.txt", "a.txt"]);
+    assert_eq!(
+        result.warnings,
+        [ReadWarning::ResultsTruncated { results_max: 2 }]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn notebooks_split_lines_and_force_included_files_are_verified_whole() -> TestResult {
     let directory = tempfile::tempdir()?;
