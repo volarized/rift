@@ -26,8 +26,8 @@ use rift_index::{
 use rift_mcp::{
     ElectionError, ElectionFault, LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT,
     START_WAIT_MAX, ServerPresence, SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns,
-    StartedServer, TokenCheck, WorkspaceStorage, install_panic_hook, probe, read_serving,
-    serve_elected_with_storage, spawn_detached_server,
+    StartedServer, StopRequestFailure, TokenCheck, WorkspaceStorage, install_panic_hook, probe,
+    read_serving, serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
 use serde_json::{Map, Value};
@@ -42,8 +42,6 @@ use waitpid_any::WaitHandle;
 const STOP_WAIT_MAX: Duration = Duration::from_secs(10);
 /// Probe attempts one stop waits: `STOP_WAIT_MAX` over the interval.
 const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
-/// Bound on the whole stop request: connect, send, and read the answer.
-const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the whole server-side stop has, shared by every stage under it.
 ///
 /// The stop derives its deadline where the stop begins, never where the
@@ -851,7 +849,15 @@ async fn serve_foreground(
         ))),
         _ => None,
     };
-    let server = match serve_elected_with_storage(root, shutdown.clone(), storage, check).await {
+    let server = match serve_elected_with_storage(
+        root,
+        shutdown.clone(),
+        storage,
+        check,
+        crate::BUILD_CHECKOUT,
+    )
+    .await
+    {
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
@@ -962,32 +968,23 @@ async fn stop(root: &Path, attempt_count: u32) -> Result<ServerOutcome, ServerCo
 }
 
 /// Delivers the authorized stop request, bounded by
-/// [`STOP_REQUEST_TIMEOUT`].
+/// [`rift_mcp::STOP_REQUEST_TIMEOUT`].
 ///
 /// Two answers mean the stop was delivered: `202`, the server accepting it,
 /// and a refused connect, nothing listening on the recorded port because
 /// serving has already ended. Neither says the process is gone, so the
 /// caller waits for the election either way.
 async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
-    let request_failed =
-        |source: reqwest::Error| Error::new(ServerCommandFault::StopRequestFailed { source });
-    let client = reqwest::Client::builder()
-        .timeout(STOP_REQUEST_TIMEOUT)
-        .build()
-        .map_err(request_failed)?;
-    let answer = client
-        .post(format!("http://127.0.0.1:{}/api/stop", lock.port))
-        .bearer_auth(&lock.token)
-        .send()
-        .await;
-    match answer {
-        Ok(response) if response.status() == reqwest::StatusCode::ACCEPTED => Ok(()),
-        Ok(response) => Err(Error::new(ServerCommandFault::StopRefused {
-            status: response.status(),
-        })),
-        Err(error) if error.is_connect() => Ok(()),
-        Err(error) => Err(request_failed(error)),
-    }
+    rift_mcp::request_stop(lock)
+        .await
+        .map_err(|failure| match failure {
+            StopRequestFailure::Failed(source) => {
+                Error::new(ServerCommandFault::StopRequestFailed { source })
+            }
+            StopRequestFailure::Refused(status) => {
+                Error::new(ServerCommandFault::StopRefused { status })
+            }
+        })
 }
 
 /// Polls until the stopped server exits or releases the election, bounded by
@@ -1335,7 +1332,6 @@ mod tests {
             pid: 4_242,
             identity: ProductIdentity {
                 version: "0.0.11".to_owned(),
-                executable_digest: "a".repeat(64),
                 schema_digest: "b".repeat(64),
             },
         }
@@ -1598,7 +1594,7 @@ mod tests {
 
         assert!(stopped.load(Ordering::Acquire));
         assert!(
-            started.elapsed() < super::STOP_REQUEST_TIMEOUT,
+            started.elapsed() < rift_mcp::STOP_REQUEST_TIMEOUT,
             "the final log drain must leave time for a five-second stop to observe process exit"
         );
     }

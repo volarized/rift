@@ -36,6 +36,8 @@ mod rust_engine;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harness::{
@@ -44,7 +46,9 @@ use harness::{
     proxied_engine_call, proxy_client, relayed_proxy_client, require_success, run_rift,
     rust_engine_workspace, within, workspace,
 };
-use rift_mcp::{PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe};
+use rift_mcp::{
+    BuildCheckout, PRESENCE_POLL_INTERVAL, START_WAIT_MAX, ServerPresence, claim, probe,
+};
 use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::lock::{
     ProductIdentity, SERVER_LOCK_FILE_NAME, SERVER_PORT_MAX, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH,
@@ -53,7 +57,7 @@ use rift_protocol::lock::{
 use rift_protocol::retry::RetryPolicy;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
+use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
 const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
@@ -97,16 +101,15 @@ fn proxied_forward_budget_ends_inside_the_call_bound() -> TestResult {
     Ok(())
 }
 
+/// The identity the `rift` binary under test publishes. The package's build script hands
+/// this suite the same checkout it hands the binary, and a dirty build reads the binary's
+/// own metadata.
 fn rift_binary_identity() -> TestResult<ProductIdentity> {
-    let executable = fs::read(harness::rift_binary())?;
-    Ok(ProductIdentity {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        executable_digest: format!("{:x}", Sha256::digest(executable)),
-        schema_digest: format!(
-            "{:x}",
-            Sha256::digest(rift_mcp::schema::schema_document().as_bytes())
-        ),
-    })
+    let checkout = BuildCheckout::recorded(env!("RIFT_BUILD_COMMIT"), env!("RIFT_BUILD_DIRTY"));
+    Ok(rift_mcp::product_identity_of(
+        checkout,
+        &harness::rift_binary(),
+    )?)
 }
 
 /// Poll attempts while waiting on a server to disappear: 10 seconds at
@@ -355,6 +358,220 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     serving_document(root).ok_or("a spawn after the lost election must serve")?;
     client.cancel().await?;
     Ok(())
+}
+
+/// A workspace server this test holds in place of a `rift server` of another release.
+///
+/// It holds the election, publishes its lock document, and answers an authorized
+/// `POST /api/stop` the way a server does - `202 Accepted` - then closes its port and
+/// releases the election, so another server can be elected.
+struct RecordedServer {
+    accepted: Arc<AtomicUsize>,
+    stop: Arc<Notify>,
+    served: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl RecordedServer {
+    /// Starts a server whose lock records `version`, in the shape a release that
+    /// digested its executable wrote: `executable_digest` beside the version.
+    async fn start(root: &Path, version: &str) -> TestResult<Self> {
+        let guard = claim(root)?;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let token = "r".repeat(SERVER_TOKEN_LENGTH);
+        let document = json!({
+            "port": listener.local_addr()?.port(),
+            "token": token,
+            "pid": std::process::id(),
+            "identity": {
+                "version": version,
+                "executable_digest": "e".repeat(64),
+                "schema_digest": "b".repeat(64),
+            },
+        });
+        fs::write(document_path(root), serde_json::to_vec(&document)?)?;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(Notify::new());
+        let expected = format!("Bearer {token}");
+        let (counted, stopping) = (Arc::clone(&accepted), Arc::clone(&stop));
+        let router = axum::Router::new().route(
+            "/api/stop",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let (counted, stopping) = (Arc::clone(&counted), Arc::clone(&stopping));
+                let authorized = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .is_some_and(|value| value.as_bytes() == expected.as_bytes());
+                async move {
+                    if !authorized {
+                        return axum::http::StatusCode::UNAUTHORIZED;
+                    }
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    stopping.notify_one();
+                    axum::http::StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let shutdown = Arc::clone(&stop);
+        let served = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await?;
+            // The port closed first; the election releases with the guard, as a
+            // stopping server's does.
+            drop(guard);
+            Ok::<(), std::io::Error>(())
+        });
+        Ok(Self {
+            accepted,
+            stop,
+            served,
+        })
+    }
+
+    /// How many authorized stop requests the server accepted.
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the server to close its port and release the election, stopping it
+    /// first when no request did.
+    async fn stopped(self) -> TestResult {
+        self.stop.notify_one();
+        within("the recorded server to release its election", self.served).await???;
+        Ok(())
+    }
+}
+
+/// A proxy asks the server of an older release to stop, starts one from its own binary
+/// once the election releases, and serves the request. The older server's lock carries
+/// `executable_digest`, as every lock before the build identity did, so this is also what
+/// an existing `.rift/` meets after an upgrade.
+#[tokio::test]
+async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let older = RecordedServer::start(root, "0.0.1").await?;
+
+    let client = proxy_client(root).await?;
+    assert_beacon(&beacon_lookup(&client).await?);
+    assert!(
+        older.accepted() >= 1,
+        "the proxy asks the older server to stop"
+    );
+    older.stopped().await?;
+    let serving = serving_document(root).ok_or("a server of this build must serve")?;
+    assert_eq!(serving.identity, rift_binary_identity()?);
+    assert_ne!(serving.pid, std::process::id());
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Serves a proxy against a recorded server of `version`, and requires its call to be
+/// refused with both identities and the operator's next step, the server never asked to
+/// stop.
+async fn assert_refused_without_a_stop(version: &str) -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let recorded = RecordedServer::start(root, version).await?;
+
+    let client = proxy_client(root).await?;
+    let refusal = within(
+        "the refusal from a server this proxy does not replace",
+        client.call_tool(
+            CallToolRequestParams::new("get_symbol")
+                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+        ),
+    )
+    .await?
+    .expect_err("the recorded server must refuse the call");
+    let rmcp::ServiceError::McpError(data) = refusal else {
+        panic!("expected a protocol-level refusal, got {refusal:?}");
+    };
+    assert!(
+        data.message
+            .contains("workspace server identity differs from this rift process"),
+        "{}",
+        data.message
+    );
+    assert!(data.message.contains(version), "{}", data.message);
+    assert!(
+        data.message.contains("run rift server stop, then retry"),
+        "{}",
+        data.message
+    );
+    assert_eq!(recorded.accepted(), 0, "the server is never asked to stop");
+    client.cancel().await?;
+    recorded.stopped().await?;
+    Ok(())
+}
+
+/// A proxy never displaces a newer server.
+#[tokio::test]
+async fn a_newer_server_is_refused_with_operator_guidance() -> TestResult {
+    assert_refused_without_a_stop("999.0.0").await
+}
+
+/// Two development builds of one version never replace each other: a server of this
+/// version from another commit is refused, as a newer one is.
+#[tokio::test]
+async fn another_build_of_this_version_is_refused_with_operator_guidance() -> TestResult {
+    let another_build = format!(
+        "{}+71ea9ed284538bd4b5429df592afd7424e2bad13",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_refused_without_a_stop(&another_build).await
+}
+
+/// Two proxies of one build race to replace the same older server. Both may ask it to
+/// stop and both may start a server, and the election keeps exactly one: each proxy
+/// connects to that one server, whose pid the lock records, and both requests are
+/// served by it.
+#[tokio::test]
+async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let older = RecordedServer::start(root, "0.0.1").await?;
+
+    let (first, second) = tokio::join!(relayed_proxy_client(root), relayed_proxy_client(root));
+    let ((first, first_stderr), (second, second_stderr)) = (first?, second?);
+    let (first_lookup, second_lookup) = tokio::join!(beacon_lookup(&first), beacon_lookup(&second));
+    assert_beacon(&first_lookup?);
+    assert_beacon(&second_lookup?);
+    assert!(older.accepted() >= 1, "the older server is asked to stop");
+    older.stopped().await?;
+
+    let serving = serving_document(root).ok_or("one server of this build must serve")?;
+    assert_eq!(serving.identity, rift_binary_identity()?);
+    first.cancel().await?;
+    second.cancel().await?;
+    let survivor = serving_document(root).ok_or("the shared server must outlive both")?;
+    assert_eq!(survivor.pid, serving.pid);
+    let stopped = run_rift(root, &["server", "stop"]).await?;
+    require_success(&stopped, "stop the replacing server")?;
+
+    for stderr in [first_stderr.text().await?, second_stderr.text().await?] {
+        let connected = connected_pids(&stderr);
+        assert_eq!(
+            connected,
+            [serving.pid],
+            "each proxy connects to the one elected server: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// The pid of every server a proxy's stderr says it connected to, in order.
+fn connected_pids(stderr: &str) -> Vec<u32> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("proxy connected to workspace server"))
+        .filter_map(|line| {
+            let (_, after) = line.split_once(" pid=")?;
+            after.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
 }
 
 /// The refusal an agent sees when the workspace cannot produce a server.

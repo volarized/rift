@@ -62,7 +62,6 @@ const IDLE_SPAN_PAST_STOP_DEADLINE: Duration = Duration::from_secs(9);
 fn stale_identity() -> ProductIdentity {
     ProductIdentity {
         version: "0.0.1".to_owned(),
-        executable_digest: "a".repeat(64),
         schema_digest: "b".repeat(64),
     }
 }
@@ -1052,6 +1051,13 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
             version = document.identity.version
         )),
         "{serving_stdout:?}"
+    );
+    let printed = rift(root, &["--version"])?;
+    require_success(&printed, "version")?;
+    assert_eq!(
+        stdout_of(&printed).trim(),
+        format!("rift {}", document.identity.version),
+        "rift --version prints the version the server publishes"
     );
 
     let stopped = rift(root, &["server", "stop"])?;

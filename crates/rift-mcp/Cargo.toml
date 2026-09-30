@@ -21,6 +21,7 @@ data-encoding.workspace = true
 getrandom.workspace = true
 notify.workspace = true
 percent-encoding.workspace = true
+reqwest.workspace = true
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
@@ -35,6 +36,7 @@ rift-ranking.workspace = true
 rift-search.workspace = true
 rift-server.workspace = true
 schemars.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
@@ -46,7 +48,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 jsonschema.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
