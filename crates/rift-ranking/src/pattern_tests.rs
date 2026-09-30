@@ -86,13 +86,24 @@ fn small_classes_expand_and_large_ones_close_the_literal() {
 }
 
 #[test]
-fn a_byte_class_past_ascii_requires_nothing() {
+fn a_translator_in_utf8_mode_refuses_a_byte_class_past_ascii() {
+    let refused = Pattern::parse(r"(?-u:[\x80\x81])abc", SIZE_LIMIT)
+        .expect_err("a byte class past ASCII can match invalid UTF-8");
+    assert_eq!(refused.fault().violation(), RankingViolation::PatternSyntax);
+}
+
+/// Only a translator with UTF-8 mode off builds a byte class past ASCII, and a debug build
+/// stops `prefilter` there rather than read its bytes as characters no text holds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a byte class must hold ASCII alone")]
+fn a_byte_class_past_ascii_breaks_the_prefilter_precondition() {
     let hir = regex_syntax::ParserBuilder::new()
         .utf8(false)
         .build()
-        .parse(r"(?-u:[\x80-\xFF])abc")
+        .parse(r"(?-u:[\x80\x81])abc")
         .expect("a byte pattern parses");
-    assert_eq!(prefilter(&hir), Some(literal("abc")));
+    let _ = prefilter(&hir);
 }
 
 #[test]

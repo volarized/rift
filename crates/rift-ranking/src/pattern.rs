@@ -151,6 +151,14 @@ fn grouped(members: &[Prefilter], operator: &str) -> String {
 
 /// The trigrams a text must hold for `hir` to match in it, or `None` when the pattern has
 /// no prefilter and every text is a candidate.
+///
+/// `hir` comes from a translator in UTF-8 mode, as [`Pattern::parse`] builds it, so every
+/// byte class in it holds ASCII alone and each of its bytes is one character of the text.
+///
+/// # Panics
+///
+/// In a debug build, when `hir` holds a byte class reaching past ASCII, which only a
+/// translator with UTF-8 mode off produces.
 #[must_use]
 pub fn prefilter(hir: &Hir) -> Option<Prefilter> {
     requirement(shape(hir))
@@ -308,8 +316,11 @@ fn shape(hir: &Hir) -> Shape {
     }
 }
 
-/// A class's members, or `None` past [`CLASS_MEMBERS_MAX`] members or for a byte class
-/// reaching past ASCII, which no UTF-8 text holds as one character.
+/// A class's members, or `None` past [`CLASS_MEMBERS_MAX`] members.
+///
+/// A byte class holds ASCII alone: regex-syntax 0.8's translator in UTF-8 mode refuses a
+/// byte class holding any other byte with `InvalidUtf8`, "pattern can match invalid
+/// UTF-8", so each byte maps to the one character a text holds it as.
 fn class_members(class: &Class) -> Option<Vec<char>> {
     match class {
         Class::Unicode(unicode) => {
@@ -327,13 +338,17 @@ fn class_members(class: &Class) -> Option<Vec<char>> {
             })
         }
         Class::Bytes(bytes) => {
-            let ascii = bytes.ranges().iter().all(|range| range.end().is_ascii());
+            debug_assert!(
+                bytes.is_ascii(),
+                "a byte class must hold ASCII alone, as a translator in UTF-8 mode builds it: \
+                 class={bytes:?}"
+            );
             let count: u32 = bytes
                 .ranges()
                 .iter()
                 .map(|range| u32::from(range.end()) - u32::from(range.start()) + 1)
                 .sum();
-            (ascii && count <= CLASS_MEMBERS_MAX).then(|| {
+            (count <= CLASS_MEMBERS_MAX).then(|| {
                 bytes
                     .ranges()
                     .iter()
