@@ -212,6 +212,13 @@ through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surfa
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
 
+Every process that opens `.rift/db`, a starting server and `rift server logs` alike, holds an
+exclusive lock on `.rift/db.lock` while it switches the file to WAL and applies the schema
+migrations. SQLite refuses a second process's WAL switch at once, without waiting for the first,
+and Toasty applies every migration it read as missing, so two processes preparing one new file
+side by side leave one of them without the database. A process that meets the lock waits for it
+up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
+
 Documentation extraction lives in `rift-analysis`. Workspace and package adapters pass selected
 bytes, exact source identities, origins, and existing chunk ranges into that shared crate. Its
 collector feature enables syntax parsers; readers can validate stored metadata and project ranked
