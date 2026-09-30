@@ -96,6 +96,31 @@ fn a_byte_class_past_ascii_requires_nothing() {
 }
 
 #[test]
+fn a_literal_past_utf8_requires_nothing() {
+    let hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(r"(?-u:\xFF)abc")
+        .expect("a byte pattern parses");
+    assert_eq!(prefilter(&hir), None);
+}
+
+#[test]
+fn an_ascii_byte_class_drops_the_line_feed_and_expands_into_its_members() {
+    let pattern = Pattern::parse(r"(?-u:[ab\n])cd", SIZE_LIMIT).expect("pattern compiles");
+    assert!(pattern.is_line_bound());
+    assert_eq!(
+        pattern.prefilter(),
+        Some(&Prefilter::Any(vec![literal("acd"), literal("bcd")]))
+    );
+    let matched: Vec<(usize, usize)> = pattern
+        .matches("bcd\ncd", 0..6)
+        .map(|found| (found.start, found.end))
+        .collect();
+    assert_eq!(matched, [(0, 3)]);
+}
+
+#[test]
 fn repetitions_keep_one_copy_or_none() {
     assert_eq!(plan("(abc)+"), Some(literal("abc")));
     assert_eq!(plan("x(abc)*y"), None);
