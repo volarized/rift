@@ -405,13 +405,6 @@ impl LexicalMatch {
         }
     }
 
-    /// The same match, its row holding the bytes `file_range` of its file.
-    #[must_use]
-    pub fn with_file_range(mut self, file_range: Range<u64>) -> Self {
-        self.file_range = Some(file_range);
-        self
-    }
-
     /// The bytes of its file the matched row holds - the whole file, or one chunk of a
     /// large one - or `None` for a row holding no file text.
     #[must_use]
