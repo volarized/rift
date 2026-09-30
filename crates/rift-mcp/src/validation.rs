@@ -17,8 +17,9 @@ use rift_core::constants::{
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
 use rift_index::{
-    ChangeSet, FileRecord, LexicalChange, LexicalStamp, PathChanges, WorkspaceDigests,
-    WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceSourcePolicy,
+    ChangeSet, FileRecord, LexicalChange, LexicalStamp, PathChanges, TrigramBatch,
+    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits,
+    WorkspaceSourcePolicy,
 };
 use rift_protocol::configuration::{
     GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
@@ -482,8 +483,10 @@ impl ConfigurationState {
             usize::try_from(source.workspace_size.bytes()).unwrap_or(usize::MAX);
         let declarations_max = usize::try_from(source.declarations).unwrap_or(usize::MAX);
         let syntax = self.syntax_configuration();
+        let large_files = self.text_inclusion().large_files();
         base.with_workspace_bounds(files_max, workspace_bytes_max, declarations_max)
             .and_then(|limits| limits.with_syntax_configuration(&syntax))
+            .map(|limits| limits.with_large_files(large_files))
             .map_err(|error| ReadError::from(ReadFault::Index(error)))
     }
 
@@ -1896,6 +1899,10 @@ pub(crate) trait LexicalStore: Send + Sync + 'static {
         stamp: &LexicalStamp,
         documentation: Option<&rift_index::DocumentationCollection>,
     ) -> impl Future<Output = Result<(), SearchError>> + Send;
+
+    /// Indexes the oldest file rows the trigram index lacks in one bounded transaction, and
+    /// answers what it indexed and how many rows it still lacks.
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send;
 }
 
 impl LexicalStore for SearchIndex {
@@ -1926,6 +1933,10 @@ impl LexicalStore for SearchIndex {
             }
             None => self.apply_lexical(change, stamp).await,
         }
+    }
+
+    fn index_trigrams(&self) -> impl Future<Output = Result<TrigramBatch, SearchError>> + Send {
+        SearchIndex::index_trigrams(self)
     }
 }
 
@@ -2120,6 +2131,11 @@ impl LexicalQueue {
 /// no publication, so a reader meets no tree rather than a mix of two, and a stop aborts
 /// one part rather than a write of every row.
 ///
+/// Between writes the lane indexes the file rows the trigram index lacks, one transaction
+/// under the same two bounds at a time, and a held write always runs before the next one.
+/// No request waits for those transactions: a regex search verifies the rows the trigram
+/// index lacks, or answers from the rows it holds and warns `pattern_index_preparing`.
+///
 /// Vector embedding never rides this lane: a lexical row costs one delete and one insert,
 /// while embedding one declaration can run for longer than the freshness wait a request
 /// is bounded by.
@@ -2266,36 +2282,102 @@ struct LexicalTask<Store> {
     product_version: Arc<str>,
 }
 
+/// The lane task's next piece of work.
+enum LaneTurn {
+    /// A held write, and whether the store is owed a whole comparison.
+    Write(LexicalCommit, bool),
+    /// One batch of the file rows the trigram index lacks, while no write is held.
+    Trigrams,
+}
+
 impl<Store: LexicalStore> LexicalTask<Store> {
-    /// Runs held writes until the token is cancelled, then marks the lane ended. Every
-    /// write's end, success or failure, wakes the waiters on [`LexicalLane::landed`] once
-    /// the backlog records it.
+    /// Runs held writes, and trigram batches while no write is held, until the token is
+    /// cancelled, then marks the lane ended.
+    ///
+    /// The lane starts owing a trigram batch: a store this process opened may hold rows an
+    /// earlier process wrote and stopped before indexing. Every write owes one after it,
+    /// since each file row it stored waits for the trigram index. A held write always runs
+    /// before the next batch, so a batch delays a write by one bounded transaction at most.
     async fn run(self) {
-        while let Some((commit, whole_owed)) = self.next_commit().await {
-            let outcome = self.transaction(commit, whole_owed).await;
-            let mut backlog = self.queue.locked();
-            backlog.running.clear();
-            if let Err(error) = outcome {
-                backlog.owe_whole(error.to_string());
+        let mut trigrams_owed = true;
+        while let Some(turn) = self.next_turn(trigrams_owed).await {
+            match turn {
+                LaneTurn::Write(commit, whole_owed) => {
+                    self.write(commit, whole_owed).await;
+                    trigrams_owed = true;
+                }
+                LaneTurn::Trigrams => trigrams_owed = self.index_trigrams().await,
             }
-            drop(backlog);
-            self.queue.landed.notify_waiters();
         }
         self.queue.locked().ended = true;
     }
 
-    /// Waits for the next held write, or for the token; nothing once it is cancelled.
-    async fn next_commit(&self) -> Option<(LexicalCommit, bool)> {
+    /// Runs one held write, then wakes the waiters on [`LexicalLane::landed`] once the
+    /// backlog records its end, success or failure.
+    async fn write(&self, commit: LexicalCommit, whole_owed: bool) {
+        let outcome = self.transaction(commit, whole_owed).await;
+        let mut backlog = self.queue.locked();
+        backlog.running.clear();
+        if let Err(error) = outcome {
+            backlog.owe_whole(error.to_string());
+        }
+        drop(backlog);
+        self.queue.landed.notify_waiters();
+    }
+
+    /// Waits for the next held write, or for the token; a trigram batch when no write is
+    /// held and one is owed; nothing once the token is cancelled.
+    async fn next_turn(&self, trigrams_owed: bool) -> Option<LaneTurn> {
         loop {
             if self.cancellation.is_cancelled() {
                 return None;
             }
-            if let Some(taken) = self.queue.locked().take_next() {
-                return Some(taken);
+            if let Some((commit, whole_owed)) = self.queue.locked().take_next() {
+                return Some(LaneTurn::Write(commit, whole_owed));
+            }
+            if trigrams_owed {
+                return Some(LaneTurn::Trigrams);
             }
             tokio::select! {
                 () = self.cancellation.cancelled() => return None,
                 () = self.queue.handed.notified() => {}
+            }
+        }
+    }
+
+    /// Runs one trigram batch on its own task, as a write's parts run, and answers whether
+    /// the trigram index still lacks rows.
+    ///
+    /// A refused batch is recorded and answers that nothing more is owed: the next write
+    /// owes a batch again, so a store that keeps refusing costs one attempt per write
+    /// rather than a loop of refusals. Its rows stay lacking meanwhile, and a regex search
+    /// verifies them or warns that the trigram index is still being prepared.
+    async fn index_trigrams(&self) -> bool {
+        let store = Arc::clone(&self.store);
+        let running = tokio::spawn(async move { store.index_trigrams().await });
+        match self.store_answer(running).await {
+            Ok(batch) => {
+                tracing::debug!(
+                    component = "search",
+                    operation = "search.commit",
+                    indexed = batch.indexed(),
+                    pending = batch.pending(),
+                    "the trigram index took a batch of file rows"
+                );
+                batch.pending() > 0
+            }
+            Err(error) => {
+                if !self.cancellation.is_cancelled() {
+                    tracing::warn!(
+                        component = "search",
+                        operation = "search.commit",
+                        error = %error,
+                        "the trigram index could not take a batch of file rows; regex \
+                         searches verify the rows it lacks or warn, and the next lexical \
+                         write retries"
+                    );
+                }
+                false
             }
         }
     }
@@ -3225,9 +3307,9 @@ pub(crate) mod lexical_double {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rift_index::{LexicalChange, LexicalStamp, WorkspaceDigests};
+    use rift_index::{LexicalChange, LexicalStamp, TrigramBatch, WorkspaceDigests};
     use rift_search::{SearchError, SearchFault, SearchIndex, SearchViolation};
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Semaphore, watch};
 
     use super::{LexicalLaneBounds, LexicalStore};
 
@@ -3236,6 +3318,15 @@ pub(crate) mod lexical_double {
     /// Polls one lane pass a test waits on before it gives up: three seconds, at
     /// [`LANE_POLL`] each.
     pub(crate) const LANE_ATTEMPTS_MAX: usize = 60;
+    /// Longest a test waits for the lexical lane, this double, or the supervisor to reach
+    /// a state it expects.
+    ///
+    /// Each wait ends as soon as the state holds, so a passing test never spends this
+    /// bound: it only ends a wait for a state that never comes, with that wait's own
+    /// message, well inside nextest's one-minute deadline. The slowest of these tests took
+    /// 2.4 s from start to end on the slowest CI runner, macos-15-intel, so a runner three
+    /// times slower still ends every wait inside half of it.
+    pub(crate) const LANE_WAIT_MAX: Duration = Duration::from_secs(15);
     /// Wait between two reads of a store the lane has not stamped yet.
     pub(crate) const LANE_POLL: Duration = Duration::from_millis(50);
     /// Bounds that never leave a unit out and never split a write into parts.
@@ -3248,18 +3339,53 @@ pub(crate) mod lexical_double {
     pub(crate) const PRODUCT_VERSION: &str = "0.0.45";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
-    /// one permit before it answers, refusing changes or recorded-digest reads when told to,
-    /// and writing through to
-    /// the attached index when one is held. A write whose future is dropped while the
+    /// one permit before it answers, refusing changes, recorded-digest reads, or trigram
+    /// batches when told to, and writing through to the attached index when one is held. A write whose future is dropped while the
     /// store still holds it is counted, so a test can prove an abort reached it.
+    ///
+    /// Trigram batches pass through to the attached index without a permit, and wait at a
+    /// gate of their own while a test holds them.
     pub(crate) struct StoreDouble {
         permits: Semaphore,
         calls: Mutex<Vec<(&'static str, String)>>,
         applied: Mutex<Vec<Vec<rift_core::ProjectPath>>>,
         refuse_changes: AtomicBool,
         refuse_reads: AtomicBool,
+        refuse_trigrams: AtomicBool,
         inner: Mutex<Option<Arc<SearchIndex>>>,
         dropped_while_held: AtomicUsize,
+        trigram_gate: watch::Sender<TrigramGate>,
+        trigram_arrivals: watch::Sender<usize>,
+        trigram_batches: AtomicUsize,
+    }
+
+    /// Which trigram batches wait at the double's gate, and how many held ones may pass.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TrigramGate {
+        /// Batches arriving once the store took at least this many writes wait; `None`
+        /// lets every batch through.
+        held_after_writes: Option<usize>,
+        /// Held batches that may still pass.
+        permits: usize,
+    }
+
+    impl TrigramGate {
+        /// Whether a batch arriving after `writes` writes waits at the gate.
+        fn holds(self, writes: usize) -> bool {
+            self.held_after_writes.is_some_and(|after| writes >= after)
+        }
+
+        /// Whether such a batch may go on now.
+        fn passes(self, writes: usize) -> bool {
+            !self.holds(writes) || self.permits > 0
+        }
+
+        /// Spends a permit on such a batch, when it was held.
+        fn spend(&mut self, writes: usize) {
+            if self.holds(writes) {
+                self.permits = self.permits.saturating_sub(1);
+            }
+        }
     }
 
     /// One write the store holds at its gate: its drop is counted unless the write was
@@ -3292,9 +3418,64 @@ pub(crate) mod lexical_double {
                 applied: Mutex::new(Vec::new()),
                 refuse_changes: AtomicBool::new(false),
                 refuse_reads: AtomicBool::new(false),
+                refuse_trigrams: AtomicBool::new(false),
                 inner: Mutex::new(None),
                 dropped_while_held: AtomicUsize::new(0),
+                trigram_gate: watch::Sender::new(TrigramGate::default()),
+                trigram_arrivals: watch::Sender::new(0),
+                trigram_batches: AtomicUsize::new(0),
             })
+        }
+
+        /// Holds every trigram batch at its gate from now on, until
+        /// [`Self::release_trigrams`] or [`Self::release_trigram_batch`].
+        pub(crate) fn hold_trigrams(&self) {
+            self.hold_trigrams_after_writes(0);
+        }
+
+        /// Holds every trigram batch arriving once the store took `writes` writes, so the
+        /// batch a lane runs before its first write passes whenever it lands.
+        pub(crate) fn hold_trigrams_after_writes(&self, writes: usize) {
+            self.trigram_gate.send_replace(TrigramGate {
+                held_after_writes: Some(writes),
+                permits: 0,
+            });
+        }
+
+        /// Lets exactly one held trigram batch, waiting or still to come, proceed.
+        pub(crate) fn release_trigram_batch(&self) {
+            self.trigram_gate.send_modify(|gate| gate.permits += 1);
+        }
+
+        /// Lets every held and later trigram batch proceed.
+        pub(crate) fn release_trigrams(&self) {
+            self.trigram_gate.send_replace(TrigramGate::default());
+        }
+
+        /// How many trigram batches reached the gate, held or not.
+        pub(crate) fn trigram_arrivals(&self) -> usize {
+            *self.trigram_arrivals.borrow()
+        }
+
+        /// Waits until `count` trigram batches reached the gate, held or not.
+        pub(crate) async fn trigram_arrivals_reach(&self, count: usize) -> TestResult {
+            let mut arrivals = self.trigram_arrivals.subscribe();
+            arrivals
+                .wait_for(|arrived| *arrived >= count)
+                .await
+                .map(drop)?;
+            Ok(())
+        }
+
+        /// Refuses every trigram batch past the gate from now on, as a store that failed
+        /// would.
+        pub(crate) fn refuse_trigrams(&self) {
+            self.refuse_trigrams.store(true, Ordering::SeqCst);
+        }
+
+        /// How many trigram batches passed the gate.
+        pub(crate) fn trigram_batches(&self) -> usize {
+            self.trigram_batches.load(Ordering::SeqCst)
         }
 
         /// How many writes had their future dropped while the store still held them.
@@ -3450,6 +3631,29 @@ pub(crate) mod lexical_double {
             let tree_revision = stamp.tree_revision().unwrap_or_default();
             self.write("apply", tree_revision, through).await
         }
+
+        async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
+            self.trigram_arrivals.send_modify(|arrived| *arrived += 1);
+            let writes = self.applied().len();
+            self.trigram_gate
+                .subscribe()
+                .wait_for(|gate| gate.passes(writes))
+                .await
+                .map(drop)
+                .map_err(|_| SearchError::new(SearchFault::new(SearchViolation::StoreFailed)))?;
+            self.trigram_gate.send_modify(|gate| gate.spend(writes));
+            if self.refuse_trigrams.load(Ordering::SeqCst) {
+                return Err(SearchError::new(
+                    SearchFault::new(SearchViolation::StoreFailed)
+                        .about("the double refuses trigram batches"),
+                ));
+            }
+            self.trigram_batches.fetch_add(1, Ordering::SeqCst);
+            match self.attached() {
+                Some(index) => index.index_trigrams().await,
+                None => Ok(TrigramBatch::default()),
+            }
+        }
     }
 }
 
@@ -3569,7 +3773,7 @@ pub(crate) mod tests {
     use rift_protocol::configuration::{GlobalConfiguration, ServerConfiguration};
     use rift_ranking::{
         DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
-        ParsedQuery, QueryPhase, RankingInput, SearchableField,
+        ParsedQuery, Pattern, QueryPhase, RankingInput, SearchableField,
     };
     use rift_search::{RevisionScoped, SearchIndex, SearchIndexLimits, VectorReadiness};
     use rift_server::ReadFault;
@@ -3577,7 +3781,7 @@ pub(crate) mod tests {
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, StoreDouble};
+    use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, LANE_WAIT_MAX, StoreDouble};
     use super::{
         BlockingExecutor, ChangeSet, ConfigurationFingerprint, IndexState, IndexValidation,
         LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_HELD_PATHS_MAX,
@@ -4062,7 +4266,7 @@ pub(crate) mod tests {
         let limits = WorkspaceIndexLimits::new(4, 60, 60, 4, 100)?;
         fs::write(
             directory.path().join("rift.toml"),
-            "[providers.syntax]\nmax_file = \"60b\"\n",
+            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
         )?;
         fs::write(&absolute, "pub fn beacon() {}\n")?;
         let before = candidate_with_limits(directory.path(), 0, limits)?;
@@ -4802,7 +5006,11 @@ pub(crate) mod tests {
     }
 
     /// A per-file byte bound small enough that [`LEFT_OUT_FILES`]'s oversized file passes it.
-    const SMALL_MAX_FILE: &str = "[providers.syntax]\nmax_file = \"60b\"\n";
+    ///
+    /// Under the default `[search.text] large_files = "split"` a file past the bound is held
+    /// as unparsed text with a digest; `"skip"` leaves it out before its bytes are read.
+    const SMALL_MAX_FILE: &str =
+        "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
 
     /// Files the catalog leaves out before digesting their bytes: one past
     /// [`SMALL_MAX_FILE`], and one holding a NUL byte.
@@ -6145,6 +6353,201 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The file rows the trigram index lacks for `tree_revision`, as a `beacon` pattern read
+    /// of `index` counts them; zero once the index holds every row.
+    async fn rows_lacking_trigrams(index: &SearchIndex, tree_revision: &str) -> TestResult<u64> {
+        let pattern = Pattern::parse("beacon", 1 << 20)?;
+        let prefilter = pattern
+            .prefilter()
+            .ok_or("`beacon` requires its trigrams")?;
+        let read = index
+            .pattern_candidates(tree_revision, prefilter, true, 10_000)
+            .await?;
+        let RevisionScoped::Matched(candidates) = read else {
+            return Err(format!("the store holds {tree_revision}: {read:?}").into());
+        };
+        Ok(candidates
+            .unindexed()
+            .map_or(0, |unindexed| unindexed.total() - unindexed.prepared()))
+    }
+
+    /// Polls `index` until its trigram index holds every row of `tree_revision`.
+    async fn trigrams_caught_up_within_bound(
+        index: &SearchIndex,
+        tree_revision: &str,
+    ) -> TestResult {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            if rows_lacking_trigrams(index, tree_revision).await? == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        Err("the lane never caught the trigram index up".into())
+    }
+
+    /// A write lands while the trigram batch after it is held, so no commit waits for the
+    /// trigram index, and the held batch then indexes every row the write stored. A lane
+    /// started over rows an earlier lane stored and never indexed indexes them with no
+    /// write handed to it.
+    #[tokio::test]
+    async fn a_write_lands_while_its_trigram_batch_is_held_and_a_new_lane_resumes_it() -> TestResult
+    {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let revision = published.reads.tree_revision().to_owned();
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let double = StoreDouble::new();
+        double.attach(Arc::clone(&index));
+        double.hold_trigrams_after_writes(1);
+        let cancellation = CancellationToken::new();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        double.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        assert!(
+            rows_lacking_trigrams(&index, &revision).await? > 0,
+            "the write stored rows the held batch has not indexed"
+        );
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
+
+        double.release_trigrams();
+        let passed = double.trigram_batches();
+        let resumed = CancellationToken::new();
+        let _cancel = resumed.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            resumed.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        trigrams_caught_up_within_bound(&index, &revision).await?;
+        assert_eq!(double.applied().len(), 1, "no second write was handed");
+        assert!(
+            double.trigram_batches() > passed,
+            "the new lane ran a batch"
+        );
+        resumed.cancel();
+        ended_within_bound(&lane).await?;
+        Ok(())
+    }
+
+    /// A write handed while a trigram batch is running runs before the next batch: with
+    /// every batch after the running one held, the write still lands, and the rows it
+    /// stored wait for the next batch.
+    #[tokio::test]
+    async fn a_held_write_runs_before_the_next_trigram_batch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
+        let first_revision = first.reads.tree_revision().to_owned();
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        let double = StoreDouble::new();
+        double.attach(Arc::clone(&index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        double.release_one();
+        lane.request(
+            super::lexical_write(&first, &ChangeSet::Full),
+            Arc::clone(&first),
+        );
+        commit_state_within_bound(&lane, &first_revision, LexicalCommitState::Settled).await?;
+        trigrams_caught_up_within_bound(&index, &first_revision).await?;
+
+        double.hold_trigrams();
+        let arrived = double.trigram_arrivals();
+        let second = candidate_declaring(directory.path(), 1, "beacon")?;
+        let second_revision = second.reads.tree_revision().to_owned();
+        double.release_one();
+        lane.request(super::lexical_write(&second, &ChangeSet::Full), second);
+        commit_state_within_bound(&lane, &second_revision, LexicalCommitState::Settled).await?;
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(arrived + 1)).await??;
+        assert_eq!(
+            double.trigram_arrivals(),
+            arrived + 1,
+            "the batch after the second write waits at the gate"
+        );
+
+        let third = candidate_declaring(directory.path(), 2, "gamma")?;
+        let third_revision = third.reads.tree_revision().to_owned();
+        double.release_one();
+        lane.request(super::lexical_write(&third, &ChangeSet::Full), third);
+        double.release_trigram_batch();
+        commit_state_within_bound(&lane, &third_revision, LexicalCommitState::Settled).await?;
+        assert!(
+            rows_lacking_trigrams(&index, &third_revision).await? > 0,
+            "the rows the third write stored wait for a batch still held"
+        );
+        double.release_trigrams();
+        trigrams_caught_up_within_bound(&index, &third_revision).await?;
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
+        Ok(())
+    }
+
+    /// A trigram batch the store refuses is recorded as a warning and owes nothing more:
+    /// the lane waits for the next write, which owes a batch again.
+    #[tokio::test]
+    async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let double = StoreDouble::new();
+        double.refuse_trigrams();
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(1)).await??;
+        double.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(2)).await??;
+
+        assert_eq!(
+            double.applied().len(),
+            1,
+            "the write ran between the batches"
+        );
+        assert_eq!(double.trigram_batches(), 0, "the store took no batch");
+        let refused = queued_records(&mut drain)
+            .into_iter()
+            .find(|record| {
+                record
+                    .message()
+                    .contains("could not take a batch of file rows")
+            })
+            .ok_or("the refused batch is recorded")?;
+        assert_eq!(refused.level(), "warn");
+        assert_eq!(refused.component(), "search");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_whole_write_compares_the_recorded_digests_and_writes_only_what_moved() -> TestResult
     {
@@ -6249,19 +6652,20 @@ pub(crate) mod tests {
         Ok(SearchIndex::open(database, limits).await?)
     }
 
-    /// One symbol document whose declaration source is `bytes` long, for the bound cases.
+    /// One file document whose text is `bytes` long, for the bound cases: the content
+    /// bound applies to file text, the one content a document stores.
     fn unit_of(path: &str, identity: &str, bytes: usize) -> TestResult<IndexDocument> {
         let fields = DocumentFields::empty()
             .with(SearchableField::Name, identity)
-            .with(SearchableField::DeclarationSource, "x".repeat(bytes));
+            .with(SearchableField::FileContent, "x".repeat(bytes));
         let document = IndexDocument::new(
             DocumentIdentity::new(identity)?,
             DocumentLocation::Project(rift_core::ProjectPath::new(path)?),
-            DocumentKind::Symbol,
+            DocumentKind::TextFile,
             fields.digest(),
             fields,
         )?;
-        Ok(document)
+        Ok(document.at_byte_offset(0))
     }
 
     /// Whether `document` addresses the chunked guide the text-file cases write.
@@ -6329,10 +6733,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The lane commits the rest of the set when one declaration exceeds the store's
-    /// unit bound, stamps the revision, and records the unit it left out. The store's own
-    /// refusal is what this replaces: `lexical.rs` still refuses such a unit handed to it
-    /// directly.
+    /// The lane commits the rest of the set when one file row exceeds the store's unit
+    /// bound, stamps the revision, and records the unit it left out. The declaration
+    /// inside that file keeps its own row, which holds no source. The store's own refusal
+    /// is what this replaces: `lexical.rs` still refuses such a unit handed to it directly.
     #[tokio::test]
     async fn a_commit_leaves_out_an_oversized_unit_records_it_and_publishes_the_rest() -> TestResult
     {
@@ -6372,7 +6776,13 @@ pub(crate) mod tests {
             "the sibling declaration stays searchable"
         );
         let blob = ranked_at(&index, published.reads.tree_revision(), "BLOB", 8).await?;
-        assert!(blob.is_empty(), "the oversized unit is absent: {blob:?}");
+        assert_eq!(
+            blob.iter()
+                .map(DocumentIdentity::as_str)
+                .collect::<Vec<_>>(),
+            ["rift://symbol/rust/blob.rs/BLOB"],
+            "the oversized file row is absent and its declaration's row stays"
+        );
         let recorded = queued_records(&mut drain);
         let left_out = recorded
             .iter()

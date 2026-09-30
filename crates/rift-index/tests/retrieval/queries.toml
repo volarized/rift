@@ -71,10 +71,10 @@ query = "truncated"
 contains = ["src/http.rs#parseJSONValue"]
 
 [[case]]
-name = "a term only declaration source carries"
-class = "declaration_source_only"
+name = "a term only a declaration's body carries reaches its file"
+class = "declaration_body_only"
 query = "saturating_mul"
-contains = ["src/http.rs#impact_radius"]
+contains = ["src/http.rs"]
 
 [[case]]
 name = "a term only file content carries"

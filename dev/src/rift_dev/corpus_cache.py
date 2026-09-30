@@ -43,6 +43,8 @@ class Pin:
     oversized_path: str
     oversized_bytes: int
     seconds: int
+    unparsed_path: str = ""
+    unparsed_bytes: int = 0
 
     @property
     def cache(self) -> Path:
@@ -80,15 +82,16 @@ class Pin:
             raise RuntimeError(
                 f"{self.name}: expected {self.measurement}, observed {observed}; remeasure the pin"
             )
-        if self.oversized_path:
-            path = root / self.oversized_path
-            if (
-                not path.is_file()
-                or path.is_symlink()
-                or path.stat().st_size != self.oversized_bytes
+        for role, relative, size in (
+            ("oversized", self.oversized_path, self.oversized_bytes),
+            ("unparsed", self.unparsed_path, self.unparsed_bytes),
+        ):
+            path = root / relative
+            if relative and (
+                not path.is_file() or path.is_symlink() or path.stat().st_size != size
             ):
                 raise RuntimeError(
-                    f"{self.name}: oversized path or byte count changed: {self.oversized_path}"
+                    f"{self.name}: {role} path or byte count changed: {relative}"
                 )
         return observed
 
@@ -241,5 +244,7 @@ def pins(path: Path = PINS) -> dict[str, Pin]:
             row.oversized_path,
             row.oversized_bytes,
             row.seconds,
+            row.unparsed_path,
+            row.unparsed_bytes,
         )
     return result

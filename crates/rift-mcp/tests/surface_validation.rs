@@ -99,8 +99,33 @@ fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(revision_read_corpus());
     requests.extend(change_search_corpus());
     requests.extend(lexical_search_corpus());
+    requests.extend(pattern_search_corpus());
     requests.extend(traversal_search_corpus());
     requests
+}
+
+/// Regex `pattern` searches: file and symbol hits verified from the trigram candidates,
+/// the matched line as `source`, and a `force_include` file verified whole.
+fn pattern_search_corpus() -> Vec<(&'static str, Value)> {
+    vec![
+        ("search", json!({ "pattern": "beacon" })),
+        (
+            "search",
+            json!({ "pattern": r"fn beacon_\w+\(", "target": "file", "include": ["source"] }),
+        ),
+        (
+            "search",
+            json!({ "pattern": "(?i)BEACON_ONE", "target": "symbol" }),
+        ),
+        (
+            "search",
+            json!({
+                "pattern": "phantom",
+                "target": "file",
+                "paths": { "force_include": ["hidden.rs"] }
+            }),
+        ),
+    ]
 }
 
 /// `scope` on `search` reaches the same collected package `get_symbol`'s scoped requests
@@ -974,6 +999,61 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
             error.message.contains("field packages"),
             "the refusal names the field: {request}: {}",
             error.message
+        );
+    }
+
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A `pattern` the server refuses is a schema-valid request answered with the refusal the
+/// read path names: beside another result-set selector, a tree, or a scope the trigram
+/// index does not hold, out of syntax, and past the compiled-size bound it is
+/// `invalid_request`; beside `target: "documentation"` it is `capability_unavailable`.
+#[tokio::test]
+async fn search_pattern_refusals_carry_their_codes() -> TestResult {
+    let (_directory, client, server_task) = served_fixture().await?;
+    let refused = [
+        (
+            json!({ "pattern": "beacon", "query": "beacon" }),
+            "invalid_request",
+        ),
+        (
+            json!({ "pattern": "beacon", "rev": "main" }),
+            "invalid_request",
+        ),
+        (
+            json!({ "pattern": "beacon", "scope": "all" }),
+            "invalid_request",
+        ),
+        (
+            json!({
+                "pattern": "beacon",
+                "scope": "all",
+                "packages": [{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]
+            }),
+            "invalid_request",
+        ),
+        (json!({ "pattern": "beacon(" }), "invalid_request"),
+        (json!({ "pattern": r"\w{2000}" }), "invalid_request"),
+        (
+            json!({ "pattern": "beacon", "target": "documentation" }),
+            "capability_unavailable",
+        ),
+    ];
+    for (arguments, code) in refused {
+        let error = client
+            .call_tool(tools_call_request("search", &arguments)?)
+            .await
+            .expect_err("the pattern request must be refused");
+        let rmcp::ServiceError::McpError(error) = error else {
+            return Err(format!("expected an McpError, found {error:?}").into());
+        };
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(code)),
+            "{arguments}: {error:?}"
         );
     }
 

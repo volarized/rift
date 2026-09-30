@@ -183,6 +183,20 @@ report asks for the whole workspace, so it supersedes the rebuild the read asked
 read captures again: a capture that matches its previous one waits for the next rebuild, and only
 a capture that differs, a tree still moving, answers from the published index with `stale_index`.
 
+<VersionBadge version="v0.0.46" />
+
+The capture records each file's stat beside its digests: the length and modification time, and
+on unix the status change time, inode, and mode. The next capture reads and hashes only the files
+whose stat moved and keeps the recorded digests of the rest, so a read over an unchanged tree
+reads no file. The record holds the last capture's paths alone and is reused only under the same
+index limits.
+
+Restoring a modification time (`touch -r`, `cp -p`, `rsync -t`) moves the status change time,
+so such a rewrite is read again. One miss stays: a rewrite to bytes of the same length inside
+the same timestamp tick keeps its old digest until the file's stat moves again. APFS and ext4
+stamp nanoseconds, which makes that tick too short to matter; the 1 s or 2 s ticks of HFS+, FAT,
+and some network mounts widen it.
+
 A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
 it answers from the published index and carries `stale_index`, whose `detail` names the counter
 the failed rebuild answered for, the counter the tree is at, and the failure's causes. The next observation retries the rebuild.
@@ -254,7 +268,7 @@ lane runs the writes it was handed in publication order, one at a time. The lane
 behind the running one, and a write handed while one waits merges into it: the union of the files
 both named, derived from the newer publication, leaves the store exactly as running both would. A
 burst of changes therefore costs one write per lane turn. One process-wide write turn serializes
-index commits, vector batches, and log batches, and each transaction starts with
+index commits, trigram batches, vector batches, and log batches, and each transaction starts with
 `BEGIN IMMEDIATE`.
 
 A write commits in transactions of at most
@@ -265,23 +279,36 @@ the last names the tree the write answers for. A server that stops during a writ
 transaction: the ones already committed recorded their files' digests with their rows, so the next
 start's comparison writes only the files the stopped write did not reach.
 
+Between writes, the lane fills the trigram index behind regex search. Each batch indexes the
+oldest rows the index lacks, under the same `transaction_units` and `transaction_size` bounds, and
+a write handed meanwhile runs before the next batch. A search never waits for a batch: it reads
+the rows the index lacks beside the index.
+
 The database uses WAL with `synchronous=NORMAL`. Read-only connections use committed WAL
 snapshots. `search.busy_timeout` bounds a lock wait caused by another process, and a wait for a
 pooled connection when every one of the `search.pool_slots` is checked out.
 
 Past that wait, a `search` ranks without the store: it answers from identifier matching and warns
-`lexical_ranking_unavailable`, with a `detail` naming the slot wait. Every other checkout refuses,
-a [`rift://logs`](/docs/mcp#resource-logs) read and a write among them.
+`lexical_ranking_unavailable`, with a `detail` naming the slot wait. A regex search verifies every
+file its `paths` select in place of the rows the trigram index would select, and warns nothing.
+Every other checkout refuses, a [`rift://logs`](/docs/mcp#resource-logs) read and a write among
+them.
+
+Every checkout sets its pragmas again, `mmap_size` among them, from
+[`[search.lexical]`](/docs/developer/configuration#search) `mmap_size`, so a pooled connection
+reads the store file through the memory map that key sets.
 
 A commit that refuses leaves the previous rows and stamp intact and records its cause in the
 server log; the next write compares its whole publication with the recorded digests.
 
 The database tables:
 
-- `lexical_documents` - one row per indexed document: a code symbol, or a text file split into
-  chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk bound. The row
-  carries an integer `id`, the document's identity, path, kind, and content digest beside the
-  searchable fields.
+- `lexical_documents` - one row per indexed document: a declaration, carrying its names,
+  signature, and documentation, or an indexed file's text, the one copy of it the store keeps,
+  split into chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk
+  bound. The row carries an integer `id`, the document's identity, path, kind, and content digest
+  beside the searchable fields, and a chunk row its `byte_offset` in the file, so a position in
+  the chunk maps back to the file without chunking it again.
 - `lexical_files` - one row per file the published index holds, the files it left out
   included, carrying the SHA-256 of the bytes that file's rows were derived from. A change
   writes a path's rows and its digest in one transaction.
@@ -306,8 +333,26 @@ The database tables:
   than in a name. The tokenizer is `unicode61 remove_diacritics 0`: keeping diacritics is what
   lets Rift split the same text the same way outside SQLite without carrying a folding table
   of its own.
+- `lexical_documents_vocabulary` - an [`fts5vocab`](https://www.sqlite.org/fts5.html) table over
+  the word index's columns. Its per-column document counts are the document frequencies body
+  matches score by.
+- `lexical_documents_trigram` - a second external-content FTS5 index over `file_content` alone,
+  tokenized `trigram` with `detail=none`: it records which rows hold each run of three
+  characters, case-folded, and no positions, which is all a regex prefilter reads. Declaration
+  rows carry no text and stay out of it, and `columnsize=0` keeps FTS5's `integrity-check` from
+  counting them as missing. The lane's trigram batches fill it, and a write that removes a path
+  deletes the entries of the path's rows the index holds alone: a `'delete'` naming a row the
+  index never took leaves it failing `integrity-check`.
+- `lexical_trigram_pending` - the `id` of every file row the trigram index doesn't hold yet. A
+  write files its new file rows here in the transaction that stores them, a trigram batch takes
+  them off as it indexes them, and a regex search reads it beside the trigram index, so a row
+  stored since the last batch still reaches the answer.
 - `semantic_vectors` - one row per embedding space and declaration digest.
 - `log_records` - bounded server diagnostics read through `rift://logs` and `rift server logs`.
+
+The store's migrations reach this layout from any earlier one. The migration that took each
+declaration's text out of its row drops that column and rebuilds both indexes, so the first start
+after an upgrade rewrites the whole store.
 
 A rebuild that named its files deletes and reinserts exactly those paths, which is why
 `lexical_documents` carries an index on `path`: the index finds a path's rows and their index
@@ -472,6 +517,15 @@ APIs never leave the syntax crate.
 The registry itself assembles from one shipped definition list in `rift-syntax`: each entry
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
+
+<VersionBadge version="v0.0.46" languages={["JavaScript", "TypeScript"]} />
+
+The JavaScript and TypeScript providers publish a declaration's attached JSDoc as its
+`documentation`. The walk starts at the statement carrying the declaration - an `export`, or the
+`const`, `let`, or `var` statement it is the first declarator of - and the declaration's `range`
+starts there too, so the JSDoc sits inside the range `get_symbol` answers. Several blocks join
+with a line break, `@` tags stay as written, and the `/**`, `*/`, and leading `*` markers are
+stripped; a `//` or `/* */` comment or a blank line ends the walk.
 
 ## Dependency context
 

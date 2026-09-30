@@ -16,16 +16,20 @@ from mcp.shared.exceptions import MCPError
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     CONTEXT_SPAN,
+    HELD_UNPARSED_RECORD,
     PROBE_PATH,
     PROBE_SOURCE,
     READ_COUNT,
     SYMBOL_COUNT,
     active_stdout,
+    build_records,
+    chunked_answer,
     churn_answer,
     database_bytes,
     exact_degradation,
     fields,
     language_counts,
+    last_line_pattern,
     lexical_breach,
     lexical_content,
     map_paths,
@@ -34,6 +38,7 @@ from rift_dev.corpus_assertions import (
     probe_units,
     records,
     sample_symbols,
+    token_past_chunk,
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
@@ -265,9 +270,10 @@ class Corpus:
                         any(package.get("manager") == "pypi" for package in packages),
                         "uv.lock produced no pypi packages",
                     )
-                await self.left_out(client)
                 await self.symbols(client, candidates)
                 await self.lexical_persistence(client)
+                await self.oversized(client)
+                await self.unparsed(client)
                 if self.pin.name == "nextjs":
                     await self.symlinks(client)
                 no_failed_builds(
@@ -353,26 +359,77 @@ class Corpus:
             for path in candidates
         )
 
-    async def left_out(self, client: Client) -> None:
+    async def oversized(self, client: Client) -> None:
+        """Search the pinned oversized file past its first chunk under the default `split`.
+
+        The file is past `[search.text] max_chunk`, so the index holds its text as chunks.
+        A token that first occurs past the first chunk answers only from a later one.
+        """
         if not self.pin.oversized_path:
             return
         path = self.pin.oversized_path
+        data = (self.root / path).read_bytes()
         require(
-            (self.root / path).stat().st_size == self.pin.oversized_bytes,
-            f"{path}: pinned byte count changed",
+            len(data) == self.pin.oversized_bytes, f"{path}: pinned byte count changed"
+        )
+        token, offset = token_past_chunk(data)
+        answer = await settled_pattern(
+            client,
+            {
+                "pattern": token,
+                "target": "file",
+                "paths": {"include": [path]},
+                "limit": 1,
+            },
+        )
+        named = chunked_answer(answer, path, len(data), offset)
+        require(not named, f"{path}: named by {named} although split holds it whole")
+        self.record(
+            "oversized", path=path, bytes=len(data), pattern=token, offset=offset
+        )
+
+    async def unparsed(self, client: Client) -> None:
+        """Search the pinned file past `[providers.syntax] max_file` held as text.
+
+        The provider refuses its source for its size alone, so under the default `split`
+        its text answers search, every answer names it in `large_file_unparsed`, and the
+        build that reads it records it as held unparsed rather than left out.
+        """
+        if not self.pin.unparsed_path:
+            return
+        path = self.pin.unparsed_path
+        data = (self.root / path).read_bytes()
+        require(
+            len(data) == self.pin.unparsed_bytes, f"{path}: pinned byte count changed"
+        )
+        pattern, offset = last_line_pattern(data)
+        answer = await settled_pattern(
+            client,
+            {
+                "pattern": pattern,
+                "target": "file",
+                "paths": {"include": [path]},
+                "limit": 1,
+            },
+        )
+        named = chunked_answer(answer, path, len(data), offset)
+        require(
+            named == ["large_file_unparsed"],
+            f"{path}: named by {named}, expected large_file_unparsed alone",
         )
         found = await observed(
             client,
             "rift://logs/component/index",
-            lambda rows: any(fields(row).get("path") == path for row in rows),
+            lambda rows: bool(build_records(rows, path)),
         )
-        matching = [row for row in found if fields(row).get("path") == path]
+        # One record per build that read the file; a rebuild of the whole tree reads it again.
+        messages = build_records(found, path)
         require(
-            any("left out" in str(row.get("message")) for row in matching),
-            f"{path}: missing left-out reason",
+            set(messages) == {HELD_UNPARSED_RECORD},
+            f"{path}: build records {messages}, expected {HELD_UNPARSED_RECORD!r} alone",
         )
         self.record(
-            "left_out", path=path, bytes=self.pin.oversized_bytes, records=matching
+            "unparsed", path=path, bytes=len(data), pattern=pattern, offset=offset
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
@@ -867,6 +924,29 @@ async def observed_output(server: Server, offset: int, message: str) -> str:
                 return output
             await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"required record never reached server output: {message}")
+
+
+async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
+    """Resend a `pattern` search until the trigram index covers every stored row.
+
+    An answer warning `pattern_index_preparing` covers only the rows the trigram index
+    holds, and the warning asks the caller to resend once the index catches up. The
+    deadline alone bounds the loop, as in `Corpus.await_probe`.
+    """
+    deadline = time.monotonic() + OBSERVATION_SECONDS
+    while time.monotonic() < deadline:
+        answer = await client.call("search", request)
+        preparing = [
+            warning
+            for warning in warnings(answer)
+            if warning.get("code") == "pattern_index_preparing"
+        ]
+        if not preparing:
+            return answer
+        await asyncio.sleep(POLL_SECONDS)
+    raise AssertionError(
+        f"the trigram index never covered every stored row within {OBSERVATION_SECONDS}s"
+    )
 
 
 def objects(answer: JsonObject, key: str) -> list[JsonObject]:

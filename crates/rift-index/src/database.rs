@@ -28,6 +28,7 @@ use toasty::stmt::{Type, Value};
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
+use tracing::Instrument as _;
 
 use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
@@ -50,24 +51,41 @@ const MIGRATION_LOCK_SUFFIX: &str = ".lock";
 /// takes it at most one span after the holder releases it.
 const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(10);
 
-/// Connection count and wait bounds for one database file.
+/// Connection count, wait bounds, and memory map size for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
     slots: u32,
     busy_timeout_ms: u32,
+    mmap_bytes: u64,
 }
 
 impl DatabasePool {
     /// Builds the pool's bounds: connection slots, and the busy-wait budget
     /// that bounds a caller's wait for a free slot, the wait `SQLite` grants a
     /// connection for another process's lock before it refuses, and an open's
-    /// wait for another process's migration lock.
+    /// wait for another process's migration lock. Connections read through
+    /// `SQLite`'s page cache alone until [`Self::memory_mapped`] sets a map.
     #[must_use]
     pub const fn new(slots: u32, busy_timeout_ms: u32) -> Self {
         Self {
             slots,
             busy_timeout_ms,
+            mmap_bytes: 0,
         }
+    }
+
+    /// The same pool with each connection mapping up to `mmap_bytes` of the file,
+    /// the `[search.lexical] mmap_size` key. `SQLite` caps the map at its compiled
+    /// `SQLITE_MAX_MMAP_SIZE`, the key's accepted maximum.
+    #[must_use]
+    pub const fn memory_mapped(self, mmap_bytes: u64) -> Self {
+        Self { mmap_bytes, ..self }
+    }
+
+    /// The bytes of the file each connection maps; `0` maps nothing.
+    #[must_use]
+    pub const fn mmap_bytes(self) -> u64 {
+        self.mmap_bytes
     }
 
     /// Pooled connection slots.
@@ -226,7 +244,18 @@ impl WorkspaceDatabase {
         &self,
         access: ConnectionAccess,
     ) -> Result<Connection, LexicalIndexError> {
-        let mut connection = self.database.connection().await.map_err(storage_error)?;
+        // Every store operation checks a connection out, so the span sits at debug: an info
+        // filter would print one closing line per checkout.
+        let mut connection = self
+            .database
+            .connection()
+            .instrument(tracing::debug_span!(
+                "database.checkout",
+                component = "database",
+                operation = "database.checkout"
+            ))
+            .await
+            .map_err(storage_error)?;
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
@@ -371,7 +400,10 @@ async fn configure_journal(connection: &mut Connection) -> Result<(), LexicalInd
     require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
 }
 
-/// Applies connection-local durability, lock wait, and access policy.
+/// Applies connection-local durability, lock wait, memory map, and access policy.
+///
+/// Every checkout sets each pragma again, one statement each, so a pooled connection
+/// answers under this pool's policy whichever checkout opened it.
 async fn configure_connection(
     connection: &mut Connection,
     pool: DatabasePool,
@@ -383,6 +415,11 @@ async fn configure_connection(
         .map_err(storage_error)?;
     let busy_timeout_ms = pool.busy_timeout_ms();
     toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
+        .exec(&mut *connection)
+        .await
+        .map_err(storage_error)?;
+    let mmap_bytes = pool.mmap_bytes();
+    toasty::sql::query(format!("PRAGMA mmap_size = {mmap_bytes}"))
         .exec(&mut *connection)
         .await
         .map_err(storage_error)?;
@@ -673,6 +710,41 @@ mod tests {
             .exec(&mut transaction)
             .await?;
         crate::lexical::require_pragma_row(&query_only, &[Value::I64(0)])?;
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_checkout_maps_the_pool_memory_map_size() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let unmapped = WorkspaceDatabase::open(&path, pool()).await?;
+        let mut reading = unmapped.connection().await?;
+        let unmapped_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        crate::lexical::require_pragma_row(&unmapped_size, &[Value::I64(0)])?;
+        drop(reading);
+        drop(unmapped);
+
+        let mapped_pool = pool().memory_mapped(1 << 20);
+        assert_eq!(mapped_pool.mmap_bytes(), 1 << 20);
+        let database = WorkspaceDatabase::open(&path, mapped_pool).await?;
+        let mut reading = database.connection().await?;
+        let read_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        crate::lexical::require_pragma_row(&read_size, &[Value::I64(1 << 20)])?;
+        drop(reading);
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        let written_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut transaction)
+            .await?;
+        crate::lexical::require_pragma_row(&written_size, &[Value::I64(1 << 20)])?;
         transaction.rollback().await?;
         Ok(())
     }

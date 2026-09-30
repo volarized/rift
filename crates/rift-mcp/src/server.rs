@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    LexicalIndexLimits, LogStore, PathChange, PathChanges, WorkspaceDigests, WorkspaceFingerprint,
-    WorkspaceIndexLimits, capture_digests_with_languages,
+    LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndexLimits, capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -24,15 +24,17 @@ use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
     WorkspaceResourcePage, WorkspaceSourceUnit,
 };
-use rift_ranking::{ParsedQuery, QueryPhase, RankingInput, RankingWeights};
+use rift_ranking::{
+    BodyTerms, FileRowFrequencies, ParsedQuery, QueryPhase, RankingInput, RankingWeights,
+};
 use rift_search::{
     AcquisitionLimits, EmbeddingModels, EmbeddingSpace, ModelSource, RemoteEmbeddingSettings,
     RetrievalModels, RevisionScoped, RiftOpenAiEmbeddingModel, SearchError, SearchIndex,
     SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    EnginePool, EngineReferences, LspProcessKey, ReadError, ReadFault, ReadService, StoreAnswer,
-    resolve_engine_references, uses_engine_references, wire_digest,
+    EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault, ReadService,
+    StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -142,17 +144,37 @@ impl BlockingExecutor {
     where
         Output: Send + 'static,
     {
+        // Both spans wrap every blocking operation, so they sit at debug: an info filter
+        // would print two closing lines per request and per build.
         let acquire = Arc::clone(&self.operations).acquire_owned();
-        let permit = tokio::time::timeout(Duration::from_millis(self.queue_timeout_ms), acquire)
+        let queue_timeout_ms = self.queue_timeout_ms;
+        let permit = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire)
+            .instrument(tracing::debug_span!(
+                "worker.queue",
+                component = "worker",
+                operation = "worker.queue"
+            ))
             .await
-            .map_err(|_| ReadFault::capacity_timeout(operation, self.queue_timeout_ms))?
+            .map_err(|_| ReadFault::capacity_timeout(operation, queue_timeout_ms))?
             .map_err(|error| ReadFault::task(operation, error.to_string()))?;
-        tokio::task::spawn_blocking(move || {
-            let result = work();
-            // Explicit success-path release; unwinding also drops the owned permit.
-            drop(permit);
-            result
-        })
+        async move {
+            // The blocking thread has no ambient span, so the work's own spans attach to
+            // the current one explicitly rather than opening a disconnected trace.
+            let parent = tracing::Span::current();
+            tokio::task::spawn_blocking(move || {
+                let _entered = parent.enter();
+                let result = work();
+                // Explicit success-path release; unwinding also drops the owned permit.
+                drop(permit);
+                result
+            })
+            .await
+        }
+        .instrument(tracing::debug_span!(
+            "worker.run",
+            component = "worker",
+            operation = "worker.run"
+        ))
         .await
         .map_err(|error| ReadFault::task(operation, error.to_string()))?
     }
@@ -985,6 +1007,9 @@ struct PhasedRanking {
     broad: Vec<RankingInput>,
     lexical_truncated_at: Option<u32>,
     readiness: VectorReadiness,
+    /// The document frequencies a body match scores declarations with, read beside the
+    /// ranking; absent for a query carrying no term.
+    file_rows: Option<FileRowFrequencies>,
 }
 
 /// The ranking one search request merges, and what the search index's own state adds to
@@ -1016,8 +1041,13 @@ impl SearchRanking {
 
     /// No store ranking and no reason to report: the request never consulted the store.
     fn without_store(weights: RankingWeights) -> Self {
+        Self::unranked(StoreAnswer::without_store(weights))
+    }
+
+    /// `answer` as it stands, with nothing about the store to report.
+    const fn unranked(answer: StoreAnswer) -> Self {
         Self {
-            answer: StoreAnswer::without_store(weights),
+            answer,
             warnings: Vec::new(),
         }
     }
@@ -1044,7 +1074,8 @@ fn ranking_of(
             let mut warnings = readiness_warnings(phased.readiness, files);
             warnings.extend(phased.lexical_truncated_at.map(lexical_truncated));
             Some(SearchRanking {
-                answer: StoreAnswer::new(phased.precise, phased.broad, weights),
+                answer: StoreAnswer::new(phased.precise, phased.broad, weights)
+                    .with_file_rows(phased.file_rows),
                 warnings,
             })
         }
@@ -1338,6 +1369,8 @@ pub struct RiftMcp {
     /// The shares the identifier, full-text, and vector rankings fuse under, as
     /// `[search.ranking]` set them.
     ranking_weights: RankingWeights,
+    /// The bounds one `pattern` search runs under, as the `[search]` table set them.
+    pattern_bounds: PatternBounds,
     /// Lazy global package client, replaced when accepted settings or credentials change.
     global: Arc<GlobalState>,
     /// The lexical lane, absent exactly when [`Self::search_index`] is. A rebuild commits
@@ -1349,6 +1382,9 @@ pub struct RiftMcp {
     /// writes records holds its own.
     logs: Option<Arc<LogStore>>,
     engines: Arc<EngineHold>,
+    /// The last request-time capture's stats and digests: the next capture reads only the
+    /// paths whose stat moved since.
+    last_capture: Arc<std::sync::Mutex<Arc<LastCapture>>>,
     /// The capture a test forces in place of reading the tree, so every retry arm of the
     /// bounded reconciliation loop is reached without racing filesystem events.
     #[cfg(test)]
@@ -1363,6 +1399,7 @@ struct SearchTier {
     acquisition: Option<EmbeddingSelection>,
     search_index: Option<Arc<SearchIndex>>,
     ranking_weights: RankingWeights,
+    pattern_bounds: PatternBounds,
     lexical: Option<LexicalLane>,
     population: Option<PopulationLane>,
 }
@@ -1508,6 +1545,7 @@ impl RiftMcp {
             acquisition,
             search_index,
             ranking_weights,
+            pattern_bounds,
             lexical,
             population,
         } = Self::open_search_tier(
@@ -1562,10 +1600,12 @@ impl RiftMcp {
             blocking,
             search_index,
             ranking_weights,
+            pattern_bounds,
             global: Arc::new(GlobalState::default()),
             lexical,
             logs,
             engines,
+            last_capture: Arc::default(),
             #[cfg(test)]
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
@@ -1644,6 +1684,7 @@ impl RiftMcp {
             acquisition,
             search_index,
             ranking_weights: ranking_weights(&search_configuration),
+            pattern_bounds: PatternBounds::from(&search_configuration),
             lexical,
             population,
         }
@@ -1765,15 +1806,17 @@ impl RiftMcp {
 
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol. `change` answers the
-    /// declarations two committed revisions hold differently, in place of `query` and
-    /// `traversal`. `rev` searches a version-control revision instead of the current tree,
-    /// and never combines with `traversal` or `change`. `scope` reaches past the project
-    /// tree: `global` answers `query` from the public declarations the global index holds
-    /// for the workspace's dependencies alone, `all` from both, ordered together.
-    /// `packages` names package versions `query` searches beside the workspace's own, such
-    /// as an upgrade target or a package the project does not use yet. Use `get_symbol`
-    /// when the declaration name is known.
+    /// bounded relationship `traversal` from one seed symbol. `pattern` matches a regex
+    /// against the text of every indexed file, line by line as ripgrep reads it, and answers
+    /// each match and each declaration holding one, in place of `query` and `traversal`.
+    /// `change` answers the declarations two committed revisions hold differently, in place
+    /// of `query` and `traversal`. `rev` searches a version-control revision instead of the
+    /// current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
+    /// reaches past the project tree: `global` answers `query` from the public declarations
+    /// the global index holds for the workspace's dependencies alone, `all` from both,
+    /// ordered together. `packages` names package versions `query` searches beside the
+    /// workspace's own, such as an upgrade target or a package the project does not use yet.
+    /// Use `get_symbol` when the declaration name is known.
     ///
     /// For a current-tree search, the published workspace is resolved exactly once and
     /// threaded through both the search index's revision check and the executed
@@ -2129,6 +2172,9 @@ impl RiftMcp {
         published: &PublishedWorkspace,
         deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
+        if params.pattern.is_some() {
+            return self.pattern_ranking(params, published).await.map(Some);
+        }
         // A global scope never consults the project store: the project answers no hit,
         // and the package hits come from the global index.
         if params.scope == SearchScope::Global {
@@ -2177,6 +2223,55 @@ impl RiftMcp {
         ))
     }
 
+    /// The files the trigram index selects for one `pattern` request against `published`,
+    /// under the `[search]` pattern bounds.
+    ///
+    /// The publication holds the text the matcher verifies, so the store only narrows
+    /// which files are read: a pattern the read path refuses, one with no prefilter, a
+    /// store that could not open or handed the read no pooled connection within
+    /// `[search] busy_timeout`, and a store that does not hold the captured tree all
+    /// leave the read path to verify every held file, and the answer is complete either
+    /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
+    /// batches: the rows the trigram index lacks ride the selection, and the read path
+    /// verifies them, or answers from the rows the index holds and warns
+    /// `pattern_index_preparing`.
+    async fn pattern_ranking(
+        &self,
+        params: &SearchParams,
+        published: &PublishedWorkspace,
+    ) -> Result<SearchRanking, ErrorData> {
+        let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
+        let Some(index) = self.search_index.as_ref() else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds) else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Some(prefilter) = pattern.prefilter().cloned() else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let line_bound = pattern.is_line_bound();
+        let tree_revision = published.reads.tree_revision();
+        let rows_max = self.pattern_bounds.candidate_rows_max();
+        let scoped =
+            rift_core::traced_async!(component = "search", operation = "search.pattern", {
+                index
+                    .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
+                    .await
+            })
+            .await;
+        let selected = match scoped.map_err(StoreReadFailure::from) {
+            Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
+            Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
+            | Err(StoreReadFailure::ConnectionUnavailable) => None,
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
+        Ok(SearchRanking::unranked(match selected {
+            Some(candidates) => answer.with_pattern_candidates(candidates),
+            None => answer,
+        }))
+    }
+
     /// The store's answer for `tree_revision` in both query phases, read as deep as
     /// [`Self::fetch_limit`].
     ///
@@ -2216,12 +2311,37 @@ impl RiftMcp {
         } else {
             Vec::new()
         };
+        let file_rows = self.file_rows(index, tree_revision, query).await?;
         Ok(RevisionScoped::Matched(PhasedRanking {
             lexical_truncated_at: precise.lexical_truncated_at(),
             readiness: precise.readiness(),
             precise: precise.into_inputs(),
             broad,
+            file_rows,
         }))
+    }
+
+    /// The document frequencies of `query`'s terms over the store's file rows, or nothing
+    /// for a query carrying no term, or a store that moved past `tree_revision` between
+    /// the ranking and this read.
+    async fn file_rows(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+    ) -> Result<Option<FileRowFrequencies>, StoreReadFailure> {
+        let terms = BodyTerms::of(query);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let read = index
+            .file_row_frequencies(tree_revision, &terms)
+            .await
+            .map_err(StoreReadFailure::from)?;
+        Ok(match read {
+            RevisionScoped::Matched(frequencies) => Some(frequencies),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+        })
     }
 
     /// One phase of the store's ranking for `tree_revision`.
@@ -2272,7 +2392,13 @@ impl RiftMcp {
         query: &ParsedQuery,
         deadline: RequestDeadline,
     ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
-        let searched = self.read_store(index, tree_revision, query).await?;
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 1_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
         let Some(lane) = self.lexical.as_ref() else {
             return Ok((searched, LexicalCommitState::Settled));
         };
@@ -2281,8 +2407,18 @@ impl RiftMcp {
         if matched || commit_state != LexicalCommitState::Committing {
             return Ok((searched, commit_state));
         }
-        let commit_state = commit_landed(lane, tree_revision, deadline).await;
-        let searched = self.read_store(index, tree_revision, query).await?;
+        let commit_state =
+            rift_core::traced_async!(component = "search", operation = "search.commit_landed", {
+                commit_landed(lane, tree_revision, deadline).await
+            })
+            .await;
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 2_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
         Ok((searched, commit_state))
     }
 
@@ -2542,7 +2678,9 @@ impl RiftMcp {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
             let superseded_seen = self.validation.superseded_epoch();
             let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
-            let tree = digests.fingerprint();
+            let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+                digests.fingerprint()
+            });
             let configuration_matches =
                 current.configuration.fingerprint == configuration_fingerprint;
             if tree == current.fingerprint && configuration_matches {
@@ -2688,7 +2826,9 @@ impl RiftMcp {
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
-    /// `current`'s accepted policy, on the worker pool.
+    /// `current`'s accepted policy, on the worker pool. A file whose stat did not move since
+    /// the last capture keeps that capture's digest without a read; [`LastCapture`] names
+    /// the one rewrite that reuse misses.
     async fn capture_tree(
         &self,
         current: &PublishedWorkspace,
@@ -2702,17 +2842,32 @@ impl RiftMcp {
         let visibility = current.configuration.source_visibility();
         let text_inclusion = current.configuration.text_inclusion();
         let languages = current.configuration.language_file_selections();
+        let last_capture = Arc::clone(&self.last_capture);
         self.blocking
             .run("workspace fingerprint", move || {
-                let digests = capture_digests_with_languages(
+                let last = Arc::clone(
+                    &last_capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                let (digests, next) = capture_digests_with_languages(
                     &root,
                     limits,
                     &visibility,
                     &text_inclusion,
                     &languages,
+                    &last,
                 )
                 .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
-                Ok((digests, configuration_fingerprint(&root)))
+                *last_capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+                let configuration = rift_core::traced!(
+                    component = "index",
+                    operation = "fingerprint.configuration",
+                    { configuration_fingerprint(&root) }
+                );
+                Ok((digests, configuration))
             })
             .instrument(tracing::debug_span!(
                 "index.reconcile",
@@ -3477,14 +3632,32 @@ mod tests {
         Ok(())
     }
 
+    /// A file past `[providers.syntax] max_file` extracts no declaration. Under the default
+    /// `[search.text] large_files = "split"` its text stays in the index and every answer
+    /// names it `large_file_unparsed`; under `skip` it leaves the index and answers carry
+    /// its `source_unavailable`.
     #[tokio::test]
-    async fn build_skips_one_oversized_file_and_serves_its_warning() -> TestResult {
+    async fn build_serves_the_warning_of_a_file_past_max_file_under_each_strategy() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
         super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"1b\"\n")?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::LargeFileUnparsed { files, .. }
+                if files.iter().any(|file| file.0.ends_with("/wide.rs"))
+        )));
+        drop(server);
 
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
+        let configuration =
+            "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
+        super::hermetic_workspace(directory.path(), configuration)?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        let result = get_symbol(&server, "wide").await?;
         assert!(result.hits.is_empty());
         assert!(result.warnings.iter().any(|warning| matches!(
             warning,
@@ -3581,7 +3754,9 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"60b\"\n")?;
+        let configuration =
+            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
+        super::hermetic_workspace(directory.path(), configuration)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
@@ -4118,19 +4293,16 @@ mod tests {
         assert_eq!(file_hit["matched_by"], json!(["content"]));
 
         // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
-        // documentation column is what carried the query into this declaration. The
-        // declaration's own span is extended over its attached doc comment, so the
-        // declaration-source column holds the same bytes and rides along as `content`.
+        // documentation column is what carried the query into this declaration. Its source
+        // is stored once, in `lib.rs`'s file row, and a body match never adds a column to a
+        // declaration already placed, so `content` does not ride along.
         let symbol_hit = results
             .iter()
             .find(|hit| {
                 hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
             })
             .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
-        assert_eq!(
-            symbol_hit["matched_by"],
-            json!(["documentation", "content"])
-        );
+        assert_eq!(symbol_hit["matched_by"], json!(["documentation"]));
 
         // The declaration's own name places the same declaration under a name hit.
         let named = search_until_hit(client.peer(), "scale_value", "lib.rs").await?;
@@ -4915,12 +5087,13 @@ mod tests {
         let visibility = current.configuration.source_visibility();
         let text_inclusion = current.configuration.text_inclusion();
         let languages = current.configuration.language_file_selections();
-        let digests = super::capture_digests_with_languages(
+        let (digests, _) = super::capture_digests_with_languages(
             root,
             limits,
             &visibility,
             &text_inclusion,
             &languages,
+            &super::LastCapture::default(),
         )
         .map_err(|error| super::ReadError::from(ReadFault::Index(error)))?;
         Ok((digests, super::configuration_fingerprint(root)))
@@ -5584,9 +5757,344 @@ mod tests {
         Ok(())
     }
 
+    /// A `pattern` search whose trigram read meets a pool with no free connection answers
+    /// from every held file, as it does when the store could not open, instead of refusing
+    /// the request.
+    #[tokio::test]
+    async fn a_pattern_search_with_no_pooled_connection_verifies_every_held_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double, database) = server_over_one_slot(directory.path()).await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let held = database.hold_connection().await?;
+
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params)))
+            .await
+            .map_err(|_elapsed| "the pattern search waited past its bound for the held connection")?
+            .map_err(|refusal| {
+                format!("the pattern search must answer without the store: {refusal:?}")
+            })?
+            .0;
+        drop(held);
+
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 14)))],
+            "every held file is verified while the store is out of reach"
+        );
+        assert!(
+            answer.warnings.is_empty(),
+            "a complete answer warns nothing: {:?}",
+            answer.warnings
+        );
+        Ok(())
+    }
+
+    /// A `pattern` search over a server whose search database could not open answers from
+    /// every held file, as it does when the pool hands the read no connection.
+    #[tokio::test]
+    async fn a_pattern_search_without_the_search_database_verifies_every_held_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(server.search_index.is_none());
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 14)))]
+        );
+        assert!(answer.warnings.is_empty());
+        Ok(())
+    }
+
+    /// A `pattern` holding no trigram leaves the store unread and verifies every held file.
+    #[tokio::test]
+    async fn a_pattern_holding_no_trigram_verifies_every_held_file() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        assert!(server.search_index.is_some());
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "fn", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 6)))]
+        );
+        assert!(answer.warnings.is_empty());
+        Ok(())
+    }
+
+    /// A query of punctuation alone carries no term: once the store holds the served tree,
+    /// the store ranks it, reads no term's document frequency, and answers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_query_of_punctuation_alone_answers_nothing_from_the_store() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        let answer = run_search(&server, "--- ...").await?;
+        assert!(answer.results.is_empty());
+        assert!(store_ranked(&answer));
+        Ok(())
+    }
+
     /// The publication `server` currently answers from.
     async fn current_publication(server: &RiftMcp) -> Arc<PublishedWorkspace> {
         Arc::clone(&server.published.read().await.current)
+    }
+
+    /// A `pattern` request answers from every held file while the store has not committed
+    /// the captured tree, with nothing about the store to warn, then reads the trigram
+    /// index once the commit lands; both answers carry the same verified hit.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_reads_the_trigram_candidates_of_the_captured_tree() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let located = |answer: &SearchResult| {
+            answer
+                .results
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.path.as_ref().map(|path| path.0.clone()),
+                        hit.line,
+                        hit.range.as_ref().map(|range| (range.start, range.end)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = [(Some("lib.rs".to_owned()), Some(1), Some((4, 14)))];
+
+        let before = server.search(Parameters(params.clone())).await?.0;
+        assert_eq!(located(&before), expected);
+        assert!(before.warnings.is_empty(), "{:?}", before.warnings);
+
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        let candidates = trigram_candidates_after_population(&server, &params).await?;
+        assert_eq!(
+            candidates.candidates().len(),
+            1,
+            "lib.rs alone holds `fn bea`"
+        );
+        let after = server.search(Parameters(params)).await?.0;
+        assert_eq!(located(&after), expected);
+        Ok(())
+    }
+
+    /// Polls `params`' trigram selection until the lexical lane's trigram batches have
+    /// indexed every row the store holds.
+    async fn trigram_candidates_after_population(
+        server: &RiftMcp,
+        params: &SearchParams,
+    ) -> TestResult<rift_index::PatternCandidates> {
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            let published = current_publication(server).await;
+            let budget = server.readiness_timeout().await;
+            let ranking = server
+                .ranking(params, &published, RequestDeadline::starting(budget))
+                .await?
+                .ok_or("a pattern always ranks")?;
+            let candidates = ranking
+                .answer
+                .pattern_candidates()
+                .ok_or("the store answered the prefilter")?;
+            if candidates.unindexed().is_none() {
+                return Ok(candidates.clone());
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+        }
+        Err("the lexical lane never caught the trigram index up".into())
+    }
+
+    /// Notes past a candidate bound of 100 rows, each a text file of one row.
+    const TRIGRAM_FIXTURE_NOTES: usize = 150;
+
+    /// A server over `lib.rs` and [`TRIGRAM_FIXTURE_NOTES`] text notes whose lexical lane
+    /// runs over a [`StoreDouble`] holding every trigram batch after the first write, with
+    /// `configuration` in `rift.toml`. Returns once that write has landed.
+    async fn server_with_trigrams_held(
+        root: &std::path::Path,
+        configuration: &str,
+    ) -> TestResult<(RiftMcp, Arc<StoreDouble>)> {
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        for note in 0..TRIGRAM_FIXTURE_NOTES {
+            let note_path = root.join(format!("note_{note:03}.txt"));
+            fs::write(note_path, format!("harbor note {note}\n"))?;
+        }
+        super::hermetic_workspace(root, configuration)?;
+        let double = StoreDouble::new();
+        double.hold_trigrams_after_writes(1);
+        let gate = Arc::clone(&double);
+        let assembled = RiftMcp::assemble(
+            super::absolute_root(root)?,
+            WorkspaceIndexLimits::default(),
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            super::workspace_watcher,
+            move |index, blocking, cancellation, product_version| {
+                gate.attach(index);
+                LexicalLane::spawn_over(
+                    gate,
+                    crate::validation::lexical_double::UNBOUNDED,
+                    blocking,
+                    cancellation,
+                    product_version,
+                )
+            },
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        Ok((server, double))
+    }
+
+    /// One hit of a pattern answer as its path and byte range.
+    type PatternHit = (Option<String>, Option<(u64, u64)>);
+
+    /// Each hit of a pattern answer as its path and byte range.
+    fn pattern_hits(answer: &SearchResult) -> Vec<PatternHit> {
+        answer
+            .results
+            .iter()
+            .map(|hit| {
+                (
+                    hit.path.as_ref().map(|path| path.0.clone()),
+                    hit.range.as_ref().map(|range| (range.start, range.end)),
+                )
+            })
+            .collect()
+    }
+
+    /// The answer a scan of every file `server`'s publication holds gives `params`.
+    async fn scanned(server: &RiftMcp, params: &SearchParams) -> TestResult<SearchResult> {
+        let published = current_publication(server).await;
+        Ok(published
+            .reads
+            .search(params, &StoreAnswer::identifier_only())?)
+    }
+
+    /// Rows the trigram index lacks are verified beside the ones it selects while they fit
+    /// the `[search]` bounds, so a search right after a write, with every trigram batch
+    /// held, answers at once and in full, warning nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_verifies_the_rows_the_trigram_index_lacks_while_they_fit()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, _double) = server_with_trigrams_held(directory.path(), "").await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
+        let answer =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params.clone())))
+                .await
+                .map_err(|_| "a pattern search never waits for the trigram index")??
+                .0;
+        assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
+        assert_eq!(pattern_hits(&answer).len(), 10, "notes 10 to 19");
+        assert_eq!(
+            pattern_hits(&answer),
+            pattern_hits(&scanned(&server, &params).await?)
+        );
+
+        let published = current_publication(&server).await;
+        let budget = server.readiness_timeout().await;
+        let ranking = server
+            .ranking(&params, &published, RequestDeadline::starting(budget))
+            .await?
+            .ok_or("a pattern always ranks")?;
+        let unindexed = ranking
+            .answer
+            .pattern_candidates()
+            .and_then(rift_index::PatternCandidates::unindexed)
+            .ok_or("every batch after the write is held, so rows still lack trigrams")?;
+        assert_eq!(unindexed.prepared(), 0);
+        assert!(
+            unindexed.completed().is_some(),
+            "the lacking rows fit the default bounds"
+        );
+        Ok(())
+    }
+
+    /// Past `pattern_candidate_rows`, a search while every trigram batch is held answers at
+    /// once from the rows the index holds, and carries `pattern_index_preparing` counting
+    /// them; the answer validates against the served `search` output schema. Once the
+    /// batches land, the warning goes and the answer equals a scan of every held file.
+    #[tokio::test(start_paused = true)]
+    async fn a_pattern_search_past_the_bounds_warns_until_the_trigram_index_catches_up()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) =
+            server_with_trigrams_held(directory.path(), "[search]\npattern_candidate_rows = 100\n")
+                .await?;
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
+        let held =
+            tokio::time::timeout(UNWAITED_READ_MAX, server.search(Parameters(params.clone())))
+                .await
+                .map_err(|_| "a pattern search never waits for the trigram index")??
+                .0;
+        let preparing: Vec<(u64, u64)> = held
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                ReadWarning::PatternIndexPreparing {
+                    prepared, total, ..
+                } => Some((*prepared, *total)),
+                _ => None,
+            })
+            .collect();
+        let [(prepared, total)] = preparing.as_slice() else {
+            return Err(format!("one preparation warning: {:?}", held.warnings).into());
+        };
+        assert_eq!(*prepared, 0, "the held batches indexed no row");
+        assert!(*total > 100, "every note and lib.rs store a row: {total}");
+        assert!(
+            held.results.is_empty(),
+            "the index holds no row to verify: {:?}",
+            held.results
+        );
+        let tools = RiftMcp::tool_router().list_all();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search")
+            .ok_or("search is served")?;
+        let schema = serde_json::Value::Object(
+            search
+                .output_schema
+                .as_deref()
+                .ok_or("search declares an output schema")?
+                .clone(),
+        );
+        let validator = jsonschema::validator_for(&schema)?;
+        let instance = serde_json::to_value(&held)?;
+        let failures: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|failure| failure.to_string())
+            .collect();
+        assert!(failures.is_empty(), "{failures:#?}\n{instance:#}");
+
+        double.release_trigrams();
+        let mut settled = server.search(Parameters(params.clone())).await?.0;
+        for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+            if settled.warnings.is_empty() {
+                break;
+            }
+            tokio::time::sleep(SEARCH_TIER_POLL).await;
+            settled = server.search(Parameters(params.clone())).await?.0;
+        }
+        assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
+        assert_eq!(pattern_hits(&settled).len(), 10, "notes 10 to 19");
+        assert_eq!(
+            pattern_hits(&settled),
+            pattern_hits(&scanned(&server, &params).await?)
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
@@ -6113,6 +6621,125 @@ mod tests {
         Ok(())
     }
 
+    /// Whether one `rift://logs` record closes a whole scan of the tree: the read service's
+    /// `index.build` span for a first build or a rescan. The supervisor's `index.build` span
+    /// carries `trigger` and wraps one scan, an incremental rebuild, or no build at all, and
+    /// an incremental rebuild's carries `changed_count` and reads only the paths it names.
+    fn closes_a_whole_scan(record: &serde_json::Value) -> bool {
+        let fields = &record["fields"];
+        let build = record["message"] == "index.build";
+        let closed = fields["span"] == "closed";
+        let supervisor = fields.get("trigger").is_some();
+        let incremental = fields.get("changed_count").is_some();
+        build && closed && !supervisor && !incremental
+    }
+
+    /// Stops the index supervisor and waits until every blocking operation has returned its
+    /// worker permit. Cancelling the supervisor leaves a scan already on the pool running to
+    /// its end, so only the returned permits say that no scan can still write a record.
+    async fn stop_index_work(server: &RiftMcp) -> TestResult {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        server.index_supervisor().shutdown(deadline).await?;
+        let workers = u32::try_from(server.server_configuration().await.num_workers)?;
+        let permits = server.blocking.operations.acquire_many(workers);
+        drop(tokio::time::timeout_at(deadline, permits).await??);
+        Ok(())
+    }
+
+    /// A file past `[providers.syntax] max_file` stays in the index as text under the
+    /// default `[search.text] large_files = "split"`, so every record naming it says it is
+    /// held unparsed, with the fields a left-out file's record carries, and no record calls
+    /// it left out.
+    ///
+    /// Each whole scan of the tree records the file once, and a filesystem event that asks
+    /// for the whole workspace starts another, so the page holds one such record per whole
+    /// scan. The index work stops before the drain does, so a rescan still running then
+    /// closes first and the page holds both of its records.
+    #[tokio::test]
+    async fn a_file_past_max_file_is_logged_as_held_unparsed() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let wide = format!("pub fn wide() {{}}\n{}", "// wide_marker\n".repeat(8));
+        fs::write(directory.path().join("src/wide.rs"), wide)?;
+        super::hermetic_workspace(directory.path(), "[providers.syntax]\nmax_file = \"64b\"\n")?;
+
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)?;
+
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage.logs().ok_or("the log store must open")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server = RiftMcp::build_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
+
+        let held = serde_json::to_value(run_search(&server, "wide_marker").await?)?;
+        assert!(
+            hit_paths(&held).contains(&"src/wide.rs"),
+            "the held file's text answers search: {held:#}"
+        );
+
+        stop_index_work(&server).await?;
+        cancellation.cancel();
+        drain_task.await?;
+        let logs = server.read_logs("rift://logs/component/index").await?;
+        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
+            .contents
+            .first()
+            .ok_or("a log read answers with one content")?
+        else {
+            return Err("a log read answers with text".into());
+        };
+        let page: serde_json::Value = serde_json::from_str(text)?;
+        let records = page["records"]
+            .as_array()
+            .ok_or("a log page carries records")?;
+        let scans = records
+            .iter()
+            .filter(|record| closes_a_whole_scan(record))
+            .count();
+        let named: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["fields"]["path"] == "src/wide.rs")
+            .collect();
+        assert!(scans > 0, "startup closes a whole scan: {text}");
+        assert_eq!(
+            named.len(),
+            scans,
+            "each whole scan records the held file once: {text}"
+        );
+        for record in named {
+            assert_eq!(
+                record["message"], "file held unparsed in the index",
+                "{record:#}"
+            );
+            assert_eq!(record["level"], "warn", "{record:#}");
+            assert_eq!(record["operation"], "index.build", "{record:#}");
+            let reason = record["fields"]["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains("source_too_large") && reason.contains("holds its text unparsed"),
+                "the record names the bound the file crossed: {record:#}"
+            );
+        }
+        assert!(
+            !text.contains("file left out of the index"),
+            "no file in this workspace is left out: {text}"
+        );
+        Ok(())
+    }
+
     /// A record emitted immediately before a `rift://logs` read appears in that read, with the
     /// drain still running. The drain writes on its own timer and nothing made the read wait
     /// for it, so a caller reading back the diagnostic behind its own refusal was answered
@@ -6237,25 +6864,26 @@ mod tests {
         Ok(())
     }
 
-    /// One declaration's content past the lexical unit bound leaves the lexical index
-    /// alone: the publication lands, the sibling answers `search`, the declaration still
-    /// answers `get_symbol`, and the record names the file. The lexical commit runs on
-    /// the building task, so the thread-local subscriber sees it.
+    /// Under `[search.text] large_files = "split"`, the default, a whole-file row as large
+    /// as a `max_chunk` above the old 1mb unit bound lands in the lexical index: the store
+    /// takes every row a `max_chunk` the configuration accepts can derive, so the file's
+    /// text answers `search`, its declaration answers `search` by name and `get_symbol`, and
+    /// no unit is recorded as left out. The lexical commit runs on the building task, so
+    /// the thread-local subscriber sees every record it raises.
     #[tokio::test]
-    async fn an_oversized_declaration_is_left_out_of_search_and_the_rest_serves() -> TestResult {
+    async fn a_file_row_as_large_as_max_chunk_answers_search_and_its_declaration_serves()
+    -> TestResult {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        let unit_bytes_max =
-            usize::try_from(rift_index::LexicalIndexLimits::default().unit_bytes_max())?;
         let blob = format!(
-            "pub const BLOB: &str = \"{}\";\n",
-            "b".repeat(unit_bytes_max)
+            "pub const BLOB: &str = \"{}\";\n// lantern harbor\n",
+            "b".repeat(1 << 20)
         );
         fs::write(directory.path().join("src/blob.rs"), blob)?;
-        super::hermetic_workspace(directory.path(), "")?;
+        super::hermetic_workspace(directory.path(), "[search.text]\nmax_chunk = \"2mb\"\n")?;
         let (sink, mut drain) = crate::logs::log_capture();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
 
@@ -6263,26 +6891,146 @@ mod tests {
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
-        let symbol = get_symbol(&server, "BLOB").await?;
-        assert_eq!(
-            symbol.hits.len(),
-            1,
-            "the declaration stays in the syntax index: {symbol:?}"
-        );
-        let recorded = loop {
-            match drain.try_recv_record() {
-                Ok(record) if record.message().contains("lexical unit left out") => break record,
-                Ok(_) => {}
-                Err(_) => return Err("the left-out unit must be recorded".into()),
-            }
-        };
-        assert_eq!(recorded.level(), "warn");
-        assert_eq!(recorded.component(), "index");
+        let text = serde_json::to_value(run_search(&server, "lantern harbor").await?)?;
         assert!(
-            recorded.fields().contains("src/blob.rs"),
-            "the record names the path: {}",
-            recorded.fields()
+            hit_paths(&text).contains(&"src/blob.rs"),
+            "the whole-file row answers: {text:#}"
         );
+        let named = serde_json::to_value(run_search(&server, "BLOB").await?)?;
+        let named_hits = named["results"].as_array().ok_or("results are an array")?;
+        assert!(
+            named_hits
+                .iter()
+                .any(|hit| hit["hit"]["symbol"]["name"] == json!("BLOB")),
+            "{named:#}"
+        );
+        let symbol = get_symbol(&server, "BLOB").await?;
+        assert_eq!(symbol.hits.len(), 1, "{symbol:?}");
+        while let Ok(record) = drain.try_recv_record() {
+            assert!(
+                !record.message().contains("lexical unit left out"),
+                "no unit is left out: {}",
+                record.fields()
+            );
+        }
+        Ok(())
+    }
+
+    /// Writes the large-file tree the two strategies are proven over: a small parsed file,
+    /// a parsed file past a 1kb `max_chunk`, and a file past an 8kb `max_file`, under the
+    /// `[search.text]` lines `text` adds.
+    fn large_file_workspace(root: &std::path::Path, text: &str) -> TestResult {
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "pub fn beacon() {}\n")?;
+        let blob = format!(
+            "pub const BLOB: &str = \"{}\";\n// harbor lantern\n",
+            "b".repeat(3_000)
+        );
+        fs::write(root.join("src/blob.rs"), blob)?;
+        let huge = format!(
+            "pub const HUGE: &str = \"{}\";\n// harbor relay\n",
+            "h".repeat(9_000)
+        );
+        fs::write(root.join("src/huge.rs"), huge)?;
+        let configuration = format!(
+            "[providers.syntax]\nmax_file = \"8kb\"\n\n[search.text]\nmax_chunk = \"1kb\"\n{text}"
+        );
+        super::hermetic_workspace(root, &configuration)?;
+        Ok(())
+    }
+
+    /// The paths of an answer's hits, in answer order.
+    fn answered_paths(answer: &SearchResult) -> Vec<&str> {
+        answer
+            .results
+            .iter()
+            .filter_map(|hit| hit.path.as_ref().map(|path| path.0.as_str()))
+            .collect()
+    }
+
+    /// Under `[search.text] large_files = "split"`, the default, a file past `max_chunk`
+    /// answers search from its chunk rows and its declaration answers `get_symbol`, and a
+    /// file past `[providers.syntax] max_file` is held as text the provider does not parse:
+    /// its text answers a `pattern`, and every answer names it in `large_file_unparsed`.
+    /// The store takes every row a `max_chunk` the configuration accepts can derive, so no
+    /// row of either file is left out of the lexical index, and the capture agrees with
+    /// the index on the held text.
+    #[tokio::test]
+    async fn split_answers_files_past_the_chunk_and_the_parse_bounds() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        large_file_workspace(directory.path(), "")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let lantern = search_after_population(&server, "lantern").await?;
+        assert!(
+            answered_paths(&lantern).contains(&"src/blob.rs"),
+            "a chunk row answers: {lantern:?}"
+        );
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(answered_paths(&answer), ["src/blob.rs", "src/huge.rs"]);
+        let unparsed = answer
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                ReadWarning::LargeFileUnparsed { files, .. } => Some(files.clone()),
+                _ => None,
+            })
+            .ok_or("the answer names the unparsed file")?;
+        assert_eq!(
+            unparsed,
+            [rift_protocol::read::FileId(
+                "rift://file/src/huge.rs".to_owned()
+            )]
+        );
+        assert!(
+            !answer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "the capture reads the held text as the build did: {:?}",
+            answer.warnings
+        );
+        assert_eq!(get_symbol(&server, "BLOB").await?.hits.len(), 1);
+        let huge = get_symbol(&server, "HUGE").await?;
+        assert!(
+            huge.hits.is_empty(),
+            "no declaration of huge.rs was extracted"
+        );
+        assert!(
+            huge.warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LargeFileUnparsed { .. })),
+            "{:?}",
+            huge.warnings
+        );
+        Ok(())
+    }
+
+    /// Under `large_files = "skip"`, a file past `max_chunk` leaves text search and an
+    /// answer whose `paths` reach it counts it in `large_file_skipped`, while its
+    /// declaration still answers `get_symbol`; a file past `max_file` leaves the index.
+    #[tokio::test]
+    async fn skip_answers_with_the_count_of_the_files_it_leaves_out() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        large_file_workspace(directory.path(), "large_files = \"skip\"\n")?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert!(answer.results.is_empty(), "{answer:?}");
+        assert!(
+            answer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LargeFileSkipped { skipped: 2, .. })),
+            "{:?}",
+            answer.warnings
+        );
+        assert_eq!(get_symbol(&server, "BLOB").await?.hits.len(), 1);
+        assert!(get_symbol(&server, "HUGE").await?.hits.is_empty());
         Ok(())
     }
 
@@ -6691,6 +7439,7 @@ mod tests {
             broad: Vec::new(),
             lexical_truncated_at: None,
             readiness,
+            file_rows: None,
         }
     }
 

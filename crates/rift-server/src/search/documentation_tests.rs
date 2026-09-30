@@ -69,6 +69,15 @@ async fn answer(
     else {
         return Err("matching revision required".into());
     };
+    let RevisionScoped::Matched(frequencies) = store
+        .file_row_frequencies(
+            service.tree_revision(),
+            &rift_ranking::BodyTerms::of(&query),
+        )
+        .await?
+    else {
+        return Err("matching revision required".into());
+    };
     let weights = RankingConfiguration::default();
     Ok(StoreAnswer::new(
         precise.into_inputs(),
@@ -79,7 +88,8 @@ async fn answer(
             weights.vector_weight,
             weights.fusion_k,
         )?,
-    ))
+    )
+    .with_file_rows(Some(frequencies)))
 }
 
 async fn scoped_documentation_search(
@@ -417,10 +427,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             "docs/api.md",
             &["Navigation API"][..],
             "6aa1b2916828c61e9ea5023fbe94e58ae6467a0c81ad4e3b95448222b7fa6ada",
-            &[
-                "docs/api.md",
-                "rift://symbol/markdown/docs/api.md/Navigation%20API",
-            ][..],
+            &["docs/api.md"][..],
             &["rift://symbol/markdown/docs/api.md/Navigation%20API"][..],
         ),
         (
@@ -428,10 +435,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             "docs/tutorial.md",
             &["Field Tutorial"][..],
             "97e7e5894ad3524019eb636fdbc15f9c23694e8cf98c2caef4aa8c3dad748e02",
-            &[
-                "docs/tutorial.md",
-                "rift://symbol/markdown/docs/tutorial.md/Field%20Tutorial",
-            ][..],
+            &["docs/tutorial.md"][..],
             &["rift://symbol/markdown/docs/tutorial.md/Field%20Tutorial"][..],
         ),
         (
@@ -439,25 +443,15 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             "docs/repeated.md",
             &["Examples", "Examples > Calibration~2"][..],
             "f029465cd85732d93c71c1c5529623413a989f85526db2c5f79c9082470b899f",
-            &[
-                "rift://symbol/markdown/docs/repeated.md/Examples%20%3E%20Calibration~2",
-                "rift://symbol/markdown/docs/repeated.md/Examples",
-                "docs/repeated.md",
-            ][..],
-            &[
-                "rift://symbol/markdown/docs/repeated.md/Examples%20%3E%20Calibration~2",
-                "rift://symbol/markdown/docs/repeated.md/Examples",
-            ][..],
+            &["docs/repeated.md"][..],
+            &["rift://symbol/markdown/docs/repeated.md/Examples%20%3E%20Calibration~2"][..],
         ),
         (
             "orbital_route",
             "docs/rust.md",
             &["Rust Example"][..],
             "0f6ff8c17f7f5e80fb03a0d9e73667bb629b52b42ad5d6aa8b2b4e98f98a4ae2",
-            &[
-                "docs/rust.md",
-                "rift://symbol/markdown/docs/rust.md/Rust%20Example",
-            ][..],
+            &["docs/rust.md"][..],
             &["rift://symbol/markdown/docs/rust.md/Rust%20Example"][..],
         ),
     ]

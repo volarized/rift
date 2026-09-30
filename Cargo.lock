@@ -3616,6 +3616,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -4350,13 +4351,16 @@ dependencies = [
  "clap",
  "flate2",
  "fs4",
+ "ignore",
  "indicatif",
  "jiff",
+ "jsonschema",
  "mimalloc",
  "nix",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "regex-syntax",
  "reqwest",
  "rift-core",
  "rift-index",
@@ -4488,6 +4492,7 @@ version = "0.0.45"
 dependencies = [
  "ignore",
  "rayon",
+ "regex-syntax",
  "rift-analysis",
  "rift-core",
  "rift-history",
@@ -4586,6 +4591,9 @@ name = "rift-ranking"
 version = "0.0.45"
 dependencies = [
  "data-encoding",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
  "rift-core",
  "serde",
  "sha2",

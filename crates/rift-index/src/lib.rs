@@ -1,5 +1,6 @@
 //! In-memory indexing and retrieval.
 
+mod capture;
 mod change_set;
 mod chunk;
 mod database;
@@ -9,12 +10,14 @@ mod language;
 mod lexical;
 mod log;
 mod semantic;
+mod trigram_store;
 
 mod relationship;
 mod revision;
 mod vector;
 mod workspace;
 
+pub use capture::LastCapture;
 pub use change_set::{
     ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
@@ -42,6 +45,7 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::{
     ForceIncludeReach, PathMatcher, PathVerdict, SourcePatternError, SourcePatternFault,
 };
+pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};
 pub use workspace::{
     IndexFailure, IndexedFile, ReadableSymbol, SymbolMatch, TextSourceFile, WorkspaceFingerprint,

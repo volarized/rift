@@ -564,18 +564,46 @@
       ],
       "description": "How one exact language selects an LSP process."
     },
+    "LargeFileStrategy": {
+      "description": "What the text index does with a file whose text runs past `[search.text] max_chunk`.",
+      "oneOf": [
+        {
+          "const": "split",
+          "description": "The file's text is indexed as whole-line chunks of at most `max_chunk` bytes, and a\nfile past `[providers.syntax] max_file` is held as text the syntax provider does\nnot parse, up to `[source] workspace_size`.",
+          "type": "string"
+        },
+        {
+          "const": "skip",
+          "description": "The file leaves the text index: no search reads its text, and a file past\n`[providers.syntax] max_file` leaves the index entirely.",
+          "type": "string"
+        }
+      ]
+    },
     "LexicalSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.lexical]` table: how many units the lexical index holds, and how many one\ntransaction writes.",
+      "description": "The `[search.lexical]` table: how many units the lexical index holds, how many one\ntransaction writes, and how much of the store file a connection memory-maps.",
       "properties": {
+        "mmap_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1gb",
+          "description": "How much of the workspace database each connection reads through a\nmemory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page\ncache alone. Every connection maps the file on its own, so resident\nmemory counts the mapped pages once per open connection.",
+          "rift:range": {
+            "max": "2097088kb",
+            "min": "0b"
+          }
+        },
         "transaction_size": {
           "$ref": "#/$defs/ByteSize",
           "default": "16mb",
-          "description": "Most content one lexical transaction writes, 1mb to 1gb, counted and\napplied the way `transaction_units` is."
+          "description": "Most content one lexical transaction writes, 1mb to 1gb, counted and\napplied the way `transaction_units` is.",
+          "rift:range": {
+            "max": "1gb",
+            "min": "1mb"
+          }
         },
         "transaction_units": {
           "default": 5000,
-          "description": "Most units one lexical transaction writes, 100 to 1000000. A write\nlarger than this commits in several transactions, and the tree it\nanswers for is stamped by the last. One file's units always share a\ntransaction, so a file holding more units takes one of its own.",
+          "description": "Most units one lexical transaction writes, 100 to 1000000. A write\nlarger than this commits in several transactions, and the tree it\nanswers for is stamped by the last. One file's units always share a\ntransaction, so a file holding more units takes one of its own. The\ntrigram index `pattern` search reads is filled after each write in\ntransactions of at most this many rows.",
           "format": "uint64",
           "maximum": 1000000,
           "minimum": 100,
@@ -811,7 +839,7 @@
         },
         "lexical_weight": {
           "default": 0.35,
-          "description": "The lexical ranking's share of a fused score, 0.0 to 1.0. The lexical\nranking is the `SQLite` full-text index over names, signatures,\nattached documentation, declaration source, and selected text files.",
+          "description": "The lexical ranking's share of a fused score, 0.0 to 1.0. The lexical\nranking is the `SQLite` full-text index over declaration names,\nsignatures, and attached documentation, and over the text of every\nindexed file, stored once.",
           "format": "double",
           "maximum": 1.0,
           "minimum": 0.0,
@@ -887,7 +915,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files, and\n`pool_slots` and `busy_timeout` bound the shared `SQLite` connections\nbehind search and logs.",
+      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files,\n`pool_slots` and `busy_timeout` bound the shared `SQLite` connections\nbehind search and logs, and the `pattern_` keys bound one regex\n`pattern` search.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -901,11 +929,46 @@
         "lexical": {
           "$ref": "#/$defs/LexicalSearchConfiguration",
           "default": {
+            "mmap_size": "1gb",
             "transaction_size": "16mb",
             "transaction_units": 5000,
             "units_max": 1000000
           },
           "description": "How many units the lexical index holds."
+        },
+        "pattern_candidate_rows": {
+          "default": 10000,
+          "description": "Most rows of the trigram index one `pattern` search reads to select the\nfiles it verifies, 100 to 1000000, counted once per chunk of a large file.\nA search whose selection passes it is refused naming this key. Rows the\ntrigram index does not hold yet are verified within what the selection\nleaves of it; past that, the search answers from the rows the index holds\nand warns `pattern_index_preparing`.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "pattern_compiled_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "1mb",
+          "description": "Most bytes the matcher one search `pattern` compiles to may take, 64kb to\n64mb. A pattern whose matcher compiles past it is refused naming this key.",
+          "rift:range": {
+            "max": "64mb",
+            "min": "64kb"
+          }
+        },
+        "pattern_matches_per_file": {
+          "default": 1000,
+          "description": "Most matches one file contributes to a `pattern` search, 1 to 100000. A\nfile past it is cut there, and the answer warns\n`pattern_matches_truncated`.",
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pattern_verified_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "128mb",
+          "description": "Most file text one `pattern` search verifies, 1mb to 64gb. A search that\nwould verify more is refused naming this key. Rows the trigram index does\nnot hold yet are left out rather than verified past it, and the answer\nwarns `pattern_index_preparing`.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "1mb"
+          }
         },
         "pool_slots": {
           "default": 4,
@@ -928,9 +991,24 @@
         "text": {
           "$ref": "#/$defs/TextSearchConfiguration",
           "default": {
+            "excluded_lockfiles": [
+              "Cargo.lock",
+              "uv.lock",
+              "package-lock.json",
+              "bun.lock",
+              "pnpm-lock.yaml",
+              "yarn.lock",
+              "poetry.lock",
+              "Pipfile.lock",
+              "composer.lock",
+              "Gemfile.lock",
+              "go.sum",
+              "deno.lock"
+            ],
             "include": [
               "**"
             ],
+            "large_files": "split",
             "max_chunk": "1mb"
           },
           "description": "Chunking policy for visible text files in lexical search."
@@ -1130,8 +1208,30 @@
     },
     "TextSearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, and `max_chunk`\nbounds the lexical units derived from them.",
+      "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, `max_chunk`\nbounds the lexical units derived from them, `large_files` decides what\nhappens to a file past `max_chunk`, and `excluded_lockfiles` names the\nlockfiles the index leaves out of search.",
       "properties": {
+        "excluded_lockfiles": {
+          "default": [
+            "Cargo.lock",
+            "uv.lock",
+            "package-lock.json",
+            "bun.lock",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            "go.sum",
+            "deno.lock"
+          ],
+          "description": "File names of the lockfiles the index leaves out of search, matched against\neach visible file's final path segment. Such a file answers no search and no\nsymbol lookup, while `rift://map` still reads its pinned versions and\n`paths.force_include` still reaches it for one request. An empty list\nindexes every lockfile.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
         "include": {
           "default": [
             "**"
@@ -1143,10 +1243,15 @@
           "maxItems": 64,
           "type": "array"
         },
+        "large_files": {
+          "$ref": "#/$defs/LargeFileStrategy",
+          "default": "split",
+          "description": "What the text index does with a file past `max_chunk`: `split` indexes it in\nchunks and holds a file past `[providers.syntax] max_file` as unparsed text;\n`skip` leaves it out of the text index, and every search answer whose `paths`\nreach one counts it in a `large_file_skipped` warning. Omitted, `split`."
+        },
         "max_chunk": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
-          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as\nseveral chunks of at most this size.",
+          "description": "Bytes one lexical chunk may hold, 1kb to 16mb. A larger file is indexed as\nseveral chunks of at most this size, or left out of the text index, as\n`large_files` decides.",
           "rift:range": {
             "max": "16mb",
             "min": "1kb"
@@ -1305,10 +1410,15 @@
       "default": {
         "busy_timeout": "5s",
         "lexical": {
+          "mmap_size": "1gb",
           "transaction_size": "16mb",
           "transaction_units": 5000,
           "units_max": 1000000
         },
+        "pattern_candidate_rows": 10000,
+        "pattern_compiled_size": "1mb",
+        "pattern_matches_per_file": 1000,
+        "pattern_verified_size": "128mb",
         "pool_slots": 4,
         "ranking": {
           "fusion_k": 60,
@@ -1317,9 +1427,24 @@
           "vector_weight": 0.3
         },
         "text": {
+          "excluded_lockfiles": [
+            "Cargo.lock",
+            "uv.lock",
+            "package-lock.json",
+            "bun.lock",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            "go.sum",
+            "deno.lock"
+          ],
           "include": [
             "**"
           ],
+          "large_files": "split",
           "max_chunk": "1mb"
         },
         "vector": {

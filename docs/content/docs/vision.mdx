@@ -82,6 +82,15 @@ unnecessary context pollution. We primarily do this to ensure that if a language
 by Rift, it can still contribute (yet without any additional structural knowledge) to the signal
 that the agent might be looking for in the codebase.
 
+<VersionBadge version="v0.0.46" />
+
+Agents already write regular expressions for `grep` and ripgrep, so the local server answers
+them too. A trigram index over the text the local index stores selects the files a pattern's
+literals can occur in, and the pattern then checks those files, so a
+[regex search](/docs/mcp#search-pattern)
+answers every match from the index rather than from a walk of the disk. Each match also names
+the declaration holding it, which is where the text layer meets syntax.
+
 ### Syntax
 
 The syntax level is one of the simplest, yet it brings a lot of useful information about the
@@ -239,8 +248,8 @@ uses a separate index of collected OSS package versions.
 />
 
 The local baseline combines identifier-aware matching with a
-[SQLite FTS5](https://www.sqlite.org/fts5.html) index over declaration names, declaration source,
-and selected text files. FTS5 ranks matching units with BM25.
+[SQLite FTS5](https://www.sqlite.org/fts5.html) index over declaration names and the text of the
+indexed files, which the index stores once. FTS5 ranks matching units with BM25.
 
 <VersionBadge
   version="v0.0.16"

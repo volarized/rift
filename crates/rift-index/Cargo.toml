@@ -31,6 +31,7 @@ rayon.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+regex-syntax.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

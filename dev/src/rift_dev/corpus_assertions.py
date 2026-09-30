@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from rift_dev.rift_test_client import (
+    Json,
     JsonObject,
     array_value,
     object_value,
@@ -33,6 +34,21 @@ MAP_MODULES_MAX = 100_000
 # unread input is reported under.
 CONTEXT_SPAN = "dependency.context"
 CONTEXT_DEGRADED = "dependency context degraded"
+# `[search.text] max_chunk` at its default. The corpus writes no `[search.text]` table, so
+# `large_files` stays `split`: a file past this many bytes is indexed as whole-line chunks
+# of at most this size, and its text past the first chunk still answers search.
+TEXT_CHUNK_BYTES = 1 << 20
+FILE_PREFIX = "rift://file/"
+# A run of identifier bytes, which a `pattern` matches literally with no escaping.
+PATTERN_TOKEN = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{7,63}")
+# The characters the Rust `regex` crate's syntax reserves, each escaped with a backslash
+# to match itself (`regex_syntax::is_meta_character`).
+PATTERN_META = re.compile(r"[\\.+*?()|\[\]{}^$#&\-~]")
+# Characters one `pattern` may hold (`SEARCH_PATTERN_CHARS_MAX`).
+PATTERN_CHARS_MAX = 1_024
+# The record each build writes for a file it holds as text its syntax provider does not
+# parse; a file it leaves out gets `file left out of the index` instead.
+HELD_UNPARSED_RECORD = "file held unparsed in the index"
 
 
 def map_paths(answer: JsonObject) -> set[str]:
@@ -198,6 +214,90 @@ def warnings(answer: JsonObject) -> list[JsonObject]:
     return found
 
 
+def token_past_chunk(data: bytes) -> tuple[str, int]:
+    """The first token that occurs nowhere in the file's first chunk, and its first offset.
+
+    A `pattern` search for it can only match text the index holds past that chunk, so its
+    first hit lands exactly at the returned offset. Each candidate costs one scan of the
+    first chunk, so the file's token count bounds the work.
+    """
+    require(
+        len(data) > TEXT_CHUNK_BYTES,
+        f"the file holds {len(data)} bytes, within one {TEXT_CHUNK_BYTES}-byte chunk",
+    )
+    for found in PATTERN_TOKEN.finditer(data, TEXT_CHUNK_BYTES):
+        token = found.group()
+        # An occurrence starting inside the first chunk may run past its end.
+        if data.find(token, 0, TEXT_CHUNK_BYTES - 1 + len(token)) == -1:
+            return token.decode("ascii"), data.find(token, TEXT_CHUNK_BYTES)
+    raise AssertionError(f"no token first occurs past byte {TEXT_CHUNK_BYTES}")
+
+
+def last_line_pattern(data: bytes) -> tuple[str, int]:
+    """A `pattern` matching the file's last nonblank line literally, and its first offset.
+
+    Each character the `regex` syntax reserves is escaped, so the pattern's first hit
+    lands at the first occurrence of that line's text.
+    """
+    lines = [line for line in data.splitlines() if line.strip()]
+    require(bool(lines), "the file holds no nonblank line")
+    line = lines[-1].decode("utf-8")
+    pattern = PATTERN_META.sub(lambda found: "\\" + found.group(), line)
+    require(
+        len(pattern) <= PATTERN_CHARS_MAX,
+        f"the last line escapes to {len(pattern)} characters, past {PATTERN_CHARS_MAX}",
+    )
+    return pattern, data.find(lines[-1])
+
+
+def named_paths(warning: JsonObject) -> set[str]:
+    """The project paths one warning names through its `unit` or `files`."""
+    identities: list[Json] = [warning["unit"]] if "unit" in warning else []
+    identities.extend(array_value(warning.get("files", []), "warning files"))
+    found: set[str] = set()
+    for value in identities:
+        identity = string_value(value, "warning file")
+        require(identity.startswith(FILE_PREFIX), f"invalid file identity: {identity}")
+        found.add(unquote(identity.removeprefix(FILE_PREFIX), errors="strict"))
+    return found
+
+
+def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> list[str]:
+    """Require a `pattern` answer to hit `path` at `offset`, the file held at full size.
+
+    Under the default `large_files = "split"` no file is left out of the text index, so no
+    warning may count one as skipped. Returns the codes of the warnings naming `path`.
+    """
+    hits = array_value(answer.get("results"), "pattern hits")
+    require(bool(hits), f"{path}: no pattern hit at byte {offset}: {answer}")
+    first = object_value(hits[0], "pattern hit")
+    target = object_value(first.get("hit"), "pattern hit target")
+    span = object_value(first.get("range"), "pattern hit range")
+    observed = (first.get("path"), target.get("target"), target.get("size"))
+    require(
+        observed == (path, "file", size),
+        f"expected a file hit on {path} holding {size} bytes, received {observed}",
+    )
+    start = number(span.get("start"), "pattern hit start")
+    require(start == offset, f"{path}: first hit at byte {start}, expected {offset}")
+    named: list[str] = []
+    for warning in warnings(answer):
+        code = string_value(warning.get("code"), "warning code")
+        require(code != "large_file_skipped", f"split skipped a large file: {warning}")
+        if path in named_paths(warning):
+            named.append(code)
+    return named
+
+
+def build_records(found: list[JsonObject], path: str) -> list[str]:
+    """The messages of the index-build records naming `path`, in page order."""
+    return [
+        string_value(row.get("message"), "log message")
+        for row in found
+        if row.get("operation") == "index.build" and fields(row).get("path") == path
+    ]
+
+
 def lexical_breach(answer: JsonObject, maximum: int) -> int:
     """Require the exact rendered lexical bound and a count beyond that maximum."""
     found = [
@@ -346,8 +446,8 @@ def lexical_content(root: Path) -> LexicalContent:
         sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=5.0)
     ) as connection:
         cursor = connection.execute(
-            "SELECT identity,path,kind,digest,byte_length,name,qualified_name,"
-            "identifier_terms,signature,documentation,declaration_source,file_content "
+            "SELECT identity,path,kind,digest,byte_length,byte_offset,name,qualified_name,"
+            "identifier_terms,signature,documentation,file_content "
             "FROM lexical_documents WHERE path != ? ORDER BY identity",
             (PROBE_PATH,),
         )

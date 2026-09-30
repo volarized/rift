@@ -26,7 +26,7 @@ use rift_core::{
     LanguageFileSelections, LimitEvidence, PortableSymbolFacts, ProjectPath, ProviderId,
     SourceVisibility, SymbolId, TextFileInclusion, fault_label, symbol_identity,
 };
-use rift_protocol::configuration::SyntaxConfiguration;
+use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
 use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
@@ -47,6 +47,7 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::capture::{CapturedPath, LastCapture, capture_path};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
 use crate::documentation::NotebookFiles;
@@ -76,6 +77,7 @@ pub struct WorkspaceIndexLimits {
     directory_depth_max: usize,
     results_max: usize,
     syntax: SyntaxLimits,
+    large_files: LargeFileStrategy,
 }
 
 impl WorkspaceIndexLimits {
@@ -103,6 +105,7 @@ impl WorkspaceIndexLimits {
             directory_depth_max,
             results_max,
             syntax: SyntaxLimits::default(),
+            large_files: LargeFileStrategy::default(),
         }
         .validated()
     }
@@ -184,15 +187,12 @@ impl WorkspaceIndexLimits {
         self.workspace_bytes_max
     }
 
-    /// Parses every source under `syntax`; the per-file byte bound follows its source bound,
-    /// so the walk admits every file a provider accepts.
+    /// Parses every source under `syntax`; the per-file byte bound follows its source bound
+    /// under the large-file strategy these bounds carry, as [`Self::with_large_files`]
+    /// states.
     #[must_use]
     pub const fn with_syntax(self, syntax: SyntaxLimits) -> Self {
-        Self {
-            file_bytes_max: syntax.source_bytes_max(),
-            syntax,
-            ..self
-        }
+        Self { syntax, ..self }.with_large_files(self.large_files)
     }
 
     /// Parses every source under a `[providers.syntax]` table's bounds, as
@@ -216,9 +216,32 @@ impl WorkspaceIndexLimits {
     pub const fn syntax(self) -> SyntaxLimits {
         self.syntax
     }
+
+    /// The per-file byte bound `[search.text] large_files` sets: under `split`, the default,
+    /// a file is held as text up to the workspace byte bound whatever its size, and one past
+    /// the syntax source bound is held unparsed; under `skip` a file past the syntax source
+    /// bound is left out, as the provider cannot parse it. [`Self::with_syntax`] keeps the
+    /// strategy and derives the bound again from the new source bound.
+    #[must_use]
+    pub const fn with_large_files(self, strategy: LargeFileStrategy) -> Self {
+        let parsed = self.syntax.source_bytes_max();
+        let file_bytes_max = match strategy {
+            LargeFileStrategy::Split if self.workspace_bytes_max > parsed => {
+                self.workspace_bytes_max
+            }
+            LargeFileStrategy::Split | LargeFileStrategy::Skip => parsed,
+        };
+        Self {
+            file_bytes_max,
+            large_files: strategy,
+            ..self
+        }
+    }
 }
 
 impl Default for WorkspaceIndexLimits {
+    /// The served defaults: `[source]` and `[providers.syntax]` at their defaults, and the
+    /// per-file byte bound the default `[search.text] large_files`, `split`, sets.
     fn default() -> Self {
         Self {
             files_max: WORKSPACE_FILES_MAX_DEFAULT,
@@ -228,7 +251,9 @@ impl Default for WorkspaceIndexLimits {
             directory_depth_max: WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
             results_max: READ_RESULTS_MAX_DEFAULT,
             syntax: SyntaxLimits::default(),
+            large_files: LargeFileStrategy::default(),
         }
+        .with_large_files(LargeFileStrategy::default())
     }
 }
 
@@ -1035,7 +1060,9 @@ pub enum WorkspaceIndexWarning {
     BinarySource(ProjectPath),
     /// File exceeds the configured per-file byte bound.
     FileTooLarge(ProjectPath),
-    /// The syntax provider refused the file under one of its bounds.
+    /// The syntax provider refused the file under one of its bounds. A file refused for its
+    /// source size stays in the index as text the provider does not parse; see
+    /// [`Self::holds_text`].
     SyntaxTooLarge {
         /// The file left out.
         path: ProjectPath,
@@ -1053,8 +1080,9 @@ pub enum WorkspaceIndexWarning {
     DeclarationsBeyondBound(ProjectPath),
 }
 
-/// Outcome of reading one file into the index: held, or left out with the
-/// warning that names it.
+/// Outcome of reading one file into the index: parsed, or skipped with the warning
+/// that names it - left out, or held as text the provider did not parse
+/// ([`WorkspaceIndexWarning::holds_text`]).
 enum IndexRead<File> {
     Included(File),
     Skipped(WorkspaceIndexWarning),
@@ -1067,6 +1095,13 @@ impl<File> IndexRead<File> {
         log_left_out(&warning);
         Self::Skipped(warning)
     }
+
+    /// Holds one file as text its provider did not parse, recording the warning that
+    /// names it once, at the build that read it.
+    fn held_unparsed(warning: WorkspaceIndexWarning) -> Self {
+        log_held_unparsed(&warning);
+        Self::Skipped(warning)
+    }
 }
 
 /// Records one file left out of the index, once, at the build that left it out.
@@ -1077,6 +1112,18 @@ fn log_left_out(warning: &WorkspaceIndexWarning) {
         path = warning.path().as_str(),
         reason = %warning.reason(),
         "file left out of the index"
+    );
+}
+
+/// Records one file the index holds as text its provider did not parse, once, at the
+/// build that read it, with the fields a left-out file's record carries.
+fn log_held_unparsed(warning: &WorkspaceIndexWarning) {
+    tracing::warn!(
+        component = "index",
+        operation = "index.build",
+        path = warning.path().as_str(),
+        reason = %warning.reason(),
+        "file held unparsed in the index"
     );
 }
 
@@ -1162,7 +1209,9 @@ impl IndexContents {
         Ok(())
     }
 
-    /// Holds one cataloged file with the syntax outcome already read for it.
+    /// Holds one cataloged file with the syntax outcome already read for it. A file the
+    /// provider refused for its source size alone is held as text, since its text still
+    /// answers search; any other refusal keeps only its digests.
     fn hold_parsed_source(
         &mut self,
         text_file: TextSourceFile,
@@ -1172,6 +1221,10 @@ impl IndexContents {
             IndexRead::Included(file) => {
                 self.files.insert(file.path().clone(), file);
                 self.hold_text_file(text_file);
+            }
+            IndexRead::Skipped(warning) if warning.holds_text() => {
+                self.hold_text_file(text_file);
+                self.warnings.push(warning);
             }
             IndexRead::Skipped(warning) => {
                 self.left_out
@@ -1243,6 +1296,36 @@ impl IndexContents {
         Ok(())
     }
 
+    /// Reads every lockfile search leaves out, in walk order, keeping each one's digests
+    /// alone: the bytes count against `workspace_bytes_max` exactly as a text file's do,
+    /// so a request-time capture of the tree agrees with the index.
+    fn hold_read_lockfiles(
+        &mut self,
+        root: &Path,
+        lockfiles: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        for path in lockfiles {
+            match catalog_file(root, path, limits)? {
+                IndexRead::Included(text_file) => {
+                    let length = text_file.content().len();
+                    count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                    self.hold_lockfile(&text_file);
+                }
+                IndexRead::Skipped(warning) => self.leave_out(warning),
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps one lockfile search leaves out by its digests alone: the index serves nothing
+    /// from it, and the capture and the dependency context still see it move.
+    pub(crate) fn hold_lockfile(&mut self, text_file: &TextSourceFile) {
+        self.left_out
+            .insert(text_file.path().clone(), LeftOutFileState::of(text_file));
+    }
+
     /// Holds one cataloged file no provider claims.
     pub(crate) fn hold_text_file(&mut self, text_file: TextSourceFile) {
         self.text_files
@@ -1283,6 +1366,19 @@ impl IndexContents {
 }
 
 impl WorkspaceIndexWarning {
+    /// Whether the file keeps its text in the index: the provider refused its source for
+    /// its size alone, so the file is held as text no declaration was extracted from.
+    #[must_use]
+    pub const fn holds_text(&self) -> bool {
+        matches!(
+            self,
+            Self::SyntaxTooLarge {
+                violation: SyntaxViolation::SourceTooLarge,
+                ..
+            }
+        )
+    }
+
     /// The file this warning names.
     #[must_use]
     pub fn path(&self) -> &ProjectPath {
@@ -1304,6 +1400,10 @@ impl WorkspaceIndexWarning {
             Self::InvalidUtf8Source(_) => "holds bytes that are not valid UTF-8".to_owned(),
             Self::BinarySource(_) => "contains a NUL byte".to_owned(),
             Self::FileTooLarge(_) => "exceeds the file byte limit".to_owned(),
+            Self::SyntaxTooLarge { violation, .. } if self.holds_text() => format!(
+                "exceeds a syntax bound ({}), so the index holds its text unparsed",
+                fault_label(violation)
+            ),
             Self::SyntaxTooLarge { violation, .. } => {
                 format!("exceeds a syntax bound ({})", fault_label(violation))
             }
@@ -1340,6 +1440,10 @@ pub struct WorkspaceIndex {
     /// The documentation layer over `documentation`, built by the first read that projects
     /// onto it; the next publication is a new index and builds its own.
     documentation_layer: OnceLock<Result<DocumentationLayer<'static>, DocumentationError>>,
+    /// The held text files holding a line longer than `[search.text] max_chunk`, found by
+    /// the first pattern search that asks; the next publication is a new index and finds
+    /// its own.
+    split_line_files: OnceLock<BTreeSet<ProjectPath>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
 }
@@ -1450,6 +1554,12 @@ impl WorkspaceIndex {
                 previous,
             )?;
             contents.hold_read_texts(&root, &classified.text, limits, &mut workspace_bytes)?;
+            contents.hold_read_lockfiles(
+                &root,
+                &classified.lockfiles,
+                limits,
+                &mut workspace_bytes,
+            )?;
             built_contents(
                 &root,
                 contents.sorted(),
@@ -1479,6 +1589,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1551,6 +1662,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1570,7 +1682,9 @@ impl WorkspaceIndex {
         let Some(class) = self.language.classifies(&absolute)? else {
             return Ok(());
         };
+        let lockfile = self.language.excludes_lockfile(&absolute);
         match read_catalog_file(&self.root, &absolute, self.limits, workspace_bytes)? {
+            IndexRead::Included(text_file) if lockfile => contents.hold_lockfile(&text_file),
             IndexRead::Included(text_file) => match class {
                 ClassifiedPath::Source(provider) => {
                     contents.hold_source_file(
@@ -1642,6 +1756,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            split_line_files: OnceLock::new(),
             notebooks,
             warnings,
         })
@@ -1805,6 +1920,15 @@ impl WorkspaceIndex {
             .or_else(|| self.left_out.get(path).map(|state| state.content))
     }
 
+    /// The files this index leaves out of search as lockfiles `[search.text]
+    /// excluded_lockfiles` names, in project-path order. Each one's digests stay recorded,
+    /// but no search answers from it.
+    pub fn excluded_lockfiles(&self) -> impl Iterator<Item = &ProjectPath> {
+        self.left_out
+            .keys()
+            .filter(|path| self.language.excludes_lockfile(Path::new(path.as_str())))
+    }
+
     /// What this index records at `path`: the digest of the bytes it read there, the
     /// files it left out after reading them included, or the warning naming a file it left
     /// out before reading a digest.
@@ -1835,16 +1959,16 @@ impl WorkspaceIndex {
     }
 
     /// Derives index documents from this index: one document per indexed symbol, carrying
-    /// its name, qualified name, derived identifier terms, signature, attached
-    /// documentation, and declaration source, and one or more documents per baseline text
-    /// file - one whole document when the file is within `[search.text].max_chunk`, one per
-    /// chunk otherwise. A chunked file's documents share its real path and share an
-    /// identity built from that path plus the chunk index, so a hit still maps back to the
-    /// file it came from.
+    /// its name, qualified name, derived identifier terms, signature, and attached
+    /// documentation, and one or more documents per file text search reads, parsed or text
+    /// alone, carrying the file's text, the one copy the store keeps: one whole document
+    /// when the file is within `[search.text].max_chunk`, one per chunk otherwise. A chunked
+    /// file's documents share its real path and share an identity built from that path plus
+    /// the chunk index, so a hit still maps back to the file it came from.
     ///
-    /// A fact no provider published stays absent. Nothing substitutes declaration source
-    /// into the signature or documentation field, because a reader weighs those fields
-    /// apart and would then be weighing the same bytes twice.
+    /// A fact no provider published stays absent. Nothing substitutes a declaration's own
+    /// text into the signature or documentation field, because a reader weighs those
+    /// fields apart and would then be weighing the same bytes twice.
     ///
     /// `force_include` files stay outside this derivation: that on-demand walk's contract
     /// covers source units read for one request, not the persistent lexical index.
@@ -1862,7 +1986,7 @@ impl WorkspaceIndex {
                         documents.extend(symbol_document(file, symbol, &mut left_out));
                     }
                 }
-                for file in self.text_files() {
+                for file in self.searched_text_files() {
                     if is_notebook_path(file.path()) {
                         continue;
                     }
@@ -1951,6 +2075,7 @@ impl WorkspaceIndex {
             }
             if let Some(file) = self.text_files.get(path)
                 && !is_notebook_path(file.path())
+                && !self.text_inclusion.skips(file.content().len())
             {
                 push_text_documents(&mut units, file, self.text_chunk_bytes_max(), &mut left_out);
             }
@@ -1968,7 +2093,7 @@ impl WorkspaceIndex {
     /// count, so a caller can report the split instead of the index silently absorbing it.
     #[must_use]
     pub fn chunked_text_files(&self) -> Vec<(ProjectPath, usize)> {
-        self.text_files()
+        self.searched_text_files()
             .filter(|file| exceeds_chunk_bound(file.content().len(), self.text_chunk_bytes_max()))
             .map(|file| {
                 let chunks = text_chunks(
@@ -2023,11 +2148,12 @@ impl WorkspaceIndex {
             .ok_or_else(|| provider_error(None, ReadableSymbolMissing { identity }))
     }
 
-    /// Files the build left out of the index, in project-path order.
+    /// Files the build left out of the index, whole or in part, in project-path order.
     ///
     /// Build and rebuild continue after invalid UTF-8, NUL bytes, a file beyond
     /// the configured per-file byte bound, or a syntax tree the provider refuses
-    /// under one of its bounds.
+    /// under one of its bounds. A file refused for its source size alone keeps its text
+    /// ([`WorkspaceIndexWarning::holds_text`]).
     #[must_use]
     pub fn warnings(&self) -> &[WorkspaceIndexWarning] {
         &self.warnings
@@ -2093,6 +2219,58 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn text_file(&self, path: &ProjectPath) -> Option<&TextSourceFile> {
         self.text_files.get(path).map(AsRef::as_ref)
+    }
+
+    /// Every held file whose text search reads, parsed or text alone, in project-path
+    /// order: under `[search.text] large_files = "skip"`, a file past `max_chunk` is left
+    /// out.
+    pub fn searched_text_files(&self) -> impl Iterator<Item = &TextSourceFile> {
+        self.text_files()
+            .filter(|file| !self.text_inclusion.skips(file.content().len()))
+    }
+
+    /// The held files text search leaves out under `[search.text] large_files = "skip"`,
+    /// in project-path order.
+    pub fn skipped_text_files(&self) -> impl Iterator<Item = &TextSourceFile> {
+        self.text_files()
+            .filter(|file| self.text_inclusion.skips(file.content().len()))
+    }
+
+    /// Every file `[search.text] large_files = "skip"` keeps out of text search: the held
+    /// files past `max_chunk`, then the files past the per-file byte bound the build left
+    /// out, which under `skip` is `[providers.syntax] max_file`. Under `split` there are
+    /// none.
+    pub fn skipped_paths(&self) -> impl Iterator<Item = &ProjectPath> {
+        let skip = self.text_inclusion.large_files() == LargeFileStrategy::Skip;
+        let past_file_bound = self
+            .warnings
+            .iter()
+            .filter(move |warning| {
+                skip && matches!(warning, WorkspaceIndexWarning::FileTooLarge(_))
+            })
+            .map(WorkspaceIndexWarning::path);
+        self.skipped_text_files()
+            .map(TextSourceFile::path)
+            .chain(past_file_bound)
+    }
+
+    /// The searched files a `pattern` search verifies whole whatever the trigram index
+    /// selects, in project-path order: a notebook, whose rows hold its cells rather than
+    /// its bytes, and a file holding a line longer than `[search.text] max_chunk`, which
+    /// chunking cut mid-line so that no one row holds the whole line.
+    ///
+    /// The long lines are found once per index: only a file past the chunk bound can hold
+    /// one, and each such file is read once, by the first search that asks.
+    pub fn whole_file_candidates(&self) -> impl Iterator<Item = &TextSourceFile> {
+        let split = self.split_line_files.get_or_init(|| {
+            let chunk_bytes_max = self.text_chunk_bytes_max_usize();
+            self.searched_text_files()
+                .filter(|file| holds_line_past(file.content(), chunk_bytes_max))
+                .map(|file| file.path().clone())
+                .collect()
+        });
+        self.searched_text_files()
+            .filter(move |file| is_notebook_path(file.path()) || split.contains(file.path()))
     }
 
     /// Chunk bound applied to baseline text when lexical units are derived.
@@ -2276,13 +2454,10 @@ impl WorkspaceIndex {
             let context_path = self.root.join(file.path().as_str());
             if let Some(ClassifiedPath::Source(provider)) =
                 self.language.classifies(&context_path)?
+                && let IndexRead::Included(indexed) =
+                    syntax_read(file, &context_path, provider, self.limits.syntax())?
             {
-                files.push(indexed_file_from_catalog(
-                    file,
-                    &context_path,
-                    provider,
-                    self.limits.syntax(),
-                )?);
+                files.push(indexed);
             }
         }
         Self::from_parts(
@@ -2558,13 +2733,17 @@ fn leave_out_beyond_declaration_bound(
     Ok(())
 }
 
-/// Source and text paths [`discover`] found below one root, each list sorted by path.
+/// Source, text, and lockfile paths [`discover`] found below one root, each list sorted
+/// by path.
 #[derive(Debug, Default)]
 struct DiscoveredPaths {
     /// Each source path with the provider that claimed it, so the caller
     /// never asks the language table the same question twice.
     source: Vec<(PathBuf, &'static dyn SyntaxProvider)>,
     text: Vec<PathBuf>,
+    /// The lockfiles `[search.text].excluded_lockfiles` leaves out of search: read for
+    /// their digests alone, so the workspace still moves when one is edited.
+    lockfiles: Vec<PathBuf>,
 }
 
 impl DiscoveredPaths {
@@ -2580,7 +2759,29 @@ impl DiscoveredPaths {
         path: &Path,
         class: ClassifiedPath,
     ) -> Result<(), WorkspaceIndexError> {
-        let total = self.source.len() + self.text.len();
+        self.within_files_max(files_max, path)?;
+        match class {
+            ClassifiedPath::Source(provider) => self.source.push((path.to_path_buf(), provider)),
+            ClassifiedPath::Text => self.text.push(path.to_path_buf()),
+        }
+        Ok(())
+    }
+
+    /// Records one lockfile search leaves out, against the same `files_max` budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the budget is already spent.
+    fn admit_lockfile(&mut self, files_max: usize, path: &Path) -> Result<(), WorkspaceIndexError> {
+        self.within_files_max(files_max, path)?;
+        self.lockfiles.push(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Refuses one more path once `files_max` paths are recorded, naming the `[source]` key
+    /// that owns the bound and the path that crossed it.
+    fn within_files_max(&self, files_max: usize, path: &Path) -> Result<(), WorkspaceIndexError> {
+        let total = self.source.len() + self.text.len() + self.lockfiles.len();
         if total >= files_max {
             return Err(index_error_over_limit(
                 WorkspaceIndexViolation::TooManyFiles,
@@ -2590,11 +2791,22 @@ impl DiscoveredPaths {
                 files_max,
             ));
         }
-        match class {
-            ClassifiedPath::Source(provider) => self.source.push((path.to_path_buf(), provider)),
-            ClassifiedPath::Text => self.text.push(path.to_path_buf()),
-        }
         Ok(())
+    }
+
+    /// Records one classified path, a lockfile search leaves out among them.
+    fn admit_classified(
+        &mut self,
+        files_max: usize,
+        path: &Path,
+        class: ClassifiedPath,
+        language: &WorkspaceLanguagePolicy,
+    ) -> Result<(), WorkspaceIndexError> {
+        if language.excludes_lockfile(path) {
+            self.admit_lockfile(files_max, path)
+        } else {
+            self.admit(files_max, path, class)
+        }
     }
 }
 
@@ -2635,13 +2847,14 @@ fn discover(
         let Some(class) = language.classifies(path)? else {
             continue;
         };
-        discovered.admit(limits.files_max, path, class)?;
+        discovered.admit_classified(limits.files_max, path, class, language)?;
     }
     discover_forced(root, limits, &matcher, language, &mut discovered)?;
     discovered
         .source
         .sort_by(|left, right| left.0.cmp(&right.0));
     discovered.text.sort();
+    discovered.lockfiles.sort();
     Ok(discovered)
 }
 
@@ -2667,6 +2880,7 @@ fn discover_forced(
         .iter()
         .map(|(path, _)| path.clone())
         .chain(discovered.text.iter().cloned())
+        .chain(discovered.lockfiles.iter().cloned())
         .collect();
     for entry in forced_walk(root, limits.directory_depth_max, reach) {
         let entry = entry.map_err(|error| walk_error(root, error))?;
@@ -2679,7 +2893,7 @@ fn discover_forced(
         let Some(class) = language.classifies(path)? else {
             continue;
         };
-        discovered.admit(limits.files_max, path, class)?;
+        discovered.admit_classified(limits.files_max, path, class, language)?;
     }
     Ok(())
 }
@@ -2792,20 +3006,58 @@ fn compiled_gitignore(path: &Path) -> Result<Gitignore, WorkspaceIndexError> {
 
 /// Hashes one already-discovered source and text path set without parsing syntax. Both
 /// classes enforce [`WorkspaceIndexLimits::file_bytes_max`] before counting accepted bytes
-/// against `workspace_bytes_max`, matching the catalog read the index build applies.
+/// against `workspace_bytes_max`, matching the catalog read the index build applies. A
+/// path whose stat matches `last` keeps its recorded digests without a read, and the
+/// returned [`LastCapture`] records this capture's paths for the next one.
 fn capture_paths(
     root: &Path,
     paths: &DiscoveredPaths,
     limits: WorkspaceIndexLimits,
-) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+    last: &LastCapture,
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let mut workspace_bytes = 0_usize;
+    let held = paths.source.len() + paths.text.len() + paths.lockfiles.len();
+    let mut next = LastCapture::under(limits, held);
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
-    let source = capture_path_class(&mut workspace_bytes, root, &source, limits)?;
-    let text = capture_path_class(&mut workspace_bytes, root, &paths.text, limits)?;
-    Ok(WorkspaceDigests::classified(
-        source,
-        text.into_iter().map(|(path, state, _)| (path, state)),
-    ))
+    let text: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
+    let mut capture = PathCapture {
+        workspace_bytes: &mut workspace_bytes,
+        root,
+        limits,
+        last,
+        next: &mut next,
+    };
+    let (source, unparsed): (Vec<_>, Vec<_>) = capture
+        .path_class(&source)?
+        .into_iter()
+        .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
+    let text = capture.path_class(&text)?;
+    tracing::debug!(
+        component = "index",
+        operation = "fingerprint.bytes",
+        bytes = workspace_bytes,
+        source = source.len(),
+        text = text.len(),
+    );
+    let digests = WorkspaceDigests::classified(
+        source
+            .into_iter()
+            .map(|captured| (captured.path, captured.state, captured.content)),
+        text.into_iter()
+            .chain(unparsed)
+            .map(|captured| (captured.path, captured.state)),
+    );
+    Ok((digests, next))
+}
+
+/// One file the capture kept: its digests, and the bytes it counts. A claimed file past
+/// the syntax source bound is held as text the provider does not parse, so the capture
+/// files it beside the text files, as the build does.
+struct CapturedEntry {
+    path: ProjectPath,
+    state: FileDigest,
+    content: FileDigest,
+    length: usize,
 }
 
 /// Reads every visible file's digest below `root`, without parsing syntax.
@@ -2829,10 +3081,14 @@ pub fn capture_digests(
         visibility,
         &TextFileInclusion::default(),
         &LanguageFileSelections::default(),
+        &LastCapture::default(),
     )
+    .map(|(digests, _)| digests)
 }
 
-/// Reads one effective language and text selection's digests below `root`.
+/// Reads one effective language and text selection's digests below `root`, reusing the
+/// digests `last` recorded for every path whose stat did not move. The returned
+/// [`LastCapture`] records this capture's paths for the next one.
 ///
 /// # Errors
 ///
@@ -2844,75 +3100,71 @@ pub fn capture_digests_with_languages(
     visibility: &SourceVisibility,
     text_inclusion: &TextFileInclusion,
     languages: &LanguageFileSelections,
-) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+    last: &LastCapture,
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let root = canonical_root(root)?;
-    let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
-    let classified = discover(&root, limits, visibility, &language)?;
-    capture_paths(&root, &classified, limits)
+    let language = rift_core::traced!(
+        component = "index",
+        operation = "fingerprint.language_policy",
+        { WorkspaceLanguagePolicy::build(&root, languages, text_inclusion) }
+    )?;
+    let classified =
+        rift_core::traced!(component = "index", operation = "fingerprint.discover", {
+            discover(&root, limits, visibility, &language)
+        })?;
+    let source = classified.source.len();
+    let text = classified.text.len() + classified.lockfiles.len();
+    rift_core::traced!(
+        component = "index",
+        operation = "fingerprint.read",
+        source = source,
+        text = text,
+        { capture_paths(&root, &classified, limits, last) }
+    )
 }
 
-/// Reads one path class into captured file states: each kept file's project path, its
-/// file-state digest, and its content digest, in walk order.
-///
-/// Files are read and hashed across the rayon pool, and no file's bytes outlive its own
-/// digest, so the capture holds one file per worker. The kept lengths are then summed in
-/// walk order: the `workspace_bytes_max` refusal names the path a sequential read would
-/// name, and an earlier path's failure wins over a later one's.
-fn capture_path_class(
-    workspace_bytes: &mut usize,
-    root: &Path,
-    paths: &[PathBuf],
+/// One request-time capture's running state: the bytes kept so far, and the record the
+/// next capture reuses.
+struct PathCapture<'capture> {
+    workspace_bytes: &'capture mut usize,
+    root: &'capture Path,
     limits: WorkspaceIndexLimits,
-) -> Result<Vec<(ProjectPath, FileDigest, FileDigest)>, WorkspaceIndexError> {
-    let read: Vec<Result<Option<CapturedFile>, WorkspaceIndexError>> = paths
-        .par_iter()
-        .map(|path| CapturedFile::read(path, limits))
-        .collect();
-    let mut captured = Vec::with_capacity(paths.len());
-    for (path, file) in paths.iter().zip(read) {
-        let Some(file) = file? else {
-            continue;
-        };
-        count_workspace_bytes(workspace_bytes, file.length, path, limits)?;
-        captured.push((project_path_below(root, path)?, file.state, file.content));
-    }
-    Ok(captured)
+    last: &'capture LastCapture,
+    next: &'capture mut LastCapture,
 }
 
-/// One file's captured digests, and the byte length it counts against the workspace.
-struct CapturedFile {
-    length: usize,
-    state: FileDigest,
-    content: FileDigest,
-}
-
-impl CapturedFile {
-    /// Reads and hashes the file at `path`, or answers nothing for a file the index leaves
-    /// out: past `file_bytes_max`, holding a NUL byte, or not UTF-8.
-    fn read(
-        path: &Path,
-        limits: WorkspaceIndexLimits,
-    ) -> Result<Option<Self>, WorkspaceIndexError> {
-        let handle = fs::File::open(path).map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
-        let metadata = handle.metadata().map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        })?;
-        let bytes = read_file_bytes(handle, path, limits)?;
-        if bytes.len() > limits.file_bytes_max()
-            || bytes.contains(&0)
-            || std::str::from_utf8(&bytes).is_err()
-        {
-            return Ok(None);
+impl PathCapture<'_> {
+    /// Reads one path class into captured file states: each kept file's project path, its
+    /// file-state digest, and its content digest, in walk order. Each path is recorded in
+    /// `next`, with its stat and what capturing it found.
+    ///
+    /// A path whose stat matches `last` keeps its recorded digests. Every other file is
+    /// read and hashed across the rayon pool, and no file's bytes outlive its own digest,
+    /// so the capture holds one file per worker. The kept lengths, reused ones included,
+    /// are then summed in walk order: the `workspace_bytes_max` refusal names the path a
+    /// sequential read would name, and an earlier path's failure wins over a later one's.
+    fn path_class(&mut self, paths: &[PathBuf]) -> Result<Vec<CapturedEntry>, WorkspaceIndexError> {
+        let (limits, last) = (self.limits, self.last);
+        let read: Vec<Result<(CapturedPath, bool), WorkspaceIndexError>> = paths
+            .par_iter()
+            .map(|path| capture_path(path, limits, last))
+            .collect();
+        let mut captured = Vec::with_capacity(paths.len());
+        for (path, capture) in paths.iter().zip(read) {
+            let (capture, was_read) = capture?;
+            self.next.record(path, capture, was_read);
+            let Some(file) = capture.file() else {
+                continue;
+            };
+            count_workspace_bytes(self.workspace_bytes, file.length, path, limits)?;
+            captured.push(CapturedEntry {
+                path: project_path_below(self.root, path)?,
+                state: file.state,
+                content: file.content,
+                length: file.length,
+            });
         }
-        let (content, state) =
-            FileDigest::of_content_and_file_state(&bytes, metadata_is_executable(&metadata));
-        Ok(Some(Self {
-            length: bytes.len(),
-            state,
-            content,
-        }))
+        Ok(captured)
     }
 }
 
@@ -3116,8 +3368,9 @@ fn read_file(
     Ok(file)
 }
 
-/// Reads one cataloged file's syntax facts, leaving the file out when the
-/// provider refuses it under one of its bounds.
+/// Reads one cataloged file's syntax facts. A file the provider refuses for its source
+/// size alone is held as text it does not parse; one refused under any other bound is
+/// left out.
 fn syntax_read(
     file: &TextSourceFile,
     context_path: &Path,
@@ -3127,6 +3380,7 @@ fn syntax_read(
     match indexed_file_from_catalog(file, context_path, provider, limits) {
         Ok(indexed) => Ok(IndexRead::Included(indexed)),
         Err(error) => match error.fault().left_out_file(file.path().clone()) {
+            Some(warning) if warning.holds_text() => Ok(IndexRead::held_unparsed(warning)),
             Some(warning) => Ok(IndexRead::left_out(warning)),
             None => Err(error),
         },
@@ -3347,20 +3601,20 @@ fn catalog_file(
 }
 
 #[cfg(unix)]
-fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
+pub(crate) fn metadata_is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn metadata_is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
 /// Reads at most one byte beyond the file bound, so callers can classify an oversized
 /// file without reading its remaining bytes. Capture, catalog, and syntax reads share it.
-fn read_file_bytes(
+pub(crate) fn read_file_bytes(
     reader: impl std::io::Read,
     path: &Path,
     limits: WorkspaceIndexLimits,
@@ -3445,19 +3699,6 @@ fn symbol_rank(symbol: &SyntaxSymbol, query: &str) -> Option<IdentifierMatchClas
     )
 }
 
-/// The declaration's exact source text, clamped to `file`'s bounds the same way the read
-/// service excerpts a symbol's source.
-fn declaration_source(file: &IndexedFile, range: rift_syntax::ByteRange) -> &str {
-    let source = file.source();
-    let start = usize::try_from(range.start)
-        .unwrap_or(source.len())
-        .min(source.len());
-    let end = usize::try_from(range.end)
-        .unwrap_or(source.len())
-        .min(source.len());
-    source.get(start..end).unwrap_or_default()
-}
-
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
 /// ranked identity and a read address are one value.
 #[must_use]
@@ -3477,8 +3718,9 @@ pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
 /// `SymbolId`, so a lexical hit's identity equals the id `get_symbol` returns for it.
 ///
 /// Every field a provider published lands in its own column. A provider that publishes
-/// no signature leaves that field absent rather than filling it with the declaration's
-/// source, so the two are weighed apart.
+/// no signature leaves that field absent. The declaration's source stays out: it is a
+/// range of its file's text, which the file's own document stores and indexes once, and
+/// a query word only its body holds reaches it through that file row.
 fn symbol_document(
     file: &IndexedFile,
     symbol: &SyntaxSymbol,
@@ -3493,7 +3735,7 @@ fn symbol_document(
         identity,
         file.path(),
         DocumentKind::Symbol,
-        declaration_fields(file, symbol),
+        declaration_fields(symbol),
         left_out,
     )
 }
@@ -3501,8 +3743,7 @@ fn symbol_document(
 /// The searchable fields one declaration fills: equal bytes produce equal fields and one
 /// digest.
 #[must_use]
-pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> DocumentFields {
-    let source = declaration_source(file, symbol.range);
+pub(crate) fn declaration_fields(symbol: &SyntaxSymbol) -> DocumentFields {
     let containers = symbol.container.iter().map(String::as_str);
     let terms = identifier_terms(
         [symbol.name.as_str(), symbol.qualified_name.as_str()]
@@ -3522,7 +3763,6 @@ pub(crate) fn declaration_fields(file: &IndexedFile, symbol: &SyntaxSymbol) -> D
             SearchableField::Documentation,
             attached_documentation(symbol),
         )
-        .with(SearchableField::DeclarationSource, source)
 }
 
 /// The declaration's rendered signatures, one per line.
@@ -3667,6 +3907,14 @@ fn exceeds_chunk_bound(content_bytes: usize, chunk_bytes_max: u64) -> bool {
     u64::try_from(content_bytes).unwrap_or(u64::MAX) > chunk_bytes_max
 }
 
+/// Whether `content` holds a line, its ending included, longer than `chunk_bytes_max`: the
+/// line the chunking kernel cuts at a character boundary rather than keeping whole. A
+/// shorter text holds no such line, so only a text past the bound is read.
+fn holds_line_past(content: &str, chunk_bytes_max: usize) -> bool {
+    content.len() > chunk_bytes_max
+        && rift_core::line::lines_inclusive(content).any(|line| line.len() > chunk_bytes_max)
+}
+
 /// Widens an already-accepted `[search.text].max_chunk` bound (1kb to 16mb) into the `usize`
 /// domain the chunking kernel indexes with.
 fn checked_chunk_bytes_max(chunk_bytes_max: u64) -> usize {
@@ -3680,7 +3928,9 @@ fn checked_chunk_bytes_max(chunk_bytes_max: u64) -> usize {
 
 /// Appends one text file's documents to `documents`: one whole document within
 /// `chunk_bytes_max`, one per chunk otherwise, every chunk sharing the file's real path
-/// and its file name so a hit still maps back to the file it came from.
+/// and its file name so a hit still maps back to the file it came from. Each document
+/// records where its text starts in the file, so a position inside a chunk maps back to
+/// the file without chunking it again.
 fn push_text_documents(
     documents: &mut Vec<IndexDocument>,
     file: &TextSourceFile,
@@ -3689,13 +3939,16 @@ fn push_text_documents(
 ) {
     let name = file_name(file.path());
     if !exceeds_chunk_bound(file.content().len(), chunk_bytes_max) {
-        documents.extend(text_document(
-            file.path().as_str().to_owned(),
-            file,
-            name.as_deref(),
-            file.content(),
-            left_out,
-        ));
+        documents.extend(
+            text_document(
+                file.path().as_str().to_owned(),
+                file,
+                name.as_deref(),
+                file.content(),
+                left_out,
+            )
+            .map(|document| document.at_byte_offset(0)),
+        );
         return;
     }
     let chunks = text_chunks(file.content(), checked_chunk_bytes_max(chunk_bytes_max));
@@ -3711,13 +3964,10 @@ fn push_text_documents(
         }
         previous_offset = Some(chunk.byte_offset());
         let identity = format!("{}#{index}", file.path().as_str());
-        documents.extend(text_document(
-            identity,
-            file,
-            name.as_deref(),
-            chunk.content(),
-            left_out,
-        ));
+        documents.extend(
+            text_document(identity, file, name.as_deref(), chunk.content(), left_out)
+                .map(|document| document.at_byte_offset(chunk.byte_offset())),
+        );
     }
 }
 
@@ -4233,11 +4483,28 @@ mod tests {
         assert_eq!(next.file_count(), index.file_count());
     }
 
+    /// Builds the oversized case under a one-mebibyte per-file bound: the default `split`
+    /// strategy holds a file up to the workspace byte bound, and writing a file past that
+    /// bound would spend the test on half a gibibyte of disk writes.
     #[test]
     fn test_rebuilt_omits_a_newly_invalid_file_and_recovers_a_fixed_one() {
         let directory = fixture();
         let root = directory.path();
-        let index = indexed(root, &TextFileInclusion::default());
+        let limits = WorkspaceIndexLimits::new(
+            WORKSPACE_FILES_MAX_DEFAULT,
+            1_048_576,
+            WORKSPACE_BYTES_MAX_DEFAULT,
+            WORKSPACE_DIRECTORY_DEPTH_MAX_DEFAULT,
+            READ_RESULTS_MAX_DEFAULT,
+        )
+        .expect("every bound is positive");
+        let index = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("the fixture workspace must index");
         assert!(index.warnings().is_empty());
         let lib_path = ProjectPath::new("src/lib.rs").expect("fixture path");
 
@@ -5655,6 +5922,7 @@ mod tests {
         DiscoveredPaths {
             source: source.into_iter().map(|path| (path, provider)).collect(),
             text: Vec::new(),
+            lockfiles: Vec::new(),
         }
     }
 
@@ -5703,6 +5971,47 @@ mod tests {
         );
     }
 
+    /// Captures `paths` below `root` with nothing recorded to reuse.
+    fn captured_paths(
+        root: &Path,
+        paths: &DiscoveredPaths,
+        limits: WorkspaceIndexLimits,
+    ) -> Result<WorkspaceDigests, WorkspaceIndexError> {
+        capture_paths(root, paths, limits, &LastCapture::default()).map(|(digests, _)| digests)
+    }
+
+    #[test]
+    fn test_capture_paths_counts_reused_lengths_against_the_workspace_bound() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let limits = WorkspaceIndexLimits::new(5, 8, 10, 4, 5).expect("limits");
+        let first = root.join("first.rs");
+        let oversized = root.join("oversized.rs");
+        fs::write(&first, b"123456").expect("first source");
+        fs::write(&oversized, b"123456789").expect("oversized source");
+        let both = source_only(vec![first.clone(), oversized.clone()]);
+        let (digests, last) =
+            capture_paths(&root, &both, limits, &LastCapture::default()).expect("first fits");
+        let alone =
+            captured_paths(&root, &source_only(vec![first.clone()]), limits).expect("first alone");
+        assert_eq!(digests.fingerprint(), alone.fingerprint());
+        let (_, next) = capture_paths(&root, &both, limits, &last).expect("nothing moved");
+        assert_eq!(
+            next.read_paths(),
+            0,
+            "the left-out file stays left out without a read"
+        );
+        let second = root.join("second.rs");
+        fs::write(&second, b"123456").expect("second source");
+        let all = source_only(vec![first, oversized, second]);
+        let error = capture_paths(&root, &all, limits, &next).expect_err("workspace bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge,
+            "a reused length still counts against workspace_bytes_max"
+        );
+    }
+
     #[test]
     fn test_capture_paths_preserves_bound_and_path_failures() {
         let directory = tempfile::tempdir().expect("workspace");
@@ -5711,7 +6020,7 @@ mod tests {
 
         let missing = root.join("missing.rs");
         let error =
-            capture_paths(&root, &source_only(vec![missing]), limits).expect_err("missing source");
+            captured_paths(&root, &source_only(vec![missing]), limits).expect_err("missing source");
         assert_eq!(
             error.fault().violation(),
             WorkspaceIndexViolation::Filesystem
@@ -5719,7 +6028,7 @@ mod tests {
 
         let oversized = root.join("oversized.rs");
         fs::write(&oversized, b"123456789").expect("oversized source");
-        let digests = capture_paths(&root, &source_only(vec![oversized]), limits)
+        let digests = captured_paths(&root, &source_only(vec![oversized]), limits)
             .expect("oversized source is omitted");
         assert!(digests.is_empty());
 
@@ -5727,7 +6036,7 @@ mod tests {
         let second = root.join("second.rs");
         fs::write(&first, b"123456").expect("first source");
         fs::write(&second, b"123456").expect("second source");
-        let error = capture_paths(&root, &source_only(vec![first, second]), limits)
+        let error = captured_paths(&root, &source_only(vec![first, second]), limits)
             .expect_err("workspace bound");
         assert_eq!(
             error.fault().violation(),
@@ -5736,7 +6045,7 @@ mod tests {
 
         let outside = tempfile::NamedTempFile::new().expect("outside source");
         fs::write(outside.path(), b"fn x(){}").expect("outside bytes");
-        let error = capture_paths(
+        let error = captured_paths(
             &root,
             &source_only(vec![outside.path().to_path_buf()]),
             limits,
@@ -5752,7 +6061,7 @@ mod tests {
         // index over the same tree.
         let invalid = root.join("invalid.rs");
         fs::write(&invalid, [0xff]).expect("invalid source");
-        let digests = capture_paths(&root, &source_only(vec![invalid]), limits)
+        let digests = captured_paths(&root, &source_only(vec![invalid]), limits)
             .expect("invalid UTF-8 is omitted rather than failing the capture");
         assert!(digests.is_empty(), "the invalid file contributes no digest");
     }
@@ -5768,8 +6077,9 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![big_text],
+            lockfiles: Vec::new(),
         };
-        let digests = capture_paths(&root, &paths, limits)
+        let digests = captured_paths(&root, &paths, limits)
             .expect("a text file over file_bytes_max is omitted");
         assert!(digests.is_empty());
 
@@ -5779,9 +6089,10 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![over_workspace],
+            lockfiles: Vec::new(),
         };
         let digests =
-            capture_paths(&root, &paths, tight).expect("the per-file bound applies first");
+            captured_paths(&root, &paths, tight).expect("the per-file bound applies first");
         assert!(digests.is_empty());
     }
 
@@ -5795,8 +6106,9 @@ mod tests {
         let paths = DiscoveredPaths {
             source: Vec::new(),
             text: vec![invalid],
+            lockfiles: Vec::new(),
         };
-        let digests = capture_paths(&root, &paths, limits)
+        let digests = captured_paths(&root, &paths, limits)
             .expect("invalid UTF-8 text is omitted rather than failing the capture");
         assert!(
             digests.is_empty(),
@@ -7035,9 +7347,11 @@ mod tests {
         );
         assert_eq!(document_path(update).as_str(), "src/lib.rs");
         assert_eq!(
-            update.fields().get(SearchableField::DeclarationSource),
-            Some("pub fn update() {}")
+            update.content(),
+            "",
+            "a declaration's source stays in its file's document"
         );
+        assert_eq!(update.byte_offset(), None);
     }
 
     #[test]
@@ -7273,6 +7587,33 @@ mod tests {
         assert_eq!(
             large.fault().violation(),
             WorkspaceIndexViolation::FileTooLarge
+        );
+    }
+
+    #[test]
+    fn test_default_limits_hold_large_files_as_the_served_default_does() {
+        let limits = WorkspaceIndexLimits::default();
+        let served = TextFileInclusion::default().large_files();
+        assert_eq!(served, LargeFileStrategy::Split);
+        assert_eq!(limits, limits.with_large_files(served));
+        assert_eq!(
+            limits.file_bytes_max(),
+            limits.workspace_bytes_max(),
+            "split holds a file as text up to the workspace byte bound"
+        );
+        let syntax = SyntaxLimits::new(4_096, 250_000, 512).expect("syntax bounds");
+        assert_eq!(
+            limits.with_syntax(syntax).file_bytes_max(),
+            limits.workspace_bytes_max(),
+            "a new source bound keeps the strategy the bounds carry"
+        );
+        let skipped = limits
+            .with_large_files(LargeFileStrategy::Skip)
+            .with_syntax(syntax);
+        assert_eq!(
+            skipped.file_bytes_max(),
+            4_096,
+            "skip follows the source bound"
         );
     }
 
@@ -7556,6 +7897,455 @@ mod tests {
         );
     }
 
+    /// Captures `root` under the default policies, reusing what `last` recorded.
+    fn captured_after(root: &Path, last: &LastCapture) -> (WorkspaceDigests, LastCapture) {
+        capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            last,
+        )
+        .expect("the capture must read the tree")
+    }
+
+    /// A two-file workspace, `src/lib.rs` and `notes.txt`, and the modification time
+    /// `src/lib.rs` holds.
+    fn two_file_workspace() -> (tempfile::TempDir, std::time::SystemTime) {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).expect("fixture directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("text");
+        let modified = fs::metadata(root.join("src/lib.rs"))
+            .and_then(|metadata| metadata.modified())
+            .expect("modification time");
+        (directory, modified)
+    }
+
+    /// Rewrites `path` in place, keeping its inode, and sets its modification time.
+    fn rewrite(path: &Path, bytes: &[u8], modified: std::time::SystemTime) {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open for rewrite");
+        std::io::Write::write_all(&mut file, bytes).expect("rewrite");
+        file.set_modified(modified).expect("set modification time");
+    }
+
+    #[test]
+    fn test_capture_of_an_unchanged_tree_reads_no_path_again() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (first, last) = captured_after(root, &LastCapture::default());
+        assert_eq!(last.read_paths(), 2, "the first capture reads every path");
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(next.read_paths(), 0, "no stat moved, so no path is read");
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        let (_, again) = captured_after(root, &next);
+        assert_eq!(
+            again.read_paths(),
+            0,
+            "the reused record carries every path on"
+        );
+    }
+
+    /// A capture record prints how many paths it holds and how many it read, never the
+    /// paths or their digests.
+    #[test]
+    fn test_a_capture_record_prints_its_counts() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (_, last) = captured_after(root, &LastCapture::default());
+        assert_eq!(format!("{last:?}"), "LastCapture { paths: 2, read: 2, .. }");
+        let (_, next) = captured_after(root, &last);
+        assert_eq!(format!("{next:?}"), "LastCapture { paths: 2, read: 0, .. }");
+    }
+
+    /// A request-time capture refuses a language selection the build refuses, before it
+    /// reads a file.
+    #[test]
+    fn test_capture_refuses_a_language_selection_the_build_refuses() {
+        let (directory, _) = two_file_workspace();
+        let mut configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        configuration.languages.insert(
+            "ruby".to_owned(),
+            rift_protocol::configuration::LanguageConfiguration::default(),
+        );
+        let languages = LanguageFileSelections::from(&configuration);
+        let error = capture_digests_with_languages(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &languages,
+            &LastCapture::default(),
+        )
+        .expect_err("an unshipped language names no include");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::LanguageIncludeRequired
+        );
+    }
+
+    /// A request-time capture refuses a directory the process cannot read, naming it, as
+    /// the build does.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_refuses_a_directory_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let locked = root.join("locked");
+        fs::create_dir(&locked).expect("locked directory");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let outcome = capture_digests_with_languages(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore read");
+        let error = outcome.expect_err("an unreadable directory fails the walk");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(error.fault().path(), Some(locked.as_path()));
+    }
+
+    /// A request-time capture refuses a file the process cannot read, naming it, as the
+    /// build does.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_refuses_a_file_the_process_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, _) = two_file_workspace();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let sealed = root.join("sealed.txt");
+        fs::write(&sealed, "sealed\n").expect("sealed file");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("remove read");
+        let outcome = capture_digests_with_languages(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        );
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o644)).expect("restore read");
+        let error = outcome.expect_err("a read this process cannot make fails the capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Filesystem
+        );
+        assert_eq!(error.fault().path(), Some(sealed.as_path()));
+    }
+
+    #[test]
+    fn test_capture_reads_again_a_path_whose_modification_time_moved() {
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let (first, last) = captured_after(root, &LastCapture::default());
+        rewrite(
+            &root.join("src/lib.rs"),
+            b"pub fn moved() {}\n",
+            modified + std::time::Duration::from_secs(2),
+        );
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(next.read_paths(), 1, "only the edited path is read");
+        assert_ne!(second.fingerprint(), first.fingerprint());
+        let (fresh, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(
+            second.fingerprint(),
+            fresh.fingerprint(),
+            "the reused capture folds to what a full read folds to"
+        );
+    }
+
+    #[test]
+    fn test_capture_reads_again_under_other_limits() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (_, last) = captured_after(root, &LastCapture::default());
+        let limits = WorkspaceIndexLimits {
+            files_max: WorkspaceIndexLimits::default().files_max - 1,
+            ..WorkspaceIndexLimits::default()
+        };
+        let (_, next) = capture_digests_with_languages(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &last,
+        )
+        .expect("the capture must read the tree");
+        assert_eq!(
+            next.read_paths(),
+            2,
+            "a record under other limits is not reused"
+        );
+    }
+
+    /// A same-size rewrite that restores the modification time still moves the status
+    /// change time, so the capture reads the file again and sees the rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_reads_again_a_same_size_rewrite_that_restores_the_modification_time() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let path = root.join("src/lib.rs");
+        let (first, last) = captured_after(root, &LastCapture::default());
+        let recorded = fs::metadata(&path).expect("recorded stat");
+        let changed = |metadata: &fs::Metadata| (metadata.ctime(), metadata.ctime_nsec());
+        // A filesystem whose clock ticks coarser than this test runs stamps the rewrite
+        // with the recorded status change time, which is the documented same-tick miss;
+        // the rewrite repeats until that clock moves, so the case under test is the
+        // restored modification time alone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            rewrite(&path, b"pub fn keep() {}\n", modified);
+            let current = fs::metadata(&path).expect("rewritten stat");
+            if changed(&current) != changed(&recorded) {
+                assert_eq!(
+                    current.len(),
+                    recorded.len(),
+                    "the rewrite keeps the length"
+                );
+                assert_eq!(current.ino(), recorded.ino(), "the rewrite keeps the inode");
+                assert_eq!(
+                    current.modified().expect("modification time"),
+                    modified,
+                    "the rewrite restores the modification time"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the status change time never moved: recorded={:?}",
+                changed(&recorded)
+            );
+            std::thread::yield_now();
+        }
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(
+            next.read_paths(),
+            1,
+            "the moved status change time reads it"
+        );
+        assert_ne!(second.fingerprint(), first.fingerprint());
+        let (fresh, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(second.fingerprint(), fresh.fingerprint());
+    }
+
+    /// A tree holding lockfiles under the default exclusion list, beside one source file.
+    fn lockfile_workspace() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::create_dir_all(root.join("web")).expect("fixture directory");
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("Cargo.lock"), "version = 4\n").expect("lockfile");
+        fs::write(root.join("deno.lock"), "{\"version\": \"4\"}\n").expect("lockfile");
+        fs::write(root.join("web/package-lock.json"), "{\"name\": \"web\"}\n").expect("lockfile");
+        directory
+    }
+
+    fn project(path: &str) -> ProjectPath {
+        ProjectPath::new(path).expect("fixture path")
+    }
+
+    /// A lockfile the default list names is parsed by no provider and holds no text row,
+    /// yet its digests stay recorded, so a capture of the tree agrees with the index.
+    #[test]
+    fn test_lockfiles_leave_search_and_keep_their_digests() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        for path in ["Cargo.lock", "deno.lock", "web/package-lock.json"] {
+            let path = project(path);
+            assert!(
+                index.file(&path).is_none(),
+                "{path} is parsed by no provider"
+            );
+            assert!(index.text_file(&path).is_none(), "{path} holds no text row");
+            assert!(index.digest(&path).is_some(), "{path} keeps its digest");
+        }
+        assert_eq!(
+            index
+                .excluded_lockfiles()
+                .map(ProjectPath::as_str)
+                .collect::<Vec<_>>(),
+            ["Cargo.lock", "deno.lock", "web/package-lock.json"]
+        );
+        let documents = index.index_documents();
+        assert!(
+            documents
+                .iter()
+                .all(|document| document_path(document).as_str() == "lib.rs"),
+            "only the source file publishes rows"
+        );
+        assert!(
+            index.warnings().is_empty(),
+            "an excluded lockfile warns of nothing"
+        );
+        let (captured, _) = capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        )
+        .expect("the capture reads the tree");
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+    }
+
+    /// A lockfile holding a NUL byte is left out as any binary file is, digest and all, and
+    /// the capture of the tree agrees with the index.
+    #[test]
+    fn test_a_binary_lockfile_is_left_out_with_its_warning() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        fs::write(root.join("Cargo.lock"), "version = 4\0\n").expect("binary lockfile");
+        let index = indexed(root, &TextFileInclusion::default());
+        let path = project("Cargo.lock");
+        assert_eq!(
+            index.warnings(),
+            [WorkspaceIndexWarning::BinarySource(path.clone())]
+        );
+        assert!(index.digest(&path).is_none());
+        let (captured, _) = captured_after(root, &LastCapture::default());
+        assert_eq!(captured.fingerprint(), *index.fingerprint());
+    }
+
+    /// Lockfile bytes count against `workspace_bytes_max` as a text file's do, so a
+    /// lockfile past the bound refuses the build and the capture alike, naming it.
+    #[test]
+    fn test_a_lockfile_past_the_workspace_bound_refuses_naming_it() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n").expect("source");
+        fs::write(root.join("Cargo.lock"), "version = 4\n").expect("lockfile");
+        let limits = WorkspaceIndexLimits::new(8, 1_024, 24, 8, 8).expect("bounds");
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let built = WorkspaceIndex::build(&root, limits, &visibility, &text)
+            .expect_err("the lockfile passes the workspace bound");
+        let languages = LanguageFileSelections::default();
+        let last = LastCapture::default();
+        let captured =
+            capture_digests_with_languages(&root, limits, &visibility, &text, &languages, &last)
+                .expect_err("the capture counts the lockfile too");
+        let lockfile = root.join("Cargo.lock");
+        for error in [built, captured] {
+            assert_eq!(
+                error.fault().violation(),
+                WorkspaceIndexViolation::WorkspaceTooLarge
+            );
+            assert_eq!(error.fault().path(), Some(lockfile.as_path()));
+        }
+    }
+
+    /// `paths.force_include` reaches a lockfile the index leaves out, and parses it when a
+    /// provider claims its extension.
+    #[test]
+    fn test_force_include_reaches_a_parsed_lockfile() {
+        let directory = lockfile_workspace();
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        let forced = index
+            .force_include_index(&["web/package-lock.json".to_owned()], 8)
+            .expect("the force-included lockfile reads");
+        let file = forced
+            .file(&project("web/package-lock.json"))
+            .expect("the JSON provider parses the lockfile");
+        assert!(
+            !file.syntax().symbols().is_empty(),
+            "its keys are declarations"
+        );
+    }
+
+    /// An empty exclusion list indexes every lockfile again.
+    #[test]
+    fn test_an_empty_exclusion_list_indexes_lockfiles() {
+        let directory = lockfile_workspace();
+        let inclusion = TextFileInclusion::default().excluding_lockfiles(Vec::new());
+        let index = indexed(directory.path(), &inclusion);
+        assert!(index.text_file(&project("Cargo.lock")).is_some());
+        assert!(index.file(&project("web/package-lock.json")).is_some());
+        assert_eq!(index.excluded_lockfiles().count(), 0);
+    }
+
+    /// An edit to an excluded lockfile moves the workspace: the rebuild over that one path
+    /// records its new digest and still stores no row for it.
+    #[test]
+    fn test_an_edited_lockfile_moves_the_workspace_and_stays_out_of_search() {
+        let directory = lockfile_workspace();
+        let root = directory.path();
+        let index = indexed(root, &TextFileInclusion::default());
+        let before = index.digest(&project("Cargo.lock"));
+        fs::write(root.join("Cargo.lock"), "version = 4\n\n[[package]]\n").expect("edit");
+        let (captured, _) = capture_digests_with_languages(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+            &LastCapture::default(),
+        )
+        .expect("the capture reads the tree");
+        let changes = PathChanges::between(&index.digests(), &captured);
+        assert_eq!(
+            changes.paths().map(ProjectPath::as_str).collect::<Vec<_>>(),
+            ["Cargo.lock"]
+        );
+        let rebuilt = index
+            .rebuilt(&changes)
+            .expect("the rebuild reads the lockfile");
+        assert_ne!(rebuilt.digest(&project("Cargo.lock")), before);
+        assert!(rebuilt.text_file(&project("Cargo.lock")).is_none());
+        assert_eq!(captured.fingerprint(), *rebuilt.fingerprint());
+        assert!(rebuilt.index_documents_for(changes.paths()).is_empty());
+    }
+
+    /// A text file past the chunk bound publishes each chunk at its start in the file, and a
+    /// file within the bound publishes itself at offset zero.
+    #[test]
+    fn test_text_rows_record_where_their_text_starts_in_the_file() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let text = "one line of chunked text\n".repeat(120);
+        fs::write(directory.path().join("big.txt"), &text).expect("big text");
+        fs::write(directory.path().join("small.txt"), "small\n").expect("small text");
+        let index = indexed(
+            directory.path(),
+            &TextFileInclusion::new(vec!["**".to_owned()], 1_024),
+        );
+        let documents = index.index_documents();
+        let small = documents
+            .iter()
+            .find(|document| document.identity().as_str() == "small.txt")
+            .expect("the small file publishes one row");
+        assert_eq!(small.byte_offset(), Some(0));
+        let chunks: Vec<&IndexDocument> = documents
+            .iter()
+            .filter(|document| document.identity().as_str().starts_with("big.txt#"))
+            .collect();
+        assert!(chunks.len() > 2, "the big file splits: {}", chunks.len());
+        for chunk in chunks {
+            let start = usize::try_from(chunk.byte_offset().expect("a chunk records its start"))
+                .expect("offset fits");
+            assert_eq!(&text[start..start + chunk.content().len()], chunk.content());
+        }
+    }
+
     #[test]
     fn test_a_capture_folds_the_tree_revision_the_build_stamps() {
         let directory = tempfile::tempdir().expect("temporary workspace");
@@ -7573,8 +8363,10 @@ mod tests {
                 &SourceVisibility::default(),
                 &inclusion,
                 &LanguageFileSelections::default(),
+                &LastCapture::default(),
             )
             .expect("the capture must read the tree")
+            .0
         };
         let captured = capture(root);
         assert_eq!(

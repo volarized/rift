@@ -562,7 +562,7 @@ fn every_named_result_class_is_covered_once() -> TestResult {
         "file_name_only",
         "signature_only",
         "documentation_only",
-        "declaration_source_only",
+        "declaration_body_only",
         "file_content_only",
         "quoted_phrase",
         "precise",

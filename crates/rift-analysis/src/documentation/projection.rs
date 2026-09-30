@@ -14,7 +14,7 @@ use rift_protocol::documentation::{
     DocumentationSourceIdentity,
 };
 use rift_protocol::read::TextRange;
-use rift_ranking::{DocumentIdentity, FieldSet, RankedIdentity, RankingInput};
+use rift_ranking::{DocumentIdentity, RankedIdentity, RankingInput};
 
 use super::failure::{DocumentationError, DocumentationViolation, refused};
 use super::publication::DocumentationCollection;
@@ -427,10 +427,12 @@ impl<'layer> DocumentationProjection<'layer> {
                 let chosen = choose_mapping(&mappings, ranked.identity(), &mut locate);
                 match Projected::for_mapping(chosen, target, &owner_answers)? {
                     Projected::Original if target == DocumentationProjectionTarget::All => {
-                        order.push(ranked.identity().clone(), ranked.fields());
+                        order.push(ranked);
                     }
                     Projected::Original | Projected::Suppressed => {}
-                    Projected::Block(identity) => order.push(identity, ranked.fields()),
+                    Projected::Block(identity) => {
+                        order.push(RankedIdentity::new(identity, ranked.fields()));
+                    }
                 }
             }
             projected.push(RankingInput::new(input.kind(), order.into_order()));
@@ -510,8 +512,10 @@ struct ProjectedOrder {
 }
 
 impl ProjectedOrder {
-    fn push(&mut self, identity: DocumentIdentity, fields: FieldSet) {
-        push_or_union(&mut self.order, &mut self.positions, identity, fields);
+    /// Adds one ranked row, the bytes of its file it holds included, so a body match
+    /// can still read them after projection.
+    fn push(&mut self, ranked: RankedIdentity) {
+        push_or_union(&mut self.order, &mut self.positions, ranked);
     }
 
     fn into_order(self) -> Vec<RankedIdentity> {
@@ -877,25 +881,32 @@ fn range_len(range: &TextRange) -> u64 {
 fn collapse_input(input: &RankingInput) -> Vec<RankedIdentity> {
     let mut order = ProjectedOrder::default();
     for ranked in input.order() {
-        order.push(ranked.identity().clone(), ranked.fields());
+        order.push(ranked.clone());
     }
     order.into_order()
 }
 
+/// Adds `ranked` at its first place, or unions its fields into the entry already there.
+/// The first entry's file range stands, and a later one fills it when the first held none.
 fn push_or_union(
     order: &mut Vec<RankedIdentity>,
     positions: &mut std::collections::BTreeMap<DocumentIdentity, usize>,
-    identity: DocumentIdentity,
-    fields: FieldSet,
+    ranked: RankedIdentity,
 ) {
-    if let Some(position) = positions.get(&identity).copied() {
-        let prior = &order[position];
-        order[position] =
-            RankedIdentity::new(prior.identity().clone(), prior.fields().union(fields));
-    } else {
-        positions.insert(identity.clone(), order.len());
-        order.push(RankedIdentity::new(identity, fields));
-    }
+    let Some(position) = positions.get(ranked.identity()).copied() else {
+        positions.insert(ranked.identity().clone(), order.len());
+        order.push(ranked);
+        return;
+    };
+    let prior = &order[position];
+    let merged = RankedIdentity::new(
+        prior.identity().clone(),
+        prior.fields().union(ranked.fields()),
+    );
+    order[position] = match prior.file_range().or(ranked.file_range()).cloned() {
+        Some(file_range) => merged.with_file_range(file_range),
+        None => merged,
+    };
 }
 
 #[cfg(test)]
@@ -1019,6 +1030,36 @@ mod tests {
             warnings: Vec::new(),
         })
         .expect("valid collection")
+    }
+
+    /// A row two entries of one input rank collapses to one entry holding both entries'
+    /// fields and the bytes of its file the row holds.
+    #[test]
+    fn a_collapsed_row_keeps_the_file_range_it_answered_with() {
+        let identity = DocumentIdentity::new("guide.md").expect("identity");
+        let name = RankedIdentity::new(
+            identity.clone(),
+            FieldSet::of(rift_ranking::SearchableField::Name),
+        );
+        let content = RankedIdentity::new(
+            identity,
+            FieldSet::of(rift_ranking::SearchableField::FileContent),
+        )
+        .with_file_range(0..64);
+        let collapsed = super::collapse_input(&RankingInput::new(
+            RankingInputKind::Lexical,
+            vec![name, content],
+        ));
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].file_range(), Some(&(0..64)));
+        assert!(
+            collapsed[0]
+                .fields()
+                .holds(rift_ranking::SearchableField::Name)
+                && collapsed[0]
+                    .fields()
+                    .holds(rift_ranking::SearchableField::FileContent)
+        );
     }
 
     fn input(identity: &str, fields: FieldSet) -> RankingInput {

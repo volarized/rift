@@ -16,6 +16,7 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | Situation | Tool |
 | --- | --- |
 | The target is unknown. | `search` |
+| Every match of a regex in the project's text is needed. | `search` (with `pattern`) |
 | The declaration name is known. | `get_symbol` |
 | A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "global"`, or `"all"` to answer the project's own too) |
 | A package version the project does not use, or a package it lacks, is needed. | `get_symbol`, `search` (with `packages` and `scope: "global"` or `"all"`) |

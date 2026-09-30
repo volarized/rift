@@ -9,7 +9,7 @@
 //!
 //! An edge's `from` is the enclosing definition: the definition record whose contribution
 //! range is the smallest range containing the reference occurrence in the same source unit.
-//! [`EnclosingDefinitions`] builds that per-unit interval list once, from every
+//! One [`EnclosingDefinitions`] per unit holds those ranges, built once from every
 //! `Contribution::source` binding a record's contributions carry, and resolves each
 //! occurrence against it. A reference with no enclosing definition in its unit - an import at
 //! module scope, for instance - contributes no edge.
@@ -27,12 +27,12 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
-use rift_core::{
-    DeclarationBinding, LoopBudget, ReferenceRole, SourceRange, SourceUnitId, SymbolId,
-};
+use rift_core::{DeclarationBinding, LoopBudget, ReferenceRole, SourceUnitId, SymbolId};
 use rift_protocol::read::RelationshipFacet;
 use rift_provider::{NormalizedGraph, NormalizedReference, NormalizedTarget};
 use strum::VariantArray as _;
+
+use crate::EnclosingDefinitions;
 
 /// Most edges one [`RelationshipStore`] holds across both directions combined.
 ///
@@ -79,62 +79,53 @@ impl RelationshipEdge {
     }
 }
 
-/// Per-unit definition ranges, resolving which definition encloses one reference occurrence.
+/// Each unit's definition ranges, resolving which definition encloses one reference
+/// occurrence.
 ///
 /// Built once from every contribution [`NormalizedGraph::records`] holds that carries a
 /// `Contribution::source` binding - only a definition's own declaring contribution sets
 /// that binding, so this is exactly the set of definitions with a placeable range.
-struct EnclosingDefinitions {
-    by_unit: BTreeMap<SourceUnitId, Vec<(SourceRange, SymbolId)>>,
+/// Complexity is proportional to the graph's own record and contribution count, both
+/// already bounded by [`PublicationLimits`](rift_provider::PublicationLimits).
+struct UnitDefinitions {
+    by_unit: BTreeMap<SourceUnitId, EnclosingDefinitions<SymbolId>>,
 }
 
-impl EnclosingDefinitions {
-    /// Complexity is proportional to the graph's own record and contribution count, both
-    /// already bounded by [`PublicationLimits`](rift_provider::PublicationLimits).
+impl UnitDefinitions {
     fn build(graph: &NormalizedGraph) -> Self {
-        let mut by_unit: BTreeMap<SourceUnitId, Vec<(SourceRange, SymbolId)>> = BTreeMap::new();
+        let mut by_unit: BTreeMap<SourceUnitId, Vec<(u64, u64, SymbolId)>> = BTreeMap::new();
         for record in graph.records() {
             let Some(identity) = record.identity() else {
                 continue;
             };
-            for key in record.contributions() {
-                let Some(contribution) = graph.contribution(key) else {
-                    continue;
-                };
-                let Some(binding) = contribution.source() else {
-                    continue;
-                };
-                by_unit
-                    .entry(binding.unit().clone())
-                    .or_default()
-                    .push((binding.range(), identity.clone()));
+            for binding in record
+                .contributions()
+                .iter()
+                .filter_map(|key| graph.contribution(key)?.source())
+            {
+                let range = binding.range();
+                by_unit.entry(binding.unit().clone()).or_default().push((
+                    range.start(),
+                    range.end(),
+                    identity.clone(),
+                ));
             }
         }
-        for ranges in by_unit.values_mut() {
-            ranges.sort_by_key(|(range, _)| (range.start(), range.end()));
-        }
+        let by_unit = by_unit
+            .into_iter()
+            .map(|(unit, spans)| (unit, EnclosingDefinitions::new(spans)))
+            .collect();
         Self { by_unit }
     }
 
-    /// The innermost definition whose range contains `occurrence`'s range in its unit.
-    /// Answers `None` when no definition in that unit encloses it. Two enclosing
-    /// candidates of equal size tie toward the earlier-starting one.
-    ///
-    /// `by_unit` sorts each unit's candidates by start, so every candidate that could
-    /// contain `occurrence` sits in the prefix ending where `partition_point` splits it;
-    /// candidates starting later cannot contain an occurrence that starts no later than
-    /// they do. Bounded by that unit's definition count, itself bounded by
-    /// `max_unit_definitions`.
+    /// The innermost definition whose range contains `occurrence`'s range in its unit,
+    /// answered by [`EnclosingDefinitions::resolve`]; `None` when no definition in that
+    /// unit encloses it.
     fn resolve(&self, occurrence: &DeclarationBinding) -> Option<&SymbolId> {
-        let candidates = self.by_unit.get(occurrence.unit())?;
         let range = occurrence.range();
-        let prefix_end =
-            candidates.partition_point(|(candidate, _)| candidate.start() <= range.start());
-        candidates[..prefix_end]
-            .iter()
-            .filter(|(candidate, _)| range.end() <= candidate.end())
-            .min_by_key(|(candidate, _)| candidate.end() - candidate.start())
-            .map(|(_, identity)| identity)
+        self.by_unit
+            .get(occurrence.unit())?
+            .resolve(range.start(), range.end())
     }
 }
 
@@ -233,7 +224,7 @@ impl RelationshipStore {
     /// Builds the adjacency under an explicit edge cap, so a test can force truncation
     /// without a graph sized past [`RELATIONSHIP_EDGES_MAX`].
     fn build_capped(graph: &NormalizedGraph, edges_max: usize) -> Self {
-        let enclosing = EnclosingDefinitions::build(graph);
+        let enclosing = UnitDefinitions::build(graph);
         let mut outgoing: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();
         let mut incoming: BTreeMap<SymbolId, Vec<RelationshipEdge>> = BTreeMap::new();
         let mut budget = LoopBudget::new(edges_max);

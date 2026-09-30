@@ -11,6 +11,8 @@ package_json = 632
 oversized_path = "src/jsc/bindings/sqlite/sqlite3.c"
 oversized_bytes = 9508000
 seconds = 540
+unparsed_path = "test/bundler/transpiler/fixtures/lots-of-for-loop.js"
+unparsed_bytes = 9040049
 
 [nextjs]
 repository = "vercel/next.js"

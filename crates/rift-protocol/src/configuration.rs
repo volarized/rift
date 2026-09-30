@@ -1022,9 +1022,10 @@ impl ExecutionConfiguration {
 
 /// The `[search]` table. `ranking` weighs the ranking inputs against each
 /// other, `lexical` and `vector` bound the two indexed rankings, `text`
-/// bounds the lexical chunks derived from visible text files, and
+/// bounds the lexical chunks derived from visible text files,
 /// `pool_slots` and `busy_timeout` bound the shared `SQLite` connections
-/// behind search and logs.
+/// behind search and logs, and the `pattern_` keys bound one regex
+/// `pattern` search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -1048,6 +1049,27 @@ pub struct SearchConfiguration {
     /// before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
+    /// Most bytes the matcher one search `pattern` compiles to may take, 64kb to
+    /// 64mb. A pattern whose matcher compiles past it is refused naming this key.
+    pub pattern_compiled_size: ByteSize,
+    /// Most rows of the trigram index one `pattern` search reads to select the
+    /// files it verifies, 100 to 1000000, counted once per chunk of a large file.
+    /// A search whose selection passes it is refused naming this key. Rows the
+    /// trigram index does not hold yet are verified within what the selection
+    /// leaves of it; past that, the search answers from the rows the index holds
+    /// and warns `pattern_index_preparing`.
+    #[schemars(range(min = 100, max = 1_000_000))]
+    pub pattern_candidate_rows: u64,
+    /// Most file text one `pattern` search verifies, 1mb to 64gb. A search that
+    /// would verify more is refused naming this key. Rows the trigram index does
+    /// not hold yet are left out rather than verified past it, and the answer
+    /// warns `pattern_index_preparing`.
+    pub pattern_verified_size: ByteSize,
+    /// Most matches one file contributes to a `pattern` search, 1 to 100000. A
+    /// file past it is cut there, and the answer warns
+    /// `pattern_matches_truncated`.
+    #[schemars(range(min = 1, max = 100_000))]
+    pub pattern_matches_per_file: u64,
 }
 
 impl Default for SearchConfiguration {
@@ -1059,6 +1081,10 @@ impl Default for SearchConfiguration {
             vector: VectorSearchConfiguration::default(),
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
+            pattern_compiled_size: ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_DEFAULT),
+            pattern_candidate_rows: SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT,
+            pattern_verified_size: ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT),
+            pattern_matches_per_file: SEARCH_PATTERN_MATCHES_PER_FILE_DEFAULT,
         }
     }
 }
@@ -1087,6 +1113,30 @@ impl SearchConfiguration {
                         SEARCH_BUSY_TIMEOUT_MS_MIN,
                         SEARCH_BUSY_TIMEOUT_MS_MAX,
                     ),
+                    (
+                        "search.pattern_compiled_size",
+                        self.pattern_compiled_size.bytes(),
+                        SEARCH_PATTERN_COMPILED_BYTES_MIN,
+                        SEARCH_PATTERN_COMPILED_BYTES_MAX,
+                    ),
+                    (
+                        "search.pattern_candidate_rows",
+                        self.pattern_candidate_rows,
+                        SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                        SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+                    ),
+                    (
+                        "search.pattern_verified_size",
+                        self.pattern_verified_size.bytes(),
+                        SEARCH_PATTERN_VERIFIED_BYTES_MIN,
+                        SEARCH_PATTERN_VERIFIED_BYTES_MAX,
+                    ),
+                    (
+                        "search.pattern_matches_per_file",
+                        self.pattern_matches_per_file,
+                        SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                        SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+                    ),
                 ])
             })
     }
@@ -1104,6 +1154,33 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+/// Bytes `search.pattern_compiled_size` may hold, at least: room for a pattern of a few
+/// Unicode word classes, the largest the text-search evaluation compiled at 51,116 bytes.
+pub const SEARCH_PATTERN_COMPILED_BYTES_MIN: u64 = 64 << 10;
+/// Bytes `search.pattern_compiled_size` may hold, at most.
+pub const SEARCH_PATTERN_COMPILED_BYTES_MAX: u64 = 64 << 20;
+/// Bytes `search.pattern_compiled_size` holds when the key is absent: a tenth of the
+/// `regex` crate's own 10 MiB default.
+const SEARCH_PATTERN_COMPILED_BYTES_DEFAULT: u64 = 1 << 20;
+/// Rows `search.pattern_candidate_rows` may hold, at least.
+pub const SEARCH_PATTERN_CANDIDATE_ROWS_MIN: u64 = 100;
+/// Rows `search.pattern_candidate_rows` may hold, at most.
+pub const SEARCH_PATTERN_CANDIDATE_ROWS_MAX: u64 = 1_000_000;
+/// Rows `search.pattern_candidate_rows` holds when the key is absent.
+const SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT: u64 = 10_000;
+/// Bytes `search.pattern_verified_size` may hold, at least.
+pub const SEARCH_PATTERN_VERIFIED_BYTES_MIN: u64 = 1 << 20;
+/// Bytes `search.pattern_verified_size` may hold, at most: the most text `[source]
+/// workspace_size` lets a workspace hold.
+pub const SEARCH_PATTERN_VERIFIED_BYTES_MAX: u64 = crate::source::SOURCE_WORKSPACE_BYTES_MAX;
+/// Bytes `search.pattern_verified_size` holds when the key is absent.
+const SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT: u64 = 128 << 20;
+/// Matches `search.pattern_matches_per_file` may hold, at least.
+pub const SEARCH_PATTERN_MATCHES_PER_FILE_MIN: u64 = 1;
+/// Matches `search.pattern_matches_per_file` may hold, at most.
+pub const SEARCH_PATTERN_MATCHES_PER_FILE_MAX: u64 = 100_000;
+/// Matches `search.pattern_matches_per_file` holds when the key is absent.
+const SEARCH_PATTERN_MATCHES_PER_FILE_DEFAULT: u64 = 1_000;
 
 /// `search.ranking.fusion_k` accepted, at least.
 pub const SEARCH_FUSION_K_MIN: u64 = 1;
@@ -1198,10 +1275,11 @@ fn is_repository_word(word: &str) -> bool {
         })
 }
 
-/// The `[search.lexical]` table: how many units the lexical index holds, and how many one
-/// transaction writes.
+/// The `[search.lexical]` table: how many units the lexical index holds, how many one
+/// transaction writes, and how much of the store file a connection memory-maps.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_lexical_ranges)]
 pub struct LexicalSearchConfiguration {
     /// Most units the lexical index holds: one per indexed file, text chunk,
     /// and declaration, 1000 to 50000000. A workspace past it refuses its
@@ -1212,12 +1290,19 @@ pub struct LexicalSearchConfiguration {
     /// Most units one lexical transaction writes, 100 to 1000000. A write
     /// larger than this commits in several transactions, and the tree it
     /// answers for is stamped by the last. One file's units always share a
-    /// transaction, so a file holding more units takes one of its own.
+    /// transaction, so a file holding more units takes one of its own. The
+    /// trigram index `pattern` search reads is filled after each write in
+    /// transactions of at most this many rows.
     #[schemars(range(min = 100, max = 1_000_000))]
     pub transaction_units: u64,
     /// Most content one lexical transaction writes, 1mb to 1gb, counted and
     /// applied the way `transaction_units` is.
     pub transaction_size: ByteSize,
+    /// How much of the workspace database each connection reads through a
+    /// memory map, 0b to 2147418112b; `0b` reads through `SQLite`'s page
+    /// cache alone. Every connection maps the file on its own, so resident
+    /// memory counts the mapped pages once per open connection.
+    pub mmap_size: ByteSize,
 }
 
 impl Default for LexicalSearchConfiguration {
@@ -1226,6 +1311,7 @@ impl Default for LexicalSearchConfiguration {
             units_max: LEXICAL_UNITS_MAX_DEFAULT,
             transaction_units: LEXICAL_TRANSACTION_UNITS_DEFAULT,
             transaction_size: ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT),
+            mmap_size: ByteSize::from_bytes(LEXICAL_MMAP_BYTES_DEFAULT),
         }
     }
 }
@@ -1252,6 +1338,12 @@ impl LexicalSearchConfiguration {
                 LEXICAL_TRANSACTION_BYTES_MIN,
                 LEXICAL_TRANSACTION_BYTES_MAX,
             ),
+            (
+                "search.lexical.mmap_size",
+                self.mmap_size.bytes(),
+                0,
+                LEXICAL_MMAP_BYTES_MAX,
+            ),
         ])
     }
 }
@@ -1272,8 +1364,9 @@ pub struct RankingConfiguration {
     #[serde(default = "default_identifier_weight")]
     pub identifier_weight: f64,
     /// The lexical ranking's share of a fused score, 0.0 to 1.0. The lexical
-    /// ranking is the `SQLite` full-text index over names, signatures,
-    /// attached documentation, declaration source, and selected text files.
+    /// ranking is the `SQLite` full-text index over declaration names,
+    /// signatures, and attached documentation, and over the text of every
+    /// indexed file, stored once.
     #[schemars(range(min = 0.0, max = 1.0))]
     #[serde(default = "default_lexical_weight")]
     pub lexical_weight: f64,
@@ -1818,6 +1911,12 @@ pub const LEXICAL_TRANSACTION_BYTES_MAX: u64 = 1 << 30;
 /// `search.lexical.transaction_size` when the key is absent: sixteen of the largest text
 /// chunks `[search.text] max_chunk` accepts by default.
 pub const LEXICAL_TRANSACTION_BYTES_DEFAULT: u64 = 16 << 20;
+/// `search.lexical.mmap_size` accepted, at most: the bundled `SQLite`'s
+/// `SQLITE_MAX_MMAP_SIZE`, which caps the map whatever a connection asks for.
+pub const LEXICAL_MMAP_BYTES_MAX: u64 = 2_147_418_112;
+/// `search.lexical.mmap_size` when the key is absent: one gigabyte, which maps the whole
+/// store of a workspace the size of the bun or next.js repositories.
+pub const LEXICAL_MMAP_BYTES_DEFAULT: u64 = 1 << 30;
 
 /// What stands in for a credential an endpoint value carried.
 const CREDENTIAL_REDACTED: &str = "[redacted]";
@@ -2006,9 +2105,46 @@ pub const TEXT_CHUNK_BYTES_MAX: u64 = 16 << 20;
 /// Bytes one lexical chunk from a `search.text` file may hold, by default.
 pub const TEXT_CHUNK_BYTES_DEFAULT: u64 = 1 << 20;
 
+/// The lockfile names `[search.text].excluded_lockfiles` carries when the key is absent:
+/// the lockfiles the dependency context reads beside their manifests, and the other
+/// common package managers' lockfiles.
+pub const EXCLUDED_LOCKFILES_DEFAULT: [&str; 12] = [
+    "Cargo.lock",
+    "uv.lock",
+    "package-lock.json",
+    "bun.lock",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "deno.lock",
+];
+/// Bytes one `[search.text].excluded_lockfiles` name may hold, at most: the longest file
+/// name the common filesystems accept.
+pub const LOCKFILE_NAME_BYTES_MAX: usize = 255;
+
+/// What the text index does with a file whose text runs past `[search.text] max_chunk`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeFileStrategy {
+    /// The file's text is indexed as whole-line chunks of at most `max_chunk` bytes, and a
+    /// file past `[providers.syntax] max_file` is held as text the syntax provider does
+    /// not parse, up to `[source] workspace_size`.
+    #[default]
+    Split,
+    /// The file leaves the text index: no search reads its text, and a file past
+    /// `[providers.syntax] max_file` leaves the index entirely.
+    Skip,
+}
+
 /// The `[search.text]` table. `include` selects which visible paths join the
-/// text index once every language entry has had its claim, and `max_chunk`
-/// bounds the lexical units derived from them.
+/// text index once every language entry has had its claim, `max_chunk`
+/// bounds the lexical units derived from them, `large_files` decides what
+/// happens to a file past `max_chunk`, and `excluded_lockfiles` names the
+/// lockfiles the index leaves out of search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_text_ranges)]
@@ -2017,9 +2153,22 @@ pub struct TextSearchConfiguration {
     /// The default `["**"]` selects every unclaimed visible path; an empty list selects none.
     #[schemars(length(max = 64))]
     pub include: Vec<PathPattern>,
-    /// Bytes one lexical chunk may hold, 1kb to 16mb. Larger files are indexed as
-    /// several chunks of at most this size.
+    /// Bytes one lexical chunk may hold, 1kb to 16mb. A larger file is indexed as
+    /// several chunks of at most this size, or left out of the text index, as
+    /// `large_files` decides.
     pub max_chunk: ByteSize,
+    /// What the text index does with a file past `max_chunk`: `split` indexes it in
+    /// chunks and holds a file past `[providers.syntax] max_file` as unparsed text;
+    /// `skip` leaves it out of the text index, and every search answer whose `paths`
+    /// reach one counts it in a `large_file_skipped` warning. Omitted, `split`.
+    pub large_files: LargeFileStrategy,
+    /// File names of the lockfiles the index leaves out of search, matched against
+    /// each visible file's final path segment. Such a file answers no search and no
+    /// symbol lookup, while `rift://map` still reads its pinned versions and
+    /// `paths.force_include` still reaches it for one request. An empty list
+    /// indexes every lockfile.
+    #[schemars(length(max = 64))]
+    pub excluded_lockfiles: Vec<String>,
 }
 
 impl Default for TextSearchConfiguration {
@@ -2027,6 +2176,11 @@ impl Default for TextSearchConfiguration {
         Self {
             include: vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())],
             max_chunk: ByteSize::from_bytes(TEXT_CHUNK_BYTES_DEFAULT),
+            large_files: LargeFileStrategy::default(),
+            excluded_lockfiles: EXCLUDED_LOCKFILES_DEFAULT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
         }
     }
 }
@@ -2047,9 +2201,33 @@ impl TextSearchConfiguration {
                 TEXT_CHUNK_BYTES_MIN,
                 TEXT_CHUNK_BYTES_MAX,
             ),
+            (
+                "search.text.excluded_lockfiles",
+                self.excluded_lockfiles.len() as u64,
+                0,
+                CONFIGURATION_PATTERNS_MAX as u64,
+            ),
         ])
         .or_else(|| path_patterns_violation("search.text.include", &self.include))
+        .or_else(|| {
+            self.excluded_lockfiles
+                .iter()
+                .find(|name| !is_file_name(name))
+                .map(|name| ConfigurationViolation::FileNameInvalid {
+                    field: "search.text.excluded_lockfiles",
+                    name: name.clone(),
+                })
+        })
     }
+}
+
+/// Whether `name` is one file name: nonempty, within [`LOCKFILE_NAME_BYTES_MAX`], neither
+/// `.` nor `..`, and free of path separators and control characters.
+fn is_file_name(name: &str) -> bool {
+    let within_length = !name.is_empty() && name.len() <= LOCKFILE_NAME_BYTES_MAX;
+    let one_segment = !name.contains(['/', '\\']) && !is_dot_path_segment(name);
+    let printable = !name.chars().any(char::is_control);
+    within_length && one_segment && printable
 }
 
 /// One executable command as a program string or a program followed by arguments.
@@ -2457,6 +2635,15 @@ pub enum ConfigurationViolation {
         /// The rejected pattern.
         pattern: String,
     },
+    /// A `search.text.excluded_lockfiles` entry is not one file name: it is empty,
+    /// longer than `LOCKFILE_NAME_BYTES_MAX` bytes, `.` or `..`, or carries a path
+    /// separator or a control character.
+    FileNameInvalid {
+        /// The key's path in the file: `search.text.excluded_lockfiles`.
+        field: &'static str,
+        /// The rejected name.
+        name: String,
+    },
     /// A `dependencies.packages` entry names `version` and `requirement` together, or
     /// neither, so it states no single version selector.
     PackageSelectorInvalid {
@@ -2561,6 +2748,9 @@ impl ConfigurationViolation {
             }
             Self::PathPatternInvalid { field, pattern } => {
                 vec![("field", (*field).to_owned()), ("pattern", pattern.clone())]
+            }
+            Self::FileNameInvalid { field, name } => {
+                vec![("field", (*field).to_owned()), ("name", name.clone())]
             }
             Self::PackageSelectorInvalid { field, package } => {
                 vec![("field", (*field).to_owned()), ("package", package.clone())]
@@ -3094,6 +3284,10 @@ mod tests {
             configuration.search.lexical.transaction_size,
             ByteSize::from_bytes(16 << 20)
         );
+        assert_eq!(
+            configuration.search.lexical.mmap_size,
+            ByteSize::from_bytes(1_073_741_824)
+        );
         assert_eq!(ranking.fusion_k, 60);
         assert_eq!(
             configuration.search.busy_timeout,
@@ -3110,7 +3304,62 @@ mod tests {
             configuration.search.text.include,
             vec![PathPattern(TEXT_INCLUDE_PATTERN_DEFAULT.to_owned())]
         );
+        assert_eq!(
+            configuration.search.text.excluded_lockfiles,
+            EXCLUDED_LOCKFILES_DEFAULT.map(str::to_owned)
+        );
+        assert!(
+            configuration
+                .search
+                .text
+                .excluded_lockfiles
+                .contains(&"deno.lock".to_owned())
+        );
         assert_eq!(configuration.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_excluded_lockfiles_accept_file_names_and_refuse_anything_else() {
+        let written = json!({ "search": { "text": { "excluded_lockfiles": ["yarn.lock"] } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("a lockfile list deserializes");
+        assert_eq!(configuration.search.text.excluded_lockfiles, ["yarn.lock"]);
+        assert_eq!(configuration.validate(), Ok(()));
+        let empty = json!({ "search": { "text": { "excluded_lockfiles": [] } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(empty).expect("an empty list indexes every lockfile");
+        assert_eq!(configuration.validate(), Ok(()));
+
+        let long = "l".repeat(LOCKFILE_NAME_BYTES_MAX + 1);
+        for name in [
+            "",
+            "crates/Cargo.lock",
+            "a\\b.lock",
+            ".",
+            "..",
+            "bad\u{7}.lock",
+            &long,
+        ] {
+            let mut configuration = WorkspaceConfiguration::default();
+            configuration.search.text.excluded_lockfiles = vec![name.to_owned()];
+            assert_eq!(
+                configuration.validate(),
+                Err(ConfigurationViolation::FileNameInvalid {
+                    field: "search.text.excluded_lockfiles",
+                    name: name.to_owned(),
+                }),
+                "{name:?} must be refused"
+            );
+        }
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.excluded_lockfiles = vec!["x.lock".to_owned(); 65];
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "search.text.excluded_lockfiles",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4433,6 +4682,201 @@ mod tests {
         }
     }
 
+    /// Sets one `[search]` pattern key to a value in its base unit.
+    type PatternSetter = fn(&mut SearchConfiguration, u64);
+
+    #[test]
+    fn test_search_pattern_bounds_refuse_past_their_ranges_naming_the_key() {
+        let cases: [(&str, PatternSetter, [u64; 2]); 4] = [
+            (
+                "search.pattern_compiled_size",
+                |search, value| search.pattern_compiled_size = ByteSize::from_bytes(value),
+                [
+                    SEARCH_PATTERN_COMPILED_BYTES_MIN,
+                    SEARCH_PATTERN_COMPILED_BYTES_MAX,
+                ],
+            ),
+            (
+                "search.pattern_candidate_rows",
+                |search, value| search.pattern_candidate_rows = value,
+                [
+                    SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                    SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+                ],
+            ),
+            (
+                "search.pattern_verified_size",
+                |search, value| search.pattern_verified_size = ByteSize::from_bytes(value),
+                [
+                    SEARCH_PATTERN_VERIFIED_BYTES_MIN,
+                    SEARCH_PATTERN_VERIFIED_BYTES_MAX,
+                ],
+            ),
+            (
+                "search.pattern_matches_per_file",
+                |search, value| search.pattern_matches_per_file = value,
+                [
+                    SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                    SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+                ],
+            ),
+        ];
+        for (field, set, [min, max]) in cases {
+            for accepted in [min, max] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, accepted);
+                assert_eq!(configuration.validate(), Ok(()), "{field} {accepted}");
+            }
+            for refused in [min - 1, max + 1] {
+                let mut configuration = WorkspaceConfiguration::default();
+                set(&mut configuration.search, refused);
+                assert!(
+                    matches!(
+                        configuration.validate(),
+                        Err(ConfigurationViolation::LimitOutOfRange { field: named, .. })
+                            if named == field
+                    ),
+                    "{field} {refused} must be refused naming the key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_search_pattern_bounds_default_and_advertise_their_ranges() {
+        let search = SearchConfiguration::default();
+        assert_eq!(search.pattern_compiled_size, ByteSize::from_bytes(1 << 20));
+        assert_eq!(search.pattern_candidate_rows, 10_000);
+        assert_eq!(
+            search.pattern_verified_size,
+            ByteSize::from_bytes(128 << 20)
+        );
+        assert_eq!(search.pattern_matches_per_file, 1_000);
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["SearchConfiguration"]["properties"];
+        assert_eq!(
+            table["pattern_compiled_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MAX),
+            })
+        );
+        assert_eq!(
+            table["pattern_verified_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MAX),
+            })
+        );
+        for (key, min, max) in [
+            (
+                "pattern_candidate_rows",
+                SEARCH_PATTERN_CANDIDATE_ROWS_MIN,
+                SEARCH_PATTERN_CANDIDATE_ROWS_MAX,
+            ),
+            (
+                "pattern_matches_per_file",
+                SEARCH_PATTERN_MATCHES_PER_FILE_MIN,
+                SEARCH_PATTERN_MATCHES_PER_FILE_MAX,
+            ),
+        ] {
+            assert_eq!(table[key]["minimum"], json!(min), "{key}");
+            assert_eq!(table[key]["maximum"], json!(max), "{key}");
+        }
+        let written = json!({ "search": {
+            "pattern_compiled_size": "2mb",
+            "pattern_candidate_rows": 500,
+            "pattern_verified_size": "1gb",
+            "pattern_matches_per_file": 20,
+        } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the pattern keys deserialize");
+        assert_eq!(
+            configuration.search.pattern_compiled_size,
+            ByteSize::from_bytes(2 << 20)
+        );
+        assert_eq!(configuration.search.pattern_candidate_rows, 500);
+        assert_eq!(
+            configuration.search.pattern_verified_size,
+            ByteSize::from_bytes(1 << 30)
+        );
+        assert_eq!(configuration.search.pattern_matches_per_file, 20);
+    }
+
+    #[test]
+    fn test_search_text_large_files_defaults_to_split_and_reads_skip() {
+        assert_eq!(
+            TextSearchConfiguration::default().large_files,
+            LargeFileStrategy::Split
+        );
+        let written = json!({ "search": { "text": { "large_files": "skip" } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the strategy deserializes");
+        assert_eq!(
+            configuration.search.text.large_files,
+            LargeFileStrategy::Skip
+        );
+        let refused = serde_json::from_value::<WorkspaceConfiguration>(
+            json!({ "search": { "text": { "large_files": "drop" } } }),
+        );
+        assert!(
+            refused.is_err(),
+            "an unknown strategy is refused: {refused:?}"
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        assert_eq!(
+            schema["$defs"]["TextSearchConfiguration"]["properties"]["large_files"]["default"],
+            json!("split")
+        );
+    }
+
+    #[test]
+    fn test_search_lexical_mmap_size_refuses_past_the_bundled_cap() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.lexical.mmap_size = ByteSize::from_bytes(2_147_418_113);
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "search.lexical.mmap_size",
+                    ..
+                })
+            ),
+            "a map past SQLITE_MAX_MMAP_SIZE must be refused naming the key"
+        );
+        for bytes in [0, LEXICAL_MMAP_BYTES_MAX] {
+            configuration.search.lexical.mmap_size = ByteSize::from_bytes(bytes);
+            assert_eq!(configuration.validate(), Ok(()), "mmap_size {bytes}");
+        }
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let table = &schema["$defs"]["LexicalSearchConfiguration"]["properties"];
+        assert_eq!(
+            table["mmap_size"]["rift:range"],
+            json!({ "min": ByteSize::from_bytes(0), "max": ByteSize::from_bytes(LEXICAL_MMAP_BYTES_MAX) })
+        );
+        assert_eq!(
+            table["transaction_size"]["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MIN),
+                "max": ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MAX),
+            })
+        );
+        let written = json!({ "search": { "lexical": { "mmap_size": "256mb" } } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the memory map size deserializes");
+        assert_eq!(
+            configuration.search.lexical.mmap_size,
+            ByteSize::from_bytes(256 << 20)
+        );
+        assert_eq!(
+            configuration.search.lexical.transaction_size,
+            ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_DEFAULT)
+        );
+    }
+
     #[test]
     fn test_search_lexical_transaction_bounds_deserialize_beside_the_unit_bound() {
         let written = json!({
@@ -4462,9 +4906,15 @@ mod tests {
         let schema =
             serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
         let properties = &schema["$defs"]["TextSearchConfiguration"]["properties"];
-        assert_eq!(properties.as_object().expect("properties").len(), 2);
+        assert_eq!(properties.as_object().expect("properties").len(), 4);
         assert!(properties.get("include").is_some());
         assert!(properties.get("max_chunk").is_some());
+        assert!(properties.get("large_files").is_some());
+        assert_eq!(
+            properties["excluded_lockfiles"]["maxItems"],
+            json!(CONFIGURATION_PATTERNS_MAX),
+            "the advertised list bound is the one acceptance enforces"
+        );
     }
 
     #[test]
@@ -5395,6 +5845,10 @@ mod tests {
             ConfigurationViolation::PathPatternInvalid {
                 field: "x",
                 pattern: text(),
+            },
+            ConfigurationViolation::FileNameInvalid {
+                field: "x",
+                name: text(),
             },
             ConfigurationViolation::PackageSelectorInvalid {
                 field: "x",

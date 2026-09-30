@@ -422,13 +422,133 @@ mod tests {
         assert_eq!(&text[start..end], "{ return 1; }");
     }
 
-    /// The span of an ECMAScript declaration is its own node: nothing
-    /// attaches in front, so `range` equals `item_range`.
+    /// The text `range` spans in `text`.
+    fn spanned(text: &str, range: crate::document::ByteRange) -> &str {
+        let start = usize::try_from(range.start).expect("fixture span fits usize");
+        let end = usize::try_from(range.end).expect("fixture span fits usize");
+        &text[start..end]
+    }
+
+    /// An exported declaration's complete span starts at `export`, the
+    /// statement carrying it, while `item_range` stays the declaration's own
+    /// node; a plain comment before the statement stays outside both.
     #[test]
-    fn test_declaration_range_equals_item_range() {
-        let document = analyze("// a note\nexport function shipped() {}\n");
+    fn test_declaration_range_starts_at_the_statement_carrying_it() {
+        let text = "// a note\nexport function shipped() {}\nfunction local() {}\n";
+        let document = analyze(text);
+        let shipped = &document.symbols()[0];
+        assert_eq!(spanned(text, shipped.range), "export function shipped() {}");
+        assert_eq!(spanned(text, shipped.item_range), "function shipped() {}");
+        let local = &document.symbols()[1];
+        assert_eq!(local.range, local.item_range, "nothing carries `local`");
+    }
+
+    fn documentation_of<'document>(
+        document: &'document SyntaxDocument,
+        name: &str,
+    ) -> Option<&'document str> {
+        document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .and_then(|symbol| symbol.documentation.first())
+            .map(|documentation| documentation.text.as_str())
+    }
+
+    #[test]
+    fn attached_jsdoc_becomes_documentation_with_its_markers_stripped() {
+        let text = "/**\n * Loads one config.\n *\n * @param path where it lives\n */\n\
+                    function load(path) {}\n";
+        let document = analyze(text);
+        assert_eq!(
+            documentation_of(&document, "load"),
+            Some("Loads one config.\n\n@param path where it lives")
+        );
         let symbol = &document.symbols()[0];
-        assert_eq!(symbol.range, symbol.item_range);
+        assert_eq!(
+            symbol.documentation[0].format,
+            rift_protocol::read::DocumentationFormat::Markdown
+        );
+        assert_eq!(symbol.documentation_ranges.len(), 1);
+        assert_eq!(symbol.documentation_ranges[0].start, 0);
+        assert_eq!(symbol.range.start, 0, "the span covers its JSDoc");
+    }
+
+    /// A `JSDoc` block written with CRLF line endings strips each line's
+    /// carriage return with its marker.
+    #[test]
+    fn a_crlf_jsdoc_block_strips_each_line_ending() {
+        let text = "/**\r\n * First line.\r\n * Second line.\r\n */\r\nfunction load() {}\r\n";
+        let document = analyze(text);
+        assert_eq!(
+            documentation_of(&document, "load"),
+            Some("First line.\nSecond line.")
+        );
+    }
+
+    #[test]
+    fn jsdoc_above_export_or_const_attaches_to_the_declaration() {
+        let text = "/** Exported. */\nexport function shown() {}\n\
+                    /** Held. */\nexport const held = () => 1;\n\
+                    /** Local. */\nconst first = 1, second = 2;\n";
+        let document = analyze(text);
+        assert_eq!(documentation_of(&document, "shown"), Some("Exported."));
+        assert_eq!(documentation_of(&document, "held"), Some("Held."));
+        assert_eq!(documentation_of(&document, "first"), Some("Local."));
+        assert_eq!(documentation_of(&document, "second"), None);
+    }
+
+    /// The span climbs with the walk: the `JSDoc` above `export` or `const`
+    /// sits inside the declaration's `range`, so reading the declaration's
+    /// source shows it. A second declarator starts at its own node.
+    #[test]
+    fn jsdoc_above_export_or_const_sits_inside_the_range() {
+        let text = "/** Exported. */\nexport function shown() {}\n\
+                    /** Held. */\nexport const held = () => 1;\n\
+                    /** Local. */\nconst first = 1, second = 2;\n";
+        let document = analyze(text);
+        let spans: Vec<(&str, &str)> = document
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), spanned(text, symbol.range)))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("shown", "/** Exported. */\nexport function shown() {}"),
+                ("held", "/** Held. */\nexport const held = () => 1"),
+                ("first", "/** Local. */\nconst first = 1"),
+                ("second", "second = 2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_jsdoc_blocks_join_and_a_plain_comment_or_blank_line_detaches() {
+        let text = "/** One. */\n/** Two. */\nfunction both() {}\n\
+                    /** Hidden. */\n// plain\nfunction plain() {}\n\
+                    /** Far. */\n\nfunction far() {}\n\
+                    /* Block. */\nfunction block() {}\n\
+                    /**   */\nfunction blank() {}\n";
+        let document = analyze(text);
+        assert_eq!(documentation_of(&document, "both"), Some("One.\nTwo."));
+        assert_eq!(documentation_of(&document, "plain"), None);
+        assert_eq!(documentation_of(&document, "far"), None);
+        assert_eq!(documentation_of(&document, "block"), None);
+        let blank = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "blank")
+            .expect("blank declares");
+        assert!(
+            blank.documentation.is_empty() && blank.documentation_ranges.is_empty(),
+            "a JSDoc block holding nothing once stripped publishes nothing"
+        );
+        assert_eq!(
+            spanned(text, blank.range),
+            "/**   */\nfunction blank() {}",
+            "the empty block still joins the span"
+        );
     }
 
     /// A JSX component parses through this provider without errors.

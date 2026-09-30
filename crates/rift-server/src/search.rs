@@ -3,10 +3,18 @@
 //! from `read` so that module stays below its size bound. The bounded relationship `traversal`
 //! lane lives in the sibling `traversal` module.
 
+mod body;
+#[cfg(test)]
+mod body_tests;
 mod documentation;
 #[cfg(test)]
 mod documentation_tests;
+mod pattern;
+#[cfg(test)]
+mod pattern_tests;
+use body::BodyMatching;
 use documentation::SearchDocumentation;
+pub use pattern::{PatternBounds, accepted_pattern};
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -15,30 +23,30 @@ use rift_core::ProjectPath;
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, SEARCH_RESULTS_DEFAULT, SYMBOL_URI_PREFIX};
 use rift_core::line;
 use rift_index::{
-    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, SymbolMatch,
-    TextSourceFile, WorkspaceIndex,
+    IndexFailure, IndexedFile, LexicalChange, PathChanges, PathMatcher, PatternCandidates,
+    SymbolMatch, TextSourceFile, WorkspaceIndex,
 };
 use rift_protocol::read::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, MatchedField, PathPattern, PathSelector,
-    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SearchChange, SearchHit,
-    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult, SearchScope,
-    SearchTraversal, Symbol, SymbolId,
+    ProjectPath as WireProjectPath, ReadWarning, ResultOrder, SOURCE_WARNINGS_MAX, SearchChange,
+    SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
+    SearchScope, SearchTraversal, Symbol, SymbolId,
 };
 use rift_ranking::{
-    DocumentIdentity, DocumentKind, DocumentLocation, FusedCandidate, IdentifierMatchClass,
-    IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QueryPhase,
-    RankedCandidates, RankingInput, RankingWeights, SearchableField, fuse,
+    DocumentIdentity, DocumentKind, DocumentLocation, FileRowFrequencies, FusedCandidate,
+    IdentifierMatchClass, IdentifierRanking, IndexDocument, PARSED_QUERY_MEMBERS_MAX, ParsedQuery,
+    QueryPhase, RankedCandidates, RankingInput, RankingWeights, SearchableField, fuse,
 };
 use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
-use crate::read::parse_symbol_address;
 use crate::read::{
     CURRENT_TREE_ALONE, ReadError, ReadFault, ReadService, accepted_limit, excerpt, page,
     project_path, results_truncation_warning, source_warnings, text_range, validate_common,
     validate_requested_packages, wire_symbol,
 };
+use crate::read::{file_id, parse_symbol_address};
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
 };
@@ -56,12 +64,15 @@ pub struct StoreAnswer {
     precise: Vec<RankingInput>,
     broad: Vec<RankingInput>,
     weights: RankingWeights,
+    file_rows: Option<FileRowFrequencies>,
+    pattern_bounds: PatternBounds,
+    pattern_candidates: Option<PatternCandidates>,
 }
 
 impl StoreAnswer {
     /// Names what the store answered for each phase, and the configured shares.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         precise: Vec<RankingInput>,
         broad: Vec<RankingInput>,
         weights: RankingWeights,
@@ -70,17 +81,32 @@ impl StoreAnswer {
             precise,
             broad,
             weights,
+            file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
+    }
+
+    /// The same answer, carrying the document frequencies of the query's terms over the
+    /// store's file rows that a body match scores declarations with; `None` leaves body
+    /// matching out of the answer.
+    #[must_use]
+    pub fn with_file_rows(mut self, file_rows: Option<FileRowFrequencies>) -> Self {
+        self.file_rows = file_rows;
+        self
     }
 
     /// No store answer, under the operator's own shares: the shares stay what
     /// `[search.ranking]` states rather than collapsing onto identifier matching.
     #[must_use]
-    pub const fn without_store(weights: RankingWeights) -> Self {
+    pub fn without_store(weights: RankingWeights) -> Self {
         Self {
             precise: Vec::new(),
             broad: Vec::new(),
             weights,
+            file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
     }
 
@@ -92,6 +118,9 @@ impl StoreAnswer {
             precise: Vec::new(),
             broad: Vec::new(),
             weights: RankingWeights::identifier_only(),
+            file_rows: None,
+            pattern_bounds: PatternBounds::default(),
+            pattern_candidates: None,
         }
     }
 
@@ -111,6 +140,40 @@ impl StoreAnswer {
     #[must_use]
     pub const fn weights(&self) -> RankingWeights {
         self.weights
+    }
+
+    /// The document frequencies a body match scores declarations with, when the store
+    /// read them beside its ranking.
+    #[must_use]
+    pub const fn file_rows(&self) -> Option<&FileRowFrequencies> {
+        self.file_rows.as_ref()
+    }
+
+    /// The same answer under the `[search]` bounds a `pattern` search runs under.
+    #[must_use]
+    pub const fn with_pattern_bounds(mut self, bounds: PatternBounds) -> Self {
+        self.pattern_bounds = bounds;
+        self
+    }
+
+    /// The same answer, carrying the files the trigram index selected for a `pattern`.
+    #[must_use]
+    pub fn with_pattern_candidates(mut self, candidates: PatternCandidates) -> Self {
+        self.pattern_candidates = Some(candidates);
+        self
+    }
+
+    /// The `[search]` bounds a `pattern` search runs under.
+    #[must_use]
+    pub const fn pattern_bounds(&self) -> PatternBounds {
+        self.pattern_bounds
+    }
+
+    /// The files the trigram index selected for a `pattern`, absent when the store was not
+    /// asked or did not answer for the tree the request captured.
+    #[must_use]
+    pub const fn pattern_candidates(&self) -> Option<&PatternCandidates> {
+        self.pattern_candidates.as_ref()
     }
 }
 
@@ -174,8 +237,9 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, ReadError> {
-        references.validate_revision(self)?;
-        validate_search(params)?;
+        if let Some(pattern) = self.validated_pattern(params, store, references)? {
+            return self.search_pattern(params, &pattern, store);
+        }
         if params.change.is_some() {
             // One snapshot holds one tree; a comparison needs two, and reaches its own
             // through `search_change`.
@@ -266,12 +330,33 @@ impl ReadService {
         })
     }
 
+    /// Validates one search against this snapshot, and compiles the `pattern` it names,
+    /// if any, under the answer's `[search]` bounds.
+    fn validated_pattern(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+    ) -> Result<Option<rift_ranking::Pattern>, ReadError> {
+        rift_core::traced!(component = "search", operation = "search.validate", {
+            references.validate_revision(self)?;
+            validate_search(params)
+        })?;
+        accepted_pattern(params, store.pattern_bounds())
+    }
+
     fn initial_search_warnings(
         &self,
         selected: &SelectedPaths,
         target: SearchParamsTarget,
         references: &EngineReferences,
     ) -> Vec<ReadWarning> {
+        let _span = tracing::info_span!(
+            "search.initial_warnings",
+            component = "search",
+            operation = "search.initial_warnings"
+        )
+        .entered();
         let mut warnings = self.warnings();
         warnings.extend(selected.warnings());
         warnings.extend(self.documentation_warnings(target));
@@ -341,8 +426,19 @@ impl ReadService {
     /// Returns [`ReadError`] for an invalid glob, or a `force_include` matching more
     /// files than `FORCE_INCLUDE_FILES_MAX`.
     fn selected_paths(&self, selector: Option<&PathSelector>) -> Result<SelectedPaths, ReadError> {
+        let _span = tracing::info_span!(
+            "search.selected_paths",
+            component = "search",
+            operation = "search.selected_paths"
+        )
+        .entered();
         let index = self.index();
         let matcher = path_matcher(index.root(), selector)?;
+        let lockfiles = selected_lockfiles(index, selector, matcher.as_ref());
+        let skipped = index
+            .skipped_paths()
+            .filter(|path| includes(matcher.as_ref(), index.root(), path))
+            .count();
         let force_include = match selector {
             Some(selector) if !selector.force_include.is_empty() => Some(
                 index
@@ -357,6 +453,8 @@ impl ReadService {
         Ok(SelectedPaths {
             matcher,
             force_include,
+            lockfiles,
+            skipped,
         })
     }
 
@@ -379,6 +477,12 @@ impl ReadService {
         (query, store): (&ParsedQuery, &StoreAnswer),
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
     ) -> Result<Option<usize>, ReadError> {
+        let _span = tracing::info_span!(
+            "search.query_hits",
+            component = "search",
+            operation = "search.query_hits"
+        )
+        .entered();
         let index = self.index();
         let root = index.root();
         let matcher = selected.matcher.as_ref();
@@ -406,6 +510,7 @@ impl ReadService {
         if let Some(documentation) = &documentation {
             warnings.extend(documentation.warnings().iter().cloned());
         }
+        let body = BodyMatching::for_request(criteria.target, store, query);
         let screen = CandidateScreen {
             index,
             matcher,
@@ -413,6 +518,7 @@ impl ReadService {
             target: criteria.target,
             resolution,
             documentation: documentation.as_ref(),
+            body: body.as_ref(),
         };
         let mut inputs = vec![rift_core::traced!(
             component = "search",
@@ -420,7 +526,7 @@ impl ReadService {
             { identifier_input(index, matcher, root, query, sources, fetch_limit) }
         )?];
         inputs.extend(store.precise().iter().cloned());
-        let screened = screen.projected(&inputs, query)?;
+        let screened = screen.projected(&inputs, query, QueryPhase::Precise)?;
         let mut ranked = rift_core::traced!(
             component = "search",
             operation = "search.fusion",
@@ -430,7 +536,7 @@ impl ReadService {
         // The widened inputs join only when the precise phase came up short: a full pool
         // leaves no slot a broad match could take.
         if ranked.len() < fetch_limit {
-            let screened = screen.projected(store.broad(), query)?;
+            let screened = screen.projected(store.broad(), query, QueryPhase::Broad)?;
             let broad = rift_core::traced!(
                 component = "search",
                 operation = "search.fusion",
@@ -439,6 +545,7 @@ impl ReadService {
             );
             ranked.append_phase(broad, fetch_limit);
         }
+        let ranked = screen.with_body_matches(ranked, fetch_limit);
         rift_core::traced!(component = "search", operation = "search.hit_resolution", {
             resolve_ranked_hits(
                 index,
@@ -492,9 +599,10 @@ impl ReadService {
     /// it has no entry and the two slices are never parallel. Each pair is built from one
     /// document's own resolution, so a document can never pick up another's declaration.
     ///
-    /// The declaration's signature, its attached documentation, and its own source all
-    /// travel with the pair, because the published document already holds each of them in
-    /// its own field and the embedding text reads all three.
+    /// The declaration's signature and its attached documentation travel from the
+    /// published document, which holds each in its own field; its own source comes from
+    /// the file the snapshot holds, a range of the text the file's own document stores.
+    /// The embedding text reads all three.
     ///
     /// The walk runs over `documents`, whose length this snapshot's own file and symbol
     /// bounds already fixed, and each symbol document costs one scan of the file it names,
@@ -523,7 +631,7 @@ impl ReadService {
         let DocumentLocation::Project(path) = unit.location() else {
             return None;
         };
-        let (_, symbol) = resolve_symbol(self.index(), path, unit.identity().as_str())?;
+        let (file, symbol) = resolve_symbol(self.index(), path, unit.identity().as_str())?;
         let fields = unit.fields();
         let declaration = Declaration::new(symbol.kind, &symbol.qualified_name)
             .signature(fields.get(SearchableField::Signature).unwrap_or_default())
@@ -532,13 +640,20 @@ impl ReadService {
                     .get(SearchableField::Documentation)
                     .unwrap_or_default(),
             )
-            .source(
-                fields
-                    .get(SearchableField::DeclarationSource)
-                    .unwrap_or_default(),
-            );
+            .source(declaration_text(file, symbol));
         Some(DescribedUnit::new(unit, declaration))
     }
+}
+
+/// The text `symbol`'s complete span holds in `file`, or nothing for a span the file's
+/// bytes cannot hold.
+fn declaration_text<'a>(file: &'a IndexedFile, symbol: &SyntaxSymbol) -> &'a str {
+    let start = usize::try_from(symbol.range.start).ok();
+    let end = usize::try_from(symbol.range.end).ok();
+    start
+        .zip(end)
+        .and_then(|(start, end)| file.source().get(start..end))
+        .unwrap_or_default()
 }
 
 /// Whether the request's `paths` selector names any `force_include` glob.
@@ -600,18 +715,84 @@ struct SearchCriteria<'a> {
 struct SelectedPaths {
     matcher: Option<PathMatcher>,
     force_include: Option<WorkspaceIndex>,
+    /// The lockfiles `paths.include` selects that the index leaves out of search.
+    lockfiles: Vec<ProjectPath>,
+    /// The held files the selection reaches that text search leaves out under
+    /// `[search.text] large_files = "skip"`.
+    skipped: usize,
 }
 
 impl SelectedPaths {
     /// The `source_unavailable` warnings for the `force_include` files the on-demand index
-    /// left out. They describe the request's selection, so the answer carries them whatever
-    /// the query yields and whether or not the pool had room for the selected files.
+    /// left out, and the `lockfile_excluded` warning for the lockfiles `paths.include`
+    /// selects that search leaves out. They describe the request's selection, so the
+    /// answer carries them whatever the query yields and whether or not the pool had room
+    /// for the selected files.
     fn warnings(&self) -> Vec<ReadWarning> {
-        self.force_include
+        let mut warnings = self
+            .force_include
             .as_ref()
             .map(|extra| source_warnings(extra.warnings()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        warnings.extend(lockfile_warning(&self.lockfiles));
+        warnings.extend(skipped_warning(self.skipped));
+        warnings
     }
+}
+
+/// The lockfiles the index leaves out of search that `selector`'s `include` globs select,
+/// in project-path order, when the request names any `include` glob at all.
+///
+/// An `include` glob holds gitignore semantics, so `Cargo.lock` names every `Cargo.lock`
+/// at any depth: the request's own matcher decides, exactly as it decides every other
+/// path the request selects.
+fn selected_lockfiles(
+    index: &WorkspaceIndex,
+    selector: Option<&PathSelector>,
+    matcher: Option<&PathMatcher>,
+) -> Vec<ProjectPath> {
+    let names_include = selector.is_some_and(|selector| !selector.include.is_empty());
+    if !names_include {
+        return Vec::new();
+    }
+    index
+        .excluded_lockfiles()
+        .filter(|path| includes(matcher, index.root(), path))
+        .cloned()
+        .collect()
+}
+
+/// The one warning counting the selected files text search leaves out under
+/// `[search.text] large_files = "skip"`, or none when the selection reaches none.
+fn skipped_warning(skipped: usize) -> Option<ReadWarning> {
+    (skipped > 0).then(|| ReadWarning::LargeFileSkipped {
+        skipped: u64::try_from(skipped).unwrap_or(u64::MAX),
+        detail: format!(
+            "{skipped} selected files are past [search.text] max_chunk and left out of the \
+             text index under large_files = \"skip\"; setting large_files to \"split\" \
+             indexes them in chunks"
+        ),
+    })
+}
+
+/// The one warning naming the selected lockfiles search leaves out, at most
+/// `SOURCE_WARNINGS_MAX` of them, or none when the request selects none.
+fn lockfile_warning(lockfiles: &[ProjectPath]) -> Option<ReadWarning> {
+    if lockfiles.is_empty() {
+        return None;
+    }
+    let files = lockfiles
+        .iter()
+        .take(SOURCE_WARNINGS_MAX)
+        .map(file_id)
+        .collect();
+    let detail = format!(
+        "the index leaves {count} selected lockfiles out of search; rift://map carries the \
+         versions they pin, paths.force_include searches one for one request, and removing \
+         its name from the [search.text] excluded_lockfiles key indexes it",
+        count = lockfiles.len(),
+    );
+    Some(ReadWarning::LockfileExcluded { files, detail })
 }
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
@@ -619,6 +800,9 @@ pub(crate) fn validate_search(params: &SearchParams) -> Result<(), ReadError> {
     validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
+    }
+    if let Some(conflict) = pattern::pattern_conflict(params) {
+        return Err(conflict);
     }
     if let Some(change) = params.change.as_ref() {
         validate_change(change, params)?;
@@ -703,10 +887,11 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
 }
 
 /// The lexical `query` the request carries, if any: refused when the request carries
-/// none of `query`, `traversal`, and `change`, and when the query is empty.
+/// none of `query`, `pattern`, `traversal`, and `change`, and when the query is empty.
 fn accepted_query(params: &SearchParams) -> Result<Option<&str>, ReadError> {
     let query = params.query.as_deref();
-    if query.is_none() && params.traversal.is_none() && params.change.is_none() {
+    let selects = params.pattern.is_some() || params.traversal.is_some() || params.change.is_some();
+    if query.is_none() && !selects {
         return Err(ReadFault::invalid("query", "missing"));
     }
     if query.is_some_and(str::is_empty) {
@@ -830,6 +1015,9 @@ struct CandidateScreen<'a> {
     target: SearchParamsTarget,
     resolution: Resolution<'a>,
     documentation: Option<&'a SearchDocumentation<'a>>,
+    /// Body matching for this request, when a file row can answer through the
+    /// declarations inside it.
+    body: Option<&'a BodyMatching<'a>>,
 }
 
 impl CandidateScreen<'_> {
@@ -837,12 +1025,28 @@ impl CandidateScreen<'_> {
         &self,
         inputs: &[RankingInput],
         query: &ParsedQuery,
+        phase: QueryPhase,
     ) -> Result<Vec<RankingInput>, ReadError> {
-        let screened = self.screened(inputs);
-        match self.documentation {
-            Some(documentation) => documentation.project(&screened, self.target, query),
-            None => Ok(screened),
-        }
+        let _span = tracing::info_span!(
+            "search.projected",
+            component = "search",
+            operation = "search.projected",
+            phase = phase.label()
+        )
+        .entered();
+        let screened = rift_core::traced!(component = "search", operation = "search.screened", {
+            self.screened(inputs)
+        });
+        rift_core::traced!(
+            component = "search",
+            operation = "search.documentation_project",
+            {
+                match self.documentation {
+                    Some(documentation) => documentation.project(&screened, self.target, query),
+                    None => Ok(screened),
+                }
+            }
+        )
     }
     /// `inputs` with every identity this request's filters exclude removed, each input
     /// keeping the order it answered in. An input screened down to nothing no longer
@@ -864,7 +1068,8 @@ impl CandidateScreen<'_> {
 
     /// Whether this request answers `identity`. It does not when no selected index holds
     /// it, when the `paths` selector excludes the path it names, or when `target`
-    /// excludes the kind it names.
+    /// excludes the kind it names. A file row stays under a `target` naming declarations
+    /// alone while body matching can answer through the declarations inside it.
     fn admits(&self, identity: &DocumentIdentity) -> bool {
         if let Some(admitted) = self
             .documentation
@@ -873,8 +1078,19 @@ impl CandidateScreen<'_> {
             return admitted;
         }
         resolve_candidate(self.index, self.resolution, identity).is_some_and(|resolved| {
-            resolved.reaches(self.index, self.matcher, self.root) && resolved.answers(self.target)
+            let carries_body_matches = self.body.is_some() && resolved.answered_path().is_some();
+            resolved.reaches(self.index, self.matcher, self.root)
+                && (resolved.answers(self.target) || carries_body_matches)
         })
+    }
+
+    /// `ranked` with the declarations its first file rows hold placed at the first file
+    /// row's place, when this request matches bodies; `ranked` unchanged otherwise.
+    fn with_body_matches(&self, ranked: RankedCandidates, keep_max: usize) -> RankedCandidates {
+        match self.body {
+            Some(body) => body.placed(self.index, ranked, keep_max),
+            None => ranked,
+        }
     }
 }
 
@@ -1026,9 +1242,7 @@ fn matched_fields(candidate: &FusedCandidate) -> Vec<MatchedField> {
             | SearchableField::IdentifierTerms => MatchedField::Name,
             SearchableField::Signature => MatchedField::Signature,
             SearchableField::Documentation => MatchedField::Documentation,
-            SearchableField::DeclarationSource | SearchableField::FileContent => {
-                MatchedField::Content
-            }
+            SearchableField::FileContent => MatchedField::Content,
         };
         if !fields.contains(&wire) {
             fields.push(wire);
@@ -1184,6 +1398,12 @@ fn populate_symbol_lines(
     index: &WorkspaceIndex,
     force_include: Option<&WorkspaceIndex>,
 ) -> Result<(), ReadError> {
+    let _span = tracing::info_span!(
+        "search.symbol_lines",
+        component = "search",
+        operation = "search.symbol_lines"
+    )
+    .entered();
     for hit in results {
         if hit.line.is_some() || !matches!(hit.hit, SearchHitTarget::Symbol { .. }) {
             continue;
@@ -1366,6 +1586,12 @@ fn order_and_bound_hits(
     order: ResultOrder,
     results_max: usize,
 ) -> Option<usize> {
+    let _span = tracing::info_span!(
+        "search.order",
+        component = "search",
+        operation = "search.order"
+    )
+    .entered();
     order_hits(results, order);
     bound_hits(results, results_max)
 }
@@ -1446,7 +1672,8 @@ mod tests {
 
     use super::{
         ByteRange, CandidateScreen, HitPayloads, IdentifierSources, ReadFault, ReadService,
-        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
+        Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer, declaration_text,
+        resolve_symbol,
     };
     use crate::read::tests::project_fixture;
 
@@ -1492,7 +1719,12 @@ mod tests {
         } else {
             Vec::new()
         };
-        Ok(StoreAnswer::new(precise, broad, configured_weights()))
+        let terms = rift_ranking::BodyTerms::of(&parsed);
+        let file_rows = match store.file_row_frequencies(revision, &terms).await? {
+            RevisionScoped::Matched(frequencies) => Some(frequencies),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+        };
+        Ok(StoreAnswer::new(precise, broad, configured_weights()).with_file_rows(file_rows))
     }
 
     /// The inputs one phase produced, refusing a store stamped with another revision.
@@ -1536,6 +1768,7 @@ mod tests {
             target: criteria.target,
             resolution,
             documentation: None,
+            body: None,
         };
         let ranked = fuse(
             &screen.screened(inputs),
@@ -3691,9 +3924,16 @@ impl Tower {
             );
             let identity = one.unit().identity();
             let text = rift_search::document(one.declaration()).into_text();
+            let path = one
+                .unit()
+                .project_path()
+                .ok_or("a symbol document has a path")?;
+            let (file, symbol) = resolve_symbol(service.index(), path, identity.as_str())
+                .ok_or("every described unit resolves")?;
+            let source = declaration_text(file, symbol);
             assert!(
-                text.contains(one.unit().content()),
-                "each description must carry its own document's declaration: {identity} {text}"
+                !source.is_empty() && text.contains(source),
+                "each description must carry its own declaration's source: {identity} {text}"
             );
         }
         Ok(())
@@ -3847,7 +4087,7 @@ impl Tower {
     }
 
     /// `matched_by` names the columns that placed a candidate: the three name columns
-    /// collapse to one member, the two content columns to another, and a candidate no
+    /// collapse to one member, the content column is another, and a candidate no
     /// column placed - one the vector ranking alone reached - answers `ranked`.
     #[test]
     fn matched_by_names_the_columns_that_placed_a_candidate() -> TestResult {
@@ -3863,7 +4103,7 @@ impl Tower {
                 .with(SearchableField::IdentifierTerms)
                 .with(SearchableField::Signature)
                 .with(SearchableField::Documentation)
-                .with(SearchableField::DeclarationSource),
+                .with(SearchableField::FileContent),
         )]);
         let declarations = SearchCriteria {
             query: &ParsedQuery::parse("Beacon")?,
@@ -3912,7 +4152,7 @@ impl Tower {
     }
 
     /// One declaration both the identifier ranking and the store's full-text ranking
-    /// placed answers once, carrying every column that placed it.
+    /// placed answers once, carrying the column that placed it.
     #[tokio::test]
     async fn search_matched_by_carries_the_identifier_and_the_full_text_columns() -> TestResult {
         let (directory, service) = fixture()?;
@@ -3933,11 +4173,11 @@ impl Tower {
             "two inputs placing one identity answer once: {answer:#?}"
         );
         let beacon = declarations[0];
-        assert!(
-            beacon.matched_by.contains(&MatchedField::Name)
-                && beacon.matched_by.contains(&MatchedField::Content),
-            "the identifier ranking's name column and the store's source column both \
-             placed it: {beacon:#?}"
+        assert_eq!(
+            beacon.matched_by,
+            [MatchedField::Name],
+            "the identifier ranking and the store's name column both placed it, and no \
+             symbol row stores the declaration's source: {beacon:#?}"
         );
 
         let readme = answer

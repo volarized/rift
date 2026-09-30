@@ -13,7 +13,8 @@
 
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
-    ConfigurationViolation, LanguageConfiguration, UnitParseError, WorkspaceConfiguration,
+    ConfigurationViolation, EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy,
+    UnitParseError, WorkspaceConfiguration,
 };
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
@@ -179,24 +180,34 @@ impl From<&WorkspaceConfiguration> for LanguageFileSelections {
     }
 }
 
-/// Resolved `[search.text]` path selection and chunk bound, and the `[documentation]`
-/// table deciding which of the text files the index reads it collects as documentation.
+/// Resolved `[search.text]` path selection, chunk bound, large-file strategy, and the
+/// lockfiles search leaves out, beside the `[documentation]` table deciding which of the
+/// text files the index reads it collects as documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextFileInclusion {
     include: Vec<String>,
     chunk_bytes_max: u64,
     documentation: DocumentationConfiguration,
+    large_files: LargeFileStrategy,
+    excluded_lockfiles: Vec<String>,
 }
 
 impl TextFileInclusion {
     /// Builds one text-file policy from its patterns and chunk bound, collecting
-    /// documentation under the `[documentation]` defaults.
+    /// documentation under the `[documentation]` defaults, splitting a file past the bound
+    /// into chunks, and leaving out the lockfiles `[search.text].excluded_lockfiles` names
+    /// when the keys are absent.
     #[must_use]
     pub fn new(include: Vec<String>, chunk_bytes_max: u64) -> Self {
         Self {
             include,
             chunk_bytes_max,
             documentation: DocumentationConfiguration::default(),
+            large_files: LargeFileStrategy::default(),
+            excluded_lockfiles: EXCLUDED_LOCKFILES_DEFAULT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
         }
     }
 
@@ -205,6 +216,40 @@ impl TextFileInclusion {
     pub fn with_documentation(mut self, documentation: DocumentationConfiguration) -> Self {
         self.documentation = documentation;
         self
+    }
+
+    /// The same policy, leaving out of search the lockfiles `names` names instead.
+    #[must_use]
+    pub fn excluding_lockfiles(mut self, names: Vec<String>) -> Self {
+        self.excluded_lockfiles = names;
+        self
+    }
+
+    /// The file names of the lockfiles search leaves out.
+    #[must_use]
+    pub fn excluded_lockfiles(&self) -> &[String] {
+        &self.excluded_lockfiles
+    }
+
+    /// The same policy, treating a file past the chunk bound as `strategy` decides.
+    #[must_use]
+    pub const fn with_large_files(mut self, strategy: LargeFileStrategy) -> Self {
+        self.large_files = strategy;
+        self
+    }
+
+    /// What the text index does with a file past the chunk bound.
+    #[must_use]
+    pub const fn large_files(&self) -> LargeFileStrategy {
+        self.large_files
+    }
+
+    /// Whether the text index leaves out a text of `content_bytes` bytes: only under
+    /// `skip`, and only past the chunk bound.
+    #[must_use]
+    pub fn skips(&self, content_bytes: usize) -> bool {
+        self.large_files == LargeFileStrategy::Skip
+            && u64::try_from(content_bytes).unwrap_or(u64::MAX) > self.chunk_bytes_max
     }
 
     /// Patterns selecting plain text when no language claims a path.
@@ -244,6 +289,8 @@ impl From<&WorkspaceConfiguration> for TextFileInclusion {
             text.max_chunk.bytes(),
         )
         .with_documentation(configuration.documentation.clone())
+        .with_large_files(text.large_files)
+        .excluding_lockfiles(text.excluded_lockfiles.clone())
     }
 }
 
@@ -308,6 +355,19 @@ mod tests {
         let inclusion = TextFileInclusion::from(&configuration);
         assert_eq!(inclusion.chunk_bytes_max(), 2 << 20);
         assert_eq!(inclusion.documentation(), &configuration.documentation);
+    }
+
+    #[test]
+    fn test_text_file_inclusion_skips_only_past_the_chunk_bound_under_skip() {
+        let mut configuration = WorkspaceConfiguration::default();
+        configuration.search.text.max_chunk = ByteSize::from_bytes(1 << 10);
+        let split = TextFileInclusion::from(&configuration);
+        assert_eq!(split.large_files(), LargeFileStrategy::Split);
+        assert!(!split.skips(4 << 10), "split never leaves a file out");
+        configuration.search.text.large_files = LargeFileStrategy::Skip;
+        let skip = TextFileInclusion::from(&configuration);
+        assert!(!skip.skips(1 << 10), "a text at the bound stays");
+        assert!(skip.skips((1 << 10) + 1), "a text past the bound leaves");
     }
 
     #[test]

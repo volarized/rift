@@ -45,15 +45,17 @@ Parameters:
 
 Searches indexed declarations and source lines by lexical `query`, merged with
 full-text matches from included `[search.text]` files and declaration bodies, and by a
-bounded relationship `traversal` from one seed symbol. `change` answers the
-declarations two committed revisions hold differently, in place of `query` and
-`traversal`. `rev` searches a version-control revision instead of the current tree,
-and never combines with `traversal` or `change`. `scope` reaches past the project
-tree: `global` answers `query` from the public declarations the global index holds
-for the workspace's dependencies alone, `all` from both, ordered together.
-`packages` names package versions `query` searches beside the workspace's own, such
-as an upgrade target or a package the project does not use yet. Use `get_symbol`
-when the declaration name is known.
+bounded relationship `traversal` from one seed symbol. `pattern` matches a regex
+against the text of every indexed file, line by line as ripgrep reads it, and answers
+each match and each declaration holding one, in place of `query` and `traversal`.
+`change` answers the declarations two committed revisions hold differently, in place
+of `query` and `traversal`. `rev` searches a version-control revision instead of the
+current tree, and never combines with `pattern`, `traversal`, or `change`. `scope`
+reaches past the project tree: `global` answers `query` from the public declarations
+the global index holds for the workspace's dependencies alone, `all` from both,
+ordered together. `packages` names package versions `query` searches beside the
+workspace's own, such as an upgrade target or a package the project does not use yet.
+Use `get_symbol` when the declaration name is known.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -64,7 +66,8 @@ Parameters:
 
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
 - `order` - Which total order the page comes back in.
-- `query` - Text to match against declaration names, qualified names, signatures, attached documentation, declaration source, and file contents.
+- `query` - Text to match against declaration names, qualified names, signatures, attached documentation, and file contents.
+- `pattern` - A regex matched against the text of every indexed file, in the syntax of the Rust `regex` crate that ripgrep reads.
 - `scope` - Which declarations `query` searches: the project tree, the public declarations of the dependency packages, or both.
 - `packages` - Packages `query` searches beside the ones the workspace's manifests and lockfiles name, at most 64.
 - `paths` - Files eligible for the search, selected by project-relative globs.

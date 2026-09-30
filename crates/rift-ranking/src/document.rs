@@ -6,9 +6,14 @@
 //! fills a field that was already declared here; it does not introduce a second
 //! document type.
 //!
-//! Absent facts stay absent. Nothing substitutes declaration source into the
+//! Absent facts stay absent. Nothing substitutes source text into the
 //! signature or documentation field, because a reader that weighs those fields
 //! differently would then be weighing the same bytes twice.
+//!
+//! A file's text is stored and indexed once, in its file document. A symbol
+//! document carries the facts derived from its declaration - names, derived
+//! terms, signature, documentation - and never the declaration's own source,
+//! which is a range of that file text.
 
 use data_encoding::HEXLOWER;
 use rift_core::constants::{DIGEST_WIRE_CHARS, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX};
@@ -77,21 +82,18 @@ pub enum SearchableField {
     Signature,
     /// Attached documentation, when a provider published it.
     Documentation,
-    /// The declaration's own source text.
-    DeclarationSource,
-    /// A visible text file's content.
+    /// A visible file's text, or one chunk of it.
     FileContent,
 }
 
 impl SearchableField {
     /// Every searchable field, in column order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Name,
         Self::QualifiedName,
         Self::IdentifierTerms,
         Self::Signature,
         Self::Documentation,
-        Self::DeclarationSource,
         Self::FileContent,
     ];
 
@@ -104,7 +106,6 @@ impl SearchableField {
             Self::IdentifierTerms => "identifier_terms",
             Self::Signature => "signature",
             Self::Documentation => "documentation",
-            Self::DeclarationSource => "declaration_source",
             Self::FileContent => "file_content",
         }
     }
@@ -123,7 +124,7 @@ impl SearchableField {
             Self::IdentifierTerms => 4.0,
             Self::Signature => 2.0,
             Self::Documentation => 1.5,
-            Self::DeclarationSource | Self::FileContent => 1.0,
+            Self::FileContent => 1.0,
         }
     }
 
@@ -132,10 +133,10 @@ impl SearchableField {
     ///
     /// A name, a derived term list, a signature, and a doc comment have a
     /// ceiling no source reasonably reaches, and a value past it is a defect
-    /// in whatever produced it. The two content fields have none here: the
-    /// store the document is published into carries the operator's own byte
-    /// bound, and restating it as a second ceiling would mean neither could
-    /// ever trip.
+    /// in whatever produced it. The content field has none here: the store
+    /// the document is published into carries the operator's own byte bound,
+    /// and restating it as a second ceiling would mean neither could ever
+    /// trip.
     #[must_use]
     pub const fn bytes_max(self) -> Option<usize> {
         match self {
@@ -143,7 +144,7 @@ impl SearchableField {
             Self::IdentifierTerms => Some(IDENTIFIER_TERMS_BYTES_MAX),
             Self::Signature => Some(SIGNATURE_BYTES_MAX),
             Self::Documentation => Some(DOCUMENTATION_BYTES_MAX),
-            Self::DeclarationSource | Self::FileContent => None,
+            Self::FileContent => None,
         }
     }
 
@@ -157,8 +158,7 @@ impl SearchableField {
             Self::IdentifierTerms => 3,
             Self::Signature => 4,
             Self::Documentation => 5,
-            Self::DeclarationSource => 6,
-            Self::FileContent => 7,
+            Self::FileContent => 6,
         }
     }
 }
@@ -259,15 +259,16 @@ impl DocumentKind {
         }
     }
 
-    /// The one field a document of this kind carries content in.
+    /// The one field a document carries content in, whatever its kind.
     ///
     /// Only this field can reach a megabyte, so it is the one an operator's byte bound
-    /// applies to and the one a reader excerpts from.
+    /// applies to and the one a reader excerpts from. A symbol document leaves it empty:
+    /// its declaration's source is a range of its file's text, which the file document
+    /// carries once.
     #[must_use]
     pub const fn content_field(self) -> SearchableField {
         match self {
-            Self::Symbol => SearchableField::DeclarationSource,
-            Self::TextFile => SearchableField::FileContent,
+            Self::Symbol | Self::TextFile => SearchableField::FileContent,
         }
     }
 
@@ -389,7 +390,6 @@ pub struct DocumentFields {
     identifier_terms: Option<String>,
     signature: Option<String>,
     documentation: Option<String>,
-    declaration_source: Option<String>,
     file_content: Option<String>,
 }
 
@@ -403,7 +403,6 @@ impl DocumentFields {
             identifier_terms: None,
             signature: None,
             documentation: None,
-            declaration_source: None,
             file_content: None,
         }
     }
@@ -419,7 +418,6 @@ impl DocumentFields {
             SearchableField::IdentifierTerms => &mut self.identifier_terms,
             SearchableField::Signature => &mut self.signature,
             SearchableField::Documentation => &mut self.documentation,
-            SearchableField::DeclarationSource => &mut self.declaration_source,
             SearchableField::FileContent => &mut self.file_content,
         };
         *slot = (!value.is_empty()).then_some(value);
@@ -444,7 +442,6 @@ impl DocumentFields {
             SearchableField::IdentifierTerms => &self.identifier_terms,
             SearchableField::Signature => &self.signature,
             SearchableField::Documentation => &self.documentation,
-            SearchableField::DeclarationSource => &self.declaration_source,
             SearchableField::FileContent => &self.file_content,
         };
         slot.as_deref()
@@ -490,6 +487,7 @@ pub struct IndexDocument {
     package: Option<PackageIdentity>,
     digest: String,
     fields: DocumentFields,
+    byte_offset: Option<u64>,
 }
 
 impl IndexDocument {
@@ -526,7 +524,23 @@ impl IndexDocument {
             package: None,
             digest: digest.into(),
             fields,
+            byte_offset: None,
         })
+    }
+
+    /// Records where the document's content starts in its file, so a position inside
+    /// one chunk of a large file maps back to the file without chunking it again.
+    #[must_use]
+    pub const fn at_byte_offset(mut self, byte_offset: u64) -> Self {
+        self.byte_offset = Some(byte_offset);
+        self
+    }
+
+    /// Where the document's content starts in its file; `None` for a document that
+    /// carries no file text.
+    #[must_use]
+    pub const fn byte_offset(&self) -> Option<u64> {
+        self.byte_offset
     }
 
     /// Records the language the document's bytes are written in.
@@ -741,7 +755,7 @@ mod tests {
             .into_iter()
             .map(SearchableField::column_position)
             .collect();
-        assert_eq!(positions, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(positions, [1, 2, 3, 4, 5, 6]);
     }
 
     /// Whether two weights agree within the last bits a literal can carry.
@@ -757,7 +771,6 @@ mod tests {
             (SearchableField::IdentifierTerms, 4.0),
             (SearchableField::Signature, 2.0),
             (SearchableField::Documentation, 1.5),
-            (SearchableField::DeclarationSource, 1.0),
             (SearchableField::FileContent, 1.0),
         ];
         for (field, expected) in declared {
@@ -878,7 +891,18 @@ mod tests {
              neither able to trip"
         );
         assert_eq!(SearchableField::FileContent.bytes_max(), None);
-        assert_eq!(SearchableField::DeclarationSource.bytes_max(), None);
+    }
+
+    #[test]
+    fn test_every_kind_carries_content_in_the_file_field_alone() {
+        for kind in [DocumentKind::Symbol, DocumentKind::TextFile] {
+            assert_eq!(kind.content_field(), SearchableField::FileContent);
+        }
+        let symbol = document(DocumentFields::empty().with(SearchableField::Name, "beacon"))
+            .expect("document must be accepted");
+        assert_eq!(symbol.content(), "", "a symbol document stores no source");
+        assert_eq!(symbol.byte_offset(), None);
+        assert_eq!(symbol.at_byte_offset(4_096).byte_offset(), Some(4_096));
     }
 
     #[test]

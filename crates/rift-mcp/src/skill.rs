@@ -93,6 +93,11 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: None,
     },
     DecisionRow {
+        situation: "Every match of a regex in the project's text is needed.",
+        tools: &["search"],
+        note: Some("with `pattern`"),
+    },
+    DecisionRow {
         situation: "The declaration name is known.",
         tools: &["get_symbol"],
         note: None,
@@ -453,6 +458,20 @@ mod tests {
                 rendered.contains(
                     "| The declarations two committed revisions hold differently are needed. | \
                      `search` (with a `change` block) |"
+                ),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_table_routes_a_regex_to_search_with_pattern() {
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            assert!(
+                rendered.contains(
+                    "| Every match of a regex in the project's text is needed. | `search` (with \
+                     `pattern`) |"
                 ),
                 "{rendered}"
             );

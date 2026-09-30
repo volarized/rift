@@ -523,6 +523,9 @@ fn map_references(
         .collect())
 }
 
+/// The declaration whose complete span, attached documentation included, holds one engine
+/// reference location: the caller an incoming hop names. `None` for a location outside the
+/// served tree or outside every declaration of its file.
 fn reference_caller(
     reads: &ReadService,
     root: &TreeRoot,
@@ -559,16 +562,7 @@ fn reference_caller(
         ));
     }
     Ok(file
-        .syntax()
-        .symbols()
-        .iter()
-        .filter(|symbol| symbol.item_range.start <= start && end <= symbol.item_range.end)
-        .min_by_key(|symbol| {
-            (
-                symbol.item_range.end - symbol.item_range.start,
-                symbol.item_range.start,
-            )
-        })
+        .enclosing_symbol(start, end)
         .map(|symbol| symbol_id(file, symbol)))
 }
 

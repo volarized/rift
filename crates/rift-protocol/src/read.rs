@@ -62,10 +62,10 @@ pub(crate) const LANGUAGE_IDENTITY_BYTES_MAX: usize = LANGUAGE_WORD_BYTES_MAX * 
 pub use crate::search::{
     CHANGE_BASE_FIELD, CHANGE_HEAD_FIELD, GraphHop, HopDirection, MatchedField, PathPattern,
     PathPatternViolation, PathSelector, ResultOrder, SEARCH_CHANGE_HEAD_DEFAULT,
-    SEARCH_CHANGE_PATHS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchChange, SearchHit,
-    SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget, SearchResult,
-    SearchTraversal, SymbolChange, TraversalDirection,
+    SEARCH_CHANGE_PATHS_MAX, SEARCH_PATTERN_CHARS_MAX, SEARCH_TRAVERSAL_DEPTH_DEFAULT,
+    SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX,
+    SearchChange, SearchHit, SearchHitTarget, SearchInclude, SearchParams, SearchParamsTarget,
+    SearchResult, SearchTraversal, SymbolChange, TraversalDirection,
 };
 // Diagnostic-family models (`Diagnostic`, its context, and their neighbors) live in
 // `diagnostic` so this module stays below its size bound; re-exporting them here keeps every
@@ -1006,6 +1006,33 @@ pub enum ReadWarning {
         /// read ranks and the hits it returns.
         results_max: u64,
     },
+    /// A file held more matches of `pattern` than `matches_per_file`, so its later matches
+    /// are missing from this answer while every other file answers in full. `files` names
+    /// the cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow
+    /// `pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.
+    PatternMatchesTruncated {
+        /// Matches one file contributes at most: the server's bound on one file's matches.
+        matches_per_file: u64,
+        /// The files cut at the bound.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
+    },
+    /// The trigram index `pattern` selects its files through lacks rows of stored file
+    /// text, and verifying those rows beside the selected ones would pass the `[search]`
+    /// key `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the
+    /// rows the index holds and a match in the other rows is missing from it. The server
+    /// indexes those rows in the background after each write; `prepared` and `total` state
+    /// how far it has got. Resend the request once the index has caught up.
+    PatternIndexPreparing {
+        /// Rows of stored file text the trigram index holds: one per file, or one per
+        /// chunk of a file split under `[search.text]`.
+        prepared: u64,
+        /// Rows of stored file text the store holds.
+        total: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// A claimed file is left out of the index - its bytes are not valid UTF-8, or it
     /// crosses a per-file bound - so it answers no search or lookup, and addressing it
     /// directly still refuses `content_unavailable`. Every other file in the workspace
@@ -1017,6 +1044,43 @@ pub enum ReadWarning {
         /// the files past `SOURCE_WARNINGS_MAX`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unit: Option<FileId>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// Text files past `[search.text] max_chunk` are left out of the text index under the
+    /// key `large_files = "skip"`, so no hit answers from their text; `skipped` counts the
+    /// ones the request's `paths` reach. A declaration such a file holds still answers.
+    /// Setting `large_files` to `split` indexes them in chunks.
+    LargeFileSkipped {
+        /// The files past `max_chunk` the request's `paths` reach.
+        skipped: u64,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// Files past `[providers.syntax] max_file` are held as text the syntax provider does
+    /// not parse: their text answers `search`, and none of their declarations were
+    /// extracted, so no symbol hit and no `get_symbol` answer comes from them. `files`
+    /// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising
+    /// `max_file` parses them.
+    LargeFileUnparsed {
+        /// The files held as text alone.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
+        /// Why the warning was raised - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
+    /// A lockfile the request's `paths.include` selects is left out of search, so no hit
+    /// answers from it; `rift://map` still carries the versions it pins. Naming the file
+    /// in `paths.force_include` searches it for one request, and removing its name from
+    /// the `[search.text]` key `excluded_lockfiles` indexes it. One warning names every
+    /// such file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.
+    LockfileExcluded {
+        /// The selected lockfiles search leaves out.
+        #[schemars(length(max = 8))]
+        files: Vec<FileId>,
         /// Why the warning was raised - prose for a reader; nothing keys on it.
         #[schemars(length(max = 4096))]
         detail: String,
@@ -1973,7 +2037,8 @@ mod tests {
         Digest, Duration, FileId, GetSymbolParams, GlobalFailureClass, GlobalPageWarningCode,
         IDENTITY_PATH_CHARACTER, LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT,
         PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet,
-        RevisionId, RevisionIdViolation, SearchScope, SourceUnitId, Symbol, SymbolId,
+        RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol,
+        SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2358,6 +2423,17 @@ mod tests {
                 }),
             ),
             (
+                ReadWarning::LockfileExcluded {
+                    files: vec![FileId("rift://file/Cargo.lock".to_owned())],
+                    detail: "Cargo.lock is left out of search".to_owned(),
+                },
+                json!({
+                    "code": "lockfile_excluded",
+                    "files": ["rift://file/Cargo.lock"],
+                    "detail": "Cargo.lock is left out of search",
+                }),
+            ),
+            (
                 ReadWarning::SymbolDisagreement {
                     symbol: SymbolId("rift://symbol/rust/src/lib.rs/Beacon".to_owned()),
                     providers: vec!["history".to_owned(), "syntax".to_owned()],
@@ -2560,6 +2636,83 @@ mod tests {
     }
 
     #[test]
+    fn the_pattern_matches_truncation_warning_round_trips_and_bounds_its_files() {
+        let warning = ReadWarning::PatternMatchesTruncated {
+            matches_per_file: 1_000,
+            files: vec![FileId("rift://file/src%2Fmany.rs".to_owned())],
+        };
+        let wire = json!({
+            "code": "pattern_matches_truncated",
+            "matches_per_file": 1_000,
+            "files": ["rift://file/src%2Fmany.rs"],
+        });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let arm = schema["oneOf"]
+            .as_array()
+            .and_then(|arms| {
+                arms.iter().find(|arm| {
+                    arm["properties"]["code"]["const"] == json!("pattern_matches_truncated")
+                })
+            })
+            .expect("the schema advertises the match-bound warning");
+        assert_eq!(
+            arm["properties"]["files"]["maxItems"],
+            json!(SOURCE_WARNINGS_MAX),
+            "the advertised bound is the one the server cuts at"
+        );
+    }
+
+    #[test]
+    fn the_pattern_index_preparation_warning_round_trips_under_its_code_tag() {
+        let warning = ReadWarning::PatternIndexPreparing {
+            prepared: 12_000,
+            total: 17_500,
+            detail: "12000 of 17500 rows of file text are in the trigram index".to_owned(),
+        };
+        let wire = json!({
+            "code": "pattern_index_preparing",
+            "prepared": 12_000,
+            "total": 17_500,
+            "detail": "12000 of 17500 rows of file text are in the trigram index",
+        });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
+    fn the_large_file_warnings_round_trip_under_their_code_tags() {
+        let cases = [
+            (
+                ReadWarning::LargeFileSkipped {
+                    skipped: 2,
+                    detail: "2 selected files are past max_chunk".to_owned(),
+                },
+                json!({
+                    "code": "large_file_skipped",
+                    "skipped": 2,
+                    "detail": "2 selected files are past max_chunk",
+                }),
+            ),
+            (
+                ReadWarning::LargeFileUnparsed {
+                    files: vec![FileId("rift://file/big.js".to_owned())],
+                    detail: "big.js is past max_file".to_owned(),
+                },
+                json!({
+                    "code": "large_file_unparsed",
+                    "files": ["rift://file/big.js"],
+                    "detail": "big.js is past max_file",
+                }),
+            ),
+        ];
+        assert_round_trips(cases);
+    }
+
+    #[test]
     fn the_results_truncation_warning_round_trips_under_its_code_tag() {
         let warning = ReadWarning::ResultsTruncated { results_max: 1_000 };
         let wire = json!({ "code": "results_truncated", "results_max": 1_000 });
@@ -2584,7 +2737,11 @@ mod tests {
             "query_narrowed",
             "lexical_ranking_truncated",
             "results_truncated",
+            "pattern_matches_truncated",
+            "pattern_index_preparing",
             "source_unavailable",
+            "large_file_skipped",
+            "large_file_unparsed",
             "symbol_disagreement",
             "global_access_disabled",
             "global_api_unavailable",

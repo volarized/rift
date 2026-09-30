@@ -971,12 +971,14 @@ pub fn declare_server_ranges(schema: &mut Schema) {
 }
 
 /// A [`SearchConfiguration`](crate::configuration::SearchConfiguration) states its
-/// `Duration` ceiling as `rift:range` on the key: schema validation alone cannot compare
-/// `"1s"` against a ceiling, so the server enforces the bound at load and the schema carries
-/// it for readers.
+/// `Duration` and `ByteSize` bounds as `rift:range` on each key: schema validation alone
+/// cannot compare `"1s"` or `"1mb"` against a ceiling, so the server enforces the bounds at
+/// load and the schema carries them for readers.
 pub fn declare_search_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        Duration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_BUSY_TIMEOUT_MS_MIN, SearchConfiguration,
+        ByteSize, Duration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_BUSY_TIMEOUT_MS_MIN,
+        SEARCH_PATTERN_COMPILED_BYTES_MAX, SEARCH_PATTERN_COMPILED_BYTES_MIN,
+        SEARCH_PATTERN_VERIFIED_BYTES_MAX, SEARCH_PATTERN_VERIFIED_BYTES_MIN, SearchConfiguration,
     };
     annotate_property(
         schema,
@@ -985,6 +987,24 @@ pub fn declare_search_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MIN),
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(SearchConfiguration, pattern_compiled_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MIN),
+            &ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(SearchConfiguration, pattern_verified_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MIN),
+            &ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_MAX),
         ),
     );
 }
@@ -1042,6 +1062,35 @@ pub fn declare_text_ranges(schema: &mut Schema) {
         range(
             &ByteSize::from_bytes(TEXT_CHUNK_BYTES_MIN),
             &ByteSize::from_bytes(TEXT_CHUNK_BYTES_MAX),
+        ),
+    );
+}
+
+/// A [`LexicalSearchConfiguration`](crate::configuration::LexicalSearchConfiguration)
+/// states each `ByteSize` bound as `rift:range` on its key: schema validation alone cannot
+/// compare `"1gb"` against a ceiling, so the server enforces the bounds at load and the
+/// schema carries them for readers.
+pub fn declare_lexical_ranges(schema: &mut Schema) {
+    use crate::configuration::{
+        ByteSize, LEXICAL_MMAP_BYTES_MAX, LEXICAL_TRANSACTION_BYTES_MAX,
+        LEXICAL_TRANSACTION_BYTES_MIN, LexicalSearchConfiguration,
+    };
+    annotate_property(
+        schema,
+        property!(LexicalSearchConfiguration, transaction_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MIN),
+            &ByteSize::from_bytes(LEXICAL_TRANSACTION_BYTES_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(LexicalSearchConfiguration, mmap_size),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(0),
+            &ByteSize::from_bytes(LEXICAL_MMAP_BYTES_MAX),
         ),
     );
 }
@@ -1261,16 +1310,17 @@ pub fn error_limit_rides_limit_exceeded(schema: &mut Schema) {
 }
 
 /// A [`SearchParams`](crate::search::SearchParams) selects its result set with `query`,
-/// `traversal`, or `change`. The server refuses a request naming none of the three, so the
-/// schema states the same rule for a validating caller.
+/// `pattern`, `traversal`, or `change`. The server refuses a request naming none of the
+/// four, so the schema states the same rule for a validating caller.
 pub fn require_search_selector(schema: &mut Schema) {
     use crate::search::SearchParams;
     append(
         schema,
         described(
-            "a search selects its result set with query, traversal, or change",
+            "a search selects its result set with query, pattern, traversal, or change",
             any_of(vec![
                 requires(&[property!(SearchParams, query)]),
+                requires(&[property!(SearchParams, pattern)]),
                 requires(&[property!(SearchParams, traversal)]),
                 requires(&[property!(SearchParams, change)]),
             ]),

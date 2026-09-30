@@ -193,6 +193,10 @@ unset, it keeps Rift's own crates at `info`. Stop the collector with Ctrl-C once
 and it prints one JSON line per operation: the span count, total duration, p50, p95, and max, in
 milliseconds.
 
+The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
+errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at
+shutdown, and each failed export.
+
 ## Developer tooling
 
 The `rift-dev` Python package lives in `dev/`. `uv` installs its locked dependencies, Typer
