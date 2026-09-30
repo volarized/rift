@@ -3037,6 +3037,11 @@ done
             "{:?}",
             owed.paths.len()
         );
+        owed.record(&first);
+        assert!(
+            owed.overflowed && owed.paths.is_empty(),
+            "a spent bound records nothing more"
+        );
     }
 
     #[test]
