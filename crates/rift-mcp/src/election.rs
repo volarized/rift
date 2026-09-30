@@ -1022,7 +1022,9 @@ mod tests {
         Ok(())
     }
 
+    // Windows timeout: https://github.com/volarized/rift/issues/388
     #[test]
+    #[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/388")]
     fn concurrent_readers_never_observe_a_partial_document() -> TestResult {
         let directory = tempfile::tempdir()?;
         let guard = claim(directory.path())?;
