@@ -612,6 +612,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_source_line_or_member_of_another_kind_refuses_the_notebook() {
+        // tree-sitter-json reads a comment as a named node beside the values, and nbformat
+        // JSON carries none, so a comment refuses the notebook as a stray value does.
+        let cases = [
+            (r#"{"cells":[7],"metadata":{}}"#, "notebook.cell"),
+            (
+                r#"{"cells":[{"cell_type":"code","source":["a", 7]}],"metadata":{}}"#,
+                "notebook.source",
+            ),
+            (
+                r#"{/* a note */ "cells":[],"metadata":{}}"#,
+                "notebook.object",
+            ),
+        ];
+        for (source, field) in cases {
+            let error = decode_notebook(source, &notebook_identity())
+                .expect_err("a value of another kind refuses the notebook");
+            assert_eq!(error.fault().field(), field, "{source}");
+        }
+    }
+
+    #[test]
     fn duplicate_top_level_field_and_excessive_depth_are_refused() {
         let duplicate = r#"{"cells":[],"cells":[],"metadata":{}}"#;
         let duplicate_error =
