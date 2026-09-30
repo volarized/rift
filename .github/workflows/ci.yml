@@ -230,7 +230,7 @@ jobs:
 
       - name: Archive unit tests
         run: just fast-archive
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: fast-build
           path: |
@@ -289,7 +289,7 @@ jobs:
           NEXTEST_PROFILE: ci
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
-        uses: actions/upload-artifact@v6.0.0
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: fast-results
           path: |
@@ -374,7 +374,7 @@ jobs:
         id: live
         timeout-minutes: 15
         run: just live-test target/fast.tar.zst
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           name: live-results
@@ -427,7 +427,7 @@ jobs:
         id: live
         timeout-minutes: 15
         run: just live-test target/native-live.tar.zst
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ !cancelled() && steps.live.outcome != 'skipped' }}
         with:
           name: live-results-macos
@@ -556,7 +556,7 @@ jobs:
           --workspace --all-targets --all-features
           --archive-file target/native-live.tar.zst
           -E 'not binary(/^corpus_/)'
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ matrix.live }}
         with:
           name: native-live
@@ -578,7 +578,7 @@ jobs:
           cargo nextest run --locked
           --workspace --all-targets --all-features --profile ${{ matrix.profile || 'ci' }} --no-tests fail
           -E 'not test(/_probe$/)'
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: native-tests-${{ matrix.target }}
@@ -643,7 +643,7 @@ jobs:
         if: steps.integration-archive-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
         run: just integration-archive
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: integration-archive
           path: target/integration.tar.zst
@@ -698,7 +698,7 @@ jobs:
         if: steps.integration-cli-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
         run: just integration-cli
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: integration-cli
           path: target/integration-cli.tar.zst
@@ -797,7 +797,7 @@ jobs:
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           report_type: test_results
           token: ${{ secrets.CODECOV_TOKEN }}
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
@@ -853,7 +853,7 @@ jobs:
           just conformance --binary target/integration-cli/rift
       - name: Validate cold first use
         run: just coldstart-test --binary target/integration-cli/rift --junit target/integration/coldstart.xml
-      - uses: actions/upload-artifact@v6.0.0
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: artifact-results
