@@ -89,7 +89,7 @@ rig-core = { version = "=0.42.0", default-features = false }
 # The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
-rmcp = { version = "=3.4.0", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.4.1", default-features = false, features = ["macros", "server", "transport-io"] }
 same-file = "1.0.6"
 schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
