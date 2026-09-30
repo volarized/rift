@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::{FillBounds, HistoryLane, OpenedStore, store_revision};
 use crate::http::IdleTracker;
 use crate::validation::ConfigurationState;
+use crate::validation::tests::{BUILD_A, BUILD_B};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -41,9 +42,9 @@ fn head_of(root: &Path) -> TestResult<String> {
 }
 
 /// The store a lane over `root` opens, for a test that reads it directly.
-fn lane_store(root: &Path, digest: &str) -> TestResult<HistoryStore> {
+fn lane_store(root: &Path, product_version: &str) -> TestResult<HistoryStore> {
     let configuration = ConfigurationState::accept(root);
-    let revision = store_revision(digest, &configuration);
+    let revision = store_revision(product_version, &configuration);
     Ok(HistoryStore::open(&StoreLocation::new(
         &root.join(".git"),
         &revision,
@@ -51,8 +52,8 @@ fn lane_store(root: &Path, digest: &str) -> TestResult<HistoryStore> {
 }
 
 /// Waits until the store at `root` holds `commit`, at most [`FILL_WAIT_MAX`].
-async fn wait_until_held(root: &Path, digest: &str, commit: &str) -> TestResult {
-    let store = lane_store(root, digest)?;
+async fn wait_until_held(root: &Path, product_version: &str, commit: &str) -> TestResult {
+    let store = lane_store(root, product_version)?;
     let reader = store.reader();
     let deadline = tokio::time::Instant::now() + FILL_WAIT_MAX;
     loop {
@@ -68,7 +69,7 @@ async fn wait_until_held(root: &Path, digest: &str, commit: &str) -> TestResult 
 
 async fn start(
     root: &Path,
-    digest: &str,
+    product_version: &str,
     activity: Arc<IdleTracker>,
     cancellation: &CancellationToken,
 ) -> TestResult<HistoryLane> {
@@ -76,7 +77,7 @@ async fn start(
     HistoryLane::start(
         root,
         &configuration,
-        digest,
+        product_version,
         (activity, cancellation.clone(), None),
     )
     .await
@@ -127,11 +128,11 @@ fn two_builds_and_two_strategies_key_two_store_files() -> TestResult {
     let everything = ConfigurationState::accept(everything.path());
     let selective = ConfigurationState::accept(selective.path());
 
-    let build_a = store_revision("executable-a", &everything);
+    let build_a = store_revision(BUILD_A, &everything);
 
-    assert_eq!(build_a, store_revision("executable-a", &everything));
-    assert_ne!(build_a, store_revision("executable-b", &everything));
-    assert_ne!(build_a, store_revision("executable-a", &selective));
+    assert_eq!(build_a, store_revision(BUILD_A, &everything));
+    assert_ne!(build_a, store_revision(BUILD_B, &everything));
+    assert_ne!(build_a, store_revision(BUILD_A, &selective));
     Ok(())
 }
 
@@ -142,22 +143,10 @@ async fn a_lane_fills_the_store_in_the_background_and_each_build_its_own_file() 
     let head = head_of(root)?;
     let cancellation = CancellationToken::new();
 
-    let _first = start(
-        root,
-        "executable-a",
-        Arc::new(IdleTracker::new()),
-        &cancellation,
-    )
-    .await?;
-    let _second = start(
-        root,
-        "executable-b",
-        Arc::new(IdleTracker::new()),
-        &cancellation,
-    )
-    .await?;
-    wait_until_held(root, "executable-a", &head).await?;
-    wait_until_held(root, "executable-b", &head).await?;
+    let _first = start(root, BUILD_A, Arc::new(IdleTracker::new()), &cancellation).await?;
+    let _second = start(root, BUILD_B, Arc::new(IdleTracker::new()), &cancellation).await?;
+    wait_until_held(root, BUILD_A, &head).await?;
+    wait_until_held(root, BUILD_B, &head).await?;
 
     let files: Vec<String> = fs::read_dir(root.join(".git/rift"))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
@@ -199,16 +188,10 @@ async fn a_selective_lane_fills_the_releases_it_selects() -> TestResult {
     let head = head_of(root)?;
     let cancellation = CancellationToken::new();
 
-    let _lane = start(
-        root,
-        "executable-a",
-        Arc::new(IdleTracker::new()),
-        &cancellation,
-    )
-    .await?;
-    wait_until_held(root, "executable-a", &head).await?;
+    let _lane = start(root, BUILD_A, Arc::new(IdleTracker::new()), &cancellation).await?;
+    wait_until_held(root, BUILD_A, &head).await?;
 
-    let reads = lane_store(root, "executable-a")?.reader().connect()?;
+    let reads = lane_store(root, BUILD_A)?.reader().connect()?;
     let newest = reads.commit(&head)?.ok_or("the newest release is held")?;
     let oldest = newest.base.clone().ok_or("the newest release has a base")?;
     let oldest = reads.commit(&oldest)?.ok_or("the oldest release is held")?;
@@ -229,8 +212,8 @@ async fn the_fill_runs_a_batch_after_its_bounded_wait_while_requests_overlap() -
     let busy = activity.begin();
     let cancellation = CancellationToken::new();
 
-    let _lane = start(root, "executable-a", Arc::clone(&activity), &cancellation).await?;
-    wait_until_held(root, "executable-a", &head).await?;
+    let _lane = start(root, BUILD_A, Arc::clone(&activity), &cancellation).await?;
+    wait_until_held(root, BUILD_A, &head).await?;
 
     drop(busy);
     cancellation.cancel();
@@ -249,8 +232,8 @@ async fn a_batch_records_its_start_with_the_pending_commits_of_the_plan() -> Tes
     let cancellation = CancellationToken::new();
     let activity = Arc::new(IdleTracker::new());
 
-    let _lane = start(root, "executable-a", activity, &cancellation).await?;
-    wait_until_held(root, "executable-a", &head).await?;
+    let _lane = start(root, BUILD_A, activity, &cancellation).await?;
+    wait_until_held(root, BUILD_A, &head).await?;
     cancellation.cancel();
 
     let mut starts = Vec::new();
@@ -305,7 +288,7 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_on
     let (sink, mut drain) = crate::logs::log_capture();
     let subscriber = tracing_subscriber::registry().with(sink);
     let opened = tracing::subscriber::with_default(subscriber, || {
-        OpenedStore::open(root, &configuration, &history, "executable-a")()
+        OpenedStore::open(root, &configuration, &history, BUILD_A)()
     });
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o755))?;
 
@@ -330,7 +313,7 @@ async fn a_disabled_history_provider_opens_no_store() -> TestResult {
     let lane = HistoryLane::start(
         directory.path(),
         &configuration,
-        "executable-a",
+        BUILD_A,
         (Arc::new(IdleTracker::new()), CancellationToken::new(), None),
     )
     .await;
@@ -349,7 +332,7 @@ async fn an_unversioned_workspace_opens_no_store() -> TestResult {
     let lane = HistoryLane::start(
         directory.path(),
         &configuration,
-        "executable-a",
+        BUILD_A,
         (Arc::new(IdleTracker::new()), CancellationToken::new(), None),
     )
     .await;

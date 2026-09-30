@@ -1622,6 +1622,24 @@ mod tests {
         assert_eq!(candidates, super::GlobalSearchCandidates::default());
     }
 
+    /// A search carrying no `pattern` has no package matches to ask for, so it answers none
+    /// without a request: the disabled client would refuse one.
+    #[tokio::test]
+    async fn a_search_without_a_pattern_returns_no_package_matches_with_a_disabled_client() {
+        let client = rift_cloud_client::GlobalClient::new(rift_cloud_client::Config {
+            enabled: false,
+            token_env: String::new(),
+            ..rift_cloud_client::Config::default()
+        })
+        .expect("disabled client");
+        let params = serde_json::from_value(serde_json::json!({"query": "compass"}))
+            .expect("query search request");
+        let matches = super::package_patterns(&client, &params, &[])
+            .await
+            .expect("a search without a pattern does not call the remote client");
+        assert_eq!(matches, super::GlobalPatternMatches::default());
+    }
+
     /// One documentation search hit per block a two-paragraph `guide.txt` holds, in block
     /// order.
     fn documentation_hits() -> Vec<SearchHit> {
@@ -1947,6 +1965,62 @@ mod tests {
         );
         assert!(route.client.is_none());
         assert!(route.remote_packages.is_empty());
+    }
+
+    /// Each page warning reaches the caller as a `global_page_warning` naming its code. A
+    /// code the page contract does not define, `requirement_unsatisfied` among them, is
+    /// `unknown`, and a warning repeated across pages lands once.
+    #[test]
+    fn page_warnings_name_each_code_once() {
+        use rift_cloud_client::{Warning, WarningCode};
+        use rift_protocol::read::{GlobalPageWarningCode, ReadWarning};
+
+        let codes = [
+            (
+                WarningCode::QueryNarrowed,
+                GlobalPageWarningCode::QueryNarrowed,
+            ),
+            (
+                WarningCode::SourceTruncated,
+                GlobalPageWarningCode::SourceTruncated,
+            ),
+            (
+                WarningCode::PublicationChanged,
+                GlobalPageWarningCode::PublicationChanged,
+            ),
+            (
+                WarningCode::CapabilityUnavailable,
+                GlobalPageWarningCode::CapabilityUnavailable,
+            ),
+            (
+                WarningCode::ResultTruncated,
+                GlobalPageWarningCode::ResultTruncated,
+            ),
+            (
+                WarningCode::RequirementUnsatisfied,
+                GlobalPageWarningCode::Unknown,
+            ),
+            (WarningCode::Unknown, GlobalPageWarningCode::Unknown),
+        ];
+        let received: Vec<Warning> = codes
+            .iter()
+            .map(|(code, _)| Warning {
+                code: code.clone(),
+                detail: Some(code.to_string()),
+                ..Warning::default()
+            })
+            .collect();
+        let mut repeated = received.clone();
+        repeated.extend(received);
+
+        let expected: Vec<ReadWarning> = codes
+            .into_iter()
+            .map(|(code, warning_code)| ReadWarning::GlobalPageWarning {
+                warning_code,
+                detail: Some(code.to_string()),
+            })
+            .collect();
+        assert_eq!(super::page_warnings(repeated), expected);
     }
 
     #[test]
