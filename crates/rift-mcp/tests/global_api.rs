@@ -99,6 +99,8 @@ pub(crate) struct FixtureOptions {
     /// The features the capabilities leave out of `supported_features`. Without both
     /// documentation features they carry no `documentation_revision` either.
     pub(crate) withheld_features: &'static [&'static str],
+    /// The status of the problem the resolution endpoint answers in place of a resolution.
+    pub(crate) resolution_problem: Option<StatusCode>,
 }
 
 impl Default for FixtureOptions {
@@ -110,6 +112,7 @@ impl Default for FixtureOptions {
             dependency_entries_max: DEPENDENCY_ENTRIES_ADVERTISED,
             stopped_at_body_bound: false,
             withheld_features: &[],
+            resolution_problem: None,
         }
     }
 }
@@ -223,6 +226,9 @@ async fn global_handler(
     }
     if path.ends_with("/resolutions") {
         state.hold_resolution().await;
+        if let Some(status) = options.resolution_problem {
+            return problem_response(status);
+        }
         return json_response(&resolution(&body));
     }
     if path.ends_with("/search") {
@@ -248,6 +254,22 @@ fn json_response(value: &Value) -> Response {
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         value.to_string(),
+    )
+        .into_response()
+}
+
+/// An RFC 9457 problem answering `status`, as the global API sends one.
+fn problem_response(status: StatusCode) -> Response {
+    let problem = json!({
+        "type": "about:blank",
+        "title": status.canonical_reason().unwrap_or_default(),
+        "status": status.as_u16(),
+        "detail": "the fixture answers this status"
+    });
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
+        problem.to_string(),
     )
         .into_response()
 }
