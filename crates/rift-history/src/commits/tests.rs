@@ -179,6 +179,64 @@ fn tagged_commits_peel_annotated_tags_and_refuse_past_the_bound() {
 }
 
 #[test]
+fn changed_blobs_list_a_blob_that_replaced_a_folder_beside_the_folders_files() {
+    let directory = three_commits();
+    let root = directory.path();
+    fs::remove_dir_all(root.join("sub")).expect("delete the folder");
+    write(root, "sub", "a file where the folder was\n");
+    commit_all(root, "replace the folder");
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let folder = repository.resolve("HEAD~1").expect("the folder's commit");
+
+    let changed = repository
+        .changed_blobs(Some(&folder), &head, &|_| true, 16)
+        .expect("changes");
+
+    let sides: Vec<(&str, bool, bool)> = changed
+        .blobs()
+        .iter()
+        .map(|blob| {
+            (
+                blob.path(),
+                blob.old_blob().is_some(),
+                blob.new_blob().is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(sides, [("sub", false, true), ("sub/moved.rs", true, false)]);
+}
+
+#[test]
+fn changed_blobs_name_a_path_a_malformed_tree_holds_twice_once() {
+    let directory = three_commits();
+    let root = directory.path();
+    crate::fixture::commit_duplicate_path(root, "lib.rs", "refs/heads/duplicated");
+    let repository = Repository::open(root).expect("repository");
+    let head = head_of(&repository);
+    let duplicated = repository
+        .resolve("duplicated")
+        .expect("duplicated resolves");
+
+    let changed = repository
+        .changed_blobs(Some(&head), &duplicated, &|_| true, 16)
+        .expect("changes");
+
+    let paths: Vec<&str> = changed
+        .blobs()
+        .iter()
+        .map(super::ChangedBlob::path)
+        .collect();
+    assert_eq!(paths, ["lib.rs", "sub/moved.rs"]);
+    let lib = &changed.blobs()[0];
+    assert!(lib.old_blob().is_some() && lib.new_blob().is_some());
+    let files = repository
+        .changed_files(&head, &duplicated, &|_| true, 16)
+        .expect("changes");
+    assert_eq!(files.paths(), ["lib.rs", "sub/moved.rs"]);
+}
+
+#[test]
 fn heads_list_every_live_worktree_git_would_not_prune() {
     let directory = three_commits();
     let root = directory.path();

@@ -127,6 +127,32 @@ pub fn commit_missing_subtree(root: &Path, branch: &str) {
     git(root, &["update-ref", branch, &commit]);
 }
 
+/// Commits a tree that names `path` twice, each entry with a blob of its own,
+/// reachable as the ref `branch`.
+///
+/// `git mktree` writes the entries without checking for a repeated name, so
+/// the commit is the shape `git fsck` reports as `duplicateEntries`.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_duplicate_path(root: &Path, path: &str, branch: &str) {
+    let first = plumb(
+        root,
+        &["hash-object", "-w", "--stdin"],
+        b"pub fn first() {}\n",
+    );
+    let second = plumb(
+        root,
+        &["hash-object", "-w", "--stdin"],
+        b"pub fn second() {}\n",
+    );
+    let entries = format!("100644 blob {first}\t{path}\n100644 blob {second}\t{path}\n");
+    let tree = plumb(root, &["mktree"], entries.as_bytes());
+    let commit = plumb(root, &["commit-tree", &tree, "-m", "duplicate path"], b"");
+    git(root, &["update-ref", branch, &commit]);
+}
+
 /// Commits one blob at a raw byte path, reachable as the ref `branch`.
 ///
 /// The tree is built through git plumbing, so the path never touches the

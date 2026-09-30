@@ -748,9 +748,12 @@ impl<'a> ChangedPathRecorder<'a> {
         }
     }
 
-    /// The recorded changes, sorted by path, one per path: a path a tree
-    /// comparison names twice - a deletion beside an addition where a blob
-    /// replaced a folder - keeps both sides' blob ids in one change.
+    /// The recorded changes, sorted by path, one per path. The comparison
+    /// orders a folder's name as if it ended in `/`, so a blob that replaced a
+    /// folder is one path and the folder's files are others; only a tree that
+    /// names one path twice, which `git fsck` reports as `duplicateEntries`,
+    /// records it twice, and its change keeps the first blob id each side
+    /// names.
     pub(crate) fn into_changes(self) -> Vec<RecordedChange> {
         let mut changes = self.changes;
         changes.sort_by(|left, right| left.path.cmp(&right.path));
