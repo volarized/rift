@@ -100,6 +100,14 @@ impl EngineReferences {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_outgoing(outgoing: BTreeMap<CoreSymbolId, Vec<GraphHop>>) -> Self {
+        Self {
+            outgoing,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn resolved(&self, symbol: &SymbolId) -> bool {
         self.incoming
             .keys()
@@ -134,20 +142,15 @@ impl EngineReferences {
         mut named: impl FnMut(&PackageCallee) -> Option<CalleeDeclaration>,
     ) {
         for callee in std::mem::take(&mut self.package_callees) {
-            let declaration = named(&callee).and_then(|declaration| {
-                Some(PackageDeclaration {
+            let answered = named(&callee).and_then(|declaration| {
+                let end = CoreSymbolId::new(declaration.id.0.clone()).ok()?;
+                let held = PackageDeclaration {
                     symbol: callee.symbol(&declaration)?,
                     unit: callee.unit(&declaration.package)?,
-                })
+                };
+                Some((declaration.id, end, held))
             });
-            let Some(declaration) = declaration else {
-                self.dropped_callees = self.dropped_callees.saturating_add(1);
-                continue;
-            };
-            let Some(id) = declaration.symbol.id.clone() else {
-                continue;
-            };
-            let Ok(end) = CoreSymbolId::new(id.0.clone()) else {
+            let Some((id, end, declaration)) = answered else {
                 self.dropped_callees = self.dropped_callees.saturating_add(1);
                 continue;
             };
@@ -1078,7 +1081,6 @@ async fn references_on_engine(
                     .is_ok_and(|locations| locations.len() <= 1),
             )
         },
-        |_report| None,
         deadline,
     )
     .await
@@ -1337,10 +1339,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
         let installed = tempfile::tempdir()?;
-        fs::write(
-            directory.path().join("lib.rs"),
-            "pub fn beacon() {}\n\npub fn larger() { beacon(); }\n",
-        )?;
+        let source = "pub fn beacon() {}\n\npub fn larger() { beacon(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
         let reads = reads(directory.path())?;
         let beacon = location(directory.path(), "lib.rs", 0, 7, 13);
         let stub = Location {
@@ -2279,6 +2279,333 @@ mod tests {
         assert!(!super::reachable_reference_source(
             &store, &seed, &traversal, selected
         ));
+        Ok(())
+    }
+
+    /// A `sh` engine answering each request from its method alone: `initialize` with the
+    /// capabilities `CAPABILITIES` spells, a call hierarchy prepare through the `PREPARE`
+    /// step, outgoing calls through the `OUTGOING` step, `exit` by exiting, and every other
+    /// request, `shutdown` included, with `null`.
+    #[cfg(unix)]
+    const METHOD_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":CAPABILITIES}}" ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      PREPARE ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      OUTGOING ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+    /// The range [`METHOD_ENGINE`] names every item at, `beacon` on line 0.
+    #[cfg(unix)]
+    const METHOD_ENGINE_RANGE: &str =
+        r#"{\"start\":{\"line\":0,\"character\":7},\"end\":{\"line\":0,\"character\":13}}"#;
+
+    /// The capabilities of a [`METHOD_ENGINE`] serving call hierarchy.
+    #[cfg(unix)]
+    const CALL_HIERARCHY: &str = r#"{\"callHierarchyProvider\":true}"#;
+
+    /// The `PREPARE` step of a [`METHOD_ENGINE`] preparing one `beacon` item in the
+    /// requested document.
+    #[cfg(unix)]
+    const PREPARED_BEACON: &str = r#"frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"beacon\",\"kind\":12,\"uri\":\"$uri\",\"range\":RANGE,\"selectionRange\":RANGE}]}""#;
+
+    /// The steps one [`METHOD_ENGINE`] takes: the capabilities it advertises, and how it
+    /// answers a prepare and an outgoing calls request.
+    #[cfg(unix)]
+    struct MethodSteps<'step> {
+        capabilities: &'step str,
+        prepare: &'step str,
+        outgoing: &'step str,
+    }
+
+    /// A pool running [`METHOD_ENGINE`] for Rust over `root` under `steps`, its script
+    /// written below `engine`.
+    #[cfg(unix)]
+    fn method_engine(
+        root: &std::path::Path,
+        engine: &std::path::Path,
+        steps: &MethodSteps<'_>,
+    ) -> Result<EnginePool, Box<dyn std::error::Error>> {
+        let script = engine.join("engine.sh");
+        let text = METHOD_ENGINE
+            .replace("CAPABILITIES", steps.capabilities)
+            .replace("PREPARE", steps.prepare)
+            .replace("OUTGOING", steps.outgoing)
+            .replace("RANGE", METHOD_ENGINE_RANGE);
+        fs::write(&script, text)?;
+        let table = json!({
+            "command": ["sh", script.display().to_string()],
+            "settle_delay": "10ms",
+            "retry": {"attempts": 2, "delay": "1ms", "delay_limit": "1ms"},
+        });
+        let configuration = serde_json::from_value(table)?;
+        Ok(pool(root, "rust", configuration))
+    }
+
+    #[cfg(unix)]
+    fn outgoing_request(seed: &SymbolId) -> SearchParams {
+        serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"outgoing","facets":["calls"]}})).expect("traversal request")
+    }
+
+    /// An outgoing walk skips a declaration it already asked about and one no engine
+    /// serves: a declaration the index does not hold, and one whose engine advertises no
+    /// call hierarchy. None of them draws an edge or a warning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_outgoing_walk_skips_requested_and_unserved_declarations() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = "pub fn beacon() {}\npub fn caller() { beacon(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let engine = tempfile::tempdir()?;
+        let references_only = r#"{\"referencesProvider\":true}"#;
+        let steps = MethodSteps {
+            capabilities: references_only,
+            prepare: ":",
+            outgoing: ":",
+        };
+        let engines = method_engine(directory.path(), engine.path(), &steps)?;
+        let beacon = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        let absent = rift_core::SymbolId::new("rift://symbol/rust/absent.rs/beacon")?;
+        let mut references = EngineReferences::default();
+        let mut requested = std::collections::BTreeSet::from([caller.clone()]);
+        let (deadline, roots) = walk();
+        let walk = super::OutgoingWalk {
+            seed: &caller,
+            deadline,
+            roots,
+        };
+        let pending = vec![caller.clone(), absent.clone(), beacon.clone()];
+        let extended = Box::pin(super::extend_callees(
+            &reads,
+            &engines,
+            &mut references,
+            pending,
+            &mut requested,
+            walk,
+        ))
+        .await;
+        engines.shutdown().await;
+        assert_eq!(extended?, None);
+        assert!(references.is_empty(), "{references:?}");
+        assert!(references.warnings().is_empty(), "{references:?}");
+        assert_eq!(
+            requested,
+            std::collections::BTreeSet::from([absent, beacon, caller])
+        );
+        Ok(())
+    }
+
+    /// One declaration's outgoing calls past the node bound drop the engine's whole
+    /// contribution, with the warning naming the count, before any callee is mapped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outgoing_calls_past_the_node_bound_drop_the_engine_contribution() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let engine = tempfile::tempdir()?;
+        let count = super::TRAVERSAL_NODES_MAX + 1;
+        let range = json!({"start":{"line":0,"character":7},"end":{"line":0,"character":13}});
+        let callee = json!({"name":"beacon","kind":12,"uri":"file:///elsewhere/lib.rs","range":range,"selectionRange":range});
+        let calls = engine.path().join("calls.json");
+        let answer = vec![json!({"to": callee, "fromRanges": []}); count];
+        fs::write(&calls, serde_json::to_string(&answer)?)?;
+        let outgoing = r#"prefix="{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":"
+      size=$(wc -c < 'CALLS')
+      printf 'Content-Length: %d\r\n\r\n%s' "$(( ${#prefix} + $size + 1 ))" "$prefix"
+      cat 'CALLS'
+      printf '}'"#
+            .replace("CALLS", &calls.display().to_string());
+        let steps = MethodSteps {
+            capabilities: CALL_HIERARCHY,
+            prepare: PREPARED_BEACON,
+            outgoing: &outgoing,
+        };
+        let engines = method_engine(directory.path(), engine.path(), &steps)?;
+        let params = outgoing_request(&symbol(&reads, "beacon"));
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
+        engines.shutdown().await;
+        let references = result?;
+        assert!(
+            references.is_empty(),
+            "an answer past the bound adds no edge"
+        );
+        let warning = serde_json::to_value(references.analysis_unavailable())?;
+        assert_eq!(warning["code"], "engine_analysis_unavailable", "{warning}");
+        let expected = format!("outgoing calls {count} exceed");
+        let detail = warning["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(&expected), "{detail}");
+        Ok(())
+    }
+
+    /// An outgoing calls answer outside the method's shape refuses the walk with the
+    /// engine's error. The engine closed its input before it answered, so closing the
+    /// document after the exchange fails too; the close failure is logged, and the
+    /// refusal stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_outgoing_answer_outside_the_method_shape_refuses_the_walk() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let engine = tempfile::tempdir()?;
+        let outgoing = r#"exec 0<&-
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":7}""#;
+        let steps = MethodSteps {
+            capabilities: CALL_HIERARCHY,
+            prepare: PREPARED_BEACON,
+            outgoing,
+        };
+        let engines = method_engine(directory.path(), engine.path(), &steps)?;
+        let params = outgoing_request(&symbol(&reads, "beacon"));
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
+        engines.shutdown().await;
+        let error = result.expect_err("an answer outside the shape refuses the walk");
+        assert!(
+            matches!(error.fault(), crate::ReadFault::Engine(_)),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("callHierarchy/outgoingCalls"),
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A callee URI the address rules refuse, a `file` URI naming a host, refuses the walk
+    /// as the server's own failure rather than dropping the engine's contribution: it says
+    /// nothing about the revision the engine read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_callee_uri_the_rules_refuse_refuses_the_walk() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let engine = tempfile::tempdir()?;
+        let outgoing = r#"frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"beacon\",\"kind\":12,\"uri\":\"file://build-host/ws/lib.rs\",\"range\":RANGE,\"selectionRange\":RANGE},\"fromRanges\":[]}]}""#;
+        let steps = MethodSteps {
+            capabilities: CALL_HIERARCHY,
+            prepare: PREPARED_BEACON,
+            outgoing,
+        };
+        let engines = method_engine(directory.path(), engine.path(), &steps)?;
+        let params = outgoing_request(&symbol(&reads, "beacon"));
+        let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
+        engines.shutdown().await;
+        let error = result.expect_err("a refused callee URI refuses the walk");
+        assert!(
+            matches!(error.fault(), crate::ReadFault::Task { .. }),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A declaration past the seed that the engine prepares no call hierarchy item at keeps
+    /// an empty callee list, where the seed would refuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unprepared_declaration_past_the_seed_keeps_an_empty_callee_list() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source = "pub fn beacon() {}\npub fn caller() { beacon(); }\n";
+        fs::write(directory.path().join("lib.rs"), source)?;
+        let reads = reads(directory.path())?;
+        let engine = tempfile::tempdir()?;
+        let steps = MethodSteps {
+            capabilities: CALL_HIERARCHY,
+            prepare: r#"frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}""#,
+            outgoing: ":",
+        };
+        let engines = method_engine(directory.path(), engine.path(), &steps)?;
+        let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        let beacon = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let mut references = EngineReferences::default();
+        let mut requested = std::collections::BTreeSet::new();
+        let (deadline, roots) = walk();
+        let walk = super::OutgoingWalk {
+            seed: &caller,
+            deadline,
+            roots,
+        };
+        let extended = Box::pin(super::extend_callees(
+            &reads,
+            &engines,
+            &mut references,
+            vec![beacon.clone()],
+            &mut requested,
+            walk,
+        ))
+        .await;
+        engines.shutdown().await;
+        assert_eq!(extended?, None);
+        assert_eq!(references.outgoing.get(&beacon), Some(&Vec::new()));
+        Ok(())
+    }
+
+    /// The outgoing edge bound counts the edges earlier requests of the same walk stored:
+    /// a request whose callees pass what is left drops the engine contribution with a
+    /// warning.
+    #[tokio::test]
+    async fn callee_edge_bound_applies_across_engine_requests() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let source =
+            "def beacon() -> int:\n    return 7\n\ndef caller() -> int:\n    return beacon()\n";
+        fs::write(directory.path().join("main.py"), source)?;
+        let reads = reads(directory.path())?;
+        let caller = rift_core::SymbolId::new(symbol(&reads, "caller").0)?;
+        let prior = rift_core::SymbolId::new(symbol(&reads, "beacon").0)?;
+        let prior_edges = (0..super::TRAVERSAL_NODES_MAX)
+            .map(|index| {
+                let end = SymbolId(format!("rift://symbol/python/prior.py/callee_{index}"));
+                super::call_hop(&SymbolId(prior.as_str().to_owned()), end)
+            })
+            .collect();
+        let mut references = EngineReferences {
+            outgoing: BTreeMap::from([(prior.clone(), prior_edges)]),
+            ..EngineReferences::default()
+        };
+        let table =
+            json!({"embedded":"ty","retry":{"attempts":2,"delay":"1ms","delay_limit":"1ms"}});
+        let configuration = serde_json::from_value(table)?;
+        let engines = pool(directory.path(), "python", configuration);
+        let mut requested = std::collections::BTreeSet::from([prior]);
+        let (deadline, roots) = walk();
+        let walk = super::OutgoingWalk {
+            seed: &caller,
+            deadline,
+            roots,
+        };
+        let extended = Box::pin(super::extend_callees(
+            &reads,
+            &engines,
+            &mut references,
+            vec![caller.clone()],
+            &mut requested,
+            walk,
+        ))
+        .await;
+        engines.shutdown().await;
+        let warning = serde_json::to_value(extended?)?;
+        assert_eq!(warning["code"], "engine_analysis_unavailable", "{warning}");
+        let detail = warning["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("more outgoing calls than the"), "{detail}");
+        assert!(references.outgoing(&caller).is_empty());
         Ok(())
     }
 }

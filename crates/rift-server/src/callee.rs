@@ -237,10 +237,11 @@ fn registry_sources(cargo_home: Option<&Path>) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .collect();
     folders.sort();
-    if folders.len() > REGISTRY_SOURCES_MAX {
+    let listed = folders.len();
+    if listed > REGISTRY_SOURCES_MAX {
         tracing::warn!(
             component = "engine",
-            folders = folders.len(),
+            folders = listed,
             bound = REGISTRY_SOURCES_MAX,
             "Cargo registry source folders past the bound address no callee"
         );
@@ -654,6 +655,64 @@ mod tests {
             folder_roots(&unrooted, &registries, spellings).is_empty(),
             "an import root the path rules refuse roots nothing"
         );
+    }
+
+    /// The roots a workspace's install folders name come in root order, whatever order
+    /// the dependency context holds them in: the context lists `left-pad` before `zod`,
+    /// while `left-pad` sits below `zod`'s own folder.
+    #[test]
+    fn read_roots_keep_the_install_folders_in_root_order() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let manifest = r#"{"name": "probe", "dependencies": {"zod": "^4.0.0"}}"#;
+        let lockfile = r#"{
+  "name": "probe",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "probe", "dependencies": { "zod": "^4.0.0" } },
+    "node_modules/zod": {
+      "version": "4.0.0",
+      "resolved": "https://registry.npmjs.org/zod/-/zod-4.0.0.tgz"
+    },
+    "node_modules/zod/node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+    }
+  }
+}
+"#;
+        std::fs::write(root.join("package.json"), manifest)?;
+        std::fs::write(root.join("package-lock.json"), lockfile)?;
+        let limits = rift_index::WorkspaceIndexLimits::default();
+        let visibility = rift_core::SourceVisibility::default();
+        let inclusion = rift_core::TextFileInclusion::default();
+        let history = rift_protocol::configuration::HistoryConfiguration::default();
+        let reads = crate::ReadService::build(&root, limits, &visibility, &inclusion, history)?;
+        let context: Vec<String> = reads
+            .dependency_context()
+            .install_folders()
+            .map(|folder| folder.package.name.clone())
+            .collect();
+        assert_eq!(context, ["left-pad", "zod"], "the context's package order");
+
+        let engines = EnginePool::new(&root, BTreeMap::new(), BTreeMap::new());
+        let roots = CalleeRoots::read(&reads, &engines);
+        let zod = root.join("node_modules/zod");
+        let left_pad = zod.join("node_modules/left-pad");
+        assert_eq!(
+            spelled(&roots.packages),
+            [
+                (
+                    TreeRoot::new(&zod)?.root_uri()?.as_str().to_owned(),
+                    "npm/zod@4.0.0".to_owned()
+                ),
+                (
+                    TreeRoot::new(&left_pad)?.root_uri()?.as_str().to_owned(),
+                    "npm/left-pad@1.3.0".to_owned()
+                ),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

@@ -2225,766 +2225,696 @@ impl RiftMcp {
                     .await?;
                 ranking = self.ranking(params, &resolved.published, deadline).await?;
             }
-            Err(ReadFault::unavailable(
-                "engine references",
-                "source or configuration kept changing during the bounded reference reads",
-            )
-            .tool_error(wire::ErrorPhase::Read))
         }
+        Err(ReadFault::unavailable(
+            "engine references",
+            "source or configuration kept changing during the bounded reference reads",
+        )
+        .tool_error(wire::ErrorPhase::Read))
+    }
 
-        /// Resolves references against one unchanged current-tree publication.
-        ///
-        /// `None` asks the caller to capture a fresh publication after source or configuration
-        /// movement. A stale publication uses its index and keeps its existing stale warning.
-        ///
-        /// The request-time capture that resolved `resolved` already matched the tree to the
-        /// publication, so the walk starts at once, and one capture after it decides whether
-        /// its answer stands: a tree that moved at any point before that capture and stayed
-        /// moved fails it, as it would have failed a capture before the walk.
-        ///
-        /// A walk, in either direction, stops waiting for engine readiness, and abandons a
-        /// retry still in flight, early enough for that capture to fit before `deadline`
-        /// ([`RequestDeadline::walk_end`]), so a spent wait answers with its warning instead
-        /// of reaching the request's own timeout, which refuses the request. A request
-        /// refused there keeps the engine session while it reads intact, and the next walk
-        /// first closes the document the refused one left open.
-        async fn engine_references(
-            &self,
-            resolved: &ResolvedWorkspace,
-            params: &SearchParams,
-            deadline: RequestDeadline,
-        ) -> Result<Option<EngineReferences>, ErrorData> {
-            if params.traversal.is_none() || resolved.stale.is_some() {
-                return Ok(Some(EngineReferences::default()));
+    /// Resolves references against one unchanged current-tree publication.
+    ///
+    /// `None` asks the caller to capture a fresh publication after source or configuration
+    /// movement. A stale publication uses its index and keeps its existing stale warning.
+    ///
+    /// The request-time capture that resolved `resolved` already matched the tree to the
+    /// publication, so the walk starts at once, and one capture after it decides whether
+    /// its answer stands: a tree that moved at any point before that capture and stayed
+    /// moved fails it, as it would have failed a capture before the walk.
+    ///
+    /// A walk, in either direction, stops waiting for engine readiness, and abandons a
+    /// retry still in flight, early enough for that capture to fit before `deadline`
+    /// ([`RequestDeadline::walk_end`]), so a spent wait answers with its warning instead
+    /// of reaching the request's own timeout, which refuses the request. A request
+    /// refused there keeps the engine session while it reads intact, and the next walk
+    /// first closes the document the refused one left open.
+    async fn engine_references(
+        &self,
+        resolved: &ResolvedWorkspace,
+        params: &SearchParams,
+        deadline: RequestDeadline,
+    ) -> Result<Option<EngineReferences>, ErrorData> {
+        if params.traversal.is_none() || resolved.stale.is_some() {
+            return Ok(Some(EngineReferences::default()));
+        }
+        let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
+        let engines = self.engine_pool_for(&resolved.published).await;
+        if !uses_engine_references(&resolved.published.reads, &engines, params)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
+        {
+            return Ok(Some(EngineReferences::default()));
+        }
+        let roots = self
+            .callee_roots(&resolved.published, &engines, params)
+            .await?;
+        let references = Box::pin(resolve_engine_references(
+            &resolved.published.reads,
+            &engines,
+            params,
+            (walk_deadline, &roots),
+        ))
+        .await
+        .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        if self.engine_tree_matches(&resolved.published).await? {
+            Ok(Some(references))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The installed packages an outgoing walk addresses its callees' files through, read
+    /// on the worker pool; no package for an incoming walk, which maps into the tree alone.
+    async fn callee_roots(
+        &self,
+        published: &PublishedWorkspace,
+        engines: &Arc<EnginePool>,
+        params: &SearchParams,
+    ) -> Result<CalleeRoots, ErrorData> {
+        let outgoing = params
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.direction == TraversalDirection::Outgoing);
+        if !outgoing {
+            return Ok(CalleeRoots::default());
+        }
+        let reads = Arc::clone(&published.reads);
+        let engines = Arc::clone(engines);
+        self.blocking
+            .run("callee package roots", move || {
+                Ok(CalleeRoots::read(&reads, &engines))
+            })
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// Names the declaration of each callee an outgoing walk found in a package file, in
+    /// one global API request per position encoding, and returns the warnings the global
+    /// lane carries.
+    ///
+    /// A callee answered no declaration, one left out of a request past its bounds, and
+    /// every callee when `[global] enabled = false` or the global API did not answer, is
+    /// counted in `callees_dropped`; the last two carry the global warning naming why.
+    async fn name_package_callees(
+        &self,
+        resolved: &ResolvedWorkspace,
+        references: &mut EngineReferences,
+        deadline: RequestDeadline,
+    ) -> Vec<ReadWarning> {
+        if references.package_callees().is_empty() {
+            return Vec::new();
+        }
+        let read_context = ReadContext::snapshot(&resolved.published.reads);
+        let configuration = resolved.published.configuration.global_configuration();
+        let mut route = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.global.route(&configuration, &read_context)),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(_) => self.global.deadline_exceeded(&read_context),
+        };
+        let Some(client) = route.client.clone() else {
+            references.drop_package_callees();
+            return route.service_warnings();
+        };
+        let asked = callee_declarations(
+            &client,
+            references.package_callees(),
+            &route.remote_packages,
+        );
+        match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
+            Ok(Ok(named)) => references.name_package_callees(|callee| named.declaration(callee)),
+            Ok(Err(error)) => {
+                route.discard_remote(&error);
+                references.drop_package_callees();
             }
-            let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
-            let engines = self.engine_pool_for(&resolved.published).await;
-            if !uses_engine_references(&resolved.published.reads, &engines, params)
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?
-            {
-                return Ok(Some(EngineReferences::default()));
+            Err(_) => {
+                route.discard_remote(&rift_cloud_client::ClientError::Deadline);
+                references.drop_package_callees();
             }
-            let roots = self
-                .callee_roots(&resolved.published, &engines, params)
-                .await?;
-            let references = Box::pin(resolve_engine_references(
-                &resolved.published.reads,
-                &engines,
-                params,
-                (walk_deadline, &roots),
-            ))
+        }
+        route.service_warnings()
+    }
+
+    /// Whether the captured source and configuration still match the publication.
+    async fn engine_tree_matches(&self, published: &PublishedWorkspace) -> Result<bool, ErrorData> {
+        let (digests, configuration) = self
+            .capture_tree(published)
             .await
             .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-            if self.engine_tree_matches(&resolved.published).await? {
-                Ok(Some(references))
-            } else {
-                Ok(None)
-            }
-        }
+        Ok(digests.fingerprint() == published.fingerprint
+            && configuration == published.configuration.fingerprint)
+    }
 
-        /// The installed packages an outgoing walk addresses its callees' files through, read
-        /// on the worker pool; no package for an incoming walk, which maps into the tree alone.
-        async fn callee_roots(
-            &self,
-            published: &PublishedWorkspace,
-            engines: &Arc<EnginePool>,
-            params: &SearchParams,
-        ) -> Result<CalleeRoots, ErrorData> {
-            let outgoing = params
-                .traversal
-                .as_ref()
-                .is_some_and(|traversal| traversal.direction == TraversalDirection::Outgoing);
-            if !outgoing {
-                return Ok(CalleeRoots::default());
-            }
-            let reads = Arc::clone(&published.reads);
-            let engines = Arc::clone(engines);
-            self.blocking
-                .run("callee package roots", move || {
-                    Ok(CalleeRoots::read(&reads, &engines))
-                })
-                .await
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    /// Runs the search index for one request against `published` - the exact snapshot the
+    /// caller also runs `ReadService::search` against, never a separately resolved one.
+    ///
+    /// Returns nothing when the store has moved past `published`'s tree to a newer
+    /// publication, which asks the caller to capture the publication the store already
+    /// answers for. Every other outcome ranks: an index that could not be opened, one the
+    /// lexical lane is still committing this tree into once `deadline` passed, and one
+    /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
+    /// search to answer alone. A query-term limit the index refuses surfaces as this
+    /// request's own `limit_exceeded` error, never a silent degrade. A `global` scope
+    /// never consults the index: the ranked lane serves the project alone, so nothing
+    /// about it rides that answer.
+    async fn ranking(
+        &self,
+        params: &SearchParams,
+        published: &PublishedWorkspace,
+        deadline: RequestDeadline,
+    ) -> Result<Option<SearchRanking>, ErrorData> {
+        if params.pattern.is_some() {
+            return self.pattern_ranking(params, published).await.map(Some);
         }
-
-        /// Names the declaration of each callee an outgoing walk found in a package file, in
-        /// one global API request per position encoding, and returns the warnings the global
-        /// lane carries.
-        ///
-        /// A callee answered no declaration, one left out of a request past its bounds, and
-        /// every callee when `[global] enabled = false` or the global API did not answer, is
-        /// counted in `callees_dropped`; the last two carry the global warning naming why.
-        async fn name_package_callees(
-            &self,
-            resolved: &ResolvedWorkspace,
-            references: &mut EngineReferences,
-            deadline: RequestDeadline,
-        ) -> Vec<ReadWarning> {
-            if references.package_callees().is_empty() {
-                return Vec::new();
-            }
-            let read_context = ReadContext::snapshot(&resolved.published.reads);
-            let configuration = resolved.published.configuration.global_configuration();
-            let mut route = match tokio::time::timeout_at(
-                deadline.at(),
-                Box::pin(self.global.route(&configuration, &read_context)),
-            )
-            .await
-            {
-                Ok(route) => route,
-                Err(_) => self.global.deadline_exceeded(&read_context),
-            };
-            let Some(client) = route.client.clone() else {
-                references.drop_package_callees();
-                return route.service_warnings();
-            };
-            let asked = callee_declarations(
-                &client,
-                references.package_callees(),
-                &route.remote_packages,
-            );
-            match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
-                Ok(Ok(named)) => {
-                    references.name_package_callees(|callee| named.declaration(callee))
-                }
-                Ok(Err(error)) => {
-                    route.discard_remote(&error);
-                    references.drop_package_callees();
-                }
-                Err(_) => {
-                    route.discard_remote(&rift_cloud_client::ClientError::Deadline);
-                    references.drop_package_callees();
-                }
-            }
-            route.service_warnings()
+        // A global scope never consults the project store: the project answers no hit,
+        // and the package hits come from the global index.
+        if params.scope == SearchScope::Global {
+            return Ok(Some(SearchRanking::without_store(self.ranking_weights)));
         }
-
-        /// Whether the captured source and configuration still match the publication.
-        async fn engine_tree_matches(
-            &self,
-            published: &PublishedWorkspace,
-        ) -> Result<bool, ErrorData> {
-            let (digests, configuration) = self
-                .capture_tree(published)
-                .await
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-            Ok(digests.fingerprint() == published.fingerprint
-                && configuration == published.configuration.fingerprint)
-        }
-
-        /// Runs the search index for one request against `published` - the exact snapshot the
-        /// caller also runs `ReadService::search` against, never a separately resolved one.
-        ///
-        /// Returns nothing when the store has moved past `published`'s tree to a newer
-        /// publication, which asks the caller to capture the publication the store already
-        /// answers for. Every other outcome ranks: an index that could not be opened, one the
-        /// lexical lane is still committing this tree into once `deadline` passed, and one
-        /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
-        /// search to answer alone. A query-term limit the index refuses surfaces as this
-        /// request's own `limit_exceeded` error, never a silent degrade. A `global` scope
-        /// never consults the index: the ranked lane serves the project alone, so nothing
-        /// about it rides that answer.
-        async fn ranking(
-            &self,
-            params: &SearchParams,
-            published: &PublishedWorkspace,
-            deadline: RequestDeadline,
-        ) -> Result<Option<SearchRanking>, ErrorData> {
-            if params.pattern.is_some() {
-                return self.pattern_ranking(params, published).await.map(Some);
-            }
-            // A global scope never consults the project store: the project answers no hit,
-            // and the package hits come from the global index.
-            if params.scope == SearchScope::Global {
-                return Ok(Some(SearchRanking::without_store(self.ranking_weights)));
-            }
-            let Some(index) = self.search_index.as_ref() else {
-                return Ok(Some(SearchRanking::unavailable(
-                    "the workspace search database could not be opened, so the answer was ranked \
+        let Some(index) = self.search_index.as_ref() else {
+            return Ok(Some(SearchRanking::unavailable(
+                "the workspace search database could not be opened, so the answer was ranked \
                  by identifier matching alone; the server log names the open failure, and a \
                  restart retries it",
+                self.ranking_weights,
+            )));
+        };
+        // An absent or empty query is refused by `ReadService::search` itself; warning
+        // about a tier that was never consulted would only crowd that refusal.
+        let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
+            return Ok(Some(SearchRanking::default()));
+        };
+        // A query the bounded parser refuses is this request's own `invalid_request`,
+        // raised where the read path raises it rather than degraded to no ranking.
+        let Ok(parsed) = ParsedQuery::parse(query) else {
+            return Ok(Some(SearchRanking::default()));
+        };
+        let tree_revision = published.reads.tree_revision();
+        let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
+            self.store_answer(index, tree_revision, &parsed, deadline)
+                .await
+        })
+        .await;
+        let (searched, commit_state) = match stored {
+            Ok(stored) => stored,
+            Err(StoreReadFailure::ConnectionUnavailable) => {
+                return Ok(Some(SearchRanking::unavailable(
+                    STORE_CONNECTION_UNAVAILABLE,
                     self.ranking_weights,
                 )));
-            };
-            // An absent or empty query is refused by `ReadService::search` itself; warning
-            // about a tier that was never consulted would only crowd that refusal.
-            let Some(query) = params.query.as_deref().filter(|query| !query.is_empty()) else {
-                return Ok(Some(SearchRanking::default()));
-            };
-            // A query the bounded parser refuses is this request's own `invalid_request`,
-            // raised where the read path raises it rather than degraded to no ranking.
-            let Ok(parsed) = ParsedQuery::parse(query) else {
-                return Ok(Some(SearchRanking::default()));
-            };
-            let tree_revision = published.reads.tree_revision();
-            let stored =
-                rift_core::traced_async!(component = "search", operation = "search.store", {
-                    self.store_answer(index, tree_revision, &parsed, deadline)
-                        .await
-                })
-                .await;
-            let (searched, commit_state) = match stored {
-                Ok(stored) => stored,
-                Err(StoreReadFailure::ConnectionUnavailable) => {
-                    return Ok(Some(SearchRanking::unavailable(
-                        STORE_CONNECTION_UNAVAILABLE,
-                        self.ranking_weights,
-                    )));
-                }
-                Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
-            };
-            Ok(ranking_of(
-                searched,
-                published.reads.file_count(),
-                tree_revision,
-                commit_state,
-                self.ranking_weights,
-            ))
-        }
-
-        /// The files the trigram index selects for one `pattern` request against `published`,
-        /// under the `[search]` pattern bounds.
-        ///
-        /// The publication holds the text the matcher verifies, so the store only narrows
-        /// which files are read: a pattern the read path refuses, one with no prefilter, a
-        /// store that could not open or handed the read no pooled connection within
-        /// `[search] busy_timeout`, and a store that does not hold the captured tree all
-        /// leave the read path to verify every held file, and the answer is complete either
-        /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
-        /// batches: the rows the trigram index lacks ride the selection, and the read path
-        /// verifies them, or answers from the rows the index holds and warns
-        /// `pattern_index_preparing`. A `global` scope verifies no project file, so the store
-        /// is not read.
-        async fn pattern_ranking(
-            &self,
-            params: &SearchParams,
-            published: &PublishedWorkspace,
-        ) -> Result<SearchRanking, ErrorData> {
-            let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
-            let Some(index) = self
-                .search_index
-                .as_ref()
-                .filter(|_| params.scope != SearchScope::Global)
-            else {
-                return Ok(SearchRanking::unranked(answer));
-            };
-            let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds)
-            else {
-                return Ok(SearchRanking::unranked(answer));
-            };
-            let Some(prefilter) = pattern.prefilter().cloned() else {
-                return Ok(SearchRanking::unranked(answer));
-            };
-            let line_bound = pattern.is_line_bound();
-            let tree_revision = published.reads.tree_revision();
-            let rows_max = self.pattern_bounds.candidate_rows_max();
-            let scoped =
-                rift_core::traced_async!(component = "search", operation = "search.pattern", {
-                    index
-                        .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
-                        .await
-                })
-                .await;
-            let selected = match scoped.map_err(StoreReadFailure::from) {
-                Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
-                Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
-                | Err(StoreReadFailure::ConnectionUnavailable) => None,
-                Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
-            };
-            Ok(SearchRanking::unranked(match selected {
-                Some(candidates) => answer.with_pattern_candidates(candidates),
-                None => answer,
-            }))
-        }
-
-        /// The store's answer for `tree_revision` in both query phases, read as deep as
-        /// [`Self::fetch_limit`].
-        ///
-        /// The broad phase runs whenever the query has one, before anything knows whether
-        /// the precise answer will fill the candidate pool. The read layer fuses first and
-        /// uses these only when it comes up short, so a broad hit never displaces a precise
-        /// one; what the eager run costs is one more full-text query.
-        async fn read_store(
-            &self,
-            index: &SearchIndex,
-            tree_revision: &str,
-            query: &ParsedQuery,
-        ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
-            let precise = self
-                .run_phase(index, tree_revision, query, QueryPhase::Precise)
-                .await?;
-            let RevisionScoped::Matched(precise) = precise else {
-                return Ok(match precise {
-                    RevisionScoped::OtherRevision(stored) => RevisionScoped::OtherRevision(stored),
-                    _ => RevisionScoped::NoRevision,
-                });
-            };
-            // The precise phase alone can already fill the pool, and the read layer would
-            // then never read a widened answer. Asking for one costs a full-text query the
-            // answer cannot use.
-            let filled = precise.inputs().iter().any(|input| {
-                input.order().len() >= usize::try_from(self.fetch_limit()).unwrap_or(usize::MAX)
-            });
-            let broad = if query.has_broad_phase() && !filled {
-                match self
-                    .run_phase(index, tree_revision, query, QueryPhase::Broad)
-                    .await?
-                {
-                    RevisionScoped::Matched(broad) => broad.into_inputs(),
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-            let file_rows = self.file_rows(index, tree_revision, query).await?;
-            Ok(RevisionScoped::Matched(PhasedRanking {
-                lexical_truncated_at: precise.lexical_truncated_at(),
-                readiness: precise.readiness(),
-                precise: precise.into_inputs(),
-                broad,
-                file_rows,
-            }))
-        }
-
-        /// The document frequencies of `query`'s terms over the store's file rows, or nothing
-        /// for a query carrying no term, or a store that moved past `tree_revision` between
-        /// the ranking and this read.
-        async fn file_rows(
-            &self,
-            index: &SearchIndex,
-            tree_revision: &str,
-            query: &ParsedQuery,
-        ) -> Result<Option<FileRowFrequencies>, StoreReadFailure> {
-            let terms = BodyTerms::of(query);
-            if terms.is_empty() {
-                return Ok(None);
             }
-            let read = index
-                .file_row_frequencies(tree_revision, &terms)
-                .await
-                .map_err(StoreReadFailure::from)?;
-            Ok(match read {
-                RevisionScoped::Matched(frequencies) => Some(frequencies),
-                RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
+        Ok(ranking_of(
+            searched,
+            published.reads.file_count(),
+            tree_revision,
+            commit_state,
+            self.ranking_weights,
+        ))
+    }
+
+    /// The files the trigram index selects for one `pattern` request against `published`,
+    /// under the `[search]` pattern bounds.
+    ///
+    /// The publication holds the text the matcher verifies, so the store only narrows
+    /// which files are read: a pattern the read path refuses, one with no prefilter, a
+    /// store that could not open or handed the read no pooled connection within
+    /// `[search] busy_timeout`, and a store that does not hold the captured tree all
+    /// leave the read path to verify every held file, and the answer is complete either
+    /// way. Nothing waits for a lexical commit in flight or for the lexical lane's trigram
+    /// batches: the rows the trigram index lacks ride the selection, and the read path
+    /// verifies them, or answers from the rows the index holds and warns
+    /// `pattern_index_preparing`. A `global` scope verifies no project file, so the store
+    /// is not read.
+    async fn pattern_ranking(
+        &self,
+        params: &SearchParams,
+        published: &PublishedWorkspace,
+    ) -> Result<SearchRanking, ErrorData> {
+        let answer = StoreAnswer::identifier_only().with_pattern_bounds(self.pattern_bounds);
+        let Some(index) = self
+            .search_index
+            .as_ref()
+            .filter(|_| params.scope != SearchScope::Global)
+        else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Ok(Some(pattern)) = rift_server::accepted_pattern(params, self.pattern_bounds) else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let Some(prefilter) = pattern.prefilter().cloned() else {
+            return Ok(SearchRanking::unranked(answer));
+        };
+        let line_bound = pattern.is_line_bound();
+        let tree_revision = published.reads.tree_revision();
+        let rows_max = self.pattern_bounds.candidate_rows_max();
+        let scoped =
+            rift_core::traced_async!(component = "search", operation = "search.pattern", {
+                index
+                    .pattern_candidates(tree_revision, &prefilter, line_bound, rows_max)
+                    .await
             })
-        }
-
-        /// One phase of the store's ranking for `tree_revision`.
-        ///
-        /// The record this raises carries the query's shape and never its text: the
-        /// byte length, how many members the parser kept, whether it narrowed, and
-        /// which phase ran. It is a `debug` record, so an operator who wants it
-        /// widens the `[logs]` capture filter; the default keeps `info`.
-        async fn run_phase(
-            &self,
-            index: &SearchIndex,
-            tree_revision: &str,
-            query: &ParsedQuery,
-            phase: QueryPhase,
-        ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
-            tracing::debug!(
-                component = "search",
-                operation = "search.rank",
-                phase = phase.label(),
-                query_bytes = query.source().len(),
-                members = query.members().len(),
-                narrowed = query.is_narrowed(),
-                "ranking the full-text store for one query phase"
-            );
-            index
-                .rank(tree_revision, query, phase, self.fetch_limit())
-                .await
-                .map_err(StoreReadFailure::from)
-        }
-
-        /// The store's answer for `tree_revision` and where that revision stands with the
-        /// lexical lane, after waiting out a commit in flight.
-        ///
-        /// A store that does not hold the captured tree while the lane is still committing
-        /// it is a transient condition: the read waits for that commit to land by
-        /// `deadline`, then reads the store and the state again once. `Owed` and `Settled`
-        /// never wait, since no held transaction can change either. A wait that reaches the
-        /// deadline leaves `Committing` standing, which is what [`ranking_of`] warns about.
-        /// Without a lane the revision counts as settled: nothing could commit it.
-        ///
-        /// # Cancel safety
-        ///
-        /// Dropping the future drops the wait and the store read; nothing is written.
-        async fn store_answer(
-            &self,
-            index: &SearchIndex,
-            tree_revision: &str,
-            query: &ParsedQuery,
-            deadline: RequestDeadline,
-        ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
-            let searched = rift_core::traced_async!(
-                component = "search",
-                operation = "search.read_store",
-                attempt = 1_u8,
-                { self.read_store(index, tree_revision, query).await }
-            )
-            .await?;
-            let Some(lane) = self.lexical.as_ref() else {
-                return Ok((searched, LexicalCommitState::Settled));
-            };
-            let commit_state = lane.commit_state(tree_revision);
-            let matched = matches!(searched, RevisionScoped::Matched(_));
-            if matched || commit_state != LexicalCommitState::Committing {
-                return Ok((searched, commit_state));
-            }
-            let commit_state = rift_core::traced_async!(
-                component = "search",
-                operation = "search.commit_landed",
-                { commit_landed(lane, tree_revision, deadline).await }
-            )
             .await;
-            let searched = rift_core::traced_async!(
-                component = "search",
-                operation = "search.read_store",
-                attempt = 2_u8,
-                { self.read_store(index, tree_revision, query).await }
-            )
+        let selected = match scoped.map_err(StoreReadFailure::from) {
+            Ok(RevisionScoped::Matched(candidates)) => Some(candidates),
+            Ok(RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision)
+            | Err(StoreReadFailure::ConnectionUnavailable) => None,
+            Err(StoreReadFailure::Refused(refusal)) => return Err(refusal),
+        };
+        Ok(SearchRanking::unranked(match selected {
+            Some(candidates) => answer.with_pattern_candidates(candidates),
+            None => answer,
+        }))
+    }
+
+    /// The store's answer for `tree_revision` in both query phases, read as deep as
+    /// [`Self::fetch_limit`].
+    ///
+    /// The broad phase runs whenever the query has one, before anything knows whether
+    /// the precise answer will fill the candidate pool. The read layer fuses first and
+    /// uses these only when it comes up short, so a broad hit never displaces a precise
+    /// one; what the eager run costs is one more full-text query.
+    async fn read_store(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+    ) -> Result<RevisionScoped<PhasedRanking>, StoreReadFailure> {
+        let precise = self
+            .run_phase(index, tree_revision, query, QueryPhase::Precise)
             .await?;
-            Ok((searched, commit_state))
-        }
-
-        /// How deep the search index is read for one request: the same `results_max` bound
-        /// `ReadService::search`'s indexed lane already uses, so every lane merges into one
-        /// candidate pool bounded once, whatever the requested page size. A request's own
-        /// `limit` changes only how that one pool is paged, never how deep it is read.
-        fn fetch_limit(&self) -> u32 {
-            u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
-        }
-
-        /// Lists the syntax nodes covering one UTF-8 byte position in one file,
-        /// outermost first. Each identity carries a witness, so an address taken
-        /// from this listing refuses cleanly once the file's bytes drift. `rev`
-        /// lists the nodes as of a version-control revision instead of the
-        /// current tree. A visible path no syntax provider parses refuses
-        /// `capability_unavailable`, naming the extension.
-        #[tool]
-        async fn nodes(
-            &self,
-            Parameters(params): Parameters<NodesParams>,
-        ) -> Result<Json<NodesResult>, ErrorData> {
-            let rev = params.rev.clone();
-            self.read_at(rev, move |reads| reads.nodes(params)).await
-        }
-
-        /// Runs one read against the tree the request names - the current
-        /// snapshot, or a snapshot built at the request's version-control
-        /// revision - behind the acceptance gate every request passes.
-        ///
-        /// A revision snapshot is built per request from the workspace's git
-        /// objects, under the same `[source]` policy and bounds as the current
-        /// one; `[providers.history] enabled = false` refuses it.
-        async fn read_at<Answer>(
-            &self,
-            rev: Option<rift_protocol::read::RevisionId>,
-            operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
-        ) -> Result<Json<Answer>, ErrorData>
-        where
-            Answer: ReadAnswer + Send + 'static,
-        {
-            let deadline = self.request_deadline().await;
-            let resolved = self
-                .published_workspace(wire::ErrorPhase::Read, deadline)
-                .await?;
-            let Some(rev) = rev else {
-                return self.current_tree_read(&resolved, operation).await;
-            };
-            let RevisionRead {
-                root,
-                limits,
-                visibility,
-                text_inclusion,
-                languages,
-                history,
-            } = self.revision_read(&resolved.published)?;
-            self.blocking
-                .run("revision workspace read", move || {
-                    let reads = ReadService::at_revision_with_languages(
-                        &root,
-                        &rev,
-                        limits,
-                        &visibility,
-                        &text_inclusion,
-                        &languages,
-                        history,
-                    )?;
-                    operation(&reads)
-                })
-                .await
-                .map(Json)
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
-        }
-
-        /// The workspace policy one read of committed source applies, derived once from the
-        /// accepted configuration: the served root, the index bounds, the `[source]` matcher,
-        /// the `[search.text]` selection, the configured language entries, and the
-        /// `[providers.history]` table a served snapshot carries forward.
-        ///
-        /// Committed source is what `[providers.history]` gates, so a workspace that turns the
-        /// table off refuses here, before any revision is resolved.
-        fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
-            let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
-            if !configuration.providers.history.enabled {
-                return Err(ReadError::from(ReadFault::Unsupported {
-                    capability: "revision reads (providers.history disabled)".to_owned(),
-                })
-                .tool_error(wire::ErrorPhase::Read));
+        let RevisionScoped::Matched(precise) = precise else {
+            return Ok(match precise {
+                RevisionScoped::OtherRevision(stored) => RevisionScoped::OtherRevision(stored),
+                _ => RevisionScoped::NoRevision,
+            });
+        };
+        // The precise phase alone can already fill the pool, and the read layer would
+        // then never read a widened answer. Asking for one costs a full-text query the
+        // answer cannot use.
+        let filled = precise.inputs().iter().any(|input| {
+            input.order().len() >= usize::try_from(self.fetch_limit()).unwrap_or(usize::MAX)
+        });
+        let broad = if query.has_broad_phase() && !filled {
+            match self
+                .run_phase(index, tree_revision, query, QueryPhase::Broad)
+                .await?
+            {
+                RevisionScoped::Matched(broad) => broad.into_inputs(),
+                _ => Vec::new(),
             }
-            Ok(RevisionRead {
-                root: self.root.clone(),
-                limits: published
-                    .configuration
-                    .index_limits(self.limits)
-                    .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
-                visibility: SourceVisibility::from(&configuration.source),
-                text_inclusion: rift_core::TextFileInclusion::from(&configuration),
-                languages: rift_core::LanguageFileSelections::from(&configuration),
-                history: configuration.providers.history.clone(),
+        } else {
+            Vec::new()
+        };
+        let file_rows = self.file_rows(index, tree_revision, query).await?;
+        Ok(RevisionScoped::Matched(PhasedRanking {
+            lexical_truncated_at: precise.lexical_truncated_at(),
+            readiness: precise.readiness(),
+            precise: precise.into_inputs(),
+            broad,
+            file_rows,
+        }))
+    }
+
+    /// The document frequencies of `query`'s terms over the store's file rows, or nothing
+    /// for a query carrying no term, or a store that moved past `tree_revision` between
+    /// the ranking and this read.
+    async fn file_rows(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+    ) -> Result<Option<FileRowFrequencies>, StoreReadFailure> {
+        let terms = BodyTerms::of(query);
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        let read = index
+            .file_row_frequencies(tree_revision, &terms)
+            .await
+            .map_err(StoreReadFailure::from)?;
+        Ok(match read {
+            RevisionScoped::Matched(frequencies) => Some(frequencies),
+            RevisionScoped::OtherRevision(_) | RevisionScoped::NoRevision => None,
+        })
+    }
+
+    /// One phase of the store's ranking for `tree_revision`.
+    ///
+    /// The record this raises carries the query's shape and never its text: the
+    /// byte length, how many members the parser kept, whether it narrowed, and
+    /// which phase ran. It is a `debug` record, so an operator who wants it
+    /// widens the `[logs]` capture filter; the default keeps `info`.
+    async fn run_phase(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        phase: QueryPhase,
+    ) -> Result<RevisionScoped<StoreRanking>, StoreReadFailure> {
+        tracing::debug!(
+            component = "search",
+            operation = "search.rank",
+            phase = phase.label(),
+            query_bytes = query.source().len(),
+            members = query.members().len(),
+            narrowed = query.is_narrowed(),
+            "ranking the full-text store for one query phase"
+        );
+        index
+            .rank(tree_revision, query, phase, self.fetch_limit())
+            .await
+            .map_err(StoreReadFailure::from)
+    }
+
+    /// The store's answer for `tree_revision` and where that revision stands with the
+    /// lexical lane, after waiting out a commit in flight.
+    ///
+    /// A store that does not hold the captured tree while the lane is still committing
+    /// it is a transient condition: the read waits for that commit to land by
+    /// `deadline`, then reads the store and the state again once. `Owed` and `Settled`
+    /// never wait, since no held transaction can change either. A wait that reaches the
+    /// deadline leaves `Committing` standing, which is what [`ranking_of`] warns about.
+    /// Without a lane the revision counts as settled: nothing could commit it.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future drops the wait and the store read; nothing is written.
+    async fn store_answer(
+        &self,
+        index: &SearchIndex,
+        tree_revision: &str,
+        query: &ParsedQuery,
+        deadline: RequestDeadline,
+    ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 1_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
+        let Some(lane) = self.lexical.as_ref() else {
+            return Ok((searched, LexicalCommitState::Settled));
+        };
+        let commit_state = lane.commit_state(tree_revision);
+        let matched = matches!(searched, RevisionScoped::Matched(_));
+        if matched || commit_state != LexicalCommitState::Committing {
+            return Ok((searched, commit_state));
+        }
+        let commit_state =
+            rift_core::traced_async!(component = "search", operation = "search.commit_landed", {
+                commit_landed(lane, tree_revision, deadline).await
             })
-        }
+            .await;
+        let searched = rift_core::traced_async!(
+            component = "search",
+            operation = "search.read_store",
+            attempt = 2_u8,
+            { self.read_store(index, tree_revision, query).await }
+        )
+        .await?;
+        Ok((searched, commit_state))
+    }
 
-        /// Runs one read against `resolved`'s current-tree snapshot, behind the acceptance
-        /// gate every request passes, and adds the `stale_index` warning when that snapshot
-        /// is served in spite of a recorded rebuild failure. Shared by `read_at`'s
-        /// current-tree path and `search`, which resolves the publication itself first so the
-        /// lexical tier's revision check and the identifier read it merges into can never
-        /// straddle two different snapshots.
-        async fn current_tree_read<Answer>(
-            &self,
-            resolved: &ResolvedWorkspace,
-            operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
-        ) -> Result<Json<Answer>, ErrorData>
-        where
-            Answer: ReadAnswer + Send + 'static,
-        {
-            resolved
-                .published
+    /// How deep the search index is read for one request: the same `results_max` bound
+    /// `ReadService::search`'s indexed lane already uses, so every lane merges into one
+    /// candidate pool bounded once, whatever the requested page size. A request's own
+    /// `limit` changes only how that one pool is paged, never how deep it is read.
+    fn fetch_limit(&self) -> u32 {
+        u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
+    }
+
+    /// Lists the syntax nodes covering one UTF-8 byte position in one file,
+    /// outermost first. Each identity carries a witness, so an address taken
+    /// from this listing refuses cleanly once the file's bytes drift. `rev`
+    /// lists the nodes as of a version-control revision instead of the
+    /// current tree. A visible path no syntax provider parses refuses
+    /// `capability_unavailable`, naming the extension.
+    #[tool]
+    async fn nodes(
+        &self,
+        Parameters(params): Parameters<NodesParams>,
+    ) -> Result<Json<NodesResult>, ErrorData> {
+        let rev = params.rev.clone();
+        self.read_at(rev, move |reads| reads.nodes(params)).await
+    }
+
+    /// Runs one read against the tree the request names - the current
+    /// snapshot, or a snapshot built at the request's version-control
+    /// revision - behind the acceptance gate every request passes.
+    ///
+    /// A revision snapshot is built per request from the workspace's git
+    /// objects, under the same `[source]` policy and bounds as the current
+    /// one; `[providers.history] enabled = false` refuses it.
+    async fn read_at<Answer>(
+        &self,
+        rev: Option<rift_protocol::read::RevisionId>,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+    ) -> Result<Json<Answer>, ErrorData>
+    where
+        Answer: ReadAnswer + Send + 'static,
+    {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(wire::ErrorPhase::Read, deadline)
+            .await?;
+        let Some(rev) = rev else {
+            return self.current_tree_read(&resolved, operation).await;
+        };
+        let RevisionRead {
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history,
+        } = self.revision_read(&resolved.published)?;
+        self.blocking
+            .run("revision workspace read", move || {
+                let reads = ReadService::at_revision_with_languages(
+                    &root,
+                    &rev,
+                    limits,
+                    &visibility,
+                    &text_inclusion,
+                    &languages,
+                    history,
+                )?;
+                operation(&reads)
+            })
+            .await
+            .map(Json)
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))
+    }
+
+    /// The workspace policy one read of committed source applies, derived once from the
+    /// accepted configuration: the served root, the index bounds, the `[source]` matcher,
+    /// the `[search.text]` selection, the configured language entries, and the
+    /// `[providers.history]` table a served snapshot carries forward.
+    ///
+    /// Committed source is what `[providers.history]` gates, so a workspace that turns the
+    /// table off refuses here, before any revision is resolved.
+    fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
+        let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
+        if !configuration.providers.history.enabled {
+            return Err(ReadError::from(ReadFault::Unsupported {
+                capability: "revision reads (providers.history disabled)".to_owned(),
+            })
+            .tool_error(wire::ErrorPhase::Read));
+        }
+        Ok(RevisionRead {
+            root: self.root.clone(),
+            limits: published
                 .configuration
-                .accepted(wire::ErrorPhase::Read)?;
-            let reads = Arc::clone(&resolved.published.reads);
-            let mut answer = self
-                .blocking
-                .run("current workspace read", move || operation(&reads))
-                .await
-                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
-            if let Some(stale) = resolved.stale.clone() {
-                answer.warnings_mut().push(stale);
-            }
-            Ok(Json(answer))
-        }
+                .index_limits(self.limits)
+                .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?,
+            visibility: SourceVisibility::from(&configuration.source),
+            text_inclusion: rift_core::TextFileInclusion::from(&configuration),
+            languages: rift_core::LanguageFileSelections::from(&configuration),
+            history: configuration.providers.history.clone(),
+        })
+    }
 
-        /// Returns one atomically published index and configuration policy.
-        ///
-        /// The wait ends at `deadline`, which the request took once from
-        /// `[server] readiness_timeout` on the last accepted `rift.toml` - the
-        /// default table's value while the file is invalid, since the acceptance
-        /// failure itself is what a request meets once the wait ends. Index
-        /// validation, the lexical lane's transaction, and a specific engine's
-        /// readiness all spend that one budget, never a fresh one each.
-        async fn published_workspace(
-            &self,
-            phase: wire::ErrorPhase,
-            deadline: RequestDeadline,
-        ) -> Result<ResolvedWorkspace, ErrorData> {
-            let Ok(result) =
-                tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
-            else {
-                let detail = self.readiness_stall(deadline.budget()).await;
-                tracing::warn!(
-                    component = "index",
-                    operation = "index.readiness",
-                    detail = detail.as_str(),
-                    "a request spent its whole readiness budget"
-                );
-                return Err(
-                    ReadFault::unavailable("current workspace read", detail).tool_error(phase)
-                );
-            };
-            result
+    /// Runs one read against `resolved`'s current-tree snapshot, behind the acceptance
+    /// gate every request passes, and adds the `stale_index` warning when that snapshot
+    /// is served in spite of a recorded rebuild failure. Shared by `read_at`'s
+    /// current-tree path and `search`, which resolves the publication itself first so the
+    /// lexical tier's revision check and the identifier read it merges into can never
+    /// straddle two different snapshots.
+    async fn current_tree_read<Answer>(
+        &self,
+        resolved: &ResolvedWorkspace,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+    ) -> Result<Json<Answer>, ErrorData>
+    where
+        Answer: ReadAnswer + Send + 'static,
+    {
+        resolved
+            .published
+            .configuration
+            .accepted(wire::ErrorPhase::Read)?;
+        let reads = Arc::clone(&resolved.published.reads);
+        let mut answer = self
+            .blocking
+            .run("current workspace read", move || operation(&reads))
+            .await
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
+        if let Some(stale) = resolved.stale.clone() {
+            answer.warnings_mut().push(stale);
         }
+        Ok(Json(answer))
+    }
 
-        /// What the elapsed wait was waiting for, in the words an operator can act
-        /// on.
-        ///
-        /// "readiness deadline elapsed" alone sends a reader to the timeout, which
-        /// is almost never the fault: the epochs say whether the index is behind
-        /// the filesystem and by how far, and `rift://logs` holds the rebuild
-        /// records that go with them.
-        async fn readiness_stall(&self, timeout: Duration) -> String {
-            let observed = self.validation.observed_epoch();
-            let published = {
-                let state = self.published.read().await;
-                let (current, _failure) = state.snapshot();
-                current.epoch
-            };
-            let waited_ms = timeout.as_millis();
-            if published == observed {
-                return format!(
-                    "the index settled at epoch {published}, but workspace validation did not finish \
-                 within {waited_ms}ms; read rift://logs for capture and rebuild records"
-                );
-            }
-            format!(
-                "the index is {behind} filesystem events behind the tree after {waited_ms}ms \
-             (published epoch {published}, observed epoch {observed}); read rift://logs for \
-             what the index lane did",
-                behind = observed.saturating_sub(published)
-            )
-        }
+    /// Returns one atomically published index and configuration policy.
+    ///
+    /// The wait ends at `deadline`, which the request took once from
+    /// `[server] readiness_timeout` on the last accepted `rift.toml` - the
+    /// default table's value while the file is invalid, since the acceptance
+    /// failure itself is what a request meets once the wait ends. Index
+    /// validation, the lexical lane's transaction, and a specific engine's
+    /// readiness all spend that one budget, never a fresh one each.
+    async fn published_workspace(
+        &self,
+        phase: wire::ErrorPhase,
+        deadline: RequestDeadline,
+    ) -> Result<ResolvedWorkspace, ErrorData> {
+        let Ok(result) =
+            tokio::time::timeout_at(deadline.at(), self.reconcile_workspace(phase)).await
+        else {
+            let detail = self.readiness_stall(deadline.budget()).await;
+            tracing::warn!(
+                component = "index",
+                operation = "index.readiness",
+                detail = detail.as_str(),
+                "a request spent its whole readiness budget"
+            );
+            return Err(ReadFault::unavailable("current workspace read", detail).tool_error(phase));
+        };
+        result
+    }
 
-        /// The deadline every wait in one request shares, starting now.
-        async fn request_deadline(&self) -> RequestDeadline {
-            RequestDeadline::starting(self.readiness_timeout().await)
-        }
-
-        /// The `[server] readiness_timeout` this request's waits are bounded by,
-        /// read from whatever configuration is currently published - stale or
-        /// not, since a deadline this call needs before validation can even
-        /// begin cannot itself wait on that validation.
-        async fn readiness_timeout(&self) -> Duration {
+    /// What the elapsed wait was waiting for, in the words an operator can act
+    /// on.
+    ///
+    /// "readiness deadline elapsed" alone sends a reader to the timeout, which
+    /// is almost never the fault: the epochs say whether the index is behind
+    /// the filesystem and by how far, and `rift://logs` holds the rebuild
+    /// records that go with them.
+    async fn readiness_stall(&self, timeout: Duration) -> String {
+        let observed = self.validation.observed_epoch();
+        let published = {
             let state = self.published.read().await;
             let (current, _failure) = state.snapshot();
-            Duration::from_millis(
-                current
-                    .configuration
-                    .server_configuration()
-                    .readiness_timeout
-                    .milliseconds(),
-            )
+            current.epoch
+        };
+        let waited_ms = timeout.as_millis();
+        if published == observed {
+            return format!(
+                "the index settled at epoch {published}, but workspace validation did not finish \
+                 within {waited_ms}ms; read rift://logs for capture and rebuild records"
+            );
         }
+        format!(
+            "the index is {behind} filesystem events behind the tree after {waited_ms}ms \
+             (published epoch {published}, observed epoch {observed}); read rift://logs for \
+             what the index lane did",
+            behind = observed.saturating_sub(published)
+        )
+    }
 
-        /// Reconciles native observations with an exact request-time capture of the tree.
-        ///
-        /// The capture reads every visible file to decide whether the publication still answers
-        /// for this request, so it already knows which files moved. A request that finds the
-        /// tree ahead of the publication names those files, and the rebuild it waits for
-        /// reparses them alone; a moved `rift.toml`, a capture that failed, and a file whose
-        /// inclusion an ignore file moved ask for the whole workspace (see
-        /// [`Self::rebuild_reaches_capture`]). A read that finds the tree ahead of a
-        /// publication whose rebuild failed waits for nothing: it answers from that publication
-        /// and says so, and the next filesystem event retries the rebuild.
-        ///
-        /// The first is the filesystem epoch, which counts observations rather than content.
-        /// [`IndexValidation::observe_locked`] increments it for every classified event, and
-        /// [`watch_path_impact`] classifies from the path and the event kind without reading a
-        /// byte, so a write that lands the bytes a file already held moves the epoch while
-        /// every digest stays equal. The capture is the content comparison: a read accepts the
-        /// publication whenever the capture folds to its fingerprint under its configuration,
-        /// whatever the epoch counter reads.
-        ///
-        /// The second is the attempt budget. Each attempt that finds the tree ahead asks for a
-        /// rebuild and waits for its publication, and a read that spends the budget answers from
-        /// the publication the last attempt resolved, with a `stale_index` warning naming what
-        /// that attempt's capture found ahead. Configuration movement waits for acceptance and
-        /// publication before the next capture; the last capture refuses if its configuration
-        /// moved.
-        ///
-        /// A successful capture superseded after the read's last capture began wakes the read
-        /// before that publication, and the read captures again. A capture that differs from
-        /// the previous one proves the tree moved during the read, so the read answers stale
-        /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
-        /// readable.
-        ///
-        /// A capture that matches the previous one proves no movement. The observation that
-        /// superseded the rebuild reported what the read had already captured, such as the
-        /// watcher's late report of the `.gitignore` write the read found, so the read asks for
-        /// nothing again and spends no attempt. It waits again, and only a later supersession or
-        /// a publication wakes it, so the readiness deadline bounds how often that repeats.
-        async fn reconcile_workspace(
-            &self,
-            phase: wire::ErrorPhase,
-        ) -> Result<ResolvedWorkspace, ErrorData> {
-            let mut spent = None;
-            let mut wait = ReadWait::Capture;
-            let mut previous: Option<PreviousCapture> = None;
-            let mut attempts = 0;
-            while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
-                let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
-                let superseded_seen = self.validation.superseded_epoch();
-                let capture_started = tokio::time::Instant::now();
-                let (digests, configuration_fingerprint) =
-                    self.capture_read(&current, phase).await?;
-                let capture_elapsed = capture_started.elapsed();
-                let tree =
-                    rift_core::traced!(component = "index", operation = "fingerprint.fold", {
-                        digests.fingerprint()
-                    });
-                let configuration_matches =
-                    current.configuration.fingerprint == configuration_fingerprint;
-                if tree == current.fingerprint
-                    && configuration_matches
-                    && !self.project_environment_moved(&current, phase).await?
-                {
-                    current.configuration.accepted(phase)?;
-                    return Ok(ResolvedWorkspace::current(current, capture_elapsed));
-                }
-                let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
-                let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
-                if let Some(failure) = rebuild_failure {
-                    let reason = StaleIndexReason::RebuildFailed(&failure);
-                    return ResolvedWorkspace::stale(
-                        current,
-                        &digests,
-                        moved,
-                        &reason,
-                        phase,
-                        capture_elapsed,
-                    );
-                }
-                let owed_publication = previous.as_ref().is_some_and(|previous| {
-                    previous.awaits_publication(&current, &tree, configuration_fingerprint)
-                });
-                if configuration_matches && owed_publication {
-                    wait = ReadWait::Rebuild { superseded_seen };
-                    continue;
-                }
-                let moved_since_previous = previous
-                    .as_ref()
-                    .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
-                attempts += 1;
-                let requested_epoch = self
-                    .request_rebuild(&current, &changes, configuration_matches, phase)
-                    .await?;
-                if configuration_matches
-                    && let Some(previous) = moved_since_previous
-                    && let Some(epoch) = self
-                        .validation
-                        .superseded_after(current.epoch.max(previous.superseded_seen))
-                {
-                    let reason = StaleIndexReason::RebuildSuperseded {
-                        epoch,
-                        changes: &changes,
-                    };
-                    return ResolvedWorkspace::stale(
-                        current,
-                        &digests,
-                        moved,
-                        &reason,
-                        phase,
-                        capture_elapsed,
-                    );
-                }
-                wait = if configuration_matches {
-                    ReadWait::Rebuild { superseded_seen }
-                } else {
-                    ReadWait::Configuration
-                };
-                previous = Some(PreviousCapture {
-                    tree,
-                    configuration: configuration_fingerprint,
-                    requested_epoch,
-                    superseded_seen,
-                });
-                spent = Some((current, digests, changes, moved, capture_elapsed));
-            }
-            if matches!(wait, ReadWait::Rebuild { .. })
-                && let Some((current, digests, changes, moved, capture_elapsed)) = spent
+    /// The deadline every wait in one request shares, starting now.
+    async fn request_deadline(&self) -> RequestDeadline {
+        RequestDeadline::starting(self.readiness_timeout().await)
+    }
+
+    /// The `[server] readiness_timeout` this request's waits are bounded by,
+    /// read from whatever configuration is currently published - stale or
+    /// not, since a deadline this call needs before validation can even
+    /// begin cannot itself wait on that validation.
+    async fn readiness_timeout(&self) -> Duration {
+        let state = self.published.read().await;
+        let (current, _failure) = state.snapshot();
+        Duration::from_millis(
+            current
+                .configuration
+                .server_configuration()
+                .readiness_timeout
+                .milliseconds(),
+        )
+    }
+
+    /// Reconciles native observations with an exact request-time capture of the tree.
+    ///
+    /// The capture reads every visible file to decide whether the publication still answers
+    /// for this request, so it already knows which files moved. A request that finds the
+    /// tree ahead of the publication names those files, and the rebuild it waits for
+    /// reparses them alone; a moved `rift.toml`, a capture that failed, and a file whose
+    /// inclusion an ignore file moved ask for the whole workspace (see
+    /// [`Self::rebuild_reaches_capture`]). A read that finds the tree ahead of a
+    /// publication whose rebuild failed waits for nothing: it answers from that publication
+    /// and says so, and the next filesystem event retries the rebuild.
+    ///
+    /// The first is the filesystem epoch, which counts observations rather than content.
+    /// [`IndexValidation::observe_locked`] increments it for every classified event, and
+    /// [`watch_path_impact`] classifies from the path and the event kind without reading a
+    /// byte, so a write that lands the bytes a file already held moves the epoch while
+    /// every digest stays equal. The capture is the content comparison: a read accepts the
+    /// publication whenever the capture folds to its fingerprint under its configuration,
+    /// whatever the epoch counter reads.
+    ///
+    /// The second is the attempt budget. Each attempt that finds the tree ahead asks for a
+    /// rebuild and waits for its publication, and a read that spends the budget answers from
+    /// the publication the last attempt resolved, with a `stale_index` warning naming what
+    /// that attempt's capture found ahead. Configuration movement waits for acceptance and
+    /// publication before the next capture; the last capture refuses if its configuration
+    /// moved.
+    ///
+    /// A successful capture superseded after the read's last capture began wakes the read
+    /// before that publication, and the read captures again. A capture that differs from
+    /// the previous one proves the tree moved during the read, so the read answers stale
+    /// with the superseded epoch, which keeps a workspace under back-to-back rebuilds
+    /// readable.
+    ///
+    /// A capture that matches the previous one proves no movement. The observation that
+    /// superseded the rebuild reported what the read had already captured, such as the
+    /// watcher's late report of the `.gitignore` write the read found, so the read asks for
+    /// nothing again and spends no attempt. It waits again, and only a later supersession or
+    /// a publication wakes it, so the readiness deadline bounds how often that repeats.
+    async fn reconcile_workspace(
+        &self,
+        phase: wire::ErrorPhase,
+    ) -> Result<ResolvedWorkspace, ErrorData> {
+        let mut spent = None;
+        let mut wait = ReadWait::Capture;
+        let mut previous: Option<PreviousCapture> = None;
+        let mut attempts = 0;
+        while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
+            let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
+            let superseded_seen = self.validation.superseded_epoch();
+            let capture_started = tokio::time::Instant::now();
+            let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
+            let capture_elapsed = capture_started.elapsed();
+            let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+                digests.fingerprint()
+            });
+            let configuration_matches =
+                current.configuration.fingerprint == configuration_fingerprint;
+            if tree == current.fingerprint
+                && configuration_matches
+                && !self.project_environment_moved(&current, phase).await?
             {
-                let reason = StaleIndexReason::TreeKeptMoving { changes: &changes };
+                current.configuration.accepted(phase)?;
+                return Ok(ResolvedWorkspace::current(current, capture_elapsed));
+            }
+            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+            let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
+            if let Some(failure) = rebuild_failure {
+                let reason = StaleIndexReason::RebuildFailed(&failure);
                 return ResolvedWorkspace::stale(
                     current,
                     &digests,
@@ -2994,6 +2924,64 @@ impl RiftMcp {
                     capture_elapsed,
                 );
             }
+            let owed_publication = previous.as_ref().is_some_and(|previous| {
+                previous.awaits_publication(&current, &tree, configuration_fingerprint)
+            });
+            if configuration_matches && owed_publication {
+                wait = ReadWait::Rebuild { superseded_seen };
+                continue;
+            }
+            let moved_since_previous = previous
+                .as_ref()
+                .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
+            attempts += 1;
+            let requested_epoch = self
+                .request_rebuild(&current, &changes, configuration_matches, phase)
+                .await?;
+            if configuration_matches
+                && let Some(previous) = moved_since_previous
+                && let Some(epoch) = self
+                    .validation
+                    .superseded_after(current.epoch.max(previous.superseded_seen))
+            {
+                let reason = StaleIndexReason::RebuildSuperseded {
+                    epoch,
+                    changes: &changes,
+                };
+                return ResolvedWorkspace::stale(
+                    current,
+                    &digests,
+                    moved,
+                    &reason,
+                    phase,
+                    capture_elapsed,
+                );
+            }
+            wait = if configuration_matches {
+                ReadWait::Rebuild { superseded_seen }
+            } else {
+                ReadWait::Configuration
+            };
+            previous = Some(PreviousCapture {
+                tree,
+                configuration: configuration_fingerprint,
+                requested_epoch,
+                superseded_seen,
+            });
+            spent = Some((current, digests, changes, moved, capture_elapsed));
+        }
+        if matches!(wait, ReadWait::Rebuild { .. })
+            && let Some((current, digests, changes, moved, capture_elapsed)) = spent
+        {
+            let reason = StaleIndexReason::TreeKeptMoving { changes: &changes };
+            return ResolvedWorkspace::stale(
+                current,
+                &digests,
+                moved,
+                &reason,
+                phase,
+                capture_elapsed,
+            );
         }
         Err(ReadFault::unavailable(
             "current workspace read",
@@ -3738,10 +3726,11 @@ done
         let key = LspProcessKey::named("rust");
         // The slot resends a request the engine answered empty through its retry
         // table, and this engine answers every request empty; one attempt sends it once.
-        let configuration: LspConfiguration = serde_json::from_value(json!({
+        let table = json!({
             "command": ["sh", script.display().to_string(), notified.display().to_string()],
             "retry": { "attempts": 1 },
-        }))?;
+        });
+        let configuration: LspConfiguration = serde_json::from_value(table)?;
         let hold = super::EngineHold::new(
             directory.path().to_path_buf(),
             std::collections::BTreeMap::from([(key.clone(), configuration)]),

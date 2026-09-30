@@ -1943,6 +1943,132 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     Ok(())
 }
 
+/// A global API whose capabilities leave out the declarations feature names no callee:
+/// every package callee drops, the answer names the feature the global API lacks, and no
+/// declarations request is sent.
+#[tokio::test]
+async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_package_callees()
+-> TestResult {
+    let fixture = global_api::GlobalFixture::start_with(global_api::FixtureOptions {
+        python_collection: true,
+        withheld_features: &["declarations"],
+        ..global_api::FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!("{}\n{OUTGOING_ENGINE}", global_table(&fixture.endpoint));
+    let (_directory, client, _server_task) =
+        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+
+    let counted = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": {
+                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
+    let warnings = &counted["warnings"];
+    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
+    assert_eq!(
+        warnings[1]["warning_code"],
+        json!("capability_unavailable"),
+        "{counted}"
+    );
+    let detail = warnings[1]["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("`declarations`"), "{counted}");
+    assert!(declaration_requests(&fixture).await.is_empty());
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A `sh` engine serving Python call hierarchy that negotiates no position encoding, so
+/// it counts in UTF-16. It begins and ends its work at start, prepares `hello` in the
+/// requested document, and names one callee: `greet`, in the `greeting` package
+/// [`INSTALLED_FILES`] installs, at its installed path below the workspace.
+#[cfg(unix)]
+const UTF16_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+while IFS= read -r header; do
+  IFS= read -r blank
+  length=$(printf '%s' "$header" | tr -dc 0-9)
+  body=$(dd bs=1 count="$length" 2>/dev/null)
+  id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
+  uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
+  case "$body" in
+    *'"method":"initialize"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"capabilities\":{\"callHierarchyProvider\":true}}}"
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
+      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}' ;;
+    *'"method":"textDocument/prepareCallHierarchy"'*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"hello\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":3,\"character\":0},\"end\":{\"line\":5,\"character\":24}},\"selectionRange\":{\"start\":{\"line\":3,\"character\":4},\"end\":{\"line\":3,\"character\":9}}}]}" ;;
+    *'"method":"callHierarchy/outgoingCalls"'*)
+      core="${uri%/app.py}/.venv/lib/python3.12/site-packages/greeting/core.py"
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"greet\",\"kind\":12,\"uri\":\"$core\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":1,\"character\":15}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":4},\"end\":{\"line\":0,\"character\":9}}},\"fromRanges\":[]}]}" ;;
+    *'"method":"exit"'*)
+      exit 0 ;;
+    *'"id":'[0-9]*)
+      frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}" ;;
+  esac
+done
+"#;
+
+/// A dependency callee an engine counting in UTF-16 names goes to the global API in a
+/// request spelling that encoding, and the declaration it answers ends the edge.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf16() -> TestResult {
+    let fixture = python_global_api().await?;
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    std::fs::write(&script, UTF16_CALLS_ENGINE)?;
+    let configuration = format!(
+        "[source]\nexclude = [\".venv/**\"]\n\n{}\n\
+         [languages.python.lsp]\ncommand = [\"sh\", \"{}\"]\nsettle_delay = \"10ms\"\n",
+        global_table(&fixture.endpoint),
+        script.display()
+    );
+    let (_directory, client, _server_task) =
+        served_workspace(INSTALLED_FILES, Some(configuration)).await?;
+
+    let hello = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
+    let greet = callee_hit(&hello, "greet")?;
+    assert_eq!(
+        greet["hit"]["symbol"]["id"],
+        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        "{greet}"
+    );
+    let requests = declaration_requests(&fixture).await;
+    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
+    assert_eq!(requests[0]["position_encoding"], json!("utf-16"));
+    assert_eq!(
+        requests[0]["positions"],
+        json!([{
+            "package": {"manager": "pypi", "name": "greeting", "version": "1.0.0"},
+            "path": "greeting/core.py",
+            "line": 0,
+            "character": 4
+        }])
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
 /// The `code` the server refuses `arguments` with.
 async fn refusal_code(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,

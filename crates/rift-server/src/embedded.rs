@@ -818,6 +818,29 @@ mod tests {
         path_to_uri(path).expect("an absolute path spells a file URI")
     }
 
+    /// Every `ty_ide` symbol kind takes the LSP kind `ty_server` gives it.
+    #[test]
+    fn test_each_symbol_kind_takes_the_lsp_kind_ty_server_gives_it() {
+        use ty_ide::SymbolKind as Ty;
+        let rows = [
+            (Ty::Module, lsp_types::SymbolKind::MODULE),
+            (Ty::Import, lsp_types::SymbolKind::MODULE),
+            (Ty::Class, lsp_types::SymbolKind::CLASS),
+            (Ty::Method, lsp_types::SymbolKind::METHOD),
+            (Ty::Function, lsp_types::SymbolKind::FUNCTION),
+            (Ty::Variable, lsp_types::SymbolKind::VARIABLE),
+            (Ty::Parameter, lsp_types::SymbolKind::VARIABLE),
+            (Ty::Constant, lsp_types::SymbolKind::CONSTANT),
+            (Ty::Property, lsp_types::SymbolKind::PROPERTY),
+            (Ty::Field, lsp_types::SymbolKind::FIELD),
+            (Ty::Constructor, lsp_types::SymbolKind::CONSTRUCTOR),
+            (Ty::TypeParameter, lsp_types::SymbolKind::TYPE_PARAMETER),
+        ];
+        for (kind, expected) in rows {
+            assert_eq!(symbol_kind(kind), expected, "{kind:?}");
+        }
+    }
+
     /// ty joins a vendored stub's path with the host's separator, as `join` does here, and
     /// the URI joins its segments with `/` on every host.
     #[test]
@@ -1408,6 +1431,55 @@ mod tests {
             panic!("prepare must reply");
         };
         assert_eq!(off_function["result"], Value::Null);
+
+        let absent = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/prepareCallHierarchy",
+            "params": {
+                "textDocument": { "uri": uri_of(&directory.path().join("absent.py")) },
+                "position": { "line": 0, "character": 0 },
+            },
+        });
+        let got = handle_message(&absent, directory.path(), &empty_documents());
+        assert!(matches!(&got, Handled::Reply(r) if r["error"]["code"] == CONTENT_MODIFIED));
+
+        let mut moved = item.clone();
+        moved["selectionRange"]["start"] = serde_json::json!({ "line": 99, "character": 0 });
+        let past_the_file = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "callHierarchy/outgoingCalls",
+            "params": { "item": moved },
+        });
+        let got = handle_message(&past_the_file, directory.path(), &empty_documents());
+        assert!(matches!(&got, Handled::Reply(r) if r["error"]["code"] == CONTENT_MODIFIED));
+    }
+
+    /// A tree whose root is not UTF-8 builds no ty database: every answer refuses as an
+    /// internal error naming the root. Linux alone lets a directory name hold such bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_tree_root_that_is_not_utf8_refuses_every_answer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let root = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"tree-\xff"));
+        std::fs::create_dir(&root).expect("a Linux directory name holds any bytes");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "textDocument/diagnostic",
+            "params": { "textDocument": { "uri": "file:///app.py" } },
+        });
+        let refused = |reply: &Value| {
+            let detail = reply["error"]["message"].as_str().unwrap_or_default();
+            reply["error"]["code"] == INTERNAL_ERROR && detail.starts_with("tree root is not UTF-8")
+        };
+        let got = handle_message(&message, &root, &empty_documents());
+        assert!(matches!(&got, Handled::Reply(reply) if refused(reply)));
     }
 
     /// The serve loop over a raw transport: initialize answers a framed
