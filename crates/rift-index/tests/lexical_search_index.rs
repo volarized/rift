@@ -1076,7 +1076,10 @@ async fn test_lexical_search_index_open_at_unusable_path_refuses_with_storage_fa
     let outcome = WorkspaceDatabase::open(&path, database_pool()).await;
     let error = outcome.expect_err("opening under a missing parent directory must refuse");
     assert_eq!(error.fault().violation(), LexicalIndexViolation::Storage);
-    assert_eq!(error.fault().path(), Some(path.as_path()));
+    // The open creates the migration lock file beside the database first, so the refusal
+    // names that file, in the same missing directory.
+    let lock_path = path.with_file_name("lexical.db.lock");
+    assert_eq!(error.fault().path(), Some(lock_path.as_path()));
     Ok(())
 }
 

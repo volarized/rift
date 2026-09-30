@@ -6143,7 +6143,11 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
-        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+        // The store lives outside the captured tree, as `.rift/db` does: the second capture
+        // runs after the open, and a file the open writes beside the database would join
+        // the tree as a moved file.
+        let state = tempfile::tempdir()?;
+        let index = Arc::new(search_index(&state.path().join("search.db")).await?);
         let double = StoreDouble::new();
         double.attach(Arc::clone(&index));
         let cancellation = CancellationToken::new();

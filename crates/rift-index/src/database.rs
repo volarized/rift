@@ -11,8 +11,14 @@
 //! wait for one process-wide turn and start with `BEGIN IMMEDIATE`. A checkout
 //! waits for a free connection at most the pool's busy-wait budget, the same
 //! budget a connection waits for a lock another process holds.
+//!
+//! Opening the file switches it to WAL and applies the schema migrations under
+//! the file's migration lock, so processes opening one new file prepare it one
+//! after the other.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +40,16 @@ use crate::lexical::{
 use crate::log::LogRecordRow;
 use crate::vector::VectorRecord;
 
+/// Suffix the migration lock file appends to the database file's whole name: the
+/// database `.rift/db` is prepared under `.rift/db.lock`.
+const MIGRATION_LOCK_SUFFIX: &str = ".lock";
+
+/// Wall-clock span between two attempts at a migration lock another process holds.
+///
+/// Preparing a new file takes a few milliseconds, so a process that meets the lock
+/// takes it at most one span after the holder releases it.
+const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(10);
+
 /// Connection count and wait bounds for one database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
@@ -43,8 +59,9 @@ pub struct DatabasePool {
 
 impl DatabasePool {
     /// Builds the pool's bounds: connection slots, and the busy-wait budget
-    /// that bounds both a caller's wait for a free slot and the wait `SQLite`
-    /// grants a connection for another process's lock before it refuses.
+    /// that bounds a caller's wait for a free slot, the wait `SQLite` grants a
+    /// connection for another process's lock before it refuses, and an open's
+    /// wait for another process's migration lock.
     #[must_use]
     pub const fn new(slots: u32, busy_timeout_ms: u32) -> Self {
         Self {
@@ -84,19 +101,26 @@ impl WorkspaceDatabase {
     /// Opens (creating if absent) the workspace database at `database_path` and
     /// applies the schema every store in it declares.
     ///
+    /// The WAL switch and the migrations run under the file's migration lock, so a
+    /// process that opens a new file while another prepares it waits, then finds WAL
+    /// on and every migration recorded.
+    ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the database cannot be opened or its
+    /// Returns [`LexicalIndexError`] when the database cannot be opened, another
+    /// process holds its migration lock past the pool's busy-wait budget, or its
     /// schema migration fails.
     ///
     /// # Cancel safety
     ///
     /// Cancellation may leave the database file created without its schema
-    /// applied. Reopening retries safely: schema migrations are idempotent.
+    /// applied. Reopening retries safely: schema migrations are idempotent, and
+    /// the migration lock releases with the dropped future.
     pub async fn open(
         database_path: &Path,
         pool: DatabasePool,
     ) -> Result<Arc<Self>, LexicalIndexError> {
+        let migration_lock = MigrationLock::acquire(database_path, pool).await?;
         let mut builder = Db::builder();
         builder
             .models(toasty::models!(
@@ -137,6 +161,7 @@ impl WorkspaceDatabase {
                 source,
             )
         })?;
+        drop(migration_lock);
         Ok(Arc::new(Self {
             database,
             pool,
@@ -244,6 +269,98 @@ enum ConnectionAccess {
     Write,
 }
 
+/// The database file's migration lock: an exclusive lock on a companion file, held
+/// while one process switches the file to WAL and applies the schema migrations.
+///
+/// `SQLite` cannot make either step wait for another process running it. On a new
+/// file, `PRAGMA journal_mode = WAL` rewrites the file header in a read transaction it
+/// then upgrades to a write transaction, and `SQLite` refuses that upgrade with
+/// `SQLITE_BUSY` at once, without calling the busy handler, while another connection
+/// holds the write lock. Toasty reads the applied migrations once and applies each
+/// missing one in a transaction of its own, so two processes that both read an empty
+/// set both apply the first migration.
+///
+/// The lock lives on a companion file because an exclusive lock on Windows blocks
+/// other processes' reads of the locked file itself. It releases when the value drops,
+/// and with the process when the process exits.
+#[derive(Debug)]
+struct MigrationLock {
+    _file: File,
+}
+
+impl MigrationLock {
+    /// Takes the migration lock of the database at `database_path`, waiting at most the
+    /// pool's busy-wait budget for another process to release it.
+    ///
+    /// The wait tries the lock once every [`MIGRATION_LOCK_POLL`], so it makes at most
+    /// the budget divided by that span, plus one, attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LexicalIndexError`] when the lock file cannot be opened or locked, or
+    /// when another process still holds the lock once the budget has passed.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait; the lock is not held.
+    async fn acquire(database_path: &Path, pool: DatabasePool) -> Result<Self, LexicalIndexError> {
+        let lock_path = migration_lock_path(database_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| migration_lock_error(&lock_path, source))?;
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(u64::from(pool.busy_timeout_ms()));
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::Error(source)) => {
+                    return Err(migration_lock_error(&lock_path, source));
+                }
+                Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
+                    let held = migration_lock_held(pool.busy_timeout_ms());
+                    return Err(migration_lock_error(&lock_path, held));
+                }
+                Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
+            }
+        }
+    }
+}
+
+/// The migration lock file of the database at `database_path`: the suffix appended to
+/// the whole file name, beside the database.
+fn migration_lock_path(database_path: &Path) -> PathBuf {
+    let mut lock_path = OsString::from(database_path);
+    lock_path.push(MIGRATION_LOCK_SUFFIX);
+    PathBuf::from(lock_path)
+}
+
+/// A migration lock failure, naming the lock file.
+fn migration_lock_error(
+    lock_path: &Path,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> LexicalIndexError {
+    lexical_error_caused_by(
+        crate::lexical::LexicalIndexViolation::Storage,
+        Some(lock_path),
+        source,
+    )
+}
+
+/// The cause an open reports when another process kept the migration lock for the
+/// whole budget.
+fn migration_lock_held(busy_timeout_ms: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "another process held the migration lock for the whole busy-wait budget of \
+             {busy_timeout_ms}ms; retry once that process has opened the database"
+        ),
+    )
+}
+
 /// Selects WAL once for the database file.
 async fn configure_journal(connection: &mut Connection) -> Result<(), LexicalIndexError> {
     let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
@@ -282,12 +399,14 @@ async fn configure_connection(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
     use toasty::stmt::{Type, Value};
+    use toasty_driver_sqlite::Sqlite;
 
-    use super::{DatabasePool, WorkspaceDatabase};
+    use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase};
     use crate::log::LogRecordRow;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -364,6 +483,124 @@ mod tests {
             "a store refusal is not a missing connection"
         );
         Ok(())
+    }
+
+    /// Starts a write transaction on the file at `path` through a pool of its own, the
+    /// state another process is in while it rewrites a new file's header.
+    async fn hold_write_lock(
+        path: &Path,
+    ) -> Result<(toasty::Db, toasty::db::Connection), Box<dyn std::error::Error>> {
+        let mut builder = toasty::Db::builder();
+        builder.models(toasty::models!(LogRecordRow));
+        let writer = builder.build(Sqlite::open(path)).await?;
+        let mut writing = writer.connection().await?;
+        toasty::sql::statement("BEGIN IMMEDIATE")
+            .exec(&mut writing)
+            .await?;
+        Ok((writer, writing))
+    }
+
+    /// A first open that meets another process preparing the same new file waits for it
+    /// and then finds the file prepared.
+    ///
+    /// The test stands in for that process: it holds the migration lock, and `SQLite`'s
+    /// write lock on the file, the state the process is in while its WAL switch rewrites
+    /// the header. A second open whose own WAL switch met that write lock is refused
+    /// `database is locked` at once, because `SQLite` calls no busy handler for the
+    /// upgrade the switch makes. The runtime's clock is paused, so the sleep below returns
+    /// only once the contender is parked.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_open_waits_while_another_process_prepares_the_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let preparing = MigrationLock::acquire(&path, pool()).await?;
+        let (writer, mut writing) = hold_write_lock(&path).await?;
+        let contender_path = path.clone();
+        let contender =
+            tokio::spawn(async move { WorkspaceDatabase::open(&contender_path, pool()).await });
+
+        tokio::time::sleep(MIGRATION_LOCK_POLL / 2).await;
+        assert!(
+            !contender.is_finished(),
+            "the second open must wait while another process prepares the file"
+        );
+        toasty::sql::statement("ROLLBACK")
+            .exec(&mut writing)
+            .await?;
+        drop(writing);
+        drop(writer);
+        drop(preparing);
+
+        let database = contender.await??;
+        let mut connection = database.connection().await?;
+        let tables = toasty::sql::query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' \
+             AND name IN ('lexical_documents', 'semantic_vectors', 'log_records')",
+        )
+        .column_types([Type::I64])
+        .exec(&mut connection)
+        .await?;
+        crate::lexical::require_pragma_row(&tables, &[Value::I64(3)])?;
+        let released = std::fs::File::open(super::migration_lock_path(&path))?;
+        released.try_lock()?;
+        Ok(())
+    }
+
+    /// A migration lock another process keeps past the busy-wait budget refuses the open,
+    /// naming the lock file and the budget, and leaves no database file behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_migration_lock_held_past_the_budget_refuses_the_open() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let held = MigrationLock::acquire(&path, pool()).await?;
+        let started = tokio::time::Instant::now();
+
+        let refused = WorkspaceDatabase::open(&path, pool())
+            .await
+            .expect_err("a held migration lock refuses the open once the budget passes");
+
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(u64::from(pool().busy_timeout_ms())),
+            "the open waits out the budget first: waited={waited:?}"
+        );
+        assert_eq!(refused.descriptor().code(), "storage_failure");
+        let rendered = refused.to_string();
+        assert!(rendered.contains("db.lock"), "{rendered}");
+        let causes = rift_core::causes(&refused).join(": ");
+        assert!(causes.contains("busy-wait budget"), "{causes}");
+        assert!(!path.exists(), "a refused open creates no database file");
+        drop(held);
+        Ok(())
+    }
+
+    /// The lock file for a database under a directory that does not exist cannot be
+    /// created, and the open refuses naming it.
+    #[tokio::test]
+    async fn a_missing_database_directory_refuses_at_the_migration_lock() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("missing").join("db");
+
+        let refused = WorkspaceDatabase::open(&path, pool())
+            .await
+            .expect_err("no lock file can be created under a missing directory");
+
+        assert_eq!(refused.descriptor().code(), "storage_failure");
+        assert!(refused.to_string().contains("db.lock"), "{refused}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_migration_lock_path_appends_to_the_whole_file_name() {
+        assert_eq!(
+            super::migration_lock_path(Path::new("/workspace/.rift/db")),
+            Path::new("/workspace/.rift/db.lock")
+        );
+        assert_eq!(
+            super::migration_lock_path(Path::new("state/db.sqlite")),
+            Path::new("state/db.sqlite.lock")
+        );
     }
 
     #[tokio::test]
