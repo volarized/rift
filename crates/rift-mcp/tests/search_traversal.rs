@@ -447,8 +447,11 @@ async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout(
 
 /// Runs three incoming walks under a 1 s `[server] readiness_timeout` over the `sh` engine
 /// `script_source`, whose `[languages.rust.lsp]` table also holds `lsp_keys`, asserts each
-/// answers `engine_analysis_unavailable` inside 2 s and that all three meet the one engine
-/// process, and returns the log the engine appended to by the end of the third walk.
+/// answers `engine_analysis_unavailable` and that all three meet the one engine process, and
+/// returns the log the engine appended to by the end of the third walk.
+///
+/// The engine's paused-clock unit owns the retry deadline. This integration covers the LSP
+/// exchange and the live session after that retry is abandoned.
 ///
 /// The first walk starts the engine, so whatever that start costs falls on it alone: the
 /// walks after it spend their wait on a running engine. The second walk's closing
@@ -485,7 +488,6 @@ async fn incoming_walks_past_the_readiness_timeout(
     };
     let mut starts_after = Vec::new();
     for _walk in 0..3 {
-        let started = std::time::Instant::now();
         let structured = call_retrying_acceptance(
             &client,
             tool_request(
@@ -494,8 +496,7 @@ async fn incoming_walks_past_the_readiness_timeout(
             ),
         )
         .await?;
-        let elapsed = started.elapsed();
-        eprintln!("incoming walk: elapsed={elapsed:?} answer={structured}");
+        eprintln!("incoming walk: answer={structured}");
         assert!(results(&structured).is_empty(), "{structured}");
         let warning = &structured["warnings"][0];
         assert_eq!(
@@ -509,7 +510,6 @@ async fn incoming_walks_past_the_readiness_timeout(
                 .is_some_and(|detail| detail.contains("readiness_timeout")),
             "{structured}"
         );
-        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
         starts_after.push(started_lines());
     }
     let log = std::fs::read_to_string(&log)?;

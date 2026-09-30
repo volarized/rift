@@ -1971,6 +1971,30 @@ mod tests {
         }
     }
 
+    /// A retry still in flight is abandoned at the walk deadline. This paused-clock unit
+    /// owns the deadline check; the LSP integration test checks the exchange the dropped
+    /// retry leaves behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_in_flight_ends_at_the_walk_deadline() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let mut retrying: Option<(Instant, Transient<()>)> = Some((deadline, Transient::Analyzing));
+
+        let ended = attempt_within(
+            &mut retrying,
+            std::future::pending::<Result<(), EngineError>>(),
+        )
+        .await;
+
+        assert!(matches!(ended, AttemptEnd::Spent(Transient::Analyzing)));
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "the retry ends at the walk deadline"
+        );
+        assert!(retrying.is_none(), "the spent retry has no later exchange");
+    }
+
     /// The default retry table spends 8 attempts over 9.75 s of waits; a walk
     /// under the 30 s `readiness_timeout` keeps asking at `delay_limit` and
     /// makes 18 attempts, the last at 29.75 s.
