@@ -441,6 +441,31 @@ fn an_lfs_file_longer_than_any_pointer_matches_its_base_by_digest() {
 }
 
 #[test]
+fn an_lfs_path_whose_base_holds_its_content_answers_changed_when_edited() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let root = directory.path();
+    init(root);
+    let content = "a payload committed before the path was tracked by lfs\n".repeat(30);
+    write(root, &[("kept.bin", content.as_str())]);
+    commit_all(root, "content");
+    // The attribute lives outside the tree, so no commit runs a clean filter over the
+    // content: the base blob is the content itself, longer than any pointer.
+    fs::create_dir_all(root.join(".git/info")).expect("info folder");
+    fs::write(
+        root.join(".git/info/attributes"),
+        "*.bin filter=lfs -text\n",
+    )
+    .expect("attributes");
+    let edited = content.replacen("payload", "PAYLOAD", 1);
+    write(root, &[("kept.bin", edited.as_str())]);
+
+    let (paths, _) = changed(root, "HEAD", &[], 512);
+
+    assert!(content.len() > 1024);
+    assert_eq!(paths, ["kept.bin"]);
+}
+
+#[test]
 fn a_workspace_below_the_repository_root_reads_its_own_paths() {
     let directory = tempfile::tempdir().expect("temp dir");
     let root = directory.path();
