@@ -642,6 +642,41 @@ fn a_committed_path_the_project_contract_forbids_is_changed_with_no_declaration(
 }
 
 #[test]
+fn a_file_a_symbolic_link_replaced_removes_its_declarations() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    init(root);
+    write(root, "lib.rs", "pub fn beacon() {}\n")?;
+    write(root, "target.rs", "pub fn target() {}\n")?;
+    commit_all(root, "introduce beacon");
+    rift_history::fixture::commit_symlink_in_place(root, "lib.rs", "target.rs", "refs/heads/main");
+
+    let record = head_record(&analysis(root, &everything(1))?)?;
+
+    let paths: Vec<(&str, bool, bool)> = record
+        .paths
+        .iter()
+        .map(|changed| {
+            (
+                changed.path.as_str(),
+                changed.old_blob.is_some(),
+                changed.new_blob.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(paths, [("lib.rs", true, false)]);
+    assert_eq!(
+        record.declarations,
+        [DeclarationChange {
+            path: "lib.rs".to_owned(),
+            qualified_name: "beacon".to_owned(),
+            change: SymbolVersionKind::Removed
+        }]
+    );
+    Ok(())
+}
+
+#[test]
 fn a_changed_blob_the_object_store_cannot_read_refuses_the_analysis() -> TestResult {
     let directory = three_commits()?;
     let root = directory.path();

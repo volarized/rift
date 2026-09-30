@@ -202,6 +202,37 @@ pub fn commit_wide_folder(root: &Path, count: usize, branch: &str) {
     git(root, &["update-ref", branch, &commit]);
 }
 
+/// Commits a symbolic link at `path` naming `target`, in place of the entry
+/// the commit `branch` names holds there, on top of that commit, and moves
+/// `branch` to it. `path` is one entry of the root tree, so it holds no `/`.
+///
+/// The tree is written through git plumbing, so the link never touches the
+/// host filesystem and the fixture builds alike on a platform where creating
+/// a symbolic link needs a privilege.
+///
+/// # Panics
+///
+/// Panics when git cannot run or exits nonzero.
+pub fn commit_symlink_in_place(root: &Path, path: &str, target: &str, branch: &str) {
+    let link = plumb(root, &["hash-object", "-w", "--stdin"], target.as_bytes());
+    let parent = plumb(root, &["rev-parse", branch], b"");
+    let parent_tree = plumb(root, &["rev-parse", &format!("{parent}^{{tree}}")], b"");
+    let listing = plumb(root, &["ls-tree", &parent_tree], b"");
+    let replaced = format!("\t{path}");
+    let mut entries = String::new();
+    for entry in listing.lines().filter(|entry| !entry.ends_with(&replaced)) {
+        writeln!(entries, "{entry}").expect("a String takes every write");
+    }
+    writeln!(entries, "120000 blob {link}\t{path}").expect("a String takes every write");
+    let tree = plumb(root, &["mktree"], entries.as_bytes());
+    let commit = plumb(
+        root,
+        &["commit-tree", &tree, "-p", &parent, "-m", "link in place"],
+        b"",
+    );
+    git(root, &["update-ref", branch, &commit]);
+}
+
 /// Commits one blob at a raw byte path, reachable as the ref `branch`.
 ///
 /// The tree is built through git plumbing, so the path never touches the

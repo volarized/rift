@@ -433,9 +433,10 @@ impl Repository {
     /// tracking" (`gix-diff-0.66.0/src/tree/function.rs:23`), so a file that
     /// moved is one deletion beside one addition; pairing the two back up is
     /// the caller's decision, taken over the declarations inside them.
-    /// Symbolic links and submodules are never listed, and a committed path
-    /// whose bytes are not UTF-8 names no readable file, so the comparison
-    /// passes over it.
+    /// A path that is a symbolic link or a submodule on both sides is never
+    /// listed; one that held a file on either side is, so a file replaced by
+    /// a link is listed as the file's deletion. A committed path whose bytes
+    /// are not UTF-8 names no readable file, so the comparison passes over it.
     ///
     /// The walk stops once `paths_max` paths pass `includes` and reports
     /// itself truncated, so one comparison's work stays proportional to that
@@ -691,13 +692,21 @@ pub(crate) struct RecordedChange {
 }
 
 impl RecordedChange {
-    /// The change one visited tree difference names at `path`: an entry
-    /// that is no blob on a side holds no blob id there.
-    fn of(path: String, change: &gix::diff::tree::visit::Change) -> Self {
+    /// The blob id each side of one visited tree difference holds: an entry
+    /// that is no blob on a side - a tree, a symbolic link, a submodule -
+    /// holds none there.
+    ///
+    /// Each side is read from its own mode. gix reports a file turned into a
+    /// link as one modification, "turning a file into a symbolic link adjusts
+    /// its mode" (`gix-diff-0.66.0/src/tree/visit.rs:43`), and
+    /// `Change::entry_mode` answers the new side's mode alone.
+    fn blob_sides(
+        change: &gix::diff::tree::visit::Change,
+    ) -> (Option<gix::ObjectId>, Option<gix::ObjectId>) {
         use gix::diff::tree::visit::Change;
         let blob =
             |mode: gix::objs::tree::EntryMode, id: gix::ObjectId| mode.is_blob().then_some(id);
-        let (old, new) = match change {
+        match change {
             Change::Addition {
                 entry_mode, oid, ..
             } => (None, blob(*entry_mode, *oid)),
@@ -713,8 +722,7 @@ impl RecordedChange {
                 blob(*previous_entry_mode, *previous_oid),
                 blob(*entry_mode, *oid),
             ),
-        };
-        Self { path, old, new }
+        }
     }
 }
 
@@ -798,9 +806,11 @@ impl gix::diff::tree::Visit for ChangedPathRecorder<'_> {
     }
 
     fn visit(&mut self, change: gix::diff::tree::visit::Change) -> ChangeVisitAction {
-        if !change.entry_mode().is_blob() {
-            // A tree added or deleted whole is announced before its blobs,
-            // which the walk goes on to announce one by one.
+        let (old, new) = RecordedChange::blob_sides(&change);
+        if old.is_none() && new.is_none() {
+            // Neither side holds a file: a tree added or deleted whole is
+            // announced before its blobs, which the walk goes on to announce
+            // one by one, and a link or submodule holds no bytes to compare.
             return std::ops::ControlFlow::Continue(());
         }
         let Some(path) = self.accepted(self.inner.path()) else {
@@ -810,7 +820,7 @@ impl gix::diff::tree::Visit for ChangedPathRecorder<'_> {
             self.truncated = true;
             return std::ops::ControlFlow::Break(());
         }
-        self.changes.push(RecordedChange::of(path, &change));
+        self.changes.push(RecordedChange { path, old, new });
         std::ops::ControlFlow::Continue(())
     }
 }

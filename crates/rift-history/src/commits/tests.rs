@@ -33,6 +33,21 @@ fn head_of(repository: &Repository) -> crate::ResolvedRevision {
     repository.resolve("HEAD").expect("head")
 }
 
+/// The `(path, has old blob, has new blob)` triple of every changed path.
+fn sides(changed: &super::ChangedBlobs) -> Vec<(&str, bool, bool)> {
+    changed
+        .blobs()
+        .iter()
+        .map(|blob| {
+            (
+                blob.path(),
+                blob.old_blob().is_some(),
+                blob.new_blob().is_some(),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn a_first_parent_window_lists_the_newest_commits_with_their_parents() {
     let directory = three_commits();
@@ -107,19 +122,8 @@ fn changed_blobs_name_each_side_of_every_changed_path() {
     let moved = repository
         .changed_blobs(Some(&middle), &head, &|_| true, 16)
         .expect("changes");
-    let paths: Vec<(&str, bool, bool)> = moved
-        .blobs()
-        .iter()
-        .map(|blob| {
-            (
-                blob.path(),
-                blob.old_blob().is_some(),
-                blob.new_blob().is_some(),
-            )
-        })
-        .collect();
     assert_eq!(
-        paths,
+        sides(&moved),
         [("gone.rs", true, false), ("sub/moved.rs", false, true)]
     );
     assert!(!moved.is_truncated());
@@ -217,18 +221,38 @@ fn changed_blobs_list_a_blob_that_replaced_a_folder_beside_the_folders_files() {
         .changed_blobs(Some(&folder), &head, &|_| true, 16)
         .expect("changes");
 
-    let sides: Vec<(&str, bool, bool)> = changed
-        .blobs()
-        .iter()
-        .map(|blob| {
-            (
-                blob.path(),
-                blob.old_blob().is_some(),
-                blob.new_blob().is_some(),
-            )
-        })
-        .collect();
-    assert_eq!(sides, [("sub", false, true), ("sub/moved.rs", true, false)]);
+    assert_eq!(
+        sides(&changed),
+        [("sub", false, true), ("sub/moved.rs", true, false)]
+    );
+}
+
+#[test]
+fn a_file_a_symbolic_link_replaced_is_listed_with_the_files_blob_alone() {
+    let directory = three_commits();
+    let root = directory.path();
+    crate::fixture::commit_symlink_in_place(root, "lib.rs", "sub/moved.rs", "refs/heads/main");
+    let repository = Repository::open(root).expect("repository");
+    let link = head_of(&repository);
+    let file = repository.resolve("HEAD~1").expect("the file's commit");
+
+    let replaced = repository
+        .changed_blobs(Some(&file), &link, &|_| true, 16)
+        .expect("changes");
+    let restored = repository
+        .changed_blobs(Some(&link), &file, &|_| true, 16)
+        .expect("changes");
+    let listed = repository
+        .changed_files(&file, &link, &|_| true, 16)
+        .expect("changes");
+
+    assert_eq!(
+        sides(&replaced),
+        [("lib.rs", true, false)],
+        "the link holds no blob, so the file reads as deleted"
+    );
+    assert_eq!(sides(&restored), [("lib.rs", false, true)]);
+    assert_eq!(listed.paths(), ["lib.rs"]);
 }
 
 #[test]
