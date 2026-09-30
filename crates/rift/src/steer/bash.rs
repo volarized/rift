@@ -734,7 +734,7 @@ mod tests {
             r"grep -rn --binary-files=text x .",
             r#"grep -rn "a\d" ."#,
             r#"grep -rn "a^b" ."#,
-            r#"grep -rn "a$b" ."#,
+            r"grep -rn 'a$b' .",
             r#"grep -rn "[[.a.]]" ."#,
             r#"grep -rn "[a--b]" ."#,
             r#"grep -rn "[abc" ."#,
@@ -798,6 +798,21 @@ y" ."#,
                     "type": "py"
                 }),
                 &["."]
+            )
+        );
+    }
+
+    #[test]
+    fn rg_takes_the_flags_it_shares_with_grep_and_ignores_with_filename() {
+        assert_eq!(
+            bash_search("rg --ignore-case --word-regexp -H Load src"),
+            grep(
+                &json!({
+                    "pattern": r"\b{start-half}(?:Load)\b{end-half}",
+                    "-i": true,
+                    "output_mode": "content"
+                }),
+                &["src"]
             )
         );
     }
@@ -872,6 +887,10 @@ y" ."#,
                 &json!({"pattern": r"a\.b\(", "output_mode": "content"}),
                 &["."]
             )
+        );
+        assert_eq!(
+            bash_search(r"grep -r 'a\/b' ."),
+            grep(&json!({"pattern": "a/b", "output_mode": "content"}), &["."])
         );
         assert_eq!(
             bash_search(r#"grep -rG "[^]a&~]" ."#),
