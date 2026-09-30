@@ -1,7 +1,7 @@
 //! Extracts range metadata from selected source owners and existing syntax facts.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rift_core::line::{line_of, line_starts, lines_inclusive};
@@ -60,7 +60,7 @@ pub fn collect_documentation_incremental(
         return Err(refused(DocumentationViolation::LimitExceeded, "references"));
     }
     let attached = attached_declaration_facts(declarations);
-    let (mut output, cache) = collect_source_facts(previous, sources, declarations, &attached)?;
+    let (mut output, cache) = collect_source_facts(previous, sources, &attached)?;
     let records = sources
         .sources()
         .iter()
@@ -73,6 +73,13 @@ pub fn collect_documentation_incremental(
 /// One source's extraction key and facts: reused from `previous` when the key matches,
 /// extracted otherwise.
 type ExtractedSource = Result<(DocumentationDigest, Arc<Collected>), DocumentationError>;
+type AttachedDeclaration = (
+    rift_protocol::read::SymbolId,
+    rift_protocol::read::TextRange,
+);
+type AttachedDeclarations =
+    BTreeMap<rift_protocol::documentation::DocumentationContentIdentity, Vec<AttachedDeclaration>>;
+type AttachedSymbols = BTreeSet<rift_protocol::read::SymbolId>;
 
 /// Extracts every source's facts, in source order.
 ///
@@ -82,26 +89,21 @@ type ExtractedSource = Result<(DocumentationDigest, Arc<Collected>), Documentati
 fn extract_sources(
     previous: Option<&DocumentationCollection>,
     sources: &[DocumentationInput<'_>],
-    declarations: &[DocumentationDeclaration<'_>],
-    attached: &BTreeMap<
-        rift_protocol::documentation::DocumentationContentIdentity,
-        Vec<(
-            rift_protocol::read::SymbolId,
-            rift_protocol::read::TextRange,
-        )>,
-    >,
+    attached: &AttachedDeclarations,
 ) -> Vec<ExtractedSource> {
     let extract = |input: &DocumentationInput<'_>| -> ExtractedSource {
-        let key = extraction_key(
-            input,
-            attached.get(&input.source().identity).map(Vec::as_slice),
-        )?;
+        let attached = attached
+            .get(&input.source().identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let symbols = attached_symbols(attached);
+        let key = extraction_key(input, attached, &symbols)?;
         let facts = previous
             .and_then(DocumentationCollection::extraction_cache)
             .and_then(|previous| previous.sources.get(&input.source().identity))
             .filter(|cached| cached.key == key)
             .map_or_else(
-                || extract_source_facts(input, declarations),
+                || extract_source_facts(input, &symbols),
                 |cached| Ok(Arc::clone(&cached.facts)),
             )?;
         Ok((key, facts))
@@ -118,18 +120,11 @@ fn extract_sources(
 fn collect_source_facts(
     previous: Option<&DocumentationCollection>,
     sources: &DocumentationSourceSet<'_>,
-    declarations: &[DocumentationDeclaration<'_>],
-    attached: &BTreeMap<
-        rift_protocol::documentation::DocumentationContentIdentity,
-        Vec<(
-            rift_protocol::read::SymbolId,
-            rift_protocol::read::TextRange,
-        )>,
-    >,
+    attached: &AttachedDeclarations,
 ) -> Result<(Collected, ExtractionCache), DocumentationError> {
     let mut output = Collected::default();
     let mut cache = ExtractionCache::default();
-    let extracted = extract_sources(previous, sources.sources(), declarations, attached);
+    let extracted = extract_sources(previous, sources.sources(), attached);
     for (input, extracted) in sources.sources().iter().zip(extracted) {
         let (key, facts) = extracted?;
         if merge_source(input, &mut output, &facts)
@@ -257,15 +252,10 @@ type AttachedSyntaxFacts = Option<(
 
 fn extraction_key(
     input: &DocumentationInput<'_>,
-    attached: Option<
-        &[(
-            rift_protocol::read::SymbolId,
-            rift_protocol::read::TextRange,
-        )],
-    >,
+    attached: &[AttachedDeclaration],
+    symbols: &AttachedSymbols,
 ) -> Result<DocumentationDigest, DocumentationError> {
-    let attached = attached.unwrap_or_default();
-    let syntax_facts = attached_syntax_facts(input, attached)?;
+    let syntax_facts = attached_syntax_facts(input, symbols)?;
     canonical_digest(&(
         input.source(),
         input.chunks(),
@@ -277,16 +267,11 @@ fn extraction_key(
 
 fn attached_syntax_facts(
     input: &DocumentationInput<'_>,
-    attached: &[(
-        rift_protocol::read::SymbolId,
-        rift_protocol::read::TextRange,
-    )],
+    symbols: &AttachedSymbols,
 ) -> Result<AttachedSyntaxFacts, DocumentationError> {
     let Some(syntax) = input.syntax() else {
         return Ok(None);
     };
-    let accepted: std::collections::BTreeSet<_> =
-        attached.iter().map(|(symbol, _)| symbol.clone()).collect();
     let path = super::references::declaration_path(&input.source().identity)?;
     let facts = syntax
         .symbols()
@@ -298,7 +283,7 @@ fn attached_syntax_facts(
                 &symbol.qualified_name,
             );
             let identity = rift_protocol::read::SymbolId(identity);
-            if !accepted.contains(&identity) {
+            if !symbols.contains(&identity) {
                 return None;
             }
             Some((
@@ -316,13 +301,7 @@ fn attached_syntax_facts(
 
 fn attached_declaration_facts(
     declarations: &[DocumentationDeclaration<'_>],
-) -> BTreeMap<
-    rift_protocol::documentation::DocumentationContentIdentity,
-    Vec<(
-        rift_protocol::read::SymbolId,
-        rift_protocol::read::TextRange,
-    )>,
-> {
+) -> AttachedDeclarations {
     let mut attached = BTreeMap::new();
     for declaration in declarations {
         attached
@@ -338,12 +317,16 @@ fn attached_declaration_facts(
     attached
 }
 
+fn attached_symbols(attached: &[AttachedDeclaration]) -> AttachedSymbols {
+    attached.iter().map(|(symbol, _)| symbol.clone()).collect()
+}
+
 fn extract_source_facts(
     input: &DocumentationInput<'_>,
-    declarations: &[DocumentationDeclaration<'_>],
+    symbols: &AttachedSymbols,
 ) -> Result<Arc<Collected>, DocumentationError> {
     let mut facts = Collected::default();
-    if let Err(error) = extract_source(input, declarations, &mut facts) {
+    if let Err(error) = extract_source(input, symbols, &mut facts) {
         let Some(kind) = recoverable_source_error(input, &error) else {
             return Err(error);
         };
@@ -412,7 +395,7 @@ fn recoverable_source_error(
 
 fn extract_source(
     input: &DocumentationInput<'_>,
-    declarations: &[DocumentationDeclaration<'_>],
+    symbols: &AttachedSymbols,
     output: &mut Collected,
 ) -> Result<(), DocumentationError> {
     use DocumentationSourceFormat as Format;
@@ -421,13 +404,13 @@ fn extract_source(
         Format::Notebook => extract_cell(input, output),
         Format::Text => extract_text(input, output),
         Format::RestructuredText => extract_rst(input, output),
-        Format::AttachedComment => extract_attached_comments(input, declarations, output),
+        Format::AttachedComment => extract_attached_comments(input, symbols, output),
     }
 }
 
 fn extract_attached_comments(
     input: &DocumentationInput<'_>,
-    declarations: &[DocumentationDeclaration<'_>],
+    symbols: &AttachedSymbols,
     output: &mut Collected,
 ) -> Result<(), DocumentationError> {
     let Some(syntax) = input.syntax() else {
@@ -440,11 +423,6 @@ fn extract_attached_comments(
         );
         return Ok(());
     };
-    let accepted = declarations
-        .iter()
-        .filter(|declaration| declaration.source() == &input.source().identity)
-        .map(|declaration| declaration.symbol().clone())
-        .collect::<std::collections::BTreeSet<_>>();
     let path = super::references::declaration_path(&input.source().identity)?;
     let starts = line_starts(input.text());
     let mut ordinals = BTreeMap::new();
@@ -455,7 +433,7 @@ fn extract_attached_comments(
             &symbol.qualified_name,
         );
         let symbol_identity = rift_protocol::read::SymbolId(identity);
-        if !accepted.contains(&symbol_identity) {
+        if !symbols.contains(&symbol_identity) {
             continue;
         }
         for range in &symbol.documentation_ranges {
