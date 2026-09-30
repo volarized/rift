@@ -229,6 +229,17 @@ impl StderrWatch {
     }
 }
 
+/// Reads a foreground child's validated document after it publishes.
+///
+/// A foreground child claims the election before it binds and publishes. This read leaves that
+/// claim alone while the test waits; the document is written only after the transport binds.
+fn published_foreground_document(root: &Path, child_pid: u32) -> Option<ServerLock> {
+    let bytes = fs::read(document_path(root)).ok()?;
+    let lock: ServerLock = serde_json::from_slice(&bytes).ok()?;
+    lock.validate().ok()?;
+    (lock.pid == child_pid).then_some(lock)
+}
+
 /// Waits for the foreground server's document and records what its child reached on failure.
 fn wait_for_foreground_server(
     root: &Path,
@@ -236,7 +247,7 @@ fn wait_for_foreground_server(
     stderr: &StderrWatch,
 ) -> TestResult<ServerLock> {
     match wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
+        published_foreground_document(root, child.id())
     }) {
         Ok(serving) => Ok(serving),
         Err(error) => {
@@ -521,7 +532,7 @@ fn foreground_start_serves_until_stopped_and_exits_cleanly() -> TestResult {
         .spawn()?;
 
     let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
+        published_foreground_document(root, child.id())
     })?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -759,7 +770,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         .stderr(Stdio::piped())
         .spawn()?;
     let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
+        published_foreground_document(root, child.id())
     })?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -809,7 +820,7 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
         .stderr(Stdio::piped())
         .spawn()?;
     let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
+        published_foreground_document(root, child.id())
     })?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
@@ -859,7 +870,7 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
         .stderr(Stdio::piped())
         .spawn()?;
     let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
+        published_foreground_document(root, child.id())
     })?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
