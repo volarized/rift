@@ -185,7 +185,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: tools/rift-release/uv.lock
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           path: dist
           pattern: rift-*
@@ -223,7 +223,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
-      - uses: actions/download-artifact@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: docs-site
           path: docs/dist
