@@ -237,10 +237,11 @@ fn registry_sources(cargo_home: Option<&Path>) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .collect();
     folders.sort();
-    if folders.len() > REGISTRY_SOURCES_MAX {
+    let listed = folders.len();
+    if listed > REGISTRY_SOURCES_MAX {
         tracing::warn!(
             component = "engine",
-            folders = folders.len(),
+            folders = listed,
             bound = REGISTRY_SOURCES_MAX,
             "Cargo registry source folders past the bound address no callee"
         );
