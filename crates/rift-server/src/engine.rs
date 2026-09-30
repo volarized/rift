@@ -1712,6 +1712,15 @@ done
         })
     }
 
+    /// An operation that asks the engine nothing and answers the session's document
+    /// version, so a request runs it on a session without waiting on the engine.
+    #[cfg(unix)]
+    fn document_version(
+        session: &mut EngineSession,
+    ) -> SessionFuture<'_, Result<i32, EngineError>> {
+        Box::pin(async move { Ok(session.document_version()) })
+    }
+
     /// The lines the `logging_slot` engine appended.
     #[cfg(unix)]
     fn engine_log(directory: &Path) -> Vec<String> {
@@ -1816,10 +1825,7 @@ done
         let pool = logging_slot(directory.path(), false, 1);
         let key = LspProcessKey::named("rust");
         let slot = pool.engine_by_key(&key).expect("slot");
-        fn version(session: &mut EngineSession) -> SessionFuture<'_, Result<i32, EngineError>> {
-            Box::pin(async move { Ok(session.document_version()) })
-        }
-        slot.request(version)
+        slot.request(document_version)
             .await
             .expect("the engine answers initialize before it stops reading");
         let opening = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1854,7 +1860,7 @@ done
         assert_eq!(pool.state_for_key(&key), Some(LspState::Failed));
 
         let reopened = slot
-            .request(version)
+            .request(document_version)
             .await
             .expect("a replacement starts within the restart budget");
         assert_eq!(reopened, 0, "the replacement opened nothing");
