@@ -2351,12 +2351,14 @@ mod tests {
     }
 
     /// An engine that announces nothing reads unconfirmed for a walk,
-    /// and quiet once a read lands one settle delay past its first read.
+    /// and quiet once a read lands one settle delay past its first read. A
+    /// record that has read nothing is never quiet.
     #[test]
     fn a_walk_reads_an_engine_that_announces_nothing_as_unconfirmed_and_quiet_after_the_delay() {
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
         let mut record = WorkProgress::default();
+        assert!(!record.walk_is_quiet(TEST_SETTLE_DELAY));
         record.read(at(0));
         assert_eq!(
             record.walk_readiness(TEST_SETTLE_DELAY),

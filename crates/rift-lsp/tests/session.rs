@@ -339,18 +339,26 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
         refusal.name(),
         ErrorName::Wire(ErrorCode::CapabilityUnavailable)
     );
+    let item: lsp_types::CallHierarchyItem = serde_json::from_value(json!({
+        "name": "beacon",
+        "kind": 12,
+        "uri": "file:///src/lib.rs",
+        "range": zero_range(),
+        "selectionRange": zero_range(),
+    }))
+    .expect("a call hierarchy item");
+    let origin = Position {
+        line: 0,
+        character: 0,
+    };
     for absent in [
         session.pull_diagnostics(&document).await.err(),
+        session.references(&document, origin).await.err(),
         session
-            .references(
-                &document,
-                Position {
-                    line: 0,
-                    character: 0,
-                },
-            )
+            .prepare_call_hierarchy(&document, origin)
             .await
             .err(),
+        session.outgoing_calls(item).await.err(),
     ] {
         let error = absent.expect("the capability gate refuses");
         assert!(matches!(
@@ -607,6 +615,46 @@ async fn payload_without_an_envelope_ends_the_session() {
     assert!(matches!(error.fault(), EngineFault::MessageUnreadable));
     session.shutdown().await;
     join(engine_task).await;
+}
+
+/// A message the wait between two attempts cannot read ends the session there, as it
+/// does inside an exchange.
+#[tokio::test]
+async fn payload_without_an_envelope_during_a_wait_ends_the_session() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine.send(&json!({"jsonrpc": "2.0"})).await;
+    })
+    .await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    let error = Box::pin(session.read_output(until, |_session| false))
+        .await
+        .expect_err("the payload fits no envelope");
+    assert!(matches!(error.fault(), EngineFault::MessageUnreadable));
+    assert!(session.is_ended(), "an unreadable message ends the session");
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// An engine that closes its side while the session waits between two attempts ends the
+/// session, and the wait reports the closed connection.
+#[tokio::test]
+async fn engine_closing_its_side_during_a_wait_ends_the_session() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+    })
+    .await;
+    join(engine_task).await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    let error = Box::pin(session.read_output(until, |_session| false))
+        .await
+        .expect_err("the engine closed its side");
+    assert!(
+        matches!(error.fault(), EngineFault::ConnectionClosed { .. }),
+        "{error}"
+    );
+    assert!(session.is_ended(), "a closed connection ends the session");
+    session.shutdown().await;
 }
 
 /// The engine delays its answer past the caller's own cancellation, and a
