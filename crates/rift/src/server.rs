@@ -1,9 +1,10 @@
 //! `rift server` lifecycle commands over the workspace election.
 //!
 //! `start` spawns a detached `rift server start --foreground` and waits for
-//! its published lock document, unless a server is already serving or still
-//! building; `stop` asks the recorded server to shut down over its own stop
-//! route; `restart` chains the two; `status` prints one probe's
+//! its published lock document, unless a server is already serving; a server
+//! still building gets the same wait with nothing spawned; `stop` asks the
+//! recorded server to shut down over its own stop route; `restart` chains
+//! the two; `status` prints one probe's
 //! classification and changes nothing. Every wait is a bounded poll over
 //! [`rift_mcp::probe`] and, when stopping, the original process handle.
 //! The election module itself never polls.
@@ -529,8 +530,12 @@ fn stale_reason_phrase(reason: &StaleReason) -> String {
 /// waits for it.
 ///
 /// Repeats are idempotent: an already-serving workspace answers with the
-/// running server's address and starts nothing, and a workspace whose
-/// server is still building answers that it is starting. A server that
+/// running server's address and starts nothing. A workspace whose server
+/// another start elected and is still building spawns nothing either: the
+/// start waits for that server's document within the window a spawning start
+/// waits, answers with its address once it serves, and answers that it is
+/// starting when the window runs out first. Concurrent starts therefore name
+/// the same server, whichever of them spawned it. A server that
 /// stopped answering its port is on its way out: the start waits for it to
 /// release the election, bounded by `stop_attempt_count` probes and the
 /// [`poll_window`] they span, before electing a fresh one. The commands pass
@@ -539,27 +544,31 @@ async fn start_detached(
     root: &Path,
     stop_attempt_count: u32,
 ) -> Result<ServerOutcome, ServerCommandError> {
-    match probe(root) {
+    let holder_building = match probe(root) {
         ServerPresence::Serving(lock) => {
             return Ok(ServerOutcome::AlreadyListening {
                 port: lock.port,
                 pid: lock.pid,
             });
         }
-        ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
+        // A spawn under a held election only loses it.
+        ServerPresence::Starting => true,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
             await_election_released(root, pid, stop_attempt_count).await?;
+            false
         }
-        ServerPresence::Stale(_) | ServerPresence::Absent => {}
-    }
+        ServerPresence::Stale(_) | ServerPresence::Absent => false,
+    };
     // A stale document keeps its bytes until the elected child scrubs it.
     // Remember them so the wait below never answers with the old document
     // read in the instant the child already holds the election.
     let stale_bytes = std::fs::read(rift_mcp::document_path(root)).ok();
     let mut spawns = StartSpawns::default();
-    spawns
-        .spawn(|| spawn_detached_server(root))
-        .map_err(spawn_failed)?;
+    if !holder_building {
+        spawns
+            .spawn(|| spawn_detached_server(root))
+            .map_err(spawn_failed)?;
+    }
     await_serving(
         root,
         START_POLL_ATTEMPT_COUNT,
@@ -2393,15 +2402,48 @@ mod tests {
         Ok(())
     }
 
-    /// A holder that has not published yet is a server still building: the start
-    /// answers that it is starting and spawns nothing.
-    #[tokio::test]
-    async fn start_reports_a_building_holder_as_starting() -> TestResult {
+    /// A holder that has not published yet is a server another start elected, still
+    /// building: the start spawns nothing and waits for that server's document, as the
+    /// start that spawned it does, then answers with the published address. The start's
+    /// first probe runs before the paused clock moves, so it always finds the holder
+    /// unpublished.
+    #[tokio::test(start_paused = true)]
+    async fn start_waits_for_a_building_holder_and_answers_with_its_address() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let guard = rift_mcp::claim(directory.path())?;
+        let (_listener, port) = answering_port()?;
+        let published = holder_on(port);
+        let publish = async {
+            tokio::time::sleep(PRESENCE_POLL_INTERVAL * 2).await;
+            guard.publish(&published).expect("the holder must publish");
+        };
+        let start = start_detached(directory.path(), STOP_POLL_ATTEMPT_COUNT);
+        let (outcome, ()) = tokio::join!(start, publish);
+        let expected = ServerOutcome::Listening {
+            port,
+            pid: published.pid,
+        };
+        assert_eq!(outcome?, expected);
+        Ok(())
+    }
+
+    /// A holder that publishes nothing within the start window is still building when
+    /// the window runs out: the start answers that it is starting, with no pid of its
+    /// own, and only once the whole window has passed.
+    #[tokio::test(start_paused = true)]
+    async fn start_reports_a_building_holder_as_starting_once_the_window_runs_out() -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = rift_mcp::claim(directory.path())?;
+        let began = tokio::time::Instant::now();
         assert_eq!(
             start_detached(directory.path(), STOP_POLL_ATTEMPT_COUNT).await?,
             ServerOutcome::Starting { pid: None }
+        );
+        let waited = began.elapsed();
+        assert!(
+            waited >= START_WAIT_MAX,
+            "the start must wait the whole start window before answering: waited={waited:?}, \
+             start_wait_max={START_WAIT_MAX:?}"
         );
         Ok(())
     }
