@@ -1527,4 +1527,46 @@ pub(crate) mod tests {
             rift_protocol::read::RelationshipDerivation::Resolution
         );
     }
+
+    /// An indexed call an engine also names is walked once, forward, as the engine's
+    /// confirmation of the indexed edge.
+    #[test]
+    fn confirmed_call_preserves_indexed_evidence_and_one_hit() {
+        let caller = graph_symbol_id("rift://symbol/rust/lib.rs/caller");
+        let target = graph_symbol_id("rift://symbol/rust/lib.rs/target");
+        let store = RelationshipStore::build(&graph_normalized(vec![
+            graph_definition("caller", caller.as_str(), (0, 40)),
+            graph_definition("target", target.as_str(), (40, 80)),
+            graph_reference(
+                "caller_calls_target",
+                graph_binding("lib.rs", 5, 10),
+                rift_core::ReferenceRole::Call,
+                "target",
+            ),
+        ]));
+        let edge = &store.outgoing(&caller)[0];
+        let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Outgoing);
+        let mut confirmed = prior.clone();
+        confirmed.relationship.evidence.clear();
+        let references = crate::EngineReferences::from_outgoing(BTreeMap::from([(
+            caller.clone(),
+            vec![confirmed],
+        )]));
+        let mut request = traversal_request(&caller, 1, vec![RelationshipFacet::Calls]);
+        request.direction = TraversalDirection::Outgoing;
+        let walk = super::walk_traversal_with_references(
+            &store,
+            &caller,
+            &request,
+            TRAVERSAL_NODES_MAX,
+            &references,
+        );
+        assert_eq!(walk.discovered.len(), 1);
+        assert_eq!(walk.discovered[0].0, target);
+        assert_eq!(walk.discovered[0].1[0], prior);
+        assert_eq!(
+            walk.discovered[0].1[0].relationship.derivation,
+            rift_protocol::read::RelationshipDerivation::Resolution
+        );
+    }
 }

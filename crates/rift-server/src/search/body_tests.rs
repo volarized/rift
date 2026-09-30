@@ -177,6 +177,32 @@ async fn a_body_term_answers_the_declarations_holding_it() -> TestResult {
     Ok(())
 }
 
+/// A file row whose bytes no longer sit inside its file answers no declaration: the store
+/// ranked the row for a longer file than the index now holds, and the row stays unmapped.
+#[tokio::test]
+async fn a_file_row_past_its_file_answers_no_declaration() -> TestResult {
+    let written = tempfile::tempdir()?;
+    let longer = service(written.path(), &[("src/lib.rs", BODIES)])?;
+    let store = published(written.path(), &longer).await?;
+    let answer = answered(&store, &longer, "quokka").await?;
+
+    let current = tempfile::tempdir()?;
+    let shorter = service(current.path(), &[("src/lib.rs", "pub fn alpha() {}\n")])?;
+    let symbols = search(
+        &shorter,
+        &answer,
+        json!({"query": "quokka", "target": "symbol"}),
+    )?;
+    assert_eq!(spelled(&symbols), Vec::<String>::new());
+    let everything = search(
+        &shorter,
+        &answer,
+        json!({"query": "quokka", "target": "all"}),
+    )?;
+    assert_eq!(spelled(&everything), ["src/lib.rs"]);
+    Ok(())
+}
+
 /// A direct match keeps its own place before the first file row, and the declarations
 /// the file rows hold follow it, a declaration already placed never twice.
 #[tokio::test]

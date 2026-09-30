@@ -33,7 +33,9 @@ use lsp_types::{FileChangeType, Position};
 use rift_core::{ErrorCode, ErrorName, ProjectPath};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::framing::FramingFault;
-use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineReadiness, EngineSession};
+use rift_lsp::session::{
+    EngineError, EngineFault, EngineLaunch, EngineReadiness, EngineSession, OPEN_DOCUMENTS_MAX,
+};
 use rift_lsp::uri::TreeRoot;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -339,18 +341,26 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
         refusal.name(),
         ErrorName::Wire(ErrorCode::CapabilityUnavailable)
     );
+    let item: lsp_types::CallHierarchyItem = serde_json::from_value(json!({
+        "name": "beacon",
+        "kind": 12,
+        "uri": "file:///src/lib.rs",
+        "range": zero_range(),
+        "selectionRange": zero_range(),
+    }))
+    .expect("a call hierarchy item");
+    let origin = Position {
+        line: 0,
+        character: 0,
+    };
     for absent in [
         session.pull_diagnostics(&document).await.err(),
+        session.references(&document, origin).await.err(),
         session
-            .references(
-                &document,
-                Position {
-                    line: 0,
-                    character: 0,
-                },
-            )
+            .prepare_call_hierarchy(&document, origin)
             .await
             .err(),
+        session.outgoing_calls(item).await.err(),
     ] {
         let error = absent.expect("the capability gate refuses");
         assert!(matches!(
@@ -609,6 +619,46 @@ async fn payload_without_an_envelope_ends_the_session() {
     join(engine_task).await;
 }
 
+/// A message the wait between two attempts cannot read ends the session there, as it
+/// does inside an exchange.
+#[tokio::test]
+async fn payload_without_an_envelope_during_a_wait_ends_the_session() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        engine.send(&json!({"jsonrpc": "2.0"})).await;
+    })
+    .await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    let error = Box::pin(session.read_output(until, |_session| false))
+        .await
+        .expect_err("the payload fits no envelope");
+    assert!(matches!(error.fault(), EngineFault::MessageUnreadable));
+    assert!(session.is_ended(), "an unreadable message ends the session");
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// An engine that closes its side while the session waits between two attempts ends the
+/// session, and the wait reports the closed connection.
+#[tokio::test]
+async fn engine_closing_its_side_during_a_wait_ends_the_session() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+    })
+    .await;
+    join(engine_task).await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    let error = Box::pin(session.read_output(until, |_session| false))
+        .await
+        .expect_err("the engine closed its side");
+    assert!(
+        matches!(error.fault(), EngineFault::ConnectionClosed { .. }),
+        "{error}"
+    );
+    assert!(session.is_ended(), "a closed connection ends the session");
+    session.shutdown().await;
+}
+
 /// The engine delays its answer past the caller's own cancellation, and a
 /// later request on the same session settles and discards it.
 #[tokio::test]
@@ -646,6 +696,10 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
         cancelled.is_err(),
         "the caller cancels before the delayed answer"
     );
+    assert!(
+        session.is_intact(),
+        "a request dropped while it waits for its answer leaves the session intact"
+    );
     let prepared = session
         .references(
             &document,
@@ -658,6 +712,138 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
         .expect("the stale request response is settled and discarded");
     assert!(!prepared.is_empty());
     session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// The session records each document it opened and has not closed, and
+/// `close_open_documents` sends `didClose` for exactly those, once: a document
+/// already closed is not closed again, and a second call sends nothing.
+#[tokio::test]
+async fn open_documents_are_recorded_and_closed_once_on_request() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        let mut methods_and_uris = Vec::new();
+        for _message in 0..4 {
+            let message = engine.next_message().await;
+            methods_and_uris.push((
+                message["method"].as_str().expect("method").to_owned(),
+                message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .expect("uri")
+                    .rsplit('/')
+                    .next()
+                    .expect("file name")
+                    .to_owned(),
+            ));
+        }
+        assert_eq!(
+            methods_and_uris,
+            [
+                ("textDocument/didOpen".to_owned(), "a.rs".to_owned()),
+                ("textDocument/didOpen".to_owned(), "b.rs".to_owned()),
+                ("textDocument/didClose".to_owned(), "a.rs".to_owned()),
+                ("textDocument/didClose".to_owned(), "b.rs".to_owned()),
+            ]
+        );
+        let (id, _params) = engine.expect_request("textDocument/references").await;
+        engine.respond(&id, json!([])).await;
+        let (id, _params) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    let (first, second) = (path("src/a.rs"), path("src/b.rs"));
+    session
+        .open(&first, "rust", "fn a() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+    session
+        .open(&second, "rust", "fn b() {}\n".to_owned())
+        .await
+        .expect("didOpen is sent");
+    session.close(&first).await.expect("didClose is sent");
+    session
+        .close_open_documents()
+        .await
+        .expect("the one document still open is closed");
+    session
+        .close_open_documents()
+        .await
+        .expect("nothing is left to close");
+    assert!(session.is_intact());
+    session
+        .references(
+            &second,
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .await
+        .expect("the next message the engine reads is this request");
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
+/// A frame dropped while it is being written to an engine that stopped reading
+/// leaves the session not intact: the engine may hold part of the frame.
+#[tokio::test]
+async fn a_frame_dropped_mid_write_leaves_the_session_not_intact() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        std::future::pending::<()>().await;
+    })
+    .await;
+    assert!(session.is_intact(), "the handshake left no frame in flight");
+    let document = path("src/lib.rs");
+    let cut = tokio::time::timeout(
+        Duration::from_millis(200),
+        session.open(&document, "rust", "x".repeat(1 << 20)),
+    )
+    .await;
+    assert!(
+        cut.is_err(),
+        "the full transport holds the write past the timer"
+    );
+    assert!(
+        !session.is_intact(),
+        "a frame cut mid-write leaves the session not intact"
+    );
+    engine_task.abort();
+}
+
+/// Past `OPEN_DOCUMENTS_MAX` open documents the record is incomplete, so the
+/// session no longer reads as intact: it could not close every document it opened.
+#[tokio::test]
+async fn a_document_opened_past_the_record_bound_leaves_the_session_not_intact() {
+    let (_workspace, mut session, engine_task) = started(|mut engine| async move {
+        engine.handshake(full_capabilities()).await;
+        for _document in 0..=OPEN_DOCUMENTS_MAX {
+            let opened = engine.next_message().await;
+            assert_eq!(
+                opened["method"],
+                json!("textDocument/didOpen"),
+                "{opened:#}"
+            );
+        }
+    })
+    .await;
+    for index in 0..OPEN_DOCUMENTS_MAX {
+        let document = path(&format!("src/f{index}.rs"));
+        session
+            .open(&document, "rust", String::new())
+            .await
+            .expect("didOpen is sent");
+    }
+    assert!(session.is_intact(), "every open document is on record");
+    session
+        .open(&path("src/past.rs"), "rust", String::new())
+        .await
+        .expect("didOpen is sent past the record bound");
+    assert!(
+        !session.is_intact(),
+        "a document past the record bound goes unrecorded"
+    );
     join(engine_task).await;
 }
 

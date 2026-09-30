@@ -720,13 +720,11 @@ mod tests {
         let path = directory.path().join("db");
         let unmapped = WorkspaceDatabase::open(&path, pool()).await?;
         let mut reading = unmapped.connection().await?;
-        crate::lexical::require_pragma_row(
-            &toasty::sql::query("PRAGMA mmap_size")
-                .column_types([Type::I64])
-                .exec(&mut reading)
-                .await?,
-            &[Value::I64(0)],
-        )?;
+        let unmapped_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        crate::lexical::require_pragma_row(&unmapped_size, &[Value::I64(0)])?;
         drop(reading);
         drop(unmapped);
 
@@ -734,23 +732,19 @@ mod tests {
         assert_eq!(mapped_pool.mmap_bytes(), 1 << 20);
         let database = WorkspaceDatabase::open(&path, mapped_pool).await?;
         let mut reading = database.connection().await?;
-        crate::lexical::require_pragma_row(
-            &toasty::sql::query("PRAGMA mmap_size")
-                .column_types([Type::I64])
-                .exec(&mut reading)
-                .await?,
-            &[Value::I64(1 << 20)],
-        )?;
+        let read_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut reading)
+            .await?;
+        crate::lexical::require_pragma_row(&read_size, &[Value::I64(1 << 20)])?;
         drop(reading);
         let mut writing = database.writing().await?;
         let mut transaction = writing.transaction().await?;
-        crate::lexical::require_pragma_row(
-            &toasty::sql::query("PRAGMA mmap_size")
-                .column_types([Type::I64])
-                .exec(&mut transaction)
-                .await?,
-            &[Value::I64(1 << 20)],
-        )?;
+        let written_size = toasty::sql::query("PRAGMA mmap_size")
+            .column_types([Type::I64])
+            .exec(&mut transaction)
+            .await?;
+        crate::lexical::require_pragma_row(&written_size, &[Value::I64(1 << 20)])?;
         transaction.rollback().await?;
         Ok(())
     }

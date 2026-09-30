@@ -548,6 +548,7 @@ pub(super) mod tests {
             (json!({"head_limit": 50, "offset": 30}), None),
             (json!({"head_limit": 0, "offset": 10}), None),
             (json!({"head_limit": -1}), None),
+            (json!({"head_limit": true}), None),
         ];
         for (paging, expected) in cases {
             let mut input = paging.clone();

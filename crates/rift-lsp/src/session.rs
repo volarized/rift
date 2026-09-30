@@ -8,9 +8,12 @@
 //! any work at all. Every wait is bounded by a timeout, and an engine that
 //! overstays one is killed and reaped - a child is never left unobserved.
 //! The child starts from the environment the server inherited, with the
-//! launch's `environment` entries laid on top.
+//! launch's `environment` entries laid on top. The session records the
+//! documents it holds open and whether a frame is part-written, so a holder
+//! whose exchange was dropped midway can tell whether the session still
+//! serves ([`EngineSession::is_intact`]).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -60,6 +63,17 @@ const PUBLISHED_DOCUMENTS_MAX: usize = 64;
 
 /// Maximum diagnostics retained per document; later entries are dropped.
 const DOCUMENT_DIAGNOSTICS_MAX: usize = 256;
+
+/// Maximum documents the session records as opened and not yet closed.
+///
+/// A holder opens the documents one exchange asks about and closes them before the
+/// exchange returns, and it closes what a dropped exchange left open before the next
+/// one begins ([`EngineSession::close_open_documents`]), so a live session holds the
+/// documents of at most two exchanges: the running one and the one a drop left behind.
+/// The bound leaves room for exchanges that open several. A document opened past it
+/// goes unrecorded, and the session stops reading as intact
+/// ([`EngineSession::is_intact`]), since it can no longer close everything it opened.
+pub const OPEN_DOCUMENTS_MAX: usize = 64;
 
 /// Maximum `workspace/configuration` items answered with `null` each.
 const CONFIGURATION_ITEMS_MAX: usize = 256;
@@ -650,6 +664,9 @@ pub struct EngineSession {
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
+    open_documents: BTreeSet<ProjectPath>,
+    open_documents_unrecorded: bool,
+    frame_in_flight: bool,
     ended: bool,
 }
 
@@ -784,6 +801,9 @@ impl EngineSession {
             empty_answers: EmptyAnswers::default(),
             watched_file_watchers: Vec::new(),
             document_version: 0,
+            open_documents: BTreeSet::new(),
+            open_documents_unrecorded: false,
+            frame_in_flight: false,
             ended: false,
         };
         if let Err(error) = session
@@ -826,6 +846,20 @@ impl EngineSession {
     #[must_use]
     pub fn is_ended(&self) -> bool {
         self.ended
+    }
+
+    /// Whether the session can serve another exchange after one was dropped midway.
+    ///
+    /// Three facts hold: the engine still runs, no frame is left part-written on
+    /// its input, and every document the session holds open is on record, so
+    /// [`EngineSession::close_open_documents`] can close it. A dropped request
+    /// leaves its response pending, and the next exchange discards that response
+    /// when it arrives. A frame cut while it was being written leaves the engine
+    /// reading the next frame as the rest of the cut one, and no later exchange can
+    /// repair that.
+    #[must_use]
+    pub fn is_intact(&self) -> bool {
+        !self.ended && !self.frame_in_flight && !self.open_documents_unrecorded
     }
 
     /// Whether the engine began work-done progress it has not ended.
@@ -916,6 +950,9 @@ impl EngineSession {
 
     /// Opens one document with the text the caller hands in.
     ///
+    /// The session records the document as open once the notification is
+    /// written, and [`EngineSession::close`] removes it from the record.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] when the session ended or the engine's side
@@ -923,8 +960,10 @@ impl EngineSession {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future may leave the notification unsent; the engine's
-    /// document state is then unknown and the next operation still runs.
+    /// The notification is written in one frame. Dropping the future while that
+    /// frame is being written leaves the session not intact
+    /// ([`EngineSession::is_intact`]); the document is recorded open only once the
+    /// frame is written.
     pub async fn open(
         &mut self,
         path: &ProjectPath,
@@ -941,7 +980,19 @@ impl EngineSession {
                 text,
             },
         };
-        self.notify::<DidOpenTextDocument>(&params).await
+        self.notify::<DidOpenTextDocument>(&params).await?;
+        self.record_open(path);
+        Ok(())
+    }
+
+    /// Records `path` as opened, or marks the record incomplete past
+    /// [`OPEN_DOCUMENTS_MAX`].
+    fn record_open(&mut self, path: &ProjectPath) {
+        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(path) {
+            self.open_documents_unrecorded = true;
+            return;
+        }
+        self.open_documents.insert(path.clone());
     }
 
     /// Closes one previously opened document.
@@ -953,15 +1004,45 @@ impl EngineSession {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future may leave the notification unsent; the engine's
-    /// document state is then unknown and the next operation still runs.
+    /// The notification is written in one frame. Dropping the future while that
+    /// frame is being written leaves the session not intact
+    /// ([`EngineSession::is_intact`]); the document stays recorded open until the
+    /// frame is written, so [`EngineSession::close_open_documents`] closes it again.
     pub async fn close(&mut self, path: &ProjectPath) -> Result<(), EngineError> {
         let params = DidCloseTextDocumentParams {
             text_document: TextDocumentIdentifier {
                 uri: self.document_uri(path)?,
             },
         };
-        self.notify::<DidCloseTextDocument>(&params).await
+        self.notify::<DidCloseTextDocument>(&params).await?;
+        self.open_documents.remove(path);
+        Ok(())
+    }
+
+    /// Closes every document the session records as open, in path order.
+    ///
+    /// A holder calls this before an exchange begins, so documents an earlier,
+    /// dropped exchange opened and never closed stop holding the engine to the
+    /// bytes that exchange sent: while a document is open, the engine takes its
+    /// content from the session and not from disk. With nothing recorded, nothing
+    /// is sent. At most [`OPEN_DOCUMENTS_MAX`] notifications go out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the session ended or the engine's side of the
+    /// connection broke.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future leaves every document not yet closed on record, so a
+    /// later call closes it; one dropped while a frame is being written leaves the
+    /// session not intact ([`EngineSession::is_intact`]).
+    pub async fn close_open_documents(&mut self) -> Result<(), EngineError> {
+        let open: Vec<ProjectPath> = self.open_documents.iter().cloned().collect();
+        for path in &open {
+            self.close(path).await?;
+        }
+        Ok(())
     }
 
     /// The locations the engine names for the declaration at one position, its own
@@ -980,7 +1061,8 @@ impl EngineSession {
     /// # Cancel safety
     ///
     /// Dropping the future leaves the request pending; a later call discards the engine's
-    /// stale response.
+    /// stale response. Dropped while the request's frame is being written, it leaves the
+    /// session not intact ([`EngineSession::is_intact`]).
     pub async fn references(
         &mut self,
         path: &ProjectPath,
@@ -1013,7 +1095,8 @@ impl EngineSession {
     /// # Cancel safety
     ///
     /// Dropping the future leaves the request pending; a later call discards
-    /// the engine's stale response.
+    /// the engine's stale response. Dropped while the request's frame is being
+    /// written, it leaves the session not intact ([`EngineSession::is_intact`]).
     pub async fn prepare_call_hierarchy(
         &mut self,
         path: &ProjectPath,
@@ -1042,7 +1125,8 @@ impl EngineSession {
     /// # Cancel safety
     ///
     /// Dropping the future leaves the request pending; a later call discards
-    /// the engine's stale response.
+    /// the engine's stale response. Dropped while the request's frame is being
+    /// written, it leaves the session not intact ([`EngineSession::is_intact`]).
     pub async fn outgoing_calls(
         &mut self,
         item: CallHierarchyItem,
@@ -1085,7 +1169,10 @@ impl EngineSession {
     ///
     /// # Cancel safety
     ///
-    /// Cancel safe: a stream read that did not complete read nothing.
+    /// Cancel safe: a stream read that did not complete read nothing. The wait
+    /// also answers requests the engine sends, and one dropped while such an
+    /// answer's frame is being written leaves the session not intact
+    /// ([`EngineSession::is_intact`]).
     pub async fn read_output(
         &mut self,
         until: Instant,
@@ -1176,7 +1263,9 @@ impl EngineSession {
     /// # Cancel safety
     ///
     /// Dropping the future leaves the request pending; a later call
-    /// discards the engine's stale response.
+    /// discards the engine's stale response. Dropped while the request's frame
+    /// is being written, it leaves the session not intact
+    /// ([`EngineSession::is_intact`]).
     pub async fn pull_diagnostics(
         &mut self,
         path: &ProjectPath,
@@ -1261,9 +1350,10 @@ impl EngineSession {
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future may leave the notification unsent; the engine's
-    /// view of the changed paths is then unknown and the next operation
-    /// still runs.
+    /// The batch is written in one frame, the only point where the future
+    /// waits. Dropping the future while that frame is being written leaves the
+    /// session not intact ([`EngineSession::is_intact`]), and the engine's view
+    /// of the changed paths is then unknown.
     pub async fn notify_changed_paths(
         &mut self,
         paths: &[(ProjectPath, FileChangeType)],
@@ -1522,6 +1612,12 @@ impl EngineSession {
     }
 
     /// Frames and writes one payload to the engine's stdin.
+    ///
+    /// The frame counts as in flight from before its first byte until the flush
+    /// returns, so a caller that drops the write partway leaves the session not
+    /// intact ([`EngineSession::is_intact`]): the engine may hold part of the frame,
+    /// and its framing would read the next frame's bytes as the rest of this one. A
+    /// failed write leaves the frame in flight too, and the caller ends the session.
     async fn write_payload(&mut self, payload: Vec<u8>, method: &str) -> Result<(), EngineError> {
         let closed = || {
             Error::new(EngineFault::ConnectionClosed {
@@ -1529,8 +1625,11 @@ impl EngineSession {
             })
         };
         let framed = Framing::frame(&payload);
+        self.frame_in_flight = true;
         self.stdin.write_all(&framed).await.map_err(|_| closed())?;
-        self.stdin.flush().await.map_err(|_| closed())
+        self.stdin.flush().await.map_err(|_| closed())?;
+        self.frame_in_flight = false;
+        Ok(())
     }
 
     /// Records the two notifications the session keeps state for; every
@@ -2351,12 +2450,14 @@ mod tests {
     }
 
     /// An engine that announces nothing reads unconfirmed for a walk,
-    /// and quiet once a read lands one settle delay past its first read.
+    /// and quiet once a read lands one settle delay past its first read. A
+    /// record that has read nothing is never quiet.
     #[test]
     fn a_walk_reads_an_engine_that_announces_nothing_as_unconfirmed_and_quiet_after_the_delay() {
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
         let mut record = WorkProgress::default();
+        assert!(!record.walk_is_quiet(TEST_SETTLE_DELAY));
         record.read(at(0));
         assert_eq!(
             record.walk_readiness(TEST_SETTLE_DELAY),
