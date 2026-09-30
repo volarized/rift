@@ -3653,10 +3653,9 @@ mod tests {
 
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("wide.rs"), "pub fn wide() {}\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
-        )?;
+        let configuration =
+            "[providers.syntax]\nmax_file = \"1b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
+        super::hermetic_workspace(directory.path(), configuration)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
         let result = get_symbol(&server, "wide").await?;
         assert!(result.hits.is_empty());
@@ -3755,10 +3754,9 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("lib.rs");
         fs::write(&path, "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n",
-        )?;
+        let configuration =
+            "[providers.syntax]\nmax_file = \"60b\"\n\n[search.text]\nlarge_files = \"skip\"\n";
+        super::hermetic_workspace(directory.path(), configuration)?;
         let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let oversized = format!("pub fn oversized() {{}}\n{}", " ".repeat(80));
@@ -5792,6 +5790,57 @@ mod tests {
         Ok(())
     }
 
+    /// A `pattern` search over a server whose search database could not open answers from
+    /// every held file, as it does when the pool hands the read no connection.
+    #[tokio::test]
+    async fn a_pattern_search_without_the_search_database_verifies_every_held_file() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+        assert!(server.search_index.is_none());
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 14)))]
+        );
+        assert!(answer.warnings.is_empty());
+        Ok(())
+    }
+
+    /// A `pattern` holding no trigram leaves the store unread and verifies every held file.
+    #[tokio::test]
+    async fn a_pattern_holding_no_trigram_verifies_every_held_file() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        assert!(server.search_index.is_some());
+        let params: SearchParams =
+            serde_json::from_value(json!({"pattern": "fn", "target": "file"}))?;
+        let answer = server.search(Parameters(params)).await?.0;
+        assert_eq!(
+            pattern_hits(&answer),
+            vec![(Some("lib.rs".to_owned()), Some((4, 6)))]
+        );
+        assert!(answer.warnings.is_empty());
+        Ok(())
+    }
+
+    /// A query of punctuation alone carries no term: once the store holds the served tree,
+    /// the store ranks it, reads no term's document frequency, and answers nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_query_of_punctuation_alone_answers_nothing_from_the_store() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let (server, double) = server_over_gated_store(directory.path()).await?;
+        double.release_one();
+        search_after_population(&server, "beacon").await?;
+        let answer = run_search(&server, "--- ...").await?;
+        assert!(answer.results.is_empty());
+        assert!(store_ranked(&answer));
+        Ok(())
+    }
+
     /// The publication `server` currently answers from.
     async fn current_publication(server: &RiftMcp) -> Arc<PublishedWorkspace> {
         Arc::clone(&server.published.read().await.current)
@@ -5875,10 +5924,8 @@ mod tests {
     ) -> TestResult<(RiftMcp, Arc<StoreDouble>)> {
         fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         for note in 0..TRIGRAM_FIXTURE_NOTES {
-            fs::write(
-                root.join(format!("note_{note:03}.txt")),
-                format!("harbor note {note}\n"),
-            )?;
+            let note_path = root.join(format!("note_{note:03}.txt"));
+            fs::write(note_path, format!("harbor note {note}\n"))?;
         }
         super::hermetic_workspace(root, configuration)?;
         let double = StoreDouble::new();
@@ -6875,26 +6922,20 @@ mod tests {
     fn large_file_workspace(root: &std::path::Path, text: &str) -> TestResult {
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(
-            root.join("src/blob.rs"),
-            format!(
-                "pub const BLOB: &str = \"{}\";\n// harbor lantern\n",
-                "b".repeat(3_000)
-            ),
-        )?;
-        fs::write(
-            root.join("src/huge.rs"),
-            format!(
-                "pub const HUGE: &str = \"{}\";\n// harbor relay\n",
-                "h".repeat(9_000)
-            ),
-        )?;
-        super::hermetic_workspace(
-            root,
-            &format!(
-                "[providers.syntax]\nmax_file = \"8kb\"\n\n[search.text]\nmax_chunk = \"1kb\"\n{text}"
-            ),
-        )?;
+        let blob = format!(
+            "pub const BLOB: &str = \"{}\";\n// harbor lantern\n",
+            "b".repeat(3_000)
+        );
+        fs::write(root.join("src/blob.rs"), blob)?;
+        let huge = format!(
+            "pub const HUGE: &str = \"{}\";\n// harbor relay\n",
+            "h".repeat(9_000)
+        );
+        fs::write(root.join("src/huge.rs"), huge)?;
+        let configuration = format!(
+            "[providers.syntax]\nmax_file = \"8kb\"\n\n[search.text]\nmax_chunk = \"1kb\"\n{text}"
+        );
+        super::hermetic_workspace(root, &configuration)?;
         Ok(())
     }
 

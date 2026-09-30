@@ -562,8 +562,64 @@ async fn index_pending_through(
 
 #[cfg(test)]
 mod tests {
-    use super::{TRIGRAM_ROWS, grouped, trigram_batch_end};
+    use super::{
+        TRIGRAM_ROWS, decode_pending_size, decode_trigram_row, grouped, trigram_batch_end,
+    };
+    use crate::lexical::LexicalIndexViolation;
     use rift_core::ProjectPath;
+    use toasty::stmt::Value;
+
+    #[test]
+    fn test_a_trigram_row_decodes_to_its_file_and_bytes() {
+        let row = Value::record_from_vec(vec![
+            Value::String("notes/long.txt".to_owned()),
+            Value::I64(1_024),
+            Value::I64(512),
+        ]);
+        let (path, range) = decode_trigram_row(&row).expect("a stored row decodes");
+        assert_eq!(path.as_str(), "notes/long.txt");
+        assert_eq!(range, 1_024..1_536);
+    }
+
+    #[test]
+    fn test_a_trigram_row_naming_no_project_path_refuses() {
+        let row = Value::record_from_vec(vec![
+            Value::String("../outside.txt".to_owned()),
+            Value::I64(0),
+            Value::I64(4),
+        ]);
+        let error = decode_trigram_row(&row).expect_err("a path above the root refuses");
+        assert_eq!(
+            error.fault().violation(),
+            LexicalIndexViolation::StoredPathInvalid
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "trigram row must be a record")]
+    fn test_decode_trigram_row_non_record_row_panics() {
+        let _ = decode_trigram_row(&Value::String("not-a-record".to_owned()));
+    }
+
+    #[test]
+    #[should_panic(expected = "trigram row must match its declared column types")]
+    fn test_decode_trigram_row_wrong_shaped_record_panics() {
+        let row = Value::record_from_vec(vec![Value::String("only-one-field".to_owned())]);
+        let _ = decode_trigram_row(&row);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending row must be a record")]
+    fn test_decode_pending_size_non_record_row_panics() {
+        let _ = decode_pending_size(&Value::I64(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "pending row must match its declared column types")]
+    fn test_decode_pending_size_wrong_shaped_record_panics() {
+        let row = Value::record_from_vec(vec![Value::I64(1)]);
+        let _ = decode_pending_size(&row);
+    }
 
     /// A trigram batch takes rows in id order while their text fits the byte bound, and the
     /// first row whatever its size, so no row is ever left behind.

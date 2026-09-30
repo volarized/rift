@@ -10,6 +10,7 @@
 //! first file row's place.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use rift_index::{IndexedFile, WorkspaceIndex, declaration_identity};
 use rift_protocol::read::SearchParamsTarget;
@@ -68,29 +69,28 @@ impl<'store> BodyMatching<'store> {
         let file_rows = ranked
             .candidates()
             .iter()
-            .filter(|candidate| is_file_row(candidate))
+            .filter_map(|candidate| Some((candidate, candidate.file_range()?)))
             .take(BODY_MATCH_FILE_ROWS_MAX);
-        for row in file_rows {
-            self.pool_row(index, row, &mut pool);
+        for (row, range) in file_rows {
+            self.pool_row(index, row, range, &mut pool);
         }
         ranked.with_body_matches(pool.into_ranked(), is_file_row, self.file_rows, keep_max)
     }
 
-    /// Adds every declaration holding a query term inside `row`'s bytes to `pool`. A text
-    /// file declares nothing, and a row whose bytes no longer sit inside its file answers
-    /// nothing: the store and the index disagree about it, and the row stays unmapped.
+    /// Adds every declaration holding a query term inside `range`, the bytes of its file
+    /// `row` holds, to `pool`. A text file declares nothing, and a row whose bytes no longer
+    /// sit inside its file answers nothing: the store and the index disagree about it, and
+    /// the row stays unmapped.
     fn pool_row(
         &self,
         index: &WorkspaceIndex,
         row: &FusedCandidate,
+        range: &Range<u64>,
         pool: &mut BodyMatchPool<DocumentIdentity>,
     ) {
         let Some(ResolvedCandidate::SourceFile(file)) =
             resolve_file(index, row.identity().as_str())
         else {
-            return;
-        };
-        let Some(range) = row.file_range() else {
             return;
         };
         let bounds = usize::try_from(range.start)

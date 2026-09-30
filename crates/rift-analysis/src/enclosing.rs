@@ -144,6 +144,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_build_holds_no_span_and_one_span_is_held() {
+        let empty = EnclosingDefinitions::<usize>::new([]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        let one = EnclosingDefinitions::new([(0, 10, 0)]);
+        assert!(!one.is_empty());
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
     fn equal_spans_answer_the_first_inserted() {
         let enclosing =
             EnclosingDefinitions::new([(5, 9, "variable"), (5, 9, "function"), (0, 20, "file")]);

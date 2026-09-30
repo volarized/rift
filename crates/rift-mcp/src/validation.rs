@@ -3318,6 +3318,15 @@ pub(crate) mod lexical_double {
     /// Polls one lane pass a test waits on before it gives up: three seconds, at
     /// [`LANE_POLL`] each.
     pub(crate) const LANE_ATTEMPTS_MAX: usize = 60;
+    /// Longest a test waits for the lexical lane, this double, or the supervisor to reach
+    /// a state it expects.
+    ///
+    /// Each wait ends as soon as the state holds, so a passing test never spends this
+    /// bound: it only ends a wait for a state that never comes, with that wait's own
+    /// message, well inside nextest's one-minute deadline. The slowest of these tests took
+    /// 2.4 s from start to end on the slowest CI runner, macos-15-intel, so a runner three
+    /// times slower still ends every wait inside half of it.
+    pub(crate) const LANE_WAIT_MAX: Duration = Duration::from_secs(15);
     /// Wait between two reads of a store the lane has not stamped yet.
     pub(crate) const LANE_POLL: Duration = Duration::from_millis(50);
     /// Bounds that never leave a unit out and never split a write into parts.
@@ -3330,9 +3339,8 @@ pub(crate) mod lexical_double {
     pub(crate) const PRODUCT_VERSION: &str = "0.0.45";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
-    /// one permit before it answers, refusing changes or recorded-digest reads when told to,
-    /// and writing through to
-    /// the attached index when one is held. A write whose future is dropped while the
+    /// one permit before it answers, refusing changes, recorded-digest reads, or trigram
+    /// batches when told to, and writing through to the attached index when one is held. A write whose future is dropped while the
     /// store still holds it is counted, so a test can prove an abort reached it.
     ///
     /// Trigram batches pass through to the attached index without a permit, and wait at a
@@ -3343,10 +3351,11 @@ pub(crate) mod lexical_double {
         applied: Mutex<Vec<Vec<rift_core::ProjectPath>>>,
         refuse_changes: AtomicBool,
         refuse_reads: AtomicBool,
+        refuse_trigrams: AtomicBool,
         inner: Mutex<Option<Arc<SearchIndex>>>,
         dropped_while_held: AtomicUsize,
         trigram_gate: watch::Sender<TrigramGate>,
-        trigram_arrivals: AtomicUsize,
+        trigram_arrivals: watch::Sender<usize>,
         trigram_batches: AtomicUsize,
     }
 
@@ -3409,10 +3418,11 @@ pub(crate) mod lexical_double {
                 applied: Mutex::new(Vec::new()),
                 refuse_changes: AtomicBool::new(false),
                 refuse_reads: AtomicBool::new(false),
+                refuse_trigrams: AtomicBool::new(false),
                 inner: Mutex::new(None),
                 dropped_while_held: AtomicUsize::new(0),
                 trigram_gate: watch::Sender::new(TrigramGate::default()),
-                trigram_arrivals: AtomicUsize::new(0),
+                trigram_arrivals: watch::Sender::new(0),
                 trigram_batches: AtomicUsize::new(0),
             })
         }
@@ -3444,7 +3454,23 @@ pub(crate) mod lexical_double {
 
         /// How many trigram batches reached the gate, held or not.
         pub(crate) fn trigram_arrivals(&self) -> usize {
-            self.trigram_arrivals.load(Ordering::SeqCst)
+            *self.trigram_arrivals.borrow()
+        }
+
+        /// Waits until `count` trigram batches reached the gate, held or not.
+        pub(crate) async fn trigram_arrivals_reach(&self, count: usize) -> TestResult {
+            let mut arrivals = self.trigram_arrivals.subscribe();
+            arrivals
+                .wait_for(|arrived| *arrived >= count)
+                .await
+                .map(drop)?;
+            Ok(())
+        }
+
+        /// Refuses every trigram batch past the gate from now on, as a store that failed
+        /// would.
+        pub(crate) fn refuse_trigrams(&self) {
+            self.refuse_trigrams.store(true, Ordering::SeqCst);
         }
 
         /// How many trigram batches passed the gate.
@@ -3607,7 +3633,7 @@ pub(crate) mod lexical_double {
         }
 
         async fn index_trigrams(&self) -> Result<TrigramBatch, SearchError> {
-            self.trigram_arrivals.fetch_add(1, Ordering::SeqCst);
+            self.trigram_arrivals.send_modify(|arrived| *arrived += 1);
             let writes = self.applied().len();
             self.trigram_gate
                 .subscribe()
@@ -3616,6 +3642,12 @@ pub(crate) mod lexical_double {
                 .map(drop)
                 .map_err(|_| SearchError::new(SearchFault::new(SearchViolation::StoreFailed)))?;
             self.trigram_gate.send_modify(|gate| gate.spend(writes));
+            if self.refuse_trigrams.load(Ordering::SeqCst) {
+                return Err(SearchError::new(
+                    SearchFault::new(SearchViolation::StoreFailed)
+                        .about("the double refuses trigram batches"),
+                ));
+            }
             self.trigram_batches.fetch_add(1, Ordering::SeqCst);
             match self.attached() {
                 Some(index) => index.index_trigrams().await,
@@ -3749,7 +3781,7 @@ pub(crate) mod tests {
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, StoreDouble};
+    use super::lexical_double::{LANE_ATTEMPTS_MAX, LANE_POLL, LANE_WAIT_MAX, StoreDouble};
     use super::{
         BlockingExecutor, ChangeSet, ConfigurationFingerprint, IndexState, IndexValidation,
         LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX, LEXICAL_HELD_PATHS_MAX,
@@ -6445,12 +6477,7 @@ pub(crate) mod tests {
         double.release_one();
         lane.request(super::lexical_write(&second, &ChangeSet::Full), second);
         commit_state_within_bound(&lane, &second_revision, LexicalCommitState::Settled).await?;
-        for _attempt in 0..LANE_ATTEMPTS_MAX {
-            if double.trigram_arrivals() > arrived {
-                break;
-            }
-            tokio::time::sleep(LANE_POLL).await;
-        }
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(arrived + 1)).await??;
         assert_eq!(
             double.trigram_arrivals(),
             arrived + 1,
@@ -6471,6 +6498,53 @@ pub(crate) mod tests {
         trigrams_caught_up_within_bound(&index, &third_revision).await?;
         cancellation.cancel();
         ended_within_bound(&lane).await?;
+        Ok(())
+    }
+
+    /// A trigram batch the store refuses is recorded as a warning and owes nothing more:
+    /// the lane waits for the next write, which owes a batch again.
+    #[tokio::test]
+    async fn a_refused_trigram_batch_is_recorded_and_the_next_write_owes_another() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let double = StoreDouble::new();
+        double.refuse_trigrams();
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+        );
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(1)).await??;
+        double.release_one();
+        lane.request(
+            super::lexical_write(&published, &ChangeSet::Full),
+            Arc::clone(&published),
+        );
+        tokio::time::timeout(LANE_WAIT_MAX, double.trigram_arrivals_reach(2)).await??;
+
+        assert_eq!(
+            double.applied().len(),
+            1,
+            "the write ran between the batches"
+        );
+        assert_eq!(double.trigram_batches(), 0, "the store took no batch");
+        let refused = queued_records(&mut drain)
+            .into_iter()
+            .find(|record| {
+                record
+                    .message()
+                    .contains("could not take a batch of file rows")
+            })
+            .ok_or("the refused batch is recorded")?;
+        assert_eq!(refused.level(), "warn");
+        assert_eq!(refused.component(), "search");
         Ok(())
     }
 
