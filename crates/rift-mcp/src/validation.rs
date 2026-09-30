@@ -276,6 +276,18 @@ impl PublishedWorkspace {
         })
     }
 
+    /// Whether a rebuild naming `paths` moves every one of them: each reads, under this
+    /// publication's own policy, as something other than what this publication holds.
+    ///
+    /// This is the comparison [`RebuildRequest::change_set`] makes, so a path that fails it
+    /// is one a rebuild naming it leaves as it is. A read that fails asks for the whole
+    /// workspace there, and answers `false` here.
+    pub(crate) fn rebuild_moves_every(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
+        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
+            PathChanges::resolve(observed, |path| self.reads.file_record(path)).len() == paths.len()
+        })
+    }
+
     /// Whether this publication holds files below one of `paths` that is no longer a
     /// directory on disk.
     ///

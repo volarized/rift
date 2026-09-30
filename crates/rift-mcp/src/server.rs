@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rift_core::SourceVisibility;
 use rift_index::{
-    LexicalIndexLimits, LogStore, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
+    LexicalIndexLimits, LogStore, PathChange, PathChanges, WorkspaceDigests, WorkspaceIndexLimits,
     capture_digests_with_languages,
 };
 use rift_protocol::configuration::{
@@ -2452,10 +2452,11 @@ impl RiftMcp {
     /// The capture reads every visible file to decide whether the publication still answers
     /// for this request, so it already knows which files moved. A request that finds the
     /// tree ahead of the publication names those files, and the rebuild it waits for
-    /// reparses them alone; only a moved `rift.toml` and a capture that failed ask for the
-    /// whole workspace. A read that finds the tree ahead of a publication whose rebuild
-    /// failed waits for nothing: it answers from that publication and says so, and the
-    /// next filesystem event retries the rebuild.
+    /// reparses them alone; a moved `rift.toml`, a capture that failed, and a file whose
+    /// inclusion an ignore file moved ask for the whole workspace (see
+    /// [`Self::rebuild_reaches_capture`]). A read that finds the tree ahead of a
+    /// publication whose rebuild failed waits for nothing: it answers from that publication
+    /// and says so, and the next filesystem event retries the rebuild.
     ///
     /// The first is the filesystem epoch, which counts observations rather than content.
     /// [`IndexValidation::observe_locked`] increments it for every classified event, and
@@ -2507,7 +2508,11 @@ impl RiftMcp {
                     stale,
                 });
             }
-            let observed = if configuration_matches {
+            let observed = if configuration_matches
+                && self
+                    .rebuild_reaches_capture(&current, &changes, phase)
+                    .await?
+            {
                 self.validation
                     .observe_paths(changes.iter().map(|(path, _)| path.clone()))
             } else {
@@ -2563,6 +2568,46 @@ impl RiftMcp {
             "workspace changed across bounded reconciliation attempts",
         )
         .tool_error(phase))
+    }
+
+    /// Whether a rebuild naming the paths in `changes` reaches what the capture that found
+    /// them read, decided on the worker pool.
+    ///
+    /// The capture walks the tree under the `.gitignore` files on disk, while a rebuild
+    /// that names paths reads each one under the ignore files `current` compiled when it
+    /// was built. A file an ignore file started or stopped excluding therefore reads there
+    /// exactly as `current` holds it, so a rebuild naming it changes nothing. Only a rebuild
+    /// of the whole workspace compiles the ignore files again.
+    ///
+    /// The watcher asks for that rebuild when it reports the ignore file's write, but a
+    /// read cannot wait on the report: a slow runner delivers it after every capture
+    /// attempt has asked for the same no-op rebuild and the read has answered stale.
+    ///
+    /// An ignore file decides whether a file is recorded, never its bytes, so only the
+    /// files the capture found added or removed are read. A capture that found only
+    /// modified files reads nothing and enters no pool.
+    async fn rebuild_reaches_capture(
+        &self,
+        current: &Arc<PublishedWorkspace>,
+        changes: &PathChanges,
+        phase: wire::ErrorPhase,
+    ) -> Result<bool, ErrorData> {
+        let added_or_removed: BTreeSet<rift_core::ProjectPath> = changes
+            .iter()
+            .filter(|(_, change)| !matches!(change, PathChange::Modified))
+            .map(|(path, _)| path.clone())
+            .collect();
+        if added_or_removed.is_empty() {
+            return Ok(true);
+        }
+        let published = Arc::clone(current);
+        let root = self.root.clone();
+        self.blocking
+            .run("observed path read", move || {
+                Ok(published.rebuild_moves_every(&root, &added_or_removed))
+            })
+            .await
+            .map_err(|error| error.tool_error(phase))
     }
 
     /// Captures every visible file's digest and the configuration file's state, under
@@ -3511,6 +3556,66 @@ mod tests {
                 .await?
                 .hits
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    /// The watcher here watches no path, so every observation comes from a read's own
+    /// capture: a read after a `.gitignore` write answers from the ignore files on disk
+    /// however late the watcher reports that write.
+    #[tokio::test]
+    async fn ignore_file_changes_reach_a_read_without_a_watcher_event() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("policy.rs"),
+            "pub fn policy_hidden() {}\n",
+        )?;
+        super::hermetic_workspace(directory.path(), "")?;
+        let root = super::absolute_root(directory.path())?;
+        let limits = WorkspaceIndexLimits::default();
+        let assembled = RiftMcp::assemble(
+            root,
+            limits,
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            unwatched,
+            LexicalLane::spawn,
+        )
+        .await?;
+        let server = assembled.supervised().await;
+        assert_eq!(get_symbol(&server, "policy_hidden").await?.hits.len(), 1);
+
+        fs::write(directory.path().join(".gitignore"), "policy.rs\n")?;
+        let hidden = get_symbol(&server, "policy_hidden").await?;
+        assert!(
+            hidden.hits.is_empty(),
+            "a read after the ignore file hid policy.rs must not answer from it: {hidden:?}"
+        );
+        assert!(
+            !hidden
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "a read after the ignore file changed must answer from a current publication: \
+             {hidden:?}"
+        );
+
+        fs::remove_file(directory.path().join(".gitignore"))?;
+        let shown = get_symbol(&server, "policy_hidden").await?;
+        assert_eq!(
+            shown.hits.len(),
+            1,
+            "a read after the ignore file was removed must answer from policy.rs again: \
+             {shown:?}"
+        );
+        assert!(
+            !shown
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::StaleIndex { .. })),
+            "a read after the ignore file was removed must answer from a current \
+             publication: {shown:?}"
         );
         Ok(())
     }
