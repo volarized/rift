@@ -470,6 +470,7 @@ fn a_workspace_below_the_repository_root_reads_its_own_paths() {
     let directory = tempfile::tempdir().expect("temp dir");
     let root = directory.path();
     init(root);
+    git(root, &["config", "core.autocrlf", "true"]);
     fs::create_dir_all(root.join("sub")).expect("workspace folder");
     write(
         root,
@@ -501,7 +502,7 @@ fn a_workspace_below_the_repository_root_reads_its_own_paths() {
     assert_eq!(files.len(), 1, "the workspace holds its own files alone");
     assert_eq!(
         form,
-        WorkingForm::Converted(b"pub fn beacon() {}\n".to_vec())
+        WorkingForm::Converted(b"pub fn beacon() {}\r\n".to_vec())
     );
 }
 
