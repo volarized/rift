@@ -719,6 +719,14 @@ struct PreviousCapture {
     superseded_seen: u64,
 }
 
+/// One request-time tree capture, folded for its reconciliation attempt.
+struct ReconciliationCapture {
+    digests: WorkspaceDigests,
+    configuration: ConfigurationFingerprint,
+    tree: WorkspaceFingerprint,
+    capture_elapsed: Duration,
+}
+
 impl PreviousCapture {
     /// Whether a later capture folds to the tree and configuration this one did.
     fn matches(
@@ -2981,36 +2989,31 @@ impl RiftMcp {
         while attempts < INDEX_CAPTURE_ATTEMPTS_MAX {
             let (current, rebuild_failure) = self.await_current_workspace(phase, wait).await?;
             let superseded_seen = self.validation.superseded_epoch();
-            let capture_started = tokio::time::Instant::now();
-            let (digests, configuration_fingerprint) = self.capture_read(&current, phase).await?;
-            let capture_elapsed = capture_started.elapsed();
-            let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
-                digests.fingerprint()
-            });
-            let configuration_matches =
-                current.configuration.fingerprint == configuration_fingerprint;
-            if tree == current.fingerprint
+            let capture = self.reconciliation_capture(&current, phase).await?;
+            let configuration_matches = current.configuration.fingerprint == capture.configuration;
+            if capture.tree == current.fingerprint
                 && configuration_matches
                 && !self.project_environment_moved(&current, phase).await?
             {
                 current.configuration.accepted(phase)?;
-                return Ok(ResolvedWorkspace::current(current, capture_elapsed));
+                return Ok(ResolvedWorkspace::current(current, capture.capture_elapsed));
             }
-            let changes = PathChanges::between(&current.reads.workspace_digests(), &digests);
+            let changes =
+                PathChanges::between(&current.reads.workspace_digests(), &capture.digests);
             let moved = CaptureMovement::from_changes(&changes, !configuration_matches);
             if let Some(failure) = rebuild_failure {
                 let reason = StaleIndexReason::RebuildFailed(&failure);
                 return ResolvedWorkspace::stale(
                     current,
-                    &digests,
+                    &capture.digests,
                     moved,
                     &reason,
                     phase,
-                    capture_elapsed,
+                    capture.capture_elapsed,
                 );
             }
             let owed_publication = previous.as_ref().is_some_and(|previous| {
-                previous.awaits_publication(&current, &tree, configuration_fingerprint)
+                previous.awaits_publication(&current, &capture.tree, capture.configuration)
             });
             if configuration_matches && owed_publication {
                 wait = ReadWait::Rebuild { superseded_seen };
@@ -3018,7 +3021,7 @@ impl RiftMcp {
             }
             let moved_since_previous = previous
                 .as_ref()
-                .filter(|previous| !previous.matches(&tree, configuration_fingerprint));
+                .filter(|previous| !previous.matches(&capture.tree, capture.configuration));
             attempts += 1;
             let requested_epoch = self
                 .request_rebuild(&current, &changes, configuration_matches, phase)
@@ -3035,11 +3038,11 @@ impl RiftMcp {
                 };
                 return ResolvedWorkspace::stale(
                     current,
-                    &digests,
+                    &capture.digests,
                     moved,
                     &reason,
                     phase,
-                    capture_elapsed,
+                    capture.capture_elapsed,
                 );
             }
             wait = if configuration_matches {
@@ -3048,11 +3051,12 @@ impl RiftMcp {
                 ReadWait::Configuration
             };
             previous = Some(PreviousCapture {
-                tree,
-                configuration: configuration_fingerprint,
+                tree: capture.tree,
+                configuration: capture.configuration,
                 requested_epoch,
                 superseded_seen,
             });
+            let (digests, capture_elapsed) = (capture.digests, capture.capture_elapsed);
             spent = Some((current, digests, changes, moved, capture_elapsed));
         }
         if matches!(wait, ReadWait::Rebuild { .. })
@@ -3115,6 +3119,27 @@ impl RiftMcp {
         self.capture_tree(current).await.map_err(|error| {
             let _ = self.validation.observe_whole_workspace();
             error.tool_error(phase)
+        })
+    }
+
+    /// Captures the tree one reconciliation attempt compares with `current`, folding its
+    /// digest and recording the capture's elapsed time.
+    async fn reconciliation_capture(
+        &self,
+        current: &PublishedWorkspace,
+        phase: wire::ErrorPhase,
+    ) -> Result<ReconciliationCapture, ErrorData> {
+        let capture_started = tokio::time::Instant::now();
+        let (digests, configuration) = self.capture_read(current, phase).await?;
+        let capture_elapsed = capture_started.elapsed();
+        let tree = rift_core::traced!(component = "index", operation = "fingerprint.fold", {
+            digests.fingerprint()
+        });
+        Ok(ReconciliationCapture {
+            digests,
+            configuration,
+            tree,
+            capture_elapsed,
         })
     }
 
