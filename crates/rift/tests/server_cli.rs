@@ -13,7 +13,8 @@ use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rift_mcp::{START_POLL_ATTEMPT_COUNT, ServerPresence, probe, stderr_file_path};
@@ -44,6 +45,14 @@ const LARGE_FIXTURE_FILES: usize = 3_000;
 /// Declarations per file in that fixture: one lexical unit each, so the whole commit
 /// that runs behind the publication takes seconds on a development machine.
 const LARGE_FIXTURE_DECLARATIONS: usize = 12;
+/// The startup stages recorded when a foreground server misses its start window.
+const STARTUP_TRACE_FILTER: &str =
+    "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_mcp::validation=debug";
+/// Bytes of a foreground server's standard error the test retains while it starts.
+///
+/// The reader drains every byte past this bound, so a server cannot wait on a full pipe while
+/// its first index build runs. The retained output records the stage reached at a refusal.
+const STARTUP_STDERR_BYTES_MAX: usize = 4 << 20;
 /// How long after rewriting the large fixture the stop is issued: long enough for the
 /// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
 const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
@@ -158,6 +167,79 @@ impl Drop for StopOnDrop {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// A foreground server's standard error, drained while the server starts.
+struct StderrWatch {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl StderrWatch {
+    /// Drains `stream` on another thread so the foreground server can keep writing startup
+    /// records. The retained prefix stays bounded for the failure message.
+    fn spawn(mut stream: ChildStderr) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bytes);
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 8 << 10];
+            loop {
+                let count = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => count,
+                };
+                let mut retained = captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let room = STARTUP_STDERR_BYTES_MAX.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..count.min(room)]);
+            }
+        });
+        Self { bytes, reader }
+    }
+
+    /// Standard error retained so far, for a start refusal before the child ends.
+    fn snapshot(&self) -> String {
+        let retained = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&retained).into_owned()
+    }
+
+    /// Waits for the reader once the foreground child ended.
+    fn finished(self) -> TestResult<String> {
+        let Self { bytes, reader } = self;
+        reader
+            .join()
+            .map_err(|_panic| "the foreground server stderr reader panicked")?;
+        let mut retained = bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = std::mem::take(&mut *retained);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Waits for the foreground server's document and records what its child reached on failure.
+fn wait_for_foreground_server(
+    root: &Path,
+    child: &mut Child,
+    stderr: &StderrWatch,
+) -> TestResult<ServerLock> {
+    match wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
+        serving_document(root)
+    }) {
+        Ok(serving) => Ok(serving),
+        Err(error) => {
+            let status = child.try_wait()?;
+            Err(format!(
+                "{error}; foreground server status: {status:?}; stderr: {}",
+                stderr.snapshot()
+            )
+            .into())
+        }
     }
 }
 
@@ -615,13 +697,14 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
+        .env("RUST_LOG", STARTUP_TRACE_FILTER)
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
-    })?;
+    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
     // Rewriting every file streams invalidations into a capture while the rebuild behind
@@ -659,8 +742,8 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
         "the process leaves within {DOCUMENT_GONE_GRACE:?} of server.json going, observed \
          {lingering:?}; (document present, process exited) per poll: {observations:?}"
     );
-    let output = child.wait_with_output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    child.wait()?;
+    let stderr = stderr.finished()?;
     assert!(
         stderr.contains("MCP server stopped"),
         "serving ended before the process left: {stderr}"
@@ -682,13 +765,14 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
+        .env("RUST_LOG", STARTUP_TRACE_FILTER)
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        serving_document(root)
-    })?;
+    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
     // The search reads the large fixture's units, so serving still has a request to
@@ -741,8 +825,8 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
         "the stopped server's process to exit after its stop reported success",
         || child.try_wait().ok().flatten(),
     )?;
-    let output = child.wait_with_output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    child.wait()?;
+    let stderr = stderr.finished()?;
     assert!(
         stderr.contains("MCP server stopped"),
         "serving ended before the process left: {stderr}"
