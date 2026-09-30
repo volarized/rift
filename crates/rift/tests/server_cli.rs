@@ -48,6 +48,9 @@ const LARGE_FIXTURE_DECLARATIONS: usize = 12;
 /// The startup stages recorded when a foreground server misses its start window.
 const STARTUP_TRACE_FILTER: &str =
     "rift=info,rift_mcp=info,rift_server=info,rift_index=info,rift_mcp::validation=debug";
+/// Test child variables that retain the server lifecycle lines this suite reads.
+const SERVER_LOG_VARIABLES: [(&str, &str); 2] =
+    [("RUST_LOG", STARTUP_TRACE_FILTER), ("NO_COLOR", "1")];
 /// Bytes of a foreground server's standard error the test retains while it starts.
 ///
 /// The reader drains every byte past this bound, so a server cannot wait on a full pipe while
@@ -438,7 +441,7 @@ fn start_serves_stop_shuts_down_and_both_repeat_idempotently() -> TestResult {
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
 
-    let started = rift(root, &["server", "start"])?;
+    let started = rift_with_variables(root, &["server", "start"], &SERVER_LOG_VARIABLES)?;
     require_success(&started, "first start")?;
     let stdout = stdout_of(&started);
     assert!(
@@ -548,6 +551,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
+        .envs(SERVER_LOG_VARIABLES)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -597,6 +601,7 @@ fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> T
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
+        .envs(SERVER_LOG_VARIABLES)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -646,6 +651,7 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     let mut child = Command::new(rift_binary()?)
         .args(["server", "start", "--foreground"])
         .current_dir(root)
+        .envs(SERVER_LOG_VARIABLES)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
