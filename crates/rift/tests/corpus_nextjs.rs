@@ -8,8 +8,9 @@ async fn test_nextjs_corpus() -> Result<(), Box<dyn std::error::Error>> {
     corpus::run("nextjs", "workspace").await
 }
 
+// CI allows this failure: https://github.com/volarized/rift/issues/483
 #[tokio::test]
-#[ignore = "requires the pinned corpus"]
+#[ignore = "https://github.com/volarized/rift/issues/483; requires the pinned corpus"]
 async fn test_nextjs_churn() -> Result<(), Box<dyn std::error::Error>> {
     corpus::run("nextjs", "churn").await
 }
