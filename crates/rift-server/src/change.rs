@@ -1598,13 +1598,8 @@ mod tests {
 
     /// Index bounds tight enough that a file three folders deep crosses them.
     fn shallow_limits() -> TestResult<WorkspaceIndexLimits> {
-        Ok(WorkspaceIndexLimits::new(
-            10_000,
-            1 << 20,
-            64 << 20,
-            2,
-            1_000,
-        )?)
+        let limits = WorkspaceIndexLimits::new(10_000, 1 << 20, 64 << 20, 2, 1_000)?;
+        Ok(limits)
     }
 
     /// A base side whose changed path crosses the index's directory depth bound

@@ -2032,7 +2032,7 @@ impl Tower {
 
     /// One commit hit at `revision`, as a commit search answers it.
     fn commit_search_hit(revision: &str) -> TestResult<SearchHit> {
-        let hit = serde_json::from_value(json!({
+        let wire = json!({
             "hit": {"target": "commit", "commit": {
                 "revision": revision,
                 "message": "Fix the release notes\n",
@@ -2042,7 +2042,8 @@ impl Tower {
                 "paths": ["NOTES.md"],
                 "paths_truncated": false
             }}
-        }))?;
+        });
+        let hit = serde_json::from_value(wire)?;
         Ok(hit)
     }
 
