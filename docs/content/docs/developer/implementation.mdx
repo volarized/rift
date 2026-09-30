@@ -117,8 +117,9 @@ Startup runs one cycle:
 `.rift/server.stderr`, and waits for `.rift/server.json` to appear; detached startup and
 `rift mcp` each allow 30 seconds for publication. A start whose child is still indexing when
 that window closes reports the server as starting rather than failing, and a start that finds
-the election already held reports the same without spawning. `rift server stop` sends the
-authorized stop request and waits for that process to exit or release its election. A proxy
+the election held by a server still indexing spawns nothing and waits the same window for that
+server's file. `rift server stop` sends the authorized stop request and waits for that process
+to exit or release its election. A proxy
 can start a replacement during this wait; the replacement does not extend the original stop.
 `rift server restart` chains stop and start. `rift server status` reports the workspace's
 current state - a serving server with its port, pid, and version, a server still indexing,
