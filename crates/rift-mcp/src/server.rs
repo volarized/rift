@@ -817,12 +817,16 @@ type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests
 /// during it as it passes during a capture on the worker pool.
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct ForcedCapture(Arc<std::sync::Mutex<Option<(Arc<ForcedTreeCapture>, Duration)>>>);
+struct ForcedCapture(Arc<std::sync::Mutex<Option<DelayedCapture>>>);
+
+/// One forced capture and the delay before each of its answers.
+#[cfg(test)]
+type DelayedCapture = (Arc<ForcedTreeCapture>, Duration);
 
 #[cfg(test)]
 impl ForcedCapture {
     /// The forced capture and its delay, when one is installed.
-    fn installed(&self) -> Option<(Arc<ForcedTreeCapture>, Duration)> {
+    fn installed(&self) -> Option<DelayedCapture> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
