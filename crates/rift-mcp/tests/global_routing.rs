@@ -12,6 +12,7 @@ mod workspace_client;
 
 use std::{fs, time::Duration};
 
+use axum::http::StatusCode;
 use global_api::{
     BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
     SymbolFixture, UNSATISFIED_REQUIREMENT,
@@ -955,6 +956,73 @@ async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult 
         "a read inside failure_ttl sends the global API nothing"
     );
     drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// A resolution the global API answers with a problem status leaves the route without
+/// packages: the read answers the project hits alone, with the warning naming the status
+/// class, and asks for no package page.
+#[tokio::test]
+async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        resolution_problem: Some(StatusCode::INTERNAL_SERVER_ERROR),
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub fn local_beacon() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let answer = get_symbol(&client, json!({"name": "local_beacon", "scope": "all"})).await?;
+    let warning = answer["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|warning| warning["code"] == "global_api_unavailable")
+        .ok_or_else(|| format!("missing global API warning: {answer:#}"))?;
+    assert_eq!(
+        warning,
+        &json!({"code": "global_api_unavailable", "failure_class": "non_success_response"})
+    );
+    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let located: Vec<(&Value, &Value)> = hits
+        .iter()
+        .map(|hit| (&hit["symbol"]["name"], &hit["path"]))
+        .collect();
+    assert_eq!(
+        located,
+        [(&json!("local_beacon"), &json!("src/lib.rs"))],
+        "{answer:#}"
+    );
+    let requested: Vec<String> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .map(|request| request.uri)
+        .collect();
+    assert_eq!(
+        requested,
+        ["/rift/rest/v1/capabilities", "/rift/rest/v1/resolutions"],
+        "the refused resolution ends the read's global requests"
+    );
     client.cancel().await?;
     server_task.await?;
     Ok(())

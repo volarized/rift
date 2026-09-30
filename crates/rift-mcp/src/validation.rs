@@ -1743,20 +1743,23 @@ pub(crate) fn commit_deadline(unit_count: usize) -> Duration {
         .clamp(LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX)
 }
 
-/// What besides a file's bytes decides the lexical rows one publication derives: the
-/// executable that derives them, the corpus shape they are written in, and the index-owned
+/// What besides a file's bytes decides the lexical rows one publication derives: the build
+/// that derives them, the corpus shape they are written in, and the index-owned
 /// configuration.
 ///
-/// The store keeps rows only under the value it stamped them with, so a new binary, a
+/// The store keeps rows only under the value it stamped them with, so a new build, a
 /// changed tokenizer or field set, or an edited index-owned table reloads the store once
-/// instead of trusting rows another derivation wrote. The executable's own digest is what
-/// covers derivation code no manifest names.
+/// instead of trusting rows another derivation wrote. The build is named by
+/// `product_version`, the product identity's version: the package version, the commit the
+/// binary was built from, and a dirty build's executable stamp. Every derivation source is
+/// in that build, so a store is derived again once per release or commit and never kept
+/// past a change to the code that derives it.
 pub(crate) fn derivation_revision(
-    executable_digest: &str,
+    product_version: &str,
     configuration: &ConfigurationState,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(executable_digest.as_bytes());
+    hasher.update(product_version.as_bytes());
     hasher.update([0]);
     hasher.update(rift_ranking::CorpusRevision::current().as_str().as_bytes());
     hasher.update([0]);
@@ -2138,8 +2141,8 @@ pub(crate) struct LexicalLane {
 
 impl LexicalLane {
     /// Spawns the lane's task over `index` and returns the handle a publication hands its
-    /// write to. `executable_digest` names the binary deriving the rows, which the
-    /// derivation revision the store stamps covers.
+    /// write to. `product_version` names the build deriving the rows, which the derivation
+    /// revision the store stamps covers.
     ///
     /// The task ends when the server does, racing the same cancellation token the index
     /// supervisor runs under. A write handed over after that is dropped with a debug line:
@@ -2148,10 +2151,10 @@ impl LexicalLane {
         index: Arc<SearchIndex>,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        executable_digest: Arc<str>,
+        product_version: Arc<str>,
     ) -> Self {
         let bounds = LexicalLaneBounds::of(index.lexical_limits());
-        Self::spawn_over(index, bounds, blocking, cancellation, executable_digest)
+        Self::spawn_over(index, bounds, blocking, cancellation, product_version)
     }
 
     /// Spawns the lane's task over any [`LexicalStore`], writing under `bounds`. Units the
@@ -2161,7 +2164,7 @@ impl LexicalLane {
         bounds: LexicalLaneBounds,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        executable_digest: Arc<str>,
+        product_version: Arc<str>,
     ) -> Self {
         let queue = Arc::new(LexicalQueue::default());
         let task = LexicalTask {
@@ -2170,7 +2173,7 @@ impl LexicalLane {
             queue: Arc::clone(&queue),
             bounds,
             cancellation,
-            executable_digest,
+            product_version,
         };
         tokio::spawn(task.run());
         Self { queue }
@@ -2271,7 +2274,7 @@ struct LexicalTask<Store> {
     queue: Arc<LexicalQueue>,
     bounds: LexicalLaneBounds,
     cancellation: CancellationToken,
-    executable_digest: Arc<str>,
+    product_version: Arc<str>,
 }
 
 /// The lane task's next piece of work.
@@ -2401,7 +2404,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             write, published, ..
         } = commit;
         let tree_revision = published.reads.tree_revision().to_owned();
-        let derivation = derivation_revision(&self.executable_digest, &published.configuration);
+        let derivation = derivation_revision(&self.product_version, &published.configuration);
         let documentation = published.reads.documentation_snapshot();
         let write = if whole_owed {
             LexicalWrite::Whole
@@ -3351,8 +3354,8 @@ pub(crate) mod lexical_double {
         transaction_units_max: usize::MAX,
         transaction_bytes_max: usize::MAX,
     };
-    /// The executable digest a test lane derives its rows under.
-    pub(crate) const EXECUTABLE_DIGEST: &str = "test-executable";
+    /// The product version a test lane derives its rows under.
+    pub(crate) const PRODUCT_VERSION: &str = "0.0.45";
 
     /// A lexical store a test steers: every write records what it was asked and waits for
     /// one permit before it answers, refusing changes or recorded-digest reads when told to,
@@ -6028,7 +6031,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             blocking,
             validation.cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(write, Arc::clone(&startup));
         double.release_one();
@@ -6214,7 +6217,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -6275,7 +6278,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         let write = super::lexical_write(&published, &ChangeSet::Full);
@@ -6316,7 +6319,7 @@ pub(crate) mod tests {
                 super::lexical_double::UNBOUNDED,
                 BlockingExecutor::isolated(2, 60_000),
                 cancellation.clone(),
-                Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+                Arc::from(super::lexical_double::PRODUCT_VERSION),
             );
             if whole_owed {
                 lane.queue
@@ -6399,7 +6402,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         lane.request(
@@ -6423,7 +6426,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             resumed.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         trigrams_caught_up_within_bound(&index, &revision).await?;
         assert_eq!(double.applied().len(), 1, "no second write was handed");
@@ -6454,7 +6457,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         lane.request(
@@ -6516,7 +6519,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         lane.request(
@@ -6699,7 +6702,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -6769,7 +6772,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -7091,7 +7094,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         double.release_one();
         committed_through(
@@ -7158,7 +7161,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         double.refuse_reads();
@@ -7215,7 +7218,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -7299,7 +7302,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -7360,7 +7363,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -7412,7 +7415,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -7489,7 +7492,7 @@ pub(crate) mod tests {
             ONE_FILE_PER_PART,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -7541,7 +7544,7 @@ pub(crate) mod tests {
         let published = three_file_publication(directory.path())?;
         let revision = published.reads.tree_revision().to_owned();
         let derivation = super::derivation_revision(
-            super::lexical_double::EXECUTABLE_DIGEST,
+            super::lexical_double::PRODUCT_VERSION,
             &published.configuration,
         );
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
@@ -7553,7 +7556,7 @@ pub(crate) mod tests {
             ONE_FILE_PER_PART,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(
             super::lexical_write(&published, &ChangeSet::Full),
@@ -7584,7 +7587,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         restarted.release_one();
         lane.request(
@@ -7618,9 +7621,84 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// One build of 0.0.45, and a dirty rebuild of the same commit.
+    const BUILD_A: &str = "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34";
+    const BUILD_B: &str =
+        "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789";
+
+    /// Spawns a lane over `index` deriving under `product_version`, hands it one
+    /// whole write of `published`, and returns the store double once the write settled.
+    async fn whole_write_under(
+        index: &Arc<SearchIndex>,
+        published: &Arc<PublishedWorkspace>,
+        product_version: &str,
+    ) -> TestResult<Arc<StoreDouble>> {
+        let revision = published.reads.tree_revision().to_owned();
+        let store = StoreDouble::new();
+        store.attach(Arc::clone(index));
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&store),
+            super::lexical_double::UNBOUNDED,
+            BlockingExecutor::isolated(2, 60_000),
+            cancellation.clone(),
+            Arc::from(product_version),
+        );
+        store.release_one();
+        lane.request(
+            super::lexical_write(published, &ChangeSet::Full),
+            Arc::clone(published),
+        );
+        commit_state_within_bound(&lane, &revision, LexicalCommitState::Settled).await?;
+        Ok(store)
+    }
+
+    /// A restart of the same build derives under the same revision, so it keeps every
+    /// stored row. Another build - another commit, or a dirty build's new stamp - names
+    /// another product version: the next start clears the store and derives every file
+    /// again.
+    #[tokio::test]
+    async fn a_restart_keeps_rows_under_one_build_and_rederives_under_another() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = three_file_publication(directory.path())?;
+        let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
+
+        let first = whole_write_under(&index, &published, BUILD_A).await?;
+        let first_written = first.applied().concat();
+        assert_eq!(first_written.len(), 3, "the first start derives every file");
+
+        let restarted = whole_write_under(&index, &published, BUILD_A).await?;
+        assert!(
+            restarted.calls().iter().all(|(form, _)| *form != "clear"),
+            "the same build keeps the store: {:?}",
+            restarted.calls()
+        );
+        assert!(
+            restarted.applied().concat().is_empty(),
+            "no stored row is derived again: {:?}",
+            restarted.applied()
+        );
+
+        let changed = whole_write_under(&index, &published, BUILD_B).await?;
+        assert!(
+            changed.calls().iter().any(|(form, _)| *form == "clear"),
+            "another build clears the store: {:?}",
+            changed.calls()
+        );
+        let mut rederived = changed.applied().concat();
+        rederived.sort();
+        let mut expected = first_written;
+        expected.sort();
+        assert_eq!(
+            rederived, expected,
+            "another build derives every file again"
+        );
+        Ok(())
+    }
+
     #[test]
-    fn the_derivation_revision_moves_with_the_executable_and_each_index_owned_table() -> TestResult
-    {
+    fn the_derivation_revision_moves_with_the_build_and_each_index_owned_table() -> TestResult {
         let directory = tempfile::tempdir()?;
         let accepted = |text: Option<&str>| -> TestResult<super::ConfigurationState> {
             let path = directory.path().join("rift.toml");
@@ -7633,9 +7711,9 @@ pub(crate) mod tests {
             Ok(super::ConfigurationState::accept(directory.path()))
         };
         let base = accepted(None)?;
-        let revision = super::derivation_revision("executable-a", &base);
-        assert_eq!(revision, super::derivation_revision("executable-a", &base));
-        assert_ne!(revision, super::derivation_revision("executable-b", &base));
+        let revision = super::derivation_revision(BUILD_A, &base);
+        assert_eq!(revision, super::derivation_revision(BUILD_A, &base));
+        assert_ne!(revision, super::derivation_revision(BUILD_B, &base));
         for table in [
             "[source]\nfiles = 1000\n",
             "[search.text]\nmax_chunk = \"2kb\"\n",
@@ -7646,7 +7724,7 @@ pub(crate) mod tests {
             let state = accepted(Some(table))?;
             assert!(state.accepted.is_ok(), "{table} must be accepted");
             assert_ne!(
-                super::derivation_revision("executable-a", &state),
+                super::derivation_revision(BUILD_A, &state),
                 revision,
                 "{table} decides the rows"
             );
@@ -7654,7 +7732,7 @@ pub(crate) mod tests {
         let server = accepted(Some("[server]\nnum_workers = 2\n"))?;
         assert!(server.accepted.is_ok());
         assert_eq!(
-            super::derivation_revision("executable-a", &server),
+            super::derivation_revision(BUILD_A, &server),
             revision,
             "a table that derives nothing keeps the stored rows"
         );
@@ -7686,7 +7764,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
@@ -7751,7 +7829,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(change_naming_lib()?, Arc::clone(&published));
         double.calls_within_bound(1).await?;
@@ -7790,7 +7868,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         lane.request(change_naming_lib()?, Arc::clone(&publications[0]));
         double.calls_within_bound(1).await?;
@@ -7828,7 +7906,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -7873,7 +7951,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,
@@ -7918,7 +7996,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
 
         let empty =
@@ -7953,7 +8031,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         cancellation.cancel();
         ended_within_bound(&lane).await?;
@@ -8243,7 +8321,7 @@ pub(crate) mod tests {
             Arc::clone(&index),
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(super::lexical_double::EXECUTABLE_DIGEST),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
         );
         committed_through(
             &lane,

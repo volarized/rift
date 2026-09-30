@@ -62,8 +62,7 @@ process the port and token it needs to reach that server. For example:
   "token": "Zk3mQ8xW1vY5uT9rN2bH7cJ4dL6fP0sA8gE5iK2oM7q",
   "pid": 4242,
   "identity": {
-    "version": "0.0.25",
-    "executable_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "version": "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34",
     "schema_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   }
 }
@@ -75,10 +74,18 @@ publishes the file, and the rest connect to it. The winner holds the lock from i
 onward, so a `rift mcp` or `rift server start` that arrives while it is still indexing waits
 for its file instead of starting another server.
 
-The proxy adopts that server only when package version, executable SHA-256, and served MCP schema
-SHA-256 match its own identity. A mismatch refuses each request, even when the recorded process and
-port are live, so requests never cross between binaries or tool schemas that interpret them
-differently; stopping the running server lets the next request start one that matches.
+The proxy adopts that server only when its identity matches the proxy's own: the package version
+with the git commit the binary was built from, and the served MCP schema's SHA-256. Requests
+therefore never cross between binaries or tool schemas that interpret them differently.
+
+When the identities differ, the version decides:
+
+- A server of an older version is asked to stop, and the proxy starts one from its own binary once
+  the election releases. Every release bumps the version, so the first request after an update
+  moves the workspace to the new binary.
+- A server of the same version from another build, or of a newer version, refuses each request,
+  so two development builds never displace each other and an older binary never displaces a
+  newer server. Stopping the running server lets the next request start one that matches.
 
 A reader that cannot reach the recorded port treats the file as stale. The election lock
 releases with its holder, so a stale file never has a live server behind it, and the next

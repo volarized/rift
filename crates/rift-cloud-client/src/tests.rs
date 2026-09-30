@@ -322,6 +322,9 @@ fn operation_response(
     if path.ends_with("/capabilities") {
         return operation_capabilities_response(mode);
     }
+    if let OperationFixture::Problem(status) = mode {
+        return problem_response(*status);
+    }
     if path.ends_with("/resolutions") {
         return operation_resolution_response(mode);
     }
@@ -381,6 +384,15 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
             value["bounds"]["page_limit_max"] = serde_json::json!(PATTERN_PAGE_LIMIT_ADVERTISED);
         }
+        OperationFixture::Problem(_) => {
+            value["supported_features"] = serde_json::json!([
+                "resolutions",
+                "search",
+                "symbols",
+                "patterns",
+                "declarations"
+            ]);
+        }
         _ => {}
     })
 }
@@ -414,9 +426,6 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
-    if let OperationFixture::Problem(status) = mode {
-        return problem_response(*status);
-    }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -484,18 +493,38 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
 }
 
 fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Response {
-    if matches!(mode, OperationFixture::BodyBoundStop) {
-        let body = pages::body_bound_page(
+    let cursor = query_cursor(query);
+    let followed = cursor.is_some();
+    let body = match mode {
+        OperationFixture::BodyBoundStop => pages::body_bound_page(
             symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
             symbol_page_json("demo", None, "analyzer-v2", "second"),
-            query_cursor(query),
-        );
-        return json_response(&body, None);
-    }
-    let body = if query_cursor(query).is_none() {
-        symbol_page_json("demo", Some("next"), "analyzer-v2", "first")
-    } else {
-        symbol_page_json("demo", None, "analyzer-v2", "second")
+            cursor,
+        ),
+        OperationFixture::PageRevisionChange => symbol_page_json(
+            "demo",
+            Some("next"),
+            if followed {
+                "analyzer-v2"
+            } else {
+                "analyzer-v1"
+            },
+            if followed { "second" } else { "first" },
+        ),
+        OperationFixture::MismatchedCursor => symbol_page_json(
+            "demo",
+            (!followed).then_some("next"),
+            "analyzer-v2",
+            "first",
+        ),
+        OperationFixture::RepeatedCursor => symbol_page_json(
+            "demo",
+            Some("next"),
+            "analyzer-v2",
+            if followed { "second" } else { "first" },
+        ),
+        _ if followed => symbol_page_json("demo", None, "analyzer-v2", "second"),
+        _ => symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
     };
     json_response(&body, None)
 }
@@ -1376,6 +1405,124 @@ async fn test_fixture_documented_problem_statuses_decode() {
     }
 }
 
+/// The page limit `operation_failure` asks for, within every fixture's `page_limit_max`.
+const OPERATION_PAGE_LIMIT: i64 = 2;
+
+/// Sends one request to `endpoint` and keeps the failure it answers.
+async fn operation_failure(
+    client: &GlobalClient,
+    endpoint: crate::contract::Endpoint,
+) -> Option<ClientError> {
+    use crate::contract::Endpoint;
+    match endpoint {
+        Endpoint::Capabilities => client.get_capabilities().await.err(),
+        Endpoint::Resolutions => client
+            .resolve_package_context(&resolution_request())
+            .await
+            .err(),
+        Endpoint::Search => client
+            .search_packages(&search_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Symbols => client
+            .list_package_symbols(&symbol_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Patterns => client
+            .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
+            .await
+            .err(),
+        Endpoint::Declarations => client
+            .find_package_declarations(&declaration::declaration_request())
+            .await
+            .err(),
+    }
+}
+
+/// The failure the client answers for the fixture's `status` problem: `Http` carrying the
+/// problem details when the contract documents `status`, and none when it does not.
+fn fixture_problem(status: StatusCode, documented: bool) -> ClientError {
+    let problem = serde_json::from_str::<ProblemDetails>(&problem_json(status)).ok();
+    ClientError::Http {
+        meta: Box::new(ResponseMeta {
+            status: status.as_u16(),
+            content_type: Some("application/problem+json".to_owned()),
+            etag: None,
+            cache_control: None,
+            www_authenticate: None,
+            retry_after: None,
+            rate_limit_limit: None,
+            rate_limit_remaining: None,
+            rate_limit_reset: None,
+        }),
+        problem: problem.filter(|_| documented).map(Box::new),
+    }
+}
+
+/// Every problem status an operation's contract documents, each decoded into its own
+/// response variant.
+const DOCUMENTED_PROBLEM_STATUSES: [StatusCode; 11] = [
+    StatusCode::BAD_REQUEST,
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::NOT_ACCEPTABLE,
+    StatusCode::PAYLOAD_TOO_LARGE,
+    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    StatusCode::TOO_MANY_REQUESTS,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
+
+/// Every operation answers a problem status as `Http`, with the problem details a documented
+/// status carries and without them for an undocumented one. The operation records the
+/// failure, so a later request answers it without reaching the endpoint. One attempt per
+/// request keeps the retried statuses to one request each.
+#[tokio::test]
+async fn test_fixture_every_operation_answers_problem_statuses() {
+    use crate::contract::Endpoint;
+    let operations = [
+        Endpoint::Resolutions,
+        Endpoint::Search,
+        Endpoint::Symbols,
+        Endpoint::Patterns,
+        Endpoint::Declarations,
+    ];
+    let statuses = DOCUMENTED_PROBLEM_STATUSES
+        .map(|status| (status, true))
+        .into_iter()
+        .chain([(StatusCode::CONFLICT, false)]);
+    for (status, documented) in statuses {
+        for endpoint in operations {
+            let mode = FixtureMode::Operations(OperationFixture::Problem(status));
+            let server = FixtureServer::start(mode).await.expect("fixture server");
+            let config = Config {
+                attempts: 1,
+                ..server.config()
+            };
+            let client = GlobalClient::new(config).expect("fixture client");
+            let expected = Some(fixture_problem(status, documented));
+            assert_eq!(
+                operation_failure(&client, endpoint).await,
+                expected,
+                "{endpoint:?} answers HTTP {status}"
+            );
+            assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                operation_failure(&client, Endpoint::Capabilities).await,
+                expected,
+                "{endpoint:?} records its failure"
+            );
+            assert_eq!(
+                server.state.requests.load(Ordering::SeqCst),
+                2,
+                "the recorded failure answers without a request"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_fixture_retry_after_beyond_deadline_does_not_repeat() {
     let server = FixtureServer::start(FixtureMode::RetryAfter {
@@ -1994,6 +2141,22 @@ async fn test_fixture_enforces_active_server_bounds() {
         client.resolve_package_context(&resolution_request()).await,
         Err(ClientError::ResponseBodyTooLarge { .. })
     ));
+
+    // Each page read meets the advertised response body bound on its own request, refusing
+    // the page by its declared length, and records the failure a later request answers.
+    let search_page = search_page_json("demo", None, "analyzer-v2", "first").to_string();
+    let symbol_page = symbol_page_json("demo", Some("next"), "analyzer-v2", "first").to_string();
+    for (endpoint, page) in [
+        (crate::contract::Endpoint::Search, search_page),
+        (crate::contract::Endpoint::Symbols, symbol_page),
+    ] {
+        let (server, client) = operation_client(OperationFixture::TightBounds).await;
+        let expected = Some(ClientError::ResponseBodyTooLarge { bytes: page.len() });
+        assert_eq!(operation_failure(&client, endpoint).await, expected);
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(client.get_capabilities().await.err(), expected);
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+    }
 
     let (server, client) = operation_client(OperationFixture::TightRequestBound).await;
     assert!(matches!(

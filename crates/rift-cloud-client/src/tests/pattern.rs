@@ -35,7 +35,7 @@ pub(super) fn pattern_page_json(cursor: Option<&str>) -> Value {
     })
 }
 
-fn pattern_request() -> PackagePatternRequest {
+pub(super) fn pattern_request() -> PackagePatternRequest {
     PackagePatternRequest {
         pattern: r"fn\s+demo".to_owned(),
         packages: vec![package_request()],
@@ -253,7 +253,7 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
         Ok(())
     );
 
-    let mutations: [PageEdit; 10] = [
+    let mutations: [PageEdit; 11] = [
         ("package", |page| {
             page["items"][0]["package"]["name"] = json!("other");
         }),
@@ -274,6 +274,9 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
         }),
         ("source_identity", |page| {
             page["items"][0]["unit"] = json!("rift://source/cargo/other@1.0.0/src/first.rs");
+        }),
+        ("source_identity", |page| {
+            page["items"][0]["unit"] = json!("rift://source/npm/demo@1.0.0/src/first.rs");
         }),
         ("declaration", |page| {
             page["items"][0]["declaration"]["range"] = json!({"start": 0, "end": 12});
@@ -438,5 +441,14 @@ fn test_a_pattern_match_converts_into_a_file_hit_and_its_declaration() {
         Err(ClientError::InvalidResponseField {
             field: "source_identity"
         })
+    );
+
+    let mut value = pattern_hit_json(UNIT, 10);
+    value["declaration"]["symbol"]["origin"]["location"] = json!("project");
+    let project: PackagePatternHit = serde_json::from_value(value).expect("pattern hit fixture");
+    assert_eq!(
+        PackagePatternMatch::try_from(&project),
+        Err(ClientError::InvalidResponseField { field: "origin" }),
+        "a declaration outside the package converts into no symbol hit"
     );
 }

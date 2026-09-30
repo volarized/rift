@@ -282,6 +282,17 @@ fn an_optional_property_accepting_null_fails_validation() -> TestResult {
     Ok(())
 }
 
+/// A boolean component schema holds no property, so the `null` rule has nothing to refuse
+/// in it and the contract stays valid.
+#[test]
+fn a_boolean_component_schema_passes_the_optional_null_rule() -> TestResult {
+    let mut document = contract()?;
+    document["components"]["schemas"]["AnyValue"] = json!(true);
+    let (_directory, path) = write_contract(&document)?;
+    contract::validate(&path)?;
+    Ok(())
+}
+
 #[test]
 fn every_contract_example_validates_against_its_schema() -> TestResult {
     let document = contract()?;

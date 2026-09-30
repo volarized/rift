@@ -156,3 +156,41 @@ fn test_stopped_at_body_bound_needs_a_short_marked_page() {
     ));
     assert!(!stopped_at_body_bound(&[], 3, 20));
 }
+
+/// Symbol page assembly refuses a page that changes revision, repeats a declaration, or
+/// repeats a cursor, and records the refusal a later request answers; it stops at the
+/// advertised candidate bound.
+#[tokio::test]
+async fn test_fixture_symbol_page_assembly_refuses_what_search_assembly_refuses() {
+    let refusals = [
+        (OperationFixture::PageRevisionChange, "revision"),
+        (OperationFixture::MismatchedCursor, "duplicate_item"),
+        (OperationFixture::RepeatedCursor, "cursor_progress"),
+    ];
+    for (mode, field) in refusals {
+        let (server, client) = operation_client(mode).await;
+        let expected = Err(ClientError::InvalidResponseField { field });
+        assert_eq!(
+            client
+                .list_package_symbols_pages(&symbol_request(), 20)
+                .await
+                .map(|pages| pages.items.len()),
+            expected,
+        );
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
+        assert_eq!(
+            client.get_capabilities().await.map(|_| 0),
+            expected,
+            "{field} is recorded"
+        );
+        assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
+    }
+
+    let (server, client) = operation_client(OperationFixture::CandidateBound).await;
+    let pages = client
+        .list_package_symbols_pages(&symbol_request(), 20)
+        .await
+        .map(|pages| (pages.items.len(), pages.next_cursor));
+    assert_eq!(pages, Ok((1, None)));
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+}
