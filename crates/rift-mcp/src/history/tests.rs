@@ -451,9 +451,9 @@ async fn a_release_pattern_that_does_not_compile_refuses_the_configuration() -> 
         matches!(
             refused.fault(),
             ConfigurationFault::Invalid {
-                violation: ConfigurationViolation::HistoryReleasePatternInvalid { pattern },
+                violation: ConfigurationViolation::HistoryReleasePatternInvalid { pattern, detail },
                 ..
-            } if pattern == "v[1"
+            } if pattern == "v[1" && detail.contains("unclosed character class")
         ),
         "{refused:?}"
     );

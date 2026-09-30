@@ -84,16 +84,15 @@ fn accept_workspace(
         })
     };
     configuration.validate().map_err(invalid)?;
-    if let Some(pattern) = configuration
-        .providers
-        .history
-        .releases
+    let releases = &configuration.providers.history.releases;
+    if let Some((pattern, error)) = releases
         .iter()
-        .find(|pattern| release_matcher(pattern).is_err())
+        .find_map(|pattern| release_matcher(pattern).err().map(|error| (pattern, error)))
     {
         return Err(invalid(
             ConfigurationViolation::HistoryReleasePatternInvalid {
                 pattern: pattern.clone(),
+                detail: error.to_string(),
             },
         ));
     }
@@ -429,9 +428,12 @@ download_timeout = "5m"
             matches!(
                 error.fault(),
                 ConfigurationFault::Invalid {
-                    violation: ConfigurationViolation::HistoryReleasePatternInvalid { pattern },
+                    violation: ConfigurationViolation::HistoryReleasePatternInvalid {
+                        pattern,
+                        detail,
+                    },
                     ..
-                } if pattern == "v[1"
+                } if pattern == "v[1" && detail.contains("unclosed character class")
             ),
             "unexpected configuration failure: {error:?}"
         );
@@ -439,6 +441,10 @@ download_timeout = "5m"
         assert!(
             rendered.contains("providers.history.releases"),
             "{rendered}"
+        );
+        assert!(
+            rendered.contains("unclosed character class"),
+            "the refusal carries the glob parser's account: {rendered}"
         );
         let alternation = concat!(
             "[providers.history]\n",

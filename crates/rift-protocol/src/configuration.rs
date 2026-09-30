@@ -1060,27 +1060,35 @@ impl HistoryConfiguration {
             }
             _ => {}
         }
-        self.releases
-            .iter()
-            .find(|pattern| release_pattern_refused(pattern))
-            .map(
-                |pattern| ConfigurationViolation::HistoryReleasePatternInvalid {
+        self.releases.iter().find_map(|pattern| {
+            release_pattern_form_violation(pattern).map(|detail| {
+                ConfigurationViolation::HistoryReleasePatternInvalid {
                     pattern: pattern.clone(),
-                },
-            )
+                    detail,
+                }
+            })
+        })
     }
 }
 
-/// Whether one release pattern breaks its form: empty, longer than
-/// [`HISTORY_RELEASE_PATTERN_BYTES_MAX`], or carrying whitespace or a control character,
-/// which no tag name git accepts carries.
-fn release_pattern_refused(pattern: &str) -> bool {
-    let empty = pattern.is_empty();
-    let oversized = pattern.len() > HISTORY_RELEASE_PATTERN_BYTES_MAX;
-    let unspellable = pattern
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control());
-    empty || oversized || unspellable
+/// The form rule one release pattern breaks, as the refusal's account of it: empty,
+/// longer than [`HISTORY_RELEASE_PATTERN_BYTES_MAX`], or carrying whitespace or a control
+/// character, which no tag name git accepts carries. Whether the pattern compiles as a glob
+/// is decided where the glob parser runs, beside the history fill.
+fn release_pattern_form_violation(pattern: &str) -> Option<String> {
+    let unspellable = |character: char| character.is_whitespace() || character.is_control();
+    match pattern {
+        "" => Some("the pattern is empty".to_owned()),
+        _ if pattern.len() > HISTORY_RELEASE_PATTERN_BYTES_MAX => Some(format!(
+            "the pattern is longer than {HISTORY_RELEASE_PATTERN_BYTES_MAX} bytes"
+        )),
+        _ if pattern.chars().any(unspellable) => Some(
+            "the pattern carries whitespace or a control character, which no tag name git \
+             accepts carries"
+                .to_owned(),
+        ),
+        _ => None,
+    }
 }
 
 /// The `[execution]` table. Exact language entries enable execution; this
@@ -2811,6 +2819,9 @@ pub enum ConfigurationViolation {
     HistoryReleasePatternInvalid {
         /// The rejected pattern.
         pattern: String,
+        /// The glob parser's account of the failure, or the form rule the pattern breaks
+        /// before it reaches the parser.
+        detail: String,
     },
 }
 
@@ -2913,9 +2924,10 @@ impl ConfigurationViolation {
                 "fields",
                 "providers.history.strategy, providers.history.releases".to_owned(),
             )],
-            Self::HistoryReleasePatternInvalid { pattern } => vec![
+            Self::HistoryReleasePatternInvalid { pattern, detail } => vec![
                 ("field", "providers.history.releases".to_owned()),
                 ("pattern", pattern.clone()),
+                ("detail", detail.clone()),
             ],
         }
     }
@@ -4100,22 +4112,28 @@ mod tests {
         let oversized = "v".repeat(HISTORY_RELEASE_PATTERN_BYTES_MAX + 1);
         let longest = "v".repeat(HISTORY_RELEASE_PATTERN_BYTES_MAX);
         for (pattern, refused) in [
-            ("", true),
-            ("v1 .*", true),
-            ("v1\u{7}", true),
-            (oversized.as_str(), true),
-            (longest.as_str(), false),
-            ("tokio-*-alpha*", false),
+            ("", Some("the pattern is empty")),
+            ("v1 .*", Some("whitespace or a control character")),
+            ("v1\u{7}", Some("whitespace or a control character")),
+            (oversized.as_str(), Some("longer than 256 bytes")),
+            (longest.as_str(), None),
+            ("tokio-*-alpha*", None),
         ] {
             let mut configuration = WorkspaceConfiguration::default();
             configuration.providers.history.strategy = HistoryStrategy::Selective;
             configuration.providers.history.releases = vec![pattern.to_owned()];
             let verdict = configuration.validate();
-            assert_eq!(
-                verdict.is_err(),
-                refused,
-                "pattern {pattern:?} answered {verdict:?}"
-            );
+            match (&verdict, refused) {
+                (
+                    Err(ConfigurationViolation::HistoryReleasePatternInvalid { detail, .. }),
+                    Some(rule),
+                ) => assert!(
+                    detail.contains(rule),
+                    "pattern {pattern:?} answered {detail}"
+                ),
+                (Ok(()), None) => {}
+                _ => panic!("pattern {pattern:?} answered {verdict:?}"),
+            }
         }
         let mut configuration = WorkspaceConfiguration::default();
         configuration.providers.history.strategy = HistoryStrategy::Selective;
@@ -6143,7 +6161,10 @@ mod tests {
             ConfigurationViolation::HistoryCpuShareInvalid { share: 0.0 },
             ConfigurationViolation::HistoryReleasesMissing,
             ConfigurationViolation::HistoryReleasesOutsideSelective,
-            ConfigurationViolation::HistoryReleasePatternInvalid { pattern: text() },
+            ConfigurationViolation::HistoryReleasePatternInvalid {
+                pattern: text(),
+                detail: text(),
+            },
             ConfigurationViolation::CommandProgramEmpty { field: "x" },
             ConfigurationViolation::CommandProgramWhitespace {
                 field: "x",
