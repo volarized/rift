@@ -1447,4 +1447,59 @@ mod tests {
         assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
         Ok(())
     }
+
+    #[test]
+    fn a_selective_store_reports_its_fill_without_reading_head() -> TestResult {
+        let unversioned = tempfile::tempdir()?;
+        let folder = tempfile::tempdir()?;
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
+        let (selective, lagged) = stored(&store, HistoryStrategy::Selective);
+        let (everything, _) = stored(&store, HistoryStrategy::Everything);
+        selective.progress().record_plan(2, 1);
+        everything.progress().record_plan(2, 1);
+        let counts = selective.progress().counts().ok_or("a plan landed")?;
+
+        let warning = selective.filling(&selective.connect()?, unversioned.path())?;
+        let refused = everything.filling(&everything.connect()?, unversioned.path());
+
+        assert!(warning.is_some());
+        assert_eq!(warning, counts.filling_warning(false));
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        assert!(refused.is_err(), "`everything` reads the commit HEAD names");
+        let rendered = format!("{selective:?}");
+        assert!(rendered.starts_with("StoredHistory"), "{rendered}");
+        assert!(rendered.contains("Selective"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_timeline_over_a_store_that_cannot_be_read_refuses_as_a_storage_failure() -> TestResult {
+        use rift_core::{ErrorCode, ErrorName, Fault as _};
+
+        let (directory, _service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let common = folder.path().join("common");
+        let location = rift_history_store::StoreLocation::new(&common, "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+        drop(store);
+        fs::remove_dir_all(&common)?;
+        let history = HistoryConfiguration::default();
+        let syntax = SyntaxLimits::default();
+
+        let opened = SymbolTimelines::open(directory.path(), None, &history, syntax, Some(&stored));
+
+        let refused = opened.expect_err("no folder holds the store's file any more");
+        let fault = refused.fault();
+        assert_eq!(fault.name(), ErrorName::Wire(ErrorCode::StorageFailure));
+        assert!(fault.limit_evidence().is_none());
+        let rendered = refused.to_string();
+        assert!(rendered.contains("open store"), "{rendered}");
+        assert!(
+            std::error::Error::source(&refused).is_some(),
+            "the driver's report rides the cause chain"
+        );
+        Ok(())
+    }
 }
