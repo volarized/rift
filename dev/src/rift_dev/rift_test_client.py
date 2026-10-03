@@ -21,7 +21,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from types import TracebackType
-from typing import Self, TextIO, TypeAlias, cast
+from typing import BinaryIO, Self, TextIO, TypeAlias, cast
 
 import psutil
 import tomllib
@@ -226,7 +226,9 @@ def write_junit(path: Path, name: str, seconds: float, failure: str | None) -> N
 
 
 @contextmanager
-def stderr_log(path: Path | None = None) -> Iterator[TextIO]:
+def stderr_log(
+    path: Path | None = None, *, output: BinaryIO | None = None
+) -> Iterator[TextIO]:
     """Give the SDK a real stderr handle backed by the shared bounded drain.
 
     The SDK must close its process before this context exits. On overflow the
@@ -237,7 +239,7 @@ def stderr_log(path: Path | None = None) -> Iterator[TextIO]:
         os.fdopen(read_fd, "rb", buffering=0) as source,
         os.fdopen(write_fd, "w", encoding="utf-8") as destination,
     ):
-        drain = Drain(source, LOG_BYTES_MAX, threading.Event())
+        drain = Drain(source, LOG_BYTES_MAX, threading.Event(), output=output)
         reader = threading.Thread(target=drain.read, daemon=True)
         reader.start()
         try:
@@ -355,6 +357,7 @@ class Server:
         *,
         startup_seconds: float = 120.0,
         env: Mapping[str, str] | None = None,
+        output: BinaryIO | None = None,
     ) -> None:
         outside_workspace(log_path, root)
         require(startup_seconds > 0, "startup timeout must be positive")
@@ -364,6 +367,7 @@ class Server:
         self.startup_seconds = startup_seconds
         self.env = dict(os.environ)
         self.env.update(env or {})
+        self.output = output
         self.process: Process
         self.port = 0
         self._process_stack = ExitStack()
@@ -423,6 +427,9 @@ class Server:
                     )
                     log.write(chunk)
                     log.flush()
+                    if self.output is not None:
+                        self.output.write(chunk)
+                        self.output.flush()
                     remaining -= len(chunk)
         except (OSError, ValueError, AssertionError) as failure:
             self._log_failure = failure
@@ -487,7 +494,7 @@ class Server:
         proxy_log = log_path or self.log_path.with_suffix(".mcp.log")
         outside_workspace(proxy_log, self.root)
         with (
-            stderr_log(proxy_log) as log,
+            stderr_log(proxy_log, output=self.output) as log,
             owned_environment(self.env) as environment,
         ):
             parameters = StdioServerParameters(

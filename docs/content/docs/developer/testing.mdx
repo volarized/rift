@@ -162,8 +162,10 @@ that warning fails. The report records source revisions, warnings, each call's d
 own deadline, its overlapping writes, and each tool's first and maximum duration.
 
 Reports record the commit, seed, case, selected identities and languages, actions, elapsed time,
-and failure. `RIFT_CORPUS_REPORT` selects the JSON report location. Harness logs and reports
-stay outside the served checkout.
+and failure, including the complete Python traceback. `RIFT_CORPUS_REPORT` selects the JSON
+report location. Nextest displays the foreground server and MCP proxy diagnostics when each
+corpus test completes. Action records stay in the JSON report. Logs and reports stay outside
+the served checkout.
 
 ## Artifact and agent checks
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -146,7 +147,6 @@ class Corpus:
             "elapsed_seconds": time.monotonic() - self.started,
         }
         self.actions.append(entry)
-        print(json.dumps(entry), flush=True)
 
     def server(self, root: Path | None = None) -> Server:
         self.sequence += 1
@@ -155,6 +155,7 @@ class Corpus:
             root or self.root,
             self.report.parent / f"{self.report.stem}.server-{self.sequence}.log",
             startup_seconds=180.0,
+            output=sys.stderr.buffer,
             env={
                 "RUST_LOG": "rift=info,rift_mcp=debug,rift_server=debug,rift_index=info",
                 "NO_COLOR": "1",

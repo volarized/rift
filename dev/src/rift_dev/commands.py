@@ -370,6 +370,7 @@ class Drain:
     failed: threading.Event
     data: bytearray = field(default_factory=bytearray)
     error: Exception | None = None
+    output: BinaryIO | None = None
 
     def read(self) -> None:
         try:
@@ -377,7 +378,11 @@ class Drain:
                 chunk = self.source.read(min(65536, self.maximum + 1 - len(self.data)))
                 if not chunk:
                     return
+                available = self.maximum - len(self.data)
                 self.data.extend(chunk)
+                if self.output is not None:
+                    self.output.write(chunk[:available])
+                    self.output.flush()
             raise RuntimeError(f"command output exceeded {self.maximum} bytes")
         except Exception as error:  # noqa: BLE001 - capture re-raises the reader failure.
             self.error = error
