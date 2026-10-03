@@ -8,8 +8,8 @@
 //! sharing no word with the code it describes still reaches it.
 //!
 //! The suite drives a live rmcp client and reads the tier's state the way a
-//! caller does, from a `search` result's own warnings: `vector_index_preparing`
-//! while the pass runs, and nothing once every declaration carries a vector.
+//! caller does, from a `search` result's own warnings: `local_index_preparing`
+//! while files prepare, then `vector_index_preparing` while declarations are embedded.
 //! Nothing here reads server internals, because nothing a caller cannot see is
 //! what this suite is for.
 //!
@@ -126,22 +126,22 @@ async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestRes
         .ok_or_else(|| "search must return structured content".into())
 }
 
-/// Whether one search answer still reports the vector ranking as not answering.
+/// Whether local preparation or vector ranking still prevents a complete answer.
 fn tier_is_waiting(answer: &Value) -> bool {
     answer["warnings"]
         .as_array()
-        .is_some_and(|warnings| warnings.iter().any(is_vector_warning))
+        .is_some_and(|warnings| warnings.iter().any(is_preparation_warning))
 }
 
-/// Whether one warning is the vector ranking reporting on itself.
-fn is_vector_warning(warning: &Value) -> bool {
+/// Whether one warning reports unfinished local preparation or vector ranking.
+fn is_preparation_warning(warning: &Value) -> bool {
     matches!(
         warning["code"].as_str(),
-        Some("vector_index_preparing" | "vector_ranking_unavailable")
+        Some("local_index_preparing" | "vector_index_preparing" | "vector_ranking_unavailable")
     )
 }
 
-/// Polls `query` until the vector ranking stops warning about itself, and returns
+/// Polls `query` until local and vector preparation finish, and returns
 /// the answer it settled on together with how long that took.
 ///
 /// The loop runs at most `budget / READINESS_POLL` times, so a hub that never
@@ -196,6 +196,46 @@ fn reaches(answer: &Value, path: &str) -> bool {
 /// turned off.
 const VECTOR_DISABLED: &str = "[search.vector]\ndisabled = true\n";
 
+#[test]
+fn test_tier_is_waiting_for_empty_and_nonempty_local_preparation() {
+    // Issue #509: a partial answer cannot establish completed vector ranking.
+    for results in [json!([]), json!([{"path": "lib.rs"}])] {
+        let answer = json!({
+            "results": results,
+            "warnings": [{"code": "local_index_preparing", "prepared": 0}]
+        });
+        assert!(
+            tier_is_waiting(&answer),
+            "local preparation remains: {answer:#}"
+        );
+    }
+}
+
+#[test]
+fn test_tier_is_waiting_preserves_vector_preparation_and_unavailable() {
+    for code in ["vector_index_preparing", "vector_ranking_unavailable"] {
+        let answer = json!({"warnings": [{"code": code}]});
+        assert!(
+            tier_is_waiting(&answer),
+            "vector ranking remains: {answer:#}"
+        );
+    }
+}
+
+#[test]
+fn test_tier_is_waiting_accepts_completed_answers_without_vector_warnings() {
+    for answer in [
+        json!({"results": []}),
+        json!({"results": [{"path": "lib.rs"}], "warnings": []}),
+        json!({"warnings": [{"code": "stale_index"}]}),
+    ] {
+        assert!(
+            !tier_is_waiting(&answer),
+            "preparation has finished: {answer:#}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
     if !search_live() {
@@ -203,12 +243,11 @@ async fn a_paraphrase_reaches_code_it_shares_no_word_with() -> TestResult {
     }
     assert_shares_no_token(PARAPHRASE, &workspace());
 
-    // The control: the same files with the vector ranking off. A disabled tier never
-    // prepares, so this answer is the lexical one whatever the cache already holds -
-    // which is what makes the comparison below a fact rather than a race.
+    // Local preparation must finish before the disabled-vector control can prove
+    // that the same files do not answer the paraphrase through lexical ranking.
     let (_off_directory, off, off_task) =
         served_configured_workspace(&workspace(), Some(VECTOR_DISABLED)).await?;
-    let lexical_only = search(&off, PARAPHRASE).await?;
+    let (lexical_only, _) = ready_answer(&off, PARAPHRASE, WARM_READY_MAX).await?;
     assert!(
         !reaches(&lexical_only, "lib.rs"),
         "a paraphrase must not reach the declaration lexically: {lexical_only:#}"
