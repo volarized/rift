@@ -1144,6 +1144,111 @@ class SourceBound(unittest.TestCase):
         configure.assert_called_with()
 
 
+class Churn(unittest.TestCase):
+    """Partial local preparation must finish before declaration checks (#504)."""
+
+    @staticmethod
+    def declaration(tool: str) -> JsonObject:
+        source = "pub fn corpus_probe() { let value = 0; }"
+        owner: JsonObject = {"symbol": {"id": "corpus_probe"}}
+        hit: JsonObject = {
+            "path": PROBE_PATH,
+            "source": source,
+            "range": {"start": 0, "end": len(source.encode())},
+        }
+        if tool == "search":
+            hit["hit"] = owner
+        else:
+            hit.update(owner)
+        return {
+            "results" if tool == "search" else "hits": [hit],
+            "warnings": [{"code": "stale_index"}],
+        }
+
+    def exercise(
+        self, responses: list[JsonObject], failure: str
+    ) -> tuple[Corpus, AsyncMock]:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            client = AsyncMock(spec=Client)
+            client.call.side_effect = responses
+            with (
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                self.assertRaisesRegex(AssertionError, failure),
+            ):
+                asyncio.run(corpus.churn(cast(Client, client)))
+            self.assertFalse((corpus.root / PROBE_PATH).exists())
+        return corpus, client
+
+    def test_initial_preparation_reaches_declaration_before_pressure(self) -> None:
+        corpus, client = self.exercise(
+            [
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                self.declaration("get_symbol"),
+                {"results": [], "warnings": []},
+            ],
+            "search lost probe declaration",
+        )
+        self.assertEqual(client.call.await_count, 3)
+        self.assertEqual(client.call.await_args_list[0], client.call.await_args_list[1])
+        initial = object_value(corpus.actions[0], "initial churn read")
+        self.assertTrue(initial["first"])
+        self.assertEqual(initial["deadline_seconds"], 40.0)
+        self.assertEqual(initial["source_revision"], 0)
+        self.assertEqual(initial["writes"], 0)
+        self.assertEqual(initial["warning_codes"], ["stale_index"])
+
+    def test_steady_preparation_keeps_existing_read_deadline(self) -> None:
+        corpus, client = self.exercise(
+            [
+                self.declaration("get_symbol"),
+                self.declaration("search"),
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                self.declaration("get_symbol"),
+                {"nodes": [], "source": [], "warnings": []},
+            ],
+            "nodes lost probe declaration",
+        )
+        self.assertEqual(client.call.await_count, 5)
+        self.assertEqual(client.call.await_args_list[2], client.call.await_args_list[3])
+        steady = object_value(corpus.actions[2], "steady churn read")
+        self.assertFalse(steady["first"])
+        self.assertEqual(steady["deadline_seconds"], 20.0)
+        self.assertEqual(steady["source_revision"], 0)
+
+    def test_settled_missing_declaration_still_fails(self) -> None:
+        _corpus, client = self.exercise(
+            [{"hits": [], "warnings": []}], "get_symbol lost probe declaration"
+        )
+        self.assertEqual(client.call.await_count, 1)
+
+    def test_continuous_preparation_spends_inherited_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            client = AsyncMock(spec=Client)
+            client.call.return_value = {
+                "hits": [],
+                "warnings": [{"code": "local_index_preparing"}],
+            }
+
+            async def exercise() -> None:
+                async with gate_deadline("churn preparation fixture", 0.01):
+                    await corpus.churn(cast(Client, client))
+
+            with (
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                self.assertRaises(TimeoutError),
+            ):
+                asyncio.run(exercise())
+            self.assertGreater(client.call.await_count, 1)
+            initial = object_value(corpus.actions[0], "initial churn read")
+            self.assertIsNone(initial["source_revision"])
+            self.assertEqual(initial["deadline_seconds"], 40.0)
+            self.assertFalse((corpus.root / PROBE_PATH).exists())
+
+
 class CaseBudgets(unittest.TestCase):
     """A case stops its own actions before nextest ends the case."""
 

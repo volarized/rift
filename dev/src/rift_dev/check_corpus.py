@@ -671,7 +671,13 @@ class Corpus:
             revision: int | None = None
             try:
                 async with gate_deadline(f"churn {name}", budget):
-                    answer = await client.call(name, CHURN_REQUESTS[name])
+                    answer = await read_settled_local(
+                        client,
+                        name,
+                        CHURN_REQUESTS[name],
+                        seconds=budget,
+                        poll_seconds=POLL_SECONDS,
+                    )
                 codes = [
                     string_value(warning.get("code"), "warning code")
                     for warning in warnings(answer)
