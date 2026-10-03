@@ -1205,7 +1205,8 @@ class ChurnPreparation(unittest.TestCase):
         self.assertEqual(client.call.await_args_list[0], client.call.await_args_list[1])
         churn.assert_awaited_once_with(client)
         server.stop.assert_called_once_with()
-        self.assertEqual(corpus.actions[-1]["state"], "after_churn")
+        action = object_value(corpus.actions[-1], "churn action")
+        self.assertEqual(action["state"], "after_churn")
 
     def test_complete_empty_startup_still_runs_pressure(self) -> None:
         _corpus, server, client, churn = self.exercise([{"hits": [], "warnings": []}])
