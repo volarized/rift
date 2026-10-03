@@ -9857,6 +9857,7 @@ pub(crate) mod tests {
 
     async fn publication_matching(
         published: &RwLock<IndexState>,
+        validation: &IndexValidation,
         expected: &rift_index::WorkspaceDigests,
     ) -> TestResult<Arc<PublishedWorkspace>> {
         for _attempt in 0..LANE_ATTEMPTS_MAX {
@@ -9866,7 +9867,69 @@ pub(crate) mod tests {
             }
             tokio::time::sleep(LANE_POLL).await;
         }
-        Err("the native watcher did not publish the complete changed tree".into())
+        let state = published.read().await;
+        let observed = state.current.reads.workspace_digests();
+        let published_epoch = state.current.epoch;
+        let failure = state
+            .failure
+            .as_ref()
+            .map(|(epoch, error)| (*epoch, error.to_string()));
+        drop(state);
+        let pending = validation
+            .publication_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Err(format!(
+            "the native watcher did not publish the complete changed tree: \
+             expected={expected:?}, observed={observed:?}, \
+             published_epoch={published_epoch}, observed_epoch={}, \
+             watch_failed={}, supervisor_running={}, failure={failure:?}, pending={pending:?}",
+            validation.observed_epoch(),
+            validation.watch_failed.load(Ordering::Acquire),
+            validation.supervisor_running.load(Ordering::Acquire),
+        )
+        .into())
+    }
+
+    /// A failed observation reports the publication, pending work, and recorded failure.
+    #[tokio::test(start_paused = true)]
+    async fn native_publication_timeout_reports_observed_state() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn old() {}\n")?;
+        let before = stable_candidate(root, 0)?;
+        fs::write(root.join("lib.rs"), "pub fn new() {}\n")?;
+        let expected = stable_candidate(root, 1)?.reads.workspace_digests();
+        let (validation, _invalidations) = IndexValidation::new(4);
+        let epoch = validation.observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        let state = RwLock::new(IndexState {
+            current: before,
+            failure: Some((
+                epoch,
+                Arc::new(ReadFault::unavailable("test rebuild", "held failure")),
+            )),
+        });
+        let error = publication_matching(&state, &validation, &expected)
+            .await
+            .expect_err("a changed tree must not match the old publication");
+        let message = error.to_string();
+        for field in [
+            "expected=WorkspaceDigests",
+            "observed=WorkspaceDigests",
+            "published_epoch=0",
+            "observed_epoch=1",
+            "watch_failed=false",
+            "supervisor_running=",
+            "held failure",
+            "pending=PendingWork",
+            "lib.rs",
+        ] {
+            assert!(
+                message.contains(field),
+                "missing diagnostic {field}: {message}"
+            );
+        }
+        Ok(())
     }
 
     /// A native workspace watcher publishes complete facts equal to a cold build.
@@ -9933,7 +9996,8 @@ pub(crate) mod tests {
                 "changed fixture must retain documentation references"
             );
             let expected_facts = published_facts(&cold_b)?;
-            let publication = publication_matching(&state, &expected_facts.digests).await?;
+            let expected = &expected_facts.digests;
+            let publication = publication_matching(&state, &validation, expected).await?;
             let watched_facts = published_facts(&publication)?;
 
             assert!(
