@@ -13,7 +13,6 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.shared.exceptions import MCPError
-
 from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_pattern
 from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
