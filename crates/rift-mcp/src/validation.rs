@@ -338,12 +338,12 @@ impl PublishedWorkspace {
             .collect();
         let mut refused = self.visible_refused.as_ref().clone();
         for path in paths {
-            let digest = match reads.file_digest(path) {
-                Some(digest) => Ok(Some(digest)),
-                None => policy.visible_digest(&root.join(path.as_str())),
+            let record = match reads.file_digest(path) {
+                Some(digest) => Ok(Some(FileRecord::Digest(digest))),
+                None => observed_record(policy, root, path),
             };
-            match digest {
-                Ok(Some(digest)) => {
+            match record {
+                Ok(Some(FileRecord::Digest(digest))) => {
                     digests.insert(path.clone(), digest);
                     refused.remove(path);
                 }
@@ -351,12 +351,8 @@ impl PublishedWorkspace {
                     digests.remove(path);
                     refused.remove(path);
                 }
-                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {
+                Ok(Some(FileRecord::LeftOut(warning))) => {
                     digests.remove(path);
-                    let warning = error
-                        .fault()
-                        .left_out_file(path.clone())
-                        .unwrap_or_else(|| unreachable!("the guard found a left-out file"));
                     refused.insert(path.clone(), warning);
                 }
                 Err(error) => return Err(ReadFault::index(error)),
@@ -5952,7 +5948,8 @@ pub(crate) mod tests {
     /// A directory the publication holds nothing below reaches the rebuild as a path when
     /// its own modify report arrives, and reading a directory as a file fails. It holds no
     /// file, so it adds nothing to the change set: alone it changes nothing, and beside a
-    /// file created in it the change names that file alone.
+    /// file created in it the change names that file alone. The publication must retain
+    /// that decision when it updates the complete visible set (issue #512).
     #[test]
     fn a_directory_modified_with_nothing_indexed_below_adds_nothing_to_the_change_set() -> TestResult
     {
@@ -5979,11 +5976,37 @@ pub(crate) mod tests {
         );
         super::report_watch_outcome(&roots, &validation, Ok(created));
         super::report_watch_outcome(&roots, &validation, Ok(folder_modified));
-        let beside = change_set_of(directory.path(), &validation, &previous);
+        let mut request = validation.take_pending();
+        request.previous = Some(previous);
+        let configuration = ConfigurationState::accept(directory.path());
+        let beside = request.change_set(directory.path(), &configuration);
         assert_eq!(
             changed_paths(&beside),
             Some(vec!["docs/first.rs".to_owned()]),
             "{beside:?}"
+        );
+        let limits = WorkspaceIndexLimits::default();
+        let WorkspaceCandidate::Stable {
+            published,
+            change_set,
+        } = build_workspace_candidate(directory.path(), limits, &request)?
+        else {
+            return Err("fixture configuration must remain stable".into());
+        };
+        assert_eq!(changed_paths(&change_set), changed_paths(&beside));
+        let cold = stable_candidate(directory.path(), request.epoch)?;
+        assert_eq!(
+            published_facts(&published)?,
+            published_facts(&cold)?,
+            "directory and file observations must publish complete cold facts"
+        );
+        assert_eq!(published.visible_digests, cold.visible_digests);
+        assert_eq!(published.visible_refused, cold.visible_refused);
+        assert_eq!(published.map, cold.map);
+        assert_eq!(
+            published.visible_digests.get(&ProjectPath::new("docs")?),
+            None,
+            "a directory has no visible file digest"
         );
         Ok(())
     }
