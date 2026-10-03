@@ -1298,17 +1298,19 @@ pub(crate) fn report_watch_outcome(
         );
         return;
     };
-    // Git controls live outside linked worktrees. Route exactly HEAD and index.lock
-    // before the source floor; the repository process's own .git/.rift writes stay out.
-    if roots.git_directory.as_ref().is_some_and(|directory| {
-        event.paths.iter().any(|path| {
-            path.parent() == Some(directory.as_path())
-                && matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some("HEAD" | "index.lock")
-                )
+    // Git control changes live outside linked worktrees. Route HEAD and index.lock
+    // before the source floor; access events keep the existing rescan classification.
+    if !matches!(event.kind, EventKind::Access(_))
+        && roots.git_directory.as_ref().is_some_and(|directory| {
+            event.paths.iter().any(|path| {
+                path.parent() == Some(directory.as_path())
+                    && matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("HEAD" | "index.lock")
+                    )
+            })
         })
-    }) {
+    {
         if let Err(error) = validation.observe_whole_workspace() {
             tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
         }
@@ -6514,6 +6516,76 @@ pub(crate) mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn git_control_access_events_do_not_invalidate_the_workspace() {
+        use notify::event::{AccessKind, AccessMode};
+
+        // Issue #500: repository reads must not schedule another repository read.
+        let root = std::path::PathBuf::from("/rift-workspace");
+        for git_directory in [root.join(".git"), std::path::PathBuf::from("/rift-git")] {
+            let roots = super::WatchRoots {
+                canonical: root.clone(),
+                watched: root.clone(),
+                git_directory: Some(git_directory.clone()),
+            };
+            let (validation, mut receiver) =
+                IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+            for access in [
+                AccessKind::Any,
+                AccessKind::Read,
+                AccessKind::Open(AccessMode::Any),
+                AccessKind::Close(AccessMode::Read),
+                AccessKind::Close(AccessMode::Write),
+            ] {
+                let head =
+                    Event::new(EventKind::Access(access)).add_path(git_directory.join("HEAD"));
+                let lock = Event::new(EventKind::Access(access))
+                    .add_path(git_directory.join("index.lock"));
+                super::report_watch_outcome(&roots, &validation, Ok(head));
+                super::report_watch_outcome(&roots, &validation, Ok(lock));
+            }
+            assert_eq!(validation.observed_epoch(), 0);
+            assert!(receiver.try_recv().is_err());
+            let pending = validation.take_pending().work;
+            assert!(!pending.covers_whole_workspace());
+            assert_eq!(pending.paths().count(), 0);
+        }
+    }
+
+    #[test]
+    fn git_control_changes_and_rescans_invalidate_the_workspace() {
+        use notify::event::{AccessKind, AccessMode, DataChange, Flag};
+
+        let root = std::path::PathBuf::from("/rift-workspace");
+        for git_directory in [root.join(".git"), std::path::PathBuf::from("/rift-git")] {
+            let roots = super::WatchRoots {
+                canonical: root.clone(),
+                watched: root.clone(),
+                git_directory: Some(git_directory.clone()),
+            };
+            let (validation, mut receiver) =
+                IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+            let head_write = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                .add_path(git_directory.join("HEAD"));
+            let lock_create = Event::new(EventKind::Create(CreateKind::File))
+                .add_path(git_directory.join("index.lock"));
+            let lock_remove = Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(git_directory.join("index.lock"));
+            let rescan = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+                .add_path(git_directory.join("HEAD"))
+                .set_flag(Flag::Rescan);
+            for (index, event) in [head_write, lock_create, lock_remove, rescan]
+                .into_iter()
+                .enumerate()
+            {
+                super::report_watch_outcome(&roots, &validation, Ok(event));
+                assert_eq!(validation.observed_epoch(), index as u64 + 1);
+                assert!(receiver.try_recv().is_ok());
+                assert!(validation.take_pending().work.covers_whole_workspace());
+            }
+        }
     }
 
     #[test]
