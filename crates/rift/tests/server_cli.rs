@@ -41,10 +41,9 @@ const GONE_POLL_ATTEMPT_COUNT: u32 = 100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Concurrent `rift server start` invocations in the election race.
 const CONCURRENT_START_COUNT: usize = 4;
-/// Source files in the workspace whose lexical commit a stop lands inside.
+/// Source files in the workspace used by preparation and rewrite stop tests.
 const LARGE_FIXTURE_FILES: usize = 3_000;
-/// Declarations per file in that fixture: one lexical unit each, so the whole commit
-/// that runs behind the publication takes seconds on a development machine.
+/// Documented declarations per file in the large workspace fixture.
 const LARGE_FIXTURE_DECLARATIONS: usize = 12;
 /// The startup stages recorded when a foreground server misses its start window.
 const STARTUP_TRACE_FILTER: &str =
@@ -57,9 +56,6 @@ const SERVER_LOG_VARIABLES: [(&str, &str); 2] =
 /// The reader drains every byte past this bound, so a server cannot wait on a full pipe while
 /// its first index build runs. The retained output records the stage reached at a refusal.
 const STARTUP_STDERR_BYTES_MAX: usize = 4 << 20;
-/// How long after rewriting the large fixture the stop is issued: long enough for the
-/// capture to be running and the previous rebuild's lexical transaction to hold the write turn.
-const STOP_DELAY_AFTER_REWRITE: Duration = Duration::from_millis(200);
 /// How long the process may still run after `server.json` goes.
 ///
 /// The serving process retires its own document, by dropping the election guard
@@ -144,6 +140,11 @@ fn held_port_in_range() -> TestResult<TcpListener> {
 /// Fills the fixture with [`LARGE_FIXTURE_FILES`] Rust files under `src`, each declaring
 /// [`LARGE_FIXTURE_DECLARATIONS`] documented functions.
 fn write_large_fixture(root: &Path) -> TestResult {
+    write_large_fixture_with_value(root, 0)
+}
+
+/// Writes a changed function value when the fixture is rewritten.
+fn write_large_fixture_with_value(root: &Path, value: u64) -> TestResult {
     use std::fmt::Write as _;
 
     let source = root.join("src");
@@ -154,7 +155,7 @@ fn write_large_fixture(root: &Path) -> TestResult {
             writeln!(
                 contents,
                 "/// Beacon {declaration} in file {file}.\npub fn beacon_{file}_{declaration}(value: \
-                 u64) -> u64 {{\n    value + {declaration}\n}}\n"
+                 u64) -> u64 {{\n    value + {declaration} + {value}\n}}\n"
             )?;
         }
         fs::write(source.join(format!("file_{file}.rs")), contents)?;
@@ -959,9 +960,8 @@ fn sigterm_flushes_the_otlp_export_before_the_process_exits() -> TestResult {
     Ok(())
 }
 
-// Startup failure: https://github.com/volarized/rift/issues/447
+// Native startup regression: https://github.com/volarized/rift/issues/447
 #[test]
-#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/447")]
 fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -975,29 +975,26 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        published_foreground_document(root, child.id())
-    })?;
+    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
     // The server serves past its own stop span before anyone asks it to stop, so a
     // deadline derived at startup would leave every later stage nothing to spend.
     std::thread::sleep(IDLE_SPAN_PAST_STOP_DEADLINE);
-    let stopped = rift(root, &["server", "stop"])?;
-    require_success(&stopped, "stop of a long-serving foreground server")?;
+    stop_foreground_server(root, &mut child)?;
 
     wait_for(
         GONE_POLL_ATTEMPT_COUNT,
         "the foreground child to exit",
         || child.try_wait().ok().flatten(),
     )?;
-    let output = child.wait_with_output()?;
+    let status = child.wait()?;
     assert!(
-        output.status.success(),
-        "a stopped foreground server exits cleanly: {:?}",
-        output.status
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.finished()?;
     let stop_line = stop_line_of(&stderr)?;
     assert!(
         stop_line.contains("\"ok\""),
@@ -1010,68 +1007,9 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     Ok(())
 }
 
-// Startup failure: https://github.com/volarized/rift/issues/447
+// Native startup regression: https://github.com/volarized/rift/issues/447
 #[test]
-#[cfg_attr(
-    all(target_os = "macos", target_arch = "x86_64"),
-    ignore = "https://github.com/volarized/rift/issues/447"
-)]
-fn stop_during_the_lexical_commit_behind_the_publication_ends_the_process() -> TestResult {
-    let directory = workspace()?;
-    let root = directory.path();
-    write_large_fixture(root)?;
-    let _cleanup = StopOnDrop::new(root);
-
-    let mut child = Command::new(rift_binary()?)
-        .args(["server", "start", "--foreground"])
-        .current_dir(root)
-        .envs(SERVER_LOG_VARIABLES)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        published_foreground_document(root, child.id())
-    })?;
-    assert_eq!(serving.pid, child.id(), "the child itself must serve");
-
-    // The document appears once the index publishes; the lexical commit of every unit
-    // runs behind that publication, so the stop lands while it runs.
-    let stopped = rift(root, &["server", "stop"])?;
-    require_success(&stopped, "stop during the lexical commit")?;
-
-    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
-    // The process leaves once the log drain has stopped; that drain's last batch waits
-    // for the database write turn the transaction holds, under the drain's own deadline.
-    let status = wait_for(
-        GONE_POLL_ATTEMPT_COUNT,
-        "the stopped server's process to exit while its lexical commit runs",
-        || child.try_wait().ok().flatten(),
-    )?;
-    assert!(
-        status.success(),
-        "a stopped foreground server exits cleanly: {status:?}"
-    );
-    let output = child.wait_with_output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("MCP server stopped"),
-        "serving ended before the process left: {stderr}"
-    );
-    assert!(
-        !document_path(root).exists(),
-        "a graceful stop retires server.json"
-    );
-    Ok(())
-}
-
-// Startup failure: https://github.com/volarized/rift/issues/447
-#[test]
-#[cfg_attr(
-    all(target_os = "macos", target_arch = "x86_64"),
-    ignore = "https://github.com/volarized/rift/issues/447"
-)]
-fn stop_during_a_running_capture_ends_the_process() -> TestResult {
+fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -1086,24 +1024,17 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
         .stderr(Stdio::piped())
         .spawn()?;
     let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
-    let serving = wait_for(START_POLL_ATTEMPT_COUNT, "the foreground server", || {
-        published_foreground_document(root, child.id())
-    })?;
+    let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
-    // The document appears once the initial index publishes. Rewriting every fixture
-    // file then streams invalidations for longer than the supervisor's debounce, so
-    // rebuilds run back to back on the blocking pool while the stop lands.
-    write_large_fixture(root)?;
-    let stopped = rift(root, &["server", "stop"])?;
-    require_success(&stopped, "stop during the rebuild")?;
+    // The document appears after HTTP binds, while source preparation can still run.
+    // The lane's injected cancellation tests separately prove held transaction abort.
+    stop_foreground_server(root, &mut child)?;
 
-    // `GONE_POLL_ATTEMPT_COUNT` probes at `POLL_INTERVAL` is the server's own stop bound.
-    // A capture the stop interrupts ends on its own thread; the supervisor does not
-    // wait for it before the process leaves.
+    // The stop helper already observes CLI completion and process exit within five seconds.
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
-        "the stopped server's process to exit while its capture runs",
+        "the stopped server's process to exit after the listener binds",
         || child.try_wait().ok().flatten(),
     )?;
     assert!(
@@ -1123,13 +1054,58 @@ fn stop_during_a_running_capture_ends_the_process() -> TestResult {
     Ok(())
 }
 
-// Startup failure: https://github.com/volarized/rift/issues/447
+// Native startup regression: https://github.com/volarized/rift/issues/447
 #[test]
-#[cfg_attr(
-    all(target_os = "macos", target_arch = "x86_64"),
-    ignore = "https://github.com/volarized/rift/issues/447"
-)]
-fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestResult {
+fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
+    let directory = workspace()?;
+    let root = directory.path();
+    write_large_fixture(root)?;
+    let _cleanup = StopOnDrop::new(root);
+
+    let mut child = Command::new(rift_binary()?)
+        .args(["server", "start", "--foreground"])
+        .current_dir(root)
+        .envs(SERVER_LOG_VARIABLES)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = StderrWatch::spawn(child.stderr.take().ok_or("the child's stderr is piped")?);
+    let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
+    assert_eq!(serving.pid, child.id(), "the child itself must serve");
+
+    // A published document identifies the listener. Changed source bytes then feed
+    // invalidations during preparation or a later rebuild. Injected supervisor tests
+    // separately prove cancellation while a capture remains held.
+    write_large_fixture_with_value(root, 1)?;
+    stop_foreground_server(root, &mut child)?;
+
+    // The stop helper already observes CLI completion and process exit within five seconds.
+    let status = wait_for(
+        GONE_POLL_ATTEMPT_COUNT,
+        "the stopped server's process to exit after the source rewrite",
+        || child.try_wait().ok().flatten(),
+    )?;
+    assert!(
+        status.success(),
+        "a stopped foreground server exits cleanly: {status:?}"
+    );
+    child.wait()?;
+    let stderr = stderr.finished()?;
+    assert!(
+        stderr.contains("MCP server stopped"),
+        "serving ended before the process left: {stderr}"
+    );
+    assert!(
+        !document_path(root).exists(),
+        "a graceful stop retires server.json"
+    );
+    Ok(())
+}
+
+// Native startup regression: https://github.com/volarized/rift/issues/447
+#[test]
+fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
     write_large_fixture(root)?;
@@ -1148,20 +1124,19 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
-    // Rewriting every file streams invalidations into a capture while the rebuild behind
-    // the publication is still replacing every lexical unit in one transaction that holds
-    // the database's write turn. The stop lands with both in flight.
-    write_large_fixture(root)?;
-    std::thread::sleep(STOP_DELAY_AFTER_REWRITE);
+    // Every rewrite changes bytes. The watcher owes validation during preparation or
+    // a later rebuild; the document alone does not identify a capture or transaction.
+    write_large_fixture_with_value(root, 1)?;
+    let stop_started = std::time::Instant::now();
     let stopped = rift(root, &["server", "stop"])?;
-    require_success(&stopped, "stop during the rebuild")?;
+    require_success(&stopped, "stop after the source rewrite")?;
 
     // Each poll reads the document before the process, so a poll never manufactures the
     // order it measures.
     let mut observations = Vec::with_capacity(GONE_POLL_ATTEMPT_COUNT as usize);
     let status = wait_for(
         GONE_POLL_ATTEMPT_COUNT,
-        "the stopped server's process to exit while its rebuild runs",
+        "the stopped server's process to exit after the source rewrite",
         || {
             let document_present = document_path(root).exists();
             let exited = child.try_wait().ok().flatten();
@@ -1172,6 +1147,10 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     assert!(
         status.success(),
         "a stopped foreground server exits cleanly: {status:?}"
+    );
+    assert!(
+        stop_started.elapsed() <= DATABASE_REOPEN_STOP_BOUND,
+        "stop and observed process exit must fit {DATABASE_REOPEN_STOP_BOUND:?}"
     );
     let lingering_polls = observations
         .iter()
@@ -1196,12 +1175,8 @@ fn stop_issued_during_a_rebuild_ends_the_process_as_the_document_goes() -> TestR
     Ok(())
 }
 
-// Startup failure: https://github.com/volarized/rift/issues/447
+// Native startup regression: https://github.com/volarized/rift/issues/447
 #[test]
-#[cfg_attr(
-    any(windows, all(target_os = "macos", target_arch = "x86_64")),
-    ignore = "https://github.com/volarized/rift/issues/447"
-)]
 fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
@@ -1221,13 +1196,12 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
     let serving = wait_for_foreground_server(root, &mut child, &stderr)?;
     assert_eq!(serving.pid, child.id(), "the child itself must serve");
 
-    // The search reads the large fixture's units, so serving still has a request to
-    // drain when the stop issued behind it cancels the serve loop. Its answer is not
-    // asserted: a drain the stop's budget cuts short leaves the caller without one,
-    // and that is a valid stop.
+    // Search and stop run concurrently. Search may answer during preparation, so this
+    // case observes election release without requiring a held search request.
     let searching = std::thread::spawn(move || {
         let _answer = search_request(serving.port, &serving.token, "beacon");
     });
+    let stop_started = std::time::Instant::now();
     let stopping = std::thread::spawn({
         let root = root.to_owned();
         move || rift(&root, &["server", "stop"]).map_err(|error| error.to_string())
@@ -1272,6 +1246,10 @@ fn a_stop_reports_success_only_once_the_election_it_waited_on_released() -> Test
         || child.try_wait().ok().flatten(),
     )?;
     child.wait()?;
+    assert!(
+        stop_started.elapsed() <= DATABASE_REOPEN_STOP_BOUND,
+        "stop and observed process exit must fit {DATABASE_REOPEN_STOP_BOUND:?}"
+    );
     let stderr = stderr.finished()?;
     assert!(
         stderr.contains("MCP server stopped"),
@@ -1510,7 +1488,6 @@ const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
 /// again inside its window and reports the server it elected.
 // Leaked handles: https://github.com/volarized/rift/issues/484
 #[test]
-#[cfg_attr(windows, ignore = "https://github.com/volarized/rift/issues/484")]
 fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let directory = workspace()?;
     let root = directory.path();
