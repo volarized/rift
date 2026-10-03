@@ -17,6 +17,12 @@ forwards every request to one `rift server` running locally for the workspace. T
 communicate over [Streamable
 HTTP](https://modelcontextprotocol.io/specification/draft/basic/transports).
 
+<VersionBadge version="v0.0.47" />
+
+A foreground repository server can hold several workspaces from the same Git repository.
+`rift mcp` adopts it when the workspace accepts its settings; automatic startup continues to
+start a workspace server. Each workspace retains its own index, configuration, watcher, and database.
+
 The `rift server` coordinates source discovery and providers. Source
 resolvers identify project files, dependencies, and generated code. Providers analyze that source
 and produce facts such as symbols, syntax nodes, relationships, and diagnostics.
@@ -69,10 +75,9 @@ process the port and token it needs to reach that server. For example:
 ```
 
 When no live server stands behind the file, `rift mcp` starts one. An exclusive file lock
-elects one starter if several processes race; the winner builds its index, binds a port, and
-publishes the file, and the rest connect to it. The winner holds the lock from its election
-onward, so a `rift mcp` or `rift server start` that arrives while it is still indexing waits
-for its file instead of starting another server.
+elects one starter if several processes race; the winner binds a port and publishes the file,
+and the rest connect to it. The winner holds the lock from its election onward, while its
+index prepares source in the background.
 
 The proxy adopts that server only when its identity matches the proxy's own: the package version
 with the git commit the binary was built from, and the served MCP schema's SHA-256. Requests
@@ -128,7 +133,8 @@ invalid file keeps the workspace unusable until you fix it.
 A rebuild that fails - the tree crossed a configured bound, a file could not be read - leaves the
 last published snapshot served. A read answers from that snapshot and carries a `stale_index`
 warning naming the failure. The next filesystem
-event retries the rebuild, and a rebuild that publishes clears the warning.
+event or background validation retries the rebuild. A successful rebuild clears the warning,
+including recovery after the tree returns to the publication's exact bytes.
 
 The server stops itself once no request remains active and the
 [`idle_timeout`](/docs/developer/configuration#server) span passes after the last response completes.
@@ -137,9 +143,10 @@ The server stops itself once no request remains active and the
 
 `rift server status` reports which of these states the workspace is in - a serving server with
 its port, pid, and version, a server still indexing, a stale `.rift/server.json`, or no server
-- and changes nothing. A server that fails to start, or panics, records why under
-`rift server logs --level error` before it exits, and a server `rift server start` spawned
-writes its standard error to `.rift/server.stderr`, truncated at each start.
+- and changes nothing. After taking its election and opening storage, a server that fails to
+start, or panics, records why under `rift server logs --level error` before it exits. A start
+refused by the election reports its error on standard error. A server `rift server start`
+spawned writes its standard error to `.rift/server.stderr`, truncated at each start.
 
 ## Source discovery
 
@@ -444,9 +451,20 @@ presentation fields and combines list facts without discarding conflicting Contr
 The server keeps an immutable index over the project's source. Tree-sitter extracts
 declarations and syntax nodes from the files the workspace's source policy includes.
 
-The server watches the workspace and validates the published index against it before each
-current-tree read, so a read serves the tree as it stands and never combines state from two
-index revisions. The [implementation](/docs/developer/implementation#rift-server) page describes the
+<VersionBadge version="v0.0.47" />
+
+The server starts with an empty publication, then publishes discovered paths and prepared files
+as indexing advances. Reads answer from prepared source and carry
+[`local_index_preparing`](/docs/developer/protocol/mcp#reads) while their selected local scope is
+incomplete. A `nodes` request can read its supplied file ahead of background preparation.
+
+Every publication owns its preparation counts and map together, so progress describes the
+answer the caller received. A tree change can reduce those counts; completion applies to the
+current selection of files.
+
+The server watches the workspace and validates the source each current-tree tool read uses,
+so an answer never combines state from two index revisions. The
+[implementation](/docs/developer/implementation#rift-server) page describes the
 watcher, the rebuild lane, and the swap that keep this true.
 
 When the published index lags the tree a read captured, the result says so: a `stale_index`

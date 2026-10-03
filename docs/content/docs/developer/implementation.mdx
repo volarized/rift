@@ -105,8 +105,8 @@ Startup runs one cycle:
 2. Parse `rift.toml` and accept the workspace; an invalid file keeps the server running but
    refuses every request until fixed.
 3. Start the native filesystem watcher.
-4. Run the initial scan and parse on a Tokio-managed blocking task, so traversal and parsing
-   never occupy an async MCP worker.
+4. Publish an empty index carrying `local_index_preparing`, then start background discovery
+   and preparation on the bounded worker pool.
 5. Bind the first free loopback port of the accepted
    [`[server]` selection](/docs/developer/configuration#server) - the pinned `port` or the configured
    `port_range` - mint the bearer token, and write both into `.rift/server.json`.
@@ -137,8 +137,11 @@ accepts the flag only together with `--foreground`, so no detached server ever s
 unchecked; the server still mints its token and writes it into `.rift/server.json`, so
 `rift mcp` reaches it unchanged; and the serving process records one `WARN` naming the run.
 
-Blocking tasks run on a Tokio-controlled worker pool. A request for blocking work lands in a
-queue, and a worker picks it up when one is free. This behavior is configurable via the
+<VersionBadge version="v0.0.47" />
+
+Filesystem and parser work runs through one named Rayon pool. Admission bounds concurrent
+operations before a Tokio blocking task enters that pool, and cancellation is checked
+between files. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
 [`[server]` section](/docs/developer/configuration#server).
 
@@ -153,6 +156,11 @@ started behind a publication can run for minutes with nothing able to cancel it.
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories.
 
+<VersionBadge version="v0.0.47" />
+
+Discovery and event filtering also skip nested linked Git worktrees. Submodules and independent
+nested repositories retain the existing source visibility rules.
+
 The symbol index stays in memory as one immutable value: a rebuild constructs the next index and
 accepted configuration outside the async lock, then swaps the complete value under its write
 lock. Each request clones the published value under a read lock and retains that capture through
@@ -162,7 +170,7 @@ its result, so reads never combine state from two index revisions.
 
 Watcher events advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
-those files, sharing every other file with the previous index. A watch failure, a written
+those files, sharing every other file with the previous index. A loss event, a written
 `.gitignore`, or a directory appearing or disappearing reads the whole workspace instead: the
 rebuild walks the tree and reads and digests every visible file under the ignore files as they
 stand now, and parses only the files whose bytes the previous index did not already parse. A
@@ -170,9 +178,9 @@ written `rift.toml` reads and parses the whole workspace when `[source]`, a lang
 selection, `[search.text]` inclusion or chunk bound, `[documentation]`, `[dependencies]`, or
 `[providers.syntax]` changed. Every other accepted configuration change reuses the published tree.
 
-Before each current-tree read, the server captures an exact digest of every included workspace
-file, then waits until the published index counter matches its observation. That capture already
-read the tree, so a read that finds the index behind names the files that moved rather than
+Before each settled current-tree tool read, the server validates the digest of every included
+workspace file, then waits until the published index counter matches its observation. That
+capture already walked the tree, so a read that finds the index behind names the files that moved rather than
 asking for a whole rebuild. A file that appeared or disappeared because a `.gitignore` changed
 is the exception: the published index still applies the ignore files it was built under, so
 rebuilding that one file changes nothing, and the read asks for the whole workspace without
@@ -183,19 +191,96 @@ report asks for the whole workspace, so it supersedes the rebuild the read asked
 read captures again: a capture that matches its previous one waits for the next rebuild, and only
 a capture that differs, a tree still moving, answers from the published index with `stale_index`.
 
-<VersionBadge version="v0.0.46" />
+<VersionBadge version="v0.0.47" />
 
-The capture records each file's stat beside its digests: the length and modification time, and
-on unix the status change time, inode, and mode. The next capture reads and hashes only the files
-whose stat moved and keeps the recorded digests of the rest, so a read over an unchanged tree
-reads no file. The record holds the last capture's paths alone and is reused only under the same
-index limits.
+The capture records each file's stat beside its digests: length and modification time, and on
+Unix status change time, device, inode, and mode. It reads a timestamp from a temporary file on
+the workspace filesystem before capturing bytes. An unchanged stat permits digest reuse only
+when both recorded change times precede the boundary that validated those bytes.
 
-Restoring a modification time (`touch -r`, `cp -p`, `rsync -t`) moves the status change time,
-so such a rewrite is read again. One miss stays: a rewrite to bytes of the same length inside
-the same timestamp tick keeps its old digest until the file's stat moves again. APFS and ext4
-stamp nanoseconds, which makes that tick too short to matter; the 1 s or 2 s ticks of HFS+, FAT,
-and some network mounts widen it.
+This follows [Git's racily-clean check](https://git-scm.com/docs/racy-git), with a status-change
+time check for rewrites that restore modification time. Reused entries retain their original
+boundary, so copying an entry into a later capture does not make a same-tick write safe to skip.
+
+Stat reuse applies to APFS and HFS+ on macOS, and ext4 and tmpfs on Linux. Windows and other
+filesystem types read every visible file again. A failed boundary, changed root, different
+device, or backwards timestamp also selects full reads under the same request budget.
+
+Every complete pass still walks the source policy to discover new and removed paths. The
+watcher's loss flag requests this recovery before path filtering, including a loss event with
+no path. The observer and publisher share the publication lane, where the candidate's epoch
+and source policy are checked before the complete value changes.
+
+Background validation uses that same source discovery and stat comparison even without watcher
+events. Its deadline follows `[server] validation_interval` and is independent of requests and
+filesystem activity. An unchanged check without a recorded failure queues no rebuild; changed paths use the existing
+incremental comparison, while a changed configuration or ignore policy requires a complete pass.
+
+A recorded rebuild failure is retried even after the tree returns to the publication's exact
+bytes. An empty incremental recovery reuses the read service and clears the failure without
+deriving source again.
+
+The watcher also observes the worktree's Git directory, including a linked worktree's directory
+outside its source root. `HEAD` and `index.lock` events request validation before the source
+floor; other `.git` paths retain that floor.
+
+Before a queued rebuild, the supervisor waits for `index.lock` to disappear within
+`[server] version_control_timeout`. The first observed lock fixes the deadline, so repeated events
+cannot renew the wait. An expired lock is named in the log and passed until its absence is observed;
+shutdown cancels the wait.
+
+### Repository serving
+
+<VersionBadge version="v0.0.47" />
+
+Repository serving requires an explicit foreground start:
+
+```sh
+rift server start --foreground --repository
+rift server status --repository
+rift server stop --repository
+```
+
+The repository process accepts server settings from the main worktree and records them at
+startup. A proxy adopts it only when the workspace and main worktree accept those same settings;
+otherwise the workspace starts its own process, as the
+[`[server]` configuration](/docs/developer/configuration#server) describes.
+
+The process holds its election under `<common git directory>/.rift/<product identity digest>/`.
+The digest is SHA-256 of the canonical product identity, and the directory contains `server.lock`
+and `server.json`. Workspace routing remains inside the proxy and HTTP transport.
+
+Each admitted workspace holds an exclusive lease on its `.rift/server.lock` and keeps its
+existing `.rift/db`. A competing serving process is refused before opening that workspace's
+mutable store until the lease is released. `rift server logs` can still read the store under
+its existing migration lock. The repository process shares its bounded worker pool and content cache;
+workspace source, configuration, publications, and language processes retain their own owners.
+
+The database connection thread retains the workspace lease until it exits, including after a
+shutdown wait expires. History retains the existing common Git store and its fill and live locks.
+
+### Local index preparation
+
+<VersionBadge version="v0.0.47" />
+
+The initial publication answers reads before discovery finishes. The supervisor discovers visible
+paths, publishes their map counts, and then captures and analyzes bounded batches. Each publication
+owns its map, source catalog, configuration, and preparation counts.
+
+`search` and `get_symbol` use the declarations already prepared. Their
+[`local_index_preparing`](/docs/developer/protocol/mcp#reads) warning remains until their selected
+local scope is complete, including a name lookup that already found a match. A `nodes` read can
+prepare its supplied path within the request budget without changing published progress.
+
+The [`rift://workspace`](/docs/developer/protocol/mcp#resource-workspace) resource projects only
+the requested page from published visible file digests. It performs no whole-tree capture per
+page; the completed catalog includes unclassified and disabled-language files as well as files
+whose syntax was refused.
+
+The process-owned content cache holds weak references to captured bytes and path-independent
+syntax facts. Its key includes the full content digest, language provider, and parse limits;
+path-dependent declarations remain with their workspace placement. Dropping the last publication
+that owns content releases it, while live publications remain readable.
 
 A read that meets a recorded rebuild failure at or past the published counter waits for nothing:
 it answers from the published index and carries `stale_index`, whose `detail` names the counter
@@ -220,6 +305,13 @@ vectors, and server logs. The server lock stays in a separate file under `.rift`
 through [Toasty](https://github.com/tokio-rs/toasty) models; the full-text surface is raw SQL,
 because Toasty 0.10 has no typed virtual-table or `MATCH` API, and the raw boundary stays confined
 to the FTS table and its rows.
+
+<VersionBadge version="v0.0.47" />
+
+One owned SQLite connection thread executes driver operations for this database file. Async
+callers send operations through a bounded queue and await their replies, so SQLite lock waits
+and statement execution occupy that thread. The queue uses the accepted
+[`[search]`](/docs/developer/configuration#search) `pool_slots` and `busy_timeout` bounds.
 
 Every process that opens `.rift/db`, a starting server and `rift server logs` alike, holds an
 exclusive lock on `.rift/db.lock` while it switches the file to WAL and applies the schema
@@ -255,13 +347,13 @@ that moved, removing a source's row and its reverse references together, so an e
 documented file writes that file's row rather than the whole collection.
 
 The store records, beside each file's rows, the digest of the bytes they were derived from, and
-its stamp names what else derived them: the build, by the product version the server publishes in
-its lock, the corpus shape, and the index-owned configuration. Every write compares before it writes. A rebuild that named the files it read
+its stamp names what else derived them: the analyzer manifest, the corpus shape, and the
+index-owned configuration. Every write compares before it writes. A rebuild that named the files it read
 deletes those paths' rows and inserts their new ones. A rebuild that read the whole workspace,
 startup included, compares every file it holds with the recorded digests and writes only the
 files whose bytes moved or that one side lacks, so a restart over an unchanged tree writes the
-stamp and nothing else. A store stamped by another build or configuration keeps nothing: the write
-clears it first, so a new release or commit derives the rows once.
+stamp and nothing else. A store stamped by another analyzer revision or configuration keeps
+nothing: the write clears it first. An unrelated binary change keeps compatible rows.
 
 The write runs behind the publication: the rebuilt index becomes current first, and the lexical
 lane runs the writes it was handed in publication order, one at a time. The lane holds one write
@@ -371,10 +463,9 @@ below. All three fuse by weighted reciprocal rank, under the shares
 
 The history store is a second SQLite database, apart from `.rift/db`, so lexical and log writes
 never wait on a fill. It sits in the `.rift/` folder of the common git directory, one file per
-derivation revision: the build, by the product version the server publishes in its lock, the
-corpus revision, the index-owned tables, and the `[providers.history]` strategy and releases. Two
-builds sharing a repository each fill and read their own file, and a server deletes a file no live
-server holds.
+derivation revision: the analyzer manifest, corpus revision, index-owned tables, and the
+`[providers.history]` strategy and releases. Compatible builds reuse that file, and a server
+deletes a file no live server holds.
 
 `rift-history-store` opens the file through [rusqlite](https://github.com/rusqlite/rusqlite) in
 WAL mode, where a writer never blocks a reader. One filler writes a store at a time: the history
@@ -567,6 +658,13 @@ Cargo package's `<name>-<version>` folder minted from the lockfile, an npm packa
 `.dist-info/RECORD` lists, and the Rust standard library below `rustc --print sysroot`. Those
 folders never reach the global API.
 
+<VersionBadge version="v0.0.47" />
+
+Global resolution retains one latest dependency context and its checked request bytes. The cache
+key compares the published dependency context, requested packages, and advertised entry bound;
+repeated reads reuse the bounded context even when the global API accepts fewer entries.
+The client compares a full request digest and analyzer and corpus revisions before reusing its answer.
+
 The standard library pass runs `rustup --version`, `rustc --version`, `rustc --print sysroot`,
 and `node --version` through the server's bounded command runner, under
 [`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"` alone. Every
@@ -630,8 +728,9 @@ answers from the stub alone.
 Two publications are comparable by their own fields. `format_revision` states the shape;
 `analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
 version and checksum and the content digest of every source file that decides what a
-publication holds: the whole `rift-core`, `rift-analysis`, `rift-provider`, `rift-protocol`,
-`rift-ranking`, and `rift-syntax` crates, and the lexical pass.
+publication holds: all Rust source in `rift-core`, `rift-analysis`, `rift-index`, `rift-provider`,
+`rift-protocol`, `rift-ranking`, and `rift-syntax`, plus the history repository, MCP server and
+validation, and server read implementations.
 Every record - a source unit, a declaration, a search document - carries a digest over its own
 content, and the whole document renders as
 [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same

@@ -61,6 +61,12 @@ For the example project, a map can look like this:
 <Callout type="info">
 
 Rift updates the map when it publishes a new index, so later reads follow changes to the project.
+
+<VersionBadge version="v0.0.47" />
+
+While Rift prepares the local index, the map can show discovered files before their symbols
+are available. A `local_index_preparing` warning reports that incomplete preparation.
+
 The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
 entry points and relationships, and when they are available.
 

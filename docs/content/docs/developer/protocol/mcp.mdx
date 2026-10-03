@@ -13,9 +13,8 @@ The expandable tool examples come from the served [JSON schema](https://volar.sh
 
 <VersionBadge version="v0.0.29" />
 
-`rift://map` reads a workspace orientation snapshot: a starting picture for an agent new to the
-codebase, computed once when the index publishes and served from cache after that, so a read
-costs a lookup. The answer carries:
+`rift://map` reads a workspace orientation snapshot: a starting picture for a caller new to the
+codebase. The answer carries:
 
 - `revision` - an eight-character [`Digest`](/docs/developer/protocol/reference) of the indexed
   tree the map was computed from
@@ -30,6 +29,14 @@ costs a lookup. The answer carries:
 - `packages` - the packages the workspace's manifests and lockfiles state, in `manager`,
   `name`, then selector order
 - `pagination` - always page zero of one, the whole map on one page
+- `warnings` - conditions that qualify the answer, omitted when empty
+
+<VersionBadge version="v0.0.47" />
+
+During local preparation, the map carries [`local_index_preparing`](#reads). File counts and
+documentation paths can describe discovered files before their declarations are prepared;
+symbol counts describe prepared declarations. The server **MUST** return the map's revision,
+counts, and warnings from the same publication.
 
 <VersionBadge version="v0.0.29" languages={["Rust"]} />
 
@@ -1097,6 +1104,14 @@ pins:
 A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
 `capability_unavailable`, naming the extension, or stating that the path carries none.
 
+<VersionBadge version="v0.0.47" />
+
+During local preparation, the server **MAY** prepare the requested path within the remaining
+[`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
+the published prepared files carries [`local_index_preparing`](#reads), including when syntax
+is returned; this read does not advance published progress. Exhausted preparation returns empty
+nodes with that warning.
+
 ## Reads
 
 Callers read code through these tools:
@@ -1119,6 +1134,34 @@ the last page returns an empty page whose `pagination` still carries the true `t
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
 disagree.
+
+<VersionBadge version="v0.0.47" />
+
+The server **MUST** carry `local_index_preparing` once while the requested local scope remains
+incomplete. `prepared` counts visible files whose capture and analysis finished, including files
+refused under an accepted bound; `total` is omitted until discovery finishes. `ready_in` is
+omitted because the server has no preparation estimate.
+
+A `get_symbol` answer retains this warning after finding a match because an unprepared file
+can hold another declaration with the same name. Global-only reads omit local preparation
+warnings. Preparation counts describe the answer's publication and can decrease when source
+selection changes.
+
+**Request:**
+
+```json
+{ "name": "ReadService" }
+```
+
+**Warning before discovery completes:**
+
+```json
+{
+  "code": "local_index_preparing",
+  "prepared": 0,
+  "detail": "selected local files are still being prepared"
+}
+```
 
 A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
@@ -1394,10 +1437,18 @@ The answer carries:
   syntax availability, and selected LSP process state
 - `source` - captured project paths, content digests, and matched language identities
 - `pagination` - the zero-based page and total page count
+- `warnings` - conditions that qualify the page, omitted when empty
 
 The bare URI selects page zero. `rift://workspace?page_index=1` selects another page. Each page
 holds at most 1000 source units; language summaries repeat so every page can be read
 alone. A page past the end returns an empty `source` list with the true page count.
+
+<VersionBadge version="v0.0.47" />
+
+The source page describes one published catalog. The server **MUST** return its configuration
+revision, source digests, pagination, and preparation warning from that publication. During
+preparation, the page carries [`local_index_preparing`](#reads) and lists prepared files;
+after preparation, the catalog also includes visible files without enabled syntax.
 
 ## Errors
 
