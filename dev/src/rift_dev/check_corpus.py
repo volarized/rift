@@ -241,7 +241,8 @@ class Corpus:
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                answer = await client.call(
+                answer = await settled_local(
+                    client,
                     "search",
                     {
                         "query": "test",
@@ -768,7 +769,9 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                answer = await client.call("search", {"query": "test", "limit": 1})
+                answer = await settled_local(
+                    client, "search", {"query": "test", "limit": 1}
+                )
                 require(
                     bool(objects(answer, "results")),
                     "symlink root has no search results",
@@ -784,7 +787,8 @@ class Corpus:
         self.configure(root=root)
         with self.server(root) as server:
             async with server.connect() as client:
-                found = await client.call(
+                found = await settled_local(
+                    client,
                     "get_symbol",
                     {"name": "FastAPI", "include": ["history"], "limit": 5},
                 )
@@ -950,6 +954,24 @@ async def observed_state(
         f"required record never reached server output within "
         f"{OBSERVATION_SECONDS}s: {wanted}"
     )
+
+
+async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
+    """Resend one read until local index preparation completes.
+
+    A `local_index_preparing` answer covers only prepared files. The existing
+    observation deadline bounds every call and poll together; a settled answer
+    keeps the caller's result checks and every other warning.
+    """
+    async with gate_deadline("local index preparation", OBSERVATION_SECONDS):
+        while True:
+            answer = await client.call(name, request)
+            if not any(
+                warning.get("code") == "local_index_preparing"
+                for warning in warnings(answer)
+            ):
+                return answer
+            await asyncio.sleep(POLL_SECONDS)
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
