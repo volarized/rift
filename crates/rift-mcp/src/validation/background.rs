@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn live_lock_defers_and_retained_lock_expires_without_renewal() {
+    async fn held_lock_defers_and_retained_lock_expires_without_renewal() {
         let mut hold = VersionControlHold::new(None, &ServerConfiguration::default());
         let now = Instant::now();
         assert_eq!(
