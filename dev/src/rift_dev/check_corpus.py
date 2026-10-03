@@ -635,6 +635,9 @@ class Corpus:
         """Run sustained reads and edits in their own required bounded case."""
         with self.server() as server:
             async with server.connect() as client:
+                # Listener readiness precedes file preparation. Observe the existing
+                # startup budget before measuring reads against external writes.
+                await settled_local(client, "get_symbol", CHURN_REQUESTS["get_symbol"])
                 await self.churn(client)
                 no_failed_builds(
                     records(await client.resource("rift://logs/component/index"))

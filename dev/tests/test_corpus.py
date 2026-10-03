@@ -1144,6 +1144,85 @@ class SourceBound(unittest.TestCase):
         configure.assert_called_with()
 
 
+class ChurnPreparation(unittest.TestCase):
+    """Churn observes startup preparation before measuring sustained reads (#504)."""
+
+    def exercise(
+        self,
+        responses: list[JsonObject] | None,
+        failure: type[Exception] | None = None,
+    ) -> tuple[Corpus, MagicMock, AsyncMock, AsyncMock]:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+            corpus.root = Path(directory)
+            server = MagicMock(spec=Server)
+            server.__enter__.return_value = server
+
+            def close(*_arguments: object) -> None:
+                server.close()
+
+            server.__exit__.side_effect = close
+            client = AsyncMock(spec=Client)
+            client.resource.return_value = {"records": []}
+            server.connect.return_value.__aenter__.return_value = client
+
+            async def preparing(_name: str, _request: JsonObject) -> JsonObject:
+                self.assertFalse((corpus.root / PROBE_PATH).exists())
+                if responses is None:
+                    return {"hits": [], "warnings": [{"code": "local_index_preparing"}]}
+                return responses.pop(0)
+
+            client.call.side_effect = preparing
+
+            async def pressure(_client: Client) -> None:
+                self.assertGreater(client.call.await_count, 0)
+                self.assertFalse((corpus.root / PROBE_PATH).exists())
+
+            churn = AsyncMock(side_effect=pressure)
+            with (
+                patch.object(corpus, "server", return_value=server),
+                patch.object(corpus, "churn", churn),
+                patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+                patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            ):
+                if failure is None:
+                    asyncio.run(corpus.churn_case())
+                else:
+                    with self.assertRaises(failure):
+                        asyncio.run(corpus.churn_case())
+            server.close.assert_called_once_with()
+        return corpus, server, client, churn
+
+    def test_partial_startup_settles_before_probe_creation_and_pressure(self) -> None:
+        corpus, server, client, churn = self.exercise(
+            [
+                {"hits": [], "warnings": [{"code": "local_index_preparing"}]},
+                {"hits": [], "warnings": []},
+            ]
+        )
+        self.assertEqual(client.call.await_count, 2)
+        client.call.assert_awaited_with("get_symbol", {"name": "corpus_probe"})
+        self.assertEqual(client.call.await_args_list[0], client.call.await_args_list[1])
+        churn.assert_awaited_once_with(client)
+        server.stop.assert_called_once_with()
+        self.assertEqual(corpus.actions[-1]["state"], "after_churn")
+
+    def test_complete_empty_startup_still_runs_pressure(self) -> None:
+        _corpus, server, client, churn = self.exercise([{"hits": [], "warnings": []}])
+        self.assertEqual(client.call.await_count, 1)
+        churn.assert_awaited_once_with(client)
+        server.stop.assert_called_once_with()
+
+    def test_continuous_preparation_exhausts_observation_without_starting_pressure(
+        self,
+    ) -> None:
+        _corpus, server, client, churn = self.exercise(None, TimeoutError)
+        self.assertGreater(client.call.await_count, 0)
+        churn.assert_not_awaited()
+        server.stop.assert_not_called()
+        client.resource.assert_not_awaited()
+
+
 class Churn(unittest.TestCase):
     """Partial local preparation must finish before declaration checks (#504)."""
 
