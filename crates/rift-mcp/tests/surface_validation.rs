@@ -8,9 +8,7 @@ mod fake_engine;
 )]
 mod global_api;
 mod hermetic_search;
-// This binary serves its own fixture; the scripted engines reach their workspaces
-// through `workspace_client`, whose relative-root helpers no suite here calls.
-#[cfg(unix)]
+// This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
 
@@ -731,6 +729,7 @@ async fn served_fixture() -> TestResult<(
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
+    workspace_client::await_workspace_ready(&client).await?;
     Ok((
         Fixture {
             _workspace: directory,

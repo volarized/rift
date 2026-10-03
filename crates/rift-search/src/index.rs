@@ -467,6 +467,7 @@ struct HeldCorpus {
 /// than embedding it again.
 #[derive(Debug)]
 pub struct SearchIndex {
+    database: Arc<WorkspaceDatabase>,
     lexical: LexicalSearchIndex,
     vectors: VectorStore,
     model: Mutex<Option<Arc<LoadedModel>>>,
@@ -543,8 +544,9 @@ impl SearchIndex {
         limits: SearchIndexLimits,
     ) -> Result<Self, SearchError> {
         let lexical = LexicalSearchIndex::attached(Arc::clone(&database), limits.lexical());
-        let vectors = VectorStore::attached(database);
+        let vectors = VectorStore::attached(Arc::clone(&database));
         Ok(Self {
+            database,
             lexical,
             vectors,
             model: Mutex::new(None),
@@ -555,6 +557,15 @@ impl SearchIndex {
             held: Mutex::new(None),
             limits,
         })
+    }
+
+    /// Stops the workspace database worker by the shared shutdown deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] if the worker fails or cannot stop before the deadline.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), SearchError> {
+        self.database.shutdown(deadline).await.map_err(store_failed)
     }
 
     /// Loads the encoder, so the vector ranking can answer.

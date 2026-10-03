@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ServiceExt as _, transport::child_process::TokioChildProcessBuilder};
@@ -371,6 +371,40 @@ pub(crate) async fn proxied_call(
     call_arguments: &serde_json::Value,
 ) -> TestResult<serde_json::Value> {
     proxied_call_within(client, name, call_arguments, PROXIED_CALL_MAX).await
+}
+
+/// Reads map until workspace file preparation finishes, within fixture bound.
+pub(crate) async fn await_workspace_ready(
+    client: &RunningService<RoleClient, ()>,
+) -> TestResult<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+        )
+        .await??;
+        let ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .ok_or("map read answers with one content")?
+        else {
+            return Err("map read answers with text".into());
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        let preparing = body["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| warning["code"] == "local_index_preparing");
+        if !preparing {
+            return Ok(body);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("workspace map remained in preparation: {body}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// One proxied live-engine call under [`PROXIED_ENGINE_CALL_MAX`].

@@ -980,7 +980,9 @@ pub fn declare_server_ranges(schema: &mut Schema) {
     use crate::configuration::{
         Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
         SERVER_QUEUE_TIMEOUT_MS_MAX, SERVER_READINESS_TIMEOUT_MS_MAX,
-        SERVER_READINESS_TIMEOUT_MS_MIN, ServerConfiguration,
+        SERVER_READINESS_TIMEOUT_MS_MIN, SERVER_VALIDATION_INTERVAL_MS_MAX,
+        SERVER_VALIDATION_INTERVAL_MS_MIN, SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX,
+        ServerConfiguration,
     };
     annotate_property(
         schema,
@@ -1007,6 +1009,24 @@ pub fn declare_server_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_MIN),
             &Duration::from_millis(SERVER_READINESS_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, validation_interval),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(SERVER_VALIDATION_INTERVAL_MS_MIN),
+            &Duration::from_millis(SERVER_VALIDATION_INTERVAL_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, version_control_timeout),
+        RIFT_RANGE,
+        range(
+            &Duration::from_millis(1),
+            &Duration::from_millis(SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX),
         ),
     );
     append(
@@ -1603,6 +1623,13 @@ pub fn declare_workspace_language_summary_empty_defaults(schema: &mut Schema) {
     );
 }
 
+/// A [`WorkspaceResourcePage`](crate::workspace::WorkspaceResourcePage) states
+/// `default: []` on `warnings`.
+pub fn declare_workspace_resource_page_empty_defaults(schema: &mut Schema) {
+    use crate::workspace::WorkspaceResourcePage;
+    declare_empty_array_defaults(schema, &[property!(WorkspaceResourcePage, warnings)]);
+}
+
 /// A [`WorkspaceMap`](crate::map::WorkspaceMap) states `default: []` on its collection
 /// fields.
 pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
@@ -1617,6 +1644,7 @@ pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
             property!(WorkspaceMap, docs),
             property!(WorkspaceMap, module_relationships),
             property!(WorkspaceMap, packages),
+            property!(WorkspaceMap, warnings),
         ],
     );
 }
@@ -2203,6 +2231,20 @@ mod tests {
             schema["properties"]["readiness_timeout"][RIFT_RANGE],
             json!({ "min": "1s", "max": "1h" }),
             "readiness_timeout must state its accepted range"
+        );
+    }
+
+    #[test]
+    fn server_configuration_schema_states_background_validation_ranges() {
+        let schema = serde_json::to_value(schema_for!(crate::configuration::ServerConfiguration))
+            .expect("schema");
+        assert_eq!(
+            schema["properties"]["validation_interval"][RIFT_RANGE],
+            json!({ "min": "1s", "max": "1h" })
+        );
+        assert_eq!(
+            schema["properties"]["version_control_timeout"][RIFT_RANGE],
+            json!({ "min": "1ms", "max": "30s" })
         );
     }
 

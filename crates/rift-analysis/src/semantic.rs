@@ -12,7 +12,7 @@ use rift_provider::{
     PublicationLimits, PublicationSet, SymbolAssembler,
 };
 use rift_syntax::{
-    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxPublicationBuilder,
+    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxDocument, SyntaxFacts, SyntaxPublicationBuilder,
     SyntaxPublicationError,
 };
 
@@ -46,6 +46,17 @@ pub struct PlacedDocument<'a> {
     pub placement: DocumentPlacement,
 }
 
+/// Path-independent syntax facts and the placement their declarations are filed under.
+#[derive(Debug)]
+pub struct PlacedFacts<'a> {
+    /// Compact syntax facts for one parsed source file.
+    pub facts: &'a SyntaxFacts,
+    /// Project-relative source path used for error and bound reporting.
+    pub path: &'a ProjectPath,
+    /// The unit, origin, and identity path the declarations carry.
+    pub placement: DocumentPlacement,
+}
+
 /// Contribution graph captured by one workspace index publication.
 #[derive(Debug)]
 pub struct WorkspaceSemantics {
@@ -54,13 +65,15 @@ pub struct WorkspaceSemantics {
     syntax_provider: ProviderId,
 }
 
-/// One build's captured semantics with the documents its declaration bound left out.
+/// One build's captured semantics and documents not included in publication.
 #[derive(Debug)]
 pub struct BuiltSemantics {
     /// The graph built over the documents that fit.
     pub semantics: WorkspaceSemantics,
     /// The documents the publication had no room for, in the order they were offered.
     pub beyond_declaration_bound: Vec<ProjectPath>,
+    /// Documents whose Contribution the publication refused.
+    pub refused_contributions: Vec<(ProjectPath, &'static str)>,
 }
 
 impl WorkspaceSemantics {
@@ -111,6 +124,64 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+        let facts = documents
+            .iter()
+            .map(|placed| PlacedFacts {
+                facts: placed.document.facts(),
+                path: placed.document.path(),
+                placement: placed.placement.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self::build_facts_placed(&facts, declarations_max, revision, previous)
+    }
+
+    /// Builds one project publication from path-independent syntax facts.
+    /// Contribution refusals are returned by path so the workspace index can leave all
+    /// refused files out in one build pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when one source path, publication, or graph is invalid.
+    pub fn build_project_facts<'a>(
+        documents: impl IntoIterator<Item = (&'a SyntaxFacts, &'a ProjectPath)>,
+        declarations_max: usize,
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+        let placed = documents
+            .into_iter()
+            .map(|(facts, path)| {
+                Ok(PlacedFacts {
+                    facts,
+                    path,
+                    placement: DocumentPlacement::project_path(path)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SyntaxPublicationError>>()?;
+        Self::build_facts_placed_inner(&placed, declarations_max, revision, previous, true)
+    }
+
+    /// Builds one publication and graph over compact syntax facts with explicit source paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when publication or graph validation fails.
+    pub fn build_facts_placed(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
+        Self::build_facts_placed_inner(documents, declarations_max, revision, previous, false)
+    }
+
+    fn build_facts_placed_inner(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        revision: u64,
+        previous: Option<&NormalizedGraph>,
+        collect_refused_contributions: bool,
+    ) -> Result<BuiltSemantics, WorkspaceSemanticError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
@@ -123,20 +194,29 @@ impl WorkspaceSemantics {
             limits,
         )?;
         let mut beyond_declaration_bound = Vec::new();
+        let mut refused_contributions = Vec::new();
         for (offered, placed) in documents.iter().enumerate() {
-            if placed.document.symbols().len() > builder.declarations_remaining() {
+            if placed.facts.symbols().len() > builder.declarations_remaining() {
                 beyond_declaration_bound = documents[offered..]
                     .iter()
-                    .map(|left_out| left_out.document.path().clone())
+                    .map(|left_out| left_out.path.clone())
                     .collect();
                 break;
             }
-            builder
-                .add_document_placed(placed.document, &placed.placement)
-                .map_err(|error| WorkspaceSemanticError::Document {
-                    path: placed.document.path().clone(),
-                    error,
-                })?;
+            match builder.add_facts_placed(placed.facts, &placed.placement) {
+                Ok(()) => {}
+                Err(SyntaxPublicationError::Contribution(error))
+                    if collect_refused_contributions =>
+                {
+                    refused_contributions.push((placed.path.clone(), error.fault().field()));
+                }
+                Err(error) => {
+                    return Err(WorkspaceSemanticError::Document {
+                        path: placed.path.clone(),
+                        error,
+                    });
+                }
+            }
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
@@ -156,6 +236,7 @@ impl WorkspaceSemantics {
                     .map_err(SyntaxPublicationError::Identity)?,
             },
             beyond_declaration_bound,
+            refused_contributions,
         })
     }
 
@@ -290,9 +371,11 @@ mod tests {
     use std::fmt::Write as _;
 
     use rift_core::ProjectPath;
-    use rift_syntax::{SyntaxLimits, SyntaxSource, registry};
+    use rift_syntax::{DocumentPlacement, SyntaxLimits, SyntaxSource, registry};
 
-    use super::{WorkspaceSemanticError, WorkspaceSemantics, publication_limits};
+    use super::{
+        PlacedDocument, PlacedFacts, WorkspaceSemanticError, WorkspaceSemantics, publication_limits,
+    };
 
     fn document() -> rift_syntax::SyntaxDocument {
         let path = ProjectPath::new("src/lib.rs").expect("path");
@@ -341,6 +424,43 @@ mod tests {
         );
         assert_eq!(assembled.index_revision().get(), 7);
         assert_eq!(semantics.graph().records().len(), 1);
+    }
+
+    #[test]
+    fn compact_facts_build_same_graph_as_complete_document() {
+        let document = document();
+        let placement = DocumentPlacement::project(&document).expect("project placement");
+        let complete = WorkspaceSemantics::build_placed(
+            &[PlacedDocument {
+                document: &document,
+                placement: placement.clone(),
+            }],
+            1,
+            7,
+            None,
+        )
+        .expect("complete document semantics");
+        let facts = document.shared_facts();
+        let compact = WorkspaceSemantics::build_facts_placed(
+            &[PlacedFacts {
+                facts: &facts,
+                path: document.path(),
+                placement,
+            }],
+            1,
+            7,
+            None,
+        )
+        .expect("compact facts semantics");
+
+        assert_eq!(
+            compact.semantics.graph().records(),
+            complete.semantics.graph().records()
+        );
+        assert_eq!(
+            compact.beyond_declaration_bound,
+            complete.beyond_declaration_bound
+        );
     }
 
     #[test]

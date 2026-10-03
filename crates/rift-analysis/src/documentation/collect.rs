@@ -1,6 +1,5 @@
 //! Extracts range metadata from selected source owners and existing syntax facts.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use rift_protocol::documentation::{
 use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::TextRange;
 use rift_syntax::{
-    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxDocument, SyntaxLimits,
+    ByteRange, MarkdownBlockKind, MarkdownSyntaxProvider, SyntaxFacts, SyntaxLimits,
     SyntaxProvider, SyntaxSource,
 };
 
@@ -121,8 +120,8 @@ fn collect_source_facts(
     previous: Option<&DocumentationCollection>,
     sources: &DocumentationSourceSet<'_>,
     attached: &AttachedDeclarations,
-) -> Result<(Collected, ExtractionCache), DocumentationError> {
-    let mut output = Collected::default();
+) -> Result<(Collected<DocumentationBlock>, ExtractionCache), DocumentationError> {
+    let mut output = Collected::<DocumentationBlock>::default();
     let mut cache = ExtractionCache::default();
     let extracted = extract_sources(previous, sources.sources(), attached);
     for (input, extracted) in sources.sources().iter().zip(extracted) {
@@ -146,7 +145,7 @@ fn resolve_collected(
     previous: Option<&DocumentationCollection>,
     declarations: &[DocumentationDeclaration<'_>],
     records: &[rift_protocol::documentation::DocumentationSource],
-    output: &mut Collected,
+    output: &mut Collected<DocumentationBlock>,
 ) -> Result<Option<super::resolution::ResolutionCache>, DocumentationError> {
     let input = super::resolution::ResolutionInput {
         sources: records,
@@ -185,7 +184,7 @@ fn resolve_collected(
 
 fn build_collection(
     sources: &DocumentationSourceSet<'_>,
-    output: Collected,
+    output: Collected<DocumentationBlock>,
     cache: ExtractionCache,
     resolution_cache: Option<super::resolution::ResolutionCache>,
 ) -> Result<DocumentationCollection, DocumentationError> {
@@ -219,9 +218,9 @@ fn build_collection(
     })
 }
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct Collected {
-    blocks: Vec<DocumentationBlock>,
+#[derive(Clone, Debug)]
+pub(super) struct Collected<B = CollectedBlock> {
+    blocks: Vec<B>,
     links: Vec<DocumentationLink>,
     unresolved_links: Vec<DocumentationLink>,
     references: Vec<DocumentationReference>,
@@ -230,6 +229,56 @@ pub(super) struct Collected {
     candidates: Vec<DocumentationReferenceCandidate>,
     warnings: Vec<DocumentationWarning>,
     omitted: u32,
+}
+
+impl<B> Default for Collected<B> {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            links: Vec::new(),
+            unresolved_links: Vec::new(),
+            references: Vec::new(),
+            unresolved_references: Vec::new(),
+            fragments: Vec::new(),
+            candidates: Vec::new(),
+            warnings: Vec::new(),
+            omitted: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CollectedBlock {
+    identity: DocumentationDigest,
+    content_digest: DocumentationDigest,
+    heading_path: Vec<DocumentationHeading>,
+    range: TextRange,
+    line: u64,
+    kind: DocumentationBlockKind,
+    language: Option<String>,
+    symbol: Option<rift_protocol::read::SymbolId>,
+}
+
+impl CollectedBlock {
+    fn to_documentation_block(&self, input: &DocumentationInput<'_>) -> DocumentationBlock {
+        let source_chunks = input.chunks();
+        let chunk_start =
+            source_chunks.partition_point(|chunk| chunk.range.end <= self.range.start);
+        let chunk_end = source_chunks.partition_point(|chunk| chunk.range.start < self.range.end);
+        let chunks = source_chunks[chunk_start..chunk_end].to_vec();
+        DocumentationBlock {
+            identity: self.identity.clone(),
+            source: input.source().identity.clone(),
+            content_digest: self.content_digest.clone(),
+            heading_path: self.heading_path.clone(),
+            range: self.range.clone(),
+            line: self.line,
+            kind: self.kind,
+            language: self.language.clone(),
+            chunks,
+            symbol: self.symbol.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -337,7 +386,11 @@ fn extract_source_facts(
     Ok(Arc::new(facts))
 }
 
-fn merge_source(input: &DocumentationInput<'_>, output: &mut Collected, facts: &Collected) -> bool {
+fn merge_source(
+    input: &DocumentationInput<'_>,
+    output: &mut Collected<DocumentationBlock>,
+    facts: &Collected,
+) -> bool {
     let fits = output.blocks.len().saturating_add(facts.blocks.len())
         <= DOCUMENTATION_BLOCKS_MAX as usize
         && output
@@ -359,7 +412,12 @@ fn merge_source(input: &DocumentationInput<'_>, output: &mut Collected, facts: &
         warn(input, output, DocumentationWarningKind::LimitExceeded, 1);
         return false;
     }
-    output.blocks.extend(facts.blocks.iter().cloned());
+    output.blocks.extend(
+        facts
+            .blocks
+            .iter()
+            .map(|block| block.to_documentation_block(input)),
+    );
     output.links.extend(facts.links.iter().cloned());
     output
         .unresolved_links
@@ -630,17 +688,15 @@ fn extract_cell(
     }
 }
 
-fn markdown_document<'a>(
-    input: &'a DocumentationInput<'_>,
-) -> Result<Cow<'a, SyntaxDocument>, DocumentationError> {
-    if let Some(document) = input.syntax() {
-        if document.markdown_facts().is_none() {
+fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, DocumentationError> {
+    if let Some(syntax) = input.shared_syntax() {
+        if syntax.markdown_facts().is_none() {
             return Err(refused(DocumentationViolation::Format, "syntax"));
         }
-        return Ok(Cow::Borrowed(document));
+        return Ok(Arc::clone(syntax));
     }
     let path = source_file_path(input.source())?;
-    MarkdownSyntaxProvider::default()
+    let document = MarkdownSyntaxProvider::default()
         .analyze(
             SyntaxSource {
                 path: &path,
@@ -648,20 +704,20 @@ fn markdown_document<'a>(
             },
             SyntaxLimits::default(),
         )
-        .map(Cow::Owned)
         .map_err(|error| {
             rift_core::Error::new(
                 super::DocumentationFault::new(DocumentationViolation::Format, "markdown")
                     .caused_by(error),
             )
-        })
+        })?;
+    Ok(document.into_facts())
 }
 
 fn extract_markdown(
     input: &DocumentationInput<'_>,
     output: &mut Collected,
 ) -> Result<(), DocumentationError> {
-    let syntax = markdown_document(input)?;
+    let syntax = markdown_facts(input)?;
     let facts = syntax
         .markdown_facts()
         .ok_or_else(|| refused(DocumentationViolation::Format, "syntax"))?;
@@ -878,24 +934,14 @@ fn append_block(
         *ordinal,
     ))?;
     let digest = content_digest(exact.as_bytes());
-    let start = input
-        .chunks()
-        .partition_point(|chunk| chunk.range.end <= draft.range.start);
-    let chunks = input.chunks()[start..]
-        .iter()
-        .take_while(|chunk| chunk.range.start < draft.range.end)
-        .cloned()
-        .collect();
-    output.blocks.push(DocumentationBlock {
+    output.blocks.push(CollectedBlock {
         identity: identity.clone(),
-        source: input.source().identity.clone(),
         content_digest: digest,
         heading_path: draft.headings,
         range: draft.range,
         line: draft.line,
         kind: draft.kind,
         language: draft.language,
-        chunks,
         symbol: draft.symbol,
     });
     Ok(identity)
@@ -950,9 +996,9 @@ fn append_paragraph(
     append_block(input, output, draft, ordinals).map(|_| ())
 }
 
-fn warn(
+fn warn<B>(
     input: &DocumentationInput<'_>,
-    output: &mut Collected,
+    output: &mut Collected<B>,
     kind: DocumentationWarningKind,
     count: u64,
 ) {
@@ -988,15 +1034,108 @@ fn wire_range(range: ByteRange) -> TextRange {
 #[cfg(test)]
 mod tests {
     use rift_protocol::documentation::{
-        DocumentationBlockKind, DocumentationContentIdentity, DocumentationSelectionReason,
-        DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
+        DocumentationBlockKind, DocumentationChunk, DocumentationContentIdentity,
+        DocumentationSelectionReason, DocumentationSource, DocumentationSourceFormat,
+        DocumentationSourceIdentity,
     };
     use rift_protocol::read::{
         ProjectPath, SourceKind, SourceLocationKind, SymbolOrigin, TextRange,
     };
 
-    use super::{BlockDraft, Collected, append_block};
+    use super::{BlockDraft, Collected, CollectedBlock, append_block};
     use crate::documentation::{DocumentationInput, DocumentationViolation, content_digest};
+
+    fn input(text: &str) -> DocumentationInput<'_> {
+        let source = DocumentationSource {
+            identity: DocumentationContentIdentity {
+                source: DocumentationSourceIdentity::Project {
+                    path: ProjectPath("README.md".to_owned()),
+                },
+                cell: None,
+            },
+            revision: content_digest(b"revision"),
+            content_digest: content_digest(text.as_bytes()),
+            origin: SymbolOrigin {
+                location: Some(SourceLocationKind::Project),
+                package: None,
+                source_kind: SourceKind::Authored,
+            },
+            format: DocumentationSourceFormat::Markdown,
+            media_type: "text/markdown".to_owned(),
+            selection: DocumentationSelectionReason::Workspace,
+            byte_length: text.len() as u64,
+            language: None,
+            physical_ranges: Vec::new(),
+            license: None,
+        };
+        let chunks = crate::text_chunks(text, 16)
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| DocumentationChunk {
+                identity: format!("README.md#{index}"),
+                range: TextRange {
+                    start: chunk.byte_offset(),
+                    end: chunk.byte_offset() + chunk.content().len() as u64,
+                },
+            })
+            .collect();
+        DocumentationInput::new(source, text)
+            .expect("source")
+            .with_chunks(chunks)
+            .expect("partition")
+    }
+
+    fn collected_block(range: TextRange, input: &DocumentationInput<'_>) -> CollectedBlock {
+        let mut output = Collected::default();
+        append_block(
+            input,
+            &mut output,
+            BlockDraft {
+                range,
+                line: 1,
+                kind: DocumentationBlockKind::Prose,
+                structure: "paragraph",
+                headings: Vec::new(),
+                language: None,
+                symbol: None,
+            },
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("valid block");
+        output.blocks.pop().expect("collected block")
+    }
+
+    #[test]
+    fn documentation_block_copies_only_intersecting_chunks() {
+        let one_input = input("x");
+        let one = collected_block(TextRange { start: 0, end: 1 }, &one_input)
+            .to_documentation_block(&one_input);
+        assert_eq!(one.chunks, one_input.chunks().to_vec());
+        assert_eq!(one.chunks.len(), 1);
+        assert_eq!(one.chunks.capacity(), 1);
+
+        let split_input = input("abcdefghijklmnopq");
+        let crossing = collected_block(TextRange { start: 15, end: 17 }, &split_input)
+            .to_documentation_block(&split_input);
+        assert_eq!(crossing.chunks, split_input.chunks().to_vec());
+        assert_eq!(crossing.chunks.len(), 2);
+        assert_eq!(crossing.chunks.capacity(), 2);
+
+        let first = collected_block(TextRange { start: 0, end: 16 }, &split_input)
+            .to_documentation_block(&split_input);
+        assert_eq!(first.chunks, split_input.chunks()[..1]);
+        assert_eq!(first.chunks.capacity(), 1);
+
+        let second = collected_block(TextRange { start: 16, end: 17 }, &split_input)
+            .to_documentation_block(&split_input);
+        assert_eq!(second.chunks, split_input.chunks()[1..]);
+        assert_eq!(second.chunks.capacity(), 1);
+
+        let empty = collected_block(TextRange { start: 17, end: 17 }, &split_input)
+            .to_documentation_block(&split_input);
+        assert!(empty.chunks.is_empty());
+        assert_eq!(empty.chunks.capacity(), 0);
+    }
 
     #[test]
     fn invalid_block_range_remains_a_refusal() {

@@ -2,6 +2,10 @@
 //! policies, tool round trips, the stop route, the idle timeout, and shutdown.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
+
+use workspace_client::await_workspace_ready;
 
 use std::error::Error;
 use std::fs;
@@ -145,6 +149,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     let directory = workspace_with(None)?;
     let (shutdown, server) = served(directory.path()).await?;
     let client = connected_client(&server).await?;
+    await_workspace_ready(&client).await?;
 
     let identity = advertised_identity(&client)?;
     let expected_schema_digest = format!("{:x}", Sha256::digest(schema::schema_document()));
@@ -334,6 +339,7 @@ async fn two_concurrent_clients_are_both_served() -> TestResult {
     let directory = workspace_with(None)?;
     let (shutdown, server) = served(directory.path()).await?;
     let first = connected_client(&server).await?;
+    await_workspace_ready(&first).await?;
     let second = connected_client(&server).await?;
 
     let (first_lookup, second_lookup) = tokio::join!(beacon_lookup(&first), beacon_lookup(&second));

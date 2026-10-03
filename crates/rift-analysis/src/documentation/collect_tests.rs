@@ -113,6 +113,38 @@ fn incremental_collection_reuses_unchanged_source_facts_and_matches_full_build()
 }
 
 #[test]
+fn reused_block_facts_rebuild_complete_output_without_changing_prior_collection() {
+    let content = "# Shared heading\n\nA body with enough text to cross chunk boundaries.\n";
+    let previous_input = input("guide.md", content);
+    let source_chunks = previous_input.chunks().to_vec();
+    let previous_sources =
+        DocumentationSourceSet::new(vec![previous_input]).expect("previous source set");
+    let previous = collect_documentation(&previous_sources, &[]).expect("previous collection");
+    let previous_index = previous.index().clone();
+
+    let next_input = input("guide.md", content);
+    let next_sources = DocumentationSourceSet::new(vec![next_input]).expect("next source set");
+    let incremental = collect_documentation_incremental(Some(&previous), &next_sources, &[])
+        .expect("incremental collection");
+    let full = collect_documentation(&next_sources, &[]).expect("full collection");
+
+    assert_eq!(incremental.index(), full.index());
+    assert_eq!(previous.index(), &previous_index);
+    let block = incremental.index().blocks.first().expect("document block");
+    assert_eq!(block.source, next_sources.sources()[0].source().identity);
+    let expected_chunks: Vec<_> = source_chunks
+        .into_iter()
+        .filter(|chunk| chunk.range.end > block.range.start && chunk.range.start < block.range.end)
+        .collect();
+    assert_eq!(block.chunks, expected_chunks);
+    let identity = &previous.index().sources[0].identity;
+    let previous_facts =
+        &previous.extraction_cache().expect("previous cache").sources[identity].facts;
+    let next_facts = &incremental.extraction_cache().expect("next cache").sources[identity].facts;
+    assert!(std::sync::Arc::ptr_eq(previous_facts, next_facts));
+}
+
+#[test]
 fn incremental_collection_relinks_cached_candidates_after_declaration_changes() {
     let content = "Use `Compass`.\n";
     let owner = source("lib.rs", "pub struct Compass;").identity;

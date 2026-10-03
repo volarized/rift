@@ -1,6 +1,7 @@
 //! Validates explicit source sets without source acquisition or filesystem access.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use rift_core::{ProjectPath, SourceUnitId};
 use rift_protocol::documentation::{
@@ -35,7 +36,7 @@ pub struct DocumentationInput<'source> {
     source: DocumentationSource,
     text: &'source str,
     #[cfg(feature = "collector")]
-    syntax: Option<&'source rift_syntax::SyntaxDocument>,
+    syntax: Option<Arc<rift_syntax::SyntaxFacts>>,
     chunks: Vec<rift_protocol::documentation::DocumentationChunk>,
 }
 
@@ -81,10 +82,33 @@ impl<'source> DocumentationInput<'source> {
     ///
     /// Returns a refusal if source path, language, or bytes do not match syntax facts.
     pub fn with_syntax(
-        mut self,
-        syntax: &'source rift_syntax::SyntaxDocument,
+        self,
+        syntax: &rift_syntax::SyntaxDocument,
     ) -> Result<Self, DocumentationError> {
-        if !syntax_matches_source(&self.source, self.text, syntax) {
+        self.with_syntax_facts(syntax.path(), syntax.shared_facts())
+    }
+
+    /// Reuses indexed facts after validating their path and exact source bytes.
+    #[cfg(feature = "collector")]
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal if source path, language, or bytes do not match syntax facts.
+    pub fn with_indexed_syntax(
+        self,
+        path: &ProjectPath,
+        syntax: &Arc<rift_syntax::SyntaxFacts>,
+    ) -> Result<Self, DocumentationError> {
+        self.with_syntax_facts(path, Arc::clone(syntax))
+    }
+
+    #[cfg(feature = "collector")]
+    fn with_syntax_facts(
+        mut self,
+        path: &ProjectPath,
+        syntax: Arc<rift_syntax::SyntaxFacts>,
+    ) -> Result<Self, DocumentationError> {
+        if !syntax_matches_source(&self.source, self.text, path, &syntax) {
             return Err(refused(DocumentationViolation::Format, "syntax_source"));
         }
         self.syntax = Some(syntax);
@@ -128,8 +152,13 @@ impl<'source> DocumentationInput<'source> {
     }
 
     #[cfg(feature = "collector")]
-    pub(super) fn syntax(&self) -> Option<&'source rift_syntax::SyntaxDocument> {
-        self.syntax
+    pub(super) fn syntax(&self) -> Option<&rift_syntax::SyntaxFacts> {
+        self.syntax.as_deref()
+    }
+
+    #[cfg(feature = "collector")]
+    pub(super) fn shared_syntax(&self) -> Option<&Arc<rift_syntax::SyntaxFacts>> {
+        self.syntax.as_ref()
     }
 
     #[cfg(feature = "collector")]
@@ -142,15 +171,16 @@ impl<'source> DocumentationInput<'source> {
 fn syntax_matches_source(
     source: &DocumentationSource,
     text: &str,
-    syntax: &rift_syntax::SyntaxDocument,
+    path: &ProjectPath,
+    syntax: &rift_syntax::SyntaxFacts,
 ) -> bool {
-    let Ok(path) = source_file_path(source) else {
+    let Ok(source_path) = source_file_path(source) else {
         return false;
     };
     let source_digest_matches = syntax
         .source_digest()
         .is_some_and(|digest| *digest == rift_core::FileDigest::of(text.as_bytes()));
-    path.as_str() == syntax.path().as_str()
+    path == &source_path
         && source
             .language
             .as_ref()

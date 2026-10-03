@@ -4,6 +4,8 @@
 //! cannot name different code sets.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
 
 use std::error::Error;
 use std::fs;
@@ -36,6 +38,7 @@ async fn served_wire_errors_validate_against_the_error_data_schema() -> TestResu
         service.waiting().await.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
+    workspace_client::await_workspace_ready(&client).await?;
     let schema = serde_json::to_value(schema_for!(ErrorData))?;
     let validator = jsonschema::validator_for(&schema)?;
 

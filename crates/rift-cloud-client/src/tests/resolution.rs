@@ -432,3 +432,28 @@ fn test_resolution_entries_stop_at_the_smaller_advertised_bound() {
         Err(ClientError::InvalidRequest { field: "entries" })
     );
 }
+
+/// One client keeps one resolution answer, so changing contexts replaces old bytes.
+#[tokio::test]
+async fn test_fixture_resolution_cache_holds_only_latest_context() {
+    let (server, client) = operation_client(OperationFixture::EchoResolution).await;
+    let first = resolution_request();
+    let mut second = first.clone();
+    second.entries[0].requirement = Some("^2".to_owned());
+
+    assert!(client.resolve_package_context(&first).await.is_ok());
+    assert!(client.resolve_package_context(&second).await.is_ok());
+    assert!(client.resolve_package_context(&first).await.is_ok());
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 4);
+    let cached = client.inner.resolution.read().await;
+    assert!(cached.is_some());
+}
+
+#[test]
+fn prepared_resolution_clones_share_checked_bytes_and_digest() {
+    let prepared = PreparedPackageResolutionRequest::new(resolution_request())
+        .expect("a valid resolution request");
+    let clone = prepared.clone();
+    assert!(Arc::ptr_eq(&prepared.body, &clone.body));
+    assert_eq!(prepared.digest, FileDigest::of(&prepared.body));
+}

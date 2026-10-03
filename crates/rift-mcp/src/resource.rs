@@ -255,6 +255,7 @@ mod tests {
             configuration_revision: Digest("3f9a1c2e".to_owned()),
             languages: Vec::new(),
             source: Vec::new(),
+            warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
                 total_pages: 0,
@@ -437,6 +438,7 @@ mod tests {
             docs: Vec::new(),
             module_relationships: Vec::new(),
             packages: Vec::new(),
+            warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
                 total_pages: 1,

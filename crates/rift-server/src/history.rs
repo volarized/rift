@@ -749,14 +749,15 @@ mod tests {
             qualified_name: "beacon".to_owned(),
             container: None,
             kind: "function",
+            node_kind: None,
             facets: Vec::new(),
             visibility: None,
             range,
             item_range: item,
             name_range: None,
             body_range: body,
-            signatures: Vec::new(),
-            documentation: Vec::new(),
+            signatures: Arc::from([]),
+            documentation: Arc::from([]),
             documentation_ranges: Vec::new(),
         };
         SymbolShape::from_source(source, &symbol)

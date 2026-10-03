@@ -21,7 +21,7 @@ use crate::documentation::{
 use crate::input::ExactPackageInput;
 use crate::revision::analyzer_revision;
 use crate::selection::documentation_format;
-use crate::semantic::{PlacedDocument, WorkspaceSemantics};
+use crate::semantic::{PlacedFacts, WorkspaceSemantics};
 use crate::source::{FileDigest, IndexedFile};
 use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::line::{line_of, line_starts};
@@ -48,7 +48,9 @@ use rift_protocol::read::{
     SymbolFacet, SymbolId, SymbolOrigin, TextRange,
 };
 use rift_provider::CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT;
-use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxLimits, SyntaxSymbol};
+use rift_syntax::{
+    DocumentPlacement, ShippedLanguage, SyntaxDocument, SyntaxFacts, SyntaxLimits, SyntaxSymbol,
+};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -304,14 +306,15 @@ impl PackageAnalyzer {
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
         join::join_modules(&mut analyzed);
-        let placed: Vec<PlacedDocument<'_>> = analyzed
+        let placed = analyzed
             .iter()
-            .map(|held| PlacedDocument {
-                document: held.file.syntax(),
+            .map(|held| PlacedFacts {
+                facts: held.file.syntax(),
+                path: held.file.path(),
                 placement: held.placement.clone(),
             })
-            .collect();
-        let built = WorkspaceSemantics::build_placed(
+            .collect::<Vec<_>>();
+        let built = WorkspaceSemantics::build_facts_placed(
             &placed,
             CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT,
             revision,
@@ -690,7 +693,7 @@ fn package_file_input<'source>(
         format,
         DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
     ) {
-        input = input.with_syntax(held.file.syntax())?;
+        input = input.with_indexed_syntax(held.file.path(), held.file.syntax_facts())?;
     }
     if text.len() <= bound(PACKAGE_SOURCE_BYTES_MAX) && !text.is_empty() {
         input = input.with_chunks(vec![DocumentationChunk {
@@ -802,7 +805,7 @@ fn append_attached_comment<'source>(
         Vec::new(),
     );
     let mut input = match DocumentationInput::new(source, source_text)
-        .and_then(|input| input.with_syntax(held.file.syntax()))
+        .and_then(|input| input.with_indexed_syntax(held.file.path(), held.file.syntax_facts()))
     {
         Ok(input) => input,
         Err(error) => {
@@ -1405,7 +1408,7 @@ fn parsed_file(
     };
     Ok(IndexedFile::new(
         file.path().clone(),
-        file.text().to_owned(),
+        file.text().to_owned().into(),
         FileDigest::of(file.text().as_bytes()),
         false,
         syntax,
@@ -1584,8 +1587,8 @@ fn is_exported(symbol: &SyntaxSymbol) -> bool {
 /// A paired module's set is replaced afterwards by the one its stub defines, so this rule
 /// decides an unpaired file alone.
 #[must_use]
-pub fn public_qualified_names(language: &Language, document: &SyntaxDocument) -> BTreeSet<String> {
-    let symbols = document.symbols();
+pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTreeSet<String> {
+    let symbols = facts.symbols();
     let Some(rule) = ExportRule::for_language(language) else {
         return symbols
             .iter()

@@ -54,6 +54,8 @@ const STOP_POLL_ATTEMPT_COUNT: u32 = 100;
 /// flush runs, each taking only what the stage before it left of that
 /// deadline.
 const SERVER_STOP_DEADLINE: Duration = Duration::from_secs(4);
+/// Shutdown time reserved for the shared SQLite worker after final log writes.
+const SERVER_DATABASE_STOP_RESERVE: Duration = Duration::from_millis(500);
 /// Wall-clock span between two polls of the store while following.
 const LOG_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The form `--tail` accepts, named in every refusal.
@@ -229,6 +231,9 @@ pub(super) enum ServerCommand {
         /// Serve in this process instead of spawning a detached one.
         #[arg(long)]
         foreground: bool,
+        /// Serve repository workspaces through one process. Requires `--foreground`.
+        #[arg(long, hide = true, requires = "foreground")]
+        repository: bool,
         /// How served requests authenticate; `skip` needs --foreground.
         #[arg(
             long,
@@ -240,11 +245,19 @@ pub(super) enum ServerCommand {
         auth: AuthMode,
     },
     /// Stop this workspace's server.
-    Stop,
+    Stop {
+        /// Stop repository server selected by this workspace.
+        #[arg(long, hide = true)]
+        repository: bool,
+    },
     /// Stop this workspace's server, then start a fresh detached one.
     Restart,
     /// Report whether this workspace's server is serving.
-    Status,
+    Status {
+        /// Report repository server selected by this workspace.
+        #[arg(long, hide = true)]
+        repository: bool,
+    },
     /// Print this workspace's recorded server diagnostics, oldest first.
     Logs {
         /// Keep printing records as the server writes them.
@@ -462,19 +475,39 @@ pub(super) async fn run(
 ) -> Result<Option<ServerOutcome>, ServerCommandError> {
     let root = Path::new(".");
     match command {
-        ServerCommand::Start { foreground, auth } => match start_mode(foreground) {
+        ServerCommand::Start {
+            foreground,
+            repository,
+            auth,
+        } => match start_mode(foreground) {
             StartMode::Detached => start_detached(root, STOP_POLL_ATTEMPT_COUNT)
                 .await
                 .map(Some),
-            StartMode::Foreground => {
-                serve_foreground(root, drain, retention_records, token_check(auth))
-                    .await
-                    .map(|()| None)
-            }
+            StartMode::Foreground => serve_foreground(
+                root,
+                drain,
+                retention_records,
+                token_check(auth),
+                repository,
+            )
+            .await
+            .map(|()| None),
         },
-        ServerCommand::Stop => stop(root, STOP_POLL_ATTEMPT_COUNT).await.map(Some),
+        ServerCommand::Stop { repository } => {
+            if repository {
+                stop_repository(root, STOP_POLL_ATTEMPT_COUNT)
+                    .await
+                    .map(Some)
+            } else {
+                stop(root, STOP_POLL_ATTEMPT_COUNT).await.map(Some)
+            }
+        }
         ServerCommand::Restart => restart(root).await.map(Some),
-        ServerCommand::Status => Ok(Some(status(root))),
+        ServerCommand::Status { repository } => Ok(Some(if repository {
+            repository_status(root)
+        } else {
+            status(root)
+        })),
         ServerCommand::Logs {
             follow,
             tail,
@@ -508,6 +541,92 @@ fn status(root: &Path) -> ServerOutcome {
         },
         ServerPresence::Absent => ServerOutcome::NotRunning,
     }
+}
+
+fn repository_state_directory(root: &Path) -> Option<std::path::PathBuf> {
+    let common_directory = rift_mcp::repository::discover_common_directory(root)?;
+    let executable = std::env::current_exe().ok()?;
+    let identity = rift_mcp::product_identity_of(crate::BUILD_CHECKOUT, &executable).ok()?;
+    rift_mcp::repository::repository_election_directory(&common_directory, &identity).ok()
+}
+
+fn repository_status(root: &Path) -> ServerOutcome {
+    let Some(state_directory) = repository_state_directory(root) else {
+        return ServerOutcome::NotRunning;
+    };
+    match rift_mcp::probe_state_directory(&state_directory) {
+        ServerPresence::Serving(lock) => ServerOutcome::Serving {
+            port: lock.port,
+            pid: lock.pid,
+            version: lock.identity.version,
+        },
+        ServerPresence::Starting => ServerOutcome::Starting { pid: None },
+        ServerPresence::Stale(reason) => ServerOutcome::Stale {
+            reason: stale_reason_phrase(&reason),
+        },
+        ServerPresence::Absent => ServerOutcome::NotRunning,
+    }
+}
+
+async fn stop_repository(
+    root: &Path,
+    attempt_count: u32,
+) -> Result<ServerOutcome, ServerCommandError> {
+    let Some(state_directory) = repository_state_directory(root) else {
+        return Ok(ServerOutcome::NotRunning);
+    };
+    let lock = match rift_mcp::probe_state_directory(&state_directory) {
+        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
+        ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
+            await_repository_election_released(&state_directory, pid, attempt_count).await?;
+            return Ok(ServerOutcome::Stopped);
+        }
+        ServerPresence::Stale(_) | ServerPresence::Absent => return Ok(ServerOutcome::NotRunning),
+    };
+    let process = ProcessExit::open(lock.pid);
+    request_stop(&lock).await?;
+    await_repository_stopped(&state_directory, lock, process, attempt_count).await?;
+    Ok(ServerOutcome::Stopped)
+}
+
+async fn await_repository_election_released(
+    state_directory: &Path,
+    pid: u32,
+    attempt_count: u32,
+) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
+    for _ in 0..attempt_count {
+        if !rift_mcp::probe_state_directory(state_directory).election_held() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+    }
+    Err(Error::new(ServerCommandFault::ElectionUnreleased { pid }))
+}
+
+async fn await_repository_stopped(
+    _state_directory: &Path,
+    holder: ServerLock,
+    mut process: ProcessExit,
+    attempt_count: u32,
+) -> Result<(), ServerCommandError> {
+    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
+    for _ in 0..attempt_count {
+        if process.exited() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+    }
+    Err(process.refused(ServerCommandFault::StopTimedOut {
+        holder: Box::new(holder),
+    }))
 }
 
 /// The probe's stale classification as one operator-facing phrase.
@@ -630,14 +749,28 @@ async fn await_serving<Spawned>(
     attempt_count: u32,
     stale_bytes: Option<&[u8]>,
     spawns: &mut StartSpawns<Spawned>,
+    launch: impl FnMut() -> io::Result<Spawned>,
+) -> Result<ServerOutcome, ServerCommandError>
+where
+    Spawned: ChildWatch + StartedServer<Failure = u32>,
+{
+    await_serving_with_probe(root, attempt_count, stale_bytes, spawns, launch, probe).await
+}
+
+async fn await_serving_with_probe<Spawned>(
+    root: &Path,
+    attempt_count: u32,
+    stale_bytes: Option<&[u8]>,
+    spawns: &mut StartSpawns<Spawned>,
     mut launch: impl FnMut() -> io::Result<Spawned>,
+    mut observe: impl FnMut(&Path) -> ServerPresence,
 ) -> Result<ServerOutcome, ServerCommandError>
 where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
 {
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
-        let presence = probe(root);
+        let presence = observe(root);
         let election_held = presence.election_held();
         let serving = match presence {
             ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(lock),
@@ -670,7 +803,7 @@ where
     }
     // A holder that has not published is starting, whether the document is
     // absent or still the pre-spawn leftover it has yet to scrub.
-    let presence = probe(root);
+    let presence = observe(root);
     let holder_unpublished = matches!(presence, ServerPresence::Starting)
         || (presence.election_held() && leftover_unscrubbed(root, stale_bytes));
     if holder_unpublished {
@@ -713,10 +846,19 @@ async fn await_election_released(
     pid: u32,
     attempt_count: u32,
 ) -> Result<(), ServerCommandError> {
+    await_election_released_with_probe(root, pid, attempt_count, probe).await
+}
+
+async fn await_election_released_with_probe(
+    root: &Path,
+    pid: u32,
+    attempt_count: u32,
+    mut observe: impl FnMut(&Path) -> ServerPresence,
+) -> Result<(), ServerCommandError> {
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     let mut process = ProcessExit::open(pid);
     for _ in 0..attempt_count {
-        if process.exited() || !probe(root).election_held() {
+        if process.exited() || !observe(root).election_held() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -841,32 +983,65 @@ async fn serve_foreground(
     drain: Option<LogDrain>,
     retention_records: u64,
     check: TokenCheck,
+    repository: bool,
 ) -> Result<(), ServerCommandError> {
     // A detached server's panic reaches its stderr file at best; the hook
     // records it through the same lane every other diagnostic takes.
     install_panic_hook();
     let shutdown = CancellationToken::new();
-    let storage = WorkspaceStorage::open(root).await;
-    // The drain starts before election, so a start that refuses is recorded too: the
-    // workspace that already has a server is exactly the one whose operator is about to
-    // ask why this one would not serve.
-    let log_drain = match (drain, storage.logs()) {
-        (Some(drain), Some(store)) => Some(tokio::spawn(drain.run(
-            store,
-            retention_records,
-            shutdown.clone(),
-        ))),
-        _ => None,
+    let selection = foreground_selection(root, repository)?;
+    let (storage, guard, log_drain) = if repository {
+        (None, None, None)
+    } else {
+        let guard = std::sync::Arc::new(
+            rift_mcp::claim(root).map_err(|error| foreground_refused(root, error))?,
+        );
+        let storage = WorkspaceStorage::open_elected(root, std::sync::Arc::clone(&guard))
+            .await
+            .map_err(|error| foreground_refused(root, error))?;
+        let log_drain = match (drain, storage.logs()) {
+            (Some(drain), Some(store)) => Some(tokio::spawn(drain.run(
+                store,
+                retention_records,
+                shutdown.clone(),
+            ))),
+            _ => None,
+        };
+        (Some(storage), Some(guard), log_drain)
     };
-    let server = match serve_elected_with_storage(
-        root,
-        shutdown.clone(),
-        storage,
-        check,
-        crate::BUILD_CHECKOUT,
-    )
-    .await
+    let serving = if let Some(rift_mcp::repository::ServerConfigurationSelection::Repository {
+        authority_root,
+        common_directory,
+        server,
+        ..
+    }) = selection
     {
+        rift_mcp::serve_repository_elected(
+            &authority_root,
+            &common_directory,
+            server,
+            shutdown.clone(),
+            rift_index::WorkspaceIndexLimits::default(),
+            check,
+            crate::BUILD_CHECKOUT,
+        )
+        .await
+    } else {
+        let storage = storage
+            .ok_or_else(|| repository_selection_fault(root, "workspace storage is unavailable"))?;
+        let guard = guard
+            .ok_or_else(|| repository_selection_fault(root, "workspace election is unavailable"))?;
+        serve_elected_with_storage(
+            root,
+            guard,
+            shutdown.clone(),
+            storage,
+            check,
+            crate::BUILD_CHECKOUT,
+        )
+        .await
+    };
+    let server = match serving {
         Ok(server) => server,
         Err(error) => {
             shutdown.cancel();
@@ -886,17 +1061,52 @@ async fn serve_foreground(
             pid: std::process::id(),
         }
     );
-    let (guard, deadline, stopped) = server.stopped(SERVER_STOP_DEADLINE).await;
+    let (guard, deadline, stopped, database) =
+        server.stopped_before_database(SERVER_STOP_DEADLINE).await;
     let stopped =
         stopped.map_err(|error| Error::new(ServerCommandFault::Election(Box::new(error))));
     shutdown.cancel();
     stop_signals.abort();
     let _ = stop_signals.await;
-    stop_log_drain(log_drain, deadline).await;
+    stop_log_drain(log_drain, deadline - SERVER_DATABASE_STOP_RESERVE).await;
+    let database = database.shutdown(deadline).await.map_err(|error| {
+        let election = Error::new(ElectionFault::Serve(Box::new(error)));
+        Error::new(ServerCommandFault::Election(Box::new(election)))
+    });
     // The election releases last: dropping the guard retires the document and
     // unlocks, immediately before the process exits.
     drop(guard);
-    stopped
+    stopped.and(database)
+}
+
+fn repository_selection_fault(root: &Path, detail: impl Into<String>) -> ServerCommandError {
+    let election = Error::new(ElectionFault::Storage {
+        operation: "select repository server",
+        path: root.to_path_buf(),
+        source: io::Error::other(detail.into()),
+    });
+    Error::new(ServerCommandFault::Election(Box::new(election)))
+}
+
+fn foreground_selection(
+    root: &Path,
+    repository: bool,
+) -> Result<Option<rift_mcp::repository::ServerConfigurationSelection>, ServerCommandError> {
+    if !repository {
+        return Ok(None);
+    }
+    let selected = rift_mcp::repository::select_server_configuration(root, None)
+        .map_err(|error| repository_selection_fault(root, error.to_string()))?;
+    if !matches!(
+        selected,
+        rift_mcp::repository::ServerConfigurationSelection::Repository { .. }
+    ) {
+        return Err(repository_selection_fault(
+            root,
+            "repository settings are unavailable",
+        ));
+    }
+    Ok(Some(selected))
 }
 
 /// Joins the diagnostics drain by `deadline`, the stop's shared deadline.
@@ -1054,12 +1264,22 @@ async fn request_stop(lock: &ServerLock) -> Result<(), ServerCommandError> {
 async fn await_stopped(
     root: &Path,
     holder: ServerLock,
+    process: ProcessExit,
+    attempt_count: u32,
+) -> Result<(), ServerCommandError> {
+    await_stopped_with_probe(root, holder, process, attempt_count, probe).await
+}
+
+async fn await_stopped_with_probe(
+    root: &Path,
+    holder: ServerLock,
     mut process: ProcessExit,
     attempt_count: u32,
+    mut observe: impl FnMut(&Path) -> ServerPresence,
 ) -> Result<(), ServerCommandError> {
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
-        if process.exited() || !probe(root).election_held() {
+        if process.exited() || !observe(root).election_held() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1356,17 +1576,18 @@ mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
         SERVER_STOP_DEADLINE, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, STOP_POLL_ATTEMPT_COUNT,
         STOP_WAIT_MAX, ServerCommandFault, ServerOutcome, StaleReason, StartMode, StartSpawns,
-        StartedServer, TailCount, TokenCheck, await_election_released, await_serving,
-        await_stopped, discard_stale_document, foreground_refused, holder_evidence, label,
-        level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs, rendered_fields,
-        rendered_line, rendered_timestamp, request_stop, stale_reason_phrase, start_detached,
-        start_mode, status, stop, stop_log_drain, token_check,
+        StartedServer, TailCount, TokenCheck, await_election_released,
+        await_election_released_with_probe, await_serving, await_serving_with_probe, await_stopped,
+        await_stopped_with_probe, discard_stale_document, foreground_refused, holder_evidence,
+        label, level_glyph, logs_mode, logs_query, logs_unavailable, now_ms, print_logs,
+        rendered_fields, rendered_line, rendered_timestamp, request_stop, stale_reason_phrase,
+        start_detached, start_mode, status, stop, stop_log_drain, token_check,
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_core::Error;
@@ -1390,6 +1611,7 @@ mod tests {
                 version: "0.0.11".to_owned(),
                 schema_digest: "b".repeat(64),
             },
+            server: None,
         }
     }
 
@@ -1421,92 +1643,39 @@ mod tests {
         Ok((listener, port))
     }
 
-    /// Most connections [`unaccepting_port`] makes before one of them waits: well past the
-    /// backlog of 128 that std gives every listener on every platform.
-    const BACKLOG_FILL_MAX: usize = 1_024;
-    /// Bound on one of those connections; the first that outlasts it met a full backlog.
-    const BACKLOG_FILL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
     /// Probes the slow-probe cases allow: a one-second window at the poll interval.
     const SLOW_PROBE_ATTEMPT_COUNT: u32 = 10;
-    /// Least one probe of an [`unaccepting_port`] costs for the slow-probe cases to measure
-    /// anything: most of the probe's connect timeout.
-    const SLOW_PROBE_COST_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+    /// Duration each test observation blocks before returning a held election.
+    const SLOW_PROBE_COST: std::time::Duration = std::time::Duration::from_millis(300);
 
-    /// A loopback listener that accepts nothing, the connections holding its backlog full,
-    /// and its port.
-    ///
-    /// A connect to that port neither completes nor is refused at once: the full queue
-    /// leaves the handshake unanswered, so a probe spends its whole connect timeout. That is
-    /// the cost every probe of a refusing port pays on Windows, where a refused connect is
-    /// retried rather than failed.
-    fn unaccepting_port() -> TestResult<(std::net::TcpListener, Vec<std::net::TcpStream>, u16)> {
-        let (listener, port) = answering_port()?;
-        let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let mut queued = Vec::new();
-        for _ in 0..BACKLOG_FILL_MAX {
-            match std::net::TcpStream::connect_timeout(&address, BACKLOG_FILL_CONNECT_TIMEOUT) {
-                Ok(connection) => queued.push(connection),
-                Err(_full) => return Ok((listener, queued, port)),
-            }
+    fn slow_port_probe(
+        pid: u32,
+        observations: std::sync::Arc<AtomicUsize>,
+    ) -> impl FnMut(&std::path::Path) -> rift_mcp::ServerPresence {
+        move |_| {
+            observations.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(SLOW_PROBE_COST);
+            rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { pid })
         }
-        Err(format!("the backlog took {BACKLOG_FILL_MAX} connections without filling").into())
     }
 
-    /// A held election whose published document names an [`unaccepting_port`], with the
-    /// cost one probe of it takes, checked against [`SLOW_PROBE_COST_MIN`].
-    struct SlowProbeHolder {
-        guard: rift_mcp::ElectionGuard,
-        document: ServerLock,
-        probe_cost: std::time::Duration,
-        _listener: std::net::TcpListener,
-        _queued: Vec<std::net::TcpStream>,
-    }
-
-    impl SlowProbeHolder {
-        fn publish(root: &std::path::Path) -> TestResult<Self> {
-            let (listener, queued, port) = unaccepting_port()?;
-            let guard = rift_mcp::claim(root)?;
-            let document = ServerLock {
-                pid: std::process::id(),
-                ..holder_on(port)
-            };
-            guard.publish(&document)?;
-            let probed = std::time::Instant::now();
-            let presence = rift_mcp::probe(root);
-            let probe_cost = probed.elapsed();
-            assert!(
-                matches!(
-                    presence,
-                    rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { .. })
-                ),
-                "a port that accepts nothing is unreachable: {presence:?}"
-            );
-            assert!(
-                probe_cost >= SLOW_PROBE_COST_MIN,
-                "a probe of a port that accepts nothing spends its connect timeout: \
-                 probe_cost={probe_cost:?}, expected at least {SLOW_PROBE_COST_MIN:?}"
-            );
-            Ok(Self {
-                guard,
-                document,
-                probe_cost,
-                _listener: listener,
-                _queued: queued,
-            })
-        }
-
-        /// Asserts a wait over [`SLOW_PROBE_ATTEMPT_COUNT`] probes ended inside the window
-        /// they span, allowing the probes already under way when it closed.
-        fn assert_within_window(&self, what: &str, waited: std::time::Duration) {
-            let window = PRESENCE_POLL_INTERVAL * SLOW_PROBE_ATTEMPT_COUNT;
-            let allowed = window + self.probe_cost * 3;
-            assert!(
-                waited <= allowed,
-                "{what} must end inside its window however long each probe takes: \
-                 waited={waited:?}, window={window:?}, probe_cost={:?}, allowed={allowed:?}",
-                self.probe_cost
-            );
-        }
+    fn assert_probe_wait_within_window(
+        what: &str,
+        waited: std::time::Duration,
+        probe_count: usize,
+        max_probe_count: usize,
+    ) {
+        let window = PRESENCE_POLL_INTERVAL * SLOW_PROBE_ATTEMPT_COUNT;
+        let allowed = window + SLOW_PROBE_COST * 3;
+        assert!(
+            waited <= allowed,
+            "{what} must end inside its window however long each probe takes: \
+             waited={waited:?}, window={window:?}, probe_cost={SLOW_PROBE_COST:?}, allowed={allowed:?}"
+        );
+        assert!(
+            (2..=max_probe_count).contains(&probe_count),
+            "{what} made {probe_count} probes, expected between 2 and {max_probe_count}"
+        );
     }
 
     /// A stand-in for the spawned server: running until told otherwise, and
@@ -2347,29 +2516,33 @@ mod tests {
         Ok(())
     }
 
-    /// A stop wait whose every probe spends its connect timeout still ends at its window,
-    /// as it does on Windows, where every probe of the port a stopping server closed pays
-    /// that cost.
+    /// A stop wait with slow probes ends inside its polling window.
     #[tokio::test]
     async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let holder = SlowProbeHolder::publish(directory.path())?;
-        let process = ProcessExit::open(holder.document.pid);
+        let pid = std::process::id();
+        let process = ProcessExit::open(pid);
+        let probe_count = Arc::new(AtomicUsize::new(0));
         let started = std::time::Instant::now();
-        let error = await_stopped(
+        let error = await_stopped_with_probe(
             directory.path(),
-            holder.document.clone(),
+            holder(),
             process,
             SLOW_PROBE_ATTEMPT_COUNT,
+            slow_port_probe(pid, Arc::clone(&probe_count)),
         )
         .await
-        .expect_err("a holder that keeps the election times the stop wait out");
-        holder.assert_within_window("the stop wait", started.elapsed());
+        .expect_err("a held election times the stop wait out");
+        assert_probe_wait_within_window(
+            "the stop wait",
+            started.elapsed(),
+            probe_count.load(Ordering::Relaxed),
+            SLOW_PROBE_ATTEMPT_COUNT as usize,
+        );
         assert!(
             matches!(error.fault(), ServerCommandFault::StopTimedOut { .. }),
             "{error:?}"
         );
-        drop(holder.guard);
         Ok(())
     }
 
@@ -2377,21 +2550,27 @@ mod tests {
     #[tokio::test]
     async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let holder = SlowProbeHolder::publish(directory.path())?;
+        let pid = std::process::id();
+        let probe_count = Arc::new(AtomicUsize::new(0));
         let started = std::time::Instant::now();
-        let error = await_election_released(
+        let error = await_election_released_with_probe(
             directory.path(),
-            holder.document.pid,
+            pid,
             SLOW_PROBE_ATTEMPT_COUNT,
+            slow_port_probe(pid, Arc::clone(&probe_count)),
         )
         .await
-        .expect_err("a holder that keeps the election times the wait out");
-        holder.assert_within_window("the election wait", started.elapsed());
+        .expect_err("a held election times the wait out");
+        assert_probe_wait_within_window(
+            "the election wait",
+            started.elapsed(),
+            probe_count.load(Ordering::Relaxed),
+            SLOW_PROBE_ATTEMPT_COUNT as usize,
+        );
         assert!(
             matches!(error.fault(), ServerCommandFault::ElectionUnreleased { .. }),
             "{error:?}"
         );
-        drop(holder.guard);
         Ok(())
     }
 
@@ -2400,24 +2579,29 @@ mod tests {
     #[tokio::test]
     async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let holder = SlowProbeHolder::publish(directory.path())?;
         let mut spawns = StartSpawns::<FakeChild>::default();
+        let probe_count = Arc::new(AtomicUsize::new(0));
         let started = std::time::Instant::now();
-        let error = await_serving(
+        let error = await_serving_with_probe(
             directory.path(),
             SLOW_PROBE_ATTEMPT_COUNT,
             None,
             &mut spawns,
             no_launch,
+            slow_port_probe(std::process::id(), Arc::clone(&probe_count)),
         )
         .await
-        .expect_err("a holder whose port accepts nothing never serves this start");
-        holder.assert_within_window("the start wait", started.elapsed());
+        .expect_err("a held election whose port does not answer never serves this start");
+        assert_probe_wait_within_window(
+            "the start wait",
+            started.elapsed(),
+            probe_count.load(Ordering::Relaxed),
+            SLOW_PROBE_ATTEMPT_COUNT as usize + 1,
+        );
         assert!(
             matches!(error.fault(), ServerCommandFault::StartTimedOut),
             "{error:?}"
         );
-        drop(holder.guard);
         Ok(())
     }
 

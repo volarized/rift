@@ -12,19 +12,25 @@ use std::fs::{OpenOptions, TryLockError};
 use std::io::{self, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, causes};
 use rift_index::WorkspaceIndexLimits;
+use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::http::serve_http;
-use crate::http::{HttpServeError, HttpServer, TokenCheck, serve_http_with_storage};
+use crate::http::{
+    DeferredDatabaseShutdown, HttpServeError, HttpServer, TokenCheck, serve_http_with_storage,
+    serve_repository_http,
+};
 use crate::identity::BuildCheckout;
+use crate::repository::repository_election_directory;
 use crate::storage::WorkspaceStorage;
 
 /// The zero-byte election file's name under the `.rift` state directory.
@@ -131,7 +137,14 @@ impl ElectionFault {
 /// election, and [`ElectionFault::Storage`] when the state directory or the
 /// election file cannot be prepared.
 pub fn claim(root: &Path) -> Result<ElectionGuard, ElectionError> {
-    let state_directory = root.join(RIFT_STATE_DIRECTORY);
+    claim_state_directory(&root.join(RIFT_STATE_DIRECTORY))
+}
+
+/// Claims an election whose files live in `state_directory`.
+pub(crate) fn claim_state_directory(
+    state_directory: &Path,
+) -> Result<ElectionGuard, ElectionError> {
+    let state_directory = state_directory.to_path_buf();
     std::fs::create_dir_all(&state_directory).map_err(|error| {
         ElectionFault::storage("create state directory", &state_directory, error)
     })?;
@@ -147,7 +160,7 @@ pub fn claim(root: &Path) -> Result<ElectionGuard, ElectionError> {
         Ok(()) => {
             let guard = ElectionGuard {
                 election_file,
-                document_path: document_path(root),
+                document_path: document_path_in(&state_directory),
                 state_directory,
             };
             // The free election proves any leftover document stale. Scrub it
@@ -180,6 +193,27 @@ pub struct ElectionGuard {
 }
 
 impl ElectionGuard {
+    /// Checks that this guard holds the requested workspace's election.
+    pub(crate) fn validate_workspace(&self, root: &Path) -> Result<(), ElectionError> {
+        let state = root.join(RIFT_STATE_DIRECTORY);
+        let requested = std::fs::canonicalize(&state)
+            .map_err(|error| ElectionFault::storage("read election directory", &state, error))?;
+        let held = std::fs::canonicalize(&self.state_directory).map_err(|error| {
+            ElectionFault::storage("read election directory", &self.state_directory, error)
+        })?;
+        if requested != held {
+            return Err(ElectionFault::storage(
+                "validate workspace election",
+                root,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "election belongs to another workspace",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publishes the lock document for readers, atomically.
     ///
     /// The document is validated, staged in a temp file inside `.rift`, and
@@ -361,7 +395,17 @@ enum ElectionState {
 /// polls; callers that need to wait poll this function.
 #[must_use]
 pub fn probe(root: &Path) -> ServerPresence {
-    match (election_state(root), published_document(root)) {
+    probe_state_directory(&root.join(RIFT_STATE_DIRECTORY))
+}
+
+/// Observes an election whose files live in `state_directory`.
+#[must_use]
+#[doc(hidden)]
+pub fn probe_state_directory(state_directory: &Path) -> ServerPresence {
+    match (
+        election_state_in(state_directory),
+        published_document_in(state_directory),
+    ) {
         (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => ServerPresence::Serving(lock),
         (ElectionState::Held, Ok(lock)) => {
             ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid })
@@ -371,7 +415,7 @@ pub fn probe(root: &Path) -> ServerPresence {
         (ElectionState::Unobservable, Ok(_)) => {
             ServerPresence::Stale(StaleReason::ElectionUnobservable)
         }
-        (_, Err(presence)) => presence,
+        (_, Err(presence)) => *presence,
     }
 }
 
@@ -384,25 +428,37 @@ fn port_answers(port: u16) -> bool {
 /// The workspace's lock document path, `.rift/server.json` below `root`.
 #[must_use]
 pub fn document_path(root: &Path) -> PathBuf {
-    root.join(RIFT_STATE_DIRECTORY).join(SERVER_LOCK_FILE_NAME)
+    document_path_in(&root.join(RIFT_STATE_DIRECTORY))
+}
+
+/// The lock document in an explicit `.rift` state directory.
+#[must_use]
+pub(crate) fn document_path_in(state_directory: &Path) -> PathBuf {
+    state_directory.join(SERVER_LOCK_FILE_NAME)
 }
 
 /// The published document when it exists, parses, and validates.
-fn published_document(root: &Path) -> Result<ServerLock, ServerPresence> {
-    let bytes = match std::fs::read(document_path(root)) {
+fn published_document_in(state_directory: &Path) -> Result<ServerLock, Box<ServerPresence>> {
+    let bytes = match std::fs::read(document_path_in(state_directory)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ServerPresence::Absent);
+            return Err(Box::new(ServerPresence::Absent));
         }
-        Err(_) => return Err(ServerPresence::Stale(StaleReason::DocumentUnreadable)),
+        Err(_) => {
+            return Err(Box::new(ServerPresence::Stale(
+                StaleReason::DocumentUnreadable,
+            )));
+        }
     };
     let Ok(lock) = serde_json::from_slice::<ServerLock>(&bytes) else {
-        return Err(ServerPresence::Stale(StaleReason::DocumentMalformed));
+        return Err(Box::new(ServerPresence::Stale(
+            StaleReason::DocumentMalformed,
+        )));
     };
     match lock.validate() {
         Ok(()) => Ok(lock),
-        Err(violation) => Err(ServerPresence::Stale(StaleReason::DocumentInvalid(
-            violation,
+        Err(violation) => Err(Box::new(ServerPresence::Stale(
+            StaleReason::DocumentInvalid(violation),
         ))),
     }
 }
@@ -424,11 +480,8 @@ fn restrict_to_owner(_file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether a live process holds the election file's exclusive lock.
-fn election_state(root: &Path) -> ElectionState {
-    let election_path = root
-        .join(RIFT_STATE_DIRECTORY)
-        .join(SERVER_ELECTION_FILE_NAME);
+fn election_state_in(state_directory: &Path) -> ElectionState {
+    let election_path = state_directory.join(SERVER_ELECTION_FILE_NAME);
     let election_file = match OpenOptions::new().read(true).open(&election_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return ElectionState::Unheld,
@@ -463,12 +516,14 @@ fn served_document(
     port: u16,
     token: &str,
     identity: rift_protocol::lock::ProductIdentity,
+    server: Option<rift_protocol::configuration::ServerConfiguration>,
 ) -> ServerLock {
     ServerLock {
         port,
         token: token.to_owned(),
         pid: std::process::id(),
         identity,
+        server,
     }
 }
 
@@ -490,17 +545,18 @@ fn served_document(
 ///
 /// # Cancel safety
 ///
-/// Dropping this future releases a claimed election. A transport already
-/// started keeps its own serving tasks until `shutdown` cancels; the
-/// election lock and any published document are gone, so probes classify
-/// the leftover state as stale.
+/// The SQLite worker retains the election until its actual exit, including after
+/// cancellation or a shutdown timeout. A transport already started keeps its serving
+/// tasks until `shutdown` cancels.
 pub async fn serve_elected(
     root: &Path,
     shutdown: CancellationToken,
 ) -> Result<ElectedServer, ElectionError> {
-    let storage = WorkspaceStorage::open(root).await;
+    let guard = Arc::new(claim(root)?);
+    let storage = WorkspaceStorage::open_elected(root, Arc::clone(&guard)).await?;
     serve_elected_with_storage(
         root,
+        guard,
         shutdown,
         storage,
         TokenCheck::Required,
@@ -509,9 +565,11 @@ pub async fn serve_elected(
     .await
 }
 
-/// Serves the workspace through storage already opened by this process,
-/// under one token policy, naming the build `checkout` describes: the one
-/// the `rift` binary's build script recorded.
+/// Serves the workspace through storage opened under its held election.
+///
+/// The caller claims `root` before calling [`WorkspaceStorage::open_elected`], then
+/// passes the same guard here. A guard for another workspace is refused before serving.
+/// Requests follow `check`, and the server names the build `checkout` describes.
 ///
 /// # Errors
 ///
@@ -522,6 +580,7 @@ pub async fn serve_elected(
 /// Dropping this future follows [`serve_elected`]'s cancellation behavior.
 pub async fn serve_elected_with_storage(
     root: &Path,
+    guard: Arc<ElectionGuard>,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     check: TokenCheck,
@@ -529,6 +588,7 @@ pub async fn serve_elected_with_storage(
 ) -> Result<ElectedServer, ElectionError> {
     serve_elected_at(
         root,
+        guard,
         shutdown,
         storage,
         WorkspaceIndexLimits::default(),
@@ -538,16 +598,61 @@ pub async fn serve_elected_with_storage(
     .await
 }
 
+/// Serves repository workspaces under one repository election.
+#[doc(hidden)]
+pub async fn serve_repository_elected(
+    authority_root: &Path,
+    common_directory: &Path,
+    server_configuration: ServerConfiguration,
+    shutdown: CancellationToken,
+    limits: WorkspaceIndexLimits,
+    check: TokenCheck,
+    checkout: BuildCheckout,
+) -> Result<ElectedServer, ElectionError> {
+    let identity = crate::identity::product_identity(checkout)
+        .await
+        .map_err(|source| {
+            ElectionFault::storage("read product identity", common_directory, source)
+        })?;
+    let state_directory =
+        repository_election_directory(common_directory, &identity).map_err(|error| {
+            ElectionFault::storage(
+                "select repository election",
+                common_directory,
+                io::Error::other(error),
+            )
+        })?;
+    let guard = Arc::new(claim_state_directory(&state_directory)?);
+    let serving_stop = shutdown.child_token();
+    let server = serve_repository_http(
+        authority_root,
+        common_directory,
+        server_configuration,
+        serving_stop.clone(),
+        limits,
+        check,
+        checkout,
+    )
+    .await
+    .map_err(ElectionFault::serve)?;
+    let document = served_document(
+        server.port(),
+        server.token(),
+        server.product_identity().clone(),
+        Some(server.server_configuration().clone()),
+    );
+    match guard.publish(&document) {
+        Ok(()) => Ok(ElectedServer { server, guard }),
+        Err(error) => Err(shut_down_unpublished(server, &serving_stop, error).await),
+    }
+}
+
 /// Serves the workspace under explicit index bounds and one token policy,
 /// recording a start that fails before it returns.
 ///
-/// This is the server's whole startup: the election claim, the index build,
-/// the transport, and the publication. A failure anywhere in it is what the
-/// process exits on, so it is recorded here as one `ERROR` event carrying
-/// the full cause chain, where `rift server logs --level error` reads it
-/// back after the process is gone. An election another server already holds
-/// is recorded at `INFO`: losing the start race is the expected outcome for
-/// every starter but one.
+/// The caller holds the election before storage opens. Build, transport, and
+/// publication failures are recorded through the workspace's log drain. An election
+/// refusal occurs before that drain starts and returns to the caller for stderr.
 ///
 /// # Errors
 ///
@@ -558,13 +663,14 @@ pub async fn serve_elected_with_storage(
 /// Dropping this future follows [`serve_elected`]'s cancellation behavior.
 pub(crate) async fn serve_elected_at(
     root: &Path,
+    guard: Arc<ElectionGuard>,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<ElectedServer, ElectionError> {
-    let elected = elect_and_serve(root, shutdown, storage, limits, check, checkout).await;
+    let elected = elect_and_serve(root, guard, shutdown, storage, limits, check, checkout).await;
     if let Err(error) = &elected {
         record_start_failure(error);
     }
@@ -591,16 +697,27 @@ fn record_start_failure(error: &ElectionError) {
     );
 }
 
-/// Claims, builds, binds, and publishes, in that order.
+/// Validates the held election, builds, binds, and publishes, in that order.
 async fn elect_and_serve(
     root: &Path,
+    guard: Arc<ElectionGuard>,
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<ElectedServer, ElectionError> {
-    let guard = claim(root)?;
+    guard.validate_workspace(root)?;
+    if !storage.holds_election(&guard) {
+        return Err(ElectionFault::storage(
+            "validate workspace storage",
+            root,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "storage opened without this workspace election",
+            ),
+        ));
+    }
     let serving_stop = shutdown.child_token();
     let server =
         serve_http_with_storage(root, serving_stop.clone(), storage, limits, check, checkout)
@@ -610,6 +727,7 @@ async fn elect_and_serve(
         server.port(),
         server.token(),
         server.product_identity().clone(),
+        Some(server.server_configuration().clone()),
     );
     match guard.publish(&document) {
         Ok(()) => Ok(ElectedServer { server, guard }),
@@ -644,7 +762,7 @@ async fn shut_down_unpublished(
 #[must_use = "an elected server is driven through `stopped`"]
 pub struct ElectedServer {
     server: HttpServer,
-    guard: ElectionGuard,
+    guard: Arc<ElectionGuard>,
 }
 
 impl ElectedServer {
@@ -670,15 +788,38 @@ impl ElectedServer {
     ///
     /// # Cancel safety
     ///
-    /// Dropping this future retires the document and releases the election
-    /// through the guard's drop; the serving tasks detach and complete a
-    /// shutdown already triggered in the background.
+    /// Dropping this future leaves the election held by a live SQLite worker.
+    /// Serving tasks complete a shutdown already triggered in the background.
     pub async fn stopped(
         self,
         budget: Duration,
-    ) -> (ElectionGuard, Instant, Result<(), ElectionError>) {
-        let (deadline, outcome) = self.server.stopped(budget).await;
-        (self.guard, deadline, outcome.map_err(ElectionFault::serve))
+    ) -> (Arc<ElectionGuard>, Instant, Result<(), ElectionError>) {
+        let (guard, deadline, stopped, database) = self.stopped_before_database(budget).await;
+        let database = database
+            .shutdown(deadline)
+            .await
+            .map_err(ElectionFault::serve);
+        (guard, deadline, stopped.and(database))
+    }
+
+    /// Stops serving before SQLite close, for a caller with final store writes.
+    #[doc(hidden)]
+    pub async fn stopped_before_database(
+        self,
+        budget: Duration,
+    ) -> (
+        Arc<ElectionGuard>,
+        Instant,
+        Result<(), ElectionError>,
+        DeferredDatabaseShutdown,
+    ) {
+        let (deadline, outcome, database) = self.server.stopped_before_database(budget).await;
+        (
+            self.guard,
+            deadline,
+            outcome.map_err(ElectionFault::serve),
+            database,
+        )
     }
 }
 
@@ -732,6 +873,7 @@ mod tests {
                 version: "0.0.11".to_owned(),
                 schema_digest: "b".repeat(64),
             },
+            server: None,
         }
     }
 
@@ -1056,63 +1198,43 @@ mod tests {
         Ok(())
     }
 
-    /// The build runs under a bound one file cannot meet, so the start fails inside the
-    /// election; the event that records it carries the refusal and every cause below it.
+    /// The elected server starts before its bounded workspace index finishes.
     #[tokio::test]
-    async fn a_failing_index_build_is_recorded_with_its_causes_before_the_start_fails() -> TestResult
-    {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
+    async fn a_workspace_over_files_max_does_not_block_elected_server_start() -> TestResult {
+        const SOURCE_FILES: usize = 1_001;
+        const SOURCE_FILES_MAX: usize = 1_000;
         let directory = tempfile::tempdir()?;
-        // `[source] files` accepts at least 1,000; one file past it fails the build.
-        for index in 0..=1_000 {
-            let unit = directory.path().join(format!("unit_{index:04}.rs"));
-            fs::write(unit, "pub fn beacon() {}\n")?;
+        for file in 0..SOURCE_FILES {
+            fs::write(directory.path().join(format!("unit_{file:04}.rs")), "")?;
         }
-        crate::server::hermetic_workspace(directory.path(), "[source]\nfiles = 1000\n")?;
-        let limits = rift_index::WorkspaceIndexLimits::default();
-        let (sink, mut drain) = crate::logs::log_capture();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(sink));
-        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
-
-        let error = serve_elected_at(
+        crate::server::hermetic_workspace(
             directory.path(),
-            CancellationToken::new(),
+            &format!("[source]\nfiles = {SOURCE_FILES_MAX}\n"),
+        )?;
+        let guard = Arc::new(claim(directory.path())?);
+        let storage =
+            crate::storage::WorkspaceStorage::open_elected(directory.path(), Arc::clone(&guard))
+                .await?;
+        let shutdown = CancellationToken::new();
+        let elected = serve_elected_at(
+            directory.path(),
+            guard,
+            shutdown.clone(),
             storage,
-            limits,
+            rift_index::WorkspaceIndexLimits::default(),
             TokenCheck::Required,
             crate::identity::BuildCheckout::Unversioned,
         )
-        .await
-        .expect_err("a workspace over files_max must fail the start");
-
-        assert_eq!(error.descriptor().code(), "limit_exceeded", "{error}");
-        let recorded = loop {
-            match drain.try_recv_record() {
-                Ok(record) if record.message() == "the server failed to start and exits" => {
-                    break record;
-                }
-                Ok(_) => {}
-                Err(_) => return Err("the failed start must be recorded".into()),
-            }
-        };
-        assert_eq!(recorded.level(), "error");
-        assert_eq!(recorded.component(), "mcp");
-        assert_eq!(recorded.operation(), "server.start");
+        .await?;
         assert!(
-            recorded.fields().contains("too_many_files"),
-            "the event names the refusal: {}",
-            recorded.fields()
+            document_path(directory.path()).exists(),
+            "the election publishes before background discovery refuses its file bound"
         );
-        assert!(
-            recorded.fields().contains("\"causes\""),
-            "the event carries the cause chain: {}",
-            recorded.fields()
-        );
-        assert!(
-            !document_path(directory.path()).exists(),
-            "a failed start publishes nothing"
-        );
+        shutdown.cancel();
+        let (guard, _deadline, outcome) = elected.stopped(std::time::Duration::from_secs(30)).await;
+        outcome?;
+        drop(guard);
+        assert!(!document_path(directory.path()).exists());
         Ok(())
     }
 
@@ -1142,7 +1264,7 @@ mod tests {
     fn served_document_records_this_process_and_release() {
         let token = "a".repeat(SERVER_TOKEN_LENGTH);
         let identity = valid_document().identity;
-        let document = served_document(SERVER_PORT_MIN, &token, identity.clone());
+        let document = served_document(SERVER_PORT_MIN, &token, identity.clone(), None);
         assert_eq!(document.pid, std::process::id());
         assert_eq!(document.identity, identity);
         assert_eq!(document.port, SERVER_PORT_MIN);
@@ -1352,6 +1474,47 @@ mod tests {
             serving_stop.is_cancelled(),
             "the unpublished server's token must be cancelled"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supplied_storage_requires_its_own_election_before_serving() -> TestResult {
+        let requested = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        let guard = Arc::new(claim(requested.path())?);
+        let other_guard = Arc::new(claim(other.path())?);
+        let storage = crate::WorkspaceStorage::open_elected(other.path(), other_guard).await?;
+        let error = super::serve_elected_with_storage(
+            requested.path(),
+            guard,
+            CancellationToken::new(),
+            storage,
+            TokenCheck::Required,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await
+        .expect_err("another workspace's storage cannot serve");
+        assert!(matches!(
+            error.fault(),
+            ElectionFault::Storage {
+                operation: "validate workspace storage",
+                ..
+            }
+        ));
+        assert!(!document_path(requested.path()).exists());
+        assert!(!requested.path().join(".rift/db").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lost_elected_start_does_not_open_workspace_storage() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let error = serve_elected(directory.path(), CancellationToken::new())
+            .await
+            .expect_err("a competing owner refuses the start");
+        assert!(matches!(error.fault(), ElectionFault::AlreadyServing));
+        assert!(!directory.path().join(".rift/db").exists());
         Ok(())
     }
 

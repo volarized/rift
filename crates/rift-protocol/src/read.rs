@@ -1090,6 +1090,23 @@ pub enum ReadWarning {
         #[schemars(length(max = 4096))]
         detail: String,
     },
+    /// The local index is still preparing selected workspace files. The answer covers only
+    /// files whose capture and analysis have finished; `total` is absent until discovery ends.
+    LocalIndexPreparing {
+        /// Selected workspace files whose capture and analysis have finished.
+        #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+        prepared: u64,
+        /// Selected workspace files, once discovery has finished.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+        total: Option<u64>,
+        /// Estimated wait before local preparation finishes. No estimate is available yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_in: Option<Duration>,
+        /// Why the local index is preparing - prose for a reader; nothing keys on it.
+        #[schemars(length(max = 4096))]
+        detail: String,
+    },
     /// The vector ranking will not answer for the life of this server, so every answer
     /// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
     /// configuration and start the server again.
@@ -3079,6 +3096,24 @@ mod tests {
             "prepared": 12_000,
             "total": 17_500,
             "detail": "12000 of 17500 rows of file text are in the trigram index",
+        });
+        assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
+        let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(parsed, warning);
+    }
+
+    #[test]
+    fn the_local_index_preparation_warning_omits_unknown_progress() {
+        let warning = ReadWarning::LocalIndexPreparing {
+            prepared: 0,
+            total: None,
+            ready_in: None,
+            detail: "selected local files are still being prepared".to_owned(),
+        };
+        let wire = json!({
+            "code": "local_index_preparing",
+            "prepared": 0,
+            "detail": "selected local files are still being prepared",
         });
         assert_eq!(serde_json::to_value(&warning).expect("serialize"), wire);
         let parsed: ReadWarning = serde_json::from_value(wire).expect("deserialize");

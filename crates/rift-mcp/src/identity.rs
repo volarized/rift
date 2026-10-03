@@ -271,6 +271,7 @@ mod tests {
                     version: checkout.version(|| Ok(stamp))?,
                     schema_digest: "b".repeat(64),
                 },
+                server: None,
             };
             assert_eq!(lock.validate(), Ok(()), "{checkout:?}");
         }

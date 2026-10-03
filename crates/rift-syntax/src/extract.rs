@@ -5,6 +5,8 @@
 //! starts - come from the grammar's [`GrammarRules`], so a new language
 //! plugs in without touching the walk or its node and depth budgets.
 
+use std::sync::Arc;
+
 use rift_core::Error;
 use rift_protocol::read::{Documentation, Extensions, Language, Signature, SymbolFacet};
 use tree_sitter::{Node, TreeCursor};
@@ -222,7 +224,7 @@ pub(crate) fn extract(
         let node_index = visits.visit(node, parent, follows_named_sibling);
         let range = byte_range(node)?;
         nodes.push(SyntaxNode {
-            kind: node.kind().into(),
+            kind: node.kind(),
             range,
             parent,
             has_error: node.is_error() || node.is_missing(),
@@ -315,7 +317,7 @@ fn qualified_symbol(
     let node = visited.node();
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
-    let signatures = callable_signature(&declaration, node, text, language)
+    let signatures: Vec<Signature> = callable_signature(&declaration, node, text, language)
         .into_iter()
         .collect();
     Ok(SyntaxSymbol {
@@ -327,6 +329,7 @@ fn qualified_symbol(
         container: (!qualification.is_empty()).then(|| qualification.to_owned()),
         name: declaration.name,
         kind: declaration.kind,
+        node_kind: None,
         facets: declaration.facets,
         visibility: declaration.visibility,
         range: ByteRange {
@@ -336,8 +339,8 @@ fn qualified_symbol(
         item_range,
         name_range: rules.name_range(node)?,
         body_range: declaration.body_range,
-        signatures,
-        documentation: declaration.documentation,
+        signatures: Arc::from(signatures),
+        documentation: Arc::from(declaration.documentation),
         documentation_ranges: declaration.documentation_ranges,
     })
 }

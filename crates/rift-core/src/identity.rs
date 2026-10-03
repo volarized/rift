@@ -1,6 +1,7 @@
 use std::fmt::{self, Write as _};
 use std::num::NonZeroU64;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
@@ -184,7 +185,7 @@ macro_rules! define_id {
     ($name:ident, $docs:literal) => {
         #[doc = $docs]
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(String);
+        pub struct $name(Arc<str>);
 
         impl $name {
             /// Validates and constructs identity.
@@ -197,7 +198,7 @@ macro_rules! define_id {
                 if value.is_empty() || value.chars().any(char::is_control) {
                     return Err(Error::new(IdFault));
                 }
-                Ok(Self(value))
+                Ok(Self(Arc::from(value)))
             }
 
             /// Returns canonical identity text.
@@ -270,7 +271,7 @@ fn resolver_id_error(violation: SourceResolverIdViolation) -> SourceResolverIdEr
 
 /// Stable identity of one source resolver.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceResolverId(String);
+pub struct SourceResolverId(Arc<str>);
 
 impl SourceResolverId {
     /// Validates canonical lowercase resolver identity.
@@ -294,7 +295,7 @@ impl SourceResolverId {
                 SourceResolverIdViolation::InvalidCharacter,
             ));
         }
-        Ok(Self(value))
+        Ok(Self(Arc::from(value)))
     }
 
     /// Returns canonical resolver text.
@@ -591,6 +592,7 @@ define_revision!(ModelRevision, "Resolved model revision.");
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::hash::{Hash as _, Hasher as _};
     use std::str::FromStr as _;
 
     use super::{
@@ -603,6 +605,32 @@ mod tests {
         SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_URI_PREFIX,
     };
     use crate::{PackageIdentity, PathViolation, ProjectPath, SourcePath};
+
+    #[test]
+    fn cloned_identity_values_share_text_and_keep_value_semantics() {
+        let identity = ProviderSymbolId::new("provider.symbol").expect("valid identity");
+        let clone = identity.clone();
+        let later = ProviderSymbolId::new("provider.zymbol").expect("valid identity");
+
+        assert!(std::sync::Arc::ptr_eq(&identity.0, &clone.0));
+        assert_eq!(identity, clone);
+        assert!(identity < later);
+        assert_eq!(identity.to_string(), "provider.symbol");
+        assert!(ProviderSymbolId::new("").is_err());
+
+        let mut identity_hash = std::collections::hash_map::DefaultHasher::new();
+        identity.hash(&mut identity_hash);
+        let mut clone_hash = std::collections::hash_map::DefaultHasher::new();
+        clone.hash(&mut clone_hash);
+        assert_eq!(identity_hash.finish(), clone_hash.finish());
+
+        let resolver = SourceResolverId::new("rift.sources.project").expect("valid resolver");
+        let resolver_clone = resolver.clone();
+        assert!(std::sync::Arc::ptr_eq(&resolver.0, &resolver_clone.0));
+        assert_eq!(resolver, resolver_clone);
+        assert_eq!(resolver.to_string(), "rift.sources.project");
+        assert!(SourceResolverId::new("Rift").is_err());
+    }
 
     #[test]
     fn encode_path_keeps_the_rfc3986_path_set_literal_and_escapes_the_rest() {

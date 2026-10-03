@@ -4,6 +4,8 @@
 //! while a request selecting it says so.
 
 mod hermetic_search;
+#[allow(dead_code)]
+mod workspace_client;
 
 use std::error::Error;
 use std::fs;
@@ -15,6 +17,7 @@ use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
+use workspace_client::await_workspace_ready;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -28,7 +31,9 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
             .expect("server must initialize");
         service.waiting().await.expect("server must stop cleanly");
     });
-    Ok(().serve(client_transport).await?)
+    let client = ().serve(client_transport).await?;
+    await_workspace_ready(&client).await?;
+    Ok(client)
 }
 
 async fn search(client: &RunningService<RoleClient, ()>, arguments: Value) -> TestResult<Value> {

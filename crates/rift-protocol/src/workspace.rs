@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::read::{Digest, Language, Pagination, ProjectPath};
+use crate::read::{Digest, Language, Pagination, ProjectPath, ReadWarning};
 use crate::schema;
 use crate::search::PathPattern;
 
@@ -29,6 +29,7 @@ pub const WORKSPACE_LSP_PROCESS_KEY_BYTES_MAX: usize = 129;
 /// One page of the effective workspace configuration and source catalog.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::declare_workspace_resource_page_empty_defaults)]
 pub struct WorkspaceResourcePage {
     /// Digest of the accepted `rift.toml` bytes this page describes.
     pub configuration_revision: Digest,
@@ -39,6 +40,9 @@ pub struct WorkspaceResourcePage {
     /// Source units on this page, sorted by project path.
     #[schemars(length(max = 1_000))]
     pub source: Vec<WorkspaceSourceUnit>,
+    /// Conditions that qualify this page. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ReadWarning>,
     /// Where this page sits in the source catalog.
     pub pagination: Pagination,
 }
@@ -165,6 +169,7 @@ mod tests {
                     dialect: Some("tsx".to_owned()),
                 }),
             }],
+            warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
                 total_pages: 1,

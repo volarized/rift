@@ -1,6 +1,7 @@
 //! Generic syntax facts one provider emits for one source file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use rift_core::{FileDigest, ProjectPath, is_portable_name};
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
@@ -31,8 +32,8 @@ impl ByteRange {
 /// One named syntax-tree node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxNode {
-    /// Grammar node kind, in the producing provider's vocabulary.
-    pub kind: String,
+    /// Grammar node kind, borrowed from the provider's static grammar names.
+    pub kind: &'static str,
     /// Node byte range.
     pub range: ByteRange,
     /// Parent index in the document node vector; `None` for the root.
@@ -58,6 +59,8 @@ pub struct SyntaxSymbol {
     /// The provider's kind word, such as `function`, carried on the wire
     /// unchanged.
     pub kind: &'static str,
+    /// Grammar node kind for the exact declaration range, when one matches.
+    pub node_kind: Option<&'static str>,
     /// Portable categories this declaration falls into, in the provider's
     /// declared order.
     pub facets: Vec<SymbolFacet>,
@@ -78,27 +81,35 @@ pub struct SyntaxSymbol {
     /// Callable forms this declaration renders as: its header before the
     /// implementation, or its whole text when it has none. Empty for a
     /// declaration the grammar does not mark callable.
-    pub signatures: Vec<Signature>,
+    pub signatures: Arc<[Signature]>,
     /// Doc comments the grammar attaches to this declaration, stripped of
     /// comment syntax. Empty when nothing attaches.
-    pub documentation: Vec<Documentation>,
+    pub documentation: Arc<[Documentation]>,
     /// Exact source ranges for attached documentation.
     pub documentation_ranges: Vec<ByteRange>,
 }
 
-/// Immutable syntax facts for one source file.
+/// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SyntaxDocument {
+pub struct SyntaxFacts {
     language: Language,
-    path: ProjectPath,
-    nodes: Vec<SyntaxNode>,
     symbols: Vec<SyntaxSymbol>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
     source_digest: Option<FileDigest>,
+}
+
+/// Immutable syntax facts for one source file and its project path.
+///
+/// Cloning a document or placing its facts at another path shares its syntax facts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyntaxDocument {
+    path: ProjectPath,
+    facts: Arc<SyntaxFacts>,
+    nodes: Arc<Vec<SyntaxNode>>,
 }
 
 /// Suffixes every repeated qualified name apart, in source order.
@@ -215,29 +226,49 @@ impl SyntaxDocument {
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
         let left_out_declarations = leave_out_refused_names(&mut symbols);
+        let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
+        for symbol in &mut symbols {
+            symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+        }
         Self {
-            language,
             path,
-            nodes,
-            symbols,
-            has_errors,
-            left_out_declarations,
-            markdown_facts: None,
-            source_digest: None,
+            facts: Arc::new(SyntaxFacts {
+                language,
+                symbols,
+                has_errors,
+                left_out_declarations,
+                markdown_facts: None,
+                source_digest: None,
+            }),
+            nodes: Arc::new(nodes),
+        }
+    }
+
+    /// Places these facts at another project path.
+    ///
+    /// The caller must establish that source bytes, language, dialect, and syntax bounds
+    /// match the facts this document holds.
+    #[must_use]
+    pub fn at_path(&self, path: ProjectPath) -> Self {
+        Self {
+            path,
+            facts: Arc::clone(&self.facts),
+            nodes: Arc::clone(&self.nodes),
         }
     }
 
     /// Attaches facts extracted from the same Markdown tree.
     pub(crate) fn with_markdown_facts(mut self, facts: MarkdownFacts) -> Self {
-        self.has_errors |= !facts.error_ranges().is_empty();
-        self.markdown_facts = Some(facts);
+        let shared = Arc::make_mut(&mut self.facts);
+        shared.has_errors |= !facts.error_ranges().is_empty();
+        shared.markdown_facts = Some(facts);
         self
     }
 
     /// Returns the language identity these facts are filed under.
     #[must_use]
-    pub const fn language(&self) -> &Language {
-        &self.language
+    pub fn language(&self) -> &Language {
+        self.facts.language()
     }
 
     /// Returns source path.
@@ -246,21 +277,89 @@ impl SyntaxDocument {
         &self.path
     }
 
+    /// Returns path-independent syntax facts.
+    #[must_use]
+    pub fn facts(&self) -> &SyntaxFacts {
+        &self.facts
+    }
+
     /// Returns digest for exact bytes parsed by this provider.
     #[must_use]
-    pub const fn source_digest(&self) -> Option<&FileDigest> {
-        self.source_digest.as_ref()
+    pub fn source_digest(&self) -> Option<&FileDigest> {
+        self.facts.source_digest()
     }
 
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
-        self.source_digest = Some(FileDigest::of(source.as_bytes()));
+        Arc::make_mut(&mut self.facts).source_digest = Some(FileDigest::of(source.as_bytes()));
         self
     }
 
     /// Returns every named syntax node in pre-order.
     #[must_use]
     pub fn nodes(&self) -> &[SyntaxNode] {
-        &self.nodes
+        self.nodes.as_slice()
+    }
+
+    /// Returns extracted declarations in source order.
+    #[must_use]
+    pub fn symbols(&self) -> &[SyntaxSymbol] {
+        self.facts.symbols()
+    }
+
+    /// How many extracted declarations this document leaves out: each with
+    /// a `name` or `qualified_name` the Contribution contract refuses -
+    /// empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes, or holding a
+    /// control character.
+    #[must_use]
+    pub fn left_out_declaration_count(&self) -> usize {
+        self.facts.left_out_declaration_count()
+    }
+
+    /// Reports whether parser observed malformed syntax.
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.facts.has_errors()
+    }
+
+    /// Returns Markdown block and inline facts when the Markdown provider produced them.
+    #[must_use]
+    pub fn markdown_facts(&self) -> Option<&MarkdownFacts> {
+        self.facts.markdown_facts()
+    }
+
+    /// Returns nodes covering byte position, outermost first.
+    #[must_use]
+    pub fn nodes_at(&self, position: u64) -> Vec<&SyntaxNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.range.contains(position))
+            .collect()
+    }
+
+    /// Clones the shared path-independent facts.
+    #[must_use]
+    pub fn shared_facts(&self) -> Arc<SyntaxFacts> {
+        Arc::clone(&self.facts)
+    }
+
+    /// Returns shared path-independent facts without the complete node table.
+    #[must_use]
+    pub fn into_facts(self) -> Arc<SyntaxFacts> {
+        self.facts
+    }
+}
+
+impl SyntaxFacts {
+    /// Returns the language identity these facts are filed under.
+    #[must_use]
+    pub fn language(&self) -> &Language {
+        &self.language
+    }
+
+    /// Returns digest for exact bytes parsed by this provider.
+    #[must_use]
+    pub const fn source_digest(&self) -> Option<&FileDigest> {
+        self.source_digest.as_ref()
     }
 
     /// Returns extracted declarations in source order.
@@ -269,10 +368,7 @@ impl SyntaxDocument {
         &self.symbols
     }
 
-    /// How many extracted declarations this document leaves out: each with
-    /// a `name` or `qualified_name` the Contribution contract refuses -
-    /// empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes, or holding a
-    /// control character.
+    /// How many extracted declarations this document leaves out.
     #[must_use]
     pub const fn left_out_declaration_count(&self) -> usize {
         self.left_out_declarations
@@ -289,15 +385,23 @@ impl SyntaxDocument {
     pub const fn markdown_facts(&self) -> Option<&MarkdownFacts> {
         self.markdown_facts.as_ref()
     }
+}
 
-    /// Returns nodes covering byte position, outermost first.
-    #[must_use]
-    pub fn nodes_at(&self, position: u64) -> Vec<&SyntaxNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.range.contains(position))
-            .collect()
+fn declaration_node_kinds(
+    nodes: &[SyntaxNode],
+    symbols: &[SyntaxSymbol],
+) -> BTreeMap<ByteRange, &'static str> {
+    let mut ranges = symbols
+        .iter()
+        .map(|symbol| symbol.range)
+        .collect::<HashSet<_>>();
+    let mut declaration_nodes = BTreeMap::new();
+    for node in nodes {
+        if ranges.remove(&node.range) {
+            declaration_nodes.insert(node.range, node.kind);
+        }
     }
+    declaration_nodes
 }
 
 #[cfg(test)]
@@ -305,6 +409,8 @@ mod tests {
     use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, encode_path, symbol_identity};
 
     use super::*;
+    use crate::contribution::DocumentPlacement;
+    use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
     /// The literal characters `SymbolId`'s advertised pattern accepts in the
     /// segments after the language, transcribed from `rift-protocol`, with
@@ -322,6 +428,13 @@ mod tests {
         ProjectPath::new(".github/dependabot.yml").expect("valid fixture path")
     }
 
+    fn rust_document(path: &ProjectPath, source: &str) -> SyntaxDocument {
+        crate::registry::provider_for_extension("rs")
+            .expect("the Rust provider claims rs")
+            .analyze(SyntaxSource { path, text: source }, SyntaxLimits::default())
+            .expect("the Rust fixture parses")
+    }
+
     /// One declaration spelling `qualified_name`, spanning one byte at
     /// `start` so source order stays readable in an assertion.
     fn symbol(qualified_name: &str, start: u64) -> SyntaxSymbol {
@@ -334,14 +447,15 @@ mod tests {
             qualified_name: qualified_name.to_owned(),
             container: None,
             kind: "mapping_entry",
+            node_kind: None,
             facets: Vec::new(),
             visibility: None,
             range,
             item_range: range,
             name_range: None,
             body_range: None,
-            signatures: Vec::new(),
-            documentation: Vec::new(),
+            signatures: Arc::from([]),
+            documentation: Arc::from([]),
             documentation_ranges: Vec::new(),
         }
     }
@@ -371,6 +485,120 @@ mod tests {
         assert!(document.nodes().is_empty());
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
+    }
+
+    #[test]
+    fn placing_same_facts_at_another_path_keeps_old_document_and_releases_on_drop() {
+        let first_path = ProjectPath::new("src/first.rs").expect("valid first path");
+        let second_path = ProjectPath::new("src/second.rs").expect("valid second path");
+        let source = "pub fn beacon() {}\n";
+        let first = rust_document(&first_path, source);
+        let facts = Arc::downgrade(&first.facts);
+
+        let second = first.at_path(second_path.clone());
+        assert_eq!(first.path(), &first_path);
+        assert_eq!(second.path(), &second_path);
+        assert!(Arc::ptr_eq(&first.facts, &second.facts));
+        assert_eq!(second.language(), first.language());
+        assert_eq!(second.source_digest(), first.source_digest());
+        assert_eq!(second.nodes(), first.nodes());
+        assert_eq!(second.symbols(), first.symbols());
+        assert_eq!(second.has_errors(), first.has_errors());
+        assert_eq!(
+            DocumentPlacement::project(&first)
+                .expect("first project placement")
+                .identity_path(),
+            first_path.as_str()
+        );
+        assert_eq!(
+            DocumentPlacement::project(&second)
+                .expect("second project placement")
+                .identity_path(),
+            second_path.as_str()
+        );
+
+        let changed = rust_document(&second_path, "pub fn lantern() {}\n");
+        assert_ne!(changed.symbols(), second.symbols());
+        assert_eq!(second.symbols()[0].name, "beacon");
+
+        drop(first);
+        drop(second);
+        assert!(facts.upgrade().is_none());
+    }
+
+    #[test]
+    fn placing_facts_keeps_the_language_and_dialect_that_produced_them() {
+        use crate::typescript::TypeScriptDialect;
+
+        let path = ProjectPath::new("src/view.tsx").expect("valid TypeScript path");
+        let source = "const App = () => <section />;\n";
+        let tsx = TypeScriptDialect::Tsx
+            .provider()
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("the TSX fixture parses");
+        let typescript = TypeScriptDialect::TypeScript
+            .provider()
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: source,
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("the TypeScript grammar records its parse result");
+
+        let placed = tsx.at_path(ProjectPath::new("src/copied.ts").expect("valid copied path"));
+        assert_eq!(placed.language().name, "typescript");
+        assert_eq!(placed.language().dialect.as_deref(), Some("tsx"));
+        assert_eq!(typescript.language().name, "typescript");
+        assert_eq!(typescript.language().dialect, None);
+        assert_ne!(placed.language(), typescript.language());
+        assert_eq!(placed.nodes(), tsx.nodes());
+        assert_eq!(placed.symbols(), tsx.symbols());
+    }
+
+    #[test]
+    fn indexed_facts_release_node_table_and_keep_first_declaration_match() {
+        let range = ByteRange { start: 7, end: 8 };
+        let document = SyntaxDocument::new(
+            language(),
+            path(),
+            vec![
+                SyntaxNode {
+                    kind: "first_kind",
+                    range,
+                    parent: None,
+                    has_error: false,
+                },
+                SyntaxNode {
+                    kind: "second_kind",
+                    range,
+                    parent: Some(0),
+                    has_error: true,
+                },
+            ],
+            vec![symbol("entry", range.start)],
+            false,
+        );
+        let node_table = Arc::downgrade(&document.nodes);
+        assert_eq!(
+            document
+                .nodes()
+                .iter()
+                .find(|node| node.range == range)
+                .map(|node| node.kind),
+            Some("first_kind")
+        );
+
+        let facts = document.into_facts();
+        assert!(node_table.upgrade().is_none());
+        assert_eq!(facts.symbols()[0].node_kind, Some("first_kind"));
     }
 
     fn qualified_names(document: &SyntaxDocument) -> Vec<&str> {

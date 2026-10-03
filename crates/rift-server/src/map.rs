@@ -110,6 +110,56 @@ pub(crate) fn build_workspace_map(
         docs: docs(index),
         module_relationships: module_relationships(graph, &unit_paths, &records_by_identity),
         packages,
+        warnings: Vec::new(),
+        pagination: Pagination {
+            page_index: 0,
+            total_pages: 1,
+        },
+    }
+}
+
+/// Builds the workspace map's file counts from discovered paths before syntax analysis ends.
+///
+/// The caller supplies paths returned by the same workspace discovery that admits files to
+/// the index. Symbols and resolved context are not ready until the final index publication.
+pub(crate) fn build_preparation_map(
+    source: &[(CoreProjectPath, Language)],
+    text: &[CoreProjectPath],
+    revision: Digest,
+) -> WorkspaceMap {
+    let mut language_counts: BTreeMap<String, (Language, u64)> = BTreeMap::new();
+    let mut directory_counts: BTreeMap<ProjectPath, FileSymbolCounts> = BTreeMap::new();
+
+    for (path, language) in source {
+        language_counts
+            .entry(language.identity_segment())
+            .or_insert_with(|| (language.clone(), 0))
+            .1 += 1;
+        credit_directories(&mut directory_counts, path, |counts| counts.files += 1);
+    }
+    for path in text {
+        credit_directories(&mut directory_counts, path, |counts| counts.files += 1);
+    }
+
+    let mut languages: Vec<MapLanguage> = language_counts
+        .into_values()
+        .map(|(language, files)| MapLanguage {
+            language,
+            files,
+            symbols: 0,
+        })
+        .collect();
+    languages.truncate(WORKSPACE_LANGUAGE_SUMMARIES_MAX);
+    WorkspaceMap {
+        revision,
+        languages,
+        modules: module_tree(&directory_counts),
+        hubs: Vec::new(),
+        entry_points: Vec::new(),
+        docs: Vec::new(),
+        module_relationships: Vec::new(),
+        packages: Vec::new(),
+        warnings: Vec::new(),
         pagination: Pagination {
             page_index: 0,
             total_pages: 1,
@@ -125,7 +175,7 @@ fn source_unit_paths(index: &WorkspaceIndex) -> BTreeMap<CoreSourceUnitId, CoreP
     index
         .files()
         .filter_map(|file| {
-            rift_syntax::source_unit(file.syntax())
+            rift_syntax::source_unit_for_path(file.path())
                 .ok()
                 .map(|unit| (unit, file.path().clone()))
         })
@@ -390,15 +440,16 @@ mod tests {
 
     use rift_core::{
         Contribution, ContributionKey, ContributionOrigin, ContributionReference,
-        DeclarationBinding, ExactKind, IndexRevision, Language, PortableSymbolFacts, ProviderId,
-        ProviderRevision, ProviderSymbolId, ReferenceRole, SemanticReference, SourceApplicability,
-        SourceKind, SourceLocation, SourcePath, SourceRange, SourceResolverId, SourceRevision,
-        SourceUnitId, SourceVisibility, SymbolId, TreeRevision,
+        DeclarationBinding, ExactKind, IndexRevision, Language, PortableSymbolFacts,
+        ProjectPath as CoreProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
+        ReferenceRole, SemanticReference, SourceApplicability, SourceKind, SourceLocation,
+        SourcePath, SourceRange, SourceResolverId, SourceRevision, SourceUnitId, SourceVisibility,
+        SymbolId, TreeRevision,
     };
     use rift_index::WorkspaceIndexLimits;
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::map::{MAP_HUBS_MAX, MapModuleRelationship, WorkspaceMap};
-    use rift_protocol::read::ProjectPath;
+    use rift_protocol::read::{Digest, ProjectPath};
     use rift_provider::{
         NormalizedGraph, NormalizedReference, NormalizedTarget, Normalizer, ProviderPublication,
         PublicationLimits, PublicationSet,
@@ -462,6 +513,33 @@ mod tests {
             HistoryConfiguration::default(),
         )?;
         Ok((directory, service))
+    }
+
+    #[test]
+    fn preparation_map_reports_discovered_paths_without_symbol_facts() -> TestResult {
+        let source = vec![(
+            CoreProjectPath::new("src/main.rs")?,
+            rift_protocol::read::Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+        )];
+        let text = vec![CoreProjectPath::new("docs/guide.md")?];
+        let map = super::build_preparation_map(&source, &text, Digest("partial".to_owned()));
+
+        assert_eq!(map.languages[0].language.name, "rust");
+        assert_eq!(map.languages[0].files, 1);
+        assert_eq!(map.languages[0].symbols, 0);
+        assert_eq!(map.modules.len(), 2);
+        assert_eq!(map.modules[0].path.0, "docs");
+        assert_eq!(map.modules[0].files, 1);
+        assert_eq!(map.modules[1].path.0, "src");
+        assert_eq!(map.modules[1].files, 1);
+        assert!(map.modules.iter().all(|module| module.symbols == 0));
+        assert!(map.hubs.is_empty());
+        assert!(map.entry_points.is_empty());
+        assert!(map.module_relationships.is_empty());
+        Ok(())
     }
 
     /// The provider every hand-built contribution publishes under. The hub ranking selects

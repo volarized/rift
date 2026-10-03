@@ -11,8 +11,10 @@ description = "Persistent indexing and retrieval for Rift"
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 ignore.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 rift-analysis = { workspace = true, features = ["collector", "archive", "parallel"] }
 rift-core.workspace = true
 rift-history.workspace = true
@@ -29,10 +31,14 @@ toasty-core.workspace = true
 toasty-driver-sqlite.workspace = true
 rayon.workspace = true
 tracing.workspace = true
+same-file.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 regex-syntax.workspace = true
+rusqlite.workspace = true
 rift-history = { workspace = true, features = ["fixtures"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 toml.workspace = true

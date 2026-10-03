@@ -5,12 +5,7 @@ mod declaration;
 mod pattern;
 mod response;
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use percent_encoding::percent_decode_str;
 use reqwest::{
@@ -20,6 +15,7 @@ use reqwest::{
         IF_NONE_MATCH, RETRY_AFTER, WWW_AUTHENTICATE,
     },
 };
+use rift_core::FileDigest;
 use serde::Serialize;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore},
@@ -394,7 +390,7 @@ struct Inner {
     permits: Arc<Semaphore>,
     capabilities: RwLock<Option<CachedCapabilities>>,
     capabilities_flight: Mutex<()>,
-    resolutions: RwLock<HashMap<Vec<u8>, CachedResolution>>,
+    resolution: RwLock<Option<CachedResolution>>,
     resolutions_flight: Mutex<()>,
     failure: RwLock<Option<CachedFailure>>,
 }
@@ -408,8 +404,41 @@ struct CachedCapabilities {
 
 #[derive(Clone)]
 struct CachedResolution {
+    analyzer_revision: String,
+    corpus_revision: String,
+    request_digest: FileDigest,
     value: PackageResolutionResponse,
     expires: Instant,
+}
+
+/// One package resolution request with checked JSON bytes retained for reuse.
+#[derive(Clone, Debug)]
+pub struct PreparedPackageResolutionRequest {
+    request: PackageResolutionRequest,
+    body: Arc<[u8]>,
+    digest: FileDigest,
+}
+
+impl PreparedPackageResolutionRequest {
+    /// Checks and encodes one package resolution request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request breaks a contract bound or its JSON body limit.
+    pub fn new(request: PackageResolutionRequest) -> Result<Self, ClientError> {
+        validate_resolution_request(&request)?;
+        Self::from_validated(request)
+    }
+
+    fn from_validated(request: PackageResolutionRequest) -> Result<Self, ClientError> {
+        let body = serialize_body(&request)?;
+        let digest = FileDigest::of(&body);
+        Ok(Self {
+            request,
+            body: Arc::from(body),
+            digest,
+        })
+    }
 }
 
 /// The failure that marked the endpoint unavailable, which every request answers until
@@ -514,7 +543,7 @@ impl GlobalClient {
                 permits: Arc::new(Semaphore::new(max_in_flight)),
                 capabilities: RwLock::new(None),
                 capabilities_flight: Mutex::new(()),
-                resolutions: RwLock::new(HashMap::new()),
+                resolution: RwLock::new(None),
                 resolutions_flight: Mutex::new(()),
                 failure: RwLock::new(None),
                 config,
@@ -611,16 +640,39 @@ impl GlobalClient {
         validate_resolution_request(request)?;
         let capabilities = self.get_capabilities().await?;
         validate_resolution_request_for_capabilities(request, &capabilities)?;
-        let body = serialize_body(request)?;
-        validate_body_for_capabilities(&body, &capabilities)?;
-        let key = resolution_cache_key(&capabilities, &body)?;
-        if let Some(value) = self.inner.resolutions.read().await.get(&key)
+        let prepared = PreparedPackageResolutionRequest::from_validated(request.clone())?;
+        validate_body_for_capabilities(&prepared.body, &capabilities)?;
+        self.resolve_prepared_package_context(&prepared).await
+    }
+
+    /// Resolves one checked package request, reusing its retained bytes and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when capabilities, the answer, or endpoint breaks the contract.
+    pub async fn resolve_prepared_package_context(
+        &self,
+        prepared: &PreparedPackageResolutionRequest,
+    ) -> Result<PackageResolutionResponse, ClientError> {
+        if !self.inner.enabled {
+            return Err(ClientError::Disabled);
+        }
+        let capabilities = self.get_capabilities().await?;
+        validate_resolution_request_for_capabilities(&prepared.request, &capabilities)?;
+        validate_body_for_capabilities(&prepared.body, &capabilities)?;
+        if let Some(value) = self.inner.resolution.read().await.as_ref()
+            && value.analyzer_revision == capabilities.analyzer_revision
+            && value.corpus_revision == capabilities.corpus_revision
+            && value.request_digest == prepared.digest
             && value.expires > Instant::now()
         {
             return Ok(value.value.clone());
         }
         let _flight = self.inner.resolutions_flight.lock().await;
-        if let Some(value) = self.inner.resolutions.read().await.get(&key)
+        if let Some(value) = self.inner.resolution.read().await.as_ref()
+            && value.analyzer_revision == capabilities.analyzer_revision
+            && value.corpus_revision == capabilities.corpus_revision
+            && value.request_digest == prepared.digest
             && value.expires > Instant::now()
         {
             return Ok(value.value.clone());
@@ -628,7 +680,7 @@ impl GlobalClient {
         let raw = match self
             .request(
                 contract::Endpoint::Resolutions,
-                Some(body),
+                Some(prepared.body.to_vec()),
                 None,
                 active_response_body_bytes_max(&capabilities),
             )
@@ -645,17 +697,17 @@ impl GlobalClient {
                 return self.observed(Err(error)).await;
             }
         };
-        if let Err(error) = validate_resolution_response(request, &value) {
+        if let Err(error) = validate_resolution_response(&prepared.request, &value) {
             return self.observed(Err(error)).await;
         }
         let ttl = bounded_resolution_ttl(&self.inner.config, &meta);
-        self.inner.resolutions.write().await.insert(
-            key,
-            CachedResolution {
-                value: value.clone(),
-                expires: Instant::now() + ttl,
-            },
-        );
+        *self.inner.resolution.write().await = Some(CachedResolution {
+            analyzer_revision: capabilities.analyzer_revision.clone(),
+            corpus_revision: capabilities.corpus_revision.clone(),
+            request_digest: prepared.digest,
+            value: value.clone(),
+            expires: Instant::now() + ttl,
+        });
         Ok(value)
     }
 
@@ -2201,15 +2253,6 @@ fn context_key(entry: &PackageContextEntry) -> (String, String, Option<String>, 
         entry.version.clone(),
         entry.requirement.clone(),
     )
-}
-
-fn resolution_cache_key(capabilities: &Capabilities, body: &[u8]) -> Result<Vec<u8>, ClientError> {
-    serde_json::to_vec(&(
-        capabilities.analyzer_revision.as_str(),
-        capabilities.corpus_revision.as_str(),
-        body,
-    ))
-    .map_err(|_| ClientError::Decode { status: 0 })
 }
 
 fn bounded_candidate_pool(capabilities: &Capabilities) -> usize {

@@ -3,13 +3,14 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.46"
+version = "0.0.47"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
+async-trait = "=0.1.92"
 rift-analysis = { path = "crates/rift-analysis", default-features = false }
 rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }

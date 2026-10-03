@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use axum::http::{HeaderName, HeaderValue};
 use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_core::{CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault};
 use rift_protocol::configuration::ServerConfiguration;
@@ -26,18 +27,21 @@ use rmcp::model::{
     ServerCapabilities, ServerConfig, ServerPeerInfo, ServerResult,
 };
 use rmcp::service::{
-    ClientInitializeError, Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient,
-    RoleServer, RunningService, ServerInitializeError,
+    Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient, RoleServer, RunningService,
+    ServerInitializeError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
 
-use crate::election::{ServerPresence, StaleReason, probe};
+use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory};
 use crate::failure::WireFailure as _;
-use crate::http::{MCP_PATH, StopRequestFailure, request_stop};
+use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
+use crate::repository::{
+    ServerConfigurationSelection, repository_election_directory, select_server_configuration,
+};
 use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
     StartSpawns, StartupCapture,
@@ -579,6 +583,9 @@ async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+    if let Some(running) = connect_repository_server(root, identity).await? {
+        return Ok(running);
+    }
     let mut replacement = Replacement::default();
     if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
         return Ok(running);
@@ -604,7 +611,7 @@ async fn connect_upstream(
         building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
         still_serving = replacement.refusal_while_serving(&presence, identity);
-        let adopted = adopt_presence(presence, identity, &mut replacement).await?;
+        let adopted = adopt_presence(root, presence, identity, &mut replacement).await?;
         // The replaced server released the election, and no other starter
         // took it: this process starts the server it replaces it with.
         if awaiting_release && !election_held {
@@ -786,7 +793,7 @@ async fn adopt_serving(
     identity: &ProductIdentity,
     replacement: &mut Replacement,
 ) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
-    adopt_presence(probed(root).await, identity, replacement).await
+    adopt_presence(root, probed(root).await, identity, replacement).await
 }
 
 /// One presence probe, off the async runtime.
@@ -823,6 +830,7 @@ async fn probed_with(
 /// Split from it so a caller that also weighs the probe's election state
 /// reads both from one probe.
 async fn adopt_presence(
+    root: &Path,
     presence: ServerPresence,
     identity: &ProductIdentity,
     replacement: &mut Replacement,
@@ -849,7 +857,7 @@ async fn adopt_presence(
         }
         ServerStanding::Refuse => return Err(identity_refusal(identity, &lock)),
     }
-    match connect_recorded(&lock, UPSTREAM_CONNECT_TIMEOUT).await {
+    match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, root).await {
         Ok(running) => {
             tracing::info!(
                 component = "mcp",
@@ -868,6 +876,47 @@ async fn adopt_presence(
             );
             Ok(None)
         }
+    }
+}
+
+async fn connect_repository_server(
+    workspace_root: &Path,
+    identity: &ProductIdentity,
+) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+    let root = workspace_root.to_path_buf();
+    let selection = tokio::task::spawn_blocking(move || select_server_configuration(&root, None))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let Some(ServerConfigurationSelection::Repository {
+        common_directory,
+        server,
+        ..
+    }) = selection
+    else {
+        return Ok(None);
+    };
+    let Some(state_directory) = repository_election_directory(&common_directory, identity).ok()
+    else {
+        return Ok(None);
+    };
+    let presence = tokio::task::spawn_blocking(move || probe_state_directory(&state_directory))
+        .await
+        .unwrap_or(ServerPresence::Stale(StaleReason::ElectionUnobservable));
+    let ServerPresence::Serving(lock) = presence else {
+        return Ok(None);
+    };
+    if lock.server.as_ref() != Some(&server)
+        || !matches!(
+            ServerStanding::of(identity, &lock.identity),
+            ServerStanding::Adopt
+        )
+    {
+        return Ok(None);
+    }
+    match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, workspace_root).await {
+        Ok(running) => Ok(Some(running)),
+        Err(_) => Ok(None),
     }
 }
 
@@ -1034,7 +1083,7 @@ fn identity_refusal(expected: &ProductIdentity, lock: &ServerLock) -> ErrorData 
 enum ConnectAttemptFailure {
     /// The transport refused or MCP initialization failed. Boxed to keep
     /// this failure small beside the large initialize error.
-    Initialize(Box<ClientInitializeError>),
+    Initialize(Box<dyn std::error::Error + Send + Sync>),
     /// The attempt outlived [`UPSTREAM_CONNECT_TIMEOUT`].
     TimedOut,
 }
@@ -1053,17 +1102,42 @@ impl ConnectAttemptFailure {
 /// `timeout`.
 ///
 /// The caller passes [`UPSTREAM_CONNECT_TIMEOUT`].
+#[cfg(test)]
 async fn connect_recorded(
     lock: &ServerLock,
     timeout: Duration,
 ) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!(
-            "http://127.0.0.1:{port}{MCP_PATH}",
-            port = lock.port
-        ))
-        .auth_header(lock.token.clone()),
-    );
+    connect_recorded_with_root(lock, timeout, None).await
+}
+
+async fn connect_recorded_for_root(
+    lock: &ServerLock,
+    timeout: Duration,
+    root: &Path,
+) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
+    connect_recorded_with_root(lock, timeout, Some(root)).await
+}
+
+async fn connect_recorded_with_root(
+    lock: &ServerLock,
+    timeout: Duration,
+    root: Option<&Path>,
+) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!(
+        "http://127.0.0.1:{port}{MCP_PATH}",
+        port = lock.port
+    ))
+    .auth_header(lock.token.clone());
+    if let Some(root) = root {
+        let canonical = std::fs::canonicalize(root)
+            .map_err(|error| ConnectAttemptFailure::Initialize(Box::new(error)))?;
+        let value = HeaderValue::from_str(&canonical.to_string_lossy())
+            .map_err(|error| ConnectAttemptFailure::Initialize(Box::new(error)))?;
+        config
+            .custom_headers
+            .insert(HeaderName::from_static(WORKSPACE_ROOT_HEADER), value);
+    }
+    let transport = StreamableHttpClientTransport::from_config(config);
     match tokio::time::timeout(timeout, ().serve(transport)).await {
         Ok(Ok(running)) => Ok(running),
         Ok(Err(error)) => Err(ConnectAttemptFailure::Initialize(Box::new(error))),
@@ -1306,6 +1380,7 @@ mod tests {
             token: "a".repeat(SERVER_TOKEN_LENGTH),
             pid: 4_242,
             identity: identity(BUILD_A, SCHEMA_DIGEST_A),
+            server: None,
         }
     }
 
@@ -2113,8 +2188,10 @@ mod tests {
     /// document, so no identity is read and nothing asks it to stop.
     #[tokio::test]
     async fn a_building_server_is_never_asked_to_stop() -> TestResult {
+        let directory = tempfile::tempdir()?;
         let mut replacement = Replacement::default();
         let adopted = super::adopt_presence(
+            directory.path(),
             ServerPresence::Starting,
             &identity("999.0.0", SCHEMA_DIGEST_A),
             &mut replacement,

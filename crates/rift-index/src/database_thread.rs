@@ -1,0 +1,968 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use toasty_core::Schema;
+use toasty_core::driver::operation::Operation;
+use toasty_core::driver::{
+    Capability, ConnectContext, Connection as DriverConnection, Driver, ExecResponse,
+};
+use toasty_core::schema::db::{AppliedMigration, Migration};
+use toasty_core::schema::diff;
+use toasty_driver_sqlite::Sqlite;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::{Instant, interval, timeout_at};
+
+const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
+
+pub(crate) struct DatabaseThread {
+    sender: mpsc::Sender<Command>,
+    join: Mutex<JoinState>,
+    queue_timeout: Duration,
+}
+
+enum JoinState {
+    Thread(Option<JoinHandle<()>>),
+    Task(tokio::task::JoinHandle<Result<(), String>>),
+    Complete(Result<(), String>),
+}
+
+impl std::fmt::Debug for DatabaseThread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseThread")
+            .field("queue_capacity", &self.sender.max_capacity())
+            .field("queue_timeout", &self.queue_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseThread {
+    pub(crate) async fn spawn(
+        driver: Arc<Sqlite>,
+        connections_max: usize,
+        queue_timeout: Duration,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> std::io::Result<Arc<Self>> {
+        let capacity = connections_max.max(1);
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let startup_deadline = Instant::now() + queue_timeout;
+        let join = thread::Builder::new()
+            .name("rift-sqlite".to_owned())
+            .spawn(move || {
+                let _owner = owner;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                match runtime {
+                    Ok(runtime) => {
+                        if ready_tx.send(Ok(())).is_ok() {
+                            runtime.block_on(run_database_thread(driver, receiver, capacity));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            })?;
+        let ready = timeout_at(startup_deadline, ready_rx).await;
+        let startup_error = match ready {
+            Ok(Ok(Ok(()))) => None,
+            Ok(Ok(Err(error))) => Some(error),
+            Ok(Err(error)) => Some(std::io::Error::other(format!(
+                "SQLite worker startup failed: {error}"
+            ))),
+            Err(_) => Some(std::io::Error::other(
+                "SQLite worker startup exceeded configured busy timeout",
+            )),
+        };
+        if let Some(error) = startup_error {
+            drop(sender);
+            let joiner = tokio::task::spawn_blocking(move || join.join().map_err(panic_message));
+            match timeout_at(startup_deadline, joiner).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(detail))) => {
+                    return Err(std::io::Error::other(format!(
+                        "SQLite worker startup cleanup failed: {detail}"
+                    )));
+                }
+                Ok(Err(error)) => {
+                    return Err(std::io::Error::other(format!(
+                        "SQLite worker startup cleanup task failed: {error}"
+                    )));
+                }
+                Err(_) => return Err(error),
+            }
+            return Err(error);
+        }
+        Ok(Arc::new(Self {
+            sender,
+            join: Mutex::new(JoinState::Thread(Some(join))),
+            queue_timeout,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_next_commit_for_test(
+        &self,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Sender<()>), toasty_core::Error> {
+        let (armed, armed_rx) = oneshot::channel();
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        self.sender
+            .send(Command::HoldNextCommit {
+                armed,
+                started,
+                release: release_rx,
+            })
+            .await
+            .map_err(|_| worker_error("SQLite worker stopped before accepting commit hold"))?;
+        armed_rx
+            .await
+            .map_err(|_| worker_error("SQLite worker stopped before arming commit hold"))?;
+        Ok((started_rx, release))
+    }
+
+    async fn request<Output>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<Output, toasty_core::Error>>) -> Command,
+    ) -> Result<Output, toasty_core::Error>
+    where
+        Output: Send + 'static,
+    {
+        let (reply, response) = oneshot::channel();
+        let command = command(reply);
+        let deadline = Instant::now() + self.queue_timeout;
+        timeout_at(deadline, self.sender.send(command))
+            .await
+            .map_err(|_| worker_error("SQLite worker queue wait exceeded configured busy timeout"))?
+            .map_err(|_| worker_error("SQLite worker stopped before accepting operation"))?;
+        response
+            .await
+            .map_err(|_| worker_error("SQLite worker stopped before returning operation"))?
+    }
+
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), toasty_core::Error> {
+        let mut join_state = timeout_at(deadline, self.join.lock())
+            .await
+            .map_err(|_| worker_error("SQLite worker shutdown wait exceeded deadline"))?;
+        if let JoinState::Complete(result) = &*join_state {
+            return result.clone().map_err(|error| {
+                worker_error(&format!("SQLite worker stopped with error: {error}"))
+            });
+        }
+
+        let already_joining = matches!(&*join_state, JoinState::Task(_));
+        let response_outcome = if already_joining {
+            Ok(Ok(()))
+        } else {
+            let (reply, response) = oneshot::channel();
+            match timeout_at(deadline, self.sender.reserve()).await {
+                Ok(Ok(permit)) => {
+                    permit.send(Command::Shutdown { reply });
+                    start_join(&mut join_state);
+                    timeout_at(deadline, response)
+                        .await
+                        .map_err(|_| worker_error("SQLite worker shutdown exceeded deadline"))
+                        .and_then(|reply| {
+                            reply.map_err(|_| {
+                                worker_error("SQLite worker stopped before shutdown completed")
+                            })
+                        })
+                }
+                Ok(Err(_)) => {
+                    start_join(&mut join_state);
+                    Err(worker_error("SQLite worker stopped before shutdown"))
+                }
+                Err(_) => {
+                    return Err(worker_error(
+                        "SQLite worker shutdown queue wait exceeded deadline",
+                    ));
+                }
+            }
+        };
+        let joined = match &mut *join_state {
+            JoinState::Task(join) => match timeout_at(deadline, join).await {
+                Ok(Ok(result)) => Some(result.clone()),
+                Ok(Err(error)) => Some(Err(error.to_string())),
+                Err(_) => None,
+            },
+            JoinState::Thread(_) => None,
+            JoinState::Complete(result) => Some(result.clone()),
+        };
+        if let Some(result) = joined {
+            *join_state = JoinState::Complete(result.clone());
+            result.map_err(|error| {
+                worker_error(&format!("SQLite worker stopped with error: {error}"))
+            })?;
+        } else {
+            return Err(worker_error("SQLite worker join exceeded deadline"));
+        }
+        response_outcome??;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SqliteThreadDriver {
+    driver: Arc<Sqlite>,
+    actor: Arc<DatabaseThread>,
+}
+
+impl SqliteThreadDriver {
+    pub(crate) fn new(driver: Arc<Sqlite>, actor: Arc<DatabaseThread>) -> Self {
+        Self { driver, actor }
+    }
+}
+
+#[async_trait]
+impl Driver for SqliteThreadDriver {
+    fn url(&self) -> std::borrow::Cow<'_, str> {
+        self.driver.url()
+    }
+
+    fn capability(&self) -> &'static Capability {
+        self.driver.capability()
+    }
+
+    async fn connect(
+        &self,
+        context: &ConnectContext,
+    ) -> Result<Box<dyn DriverConnection>, toasty_core::Error> {
+        let context = context.clone();
+        let (id, lease) = self
+            .actor
+            .request(|reply| Command::Open { context, reply })
+            .await?;
+        Ok(Box::new(SqliteThreadConnection {
+            actor: Arc::clone(&self.actor),
+            id,
+            _lease: lease,
+        }))
+    }
+
+    fn max_connections(&self) -> Option<usize> {
+        self.driver.max_connections()
+    }
+
+    fn generate_migration(&self, schema_diff: &diff::Schema<'_>) -> Migration {
+        self.driver.generate_migration(schema_diff)
+    }
+
+    async fn reset_db(&self) -> Result<(), toasty_core::Error> {
+        self.actor.request(|reply| Command::Reset { reply }).await
+    }
+}
+
+#[derive(Debug)]
+struct SqliteThreadConnection {
+    actor: Arc<DatabaseThread>,
+    id: u64,
+    _lease: Arc<()>,
+}
+
+impl Drop for SqliteThreadConnection {
+    fn drop(&mut self) {
+        let _ = self.actor.sender.try_send(Command::Close { id: self.id });
+    }
+}
+
+#[async_trait]
+impl DriverConnection for SqliteThreadConnection {
+    async fn exec(
+        &mut self,
+        schema: &Arc<Schema>,
+        operation: Operation,
+    ) -> Result<ExecResponse, toasty_core::Error> {
+        let id = self.id;
+        let schema = Arc::clone(schema);
+        self.actor
+            .request(|reply| Command::Exec {
+                id,
+                schema,
+                operation: Box::new(operation),
+                reply,
+            })
+            .await
+    }
+
+    async fn push_schema(&mut self, schema: &Schema) -> Result<(), toasty_core::Error> {
+        let id = self.id;
+        let schema = Arc::new(Schema {
+            app: toasty_core::schema::app::Schema::default(),
+            db: schema.db.clone(),
+            mapping: toasty_core::schema::mapping::Mapping {
+                models: std::iter::empty().collect(),
+                document_columns: std::iter::empty().collect(),
+            },
+        });
+        self.actor
+            .request(|reply| Command::PushSchema { id, schema, reply })
+            .await
+    }
+
+    async fn applied_migrations(&mut self) -> Result<Vec<AppliedMigration>, toasty_core::Error> {
+        let id = self.id;
+        self.actor
+            .request(|reply| Command::AppliedMigrations { id, reply })
+            .await
+    }
+
+    async fn apply_migration(
+        &mut self,
+        id: u64,
+        name: &str,
+        migration: &Migration,
+    ) -> Result<(), toasty_core::Error> {
+        let connection_id = self.id;
+        let name = name.to_owned();
+        let statements = migration
+            .statements()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        self.actor
+            .request(|reply| Command::ApplyMigration {
+                connection_id,
+                id,
+                name,
+                statements,
+                reply,
+            })
+            .await
+    }
+}
+
+enum Command {
+    Open {
+        context: ConnectContext,
+        reply: oneshot::Sender<Result<(u64, Arc<()>), toasty_core::Error>>,
+    },
+    Exec {
+        id: u64,
+        schema: Arc<Schema>,
+        operation: Box<Operation>,
+        reply: oneshot::Sender<Result<ExecResponse, toasty_core::Error>>,
+    },
+    PushSchema {
+        id: u64,
+        schema: Arc<Schema>,
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    },
+    AppliedMigrations {
+        id: u64,
+        reply: oneshot::Sender<Result<Vec<AppliedMigration>, toasty_core::Error>>,
+    },
+    ApplyMigration {
+        connection_id: u64,
+        id: u64,
+        name: String,
+        statements: Vec<String>,
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    },
+    Reset {
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    },
+    Close {
+        id: u64,
+    },
+    Shutdown {
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    },
+    #[cfg(test)]
+    Panic,
+    #[cfg(test)]
+    Hold {
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+    #[cfg(test)]
+    HoldNextCommit {
+        armed: oneshot::Sender<()>,
+        started: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+    #[cfg(test)]
+    Noop(oneshot::Sender<()>),
+}
+
+struct OwnedConnection {
+    connection: Box<dyn DriverConnection>,
+    lease: Weak<()>,
+}
+
+async fn run_database_thread(
+    driver: Arc<Sqlite>,
+    receiver: mpsc::Receiver<Command>,
+    connections_max: usize,
+) {
+    DatabaseWorker::new(driver, connections_max)
+        .run(receiver)
+        .await;
+}
+
+struct DatabaseWorker {
+    driver: Arc<Sqlite>,
+    connections: HashMap<u64, OwnedConnection>,
+    next_id: u64,
+    connections_max: usize,
+    #[cfg(test)]
+    commit_hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+}
+
+impl DatabaseWorker {
+    fn new(driver: Arc<Sqlite>, connections_max: usize) -> Self {
+        Self {
+            driver,
+            connections: HashMap::new(),
+            next_id: 0,
+            connections_max,
+            #[cfg(test)]
+            commit_hold: None,
+        }
+    }
+
+    async fn run(mut self, mut receiver: mpsc::Receiver<Command>) {
+        let mut reap = interval(CONNECTION_REAP_SPAN);
+        loop {
+            tokio::select! {
+                _ = reap.tick() => reap_connections(&mut self.connections),
+                command = receiver.recv() => {
+                    let Some(command) = command else { break; };
+                    if !self.handle(command).await {
+                        break;
+                    }
+                    reap_connections(&mut self.connections);
+                }
+            }
+        }
+    }
+
+    async fn handle(&mut self, command: Command) -> bool {
+        match command {
+            Command::Open { context, reply } => {
+                self.open(context, reply).await;
+            }
+            Command::Exec {
+                id,
+                schema,
+                operation,
+                reply,
+            } => {
+                self.exec(id, schema, operation, reply).await;
+            }
+            Command::PushSchema { id, schema, reply } => {
+                self.push_schema(id, schema, reply).await;
+            }
+            Command::AppliedMigrations { id, reply } => {
+                self.applied_migrations(id, reply).await;
+            }
+            Command::ApplyMigration {
+                connection_id,
+                id,
+                name,
+                statements,
+                reply,
+            } => {
+                self.apply_migration(connection_id, id, name, statements, reply)
+                    .await;
+            }
+            Command::Reset { reply } => self.reset(reply).await,
+            Command::Close { id } => {
+                if self
+                    .connections
+                    .get(&id)
+                    .is_some_and(|owned| owned.lease.strong_count() == 0)
+                {
+                    self.connections.remove(&id);
+                }
+            }
+            Command::Shutdown { reply } => {
+                self.connections.clear();
+                let _ = reply.send(Ok(()));
+                return false;
+            }
+            #[cfg(test)]
+            Command::Panic => panic!("test SQLite worker panic"),
+            #[cfg(test)]
+            Command::Hold { started, release } => {
+                let _ = started.send(());
+                let _ = release.await;
+            }
+            #[cfg(test)]
+            Command::HoldNextCommit {
+                armed,
+                started,
+                release,
+            } => {
+                assert!(
+                    self.commit_hold.is_none(),
+                    "only one commit hold may be armed"
+                );
+                self.commit_hold = Some((started, release));
+                let _ = armed.send(());
+            }
+            #[cfg(test)]
+            Command::Noop(reply) => {
+                let _ = reply.send(());
+            }
+        }
+        true
+    }
+
+    async fn open(
+        &mut self,
+        context: ConnectContext,
+        reply: oneshot::Sender<Result<(u64, Arc<()>), toasty_core::Error>>,
+    ) {
+        reap_connections(&mut self.connections);
+        let result = if self.connections.len() >= self.connections_max {
+            Err(worker_error("SQLite connection bound reached"))
+        } else {
+            match self.driver.connect(&context).await {
+                Ok(connection) => match self.next_id.checked_add(1) {
+                    Some(id) => {
+                        self.next_id = id;
+                        let lease = Arc::new(());
+                        self.connections.insert(
+                            id,
+                            OwnedConnection {
+                                connection,
+                                lease: Arc::downgrade(&lease),
+                            },
+                        );
+                        Ok((id, lease))
+                    }
+                    None => Err(worker_error("SQLite connection id exhausted")),
+                },
+                Err(error) => Err(error),
+            }
+        };
+        let _ = reply.send(result);
+    }
+
+    async fn exec(
+        &mut self,
+        id: u64,
+        schema: Arc<Schema>,
+        operation: Box<Operation>,
+        reply: oneshot::Sender<Result<ExecResponse, toasty_core::Error>>,
+    ) {
+        let operation = *operation;
+        #[cfg(test)]
+        if operation.is_transaction_commit()
+            && let Some((started, release)) = self.commit_hold.take()
+        {
+            let _ = started.send(());
+            let _ = release.await;
+        }
+        let result = match self.connections.get_mut(&id) {
+            Some(owned) => owned.connection.exec(&schema, operation).await,
+            None => Err(worker_error("SQLite connection is closed")),
+        };
+        let _ = reply.send(result);
+    }
+
+    async fn push_schema(
+        &mut self,
+        id: u64,
+        schema: Arc<Schema>,
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    ) {
+        let result = match self.connections.get_mut(&id) {
+            Some(owned) => owned.connection.push_schema(&schema).await,
+            None => Err(worker_error("SQLite connection is closed")),
+        };
+        let _ = reply.send(result);
+    }
+
+    async fn applied_migrations(
+        &mut self,
+        id: u64,
+        reply: oneshot::Sender<Result<Vec<AppliedMigration>, toasty_core::Error>>,
+    ) {
+        let result = match self.connections.get_mut(&id) {
+            Some(owned) => owned.connection.applied_migrations().await,
+            None => Err(worker_error("SQLite connection is closed")),
+        };
+        let _ = reply.send(result);
+    }
+
+    async fn apply_migration(
+        &mut self,
+        connection_id: u64,
+        id: u64,
+        name: String,
+        statements: Vec<String>,
+        reply: oneshot::Sender<Result<(), toasty_core::Error>>,
+    ) {
+        let migration = Migration::new_sql_with_breakpoints(&statements);
+        let result = match self.connections.get_mut(&connection_id) {
+            Some(owned) => {
+                owned
+                    .connection
+                    .apply_migration(id, &name, &migration)
+                    .await
+            }
+            None => Err(worker_error("SQLite connection is closed")),
+        };
+        let _ = reply.send(result);
+    }
+
+    async fn reset(&self, reply: oneshot::Sender<Result<(), toasty_core::Error>>) {
+        let result = if self.connections.is_empty() {
+            self.driver.reset_db().await
+        } else {
+            Err(worker_error(
+                "SQLite reset refused while connections are open",
+            ))
+        };
+        let _ = reply.send(result);
+    }
+}
+
+fn reap_connections(connections: &mut HashMap<u64, OwnedConnection>) {
+    connections.retain(|_, connection| connection.lease.strong_count() > 0);
+}
+
+fn worker_error(message: &str) -> toasty_core::Error {
+    toasty_core::Error::driver_operation_failed(std::io::Error::other(message.to_owned()))
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "SQLite worker panicked with a non-string payload".to_owned(),
+        },
+    }
+}
+
+fn start_join(join_state: &mut JoinState) {
+    let thread_join = match join_state {
+        JoinState::Thread(join) => join.take(),
+        JoinState::Task(_) | JoinState::Complete(_) => None,
+    };
+    if let Some(join) = thread_join {
+        *join_state = JoinState::Task(tokio::task::spawn_blocking(move || {
+            join.join().map_err(panic_message)
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use toasty_core::driver::{ConnectContext, Driver as _};
+    use toasty_driver_sqlite::Sqlite;
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+
+    use super::{Command, DatabaseThread, SqliteThreadDriver};
+
+    async fn driver(
+        path: &std::path::Path,
+        queue_timeout: Duration,
+    ) -> (Arc<DatabaseThread>, SqliteThreadDriver) {
+        let sqlite = Arc::new(Sqlite::open(path));
+        let actor = DatabaseThread::spawn(Arc::clone(&sqlite), 1, queue_timeout, None)
+            .await
+            .expect("SQLite worker must start");
+        let driver = SqliteThreadDriver::new(sqlite, Arc::clone(&actor));
+        (actor, driver)
+    }
+
+    #[tokio::test]
+    async fn cancelled_connect_after_open_releases_slot() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let (reply, response) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Open {
+                context: ConnectContext::default(),
+                reply,
+            })
+            .await
+            .expect("open must queue");
+        drop(response);
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Noop(done))
+            .await
+            .expect("barrier must queue after open");
+        completed.await.expect("barrier must complete");
+
+        let connection = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect("cancelled connect must release its opened slot");
+        drop(connection);
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker must stop");
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("completed shutdown must be idempotent");
+    }
+
+    #[tokio::test]
+    async fn dropped_connection_reaps_when_close_cannot_queue() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let connection = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect("first connection must open");
+
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started.await.expect("worker must hold queue");
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .try_send(Command::Noop(done))
+            .expect("one queued command must fill bounded queue");
+        drop(connection);
+        release.send(()).expect("worker must resume");
+        completed.await.expect("queued command must complete");
+
+        let connection = tokio::time::timeout(
+            Duration::from_secs(1),
+            driver.connect(&ConnectContext::default()),
+        )
+        .await
+        .expect("connection reaping must finish within one second")
+        .expect("dropped proxy must not leak actor slot");
+        drop(connection);
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("worker must stop");
+    }
+
+    #[tokio::test]
+    async fn full_queue_and_worker_panic_keep_error_sources() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, driver) = driver(&directory.path().join("db"), Duration::from_millis(20)).await;
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started.await.expect("worker must hold queue");
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .try_send(Command::Noop(done))
+            .expect("one queued command must fill bounded queue");
+        let error = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect_err("full queue must refuse after configured wait");
+        assert!(std::error::Error::source(&error).is_some());
+
+        release.send(()).expect("worker must resume");
+        completed.await.expect("queued command must complete");
+        actor
+            .sender
+            .send(Command::Panic)
+            .await
+            .expect("panic command must queue");
+        let error = driver
+            .connect(&ConnectContext::default())
+            .await
+            .expect_err("worker panic must close pending driver requests");
+        assert!(std::error::Error::source(&error).is_some());
+        let error = actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect_err("shutdown must report worker panic");
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(
+            error.to_string().contains("test SQLite worker panic"),
+            "shutdown error must preserve worker panic payload: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_queue_wait_respects_deadline_and_can_be_retried() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, _driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started.await.expect("worker must hold queue");
+        let (done, completed) = oneshot::channel();
+        actor
+            .sender
+            .try_send(Command::Noop(done))
+            .expect("one queued command must fill bounded queue");
+
+        let error = actor
+            .shutdown(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("shutdown must honor its queue deadline");
+        assert!(error.to_string().contains("queue wait exceeded deadline"));
+
+        release.send(()).expect("worker must resume");
+        completed.await.expect("queued command must complete");
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown can retry after the queue drains");
+    }
+
+    #[tokio::test]
+    async fn shutdown_response_timeout_keeps_join_for_retry() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, _driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started
+            .await
+            .expect("worker must hold command processing");
+
+        let error = actor
+            .shutdown(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("shutdown response must respect its deadline");
+        assert!(error.to_string().contains("deadline"));
+
+        release.send(()).expect("worker must resume");
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("retry must await previously accepted shutdown and join");
+    }
+
+    #[tokio::test]
+    async fn timed_out_shutdown_retains_owner_after_caller_drops_the_actor() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let lock_path = directory.path().join("owner.lock");
+        let owner = Arc::new(std::fs::File::create(&lock_path).expect("owner file opens"));
+        owner.lock().expect("owner locks its file");
+        let retained = Arc::downgrade(&owner);
+        let actor = DatabaseThread::spawn(
+            Arc::new(Sqlite::open(directory.path().join("db"))),
+            1,
+            Duration::from_secs(1),
+            Some(Arc::<std::fs::File>::clone(&owner)),
+        )
+        .await
+        .expect("SQLite worker starts");
+        drop(owner);
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("worker hold queues");
+        is_started.await.expect("worker is held");
+        actor
+            .shutdown(Instant::now() + Duration::from_millis(10))
+            .await
+            .expect_err("held worker exceeds shutdown deadline");
+        drop(actor);
+        assert!(retained.upgrade().is_some(), "worker still owns its lease");
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("contender opens same lock");
+        assert!(
+            contender.try_lock().is_err(),
+            "another owner cannot enter while worker runs"
+        );
+        release.send(()).expect("worker resumes");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if retained.upgrade().is_none() && contender.try_lock().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker releases owner after real exit");
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_retains_accepted_worker_join() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        let (actor, _driver) = driver(&directory.path().join("db"), Duration::from_secs(1)).await;
+        let (started, is_started) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        actor
+            .sender
+            .send(Command::Hold {
+                started,
+                release: released,
+            })
+            .await
+            .expect("hold command must queue");
+        is_started
+            .await
+            .expect("worker must hold command processing");
+
+        let shutdown_actor = Arc::clone(&actor);
+        let shutdown = tokio::spawn(async move {
+            shutdown_actor
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while actor.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown command must enter bounded queue");
+        shutdown.abort();
+        release.send(()).expect("worker must resume");
+        actor
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("cancelled shutdown must leave accepted join awaitable");
+    }
+}

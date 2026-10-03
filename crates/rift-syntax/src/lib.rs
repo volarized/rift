@@ -19,9 +19,9 @@ mod yaml;
 
 pub use contribution::{
     DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, SyntaxPublicationError,
-    source_unit,
+    source_unit, source_unit_for_path,
 };
-pub use document::{ByteRange, SyntaxDocument, SyntaxNode, SyntaxSymbol};
+pub use document::{ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxSymbol};
 pub use failure::{SyntaxBound, SyntaxError, SyntaxFault, SyntaxViolation};
 pub use javascript::JavaScriptSyntaxProvider;
 pub use json::JsonSyntaxProvider;

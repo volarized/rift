@@ -1575,14 +1575,19 @@ impl LexicalChange {
             inserted,
             recorded,
         } = self;
-        let mut units_by_path: BTreeMap<ProjectPath, Vec<IndexDocument>> = BTreeMap::new();
+        let mut units_by_path: BTreeMap<ProjectPath, Vec<IndexDocument>> = replaced
+            .iter()
+            .cloned()
+            .map(|path| (path, Vec::new()))
+            .collect();
         let mut unfiled = Vec::new();
         for unit in inserted {
-            match unit.location() {
-                DocumentLocation::Project(path) if replaced.contains(path) => {
-                    units_by_path.entry(path.clone()).or_default().push(unit);
-                }
-                DocumentLocation::Project(_) | DocumentLocation::Unit(_) => unfiled.push(unit),
+            if let DocumentLocation::Project(path) = unit.location()
+                && let Some(units) = units_by_path.get_mut(path)
+            {
+                units.push(unit);
+            } else {
+                unfiled.push(unit);
             }
         }
         let mut digests: BTreeMap<ProjectPath, FileDigest> = recorded.into_iter().collect();
@@ -3081,6 +3086,32 @@ mod tests {
             vec![vec!["a.rs"], vec!["big.json"], vec!["c.rs"]]
         );
         assert_eq!(parts[1].inserted().len(), 7);
+    }
+
+    #[test]
+    fn test_a_split_preserves_replacement_order_and_empty_deletions() {
+        let change = fixture_change(&[("z.rs", 2), ("a.rs", 2), ("empty.rs", 0)], 10);
+        let expected_units = change.inserted().to_vec();
+        let expected_digests = change.recorded().to_vec();
+        let parts = change.into_parts_within(2, 1_000);
+        assert_eq!(
+            part_paths(&parts),
+            vec![vec!["z.rs"], vec!["a.rs", "empty.rs"]]
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .flat_map(LexicalChange::inserted)
+                .collect::<Vec<_>>(),
+            expected_units.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .flat_map(LexicalChange::recorded)
+                .collect::<Vec<_>>(),
+            expected_digests.iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]

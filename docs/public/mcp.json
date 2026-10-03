@@ -1463,6 +1463,45 @@
               },
               {
                 "additionalProperties": false,
+                "description": "The local index is still preparing selected workspace files. The answer covers only\nfiles whose capture and analysis have finished; `total` is absent until discovery ends.",
+                "properties": {
+                  "code": {
+                    "const": "local_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Selected workspace files whose capture and analysis have finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before local preparation finishes. No estimate is available yet."
+                  },
+                  "total": {
+                    "description": "Selected workspace files, once discovery has finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
                 "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
                 "properties": {
                   "code": {
@@ -3172,7 +3211,7 @@
       }
     },
     {
-      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. A visible path no syntax provider parses refuses\n`capability_unavailable`, naming the extension.",
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
       "input_schema": {
         "$defs": {
           "ProjectPath": {
@@ -4035,6 +4074,45 @@
                   "prepared",
                   "total",
                   "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The local index is still preparing selected workspace files. The answer covers only\nfiles whose capture and analysis have finished; `total` is absent until discovery ends.",
+                "properties": {
+                  "code": {
+                    "const": "local_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Selected workspace files whose capture and analysis have finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before local preparation finishes. No estimate is available yet."
+                  },
+                  "total": {
+                    "description": "Selected workspace files, once discovery has finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
                   "detail"
                 ],
                 "type": "object"
@@ -6997,6 +7075,45 @@
                   "prepared",
                   "total",
                   "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The local index is still preparing selected workspace files. The answer covers only\nfiles whose capture and analysis have finished; `total` is absent until discovery ends.",
+                "properties": {
+                  "code": {
+                    "const": "local_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Selected workspace files whose capture and analysis have finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before local preparation finishes. No estimate is available yet."
+                  },
+                  "total": {
+                    "description": "Selected workspace files, once discovery has finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
                   "detail"
                 ],
                 "type": "object"

@@ -81,14 +81,17 @@ impl FillBounds {
 }
 
 /// The derivation revision one store file is keyed on: what decides the
-/// lexical rows - the build, by its product version, the corpus shape, the
-/// index-owned tables - beside the strategy and the releases it selects, since
+/// lexical rows - the analyzer revision, corpus shape, and index-owned tables -
+/// beside the strategy and the releases it selects, since
 /// a commit analyzed under one strategy is compared with another commit than
 /// under the other.
-pub(crate) fn store_revision(product_version: &str, configuration: &ConfigurationState) -> String {
+pub(crate) fn store_revision(
+    analyzer_revision: &str,
+    configuration: &ConfigurationState,
+) -> String {
     let history = configuration.history_configuration();
     let mut hasher = Sha256::new();
-    hasher.update(derivation_revision(product_version, configuration).as_bytes());
+    hasher.update(derivation_revision(analyzer_revision, configuration).as_bytes());
     hasher.update([0]);
     hasher.update(format!("{:?}", history.strategy).as_bytes());
     for release in &history.releases {
@@ -121,14 +124,14 @@ impl HistoryLane {
     pub(crate) async fn start(
         root: &Path,
         configuration: &ConfigurationState,
-        product_version: &str,
+        analyzer_revision: &str,
         (activity, cancellation, gate): (Arc<IdleTracker>, CancellationToken, Option<AnalysisGate>),
     ) -> Option<Self> {
         let history = configuration.history_configuration();
         if !history.enabled || !configuration.is_accepted() {
             return None;
         }
-        let opening = OpenedStore::open(root, configuration, &history, product_version);
+        let opening = OpenedStore::open(root, configuration, &history, analyzer_revision);
         let opened = tokio::task::spawn_blocking(opening).await.ok()??;
         let wake = Arc::new(Notify::new());
         let signal = Arc::clone(&wake);
@@ -172,11 +175,11 @@ impl OpenedStore {
         root: &Path,
         configuration: &ConfigurationState,
         history: &HistoryConfiguration,
-        product_version: &str,
+        analyzer_revision: &str,
     ) -> impl FnOnce() -> Option<Self> + Send + 'static {
         let root = root.to_path_buf();
         let history = history.clone();
-        let revision = store_revision(product_version, configuration);
+        let revision = store_revision(analyzer_revision, configuration);
         let policy = (
             configuration.source_visibility(),
             configuration.text_inclusion(),

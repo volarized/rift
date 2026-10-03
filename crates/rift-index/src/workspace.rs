@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::io::Read as _;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
@@ -47,9 +48,10 @@ use rift_syntax::{
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::capture::{CapturedPath, LastCapture, capture_path};
+use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
+use crate::content_cache::WorkspaceContentCache;
 use crate::documentation::NotebookFiles;
 use crate::language::{ClassifiedPath, LanguagePolicyError, WorkspaceLanguagePolicy};
 use crate::lexical::LimitBreach;
@@ -280,6 +282,10 @@ pub enum WorkspaceIndexViolation {
     InvalidSource,
     /// Filesystem operation failed.
     Filesystem,
+    /// A file changed while its bytes were being captured.
+    ChangedDuringCapture,
+    /// Index work was cancelled between files.
+    Cancelled,
     /// Rust syntax analysis failed.
     Syntax,
     /// Provider publication or normalization failed.
@@ -411,6 +417,10 @@ impl Fault for WorkspaceIndexFault {
                 ErrorName::Wire(ErrorCode::ContentUnavailable)
             }
             WorkspaceIndexViolation::Filesystem => ErrorName::Wire(ErrorCode::StorageFailure),
+            WorkspaceIndexViolation::ChangedDuringCapture => {
+                ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+            }
+            WorkspaceIndexViolation::Cancelled => ErrorName::Wire(ErrorCode::Cancelled),
             WorkspaceIndexViolation::Syntax => self.syntax_source().map_or_else(
                 || ErrorName::Wire(ErrorCode::InternalError),
                 |error| error.descriptor().name(),
@@ -544,7 +554,7 @@ pub(crate) fn index_error_caused_by(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSourceFile {
     path: ProjectPath,
-    content: String,
+    content: Arc<String>,
     digest: FileDigest,
     executable: bool,
 }
@@ -555,7 +565,7 @@ impl TextSourceFile {
         Self {
             path,
             digest: FileDigest::of(content.as_bytes()),
-            content,
+            content: Arc::new(content),
             executable: false,
         }
     }
@@ -781,6 +791,30 @@ impl WorkspaceSourcePolicy {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_languages_cancellable(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            &|| false,
+        )
+    }
+
+    /// Compiles path policy, checking `cancelled` between ignore files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid roots, patterns, ignore files,
+    /// configured-bound failures, or cancellation.
+    pub fn build_with_languages_cancellable(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
         let watched_root = root.to_path_buf();
         let root = canonical_root(root)?;
         let matcher = PathMatcher::build_with_force_include(
@@ -793,7 +827,7 @@ impl WorkspaceSourcePolicy {
         let language = WorkspaceLanguagePolicy::build(&root, languages, text_inclusion)?;
         let gitignore = visibility
             .respect_gitignore()
-            .then(|| GitignoreChain::build(&root, limits))
+            .then(|| GitignoreChain::build_cancellable(&root, limits, cancelled))
             .transpose()?;
         Ok(Self {
             root,
@@ -850,12 +884,21 @@ impl WorkspaceSourcePolicy {
     ///
     /// Returns [`WorkspaceIndexError`] for discovery or configured-bound failures.
     pub fn visible_paths(&self) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
+        self.visible_paths_cancellable(&|| false)
+    }
+
+    fn visible_paths_cancellable(
+        &self,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
+        check_cancelled(cancelled)?;
         let mut paths = Vec::new();
         for entry in source_walk(
             &self.root,
             self.limits.directory_depth_max,
             GitignorePolicy::Ignore,
         ) {
+            check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| walk_error(&self.root, error))?;
             let file_type = entry.file_type();
             if file_type.is_some_and(|file_type| file_type.is_dir()) {
@@ -868,7 +911,7 @@ impl WorkspaceSourcePolicy {
                 continue;
             }
             if !file_type.is_some_and(|file_type| file_type.is_file())
-                || !self.visible_normalized(entry.path())
+                || !self.visible_selection(entry.path())
             {
                 continue;
             }
@@ -960,6 +1003,11 @@ impl WorkspaceSourcePolicy {
         if !above_hard_floor {
             return false;
         }
+        self.visible_selection(path)
+    }
+
+    /// Applies source selection to a path whose traversal already checked the hard floor.
+    fn visible_selection(&self, path: &Path) -> bool {
         match self.matcher.verdict(path) {
             PathVerdict::Excluded | PathVerdict::NotIncluded => false,
             PathVerdict::ForceIncluded => true,
@@ -1083,9 +1131,20 @@ pub enum WorkspaceIndexWarning {
 /// Outcome of reading one file into the index: parsed, or skipped with the warning
 /// that names it - left out, or held as text the provider did not parse
 /// ([`WorkspaceIndexWarning::holds_text`]).
-enum IndexRead<File> {
+pub enum IndexRead<File> {
+    /// File content passed read and syntax checks.
     Included(File),
+    /// Catalog or syntax bound left the file out of this read.
     Skipped(WorkspaceIndexWarning),
+}
+
+/// Indexed file and syntax nodes selected for one source position.
+#[derive(Debug)]
+pub struct IndexedFileNodes {
+    /// Parsed file used to validate source identity and position.
+    pub file: IndexedFile,
+    /// Nodes that cover the requested position.
+    pub nodes: Vec<SyntaxNode>,
 }
 
 impl<File> IndexRead<File> {
@@ -1135,6 +1194,8 @@ struct LeftOutFileState {
     content: FileDigest,
     /// Digest of the bytes and the executable bit, what `WorkspaceIndex::digests` answers.
     state: FileDigest,
+    /// Number of bytes counted against `workspace_bytes_max`.
+    bytes: usize,
 }
 
 impl LeftOutFileState {
@@ -1142,6 +1203,7 @@ impl LeftOutFileState {
         Self {
             content: file.digest(),
             state: FileDigest::of_file_state(file.content().as_bytes(), file.executable()),
+            bytes: file.content().len(),
         }
     }
 
@@ -1149,13 +1211,14 @@ impl LeftOutFileState {
         Self {
             content: file.digest(),
             state: FileDigest::of_file_state(file.source().as_bytes(), file.executable()),
+            bytes: file.source().len(),
         }
     }
 }
 
 /// The files one build holds and the files it left out, gathered before the index is
 /// assembled over them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct IndexContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
@@ -1163,7 +1226,515 @@ pub(crate) struct IndexContents {
     warnings: Vec<WorkspaceIndexWarning>,
 }
 
+/// Project-relative paths selected for one workspace map.
+#[derive(Default)]
+pub struct WorkspaceMapPaths {
+    /// Source paths and their selected language.
+    pub source: Vec<(ProjectPath, rift_protocol::read::Language)>,
+    /// Baseline text paths, excluding lockfiles.
+    pub text: Vec<ProjectPath>,
+}
+
+/// One cancellable workspace preparation, retaining every completed file for later
+/// immutable snapshots.
+pub struct WorkspaceIndexPreparation {
+    root: PathBuf,
+    limits: WorkspaceIndexLimits,
+    composition: ProviderComposition,
+    language: Arc<WorkspaceLanguagePolicy>,
+    text_inclusion: TextFileInclusion,
+    discovered: Option<DiscoveredPaths>,
+    contents: IndexContents,
+    content_cache: WorkspaceContentCache,
+    workspace_bytes: usize,
+    source_cursor: usize,
+    text_cursor: usize,
+    lockfile_cursor: usize,
+}
+
+impl fmt::Debug for WorkspaceIndexPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceIndexPreparation")
+            .field("root", &self.root)
+            .field("prepared", &self.prepared())
+            .field("total", &self.total())
+            .finish_non_exhaustive()
+    }
+}
+
+type PreparedBatch = Result<usize, (usize, WorkspaceIndexError)>;
+
+impl WorkspaceIndexPreparation {
+    /// Creates empty immutable views before discovery starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid root, configuration, or composition.
+    pub fn new(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<Self, WorkspaceIndexError> {
+        let root = canonical_root(root)?;
+        let composition = composition()?;
+        let language = Arc::new(WorkspaceLanguagePolicy::build(
+            &root,
+            languages,
+            text_inclusion,
+        )?);
+        Ok(Self {
+            root,
+            limits,
+            composition,
+            language,
+            text_inclusion: text_inclusion.clone(),
+            discovered: None,
+            contents: IndexContents::default(),
+            content_cache: WorkspaceContentCache::default(),
+            workspace_bytes: 0,
+            source_cursor: 0,
+            text_cursor: 0,
+            lockfile_cursor: 0,
+        })
+    }
+
+    /// Uses shared content and syntax facts for matching source files.
+    #[must_use]
+    pub fn with_content_cache(mut self, cache: WorkspaceContentCache) -> Self {
+        self.content_cache = cache;
+        self
+    }
+
+    /// Builds an empty index under the accepted workspace configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the empty index cannot be assembled.
+    pub fn empty_snapshot(&self) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        WorkspaceIndex::from_parts(
+            self.root.clone(),
+            IndexContents::default(),
+            self.composition.clone(),
+            self.limits,
+            Arc::clone(&self.language),
+            self.text_inclusion.clone(),
+            self.content_cache.clone(),
+            None,
+        )
+    }
+
+    /// Discovers the complete selected file set under the same visibility authority as a
+    /// full build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for discovery, configured bounds, or cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if discovery was already run. A preparation uses one visibility policy.
+    pub fn discover(
+        &mut self,
+        visibility: &SourceVisibility,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<usize, WorkspaceIndexError> {
+        assert!(
+            self.discovered.is_none(),
+            "discovery runs once per preparation"
+        );
+        self.discovered = Some(discover_cancellable(
+            &self.root,
+            self.limits,
+            visibility,
+            &self.language,
+            cancelled,
+        )?);
+        Ok(self.total().expect("discovery has completed"))
+    }
+
+    /// Next bounded publication count: the first completed batch, then doubled counts,
+    /// ending exactly at the selected file total.
+    #[must_use]
+    pub fn next_checkpoint(&self) -> Option<usize> {
+        let total = self.total()?;
+        let prepared = self.prepared();
+        if prepared == total {
+            return None;
+        }
+        let next = if prepared == 0 {
+            SOURCE_BATCH_FILES
+        } else {
+            prepared.saturating_mul(2)
+        };
+        Some(next.min(total))
+    }
+
+    /// Number of selected visible files, once discovery has completed.
+    #[must_use]
+    pub fn total(&self) -> Option<usize> {
+        self.discovered.as_ref().and_then(|paths| {
+            paths
+                .source
+                .len()
+                .checked_add(paths.text.len())?
+                .checked_add(paths.lockfiles.len())
+        })
+    }
+
+    /// Selected project-relative paths, once discovery has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a discovered path cannot be made project-relative.
+    pub fn selected_paths(&self) -> Result<Option<Vec<ProjectPath>>, WorkspaceIndexError> {
+        let Some(total) = self.total() else {
+            return Ok(None);
+        };
+        self.paths_through(total).map(Some)
+    }
+
+    /// Number of selected files whose capture and analysis have finished.
+    #[must_use]
+    pub const fn prepared(&self) -> usize {
+        self.source_cursor
+            .saturating_add(self.text_cursor)
+            .saturating_add(self.lockfile_cursor)
+    }
+
+    /// Project-relative paths whose capture and analysis have finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a discovered path cannot be made project-relative.
+    pub fn prepared_paths(&self) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
+        self.paths_through(self.prepared())
+    }
+
+    /// Replaces prepared file contents with the result of an incremental rebuild of this
+    /// preparation's snapshot. Discovery and completed path cursors remain unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `index` has a different root or bounds.
+    pub fn retain_rebuilt_snapshot(&mut self, index: &WorkspaceIndex) {
+        debug_assert_eq!(self.root, index.root);
+        debug_assert_eq!(self.limits, index.limits);
+        self.contents = IndexContents::from_index(index);
+        self.workspace_bytes = WorkspaceIndex::indexed_bytes(
+            &self.contents.files,
+            &self.contents.text_files,
+            &self.contents.left_out,
+        );
+    }
+
+    /// Captures the paths this preparation has finished reading, reusing the previous
+    /// capture only when the retained file stat and capture boundary still match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a prepared path cannot be read within limits.
+    pub fn capture_prepared_paths(
+        &self,
+        last: &LastCapture,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+        let Some(paths) = &self.discovered else {
+            return Ok((WorkspaceDigests::default(), LastCapture::default()));
+        };
+        let mut remaining = self.prepared();
+        let source_count = remaining.min(paths.source.len());
+        remaining -= source_count;
+        let text_count = remaining.min(paths.text.len());
+        remaining -= text_count;
+        let lockfile_count = remaining.min(paths.lockfiles.len());
+        let source = paths.source[..source_count]
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let other = paths.text[..text_count]
+            .iter()
+            .chain(&paths.lockfiles[..lockfile_count])
+            .cloned()
+            .collect::<Vec<_>>();
+        capture_path_lists_with_boundary(
+            &self.root,
+            self.limits,
+            &CapturePathLists {
+                source: &source,
+                other: &other,
+                last,
+                boundary: CaptureBoundary::create(&self.root),
+                root_identity: root_identity(&self.root),
+                cancelled,
+            },
+        )
+    }
+
+    /// Project-relative paths whose completed reads form this snapshot, split by index class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a discovered path cannot be made project-relative.
+    pub fn prepared_path_classes(
+        &self,
+    ) -> Result<(Vec<ProjectPath>, Vec<ProjectPath>), WorkspaceIndexError> {
+        let Some(paths) = &self.discovered else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut remaining = self.prepared();
+        let source_count = remaining.min(paths.source.len());
+        remaining -= source_count;
+        let text_count = remaining.min(paths.text.len());
+        remaining -= text_count;
+        let lockfile_count = remaining.min(paths.lockfiles.len());
+        let project_path = |path: &PathBuf| {
+            let relative = path.strip_prefix(&self.root).map_err(|error| {
+                index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+            })?;
+            relative_path(relative)
+        };
+        let source = paths.source[..source_count]
+            .iter()
+            .map(|(path, _)| project_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let other = paths.text[..text_count]
+            .iter()
+            .chain(&paths.lockfiles[..lockfile_count])
+            .map(project_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((source, other))
+    }
+
+    /// Project-relative paths discovered under this preparation's visibility policy, split
+    /// into source files and baseline text files. Excluded lockfiles are omitted because the
+    /// workspace map does not count them as indexed files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when a discovered path cannot be made project-relative.
+    pub fn discovered_map_paths(&self) -> Result<WorkspaceMapPaths, WorkspaceIndexError> {
+        let Some(paths) = &self.discovered else {
+            return Ok(WorkspaceMapPaths::default());
+        };
+        let project_path = |path: &Path| {
+            let relative = path.strip_prefix(&self.root).map_err(|error| {
+                index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+            })?;
+            relative_path(relative)
+        };
+        let source = paths
+            .source
+            .iter()
+            .map(|(path, provider)| Ok((project_path(path)?, provider.language().clone())))
+            .collect::<Result<Vec<_>, WorkspaceIndexError>>()?;
+        let text = paths
+            .text
+            .iter()
+            .map(|path| project_path(path))
+            .collect::<Result<Vec<_>, WorkspaceIndexError>>()?;
+        Ok(WorkspaceMapPaths { source, text })
+    }
+
+    fn paths_through(&self, count: usize) -> Result<Vec<ProjectPath>, WorkspaceIndexError> {
+        let Some(paths) = &self.discovered else {
+            return Ok(Vec::new());
+        };
+        let mut remaining = count;
+        let source_count = remaining.min(paths.source.len());
+        remaining -= source_count;
+        let text_count = remaining.min(paths.text.len());
+        remaining -= text_count;
+        let lockfile_count = remaining.min(paths.lockfiles.len());
+        paths.source[..source_count]
+            .iter()
+            .map(|(path, _)| path)
+            .chain(paths.text[..text_count].iter())
+            .chain(paths.lockfiles[..lockfile_count].iter())
+            .map(|path| {
+                let relative = path.strip_prefix(&self.root).map_err(|error| {
+                    index_error_caused_by(WorkspaceIndexViolation::InvalidPath, Some(path), error)
+                })?;
+                relative_path(relative)
+            })
+            .collect()
+    }
+
+    /// Reads through `target` selected files and returns a new index over all completed
+    /// files. Prior files are shared through their `Arc` values and are not parsed again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for an invalid target, read, syntax, bound, or
+    /// cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics before discovery or when `target` moves backward or exceeds selected files.
+    pub fn advance_to(
+        &mut self,
+        target: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        self.advance_to_with_previous(target, None, cancelled)
+    }
+
+    /// Reads through `target` selected files and reuses derived data from `previous` when
+    /// both indexes use the same accepted inputs.
+    ///
+    /// A mismatch skips reuse and assembles the same result as `advance_to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for an invalid target, read, syntax, bound, or
+    /// cancellation.
+    ///
+    /// # Panics
+    ///
+    /// Panics before discovery or when `target` moves backward or exceeds selected files.
+    pub fn advance_to_with_previous(
+        &mut self,
+        target: usize,
+        previous: Option<&WorkspaceIndex>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        let paths = self.discovered.as_ref().unwrap_or_else(|| {
+            unreachable!("workspace files cannot be prepared before discovery completes")
+        });
+        let total = paths
+            .source
+            .len()
+            .checked_add(paths.text.len())
+            .and_then(|count| count.checked_add(paths.lockfiles.len()))
+            .expect("discovered file count must fit usize");
+        assert!(
+            (self.prepared()..=total).contains(&target),
+            "preparation target must not move backward or exceed selected files"
+        );
+        let paths = self.discovered.take().expect("discovery was checked above");
+        let advanced = (|| {
+            while self.prepared() < target {
+                check_cancelled(cancelled)?;
+                if self.source_cursor < paths.source.len() {
+                    self.advance_sources(&paths, target, cancelled)?;
+                } else if self.text_cursor < paths.text.len() {
+                    self.advance_text(&paths, target, cancelled)?;
+                } else {
+                    self.advance_lockfiles(&paths, target, cancelled)?;
+                }
+            }
+            self.snapshot(previous)
+        })();
+        self.discovered = Some(paths);
+        advanced
+    }
+
+    fn advance_sources(
+        &mut self,
+        paths: &DiscoveredPaths,
+        target: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), WorkspaceIndexError> {
+        let end = self.batch_end(self.source_cursor, paths.source.len(), target);
+        let completed = self.contents.hold_parsed_sources_progress(
+            &self.root,
+            &paths.source[self.source_cursor..end],
+            self.limits,
+            &mut self.workspace_bytes,
+            None,
+            &self.content_cache,
+            cancelled,
+        );
+        self.source_cursor += batch_completed(&completed);
+        completed.map(|_| ()).map_err(|(_, error)| error)
+    }
+
+    fn advance_text(
+        &mut self,
+        paths: &DiscoveredPaths,
+        target: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), WorkspaceIndexError> {
+        let end = self.batch_end(self.text_cursor, paths.text.len(), target);
+        let completed = self.contents.hold_read_texts_progress(
+            &self.root,
+            &paths.text[self.text_cursor..end],
+            self.limits,
+            &mut self.workspace_bytes,
+            cancelled,
+        );
+        self.text_cursor += batch_completed(&completed);
+        completed.map(|_| ()).map_err(|(_, error)| error)
+    }
+
+    fn advance_lockfiles(
+        &mut self,
+        paths: &DiscoveredPaths,
+        target: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), WorkspaceIndexError> {
+        let end = self.batch_end(self.lockfile_cursor, paths.lockfiles.len(), target);
+        let completed = self.contents.hold_read_lockfiles_progress(
+            &self.root,
+            &paths.lockfiles[self.lockfile_cursor..end],
+            self.limits,
+            &mut self.workspace_bytes,
+            cancelled,
+        );
+        self.lockfile_cursor += batch_completed(&completed);
+        completed.map(|_| ()).map_err(|(_, error)| error)
+    }
+
+    fn batch_end(&self, cursor: usize, length: usize, target: usize) -> usize {
+        cursor
+            .saturating_add(SOURCE_BATCH_FILES)
+            .min(length)
+            .min(cursor.saturating_add(target.saturating_sub(self.prepared())))
+    }
+
+    fn snapshot(
+        &self,
+        previous: Option<&WorkspaceIndex>,
+    ) -> Result<WorkspaceIndex, WorkspaceIndexError> {
+        WorkspaceIndex::from_parts(
+            self.root.clone(),
+            self.contents.clone(),
+            self.composition.clone(),
+            self.limits,
+            Arc::clone(&self.language),
+            self.text_inclusion.clone(),
+            self.content_cache.clone(),
+            previous.filter(|index| self.accepts_previous(index)),
+        )
+    }
+
+    fn accepts_previous(&self, previous: &WorkspaceIndex) -> bool {
+        self.root == previous.root
+            && self.limits == previous.limits
+            && self.text_inclusion == previous.text_inclusion
+            && Arc::ptr_eq(&self.language, &previous.language)
+            && self.composition.id() == previous.composition.id()
+            && self.composition.steps() == previous.composition.steps()
+    }
+}
+
+fn batch_completed(result: &PreparedBatch) -> usize {
+    result
+        .as_ref()
+        .map_or_else(|(count, _)| *count, |count| *count)
+}
+
 impl IndexContents {
+    fn from_index(index: &WorkspaceIndex) -> Self {
+        Self {
+            files: index.files.clone(),
+            text_files: index.text_files.clone(),
+            left_out: index.left_out.clone(),
+            warnings: index.warnings.clone(),
+        }
+    }
+
     /// The previous index's contents, less every path `changes` names: a rebuild reads
     /// those again, and a warning the previous index carried for one of them goes with it.
     fn carried_from(index: &WorkspaceIndex, changes: &PathChanges) -> Self {
@@ -1204,7 +1775,56 @@ impl IndexContents {
         provider: &dyn SyntaxProvider,
         syntax: SyntaxLimits,
     ) -> Result<(), WorkspaceIndexError> {
-        let parsed = shared_read(syntax_read(&text_file, context_path, provider, syntax)?);
+        self.hold_source_file_with_cache(
+            text_file,
+            context_path,
+            provider,
+            syntax,
+            &WorkspaceContentCache::default(),
+            WORKSPACE_FILES_MAX_DEFAULT,
+        )
+    }
+
+    fn hold_source_file_with_cache(
+        &mut self,
+        mut text_file: TextSourceFile,
+        context_path: &Path,
+        provider: &dyn SyntaxProvider,
+        syntax_limits: SyntaxLimits,
+        cache: &WorkspaceContentCache,
+        entries_max: usize,
+    ) -> Result<(), WorkspaceIndexError> {
+        let digest = text_file.digest();
+        let (cached_source, cached_syntax) = cache.get(digest, syntax_limits, provider);
+        if let Some(source) = cached_source {
+            text_file.content = source;
+        }
+        let parsed = if let Some(syntax) = cached_syntax {
+            IndexRead::Included(Arc::new(IndexedFile::new_with_shared_syntax(
+                text_file.path().clone(),
+                Arc::clone(&text_file.content),
+                digest,
+                text_file.executable(),
+                syntax,
+            )))
+        } else {
+            match shared_read(syntax_read(
+                &text_file,
+                context_path,
+                provider,
+                syntax_limits,
+            )?) {
+                IndexRead::Included(file) => IndexRead::Included(cache_indexed_file(
+                    file,
+                    &mut text_file,
+                    provider,
+                    syntax_limits,
+                    cache,
+                    entries_max,
+                )),
+                IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+            }
+        };
         self.hold_parsed_source(text_file, parsed);
         Ok(())
     }
@@ -1241,6 +1861,10 @@ impl IndexContents {
     /// parse outcome is held, so the `workspace_bytes_max` refusal and every other failure
     /// name the path a sequential read would name. The refusal stops the build after the
     /// batch that crossed it, so at most one batch is read past the bound.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Inputs carry one bounded source-read operation through the batch."
+    )]
     fn hold_parsed_sources(
         &mut self,
         root: &Path,
@@ -1248,24 +1872,76 @@ impl IndexContents {
         limits: WorkspaceIndexLimits,
         workspace_bytes: &mut usize,
         previous: Option<&WorkspaceIndex>,
+        content_cache: &WorkspaceContentCache,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), WorkspaceIndexError> {
         for batch in sources.chunks(SOURCE_BATCH_FILES) {
-            let read: Vec<Result<IndexRead<ParsedSource>, WorkspaceIndexError>> = batch
-                .par_iter()
-                .map(|(path, provider)| ParsedSource::read(root, path, *provider, limits, previous))
-                .collect();
-            for ((path, _), read) in batch.iter().zip(read) {
-                match read? {
-                    IndexRead::Included(ParsedSource { text_file, parsed }) => {
-                        let length = text_file.content().len();
-                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
-                        self.hold_parsed_source(text_file, parsed?);
-                    }
-                    IndexRead::Skipped(warning) => self.leave_out(warning),
-                }
-            }
+            self.hold_parsed_sources_progress(
+                root,
+                batch,
+                limits,
+                workspace_bytes,
+                previous,
+                content_cache,
+                cancelled,
+            )
+            .map_err(|(_, error)| error)?;
         }
         Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Inputs carry one bounded source-read operation through the batch."
+    )]
+    fn hold_parsed_sources_progress(
+        &mut self,
+        root: &Path,
+        sources: &[(PathBuf, &'static dyn SyntaxProvider)],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+        previous: Option<&WorkspaceIndex>,
+        content_cache: &WorkspaceContentCache,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> PreparedBatch {
+        let read: Vec<Result<IndexRead<ParsedSource>, WorkspaceIndexError>> = sources
+            .par_iter()
+            .map(|(path, provider)| {
+                check_cancelled(cancelled)?;
+                ParsedSource::read(root, path, *provider, limits, previous, content_cache)
+            })
+            .collect();
+        let mut completed = 0;
+        for ((path, _), read) in sources.iter().zip(read) {
+            if let Err(error) = check_cancelled(cancelled) {
+                return Err((completed, error));
+            }
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => return Err((completed, error)),
+            };
+            match read {
+                IndexRead::Included(ParsedSource { text_file, parsed }) => {
+                    let length = text_file.content().len();
+                    let bytes_before_file = *workspace_bytes;
+                    if let Err(error) = count_workspace_bytes(workspace_bytes, length, path, limits)
+                    {
+                        return Err((completed, error));
+                    }
+                    let parsed = match parsed {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            *workspace_bytes = bytes_before_file;
+                            return Err((completed, error));
+                        }
+                    };
+                    self.hold_parsed_source(text_file, parsed);
+                }
+                IndexRead::Skipped(warning) => self.leave_out(warning),
+            }
+            completed += 1;
+        }
+        Ok(completed)
     }
 
     /// Reads every text path, in walk order, batched across the rayon pool the way
@@ -1276,24 +1952,53 @@ impl IndexContents {
         texts: &[PathBuf],
         limits: WorkspaceIndexLimits,
         workspace_bytes: &mut usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), WorkspaceIndexError> {
         for batch in texts.chunks(SOURCE_BATCH_FILES) {
-            let read: Vec<Result<IndexRead<TextSourceFile>, WorkspaceIndexError>> = batch
-                .par_iter()
-                .map(|path| catalog_file(root, path, limits))
-                .collect();
-            for (path, read) in batch.iter().zip(read) {
-                match read? {
-                    IndexRead::Included(text_file) => {
-                        let length = text_file.content().len();
-                        count_workspace_bytes(workspace_bytes, length, path, limits)?;
-                        self.hold_text_file(text_file);
-                    }
-                    IndexRead::Skipped(warning) => self.leave_out(warning),
-                }
-            }
+            self.hold_read_texts_progress(root, batch, limits, workspace_bytes, cancelled)
+                .map_err(|(_, error)| error)?;
         }
         Ok(())
+    }
+
+    fn hold_read_texts_progress(
+        &mut self,
+        root: &Path,
+        texts: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> PreparedBatch {
+        let read: Vec<Result<IndexRead<TextSourceFile>, WorkspaceIndexError>> = texts
+            .par_iter()
+            .map(|path| {
+                check_cancelled(cancelled)?;
+                catalog_file(root, path, limits)
+            })
+            .collect();
+        let mut completed = 0;
+        for (path, read) in texts.iter().zip(read) {
+            if let Err(error) = check_cancelled(cancelled) {
+                return Err((completed, error));
+            }
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => return Err((completed, error)),
+            };
+            match read {
+                IndexRead::Included(text_file) => {
+                    let length = text_file.content().len();
+                    if let Err(error) = count_workspace_bytes(workspace_bytes, length, path, limits)
+                    {
+                        return Err((completed, error));
+                    }
+                    self.hold_text_file(text_file);
+                }
+                IndexRead::Skipped(warning) => self.leave_out(warning),
+            }
+            completed += 1;
+        }
+        Ok(completed)
     }
 
     /// Reads every lockfile search leaves out, in walk order, keeping each one's digests
@@ -1305,18 +2010,41 @@ impl IndexContents {
         lockfiles: &[PathBuf],
         limits: WorkspaceIndexLimits,
         workspace_bytes: &mut usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), WorkspaceIndexError> {
+        self.hold_read_lockfiles_progress(root, lockfiles, limits, workspace_bytes, cancelled)
+            .map(|_| ())
+            .map_err(|(_, error)| error)
+    }
+
+    fn hold_read_lockfiles_progress(
+        &mut self,
+        root: &Path,
+        lockfiles: &[PathBuf],
+        limits: WorkspaceIndexLimits,
+        workspace_bytes: &mut usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> PreparedBatch {
+        let mut completed = 0;
         for path in lockfiles {
-            match catalog_file(root, path, limits)? {
-                IndexRead::Included(text_file) => {
+            if let Err(error) = check_cancelled(cancelled) {
+                return Err((completed, error));
+            }
+            match catalog_file(root, path, limits) {
+                Ok(IndexRead::Included(text_file)) => {
                     let length = text_file.content().len();
-                    count_workspace_bytes(workspace_bytes, length, path, limits)?;
+                    if let Err(error) = count_workspace_bytes(workspace_bytes, length, path, limits)
+                    {
+                        return Err((completed, error));
+                    }
                     self.hold_lockfile(&text_file);
                 }
-                IndexRead::Skipped(warning) => self.leave_out(warning),
+                Ok(IndexRead::Skipped(warning)) => self.leave_out(warning),
+                Err(error) => return Err((completed, error)),
             }
+            completed += 1;
         }
-        Ok(())
+        Ok(completed)
     }
 
     /// Keeps one lockfile search leaves out by its digests alone: the index serves nothing
@@ -1433,6 +2161,8 @@ pub struct WorkspaceIndex {
     composition: ProviderComposition,
     limits: WorkspaceIndexLimits,
     language: Arc<WorkspaceLanguagePolicy>,
+    content_cache: WorkspaceContentCache,
+    symbol_documents: RwLock<BTreeMap<ProjectPath, CachedSymbolDocuments>>,
     text_inclusion: TextFileInclusion,
     fingerprint: WorkspaceFingerprint,
     semantics: WorkspaceSemantics,
@@ -1446,6 +2176,21 @@ pub struct WorkspaceIndex {
     split_line_files: OnceLock<BTreeSet<ProjectPath>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolDocumentKey {
+    digest: FileDigest,
+    language: String,
+    source_bytes_max: usize,
+    syntax_nodes_max: usize,
+    syntax_depth_max: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSymbolDocuments {
+    key: SymbolDocumentKey,
+    documents: Arc<[IndexDocument]>,
 }
 
 impl WorkspaceIndex {
@@ -1487,13 +2232,73 @@ impl WorkspaceIndex {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
     ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_languages_cancellable(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            &|| false,
+        )
+    }
+
+    /// Scans visible regular files with configured language entries, checking `cancelled`
+    /// between discovered and parsed files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for invalid configuration, I/O, syntax,
+    /// exceeded bounds, or cancellation.
+    pub fn build_with_languages_cancellable(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
+        Self::build_with_languages_cancellable_and_cache(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            &WorkspaceContentCache::default(),
+            cancelled,
+        )
+    }
+
+    /// Scans visible regular files with shared content and syntax facts from `cache`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the root, bounds, file contents, or cancellation
+    /// prevents the scan from completing.
+    pub fn build_with_languages_cancellable_and_cache(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        cache: &WorkspaceContentCache,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
         let root = canonical_root(root)?;
         let language = Arc::new(WorkspaceLanguagePolicy::build(
             &root,
             languages,
             text_inclusion,
         )?);
-        Self::scanned(root, limits, visibility, language, text_inclusion, None)
+        Self::scanned(
+            root,
+            limits,
+            visibility,
+            language,
+            text_inclusion,
+            None,
+            cache,
+            cancelled,
+        )
     }
 
     /// Builds the next index from a whole scan of the tree under `visibility`, sharing every
@@ -1512,6 +2317,19 @@ impl WorkspaceIndex {
     /// Returns [`WorkspaceIndexError`] for I/O, syntax, or an exceeded bound, exactly as a
     /// full build does.
     pub fn rescanned(&self, visibility: &SourceVisibility) -> Result<Self, WorkspaceIndexError> {
+        self.rescanned_cancellable(visibility, &|| false)
+    }
+
+    /// Rescans the workspace, checking `cancelled` between discovered and parsed files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for I/O, syntax, exceeded bounds, or cancellation.
+    pub fn rescanned_cancellable(
+        &self,
+        visibility: &SourceVisibility,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
         Self::scanned(
             self.root.clone(),
             self.limits,
@@ -1519,11 +2337,17 @@ impl WorkspaceIndex {
             Arc::clone(&self.language),
             &self.text_inclusion,
             Some(self),
+            &self.content_cache,
+            cancelled,
         )
     }
 
     /// Walks, reads, and parses every visible file under `root`, sharing what `previous`
     /// parsed from the same bytes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Inputs define one workspace scan and its cancellation boundary."
+    )]
     fn scanned(
         root: PathBuf,
         limits: WorkspaceIndexLimits,
@@ -1531,10 +2355,13 @@ impl WorkspaceIndex {
         language: Arc<WorkspaceLanguagePolicy>,
         text_inclusion: &TextFileInclusion,
         previous: Option<&Self>,
+        content_cache: &WorkspaceContentCache,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, WorkspaceIndexError> {
+        check_cancelled(cancelled)?;
         let composition = composition()?;
         let classified = rift_core::traced!(component = "index", operation = "index.discover", {
-            discover(&root, limits, visibility, &language)
+            discover_cancellable(&root, limits, visibility, &language, cancelled)
         })?;
         let BuiltContents {
             files,
@@ -1552,14 +2379,24 @@ impl WorkspaceIndex {
                 limits,
                 &mut workspace_bytes,
                 previous,
+                content_cache,
+                cancelled,
             )?;
-            contents.hold_read_texts(&root, &classified.text, limits, &mut workspace_bytes)?;
+            contents.hold_read_texts(
+                &root,
+                &classified.text,
+                limits,
+                &mut workspace_bytes,
+                cancelled,
+            )?;
             contents.hold_read_lockfiles(
                 &root,
                 &classified.lockfiles,
                 limits,
                 &mut workspace_bytes,
+                cancelled,
             )?;
+            check_cancelled(cancelled)?;
             built_contents(
                 &root,
                 contents.sorted(),
@@ -1576,6 +2413,7 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
             previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
+        let symbol_documents = carried_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
             files,
@@ -1584,6 +2422,8 @@ impl WorkspaceIndex {
             composition,
             limits,
             language,
+            content_cache: content_cache.clone(),
+            symbol_documents,
             text_inclusion: text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -1622,11 +2462,27 @@ impl WorkspaceIndex {
     /// one, and a warning naming it replaces any warning the previous index carried for
     /// that path.
     pub fn rebuilt(&self, changes: &PathChanges) -> Result<Self, WorkspaceIndexError> {
+        self.rebuilt_cancellable(changes, &|| false)
+    }
+
+    /// Builds the named-path index, checking `cancelled` between paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] for I/O, syntax, exceeded bounds, or cancellation.
+    pub fn rebuilt_cancellable(
+        &self,
+        changes: &PathChanges,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
         let mut contents = IndexContents::carried_from(self, changes);
-        let mut workspace_bytes = Self::indexed_bytes(&contents.files, &contents.text_files);
+        let mut workspace_bytes =
+            Self::indexed_bytes(&contents.files, &contents.text_files, &contents.left_out);
         for path in changes.indexed() {
+            check_cancelled(cancelled)?;
             self.read_indexed_path(path, &mut contents, &mut workspace_bytes)?;
         }
+        check_cancelled(cancelled)?;
         let BuiltContents {
             files,
             text_files,
@@ -1649,6 +2505,7 @@ impl WorkspaceIndex {
             checked_chunk_bytes_max(self.text_inclusion.chunk_bytes_max()),
             Some((&self.documentation, &self.notebooks)),
         )?;
+        let symbol_documents = carried_symbol_documents(Some(self), &files, self.limits.syntax());
         Ok(Self {
             root: self.root.clone(),
             files,
@@ -1657,6 +2514,8 @@ impl WorkspaceIndex {
             composition: composition()?,
             limits: self.limits,
             language: Arc::clone(&self.language),
+            content_cache: self.content_cache.clone(),
+            symbol_documents,
             text_inclusion: self.text_inclusion.clone(),
             fingerprint,
             semantics,
@@ -1687,11 +2546,13 @@ impl WorkspaceIndex {
             IndexRead::Included(text_file) if lockfile => contents.hold_lockfile(&text_file),
             IndexRead::Included(text_file) => match class {
                 ClassifiedPath::Source(provider) => {
-                    contents.hold_source_file(
+                    contents.hold_source_file_with_cache(
                         text_file,
                         &absolute,
                         provider,
                         self.limits.syntax(),
+                        &self.content_cache,
+                        self.limits.files_max(),
                     )?;
                 }
                 ClassifiedPath::Text => contents.hold_text_file(text_file),
@@ -1701,10 +2562,11 @@ impl WorkspaceIndex {
         Ok(())
     }
 
-    /// Bytes shared files already contribute to workspace byte bound.
+    /// Bytes the held contents already contribute to the workspace byte bound.
     fn indexed_bytes(
         files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
         text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+        left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
     ) -> usize {
         let catalog: usize = text_files.values().map(|file| file.content().len()).sum();
         let syntax_only: usize = files
@@ -1712,12 +2574,23 @@ impl WorkspaceIndex {
             .filter(|(path, _)| !text_files.contains_key(*path))
             .map(|(_, file)| file.source().len())
             .sum();
-        catalog.saturating_add(syntax_only)
+        let left_out_bytes: usize = left_out
+            .iter()
+            .filter(|(path, _)| !files.contains_key(*path) && !text_files.contains_key(*path))
+            .map(|(_, state)| state.bytes)
+            .sum();
+        catalog
+            .saturating_add(syntax_only)
+            .saturating_add(left_out_bytes)
     }
 
     /// Assembles an index from files another source already accepted - the
     /// revision build, whose bytes come from git objects instead of a
     /// directory walk.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Inputs define one index publication over already accepted files."
+    )]
     pub(crate) fn from_parts(
         root: PathBuf,
         contents: IndexContents,
@@ -1725,6 +2598,8 @@ impl WorkspaceIndex {
         limits: WorkspaceIndexLimits,
         language: Arc<WorkspaceLanguagePolicy>,
         text_inclusion: TextFileInclusion,
+        content_cache: WorkspaceContentCache,
+        previous: Option<&Self>,
     ) -> Result<Self, WorkspaceIndexError> {
         let BuiltContents {
             files,
@@ -1733,7 +2608,12 @@ impl WorkspaceIndex {
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(&root, contents.sorted(), limits.declarations_max(), None)?;
+        } = built_contents(
+            &root,
+            contents.sorted(),
+            limits.declarations_max(),
+            previous.map(|index| index.semantics.graph()),
+        )?;
         let declarations = crate::documentation::declarations(&files, &semantics);
         let (documentation, notebooks) = crate::documentation::build(
             &files,
@@ -1741,8 +2621,9 @@ impl WorkspaceIndex {
             &declarations,
             &documentation_selection(&text_inclusion)?,
             checked_chunk_bytes_max(text_inclusion.chunk_bytes_max()),
-            None,
+            previous.map(|index| (&*index.documentation, &index.notebooks)),
         )?;
+        let symbol_documents = carried_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
             files,
@@ -1751,6 +2632,8 @@ impl WorkspaceIndex {
             composition,
             limits,
             language,
+            content_cache,
+            symbol_documents,
             text_inclusion,
             fingerprint,
             semantics,
@@ -2008,6 +2891,67 @@ impl WorkspaceIndex {
         )
     }
 
+    /// Symbol documents grouped by project file for vector population.
+    ///
+    /// Groups share unchanged documents with the previous index. Text documents stay out:
+    /// they carry no declaration for vector embedding.
+    #[must_use]
+    pub fn symbol_index_documents_by_file(&self) -> Vec<Arc<[IndexDocument]>> {
+        let paths = self.files.keys().collect::<Vec<_>>();
+        let (groups, left_out) = self.symbol_index_documents_for(&paths);
+        left_out.report();
+        groups
+    }
+
+    fn symbol_index_documents_for(
+        &self,
+        paths: &[&ProjectPath],
+    ) -> (Vec<Arc<[IndexDocument]>>, LeftOut) {
+        let mut cache = self
+            .symbol_documents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut groups = Vec::with_capacity(paths.len());
+        let mut left_out = LeftOut::default();
+        for path in paths {
+            let Some(file) = self.files.get(*path) else {
+                continue;
+            };
+            let key = symbol_document_key(file, self.limits.syntax());
+            if let Some(cached) = cache.get(*path).filter(|cached| cached.key == key) {
+                groups.push(Arc::clone(&cached.documents));
+                continue;
+            }
+            cache.remove(*path);
+            let mut file_left_out = LeftOut::default();
+            let documents = file
+                .syntax()
+                .symbols()
+                .iter()
+                .filter_map(|symbol| symbol_document(file, symbol, &mut file_left_out))
+                .collect::<Vec<_>>();
+            left_out.count += file_left_out.count;
+            if left_out.first.is_none() {
+                left_out.first.clone_from(&file_left_out.first);
+            }
+            if documents.is_empty() {
+                continue;
+            }
+            let documents: Arc<[IndexDocument]> = Arc::from(documents);
+            if file_left_out.count == 0 {
+                cache.insert(
+                    (*path).clone(),
+                    CachedSymbolDocuments {
+                        key,
+                        documents: Arc::clone(&documents),
+                    },
+                );
+            }
+            groups.push(documents);
+        }
+        (groups, left_out)
+    }
+
     /// Records this index's declarations against every identifier `query` carried.
     ///
     /// Each extracted candidate is matched separately and an identity keeps its best class,
@@ -2215,6 +3159,57 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
+    /// Parses one selected source path and keeps only nodes covering `position` for this read.
+    ///
+    /// Returns `None` when no provider selects `path`, `Skipped` when a catalog or syntax
+    /// bound leaves it out, and `Included` when parsing succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when reading, path validation, or syntax analysis
+    /// fails for a reason that does not leave the file out of the index.
+    pub fn parse_source_file_with_nodes(
+        &self,
+        path: &ProjectPath,
+        position: u64,
+    ) -> Result<Option<IndexRead<IndexedFileNodes>>, WorkspaceIndexError> {
+        let absolute = self.root.join(path.as_str());
+        let Some(ClassifiedPath::Source(provider)) = self.language.classifies(&absolute)? else {
+            return Ok(None);
+        };
+        let mut workspace_bytes = 0;
+        let text_file =
+            match read_catalog_file(&self.root, &absolute, self.limits, &mut workspace_bytes)? {
+                IndexRead::Included(file) => file,
+                IndexRead::Skipped(warning) => return Ok(Some(IndexRead::Skipped(warning))),
+            };
+        let syntax = match analyze_source(
+            path,
+            text_file.content(),
+            &absolute,
+            provider,
+            self.limits.syntax(),
+        ) {
+            Ok(syntax) => syntax,
+            Err(error) => match error.fault().left_out_file(path.clone()) {
+                Some(warning) if warning.holds_text() => {
+                    return Ok(Some(IndexRead::held_unparsed(warning)));
+                }
+                Some(warning) => return Ok(Some(IndexRead::left_out(warning))),
+                None => return Err(error),
+            },
+        };
+        let nodes = syntax.nodes_at(position).into_iter().cloned().collect();
+        let file = IndexedFile::new(
+            text_file.path().clone(),
+            Arc::clone(&text_file.content),
+            text_file.digest(),
+            text_file.executable(),
+            syntax,
+        );
+        Ok(Some(IndexRead::Included(IndexedFileNodes { file, nodes })))
+    }
+
     /// Returns one baseline text file by canonical project path.
     #[must_use]
     pub fn text_file(&self, path: &ProjectPath) -> Option<&TextSourceFile> {
@@ -2282,10 +3277,38 @@ impl WorkspaceIndex {
         checked_chunk_bytes_max(self.text_chunk_bytes_max())
     }
 
-    /// Returns syntax nodes covering byte position.
-    #[must_use]
-    pub fn nodes(&self, path: &ProjectPath, position: u64) -> Option<Vec<&SyntaxNode>> {
-        self.file(path).map(|file| file.syntax().nodes_at(position))
+    /// Parses one selected source path and returns syntax nodes covering byte position.
+    ///
+    /// The selected provider and syntax bounds belong to this index. `None` means no
+    /// provider selected the path; `Skipped` carries a catalog or syntax warning; `Included`
+    /// carries the parsed file and matching nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceIndexError`] when the provider refuses captured source or path
+    /// policy no longer identifies the held file.
+    pub fn nodes(
+        &self,
+        path: &ProjectPath,
+        position: u64,
+    ) -> Result<Option<Vec<SyntaxNode>>, WorkspaceIndexError> {
+        let Some(file) = self.file(path) else {
+            return Ok(None);
+        };
+        let absolute = self.root.join(path.as_str());
+        let Some(ClassifiedPath::Source(provider)) = self.language.classifies(&absolute)? else {
+            return Err(index_error_at(WorkspaceIndexViolation::Syntax, &absolute));
+        };
+        let syntax = analyze_source(
+            path,
+            file.source(),
+            &absolute,
+            provider,
+            self.limits.syntax(),
+        )?;
+        Ok(Some(
+            syntax.nodes_at(position).into_iter().cloned().collect(),
+        ))
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
@@ -2471,6 +3494,8 @@ impl WorkspaceIndex {
             self.limits,
             Arc::clone(&self.language),
             self.text_inclusion.clone(),
+            WorkspaceContentCache::default(),
+            None,
         )
     }
 
@@ -2627,12 +3652,10 @@ struct BuiltContents {
 /// Builds the semantics graph over `contents`, leaving out every held file whose
 /// declarations the Contribution contract refuses.
 ///
-/// The graph is built over every held document at once, so a refused Contribution
-/// names the document that carried it: the build leaves that file out, keeping its
-/// digests as it keeps a file a provider refused, and builds the graph again without
-/// it. Every pass either completes or leaves one held file out, so the passes are
-/// bounded by the held file count plus the final pass. A failure the left-out rule
-/// does not route fails the build with the fault, path attached when known.
+/// The graph is built over every held document at once. Refused Contributions name their
+/// documents, so the build leaves all such files out together, keeps their digests, then
+/// builds the graph again. A failure the left-out rule does not route fails the build with
+/// the fault, path attached when known.
 ///
 /// `declarations_max` is the publication's own capacity, the `[source]` table's
 /// `declarations`. A workspace carrying more declarations than that publishes the files
@@ -2652,8 +3675,11 @@ fn built_contents(
             &contents.text_files,
             &contents.left_out,
         );
-        let built = WorkspaceSemantics::build(
-            contents.files.values().map(|file| file.syntax()),
+        let built = WorkspaceSemantics::build_project_facts(
+            contents
+                .files
+                .values()
+                .map(|file| (file.syntax(), file.path())),
             declarations_max,
             fingerprint.revision_number(),
             previous,
@@ -2662,9 +3688,15 @@ fn built_contents(
             Ok(BuiltSemantics {
                 semantics,
                 beyond_declaration_bound,
+                refused_contributions,
             }) => {
-                if !beyond_declaration_bound.is_empty() {
+                if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty() {
                     passes = passes.saturating_add(1);
+                    leave_out_refused_contributions(
+                        &mut contents,
+                        &refused_contributions,
+                        passes < passes_max,
+                    )?;
                     leave_out_beyond_declaration_bound(
                         &mut contents,
                         &beyond_declaration_bound,
@@ -2704,6 +3736,27 @@ fn built_contents(
             return Err(error);
         }
     }
+}
+
+/// Leaves every document whose Contribution the syntax publication refused out in one pass.
+fn leave_out_refused_contributions(
+    contents: &mut IndexContents,
+    refused: &[(ProjectPath, &'static str)],
+    within_passes: bool,
+) -> Result<(), WorkspaceIndexError> {
+    for (path, field) in refused {
+        let warning = WorkspaceIndexWarning::Contribution {
+            path: path.clone(),
+            field,
+        };
+        if !within_passes || !contents.leave_out_held(path, warning) {
+            return Err(index_error_at(
+                WorkspaceIndexViolation::Provider,
+                Path::new(path.as_str()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Leaves every document the declaration bound had no room for out of `contents`.
@@ -2821,11 +3874,12 @@ impl DiscoveredPaths {
 /// deterministically; both returned lists are sorted by path. Source and text paths share one
 /// `files_max` budget, counted as they are discovered, and [`discover_forced`] spends the same
 /// budget on what the `.gitignore`-respecting walk could not reach.
-fn discover(
+fn discover_cancellable(
     root: &Path,
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
     language: &WorkspaceLanguagePolicy,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<DiscoveredPaths, WorkspaceIndexError> {
     let matcher = PathMatcher::build_with_force_include(
         root,
@@ -2837,6 +3891,7 @@ fn discover(
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
+        check_cancelled(cancelled)?;
         let entry = entry.map_err(|error| walk_error(root, error))?;
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
@@ -2849,7 +3904,7 @@ fn discover(
         };
         discovered.admit_classified(limits.files_max, path, class, language)?;
     }
-    discover_forced(root, limits, &matcher, language, &mut discovered)?;
+    discover_forced(root, limits, &matcher, language, &mut discovered, cancelled)?;
     discovered
         .source
         .sort_by(|left, right| left.0.cmp(&right.0));
@@ -2870,6 +3925,7 @@ fn discover_forced(
     matcher: &PathMatcher,
     language: &WorkspaceLanguagePolicy,
     discovered: &mut DiscoveredPaths,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), WorkspaceIndexError> {
     let reach = matcher.force_include_reach();
     if reach.is_empty() {
@@ -2883,6 +3939,7 @@ fn discover_forced(
         .chain(discovered.lockfiles.iter().cloned())
         .collect();
     for entry in forced_walk(root, limits.directory_depth_max, reach) {
+        check_cancelled(cancelled)?;
         let entry = entry.map_err(|error| walk_error(root, error))?;
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
@@ -2896,6 +3953,14 @@ fn discover_forced(
         discovered.admit_classified(limits.files_max, path, class, language)?;
     }
     Ok(())
+}
+
+fn check_cancelled(cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), WorkspaceIndexError> {
+    if cancelled() {
+        Err(index_error(WorkspaceIndexViolation::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 /// The file one walked entry names: `None` for a directory within `directory_depth_max` and
@@ -2939,10 +4004,15 @@ impl GitignoreChain {
     /// Compiles every `.gitignore` below `root`, each against its own directory.
     ///
     /// Work is bounded by [`WorkspaceIndexLimits::files_max`], counted over ignore files.
-    fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, WorkspaceIndexError> {
+    fn build_cancellable(
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, WorkspaceIndexError> {
         let mut layers = Vec::new();
         let mut ignore_files = 0_usize;
         for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
+            check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| walk_error(root, error))?;
             let path = entry.path();
             if !entry
@@ -3009,29 +4079,92 @@ fn compiled_gitignore(path: &Path) -> Result<Gitignore, WorkspaceIndexError> {
 /// against `workspace_bytes_max`, matching the catalog read the index build applies. A
 /// path whose stat matches `last` keeps its recorded digests without a read, and the
 /// returned [`LastCapture`] records this capture's paths for the next one.
+#[cfg(test)]
 fn capture_paths(
     root: &Path,
     paths: &DiscoveredPaths,
     limits: WorkspaceIndexLimits,
     last: &LastCapture,
 ) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
-    let mut workspace_bytes = 0_usize;
-    let held = paths.source.len() + paths.text.len() + paths.lockfiles.len();
-    let mut next = LastCapture::under(limits, held);
+    capture_paths_with_boundary(
+        root,
+        paths,
+        limits,
+        last,
+        CaptureBoundary::create(root),
+        root_identity(root),
+        &|| false,
+    )
+}
+
+fn capture_paths_with_boundary(
+    root: &Path,
+    paths: &DiscoveredPaths,
+    limits: WorkspaceIndexLimits,
+    last: &LastCapture,
+    boundary: Option<CaptureBoundary>,
+    root_identity: Option<(u64, u64)>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
-    let text: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
+    let other: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
+    capture_path_lists_with_boundary(
+        root,
+        limits,
+        &CapturePathLists {
+            source: &source,
+            other: &other,
+            last,
+            boundary,
+            root_identity,
+            cancelled,
+        },
+    )
+}
+
+struct CapturePathLists<'a> {
+    source: &'a [PathBuf],
+    other: &'a [PathBuf],
+    last: &'a LastCapture,
+    boundary: Option<CaptureBoundary>,
+    root_identity: Option<(u64, u64)>,
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+}
+
+fn capture_path_lists_with_boundary(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    paths: &CapturePathLists<'_>,
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+    let CapturePathLists {
+        source,
+        other,
+        last,
+        boundary,
+        root_identity,
+        cancelled,
+    } = *paths;
+    let mut workspace_bytes = 0_usize;
+    let held = source
+        .len()
+        .checked_add(other.len())
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::TooManyFiles, root))?;
+    let mut next = LastCapture::under(limits, held, boundary, root_identity);
     let mut capture = PathCapture {
         workspace_bytes: &mut workspace_bytes,
         root,
         limits,
         last,
         next: &mut next,
+        boundary,
+        root_identity,
+        cancelled,
     };
     let (source, unparsed): (Vec<_>, Vec<_>) = capture
-        .path_class(&source)?
+        .path_class(source)?
         .into_iter()
         .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
-    let text = capture.path_class(&text)?;
+    let text = capture.path_class(other)?;
     tracing::debug!(
         component = "index",
         operation = "fingerprint.bytes",
@@ -3102,7 +4235,216 @@ pub fn capture_digests_with_languages(
     languages: &LanguageFileSelections,
     last: &LastCapture,
 ) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+    capture_digests_with_languages_cancellable(
+        root,
+        limits,
+        visibility,
+        text_inclusion,
+        languages,
+        last,
+        &|| false,
+    )
+}
+
+/// Captures one effective language and text selection, checking `cancelled` between files.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] for configuration, discovery, read, configured-bound,
+/// or cancellation failures.
+///
+/// # Panics
+///
+/// Panics if all three attempts finish without a `ChangedDuringCapture` error. Each attempt
+/// that continues the retry loop records that error.
+pub fn capture_digests_with_languages_cancellable(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+    check_cancelled(cancelled)?;
+    let mut changed = None;
+    for _ in 0..3 {
+        match capture_digests_attempt(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            last,
+            cancelled,
+        ) {
+            Err(error)
+                if error.fault().violation() == WorkspaceIndexViolation::ChangedDuringCapture =>
+            {
+                changed = Some(error);
+            }
+            result => return result,
+        }
+    }
+    Err(changed.expect("three changed captures leave one change error"))
+}
+
+/// Captures indexed file states and all visible content with the same stat record.
+/// Selected source paths are read once and count against the indexed workspace-byte
+/// bound. Other visible paths use per-file, file-count, cancellation, and
+/// changed-during-capture checks, matching the visible catalog's admission.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] for configuration, discovery, read, configured-bound,
+/// or cancellation failures.
+///
+/// # Panics
+///
+/// Panics if all three attempts finish without a `ChangedDuringCapture` error. Each attempt
+/// that continues the retry loop records that error.
+pub fn capture_visible_digests_with_languages_cancellable(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+    let mut changed = None;
+    for _ in 0..3 {
+        let result: Result<_, WorkspaceIndexError> = (|| {
+            check_cancelled(cancelled)?;
+            let root = canonical_root(root)?;
+            let (indexed, mut next) = capture_digests_attempt(
+                &root,
+                limits,
+                visibility,
+                text_inclusion,
+                languages,
+                last,
+                cancelled,
+            )?;
+            let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+                &root,
+                limits,
+                visibility,
+                text_inclusion,
+                languages,
+                cancelled,
+            )?;
+            let paths = policy.visible_paths_cancellable(cancelled)?;
+            let boundary = next.boundary();
+            let root_identity = next.root_identity();
+            let mut visible = Vec::with_capacity(paths.len());
+            for batch in paths.chunks(SOURCE_BATCH_FILES) {
+                check_cancelled(cancelled)?;
+                let read: Vec<Result<(PathBuf, CapturedPath, bool), WorkspaceIndexError>> = batch
+                    .par_iter()
+                    .map(|path| {
+                        check_cancelled(cancelled)?;
+                        let absolute = root.join(path.as_str());
+                        let (capture, was_read) = match next.captured(&absolute) {
+                            Some(capture) => (capture, false),
+                            None => capture_path(&absolute, limits, last, boundary, root_identity)?,
+                        };
+                        Ok((absolute, capture, was_read))
+                    })
+                    .collect();
+                for (path, capture) in batch.iter().zip(read) {
+                    check_cancelled(cancelled)?;
+                    let (absolute, capture, was_read) = capture?;
+                    if next.captured(&absolute).is_none() {
+                        next.record(&absolute, capture, was_read);
+                    }
+                    if let Some((_, digest)) = capture.content() {
+                        visible.push((path.clone(), digest));
+                    }
+                }
+            }
+            Ok((indexed, WorkspaceDigests::new(visible), next))
+        })();
+        match result {
+            Err(error)
+                if error.fault().violation() == WorkspaceIndexViolation::ChangedDuringCapture =>
+            {
+                changed = Some(error);
+            }
+            result => return result,
+        }
+    }
+    Err(changed.expect("three changed captures leave one change error"))
+}
+
+/// Captures one publication's selected source and other paths without walking the workspace.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceIndexError`] for an invalid root, duplicate or over-bound paths, read,
+/// configured-bound, or cancellation failures.
+pub fn capture_selected_paths_cancellable(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    source: &[ProjectPath],
+    other: &[ProjectPath],
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
     let root = canonical_root(root)?;
+    let total = source
+        .len()
+        .checked_add(other.len())
+        .ok_or_else(|| index_error_at(WorkspaceIndexViolation::TooManyFiles, &root))?;
+    if total > limits.files_max() {
+        return Err(index_error_over_limit(
+            WorkspaceIndexViolation::TooManyFiles,
+            &root,
+            SOURCE_FILES_FIELD,
+            total,
+            limits.files_max(),
+        ));
+    }
+    let unique = source.iter().chain(other).collect::<BTreeSet<_>>().len();
+    if unique != total {
+        return Err(index_error(WorkspaceIndexViolation::InvalidPath));
+    }
+    let source = source
+        .iter()
+        .map(|path| root.join(path.as_str()))
+        .collect::<Vec<_>>();
+    let other = other
+        .iter()
+        .map(|path| root.join(path.as_str()))
+        .collect::<Vec<_>>();
+    let boundary = CaptureBoundary::create(&root);
+    let root_identity = root_identity(&root);
+    capture_path_lists_with_boundary(
+        &root,
+        limits,
+        &CapturePathLists {
+            source: &source,
+            other: &other,
+            last,
+            boundary,
+            root_identity,
+            cancelled,
+        },
+    )
+}
+
+fn capture_digests_attempt(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, LastCapture), WorkspaceIndexError> {
+    let root = canonical_root(root)?;
+    let boundary = CaptureBoundary::create(&root);
+    let root_identity = root_identity(&root);
     let language = rift_core::traced!(
         component = "index",
         operation = "fingerprint.language_policy",
@@ -3110,7 +4452,7 @@ pub fn capture_digests_with_languages(
     )?;
     let classified =
         rift_core::traced!(component = "index", operation = "fingerprint.discover", {
-            discover(&root, limits, visibility, &language)
+            discover_cancellable(&root, limits, visibility, &language, cancelled)
         })?;
     let source = classified.source.len();
     let text = classified.text.len() + classified.lockfiles.len();
@@ -3119,7 +4461,17 @@ pub fn capture_digests_with_languages(
         operation = "fingerprint.read",
         source = source,
         text = text,
-        { capture_paths(&root, &classified, limits, last) }
+        {
+            capture_paths_with_boundary(
+                &root,
+                &classified,
+                limits,
+                last,
+                boundary,
+                root_identity,
+                cancelled,
+            )
+        }
     )
 }
 
@@ -3131,6 +4483,9 @@ struct PathCapture<'capture> {
     limits: WorkspaceIndexLimits,
     last: &'capture LastCapture,
     next: &'capture mut LastCapture,
+    boundary: Option<CaptureBoundary>,
+    root_identity: Option<(u64, u64)>,
+    cancelled: &'capture (dyn Fn() -> bool + Sync),
 }
 
 impl PathCapture<'_> {
@@ -3144,13 +4499,24 @@ impl PathCapture<'_> {
     /// are then summed in walk order: the `workspace_bytes_max` refusal names the path a
     /// sequential read would name, and an earlier path's failure wins over a later one's.
     fn path_class(&mut self, paths: &[PathBuf]) -> Result<Vec<CapturedEntry>, WorkspaceIndexError> {
-        let (limits, last) = (self.limits, self.last);
+        check_cancelled(self.cancelled)?;
+        let (limits, last, boundary, root_identity, cancelled) = (
+            self.limits,
+            self.last,
+            self.boundary,
+            self.root_identity,
+            self.cancelled,
+        );
         let read: Vec<Result<(CapturedPath, bool), WorkspaceIndexError>> = paths
             .par_iter()
-            .map(|path| capture_path(path, limits, last))
+            .map(|path| {
+                check_cancelled(cancelled)?;
+                capture_path(path, limits, last, boundary, root_identity)
+            })
             .collect();
         let mut captured = Vec::with_capacity(paths.len());
         for (path, capture) in paths.iter().zip(read) {
+            check_cancelled(cancelled)?;
             let (capture, was_read) = capture?;
             self.next.record(path, capture, was_read);
             let Some(file) = capture.file() else {
@@ -3308,7 +4674,11 @@ fn hard_floor_includes(entry: &DirEntry) -> bool {
     if entry.path_is_symlink() {
         return false;
     }
-    !is_hard_floor_name(entry.file_name())
+    let allowed_name = !is_hard_floor_name(entry.file_name());
+    let linked_worktree = allowed_name
+        && entry.file_type().is_some_and(|kind| kind.is_dir())
+        && rift_history::Repository::is_linked_worktree(entry.path());
+    allowed_name && !linked_worktree
 }
 
 /// Applies the hard floor to one absolute event path.
@@ -3316,12 +4686,18 @@ fn hard_floor_includes_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    !relative.components().any(|component| {
+    let allowed_names = !relative.components().any(|component| {
         component
             .as_os_str()
             .to_str()
             .is_some_and(|name| WORKSPACE_IGNORED_DIRECTORIES.contains(&name))
-    })
+    });
+    let linked_worktree = allowed_names
+        && path
+            .ancestors()
+            .take_while(|ancestor| *ancestor != root)
+            .any(rift_history::Repository::is_linked_worktree);
+    allowed_names && !linked_worktree
 }
 
 /// Whether `name` is one of the hard floor's names (`.git`, `.rift`, `target`), whatever the
@@ -3393,24 +4769,28 @@ pub(crate) fn indexed_file_from_catalog(
     provider: &dyn SyntaxProvider,
     limits: SyntaxLimits,
 ) -> Result<IndexedFile, WorkspaceIndexError> {
-    let syntax = provider
-        .analyze(
-            SyntaxSource {
-                path: file.path(),
-                text: file.content(),
-            },
-            limits,
-        )
-        .map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
-        })?;
+    let syntax = analyze_source(file.path(), file.content(), context_path, provider, limits)?;
     Ok(IndexedFile::new(
         file.path().clone(),
-        file.content().to_owned(),
+        Arc::clone(&file.content),
         file.digest(),
         file.executable(),
         syntax,
     ))
+}
+
+fn analyze_source(
+    path: &ProjectPath,
+    source: &str,
+    context_path: &Path,
+    provider: &dyn SyntaxProvider,
+    limits: SyntaxLimits,
+) -> Result<rift_syntax::SyntaxDocument, WorkspaceIndexError> {
+    provider
+        .analyze(SyntaxSource { path, text: source }, limits)
+        .map_err(|error| {
+            index_error_caused_by(WorkspaceIndexViolation::Syntax, Some(context_path), error)
+        })
 }
 
 /// Includes one provider-backed file under the workspace bounds.
@@ -3455,7 +4835,7 @@ pub(crate) fn included_file(
     let digest = FileDigest::of(source.as_bytes());
     Ok(IndexedFile::new(
         project_path,
-        source,
+        Arc::new(source),
         digest,
         false,
         syntax,
@@ -3494,18 +4874,19 @@ fn count_workspace_bytes(
     context_path: &Path,
     limits: WorkspaceIndexLimits,
 ) -> Result<(), WorkspaceIndexError> {
-    *workspace_bytes = workspace_bytes
+    let total = workspace_bytes
         .checked_add(length)
         .ok_or_else(|| index_error_at(WorkspaceIndexViolation::WorkspaceTooLarge, context_path))?;
-    if *workspace_bytes > limits.workspace_bytes_max() {
+    if total > limits.workspace_bytes_max() {
         return Err(index_error_over_limit(
             WorkspaceIndexViolation::WorkspaceTooLarge,
             context_path,
             SOURCE_WORKSPACE_SIZE_FIELD,
-            *workspace_bytes,
+            total,
             limits.workspace_bytes_max(),
         ));
     }
+    *workspace_bytes = total;
     Ok(())
 }
 
@@ -3525,13 +4906,63 @@ impl ParsedSource {
         provider: &dyn SyntaxProvider,
         limits: WorkspaceIndexLimits,
         previous: Option<&WorkspaceIndex>,
+        content_cache: &WorkspaceContentCache,
     ) -> Result<IndexRead<Self>, WorkspaceIndexError> {
         Ok(match catalog_file(root, path, limits)? {
-            IndexRead::Included(text_file) => {
+            IndexRead::Included(mut text_file) => {
+                let digest = text_file.digest();
+                let syntax_limits = limits.syntax();
+                let (cached_source, cached_syntax) =
+                    content_cache.get(digest, syntax_limits, provider);
+                if let Some(source) = cached_source {
+                    text_file.content = source;
+                }
                 let parsed = match previous.and_then(|index| index.parsed_as(&text_file)) {
-                    Some(shared) => Ok(IndexRead::Included(shared)),
+                    Some(shared) => {
+                        let shared = cache_indexed_file(
+                            shared,
+                            &mut text_file,
+                            provider,
+                            syntax_limits,
+                            content_cache,
+                            limits.files_max(),
+                        );
+                        Ok(IndexRead::Included(shared))
+                    }
                     None => {
-                        syntax_read(&text_file, path, provider, limits.syntax()).map(shared_read)
+                        if let Some(syntax) = cached_syntax {
+                            let file = Arc::new(IndexedFile::new_with_shared_syntax(
+                                text_file.path().clone(),
+                                Arc::clone(&text_file.content),
+                                digest,
+                                text_file.executable(),
+                                syntax,
+                            ));
+                            Ok(IndexRead::Included(cache_indexed_file(
+                                file,
+                                &mut text_file,
+                                provider,
+                                syntax_limits,
+                                content_cache,
+                                limits.files_max(),
+                            )))
+                        } else {
+                            match syntax_read(&text_file, path, provider, syntax_limits)
+                                .map(shared_read)?
+                            {
+                                IndexRead::Included(file) => {
+                                    Ok(IndexRead::Included(cache_indexed_file(
+                                        file,
+                                        &mut text_file,
+                                        provider,
+                                        syntax_limits,
+                                        content_cache,
+                                        limits.files_max(),
+                                    )))
+                                }
+                                IndexRead::Skipped(warning) => Ok(IndexRead::Skipped(warning)),
+                            }
+                        }
                     }
                 };
                 IndexRead::Included(Self { text_file, parsed })
@@ -3547,6 +4978,36 @@ fn shared_read(read: IndexRead<IndexedFile>) -> IndexRead<Arc<IndexedFile>> {
     match read {
         IndexRead::Included(file) => IndexRead::Included(Arc::new(file)),
         IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+    }
+}
+
+fn cache_indexed_file(
+    file: Arc<IndexedFile>,
+    text_file: &mut TextSourceFile,
+    provider: &dyn SyntaxProvider,
+    syntax_limits: SyntaxLimits,
+    cache: &WorkspaceContentCache,
+    entries_max: usize,
+) -> Arc<IndexedFile> {
+    let (source, syntax) = cache.insert(
+        file.digest(),
+        syntax_limits,
+        provider,
+        file.source_content(),
+        file.syntax_facts(),
+        entries_max,
+    );
+    text_file.content = Arc::clone(&source);
+    if Arc::ptr_eq(file.source_content(), &source) && Arc::ptr_eq(file.syntax_facts(), &syntax) {
+        file
+    } else {
+        Arc::new(IndexedFile::new_with_shared_syntax(
+            text_file.path().clone(),
+            source,
+            file.digest(),
+            text_file.executable(),
+            syntax,
+        ))
     }
 }
 
@@ -3572,10 +5033,20 @@ fn catalog_file(
     limits: WorkspaceIndexLimits,
 ) -> Result<IndexRead<TextSourceFile>, WorkspaceIndexError> {
     let handle = fs::File::open(path).map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        let violation = if error.kind() == std::io::ErrorKind::NotFound {
+            WorkspaceIndexViolation::ChangedDuringCapture
+        } else {
+            WorkspaceIndexViolation::Filesystem
+        };
+        index_error_caused_by(violation, Some(path), error)
     })?;
     let metadata = handle.metadata().map_err(|error| {
-        index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+        let violation = if error.kind() == std::io::ErrorKind::NotFound {
+            WorkspaceIndexViolation::ChangedDuringCapture
+        } else {
+            WorkspaceIndexViolation::Filesystem
+        };
+        index_error_caused_by(violation, Some(path), error)
     })?;
     let bytes = read_file_bytes(handle, path, limits)?;
     let project_path = project_path_below(root, path)?;
@@ -3738,6 +5209,40 @@ fn symbol_document(
         declaration_fields(symbol),
         left_out,
     )
+}
+
+fn symbol_document_key(file: &IndexedFile, limits: SyntaxLimits) -> SymbolDocumentKey {
+    SymbolDocumentKey {
+        digest: file.digest(),
+        language: file.syntax().language().identity_segment(),
+        source_bytes_max: limits.source_bytes_max(),
+        syntax_nodes_max: limits.syntax_nodes_max(),
+        syntax_depth_max: limits.syntax_depth_max(),
+    }
+}
+
+fn carried_symbol_documents(
+    previous: Option<&WorkspaceIndex>,
+    files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    limits: SyntaxLimits,
+) -> RwLock<BTreeMap<ProjectPath, CachedSymbolDocuments>> {
+    let mut carried = BTreeMap::new();
+    if let Some(previous) = previous.filter(|previous| previous.limits.syntax() == limits) {
+        let previous_cache = previous
+            .symbol_documents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (path, file) in files {
+            let shared_file = previous
+                .files
+                .get(path)
+                .is_some_and(|previous_file| Arc::ptr_eq(previous_file, file));
+            if shared_file && let Some(cached) = previous_cache.get(path) {
+                carried.insert(path.clone(), cached.clone());
+            }
+        }
+    }
+    RwLock::new(carried)
 }
 
 /// The searchable fields one declaration fills: equal bytes produce equal fields and one
@@ -4006,6 +5511,256 @@ mod tests {
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};
 
     #[test]
+    fn shared_content_cache_reuses_facts_and_releases_them_after_workspace_drop() {
+        let source = "pub fn beacon() {}\n";
+        let first_root = tempfile::tempdir().expect("first workspace");
+        let second_root = tempfile::tempdir().expect("second workspace");
+        let changed_root = tempfile::tempdir().expect("changed workspace");
+        let final_root = tempfile::tempdir().expect("final workspace");
+        fs::create_dir_all(first_root.path().join("src")).expect("first source directory");
+        fs::create_dir_all(second_root.path().join("lib")).expect("second source directory");
+        fs::create_dir_all(changed_root.path().join("other")).expect("changed source directory");
+        fs::create_dir_all(final_root.path().join("next")).expect("final source directory");
+        fs::write(first_root.path().join("src/first.rs"), source).expect("first source");
+        fs::write(second_root.path().join("lib/second.rs"), source).expect("same source");
+        fs::write(changed_root.path().join("other/changed.rs"), source).expect("same bytes");
+        fs::write(
+            final_root.path().join("next/final.rs"),
+            "pub fn lantern() {}\n",
+        )
+        .expect("new source");
+
+        let cache = WorkspaceContentCache::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let limits = WorkspaceIndexLimits::default();
+        let build = |root: &Path, limits, cache: &WorkspaceContentCache| {
+            WorkspaceIndex::build_with_languages_cancellable_and_cache(
+                root,
+                limits,
+                &visibility,
+                &text,
+                &languages,
+                cache,
+                &|| false,
+            )
+            .expect("workspace builds")
+        };
+
+        let first = build(first_root.path(), limits, &cache);
+        let first_path = ProjectPath::new("src/first.rs").expect("first project path");
+        let first_file = first.file(&first_path).expect("first indexed file");
+        let source_weak = Arc::downgrade(first_file.source_content());
+        let syntax_weak = Arc::downgrade(first_file.syntax_facts());
+
+        let second = build(second_root.path(), limits, &cache);
+        let second_path = ProjectPath::new("lib/second.rs").expect("second project path");
+        let second_file = second.file(&second_path).expect("second indexed file");
+        assert!(Arc::ptr_eq(
+            first_file.source_content(),
+            second_file.source_content()
+        ));
+        assert!(Arc::ptr_eq(
+            first_file.syntax_facts(),
+            second_file.syntax_facts()
+        ));
+        assert_eq!(first_file.path().as_str(), "src/first.rs");
+        assert_eq!(second_file.path().as_str(), "lib/second.rs");
+        assert_eq!(first_file.syntax().symbols()[0].name, "beacon");
+        assert_eq!(first_file.source(), source);
+
+        let syntax = limits.syntax();
+        let changed_syntax = SyntaxLimits::new(
+            syntax.source_bytes_max() - 1,
+            syntax.syntax_nodes_max(),
+            syntax.syntax_depth_max(),
+        )
+        .expect("changed syntax bound");
+        let changed_limits = limits.with_syntax(changed_syntax);
+        let changed = build(changed_root.path(), changed_limits, &cache);
+        let changed_path = ProjectPath::new("other/changed.rs").expect("changed project path");
+        let changed_file = changed.file(&changed_path).expect("changed indexed file");
+        assert!(!Arc::ptr_eq(
+            first_file.source_content(),
+            changed_file.source_content()
+        ));
+        assert!(!Arc::ptr_eq(
+            first_file.syntax_facts(),
+            changed_file.syntax_facts()
+        ));
+        assert_eq!(first_file.syntax().symbols()[0].name, "beacon");
+
+        drop(first);
+        drop(second);
+        drop(changed);
+        assert!(source_weak.upgrade().is_none());
+        assert!(syntax_weak.upgrade().is_none());
+        assert_eq!(cache.entry_count(), 2);
+
+        let final_limits = WorkspaceIndexLimits::new(
+            1,
+            limits.file_bytes_max(),
+            limits.workspace_bytes_max(),
+            limits.directory_depth_max(),
+            limits.results_max(),
+        )
+        .expect("one-file bound");
+        let final_index = build(final_root.path(), final_limits, &cache);
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(
+            final_index
+                .files()
+                .next()
+                .expect("final indexed file")
+                .syntax()
+                .symbols()[0]
+                .name,
+            "lantern"
+        );
+    }
+
+    fn assert_symbol_groups_match_index(index: &WorkspaceIndex, groups: &[Arc<[IndexDocument]>]) {
+        assert_eq!(
+            groups
+                .iter()
+                .flat_map(|group| group.iter().cloned())
+                .collect::<Vec<_>>(),
+            index
+                .index_documents()
+                .into_iter()
+                .filter(|document| document.kind() == DocumentKind::Symbol)
+                .collect::<Vec<_>>(),
+            "grouped cache preserves symbol unit fields and order"
+        );
+    }
+
+    fn assert_symbol_documents_do_not_carry_for_path_or_language(
+        index: &WorkspaceIndex,
+        path: &ProjectPath,
+        file: &IndexedFile,
+        limits: SyntaxLimits,
+    ) {
+        let moved_path = ProjectPath::new("moved.rs").expect("moved path");
+        let moved_file = Arc::new(IndexedFile::new_with_shared_syntax(
+            moved_path.clone(),
+            Arc::clone(file.source_content()),
+            file.digest(),
+            file.executable(),
+            Arc::clone(file.syntax_facts()),
+        ));
+        let moved = BTreeMap::from([(moved_path, moved_file)]);
+        assert!(
+            carried_symbol_documents(Some(index), &moved, limits)
+                .read()
+                .expect("document cache lock")
+                .is_empty()
+        );
+
+        let python = registry::provider_for_extension("py").expect("Python provider");
+        let python_facts = python
+            .analyze(
+                SyntaxSource {
+                    path,
+                    text: file.source(),
+                },
+                limits,
+            )
+            .expect("Python provider accepts source")
+            .into_facts();
+        let different_language = Arc::new(IndexedFile::new_with_shared_syntax(
+            path.clone(),
+            Arc::clone(file.source_content()),
+            file.digest(),
+            file.executable(),
+            python_facts,
+        ));
+        let other_language = BTreeMap::from([(path.clone(), different_language)]);
+        assert!(
+            carried_symbol_documents(Some(index), &other_language, limits)
+                .read()
+                .expect("document cache lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn vector_symbol_documents_share_unchanged_files_only() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::write(root.join("a.rs"), "pub fn alpha() {}\n").expect("first source");
+        fs::write(root.join("b.rs"), "pub fn bravo() {}\n").expect("second source");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let inclusion = TextFileInclusion::default();
+        let first =
+            WorkspaceIndex::build(root, limits, &visibility, &inclusion).expect("workspace builds");
+
+        assert!(
+            first
+                .symbol_documents
+                .read()
+                .expect("document cache lock")
+                .is_empty()
+        );
+        let lexical = first.index_documents();
+        assert_eq!(
+            lexical
+                .iter()
+                .filter(|document| document.kind() == DocumentKind::Symbol)
+                .count(),
+            2
+        );
+        assert!(
+            first
+                .symbol_documents
+                .read()
+                .expect("document cache lock")
+                .is_empty()
+        );
+
+        let first_groups = first.symbol_index_documents_by_file();
+        assert_eq!(first_groups.len(), 2);
+        let original_path = ProjectPath::new("a.rs").expect("original path");
+        let original_file = first.file(&original_path).expect("indexed file");
+        assert_symbol_documents_do_not_carry_for_path_or_language(
+            &first,
+            &original_path,
+            original_file,
+            limits.syntax(),
+        );
+
+        let changed_path = ProjectPath::new("b.rs").expect("changed path");
+        let changed_content = "pub fn charlie() {}\n";
+        fs::write(root.join("b.rs"), changed_content).expect("changed source");
+        let changes = resolved(&first, root, &["b.rs"]);
+        let rebuilt = first.rebuilt(&changes).expect("incremental rebuild");
+        let rebuilt_groups = rebuilt.symbol_index_documents_by_file();
+
+        assert!(Arc::ptr_eq(&first_groups[0], &rebuilt_groups[0]));
+        assert!(!Arc::ptr_eq(&first_groups[1], &rebuilt_groups[1]));
+        assert_symbol_groups_match_index(&rebuilt, &rebuilt_groups);
+        assert_eq!(
+            rebuilt
+                .file(&changed_path)
+                .expect("changed indexed file")
+                .syntax()
+                .symbols()[0]
+                .name,
+            "charlie"
+        );
+
+        let limits_changed = SyntaxLimits::new(
+            limits.syntax().source_bytes_max(),
+            limits.syntax().syntax_nodes_max() - 1,
+            limits.syntax().syntax_depth_max(),
+        )
+        .expect("changed syntax bounds");
+        let invalidated = carried_symbol_documents(Some(&rebuilt), &rebuilt.files, limits_changed);
+        assert!(invalidated.read().expect("document cache lock").is_empty());
+    }
+
+    #[test]
     fn test_a_pass_counts_what_it_left_out_and_keeps_the_first_of_them() {
         // The pass raises one record however many declarations it refused. One
         // per declaration would fill the bounded log store from a workspace
@@ -4063,6 +5818,693 @@ mod tests {
         directory
     }
 
+    fn prepared_fixture() -> (tempfile::TempDir, WorkspaceIndexPreparation, usize) {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        for file in 0..SOURCE_BATCH_FILES {
+            fs::write(
+                directory.path().join(format!("file-{file:04}.txt")),
+                format!("file {file}\n"),
+            )
+            .expect("fixture file");
+        }
+        fs::create_dir_all(directory.path().join("src")).expect("source directory");
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn prepared_source() {}\n",
+        )
+        .expect("source fixture");
+        fs::write(directory.path().join("Cargo.lock"), "version = 4\n").expect("lockfile fixture");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(directory.path(), limits, &text_inclusion, &languages)
+                .expect("preparation configuration");
+        let total = preparation
+            .discover(&visibility, &|| false)
+            .expect("selected paths");
+        (directory, preparation, total)
+    }
+
+    fn assert_empty_and_selected(preparation: &WorkspaceIndexPreparation, total: usize) {
+        let empty = preparation.empty_snapshot().expect("empty index");
+        assert_eq!(empty.text_file_count(), 0);
+        assert_eq!(preparation.prepared(), 0);
+        assert_eq!(preparation.total(), Some(total));
+        assert_eq!(total, SOURCE_BATCH_FILES + 2);
+        let selected = preparation
+            .selected_paths()
+            .expect("selected path identities")
+            .expect("discovery completed");
+        assert_eq!(selected.len(), total);
+        assert_eq!(selected.iter().collect::<BTreeSet<_>>().len(), total);
+        assert_eq!(preparation.next_checkpoint(), Some(SOURCE_BATCH_FILES));
+    }
+
+    fn assert_partial_preparation(
+        preparation: &mut WorkspaceIndexPreparation,
+        total: usize,
+    ) -> WorkspaceIndex {
+        let partial = preparation
+            .advance_to(SOURCE_BATCH_FILES, &|| false)
+            .expect("first publication");
+        assert_eq!(preparation.prepared(), SOURCE_BATCH_FILES);
+        assert_eq!(partial.text_file_count(), SOURCE_BATCH_FILES);
+        assert_eq!(partial.file_count(), 1);
+        assert_eq!(
+            preparation.prepared_paths().expect("prepared paths").len(),
+            SOURCE_BATCH_FILES
+        );
+        assert_eq!(preparation.next_checkpoint(), Some(total));
+        partial
+    }
+
+    fn assert_complete_preparation(
+        directory: &Path,
+        preparation: &mut WorkspaceIndexPreparation,
+        total: usize,
+        partial: &WorkspaceIndex,
+    ) {
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let complete = preparation
+            .advance_to(total, &|| false)
+            .expect("complete publication");
+        let fresh = WorkspaceIndex::build_with_languages(
+            directory,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+        )
+        .expect("fresh index");
+        assert_eq!(complete.text_file_count(), SOURCE_BATCH_FILES + 1);
+        assert_eq!(preparation.prepared(), total);
+        assert_eq!(preparation.next_checkpoint(), None);
+        assert_eq!(complete.digests(), fresh.digests());
+        assert_eq!(complete.index_documents(), fresh.index_documents());
+        let source = ProjectPath::new("src/lib.rs").expect("source path");
+        assert!(Arc::ptr_eq(
+            partial.files.get(&source).expect("partial source"),
+            complete.files.get(&source).expect("complete source"),
+        ));
+    }
+
+    fn two_text_preparation() -> (tempfile::TempDir, WorkspaceIndexPreparation) {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        for name in ["first.txt", "second.txt"] {
+            fs::write(directory.path().join(name), format!("{name}\n")).expect("fixture text");
+        }
+        let mut preparation = WorkspaceIndexPreparation::new(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )
+        .expect("preparation configuration");
+        assert_eq!(
+            preparation
+                .discover(&SourceVisibility::default(), &|| false)
+                .expect("selected paths"),
+            2
+        );
+        (directory, preparation)
+    }
+
+    #[test]
+    fn preparation_reuses_previous_documentation_when_target_arrives() {
+        use rift_protocol::documentation::DocumentationLinkResolution;
+
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir(root.join("docs")).expect("documentation directory");
+        fs::write(
+            root.join("docs/README.md"),
+            "# Guide\n\n[Notes](notes.md)\n",
+        )
+        .expect("guide");
+        fs::write(root.join("docs/notes.md"), "# Notes\n\nText.\n").expect("notes");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = TextFileInclusion::new(vec!["docs/*.md".to_owned()], 1_024);
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(root, limits, &text_inclusion, &languages)
+                .expect("preparation configuration");
+        assert_eq!(
+            preparation
+                .discover(&visibility, &|| false)
+                .expect("selected paths"),
+            2
+        );
+
+        let first = preparation
+            .advance_to(1, &|| false)
+            .expect("first publication");
+        assert!(
+            preparation.accepts_previous(&first),
+            "same accepted inputs permit reuse"
+        );
+        let unresolved = |index: &WorkspaceIndex| {
+            index.documentation().index().links.iter().any(|link| {
+                link.authored == "notes.md"
+                    && matches!(
+                        link.resolution,
+                        DocumentationLinkResolution::Unresolved { .. }
+                    )
+            })
+        };
+        assert!(
+            unresolved(&first),
+            "target has not arrived yet; prepared={:?}; sources={:?}; links={:?}",
+            preparation.prepared_paths().expect("prepared paths"),
+            first.documentation().index().sources,
+            first.documentation().index().links
+        );
+
+        let complete = preparation
+            .advance_to_with_previous(2, Some(&first), &|| false)
+            .expect("complete publication");
+        let cold = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+        )
+        .expect("cold index");
+        assert_eq!(
+            complete.documentation().index(),
+            cold.documentation().index()
+        );
+        assert_eq!(complete.index_documents(), cold.index_documents());
+        assert!(complete.documentation().index().links.iter().any(|link| {
+            link.authored == "notes.md"
+                && matches!(
+                    link.resolution,
+                    DocumentationLinkResolution::Resolved { .. }
+                )
+        }));
+        assert!(unresolved(&first), "earlier publication stays unchanged");
+    }
+
+    #[test]
+    fn preparation_reuses_previous_semantics_when_source_arrives() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::create_dir(root.join("src")).expect("source directory");
+        fs::write(root.join("src/a.rs"), "pub fn first() {}\n").expect("first source");
+        fs::write(root.join("src/b.rs"), "pub fn second() {}\n").expect("second source");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text_inclusion = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(root, limits, &text_inclusion, &languages)
+                .expect("preparation configuration");
+        assert_eq!(
+            preparation
+                .discover(&visibility, &|| false)
+                .expect("selected paths"),
+            2
+        );
+        let first = preparation
+            .advance_to(1, &|| false)
+            .expect("first source publication");
+        assert_eq!(first.symbols("first", 10).expect("first symbol").len(), 1);
+        let complete = preparation
+            .advance_to_with_previous(2, Some(&first), &|| false)
+            .expect("complete source publication");
+        let cold = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &text_inclusion,
+            &languages,
+        )
+        .expect("cold index");
+        for query in ["first", "second"] {
+            let symbol_facts = |index: &WorkspaceIndex| {
+                index
+                    .symbols(query, 10)
+                    .expect("symbol query")
+                    .into_iter()
+                    .map(|matched| {
+                        (
+                            matched.file.path().as_str().to_owned(),
+                            matched.symbol.qualified_name.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(symbol_facts(&complete), symbol_facts(&cold));
+        }
+        assert_eq!(complete.index_documents(), cold.index_documents());
+    }
+
+    #[test]
+    fn preparation_skips_reuse_when_text_selection_changes() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        fs::write(root.join("README.md"), "# Guide\n").expect("guide");
+        fs::write(root.join("notes.txt"), "Notes\n").expect("notes");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let languages = LanguageFileSelections::default();
+        let prior_inclusion = TextFileInclusion::new(Vec::new(), 1_024);
+        let prior = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &prior_inclusion,
+            &languages,
+        )
+        .expect("prior index");
+        let changed_inclusion = TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024);
+        let mut preparation =
+            WorkspaceIndexPreparation::new(root, limits, &changed_inclusion, &languages)
+                .expect("changed preparation configuration");
+        let total = preparation
+            .discover(&visibility, &|| false)
+            .expect("selected paths");
+        assert!(
+            !preparation.accepts_previous(&prior),
+            "changed text selection cannot reuse prior derived data"
+        );
+        let actual = preparation
+            .advance_to_with_previous(total, Some(&prior), &|| false)
+            .expect("changed-policy index");
+        let cold = WorkspaceIndex::build_with_languages(
+            root,
+            limits,
+            &visibility,
+            &changed_inclusion,
+            &languages,
+        )
+        .expect("cold changed-policy index");
+        assert_eq!(actual.documentation().index(), cold.documentation().index());
+        assert_eq!(actual.index_documents(), cold.index_documents());
+    }
+
+    #[test]
+    fn preparation_rejects_previous_with_changed_root_limits_text_or_language() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let root = directory.path();
+        let limits = WorkspaceIndexLimits::default();
+        let text_inclusion = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let mut preparation =
+            WorkspaceIndexPreparation::new(root, limits, &text_inclusion, &languages)
+                .expect("preparation configuration");
+        let previous = preparation.empty_snapshot().expect("empty index");
+        assert!(preparation.accepts_previous(&previous));
+
+        preparation.root.push("other");
+        assert!(!preparation.accepts_previous(&previous), "root must match");
+        preparation.root = previous.root.clone();
+
+        preparation.limits = limits
+            .with_workspace_bounds(
+                limits.files_max() - 1,
+                limits.workspace_bytes_max(),
+                limits.declarations_max(),
+            )
+            .expect("changed bounds");
+        assert!(
+            !preparation.accepts_previous(&previous),
+            "bounds must match"
+        );
+        preparation.limits = limits;
+
+        preparation.text_inclusion = TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024);
+        assert!(
+            !preparation.accepts_previous(&previous),
+            "text selection must match"
+        );
+        preparation.text_inclusion = text_inclusion;
+        preparation.language = Arc::new(
+            WorkspaceLanguagePolicy::build(
+                &preparation.root,
+                &languages,
+                &preparation.text_inclusion,
+            )
+            .expect("compiled language policy"),
+        );
+        assert!(
+            !preparation.accepts_previous(&previous),
+            "compiled language policy must match"
+        );
+    }
+
+    #[test]
+    fn preparation_resumes_after_cancellation_with_completed_prefix() {
+        let (directory, mut preparation) = two_text_preparation();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 4;
+        let error = preparation
+            .advance_to(2, &cancelled)
+            .expect_err("cancellation stops before next text file");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Cancelled
+        );
+        assert_eq!(preparation.prepared(), 1);
+        let partial = preparation
+            .advance_to(1, &|| false)
+            .expect("completed prefix remains publishable");
+        assert_eq!(partial.text_file_count(), 1);
+        let complete = preparation
+            .advance_to(2, &|| false)
+            .expect("retry resumes at next file");
+        let fresh = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("fresh index");
+        assert_eq!(complete.digests(), fresh.digests());
+    }
+
+    #[test]
+    fn preparation_resumes_after_a_discovered_file_returns() {
+        let (directory, mut preparation) = two_text_preparation();
+        let removed = directory.path().join("second.txt");
+        fs::remove_file(&removed).expect("remove selected path");
+        let error = preparation
+            .advance_to(2, &|| false)
+            .expect_err("a path removed after discovery names capture movement");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::ChangedDuringCapture
+        );
+        assert_eq!(preparation.prepared(), 1);
+        let source = std::error::Error::source(&error).expect("original read cause");
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .expect("filesystem cause")
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "the returned capture movement retains its NotFound cause"
+        );
+        fs::write(&removed, "second.txt\n").expect("restore selected path");
+        let complete = preparation
+            .advance_to(2, &|| false)
+            .expect("retry resumes at the changed path");
+        let fresh = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("fresh index");
+        assert_eq!(complete.digests(), fresh.digests());
+    }
+
+    #[test]
+    fn workspace_byte_bound_refusal_keeps_previous_count() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let limits = WorkspaceIndexLimits::default()
+            .with_workspace_bounds(
+                WorkspaceIndexLimits::default().files_max(),
+                4,
+                WorkspaceIndexLimits::default().declarations_max(),
+            )
+            .expect("positive bounds");
+        let path = directory.path().join("file.txt");
+        let mut workspace_bytes = 3;
+        let error = count_workspace_bytes(&mut workspace_bytes, 2, &path, limits)
+            .expect_err("aggregate limit crossed");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        assert_eq!(workspace_bytes, 3, "failed file does not advance count");
+    }
+
+    #[test]
+    fn preparation_publishes_empty_partial_and_complete_indexes() {
+        let (directory, mut preparation, total) = prepared_fixture();
+        assert_empty_and_selected(&preparation, total);
+        let partial = assert_partial_preparation(&mut preparation, total);
+        let (partial_capture, last) = preparation
+            .capture_prepared_paths(&LastCapture::default(), &|| false)
+            .expect("capture prepared paths");
+        assert_eq!(partial_capture, partial.digests());
+        assert_complete_preparation(directory.path(), &mut preparation, total, &partial);
+        let complete = preparation
+            .advance_to(total, &|| false)
+            .expect("complete index");
+        let (complete_capture, _) = preparation
+            .capture_prepared_paths(&last, &|| false)
+            .expect("capture complete paths");
+        assert_eq!(complete_capture, complete.digests());
+    }
+
+    #[test]
+    fn preparation_retains_incremental_rebuild_of_a_changed_prepared_file() {
+        let (directory, mut preparation) = two_text_preparation();
+        let partial = preparation
+            .advance_to(1, &|| false)
+            .expect("first selected file");
+        let (_, last) = preparation
+            .capture_prepared_paths(&LastCapture::default(), &|| false)
+            .expect("first selected capture");
+        fs::write(directory.path().join("first.txt"), "updated text\n")
+            .expect("rewrite prepared file");
+        let (captured, _) = preparation
+            .capture_prepared_paths(&last, &|| false)
+            .expect("capture changed prepared file");
+        let changes = PathChanges::between(&partial.digests(), &captured);
+        assert_eq!(changes.len(), 1, "only rewritten file changed");
+        let repaired = partial
+            .rebuilt_cancellable(&changes, &|| false)
+            .expect("incremental repair");
+        preparation.retain_rebuilt_snapshot(&repaired);
+        let complete = preparation
+            .advance_to(2, &|| false)
+            .expect("continue after repair");
+        let fresh = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("fresh index");
+        assert_eq!(complete.digests(), fresh.digests());
+        assert_eq!(complete.text_file_count(), 2);
+    }
+
+    #[test]
+    fn preparation_rebuild_retains_bytes_for_declaration_bound_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let first = b"pub fn alpha() {}\npub fn bravo() {}\n";
+        let later = b"version = 3\n";
+        let replacement = b"pub fn delta() {}\npub fn gamma() {}\npub fn epsilon() {}\n";
+        fs::write(root.join("a.rs"), first)?;
+        fs::write(root.join("Cargo.lock"), later)?;
+        let limits = WorkspaceIndexLimits::default().with_workspace_bounds(
+            WorkspaceIndexLimits::default().files_max(),
+            replacement.len() + later.len() - 1,
+            1,
+        )?;
+        let mut preparation = WorkspaceIndexPreparation::new(
+            root,
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+        assert_eq!(
+            preparation.discover(&SourceVisibility::default(), &|| false)?,
+            2
+        );
+
+        let partial = preparation.advance_to(1, &|| false)?;
+        let first_path = ProjectPath::new("a.rs")?;
+        assert!(partial.file(&first_path).is_none());
+        assert!(matches!(
+            partial
+                .warnings()
+                .iter()
+                .find(|warning| warning.path() == &first_path),
+            Some(WorkspaceIndexWarning::DeclarationsBeyondBound(_))
+        ));
+        let (before, last) =
+            preparation.capture_prepared_paths(&LastCapture::default(), &|| false)?;
+        assert!(PathChanges::between(&partial.digests(), &before).is_empty());
+
+        fs::write(root.join("a.rs"), replacement)?;
+        let cold_error = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect_err("cold indexing must count declaration-refused source bytes");
+        assert_eq!(
+            cold_error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        let (captured, _) = preparation.capture_prepared_paths(&last, &|| false)?;
+        let changes = PathChanges::between(&partial.digests(), &captured);
+        assert_eq!(changes.len(), 1);
+        let rebuilt = partial.rebuilt_cancellable(&changes, &|| false)?;
+        preparation.retain_rebuilt_snapshot(&rebuilt);
+
+        let error = preparation
+            .advance_to(2, &|| false)
+            .expect_err("later lockfile must exceed bound after counted earlier source");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_rebuild_releases_bytes_for_a_deleted_declaration_bound_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let first = b"pub fn alpha() {}\npub fn bravo() {}\n";
+        let later = b"version = 3\n";
+        fs::write(root.join("a.rs"), first)?;
+        fs::write(root.join("Cargo.lock"), later)?;
+        let limits = WorkspaceIndexLimits::default().with_workspace_bounds(
+            WorkspaceIndexLimits::default().files_max(),
+            first.len() + later.len() - 1,
+            1,
+        )?;
+        let mut preparation = WorkspaceIndexPreparation::new(
+            root,
+            limits,
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )?;
+        assert_eq!(
+            preparation.discover(&SourceVisibility::default(), &|| false)?,
+            2
+        );
+        let partial = preparation.advance_to(1, &|| false)?;
+        let first_path = ProjectPath::new("a.rs")?;
+        assert!(partial.file(&first_path).is_none());
+
+        fs::remove_file(root.join("a.rs"))?;
+        let changes =
+            PathChanges::resolve([(first_path.clone(), None)], |path| partial.record(path));
+        let rebuilt = partial.rebuilt_cancellable(&changes, &|| false)?;
+        preparation.retain_rebuilt_snapshot(&rebuilt);
+        let complete = preparation.advance_to(2, &|| false)?;
+        let fresh = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        assert_eq!(complete.digests(), fresh.digests());
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilt_counts_a_retained_lockfile_with_a_growing_refused_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let first = b"pub fn alpha() {}\npub fn bravo() {}\n";
+        let later = b"version = 3\n";
+        let replacement = b"pub fn delta() {}\npub fn gamma() {}\n// grow\n";
+        fs::write(root.join("a.rs"), first)?;
+        fs::write(root.join("Cargo.lock"), later)?;
+        let limits = WorkspaceIndexLimits::default().with_workspace_bounds(
+            WorkspaceIndexLimits::default().files_max(),
+            first.len() + later.len(),
+            1,
+        )?;
+        let previous = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        assert_eq!(counted_bytes(&previous), first.len() + later.len());
+
+        let source_path = ProjectPath::new("a.rs")?;
+        fs::write(root.join("a.rs"), replacement)?;
+        let changes = PathChanges::resolve(
+            [(
+                source_path.clone(),
+                Some(FileRecord::Digest(FileDigest::of(replacement))),
+            )],
+            |path| previous.record(path),
+        );
+        let cold_error = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect_err("cold indexing counts retained lockfile bytes");
+        let rebuilt_error = previous
+            .rebuilt_cancellable(&changes, &|| false)
+            .expect_err("incremental rebuild counts retained lockfile bytes");
+        assert_eq!(
+            cold_error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        assert_eq!(
+            rebuilt_error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilt_recounts_a_shrinking_refused_source() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let first = b"pub fn alpha() {}\npub fn bravo() {}\n";
+        let later = b"version = 3\n";
+        let replacement = b"pub fn kept() {}\n";
+        fs::write(root.join("a.rs"), first)?;
+        fs::write(root.join("Cargo.lock"), later)?;
+        let limits = WorkspaceIndexLimits::default().with_workspace_bounds(
+            WorkspaceIndexLimits::default().files_max(),
+            first.len() + later.len(),
+            1,
+        )?;
+        let previous = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        let source_path = ProjectPath::new("a.rs")?;
+        fs::write(root.join("a.rs"), replacement)?;
+        let changes = PathChanges::resolve(
+            [(
+                source_path,
+                Some(FileRecord::Digest(FileDigest::of(replacement))),
+            )],
+            |path| previous.record(path),
+        );
+        let rebuilt = previous.rebuilt_cancellable(&changes, &|| false)?;
+        let cold = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        assert_eq!(rebuilt.digests(), cold.digests());
+        assert_eq!(counted_bytes(&rebuilt), replacement.len() + later.len());
+        Ok(())
+    }
+
     /// Builds one index over `directory` under the default policies.
     fn indexed(directory: &Path, text_inclusion: &TextFileInclusion) -> WorkspaceIndex {
         WorkspaceIndex::build(
@@ -4076,7 +6518,7 @@ mod tests {
 
     /// Every byte baseline catalog counts against aggregate bound.
     fn counted_bytes(index: &WorkspaceIndex) -> usize {
-        WorkspaceIndex::indexed_bytes(&index.files, &index.text_files)
+        WorkspaceIndex::indexed_bytes(&index.files, &index.text_files, &index.left_out)
     }
 
     /// Resolves the paths named against `index`, reading each one's current bytes.
@@ -4664,7 +7106,28 @@ mod tests {
         let source = index.source_matches("pub struct", 5).expect("lexical read");
         assert_eq!(source[0].1, 1);
         let path = ProjectPath::new("src/lib.rs").expect("fixture path");
-        assert!(!index.nodes(&path, 4).expect("indexed path").is_empty());
+        let file = index.file(&path).expect("indexed source");
+        let provider = registry::provider_for_language(file.syntax().language())
+            .expect("language has syntax provider");
+        let complete = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: file.source(),
+                },
+                index.limits().syntax(),
+            )
+            .expect("complete syntax parse");
+        let expected = complete
+            .nodes_at(4)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index.nodes(&path, 4).expect("node parse"),
+            Some(expected),
+            "reparsed nodes preserve complete provider rows and order"
+        );
     }
 
     /// `README.txt` reaches the index only through the text lane; `text_matches` finds its
@@ -4763,6 +7226,94 @@ mod tests {
             policy.visible(&directory.path().join("logo.png")),
             "visibility does not depend on a file extension"
         );
+    }
+
+    #[test]
+    fn test_nested_linked_worktree_is_excluded_from_walk_capture_and_events() {
+        use rift_history::fixture::{commit_all, git, init};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        init(root);
+        fs::write(root.join("lib.rs"), "pub fn main_beacon() {}\n").expect("main source");
+        commit_all(root, "initial source");
+        git(root, &["worktree", "add", "--detach", "linked", "HEAD"]);
+        let independent = root.join("independent");
+        fs::create_dir(&independent).expect("nested repository");
+        init(&independent);
+        fs::write(
+            independent.join("lib.rs"),
+            "pub fn independent_beacon() {}\n",
+        )
+        .expect("independent source");
+        let origin = tempfile::tempdir().expect("submodule origin");
+        init(origin.path());
+        fs::write(
+            origin.path().join("lib.rs"),
+            "pub fn submodule_beacon() {}\n",
+        )
+        .expect("submodule source");
+        commit_all(origin.path(), "submodule source");
+        let origin_path = origin.path().to_str().expect("fixture path");
+        git(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                origin_path,
+                "module",
+            ],
+        );
+        let visibility = SourceVisibility::new(Vec::new(), Vec::new(), false)
+            .with_force_include(vec!["linked/**".to_owned()]);
+        let policy = WorkspaceSourcePolicy::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("workspace policy");
+        let paths = policy.visible_paths().expect("visible source");
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.as_str().starts_with("linked/"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.as_str() == "independent/lib.rs")
+        );
+        assert!(paths.iter().any(|path| path.as_str() == "module/lib.rs"));
+        assert!(!policy.visible(&root.join("linked/lib.rs")));
+        assert!(!policy.may_include_descendant(&root.join("linked")));
+        let index = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("workspace index");
+        let capture = capture_digests(root, WorkspaceIndexLimits::default(), &visibility)
+            .expect("workspace capture");
+        assert_eq!(capture.fingerprint(), *index.fingerprint());
+        assert!(
+            capture
+                .iter()
+                .all(|(path, _)| !path.as_str().starts_with("linked/"))
+        );
+        assert!(has_symbol(&index, "independent_beacon"));
+        assert!(has_symbol(&index, "submodule_beacon"));
+        let linked_index = WorkspaceIndex::build(
+            &root.join("linked"),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("linked worktree serves its own root");
+        assert!(has_symbol(&linked_index, "main_beacon"));
     }
 
     /// Language selection answers only for a path visibility already accepted:
@@ -5599,7 +8150,12 @@ mod tests {
         );
         let missing = ProjectPath::new("src/missing.rs").expect("missing path");
         assert!(index.file(&missing).is_none());
-        assert!(index.nodes(&missing, 0).is_none());
+        assert!(
+            index
+                .nodes(&missing, 0)
+                .expect("missing path has no node parse")
+                .is_none()
+        );
     }
 
     #[test]
@@ -5990,6 +8546,10 @@ mod tests {
         fs::write(&first, b"123456").expect("first source");
         fs::write(&oversized, b"123456789").expect("oversized source");
         let both = source_only(vec![first.clone(), oversized.clone()]);
+        #[cfg(unix)]
+        if crate::capture::supports_stat_reuse(&root) {
+            advance_capture_clock(&root, &[first.clone(), oversized.clone()]);
+        }
         let (digests, last) =
             capture_paths(&root, &both, limits, &LastCapture::default()).expect("first fits");
         let alone =
@@ -5998,8 +8558,12 @@ mod tests {
         let (_, next) = capture_paths(&root, &both, limits, &last).expect("nothing moved");
         assert_eq!(
             next.read_paths(),
-            0,
-            "the left-out file stays left out without a read"
+            if cfg!(unix) && crate::capture::supports_stat_reuse(&root) {
+                0
+            } else {
+                2
+            },
+            "the left-out file stays omitted; supported filesystems reuse its recorded length"
         );
         let second = root.join("second.rs");
         fs::write(&second, b"123456").expect("second source");
@@ -6023,7 +8587,11 @@ mod tests {
             captured_paths(&root, &source_only(vec![missing]), limits).expect_err("missing source");
         assert_eq!(
             error.fault().violation(),
-            WorkspaceIndexViolation::Filesystem
+            WorkspaceIndexViolation::ChangedDuringCapture
+        );
+        assert!(
+            !rift_core::causes(&error).is_empty(),
+            "the missing path keeps its operating-system cause"
         );
 
         let oversized = root.join("oversized.rs");
@@ -6831,6 +9399,33 @@ mod tests {
             ),
         );
         assert_eq!(elsewhere.fault().left_out_file(path), None);
+    }
+
+    #[test]
+    fn catalog_and_syntax_share_source_until_last_reader_releases_it() {
+        let path = ProjectPath::new("src/shared.rs").expect("path");
+        let text = TextSourceFile::from_content(path, "pub fn original() {}\n".to_owned());
+        let owner = Arc::downgrade(&text.content);
+        let file = indexed_file_from_catalog(
+            &text,
+            Path::new("src/shared.rs"),
+            &RustSyntaxProvider::default(),
+            SyntaxLimits::default(),
+        )
+        .expect("source parses");
+        assert_eq!(text.content().as_ptr(), file.source().as_ptr());
+        let retained = file.clone();
+        assert_eq!(retained.source().as_ptr(), file.source().as_ptr());
+        drop(text);
+        drop(file);
+        assert_eq!(retained.source(), "pub fn original() {}\n");
+        assert_eq!(retained.syntax().symbols()[0].name, "original");
+        assert!(owner.upgrade().is_some(), "the last reader owns the source");
+        drop(retained);
+        assert!(
+            owner.upgrade().is_none(),
+            "no cache keeps released source alive"
+        );
     }
 
     #[test]
@@ -7723,7 +10318,7 @@ mod tests {
         let file = TextSourceFile {
             path: ProjectPath::new("").expect("an empty project path names the workspace root"),
             digest: FileDigest::of(b"hello"),
-            content: "hello".to_owned(),
+            content: Arc::new("hello".to_owned()),
             executable: false,
         };
         let mut documents = Vec::new();
@@ -7743,7 +10338,7 @@ mod tests {
         TextSourceFile {
             path: ProjectPath::new(name.to_owned()).expect("a project path"),
             digest: FileDigest::of(content.as_bytes()),
-            content,
+            content: Arc::new(content),
             executable: false,
         }
     }
@@ -7827,6 +10422,80 @@ mod tests {
     }
 
     #[test]
+    fn refused_python_contributions_leave_out_in_one_batch() {
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let provider = registry::provider_for_extension("py").expect("the Python provider");
+        let limits = SyntaxLimits::default();
+        let mut contents = IndexContents::default();
+        let valid_path = ProjectPath::new("src/valid.py").expect("valid path");
+        let valid_content = "def beacon():\n    return 1\n".to_owned();
+        let valid = TextSourceFile {
+            path: valid_path,
+            digest: FileDigest::of(valid_content.as_bytes()),
+            content: Arc::new(valid_content),
+            executable: false,
+        };
+        contents
+            .hold_source_file(
+                valid.clone(),
+                &root.path().join("src/valid.py"),
+                provider,
+                limits,
+            )
+            .expect("valid Python source");
+
+        let name = "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+        for path in ["src/wide_a.py", "src/wide_b.py"] {
+            let content = format!("def {name}():\n    return 1\n");
+            let project_path = ProjectPath::new(path).expect("wide path");
+            let file = TextSourceFile {
+                path: project_path,
+                digest: FileDigest::of(content.as_bytes()),
+                content: Arc::new(content),
+                executable: false,
+            };
+            contents
+                .hold_source_file(file, &root.path().join(path), provider, limits)
+                .expect("provider parses exact-bound name");
+        }
+
+        let mut expected = contents.clone();
+        for path in ["src/wide_a.py", "src/wide_b.py"] {
+            let path = ProjectPath::new(path).expect("path");
+            assert!(expected.leave_out_held(
+                &path,
+                WorkspaceIndexWarning::Contribution {
+                    path: path.clone(),
+                    field: "provider_symbol",
+                },
+            ));
+        }
+        let built = built_contents(root.path(), contents.sorted(), 10, None)
+            .expect("all refused declarations leave out together");
+        let expected = built_contents(root.path(), expected.sorted(), 10, None)
+            .expect("valid source alone builds");
+        assert_eq!(built.left_out.len(), 2);
+        assert_eq!(
+            built.warnings,
+            [
+                WorkspaceIndexWarning::Contribution {
+                    path: ProjectPath::new("src/wide_a.py").expect("path"),
+                    field: "provider_symbol",
+                },
+                WorkspaceIndexWarning::Contribution {
+                    path: ProjectPath::new("src/wide_b.py").expect("path"),
+                    field: "provider_symbol",
+                },
+            ]
+        );
+        assert_eq!(
+            built.semantics.graph().records(),
+            expected.semantics.graph().records(),
+            "accepted graph matches build without refused files"
+        );
+    }
+
+    #[test]
     fn test_a_path_the_wire_can_address_publishes_a_document() {
         // The document shape's address ceiling is the wire's own, so a path at the
         // longest a project path may be still publishes. A shorter ceiling here would
@@ -7843,7 +10512,7 @@ mod tests {
         let file = TextSourceFile {
             path: ProjectPath::new(path).expect("a long project path is legal"),
             digest: FileDigest::of(b"hello"),
-            content: "hello".to_owned(),
+            content: Arc::new("hello".to_owned()),
             executable: false,
         };
         let mut documents = Vec::new();
@@ -7910,6 +10579,59 @@ mod tests {
         .expect("the capture must read the tree")
     }
 
+    /// The paths the production discovery policy admits in one test workspace.
+    fn discovered_files_for_test(root: &Path) -> Vec<PathBuf> {
+        let languages = LanguageFileSelections::default();
+        let text_inclusion = TextFileInclusion::default();
+        let language = WorkspaceLanguagePolicy::build(root, &languages, &text_inclusion)
+            .expect("language policy");
+        let paths = discover_cancellable(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &language,
+            &|| false,
+        )
+        .expect("discover fixture paths");
+        paths
+            .source
+            .into_iter()
+            .map(|(path, _)| path)
+            .chain(paths.text)
+            .chain(paths.lockfiles)
+            .collect()
+    }
+
+    /// Waits until a filesystem marker has newer modification and status-change times than
+    /// every path, so the next capture can prove unchanged digests safe to reuse.
+    #[cfg(unix)]
+    fn advance_capture_clock(root: &Path, paths: &[PathBuf]) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        fs::create_dir_all(root.join(".rift")).expect("state directory");
+        let marker = root.join(".rift/stat-probe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            fs::write(&marker, b"timestamp probe").expect("advance filesystem timestamp");
+            let marker_metadata = fs::metadata(&marker).expect("marker stat");
+            let marker_changed = (marker_metadata.ctime(), marker_metadata.ctime_nsec());
+            let marker_modified = marker_metadata.modified().expect("marker mtime");
+            let old_files = paths.iter().all(|path| {
+                let metadata = fs::metadata(path).expect("source stat");
+                metadata.modified().expect("source mtime") < marker_modified
+                    && (metadata.ctime(), metadata.ctime_nsec()) < marker_changed
+            });
+            if old_files {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem timestamps advance beyond every fixture file"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// A two-file workspace, `src/lib.rs` and `notes.txt`, and the modification time
     /// `src/lib.rs` holds.
     fn two_file_workspace() -> (tempfile::TempDir, std::time::SystemTime) {
@@ -7936,19 +10658,328 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_of_an_unchanged_tree_reads_no_path_again() {
+    fn visible_capture_reuses_selected_reads_and_retains_refused_raw_bytes() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let entries: [(&str, &[u8]); 4] = [
+            ("lib.rs", b"pub fn kept() {}\n"),
+            ("binary.rs", b"source\0bytes"),
+            ("invalid.rs", &[0xff, 0xfe]),
+            ("opaque.bin", b"unclassified bytes"),
+        ];
+        for (path, bytes) in entries {
+            fs::write(root.join(path), bytes).expect("fixture bytes");
+        }
+        let text = TextFileInclusion::new(vec!["**/*.txt".to_owned()], 1_024);
+        let limits = WorkspaceIndexLimits::default();
+        let capture = |last: &LastCapture| {
+            capture_visible_digests_with_languages_cancellable(
+                root,
+                limits,
+                &SourceVisibility::default(),
+                &text,
+                &LanguageFileSelections::default(),
+                last,
+                &|| false,
+            )
+            .expect("bounded visible capture")
+        };
+        #[cfg(unix)]
+        advance_capture_clock(
+            root,
+            &entries
+                .iter()
+                .map(|(path, _)| root.join(path))
+                .collect::<Vec<_>>(),
+        );
+        let (indexed, visible, last) = capture(&LastCapture::default());
+        assert_eq!(
+            last.read_paths(),
+            entries.len(),
+            "selected files are not read twice"
+        );
+        assert_eq!(
+            indexed.iter().count(),
+            1,
+            "only valid selected source is indexed"
+        );
+        for (path, bytes) in entries {
+            assert_eq!(
+                visible.get(&ProjectPath::new(path).expect("path")),
+                Some(FileDigest::of(bytes)),
+                "raw content includes refused and unclassified files",
+            );
+        }
+        let (again_indexed, again_visible, next) = capture(&last);
+        assert_eq!(again_indexed, indexed);
+        assert_eq!(again_visible, visible);
+        #[cfg(unix)]
+        if crate::capture::supports_stat_reuse(root) {
+            assert_eq!(
+                next.read_paths(),
+                0,
+                "unchanged raw content uses the original stat proof"
+            );
+        }
+        let binary = root.join("binary.rs");
+        let modified = fs::metadata(&binary)
+            .expect("binary stat")
+            .modified()
+            .expect("mtime");
+        rewrite(&binary, b"changed\0raw!", modified);
+        let (_, changed, reused) = capture(&next);
+        assert!(
+            reused.read_paths() >= 1,
+            "restored modification time does not hide raw edits"
+        );
+        assert_ne!(changed, visible);
+        let (_, cold, _) = capture(&LastCapture::default());
+        assert_eq!(changed, cold, "stat reuse equals a fresh raw read");
+    }
+
+    #[test]
+    fn visible_capture_enforces_raw_file_count_byte_bounds_and_cancellation() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        for path in ["a.bin", "b.bin"] {
+            fs::write(root.join(path), b"raw\0").expect("raw source");
+        }
+        let text = TextFileInclusion::new(Vec::new(), 1_024);
+        let capture = |limits, cancelled: &(dyn Fn() -> bool + Sync)| {
+            capture_visible_digests_with_languages_cancellable(
+                root,
+                limits,
+                &SourceVisibility::default(),
+                &text,
+                &LanguageFileSelections::default(),
+                &LastCapture::default(),
+                cancelled,
+            )
+        };
+        let limits = |files, file_bytes, total_bytes| {
+            WorkspaceIndexLimits::new(files, file_bytes, total_bytes, 16, 100).expect("bounds")
+        };
+        let error = capture(limits(1, 4, 8), &|| false)
+            .expect_err("visible raw files retain the file-count bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::TooManyFiles
+        );
+        let (indexed, visible, _) = capture(limits(2, 4, 7), &|| false)
+            .expect("unindexed raw bytes do not count against the indexed source budget");
+        assert!(indexed.is_empty());
+        assert_eq!(visible.iter().count(), 2);
+        let (_, visible, last) =
+            capture(limits(2, 3, 8), &|| false).expect("oversized files left out");
+        assert!(
+            visible.is_empty(),
+            "no digest describes truncated raw bytes"
+        );
+        assert_eq!(last.read_paths(), 2);
+        let error = capture(limits(2, 4, 8), &|| true).expect_err("cancelled capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Cancelled
+        );
+        for (path, bytes) in [("a.rs", b"// a"), ("b.rs", b"// b")] {
+            fs::write(root.join(path), bytes).expect("selected source");
+        }
+        let error = capture(limits(4, 4, 7), &|| false)
+            .expect_err("indexed source still counts against the workspace-byte bound");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::WorkspaceTooLarge
+        );
+        let (indexed, visible, _) = capture(limits(4, 4, 8), &|| false)
+            .expect("source at its bound and raw bytes beyond it remain admitted");
+        assert_eq!(indexed.iter().count(), 2);
+        assert_eq!(visible.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_capture_of_an_unchanged_tree_preserves_fingerprint() {
         let (directory, _) = two_file_workspace();
         let root = directory.path();
         let (first, last) = captured_after(root, &LastCapture::default());
-        assert_eq!(last.read_paths(), 2, "the first capture reads every path");
+        assert_eq!(
+            last.read_paths(),
+            2,
+            "the first capture reads every admitted path: {:?}",
+            discovered_files_for_test(root)
+        );
         let (second, next) = captured_after(root, &last);
-        assert_eq!(next.read_paths(), 0, "no stat moved, so no path is read");
+        assert!(
+            next.read_paths() <= 2,
+            "a proved boundary reuses both files; unavailable timestamp proof reads both"
+        );
         assert_eq!(second.fingerprint(), first.fingerprint());
         let (_, again) = captured_after(root, &next);
+        assert!(
+            again.read_paths() <= 2,
+            "reuse keeps its original proof; no proof reads both files"
+        );
+    }
+
+    #[test]
+    fn test_capture_tracks_case_distinct_paths_and_case_only_rename() {
+        use same_file::Handle;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let source_directory = root.join("src");
+        fs::create_dir(&source_directory).expect("source directory");
+        let upper = source_directory.join("Case.rs");
+        let lower = source_directory.join("case.rs");
+        let intermediate = source_directory.join("rename.rs");
+        fs::write(&upper, "pub fn upper() {}\n").expect("upper-case source");
+
+        let (first, first_capture) = captured_after(root, &LastCapture::default());
+        assert_eq!(first.len(), 1, "first capture records one source path");
+        assert_eq!(first_capture.read_paths(), 1, "first capture reads source");
+
+        fs::write(&lower, "pub fn lower() {}\n").expect("lower-case source");
+        let upper_identity = Handle::from_path(&upper).expect("open upper-case path identity");
+        let lower_identity = Handle::from_path(&lower).expect("open lower-case path identity");
+        let paths_are_distinct = upper_identity != lower_identity;
+        let (both_spellings, both_capture) = captured_after(root, &first_capture);
         assert_eq!(
-            again.read_paths(),
+            both_spellings.len(),
+            if paths_are_distinct { 2 } else { 1 },
+            "capture follows filesystem path identity for case-distinct names"
+        );
+        if paths_are_distinct {
+            assert!(
+                both_spellings
+                    .get(&ProjectPath::new("src/Case.rs").expect("upper project path"))
+                    .is_some(),
+                "case-sensitive filesystem retains upper-case path"
+            );
+            assert!(
+                both_spellings
+                    .get(&ProjectPath::new("src/case.rs").expect("lower project path"))
+                    .is_some(),
+                "case-sensitive filesystem retains lower-case path"
+            );
+        } else {
+            assert!(
+                both_spellings
+                    .iter()
+                    .all(|(path, _)| { matches!(path.as_str(), "src/Case.rs" | "src/case.rs") }),
+                "case-insensitive filesystem records one spelling of shared path"
+            );
+            assert_eq!(
+                fs::read(&upper).expect("read upper-case alias"),
+                fs::read(&lower).expect("read lower-case alias"),
+                "case-insensitive names resolve to same file"
+            );
+        }
+        if paths_are_distinct {
+            fs::remove_file(&lower).expect("remove lower-case path before rename");
+        }
+        fs::rename(&upper, &intermediate).expect("rename source to intermediate spelling");
+        fs::rename(&intermediate, &lower).expect("rename source to lower-case spelling");
+        fs::write(&lower, "pub fn renamed() {}\n").expect("write renamed source");
+
+        let (renamed, renamed_capture) = captured_after(root, &both_capture);
+        assert_eq!(renamed.len(), 1, "renamed tree contains one source path");
+        assert!(
+            renamed
+                .get(&ProjectPath::new("src/Case.rs").expect("upper project path"))
+                .is_none(),
+            "capture drops the old path spelling"
+        );
+        assert!(
+            renamed
+                .get(&ProjectPath::new("src/case.rs").expect("lower project path"))
+                .is_some(),
+            "capture records the renamed path spelling"
+        );
+        assert_eq!(renamed_capture.read_paths(), 1, "renamed file is read");
+
+        let cold = WorkspaceIndex::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("cold build after case-only rename");
+        assert_eq!(
+            renamed,
+            cold.digests(),
+            "incremental capture matches cold build after case-only rename"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_reuses_files_after_filesystem_timestamp_advances() {
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let paths = [root.join("src/lib.rs"), root.join("notes.txt")];
+        if !crate::capture::supports_stat_reuse(root) {
+            let (first, last) = captured_after(root, &LastCapture::default());
+            let (second, next) = captured_after(root, &last);
+            assert_eq!(
+                next.read_paths(),
+                last.read_paths(),
+                "unsupported filesystem type uses full reads on every capture"
+            );
+            assert_eq!(second.fingerprint(), first.fingerprint());
+            return;
+        }
+        advance_capture_clock(root, &paths);
+
+        let (first, last) = captured_after(root, &LastCapture::default());
+        assert_eq!(
+            last.read_paths(),
+            2,
+            "first capture reads each fixture file"
+        );
+        let (second, next) = captured_after(root, &last);
+        assert_eq!(
+            next.read_paths(),
             0,
-            "the reused record carries every path on"
+            "strictly older files reuse captured digests"
+        );
+        assert_eq!(second.fingerprint(), first.fingerprint());
+    }
+
+    #[test]
+    fn test_capture_does_not_recreate_a_removed_root() {
+        let parent = tempfile::tempdir().expect("parent directory");
+        let root = parent.path().join("removed");
+        let error = capture_digests(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+        )
+        .expect_err("a removed root refuses capture");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::InvalidRoot
+        );
+        assert!(!root.exists(), "capture must not recreate a removed root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_does_not_reuse_across_a_symlinked_state_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, _) = two_file_workspace();
+        let root = directory.path();
+        let (_, last) = captured_after(root, &LastCapture::default());
+        let state = root.join(rift_core::constants::RIFT_STATE_DIRECTORY);
+        fs::create_dir_all(&state).expect("state directory");
+        fs::remove_dir_all(&state).expect("remove state directory");
+        let external = tempfile::tempdir().expect("external state directory");
+        symlink(external.path(), &state).expect("symlink state directory");
+
+        let (_, next) = captured_after(root, &last);
+        assert_eq!(
+            next.read_paths(),
+            2,
+            "a state path that leaves the workspace filesystem disables reuse"
         );
     }
 
@@ -7961,7 +10992,10 @@ mod tests {
         let (_, last) = captured_after(root, &LastCapture::default());
         assert_eq!(format!("{last:?}"), "LastCapture { paths: 2, read: 2, .. }");
         let (_, next) = captured_after(root, &last);
-        assert_eq!(format!("{next:?}"), "LastCapture { paths: 2, read: 0, .. }");
+        assert!(
+            [0, 2].contains(&next.read_paths()),
+            "capture record counts reuse or full-read fallback"
+        );
     }
 
     /// A request-time capture refuses a language selection the build refuses, before it
@@ -8059,7 +11093,10 @@ mod tests {
             modified + std::time::Duration::from_secs(2),
         );
         let (second, next) = captured_after(root, &last);
-        assert_eq!(next.read_paths(), 1, "only the edited path is read");
+        assert!(
+            matches!(next.read_paths(), 1 | 2),
+            "the edited path is read; files without boundary proof use full-read fallback"
+        );
         assert_ne!(second.fingerprint(), first.fingerprint());
         let (fresh, _) = captured_after(root, &LastCapture::default());
         assert_eq!(
@@ -8105,12 +11142,23 @@ mod tests {
         let root = directory.path();
         let path = root.join("src/lib.rs");
         let (first, last) = captured_after(root, &LastCapture::default());
+        if !crate::capture::supports_stat_reuse(root) {
+            rewrite(&path, b"pub fn keep() {}\n", modified);
+            let (second, next) = captured_after(root, &last);
+            let (fresh, _) = captured_after(root, &LastCapture::default());
+            assert_eq!(
+                next.read_paths(),
+                last.read_paths(),
+                "unsupported filesystem type reads every path after restored-time rewrite"
+            );
+            assert_ne!(second.fingerprint(), first.fingerprint());
+            assert_eq!(second.fingerprint(), fresh.fingerprint());
+            return;
+        }
         let recorded = fs::metadata(&path).expect("recorded stat");
         let changed = |metadata: &fs::Metadata| (metadata.ctime(), metadata.ctime_nsec());
-        // A filesystem whose clock ticks coarser than this test runs stamps the rewrite
-        // with the recorded status change time, which is the documented same-tick miss;
-        // the rewrite repeats until that clock moves, so the case under test is the
-        // restored modification time alone.
+        // The rewrite repeats until the status change clock moves, so the case under test
+        // isolates a restored modification time.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             rewrite(&path, b"pub fn keep() {}\n", modified);
@@ -8131,20 +11179,205 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the status change time never moved: recorded={:?}",
-                changed(&recorded)
+                "status change clock moved before the test deadline"
             );
             std::thread::yield_now();
         }
         let (second, next) = captured_after(root, &last);
-        assert_eq!(
-            next.read_paths(),
-            1,
-            "the moved status change time reads it"
+        assert!(
+            matches!(next.read_paths(), 1 | 2),
+            "the moved status change time reads it; unproved paths use full-read fallback"
         );
         assert_ne!(second.fingerprint(), first.fingerprint());
         let (fresh, _) = captured_after(root, &LastCapture::default());
         assert_eq!(second.fingerprint(), fresh.fingerprint());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_repeated_restored_modification_time_rewrites_match_full_reads() {
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let path = root.join("src/lib.rs");
+        let (_, first) = captured_after(root, &LastCapture::default());
+        let mut last;
+        if crate::capture::supports_stat_reuse(root) {
+            advance_capture_clock(root, &[path.clone(), root.join("notes.txt")]);
+            let (_, first) = captured_after(root, &LastCapture::default());
+            let (_, next) = captured_after(root, &first);
+            assert_eq!(
+                next.read_paths(),
+                0,
+                "restored-time rewrites start after proven digest reuse"
+            );
+            last = next;
+        } else {
+            let (_, next) = captured_after(root, &first);
+            assert_eq!(
+                next.read_paths(),
+                first.read_paths(),
+                "unsupported filesystem type reads every file"
+            );
+            last = next;
+        }
+        for (index, name) in (0..32)
+            .map(|index| if index % 2 == 0 { "beta" } else { "zeta" })
+            .enumerate()
+        {
+            let contents = format!("pub fn {name}() {{}}\n");
+            rewrite(&path, contents.as_bytes(), modified);
+            assert_eq!(
+                fs::metadata(&path).expect("rewritten stat").len(),
+                u64::try_from(contents.len()).expect("fixture length fits u64")
+            );
+            let (captured, next) = captured_after(root, &last);
+            let (fresh, _) = captured_after(root, &LastCapture::default());
+            assert_eq!(
+                captured.fingerprint(),
+                fresh.fingerprint(),
+                "capture after rewrite {index} matches full read"
+            );
+            if crate::capture::supports_stat_reuse(root) {
+                assert!(matches!(next.read_paths(), 1 | 2));
+            } else {
+                assert_eq!(
+                    next.read_paths(),
+                    last.read_paths(),
+                    "unsupported filesystem type reads every file after rewrite {index}"
+                );
+            }
+            last = next;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_capture_reads_files_after_root_directory_replacement() {
+        let parent = tempfile::tempdir().expect("workspace parent");
+        let root = parent.path().join("workspace");
+        fs::create_dir_all(root.join("src")).expect("source directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("source file");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("text file");
+        let (first, last) = captured_after(&root, &LastCapture::default());
+        let displaced = parent.path().join("displaced");
+        fs::rename(&root, &displaced).expect("move captured root aside");
+        fs::create_dir(&root).expect("replace root directory");
+        fs::create_dir(root.join("src")).expect("replacement source directory");
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").expect("replacement source");
+        fs::write(root.join("notes.txt"), "plain notes\n").expect("replacement notes");
+
+        let (second, next) = captured_after(&root, &last);
+        assert_eq!(
+            next.read_paths(),
+            2,
+            "a replacement root cannot reuse the displaced root's file records"
+        );
+        assert_eq!(second.fingerprint(), first.fingerprint());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_capture_full_reads_windows_rewrites_with_writer_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let path = root.join("src/lib.rs");
+        let mut writer = OpenOptions::new().read(true).write(true).open(&path)?;
+        let (_, mut last) = captured_after(root, &LastCapture::default());
+        for (index, name) in (0..32)
+            .map(|index| if index % 2 == 0 { "beta" } else { "zeta" })
+            .enumerate()
+        {
+            writer.seek(SeekFrom::Start(0))?;
+            let contents = format!("pub fn {name}() {{}}\n");
+            writer.write_all(contents.as_bytes())?;
+            writer.set_modified(modified)?;
+            assert_eq!(fs::metadata(&path)?.len(), contents.len() as u64);
+            let (captured, next) = captured_after(root, &last);
+            assert_eq!(
+                next.read_paths(),
+                2,
+                "capture reads both files while writer remains open after rewrite {index}"
+            );
+            let (fresh, _) = captured_after(root, &LastCapture::default());
+            assert_eq!(
+                captured.fingerprint(),
+                fresh.fingerprint(),
+                "capture after rewrite {index} matches full read"
+            );
+            last = next;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_capture_full_reads_repeated_same_size_rewrites_with_restored_modification_time() {
+        let (directory, modified) = two_file_workspace();
+        let root = directory.path();
+        let path = root.join("src/lib.rs");
+        let (_, mut last) = captured_after(root, &LastCapture::default());
+        for (index, name) in (0..32)
+            .map(|index| if index % 2 == 0 { "beta" } else { "zeta" })
+            .enumerate()
+        {
+            rewrite(
+                &path,
+                format!("pub fn {name}() {{}}\n").as_bytes(),
+                modified,
+            );
+            let (captured, next) = captured_after(root, &last);
+            assert_eq!(
+                next.read_paths(),
+                2,
+                "platform without verified status change time reads every path at rewrite {index}"
+            );
+            let (fresh, _) = captured_after(root, &LastCapture::default());
+            assert_eq!(
+                captured.fingerprint(),
+                fresh.fingerprint(),
+                "capture after rewrite {index} matches a full read"
+            );
+            last = next;
+        }
+    }
+
+    #[test]
+    fn test_workspace_rebuild_stops_when_cancelled_between_changed_paths() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n").expect("source");
+        fs::write(directory.path().join("b.rs"), "pub fn second() {}\n").expect("source");
+        let index = indexed(directory.path(), &TextFileInclusion::default());
+        fs::write(directory.path().join("a.rs"), "pub fn changed_first() {}\n")
+            .expect("changed source");
+        fs::write(
+            directory.path().join("b.rs"),
+            "pub fn changed_second() {}\n",
+        )
+        .expect("changed source");
+        let changes = resolved(&index, directory.path(), &["a.rs", "b.rs"]);
+        assert_eq!(changes.len(), 2, "both named paths need replacement");
+        let checks = AtomicUsize::new(0);
+        // `rebuilt_cancellable` checks once before each sorted changed path. First path
+        // therefore completes; cancellation refuses second path before reading it.
+        let cancelled = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
+        let error = index
+            .rebuilt_cancellable(&changes, &cancelled)
+            .expect_err("cancelled rebuild must stop between changed paths");
+        assert_eq!(
+            error.fault().violation(),
+            WorkspaceIndexViolation::Cancelled
+        );
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            2,
+            "second path observes cancellation"
+        );
     }
 
     /// A tree holding lockfiles under the default exclusion list, beside one source file.

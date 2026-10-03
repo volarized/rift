@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::fmt;
+use std::sync::Arc;
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -83,7 +84,7 @@ pub type PathError = Error<PathFault>;
 
 /// Validated path below a workspace root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProjectPath(String);
+pub struct ProjectPath(Arc<str>);
 
 impl ProjectPath {
     /// Validates one project-relative path.
@@ -108,7 +109,7 @@ impl ProjectPath {
         if value.split('/').any(str::is_empty) && !value.is_empty() {
             return Err(path_error(PathKind::Project, PathViolation::EmptySegment));
         }
-        Ok(Self(value))
+        Ok(Self(Arc::from(value)))
     }
 
     /// Returns canonical project-relative text.
@@ -135,7 +136,7 @@ impl Borrow<str> for ProjectPath {
 
 /// Validated path relative to one source location.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourcePath(String);
+pub struct SourcePath(Arc<str>);
 
 impl SourcePath {
     /// Validates one catalog-relative source path.
@@ -149,7 +150,7 @@ impl SourcePath {
         if value.is_empty() {
             return Err(path_error(PathKind::Source, PathViolation::Empty));
         }
-        Ok(Self(value))
+        Ok(Self(Arc::from(value)))
     }
 
     /// Returns location-relative path text.
@@ -201,7 +202,33 @@ fn path_error(kind: PathKind, violation: PathViolation) -> PathError {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{Hash as _, Hasher as _};
+
     use super::{PathKind, PathViolation, ProjectPath, SourcePath};
+
+    #[test]
+    fn cloned_paths_share_text_and_keep_value_semantics() {
+        let project = ProjectPath::new("src/lib.rs").expect("valid project path");
+        let project_clone = project.clone();
+        assert!(std::sync::Arc::ptr_eq(&project.0, &project_clone.0));
+        assert_eq!(project, project_clone);
+        assert!(project < ProjectPath::new("src/main.rs").expect("valid project path"));
+        assert_eq!(project.to_string(), "src/lib.rs");
+        assert!(ProjectPath::new("src/../lib.rs").is_err());
+
+        let mut project_hash = std::collections::hash_map::DefaultHasher::new();
+        project.hash(&mut project_hash);
+        let mut clone_hash = std::collections::hash_map::DefaultHasher::new();
+        project_clone.hash(&mut clone_hash);
+        assert_eq!(project_hash.finish(), clone_hash.finish());
+
+        let source = SourcePath::new("serde/src/lib.rs").expect("valid source path");
+        let source_clone = source.clone();
+        assert!(std::sync::Arc::ptr_eq(&source.0, &source_clone.0));
+        assert_eq!(source, source_clone);
+        assert_eq!(source.to_string(), "serde/src/lib.rs");
+        assert!(SourcePath::new("").is_err());
+    }
 
     #[test]
     fn project_path_accepts_root_and_canonical_unicode() {

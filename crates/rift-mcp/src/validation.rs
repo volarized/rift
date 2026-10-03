@@ -1,6 +1,8 @@
 //! Current-index validation: filesystem observation, serialized rebuilds,
 //! and atomic publication of the workspace snapshot.
 
+mod background;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::Read as _;
@@ -16,10 +18,12 @@ use rift_core::constants::{
     VCS_IGNORE_FILE, WORKSPACE_CONFIGURATION_FILE, WORKSPACE_IGNORED_DIRECTORIES,
 };
 use rift_core::{LanguageFileSelections, SourceVisibility, TextFileInclusion};
+use rift_dependency::DependencyContext;
 use rift_index::{
-    ChangeSet, FileRecord, LexicalChange, LexicalStamp, PathChanges, TrigramBatch,
+    ChangeSet, FileRecord, LastCapture, LexicalChange, LexicalStamp, PathChanges, TrigramBatch,
     WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexError, WorkspaceIndexLimits,
-    WorkspaceSourcePolicy,
+    WorkspaceIndexPreparation, WorkspaceSourcePolicy, capture_digests_with_languages_cancellable,
+    capture_selected_paths_cancellable,
 };
 use rift_protocol::configuration::{
     GlobalConfiguration, HistoryConfiguration, LanguageLspConfiguration, LogsConfiguration,
@@ -29,12 +33,13 @@ use rift_protocol::configuration::{
 use rift_protocol::dependencies::DependenciesConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::map::WorkspaceMap;
+use rift_protocol::read::ReadWarning;
 use rift_protocol::source::SourceConfiguration;
 use rift_ranking::IndexDocument;
 use rift_search::{Embedding, SearchError, SearchIndex, VectorReadiness};
 use rift_server::{
     CONFIGURATION_FILE_BYTES_MAX, ConfigurationError, LspProcessKey, ReadError, ReadFault,
-    ReadService, load_configuration,
+    ReadService, ReadServiceBuild, load_configuration,
 };
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
@@ -71,6 +76,7 @@ pub(crate) struct PendingWork {
 
 impl PendingWork {
     /// The observation a caller makes when it cannot name what moved.
+    #[cfg(test)]
     pub(crate) const fn whole_workspace() -> Self {
         Self {
             paths: BTreeSet::new(),
@@ -137,15 +143,19 @@ pub(crate) struct RebuildRequest {
     pub(crate) work: PendingWork,
     /// The current publication, absent only at startup, when nothing is published yet.
     pub(crate) previous: Option<Arc<PublishedWorkspace>>,
+    /// Supervisor stop state, checked between files by index capture.
+    pub(crate) cancellation: CancellationToken,
 }
 
 impl RebuildRequest {
     /// The rebuild startup runs: every visible file, with nothing to share.
-    pub(crate) const fn initial(epoch: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn initial(epoch: u64) -> Self {
         Self {
             epoch,
             work: PendingWork::whole_workspace(),
             previous: None,
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -175,12 +185,14 @@ impl RebuildRequest {
         if previous.holds_files_below_a_gone_path(root, &self.work.paths) {
             return ChangeSet::Full;
         }
-        let Some(observed) = observed_records(root, &self.work.paths, &previous.source_policy)
-        else {
+        let Some(source_policy) = previous.source_policy.as_deref() else {
+            return ChangeSet::Full;
+        };
+        let Some(observed) = observed_records(root, &self.work.paths, source_policy) else {
             return ChangeSet::Full;
         };
         ChangeSet::Incremental(PathChanges::resolve(observed, |path| {
-            previous.reads.file_record(path)
+            previous.file_record(path)
         }))
     }
 }
@@ -236,13 +248,25 @@ fn observed_record(
     }
 }
 
+#[derive(Clone, Debug)]
+struct VisibleWorkspaceFiles {
+    digests: Arc<WorkspaceDigests>,
+    refused: Arc<BTreeMap<ProjectPath, rift_index::WorkspaceIndexWarning>>,
+}
+
 /// Read index and configuration policy published as one immutable value.
 #[derive(Debug)]
 pub(crate) struct PublishedWorkspace {
     pub(crate) reads: Arc<ReadService>,
     pub(crate) configuration: ConfigurationState,
     pub(crate) fingerprint: WorkspaceFingerprint,
-    pub(crate) source_policy: Arc<WorkspaceSourcePolicy>,
+    pub(crate) source_policy: Option<Arc<WorkspaceSourcePolicy>>,
+    pub(crate) preparation: Option<LocalIndexPreparation>,
+    /// Workspace resource digests captured with this publication. Prepared publications
+    /// carry the indexed batch; complete publications carry every visible file.
+    pub(crate) visible_digests: Arc<WorkspaceDigests>,
+    /// Visible files left out by the per-file bound, keyed for observation comparisons.
+    visible_refused: Arc<BTreeMap<ProjectPath, rift_index::WorkspaceIndexWarning>>,
     /// Workspace orientation snapshot served by `rift://map`, computed once for this
     /// publication and reused until the next one - a read costs a lookup, never a rebuild.
     pub(crate) map: Arc<WorkspaceMap>,
@@ -250,6 +274,21 @@ pub(crate) struct PublishedWorkspace {
 }
 
 impl PublishedWorkspace {
+    /// The record this publication uses to compare a path capture, including visible paths
+    /// the read index does not classify.
+    fn file_record(&self, path: &ProjectPath) -> Option<FileRecord> {
+        self.visible_digests
+            .get(path)
+            .map(FileRecord::Digest)
+            .or_else(|| {
+                self.visible_refused
+                    .get(path)
+                    .cloned()
+                    .map(FileRecord::LeftOut)
+            })
+            .or_else(|| self.reads.file_record(path))
+    }
+
     /// This publication's twin under `configuration` and `epoch`.
     ///
     /// Every part is shared, so the twin costs the clones of its handles and reads no
@@ -260,10 +299,73 @@ impl PublishedWorkspace {
             reads: Arc::clone(&self.reads),
             configuration,
             fingerprint: self.fingerprint.clone(),
-            source_policy: Arc::clone(&self.source_policy),
+            source_policy: self.source_policy.as_ref().map(Arc::clone),
+            preparation: self.preparation.clone(),
+            visible_digests: Arc::clone(&self.visible_digests),
+            visible_refused: Arc::clone(&self.visible_refused),
             map: Arc::clone(&self.map),
             epoch,
         }
+    }
+
+    /// Replaces request-named paths in the complete visible set, including paths the read
+    /// index does not classify.
+    fn update_visible_digests(
+        &self,
+        root: &Path,
+        reads: &ReadService,
+        paths: &BTreeSet<ProjectPath>,
+    ) -> Result<VisibleWorkspaceFiles, ReadError> {
+        if self.preparation.is_some() {
+            return Ok(VisibleWorkspaceFiles {
+                digests: Arc::new(reads.content_digests()),
+                refused: Arc::new(BTreeMap::new()),
+            });
+        }
+        if paths.is_empty() {
+            return Ok(VisibleWorkspaceFiles {
+                digests: Arc::clone(&self.visible_digests),
+                refused: Arc::clone(&self.visible_refused),
+            });
+        }
+        let policy = self.source_policy.as_deref().unwrap_or_else(|| {
+            unreachable!("a complete current-tree publication holds its source policy")
+        });
+        let mut digests: BTreeMap<ProjectPath, rift_index::FileDigest> = self
+            .visible_digests
+            .iter()
+            .map(|(path, digest)| (path.clone(), digest))
+            .collect();
+        let mut refused = self.visible_refused.as_ref().clone();
+        for path in paths {
+            let digest = match reads.file_digest(path) {
+                Some(digest) => Ok(Some(digest)),
+                None => policy.visible_digest(&root.join(path.as_str())),
+            };
+            match digest {
+                Ok(Some(digest)) => {
+                    digests.insert(path.clone(), digest);
+                    refused.remove(path);
+                }
+                Ok(None) => {
+                    digests.remove(path);
+                    refused.remove(path);
+                }
+                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {
+                    digests.remove(path);
+                    let warning = error
+                        .fault()
+                        .left_out_file(path.clone())
+                        .unwrap_or_else(|| unreachable!("the guard found a left-out file"));
+                    refused.insert(path.clone(), warning);
+                }
+                Err(error) => return Err(ReadFault::index(error)),
+            }
+        }
+        Ok(VisibleWorkspaceFiles {
+            digests: Arc::new(WorkspaceDigests::new(digests)),
+            refused: Arc::new(refused),
+        })
     }
 
     /// Whether this publication already holds what every one of `paths` holds on disk,
@@ -272,9 +374,12 @@ impl PublishedWorkspace {
     /// A file left out under the per-file byte bound matches only a publication that left
     /// it out the same way; an I/O error matches nothing.
     fn holds_observed(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
-        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
-            PathChanges::resolve(observed, |path| self.reads.file_record(path)).is_empty()
-        })
+        self.source_policy
+            .as_deref()
+            .and_then(|policy| observed_records(root, paths, policy))
+            .is_some_and(|observed| {
+                PathChanges::resolve(observed, |path| self.file_record(path)).is_empty()
+            })
     }
 
     /// Whether a rebuild naming `paths` moves every one of them: each reads, under this
@@ -284,9 +389,12 @@ impl PublishedWorkspace {
     /// is one a rebuild naming it leaves as it is. A read that fails asks for the whole
     /// workspace there, and answers `false` here.
     pub(crate) fn rebuild_moves_every(&self, root: &Path, paths: &BTreeSet<ProjectPath>) -> bool {
-        observed_records(root, paths, &self.source_policy).is_some_and(|observed| {
-            PathChanges::resolve(observed, |path| self.reads.file_record(path)).len() == paths.len()
-        })
+        self.source_policy
+            .as_deref()
+            .and_then(|policy| observed_records(root, paths, policy))
+            .is_some_and(|observed| {
+                PathChanges::resolve(observed, |path| self.file_record(path)).len() == paths.len()
+            })
     }
 
     /// Whether this publication holds files below one of `paths` that is no longer a
@@ -302,6 +410,52 @@ impl PublishedWorkspace {
             .iter()
             .any(|path| self.reads.holds_files_below(path) && !root.join(path.as_str()).is_dir())
     }
+}
+
+/// Progress carried by one local publication while discovery or file preparation remains.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalIndexPreparation {
+    pub(crate) prepared: usize,
+    pub(crate) total: Option<usize>,
+    pub(crate) source_paths: Arc<Vec<ProjectPath>>,
+    pub(crate) other_paths: Arc<Vec<ProjectPath>>,
+    pub(crate) map_source_paths: Arc<Vec<(ProjectPath, rift_protocol::read::Language)>>,
+    pub(crate) map_text_paths: Arc<Vec<ProjectPath>>,
+}
+
+impl LocalIndexPreparation {
+    pub(crate) fn warning(&self) -> Option<ReadWarning> {
+        if self.total.is_some_and(|total| self.prepared >= total) {
+            return None;
+        }
+        Some(ReadWarning::LocalIndexPreparing {
+            prepared: u64::try_from(self.prepared).unwrap_or(u64::MAX),
+            total: self
+                .total
+                .map(|total| u64::try_from(total).unwrap_or(u64::MAX)),
+            ready_in: None,
+            detail: "selected local files are still being prepared".to_owned(),
+        })
+    }
+}
+
+fn publication_map(
+    reads: &ReadService,
+    preparation: Option<&LocalIndexPreparation>,
+) -> Arc<WorkspaceMap> {
+    let mut map = preparation.map_or_else(
+        || reads.workspace_map(),
+        |preparation| {
+            reads.workspace_preparation_map(
+                &preparation.map_source_paths,
+                &preparation.map_text_paths,
+            )
+        },
+    );
+    if let Some(warning) = preparation.and_then(LocalIndexPreparation::warning) {
+        map.warnings.push(warning);
+    }
+    Arc::new(map)
 }
 
 /// Published workspace plus failure for latest observed epoch.
@@ -361,6 +515,7 @@ pub(crate) struct IndexValidation {
     /// capture and its publication cannot be lost.
     pub(crate) publication_lane: SyncMutex<PendingWork>,
     paths_max: usize,
+    initial_preparation: SyncMutex<Option<WorkspaceIndexPreparation>>,
 
     /// The current publication as event classification sees it: the inclusion policy
     /// the index was built under, and the index itself for what it holds. Absent before
@@ -673,6 +828,7 @@ impl IndexValidation {
                 superseded_epoch: AtomicU64::new(0),
                 publication_lane: SyncMutex::new(PendingWork::default()),
                 paths_max,
+                initial_preparation: SyncMutex::new(None),
                 published: SyncRwLock::new(None),
                 cancellation: CancellationToken::new(),
                 task: AsyncMutex::new(None),
@@ -680,6 +836,22 @@ impl IndexValidation {
             }),
             receiver,
         )
+    }
+
+    /// Gives the supervisor the one preparation created for this workspace.
+    pub(crate) fn prepare_initial(&self, preparation: WorkspaceIndexPreparation) {
+        *self
+            .initial_preparation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(preparation);
+    }
+
+    /// Takes the initial preparation once, transferring its retained file state to supervisor.
+    fn take_initial_preparation(&self) -> Option<WorkspaceIndexPreparation> {
+        self.initial_preparation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Hands every later publication's changed files to `engines`.
@@ -733,6 +905,7 @@ impl IndexValidation {
             epoch,
             work,
             previous: None,
+            cancellation: self.cancellation.clone(),
         }
     }
 
@@ -851,22 +1024,34 @@ impl IndexValidation {
     fn source_project_path(&self, roots: &WatchRoots, path: &Path) -> Option<ProjectPath> {
         self.current_publication().as_ref().map_or_else(
             || roots.project_path(path),
-            |published| published.source_policy.project_path(path),
+            |published| {
+                published
+                    .source_policy
+                    .as_deref()
+                    .and_then(|policy| policy.project_path(path))
+                    .or_else(|| roots.project_path(path))
+            },
         )
     }
 
     /// Returns whether current policy includes one source event path.
     fn source_path_is_relevant(&self, path: &Path) -> bool {
-        self.current_publication()
-            .as_ref()
-            .is_none_or(|published| published.source_policy.visible(path))
+        self.current_publication().as_ref().is_none_or(|published| {
+            published
+                .source_policy
+                .as_deref()
+                .is_none_or(|policy| policy.visible(path))
+        })
     }
 
     /// Returns whether current policy can include source below one directory.
     fn source_directory_is_relevant(&self, path: &Path) -> bool {
-        self.current_publication()
-            .as_ref()
-            .is_none_or(|published| published.source_policy.may_include_descendant(path))
+        self.current_publication().as_ref().is_none_or(|published| {
+            published
+                .source_policy
+                .as_deref()
+                .is_none_or(|policy| policy.may_include_descendant(path))
+        })
     }
 
     /// Whether the current publication holds at least one file below one event path.
@@ -882,7 +1067,8 @@ impl IndexValidation {
         };
         published
             .source_policy
-            .project_path(path)
+            .as_deref()
+            .and_then(|policy| policy.project_path(path))
             .is_some_and(|directory| published.reads.holds_files_below(&directory))
     }
 
@@ -894,7 +1080,12 @@ impl IndexValidation {
     fn is_workspace_configuration(&self, root: &Path, path: &Path) -> bool {
         self.current_publication().as_ref().map_or_else(
             || path == root.join(WORKSPACE_CONFIGURATION_FILE),
-            |published| published.source_policy.is_workspace_configuration(path),
+            |published| {
+                published
+                    .source_policy
+                    .as_deref()
+                    .is_none_or(|policy| policy.is_workspace_configuration(path))
+            },
         )
     }
 
@@ -909,7 +1100,12 @@ impl IndexValidation {
                 path == root.join(WORKSPACE_CONFIGURATION_FILE)
                     || path.file_name() == Some(std::ffi::OsStr::new(VCS_IGNORE_FILE))
             },
-            |published| published.source_policy.decides_inclusion(path),
+            |published| {
+                published
+                    .source_policy
+                    .as_deref()
+                    .is_none_or(|policy| policy.decides_inclusion(path))
+            },
         )
     }
 }
@@ -965,6 +1161,7 @@ impl IndexSupervisor {
 pub(crate) struct WatchRoots {
     canonical: PathBuf,
     watched: PathBuf,
+    git_directory: Option<PathBuf>,
 }
 
 impl WatchRoots {
@@ -977,6 +1174,11 @@ impl WatchRoots {
         let canonical = std::fs::canonicalize(root)
             .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
         Ok(Self {
+            git_directory: rift_history::Repository::open(&canonical)
+                .ok()
+                .and_then(|repository| {
+                    repository.index_lock_path().parent().map(Path::to_path_buf)
+                }),
             canonical,
             watched: root.to_path_buf(),
         })
@@ -994,6 +1196,7 @@ impl WatchRoots {
         Self {
             canonical: root.to_path_buf(),
             watched: root.to_path_buf(),
+            git_directory: None,
         }
     }
 
@@ -1052,6 +1255,11 @@ pub(crate) fn workspace_watcher(
     watcher
         .watch(roots.canonical(), RecursiveMode::Recursive)
         .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    if let Some(git_directory) = &roots.git_directory {
+        watcher
+            .watch(git_directory, RecursiveMode::NonRecursive)
+            .map_err(|error| ReadFault::unavailable("workspace watch", error.to_string()))?;
+    }
     Ok(watcher)
 }
 
@@ -1090,6 +1298,22 @@ pub(crate) fn report_watch_outcome(
         );
         return;
     };
+    // Git controls live outside linked worktrees. Route exactly HEAD and index.lock
+    // before the source floor; the repository process's own .git/.rift writes stay out.
+    if roots.git_directory.as_ref().is_some_and(|directory| {
+        event.paths.iter().any(|path| {
+            path.parent() == Some(directory.as_path())
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("HEAD" | "index.lock")
+                )
+        })
+    }) {
+        if let Err(error) = validation.observe_whole_workspace() {
+            tracing::error!(component = "index", operation = "watch.observe", error = %error, "index watch failed");
+        }
+        return;
+    }
     if validation.observe_event(roots, &event).is_err() {
         tracing::error!(
             component = "index",
@@ -1164,6 +1388,9 @@ pub(crate) fn watch_event_impact(
     validation: &IndexValidation,
     event: &Event,
 ) -> WatchImpact {
+    if event.need_rescan() {
+        return WatchImpact::WholeWorkspace;
+    }
     if matches!(event.kind, EventKind::Access(_)) {
         return WatchImpact::None;
     }
@@ -1318,19 +1545,86 @@ fn names_a_directory(validation: &IndexValidation, kind: EventKind, path: &Path)
     validation.published_holds_files_below(path) || (!left && path.is_dir())
 }
 
-/// Builds the first snapshot while rejecting concurrent filesystem movement, and returns
-/// what the lexical index owes for it.
-///
-/// The write is not committed here: the search database lives under the workspace's own
-/// `.rift` directory, which opens only once this scan proves the root real. The caller
-/// commits it before it installs the snapshot as current.
-pub(crate) async fn initial_workspace(
+/// Creates an empty readable publication and retains its owner for background preparation.
+pub(crate) fn empty_workspace_preparation(
     root: &Path,
     limits: WorkspaceIndexLimits,
-    validation: &IndexValidation,
-    blocking: &BlockingExecutor,
-) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    initial_workspace_with(root, limits, validation, blocking, workspace_capture()).await
+    configuration: ConfigurationState,
+    epoch: u64,
+    content_cache: rift_index::WorkspaceContentCache,
+) -> Result<(Arc<PublishedWorkspace>, WorkspaceIndexPreparation), ReadError> {
+    let limits = configuration.index_limits(limits)?;
+    let preparation = WorkspaceIndexPreparation::new(
+        root,
+        limits,
+        &configuration.text_inclusion(),
+        &configuration.language_file_selections(),
+    )
+    .map_err(ReadFault::index)?
+    .with_content_cache(content_cache);
+    let index = preparation.empty_snapshot().map_err(ReadFault::index)?;
+    let reads = ReadService::from_prepared_index(
+        index,
+        None,
+        Arc::new(DependencyContext::default()),
+        configuration.history_configuration(),
+        configuration.dependencies_configuration(),
+    );
+    let preparation_state = LocalIndexPreparation {
+        prepared: 0,
+        total: None,
+        source_paths: Arc::new(Vec::new()),
+        other_paths: Arc::new(Vec::new()),
+        map_source_paths: Arc::new(Vec::new()),
+        map_text_paths: Arc::new(Vec::new()),
+    };
+    let map = publication_map(&reads, Some(&preparation_state));
+    let published = Arc::new(PublishedWorkspace {
+        fingerprint: reads.workspace_fingerprint().clone(),
+        reads: Arc::new(reads),
+        configuration,
+        source_policy: None,
+        preparation: Some(preparation_state),
+        visible_digests: Arc::new(WorkspaceDigests::default()),
+        visible_refused: Arc::new(BTreeMap::new()),
+        map,
+        epoch,
+    });
+    Ok((published, preparation))
+}
+
+/// Captures only paths held by one immutable publication.
+pub(crate) fn capture_prepared_workspace(
+    root: &Path,
+    published: &PublishedWorkspace,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, LastCapture), ReadError> {
+    let limits = published.reads.workspace_limits();
+    if let Some(preparation) = &published.preparation {
+        return capture_selected_paths_cancellable(
+            root,
+            limits,
+            &preparation.source_paths,
+            &preparation.other_paths,
+            last,
+            cancelled,
+        )
+        .map_err(ReadFault::index);
+    }
+    let visibility = published.configuration.source_visibility();
+    let text_inclusion = published.configuration.text_inclusion();
+    let languages = published.configuration.language_file_selections();
+    capture_digests_with_languages_cancellable(
+        root,
+        limits,
+        &visibility,
+        &text_inclusion,
+        &languages,
+        last,
+        cancelled,
+    )
+    .map_err(ReadFault::index)
 }
 
 /// One candidate capture: the whole-workspace scan, or a test's stand-in for it.
@@ -1346,170 +1640,17 @@ impl<Capture> CaptureWorkspace for Capture where
 }
 
 /// The capture production runs: the whole-workspace scan.
+#[cfg(test)]
 pub(crate) fn workspace_capture() -> impl CaptureWorkspace + Clone + Send + 'static {
     build_workspace_candidate
 }
 
-/// What one startup attempt's scan folded, kept so the next attempt compares content
-/// instead of counters.
-struct ScannedTree {
-    /// Every recorded file's digest: the syntax-indexed files, the baseline text files,
-    /// and the files the build left out. This is the whole set
-    /// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, so two scans that
-    /// agree here read one tree.
-    digests: rift_index::WorkspaceDigests,
-    /// The `rift.toml` state the candidate was built under.
-    ///
-    /// [`configuration_fingerprint`] folds that one file and nothing else: its absence or
-    /// unreadability, its length once past `CONFIGURATION_FILE_BYTES_MAX`, and otherwise
-    /// the SHA-256 of its bytes.
-    configuration: ConfigurationFingerprint,
-}
-
-impl ScannedTree {
-    /// Which set moved between this scan and `later`, and the paths that carried it, for
-    /// a refusal that has to say why the two disagreed.
-    ///
-    /// The configuration arm names no path: it names a file the reader already holds.
-    fn moved_to(&self, later: &Self) -> String {
-        if self.configuration != later.configuration {
-            return "the configuration file moved between two scans".to_owned();
-        }
-        let changes = PathChanges::between(&self.digests, &later.digests);
-        let Some(named) = crate::server::moved_paths(&changes) else {
-            return "two scans folded one tree, so the watch state refused the capture \
-                    rather than anything the scans read"
-                .to_owned();
-        };
-        if self.digests.tree_revision() == later.digests.tree_revision() {
-            format!("files recorded outside the syntax index moved between two scans: {named}")
-        } else {
-            format!("the syntax-indexed files moved between two scans: {named}")
-        }
+fn workspace_capture_with_cache(
+    content_cache: rift_index::WorkspaceContentCache,
+) -> impl CaptureWorkspace + Clone + Send + 'static {
+    move |root, limits, request| {
+        build_workspace_candidate_with_cache(root, limits, request, &content_cache)
     }
-}
-
-/// Runs the bounded capture loop over an injectable capture, so tests can
-/// force each retry arm deterministically instead of racing the filesystem.
-///
-/// An attempt publishes on content, never on the filesystem epoch.
-/// [`IndexValidation::observe_locked`] increments that epoch for every classified event,
-/// and [`watch_path_impact`] classifies from the path and the event kind without reading a
-/// byte, so an epoch that moved says nothing about whether the tree did. Two scans that
-/// fold one [`ScannedTree`] - the same recorded set
-/// [`WorkspaceFingerprint`](rift_index::WorkspaceFingerprint) folds, under one `rift.toml`
-/// state - publish, whatever the counter reads and whatever the pending work escalated to.
-///
-/// A change observed while an attempt scans is taken the way a change after the first
-/// publication is. Before that publication an event names its own path, and
-/// [`CandidateAnswer::published_at_startup`] publishes the candidate and leaves every path it
-/// does not hold to the supervisor's first rebuild. Only an observation that asks for the
-/// whole workspace - a written `.gitignore`, a directory event, more paths than the
-/// workspace may hold files - a path the candidate holds files below that is gone from the
-/// disk, or a `rift.toml` that moved under the candidate captures the workspace again,
-/// within [`INDEX_CAPTURE_ATTEMPTS_MAX`] attempts.
-///
-/// A capture that comes back [`WorkspaceCandidate::ConfigurationChanged`] folds no tree at
-/// all, so it contributes no scan to compare; the span records it and the refusal names it
-/// rather than reporting the workspace as having changed.
-pub(crate) async fn initial_workspace_with(
-    root: &Path,
-    limits: WorkspaceIndexLimits,
-    validation: &IndexValidation,
-    blocking: &BlockingExecutor,
-    capture: impl CaptureWorkspace + Clone + Send + 'static,
-) -> Result<(Arc<PublishedWorkspace>, LexicalWrite), ReadError> {
-    let mut scanned: Option<ScannedTree> = None;
-    let mut moved = "no attempt folded a tree to compare".to_owned();
-    for attempt in 1..=INDEX_CAPTURE_ATTEMPTS_MAX {
-        let request = validation.take_pending();
-        let epoch = request.epoch;
-        let build_root = root.to_path_buf();
-        let span = tracing::info_span!(
-            "index.build",
-            component = "index",
-            trigger = "startup",
-            epoch,
-            attempt,
-            fingerprint = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
-        // The clone outlives the instrumented future, so the fields recorded after it
-        // reach the span's close record and `rift server logs`, not standard error alone.
-        let recorded = span.clone();
-        let attempt_capture = capture.clone();
-        let built = blocking
-            .run("initial index build", move || {
-                let candidate =
-                    attempt_capture(&build_root, limits, &RebuildRequest::initial(epoch))?;
-                let WorkspaceCandidate::Stable {
-                    published,
-                    change_set,
-                } = candidate
-                else {
-                    return Ok(None);
-                };
-                let write = lexical_write(&published, &change_set);
-                Ok(Some((published, write)))
-            })
-            .instrument(span)
-            .await?;
-        let Some((built, write)) = built else {
-            recorded.record("outcome", "configuration_changed");
-            "the configuration file moved during every capture that read the tree"
-                .clone_into(&mut moved);
-            continue;
-        };
-        let current = ScannedTree {
-            digests: built.reads.workspace_digests(),
-            configuration: built.configuration.fingerprint,
-        };
-        recorded.record(
-            "fingerprint",
-            current.digests.fingerprint().wire_revision().as_str(),
-        );
-        let settled = scanned.as_ref().is_some_and(|previous| {
-            previous.digests == current.digests && previous.configuration == current.configuration
-        });
-        if !validation.watch_failed.load(Ordering::Acquire) {
-            let publication = validation.locked_pending();
-            let observed_epoch = validation.observed_epoch();
-            let answering = if validation.watch_failed.load(Ordering::Acquire) {
-                None
-            } else if settled && current.configuration == configuration_fingerprint(root) {
-                Some(Arc::new(
-                    built.under(built.configuration.clone(), observed_epoch),
-                ))
-            } else {
-                answered_candidate(root, &built, &publication, observed_epoch)
-                    .published_at_startup(&built)
-            };
-            if let Some(answering) = answering {
-                validation.replace_publication_locked(&answering);
-                drop(publication);
-                recorded.record("outcome", "published");
-                let published_epoch = answering.epoch;
-                tracing::info!(
-                    component = "index",
-                    operation = "index.publish",
-                    trigger = "startup",
-                    epoch = published_epoch,
-                    "index snapshot published"
-                );
-                return Ok((answering, write));
-            }
-            drop(publication);
-        }
-        recorded.record("outcome", "superseded");
-        if let Some(previous) = scanned.as_ref() {
-            moved = previous.moved_to(&current);
-        }
-        scanned = Some(current);
-    }
-    Err(ReadFault::unavailable(
-        "initial index build",
-        format!("workspace kept changing across bounded capture attempts: {moved}"),
-    ))
 }
 
 /// Result of one bounded workspace candidate capture.
@@ -1534,10 +1675,25 @@ pub(crate) enum WorkspaceCandidate {
 /// against; a full request scans the workspace. Either way the acceptance is verified
 /// against `rift.toml` after the read, so a candidate built under configuration that moved
 /// underneath it is reported as changed rather than published.
+#[cfg(test)]
 pub(crate) fn build_workspace_candidate(
     root: &Path,
     limits: WorkspaceIndexLimits,
     request: &RebuildRequest,
+) -> Result<WorkspaceCandidate, ReadError> {
+    build_workspace_candidate_with_cache(
+        root,
+        limits,
+        request,
+        &rift_index::WorkspaceContentCache::default(),
+    )
+}
+
+fn build_workspace_candidate_with_cache(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    request: &RebuildRequest,
+    content_cache: &rift_index::WorkspaceContentCache,
 ) -> Result<WorkspaceCandidate, ReadError> {
     tracing::debug!(
         component = "index",
@@ -1548,6 +1704,7 @@ pub(crate) fn build_workspace_candidate(
     );
     let configuration = ConfigurationState::accept(root);
     let change_set = request.change_set(root, &configuration);
+    let cancelled = || request.cancellation.is_cancelled();
     let candidate = match &change_set {
         ChangeSet::Full => {
             let sharing = request.previous.as_deref().filter(|previous| {
@@ -1555,14 +1712,30 @@ pub(crate) fn build_workspace_candidate(
                     .configuration
                     .index_configuration_differs(&configuration)
             });
-            whole_workspace_candidate(root, limits, configuration, request.epoch, sharing)?
+            whole_workspace_candidate(
+                root,
+                limits,
+                configuration,
+                request.epoch,
+                sharing,
+                &cancelled,
+                content_cache,
+            )?
         }
         ChangeSet::Incremental(changes) => {
             let previous = request
                 .previous
                 .as_ref()
                 .unwrap_or_else(|| unreachable!("an incremental change set names a publication"));
-            shared_workspace_candidate(previous, changes, configuration, request.epoch)?
+            shared_workspace_candidate(
+                root,
+                previous,
+                changes,
+                &request.work.paths,
+                configuration,
+                request.epoch,
+                &cancelled,
+            )?
         }
     };
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
@@ -1584,12 +1757,50 @@ pub(crate) fn lexical_write(
     published: &PublishedWorkspace,
     change_set: &ChangeSet,
 ) -> LexicalWrite {
+    if published.preparation.is_some() {
+        return LexicalWrite::Hold;
+    }
     match change_set {
         ChangeSet::Full => LexicalWrite::Whole,
         ChangeSet::Incremental(changes) => {
             LexicalWrite::Change(published.reads.lexical_change(changes))
         }
     }
+}
+
+/// Retains every visible file digest, reusing index-held content digests and reading only
+/// paths the index did not classify or could not digest.
+fn complete_visible_digests(
+    root: &Path,
+    reads: &ReadService,
+    policy: &WorkspaceSourcePolicy,
+) -> Result<VisibleWorkspaceFiles, ReadError> {
+    let mut digests = Vec::new();
+    let mut refused = BTreeMap::new();
+    for path in policy.visible_paths().map_err(ReadFault::index)? {
+        let digest = match reads.file_digest(&path) {
+            Some(digest) => Some(digest),
+            None => match policy.visible_digest(&root.join(path.as_str())) {
+                Ok(digest) => digest,
+                Err(error) if error.fault().left_out_file(path.clone()).is_some() => {
+                    let warning = error
+                        .fault()
+                        .left_out_file(path.clone())
+                        .unwrap_or_else(|| unreachable!("the guard found a left-out file"));
+                    refused.insert(path.clone(), warning);
+                    None
+                }
+                Err(error) => return Err(ReadFault::index(error)),
+            },
+        };
+        if let Some(digest) = digest {
+            digests.push((path, digest));
+        }
+    }
+    Ok(VisibleWorkspaceFiles {
+        digests: Arc::new(WorkspaceDigests::new(digests)),
+        refused: Arc::new(refused),
+    })
 }
 
 /// Scans every visible file, taking the `[source]` policy `reads` already compiled
@@ -1606,6 +1817,8 @@ fn whole_workspace_candidate(
     configuration: ConfigurationState,
     epoch: u64,
     sharing: Option<&PublishedWorkspace>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    content_cache: &rift_index::WorkspaceContentCache,
 ) -> Result<PublishedWorkspace, ReadError> {
     let visibility = configuration.source_visibility();
     let limits = configuration.index_limits(limits)?;
@@ -1613,30 +1826,44 @@ fn whole_workspace_candidate(
     let languages = configuration.language_file_selections();
     let dependencies_configuration = configuration.dependencies_configuration();
     let reads = match sharing {
-        Some(previous) => {
-            previous
-                .reads
-                .rescanned(root, &visibility, &text_inclusion, &languages)?
-        }
-        None => ReadService::build_with_languages(
+        Some(previous) => previous.reads.rescanned_cancellable(
             root,
-            limits,
             &visibility,
             &text_inclusion,
             &languages,
-            configuration.history_configuration(),
-            dependencies_configuration,
+            cancelled,
         )?,
+        None => ReadService::build_with_languages_cancellable(ReadServiceBuild {
+            root,
+            limits,
+            visibility: &visibility,
+            text_inclusion: &text_inclusion,
+            languages: &languages,
+            history: configuration.history_configuration(),
+            dependencies: dependencies_configuration,
+            content_cache: Some(content_cache),
+            cancelled,
+        })?,
     };
-    let source_policy = reads.source_policy_handle().unwrap_or_else(|| {
+    let source_policy = Some(reads.source_policy_handle().unwrap_or_else(|| {
         unreachable!("a current-tree read service always compiles its source policy")
-    });
-    let map = Arc::new(reads.workspace_map());
+    }));
+    let visible_files = complete_visible_digests(
+        root,
+        &reads,
+        source_policy.as_deref().unwrap_or_else(|| {
+            unreachable!("a current-tree read service always compiles its source policy")
+        }),
+    )?;
+    let map = publication_map(&reads, None);
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
         source_policy,
+        preparation: None,
+        visible_digests: visible_files.digests,
+        visible_refused: visible_files.refused,
         map,
         epoch,
     })
@@ -1651,21 +1878,56 @@ fn whole_workspace_candidate(
 /// a project environment the dependency context listed lists differently now, the one
 /// movement no changed path reports, in which case the rebuild reads the context again.
 fn shared_workspace_candidate(
+    root: &Path,
     previous: &PublishedWorkspace,
     changes: &PathChanges,
+    observed_paths: &BTreeSet<ProjectPath>,
     configuration: ConfigurationState,
     epoch: u64,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<PublishedWorkspace, ReadError> {
     if changes.is_empty() && !previous.reads.project_environment_moved() {
-        return Ok(previous.under(configuration, epoch));
+        let configuration_changed = previous.configuration.fingerprint != configuration.fingerprint;
+        let non_index_configuration_changed = configuration_changed
+            && !previous
+                .configuration
+                .index_configuration_differs(&configuration);
+        let configuration_path_observed = non_index_configuration_changed
+            && observed_paths
+                .iter()
+                .any(|path| path.as_str() == WORKSPACE_CONFIGURATION_FILE);
+        let holds_observed = if configuration_path_observed {
+            let observed_for_tree = observed_paths
+                .iter()
+                .filter(|path| path.as_str() != WORKSPACE_CONFIGURATION_FILE)
+                .cloned()
+                .collect();
+            previous.holds_observed(root, &observed_for_tree)
+        } else {
+            previous.holds_observed(root, observed_paths)
+        };
+        if holds_observed {
+            let mut candidate = previous.under(configuration, epoch);
+            if configuration_path_observed {
+                let visible_files =
+                    previous.update_visible_digests(root, &previous.reads, observed_paths)?;
+                candidate.visible_digests = visible_files.digests;
+                candidate.visible_refused = visible_files.refused;
+            }
+            return Ok(candidate);
+        }
     }
-    let reads = previous.reads.rebuilt(changes)?;
-    let map = Arc::new(reads.workspace_map());
+    let reads = previous.reads.rebuilt_cancellable(changes, cancelled)?;
+    let visible_files = previous.update_visible_digests(root, &reads, observed_paths)?;
+    let map = publication_map(&reads, previous.preparation.as_ref());
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
         configuration,
-        source_policy: Arc::clone(&previous.source_policy),
+        source_policy: previous.source_policy.as_ref().map(Arc::clone),
+        preparation: previous.preparation.clone(),
+        visible_digests: visible_files.digests,
+        visible_refused: visible_files.refused,
         map,
         epoch,
     })
@@ -1709,8 +1971,8 @@ pub(crate) async fn populate_search(
     if index.pass_readiness() == VectorReadiness::Disabled {
         return;
     }
-    let units = published.reads.index_documents();
-    let described = published.reads.described_units(&units);
+    let units = published.reads.symbol_index_documents_by_file();
+    let described = published.reads.described_symbol_units_by_file(&units);
     let tree_revision = published.reads.tree_revision();
     if let Err(error) = index
         .embed_described(&described, embedding, tree_revision)
@@ -1762,23 +2024,16 @@ pub(crate) fn commit_deadline(unit_count: usize) -> Duration {
         .clamp(LEXICAL_COMMIT_TIMEOUT, LEXICAL_COMMIT_TIMEOUT_MAX)
 }
 
-/// What besides a file's bytes decides the lexical rows one publication derives: the build
-/// that derives them, the corpus shape they are written in, and the index-owned
-/// configuration.
+/// Derivation revision of lexical rows from the analyzer, corpus, and configuration.
 ///
-/// The store keeps rows only under the value it stamped them with, so a new build, a
-/// changed tokenizer or field set, or an edited index-owned table reloads the store once
-/// instead of trusting rows another derivation wrote. The build is named by
-/// `product_version`, the product identity's version: the package version, the commit the
-/// binary was built from, and a dirty build's executable stamp. Every derivation source is
-/// in that build, so a store is derived again once per release or commit and never kept
-/// past a change to the code that derives it.
+/// The full analyzer manifest digest covers the sources deriving stored rows. Unrelated
+/// binary changes preserve the revision, while changed analysis inputs invalidate reuse.
 pub(crate) fn derivation_revision(
-    product_version: &str,
+    analyzer_revision: &str,
     configuration: &ConfigurationState,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(product_version.as_bytes());
+    hasher.update(analyzer_revision.as_bytes());
     hasher.update([0]);
     hasher.update(rift_ranking::CorpusRevision::current().as_str().as_bytes());
     hasher.update([0]);
@@ -1789,6 +2044,8 @@ pub(crate) fn derivation_revision(
 /// What one lexical commit writes.
 #[derive(Debug)]
 pub(crate) enum LexicalWrite {
+    /// The publication is partial and must not change stored rows.
+    Hold,
     /// Every file the publication holds, compared with the digests the store recorded:
     /// only a file whose digest differs, or that one side lacks, is written.
     Whole,
@@ -1807,6 +2064,7 @@ impl LexicalWrite {
     /// stamp already names the tree revision the candidate answers under.
     pub(crate) fn is_empty(&self) -> bool {
         match self {
+            Self::Hold => true,
             Self::Whole => false,
             Self::Change(change) => change.is_empty(),
             Self::Paths(paths) => paths.is_empty(),
@@ -1816,6 +2074,7 @@ impl LexicalWrite {
     /// The write's form, as a record names it.
     const fn form(&self) -> &'static str {
         match self {
+            Self::Hold => "hold",
             Self::Whole => "whole",
             Self::Change(_) => "change",
             Self::Paths(_) => "paths",
@@ -1842,6 +2101,7 @@ impl LexicalWrite {
     /// The paths this write names, or nothing for a whole write.
     fn named_paths(self) -> Option<BTreeSet<ProjectPath>> {
         match self {
+            Self::Hold => Some(BTreeSet::new()),
             Self::Whole => None,
             Self::Change(change) => Some(change.replaced().iter().cloned().collect()),
             Self::Paths(paths) => Some(paths),
@@ -2160,8 +2420,7 @@ pub(crate) struct LexicalLane {
 
 impl LexicalLane {
     /// Spawns the lane's task over `index` and returns the handle a publication hands its
-    /// write to. `product_version` names the build deriving the rows, which the derivation
-    /// revision the store stamps covers.
+    /// write to. `analyzer_revision` carries the full manifest digest deriving the rows.
     ///
     /// The task ends when the server does, racing the same cancellation token the index
     /// supervisor runs under. A write handed over after that is dropped with a debug line:
@@ -2170,10 +2429,10 @@ impl LexicalLane {
         index: Arc<SearchIndex>,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        product_version: Arc<str>,
+        analyzer_revision: Arc<str>,
     ) -> Self {
         let bounds = LexicalLaneBounds::of(index.lexical_limits());
-        Self::spawn_over(index, bounds, blocking, cancellation, product_version)
+        Self::spawn_over(index, bounds, blocking, cancellation, analyzer_revision)
     }
 
     /// Spawns the lane's task over any [`LexicalStore`], writing under `bounds`. Units the
@@ -2183,7 +2442,7 @@ impl LexicalLane {
         bounds: LexicalLaneBounds,
         blocking: BlockingExecutor,
         cancellation: CancellationToken,
-        product_version: Arc<str>,
+        analyzer_revision: Arc<str>,
     ) -> Self {
         let queue = Arc::new(LexicalQueue::default());
         let task = LexicalTask {
@@ -2192,7 +2451,7 @@ impl LexicalLane {
             queue: Arc::clone(&queue),
             bounds,
             cancellation,
-            product_version,
+            analyzer_revision,
         };
         tokio::spawn(task.run());
         Self { queue }
@@ -2206,6 +2465,9 @@ impl LexicalLane {
     /// handed while another waits merges into it, and the waiters on [`Self::landed`] are
     /// woken to read the revisions the merged write answers for.
     pub(crate) fn request(&self, write: LexicalWrite, published: Arc<PublishedWorkspace>) {
+        if published.preparation.is_some() {
+            return;
+        }
         let tree_revision = published.reads.tree_revision().to_owned();
         let mut backlog = self.queue.locked();
         if backlog.ended {
@@ -2293,7 +2555,7 @@ struct LexicalTask<Store> {
     queue: Arc<LexicalQueue>,
     bounds: LexicalLaneBounds,
     cancellation: CancellationToken,
-    product_version: Arc<str>,
+    analyzer_revision: Arc<str>,
 }
 
 /// The lane task's next piece of work.
@@ -2423,7 +2685,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             write, published, ..
         } = commit;
         let tree_revision = published.reads.tree_revision().to_owned();
-        let derivation = derivation_revision(&self.product_version, &published.configuration);
+        let derivation = derivation_revision(&self.analyzer_revision, &published.configuration);
         let documentation = published.reads.documentation_snapshot();
         let write = if whole_owed {
             LexicalWrite::Whole
@@ -2435,14 +2697,26 @@ impl<Store: LexicalStore> LexicalTask<Store> {
             .derived(write, published, &derivation)
             .await
             .inspect_err(|error| record_commit_failure(&tree_revision, form, error))?;
-        let (change, left_out) = within_unit_bound(change, self.bounds.unit_bytes_max);
+        let bounds = self.bounds;
+        let (parts, left_out) = self
+            .blocking
+            .run_with_cancellation(
+                "lexical unit derivation",
+                self.cancellation.clone(),
+                move |_| {
+                    let (change, left_out) = within_unit_bound(change, bounds.unit_bytes_max);
+                    let parts = change.into_parts_within(
+                        bounds.transaction_units_max,
+                        bounds.transaction_bytes_max,
+                    );
+                    Ok((parts, left_out))
+                },
+            )
+            .await
+            .inspect_err(|error| record_commit_failure(&tree_revision, form, error))?;
         record_units_left_out(&left_out, self.bounds.unit_bytes_max);
         // A source selection or resolved reference can change metadata without changing
         // lexical documents, so the last part stamps and writes metadata even when empty.
-        let parts = change.into_parts_within(
-            self.bounds.transaction_units_max,
-            self.bounds.transaction_bytes_max,
-        );
         let last = parts.len().saturating_sub(1);
         for (index, part) in parts.into_iter().enumerate() {
             let closing = index == last;
@@ -2473,6 +2747,7 @@ impl<Store: LexicalStore> LexicalTask<Store> {
         derivation_revision: &str,
     ) -> Result<LexicalChange, ReadError> {
         match write {
+            LexicalWrite::Hold => Ok(LexicalChange::default()),
             LexicalWrite::Change(change) => {
                 // The prepared write owns its units. Release the publication on the
                 // blocking pool before SQL waits, without blocking the lane on its Drop.
@@ -2711,6 +2986,9 @@ impl PopulationLane {
     /// written. That is a debug line rather than a caller's failure, because the work this
     /// publication came from already landed.
     pub(crate) fn request(&self, published: Arc<PublishedWorkspace>) {
+        if published.preparation.is_some() {
+            return;
+        }
         if self.publications.is_closed() {
             tracing::debug!(
                 component = "search",
@@ -2767,8 +3045,490 @@ pub(crate) async fn run_index_supervisor(
     invalidations: mpsc::Receiver<()>,
     context: IndexSupervisorContext,
 ) {
-    let capture = workspace_capture();
+    let capture = workspace_capture_with_cache(context.blocking.content_cache());
     run_index_supervisor_with(watcher, invalidations, context, capture).await;
+}
+
+/// Discovers and publishes the selected local index before the supervisor accepts events.
+#[cfg(test)]
+pub(crate) async fn prepare_initial_workspace(
+    context: &IndexSupervisorContext,
+) -> Result<(), ReadError> {
+    prepare_initial_workspace_with_epoch(context)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Startup failure and exact invalidation epoch queued for its retry.
+struct InitialPreparationFailure {
+    error: ReadError,
+    queued_epoch: Option<u64>,
+}
+
+async fn prepare_initial_workspace_with_epoch(
+    context: &IndexSupervisorContext,
+) -> Result<(), Box<InitialPreparationFailure>> {
+    let preparation = match discover_initial_workspace(context).await {
+        Ok(preparation) => preparation,
+        Err(error) => return Err(Box::new(initial_preparation_failure(context, error))),
+    };
+    let Some(preparation) = preparation else {
+        return Ok(());
+    };
+    prepare_initial_workspace_from_with_epoch(context, preparation).await
+}
+
+/// Retained owner and immutable discovery result for one startup preparation.
+pub(crate) struct InitialWorkspacePreparation {
+    preparation: WorkspaceIndexPreparation,
+    source_policy: Arc<WorkspaceSourcePolicy>,
+    configuration: ConfigurationState,
+    total: usize,
+    map_source_paths: Arc<Vec<(ProjectPath, rift_protocol::read::Language)>>,
+    map_text_paths: Arc<Vec<ProjectPath>>,
+    last: LastCapture,
+}
+
+/// Discovers visible paths and publishes their names before reading and parsing files.
+pub(crate) async fn discover_initial_workspace(
+    context: &IndexSupervisorContext,
+) -> Result<Option<InitialWorkspacePreparation>, ReadError> {
+    let Some(preparation) = context.validation.take_initial_preparation() else {
+        return Ok(None);
+    };
+    let validation = Arc::clone(&context.validation);
+    let root = context.root.clone();
+    let limits = context.limits;
+    let cancellation = validation.cancellation.clone();
+    let configuration = context
+        .published
+        .read()
+        .await
+        .snapshot()
+        .0
+        .configuration
+        .clone();
+    let visibility = configuration.source_visibility();
+    let text_inclusion = configuration.text_inclusion();
+    let languages = configuration.language_file_selections();
+    let effective_limits = configuration.index_limits(limits)?;
+    let (preparation, source_policy, total, map_source_paths, map_text_paths, empty_index) =
+        context
+            .blocking
+            .run_with_cancellation(
+                "initial index discovery",
+                cancellation.clone(),
+                move |token| {
+                    let cancelled = || token.is_cancelled();
+                    let empty_index = preparation.empty_snapshot().map_err(ReadFault::index)?;
+                    let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+                        &root,
+                        effective_limits,
+                        &visibility,
+                        &text_inclusion,
+                        &languages,
+                        &cancelled,
+                    )
+                    .map_err(ReadFault::index)?;
+                    let mut preparation = preparation;
+                    let total = preparation
+                        .discover(&visibility, &cancelled)
+                        .map_err(ReadFault::index)?;
+                    let map_paths = preparation
+                        .discovered_map_paths()
+                        .map_err(ReadFault::index)?;
+                    Ok((
+                        preparation,
+                        Arc::new(policy),
+                        total,
+                        Arc::new(map_paths.source),
+                        Arc::new(map_paths.text),
+                        empty_index,
+                    ))
+                },
+            )
+            .await?;
+    let initial = InitialWorkspacePreparation {
+        preparation,
+        source_policy,
+        configuration: configuration.clone(),
+        total,
+        map_source_paths,
+        map_text_paths,
+        last: LastCapture::default(),
+    };
+    publish_initial_empty(context, initial, empty_index, configuration).await
+}
+
+async fn publish_initial_empty(
+    context: &IndexSupervisorContext,
+    initial: InitialWorkspacePreparation,
+    empty_index: rift_index::WorkspaceIndex,
+    configuration: ConfigurationState,
+) -> Result<Option<InitialWorkspacePreparation>, ReadError> {
+    let InitialWorkspacePreparation {
+        preparation,
+        source_policy,
+        configuration: initial_configuration,
+        total,
+        map_source_paths,
+        map_text_paths,
+        last,
+    } = initial;
+    let root = context.root.clone();
+    let state = Arc::clone(&context.published);
+    let validation = Arc::clone(&context.validation);
+    let source_policy_for_publish = Arc::clone(&source_policy);
+    let map_source_paths_for_publish = Arc::clone(&map_source_paths);
+    let map_text_paths_for_publish = Arc::clone(&map_text_paths);
+    let lexical = context.lexical.clone();
+    let cancellation = validation.cancellation.clone();
+    let empty = context
+        .blocking
+        .run_with_cancellation(
+            "initial index empty publication",
+            cancellation,
+            move |token| {
+                let preparation_state = (total > 0).then(|| LocalIndexPreparation {
+                    prepared: 0,
+                    total: Some(total),
+                    source_paths: Arc::new(Vec::new()),
+                    other_paths: Arc::new(Vec::new()),
+                    map_source_paths: Arc::clone(&map_source_paths_for_publish),
+                    map_text_paths: Arc::clone(&map_text_paths_for_publish),
+                });
+                let candidate = preparation_publication(
+                    &root,
+                    empty_index,
+                    source_policy_for_publish,
+                    &configuration,
+                    preparation_state,
+                    validation.observed_epoch(),
+                )?;
+                if token.is_cancelled() {
+                    return Err(ReadFault::cancelled());
+                }
+                let lexical = if total == 0 {
+                    lexical.map(|lane| LexicalHandoff::new(lane, LexicalWrite::Whole))
+                } else {
+                    None
+                };
+                Ok(publish_preparation_after(
+                    &root,
+                    &state,
+                    &validation,
+                    &candidate,
+                    lexical,
+                ))
+            },
+        )
+        .await?;
+    if empty == RebuildOutcome::Cancelled {
+        return Ok(None);
+    }
+    Ok(Some(InitialWorkspacePreparation {
+        preparation,
+        source_policy,
+        configuration: initial_configuration,
+        total,
+        map_source_paths,
+        map_text_paths,
+        last,
+    }))
+}
+
+/// Reads bounded batches from one discovery result, preserving its visibility policy.
+#[cfg(test)]
+pub(crate) async fn prepare_initial_workspace_from(
+    context: &IndexSupervisorContext,
+    initial: InitialWorkspacePreparation,
+) -> Result<(), ReadError> {
+    prepare_initial_workspace_from_with_epoch(context, initial)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+async fn prepare_initial_workspace_from_with_epoch(
+    context: &IndexSupervisorContext,
+    initial: InitialWorkspacePreparation,
+) -> Result<(), Box<InitialPreparationFailure>> {
+    let result = prepare_initial_workspace_steps(context, initial).await;
+    result.map_err(|error| Box::new(initial_preparation_failure(context, error)))
+}
+
+fn schedule_initial_rebuild(context: &IndexSupervisorContext) -> Result<Option<u64>, ReadError> {
+    if context.validation.cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    context.validation.observe_whole_workspace().map(Some)
+}
+
+fn initial_preparation_failure(
+    context: &IndexSupervisorContext,
+    error: ReadError,
+) -> InitialPreparationFailure {
+    match schedule_initial_rebuild(context) {
+        Ok(queued_epoch) => InitialPreparationFailure {
+            error,
+            queued_epoch,
+        },
+        Err(error) => InitialPreparationFailure {
+            error,
+            queued_epoch: None,
+        },
+    }
+}
+
+async fn prepare_initial_workspace_steps(
+    context: &IndexSupervisorContext,
+    mut initial: InitialWorkspacePreparation,
+) -> Result<(), ReadError> {
+    let validation = Arc::clone(&context.validation);
+    let cancellation = validation.cancellation.clone();
+    while let Some(target) = initial.preparation.next_checkpoint() {
+        let (next_initial, outcome) =
+            prepare_initial_workspace_batch(context, initial, target, cancellation.clone()).await?;
+        initial = next_initial;
+        if outcome == RebuildOutcome::Cancelled {
+            return Ok(());
+        }
+    }
+    let current = Arc::clone(&context.published.read().await.current);
+    if current.preparation.is_none()
+        && let Some(population) = &context.population
+    {
+        population.request(current);
+    }
+    Ok(())
+}
+
+async fn prepare_initial_workspace_batch(
+    context: &IndexSupervisorContext,
+    mut initial: InitialWorkspacePreparation,
+    target: usize,
+    cancellation: CancellationToken,
+) -> Result<(InitialWorkspacePreparation, RebuildOutcome), ReadError> {
+    let root = context.root.clone();
+    let state = Arc::clone(&context.published);
+    let validation = Arc::clone(&context.validation);
+    let configuration = initial.configuration.clone();
+    let source_policy = Arc::clone(&initial.source_policy);
+    let previous_capture = std::mem::take(&mut initial.last);
+    let complete = target == initial.total;
+    let lexical = context.lexical.clone();
+    let map_source_paths = Arc::clone(&initial.map_source_paths);
+    let map_text_paths = Arc::clone(&initial.map_text_paths);
+    let batch = InitialWorkspaceBatch {
+        preparation: initial.preparation,
+        target,
+        complete,
+        total: initial.total,
+        root,
+        state,
+        validation,
+        configuration,
+        source_policy,
+        previous_capture,
+        map_source_paths,
+        map_text_paths,
+        lexical,
+    };
+    let (preparation, last, outcome) = context
+        .blocking
+        .run_with_cancellation("initial index preparation", cancellation, move |token| {
+            prepare_initial_batch(token, batch)
+        })
+        .await?;
+    initial.preparation = preparation;
+    initial.last = last;
+    Ok((initial, outcome))
+}
+
+struct InitialWorkspaceBatch {
+    preparation: WorkspaceIndexPreparation,
+    target: usize,
+    complete: bool,
+    total: usize,
+    root: PathBuf,
+    state: Arc<RwLock<IndexState>>,
+    validation: Arc<IndexValidation>,
+    configuration: ConfigurationState,
+    source_policy: Arc<WorkspaceSourcePolicy>,
+    previous_capture: LastCapture,
+    map_source_paths: Arc<Vec<(ProjectPath, rift_protocol::read::Language)>>,
+    map_text_paths: Arc<Vec<ProjectPath>>,
+    lexical: Option<LexicalLane>,
+}
+
+fn prepare_initial_batch(
+    token: &CancellationToken,
+    batch: InitialWorkspaceBatch,
+) -> Result<(WorkspaceIndexPreparation, LastCapture, RebuildOutcome), ReadError> {
+    let cancelled = || token.is_cancelled();
+    let mut preparation = batch.preparation;
+    let current = batch.state.blocking_read().snapshot().0;
+    let mut index = {
+        let current = &current;
+        if current.configuration.fingerprint == batch.configuration.fingerprint
+            && current
+                .source_policy
+                .as_ref()
+                .is_some_and(|policy| Arc::ptr_eq(policy, &batch.source_policy))
+        {
+            current
+                .reads
+                .advance_workspace_preparation(&mut preparation, batch.target, &cancelled)
+        } else {
+            preparation.advance_to(batch.target, &cancelled)
+        }
+    }
+    .map_err(ReadFault::index)?;
+    drop(current);
+    let (captured, mut last) = preparation
+        .capture_prepared_paths(&batch.previous_capture, &cancelled)
+        .map_err(ReadFault::index)?;
+    let changes = PathChanges::between(&index.digests(), &captured);
+    if !changes.is_empty() {
+        index = index
+            .rebuilt_cancellable(&changes, &cancelled)
+            .map_err(ReadFault::index)?;
+        preparation.retain_rebuilt_snapshot(&index);
+        let (verified, refreshed_last) = preparation
+            .capture_prepared_paths(&last, &cancelled)
+            .map_err(ReadFault::index)?;
+        if !PathChanges::between(&index.digests(), &verified).is_empty() {
+            return Err(ReadFault::unavailable(
+                "initial index preparation",
+                "a selected file kept changing during its capture",
+            ));
+        }
+        last = refreshed_last;
+    }
+    let (source_paths, other_paths) = preparation
+        .prepared_path_classes()
+        .map_err(ReadFault::index)?;
+    let candidate_state = (!batch.complete).then(|| LocalIndexPreparation {
+        prepared: preparation.prepared(),
+        total: Some(batch.total),
+        source_paths: Arc::new(source_paths),
+        other_paths: Arc::new(other_paths),
+        map_source_paths: batch.map_source_paths,
+        map_text_paths: batch.map_text_paths,
+    });
+    let candidate = preparation_publication(
+        &batch.root,
+        index,
+        batch.source_policy,
+        &batch.configuration,
+        candidate_state,
+        batch.validation.observed_epoch(),
+    )?;
+    let handoff = if batch.complete {
+        batch
+            .lexical
+            .map(|lane| LexicalHandoff::new(lane, LexicalWrite::Whole))
+    } else {
+        None
+    };
+    let outcome = publish_preparation_after(
+        &batch.root,
+        &batch.state,
+        &batch.validation,
+        &candidate,
+        handoff,
+    );
+    Ok((preparation, last, outcome))
+}
+
+fn preparation_publication(
+    root: &Path,
+    index: rift_index::WorkspaceIndex,
+    source_policy: Arc<WorkspaceSourcePolicy>,
+    configuration: &ConfigurationState,
+    preparation: Option<LocalIndexPreparation>,
+    epoch: u64,
+) -> Result<Arc<PublishedWorkspace>, ReadError> {
+    let context = match &preparation {
+        Some(_) => DependencyContext::default(),
+        None => ReadService::dependency_context_for_policy(
+            root,
+            &source_policy,
+            &configuration.dependencies_configuration(),
+        )?,
+    };
+    let reads = ReadService::from_prepared_index(
+        index,
+        Some(Arc::clone(&source_policy)),
+        Arc::new(context),
+        configuration.history_configuration(),
+        configuration.dependencies_configuration(),
+    );
+    let visible_files = if preparation.is_some() {
+        VisibleWorkspaceFiles {
+            digests: Arc::new(reads.content_digests()),
+            refused: Arc::new(BTreeMap::new()),
+        }
+    } else {
+        complete_visible_digests(root, &reads, &source_policy)?
+    };
+    let map = publication_map(&reads, preparation.as_ref());
+    Ok(Arc::new(PublishedWorkspace {
+        fingerprint: reads.workspace_fingerprint().clone(),
+        reads: Arc::new(reads),
+        configuration: configuration.clone(),
+        source_policy: Some(source_policy),
+        preparation,
+        visible_digests: visible_files.digests,
+        visible_refused: visible_files.refused,
+        map,
+        epoch,
+    }))
+}
+
+fn publish_preparation_after(
+    root: &Path,
+    published: &RwLock<IndexState>,
+    validation: &IndexValidation,
+    candidate: &Arc<PublishedWorkspace>,
+    lexical: Option<LexicalHandoff>,
+) -> RebuildOutcome {
+    let pending = validation.locked_pending();
+    let observed_epoch = validation.observed_epoch();
+    if pending.covers_whole_workspace()
+        || candidate.configuration.fingerprint != configuration_fingerprint(root)
+    {
+        drop(pending);
+        return RebuildOutcome::Superseded;
+    }
+    let answer = answered_candidate(root, candidate, &pending, observed_epoch)
+        .published_at_startup(candidate);
+    let Some(answer) = answer else {
+        drop(pending);
+        return RebuildOutcome::Superseded;
+    };
+    let mut state = published.blocking_write();
+    if state.current.preparation.is_none() || answer.epoch < state.current.epoch {
+        drop(state);
+        drop(pending);
+        return RebuildOutcome::Superseded;
+    }
+    let previous = Arc::clone(&state.current);
+    if !state.publish(Arc::clone(&answer), answer.epoch) {
+        drop(state);
+        drop(pending);
+        return RebuildOutcome::Superseded;
+    }
+    validation.replace_publication_locked(&answer);
+    if let Some(engines) = validation.engines.get() {
+        engines.owe_publication(&previous, &answer, &ChangeSet::Full);
+    }
+    if let Some(handoff) = lexical {
+        handoff.hand_over(Arc::clone(&answer));
+    }
+    drop(state);
+    drop(pending);
+    validation.changed.notify_waiters();
+    RebuildOutcome::Published
 }
 
 /// Runs the supervisor loop over an injectable capture, so a test can hold one capture
@@ -2792,17 +3552,60 @@ pub(crate) async fn run_index_supervisor_with(
         Arc::clone(&validation.supervisor_running),
         Arc::clone(&validation.changed),
     );
-    loop {
-        let received = tokio::select! {
-            () = validation.cancellation.cancelled() => false,
-            received = invalidations.recv() => received.is_some(),
-        };
-        if !received {
+    let (mut background, mut version_control) = match background::start(&context).await {
+        Ok(Some(scheduling)) => scheduling,
+        Ok(None) => return,
+        Err(error) => {
+            if !validation.cancellation.is_cancelled() {
+                publish_rebuild_failure(&context, validation.observed_epoch(), error).await;
+            }
             return;
         }
+    };
+    if let Err(failure) = prepare_initial_workspace_with_epoch(&context).await
+        && let Some(epoch) = failure.queued_epoch
+    {
+        publish_rebuild_failure(&context, epoch, failure.error).await;
+    }
+    loop {
+        let Some(trigger) = background
+            .next(&mut invalidations, &validation.cancellation)
+            .await
+        else {
+            return;
+        };
         tokio::select! {
             () = validation.cancellation.cancelled() => return,
             () = tokio::time::sleep(INDEX_DEBOUNCE) => {}
+        }
+        match version_control.wait(&context).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                publish_rebuild_failure(&context, validation.observed_epoch(), error).await;
+                continue;
+            }
+        }
+        if trigger == background::Trigger::Validation
+            && let Err(error) = background.validate(&context).await
+        {
+            if validation.cancellation.is_cancelled() {
+                return;
+            }
+            publish_rebuild_failure(&context, validation.observed_epoch(), error).await;
+            continue;
+        }
+        // The bounded signal may remain after a timer took the work it announced.
+        // Drain before taking pending work, so a later observation retains its signal.
+        let _ = invalidations.try_recv();
+        let pending_is_empty = {
+            let pending = validation.locked_pending();
+            !pending.covers_whole_workspace() && pending.paths.is_empty()
+        };
+        if pending_is_empty
+            && validation.observed_epoch() <= published.read().await.snapshot().0.epoch
+        {
+            continue;
         }
         let request = validation.take_pending();
         let epoch = request.epoch;
@@ -3077,6 +3880,9 @@ pub(crate) fn capture_rebuild_with(
         Ok(candidate) => candidate,
         Err(error) => {
             validation.restore_pending(request.work);
+            if request.cancellation.is_cancelled() || validation.cancellation.is_cancelled() {
+                return Ok(CapturedRebuild::Cancelled);
+            }
             return Err(error);
         }
     };
@@ -3751,7 +4557,7 @@ impl ConfigurationState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::ConfigurationState;
-    use rift_core::SourceVisibility;
+    use rift_core::{ProjectPath, SourceVisibility};
     use rift_server::LspProcessKey;
     #[test]
     fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
@@ -3808,6 +4614,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    use std::collections::{BTreeMap, BTreeSet};
     use std::error::Error;
     use std::fs;
     use std::sync::Arc;
@@ -3817,8 +4624,10 @@ pub(crate) mod tests {
 
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
+    use rift_core::SymbolId;
     use rift_index::{LexicalChange, LexicalIndexLimits, WorkspaceIndexLimits};
     use rift_protocol::configuration::{GlobalConfiguration, ServerConfiguration};
+    use rift_protocol::map::WorkspaceMap;
     use rift_ranking::{
         DocumentFields, DocumentIdentity, DocumentKind, DocumentLocation, IndexDocument,
         ParsedQuery, Pattern, QueryPhase, RankingInput, SearchableField,
@@ -3873,6 +4682,40 @@ pub(crate) mod tests {
         candidate_with_limits(root, epoch, WorkspaceIndexLimits::default())
     }
 
+    fn initial_preparation_context(
+        root: &std::path::Path,
+    ) -> TestResult<(
+        super::IndexSupervisorContext,
+        tokio::sync::mpsc::Receiver<()>,
+    )> {
+        let limits = WorkspaceIndexLimits::default();
+        let (validation, invalidations) = IndexValidation::new(limits.files_max());
+        let (empty, preparation) = super::empty_workspace_preparation(
+            root,
+            limits,
+            ConfigurationState::accept(root),
+            0,
+            rift_index::WorkspaceContentCache::default(),
+        )?;
+        validation.prepare_initial(preparation);
+        let published = Arc::new(RwLock::new(IndexState {
+            current: empty,
+            failure: None,
+        }));
+        Ok((
+            super::IndexSupervisorContext {
+                root: root.to_path_buf(),
+                limits,
+                published,
+                validation,
+                blocking: BlockingExecutor::isolated(2, 60_000),
+                population: None,
+                lexical: None,
+            },
+            invalidations,
+        ))
+    }
+
     fn candidate_with_limits(
         root: &std::path::Path,
         epoch: u64,
@@ -3884,6 +4727,44 @@ pub(crate) mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn later_watch_epoch_rejects_queued_initial_preparation_failure() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("a.rs"), "pub fn first() {}\n")?;
+        fs::write(directory.path().join("b.rs"), "pub fn second() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(directory.path())?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        fs::remove_file(directory.path().join("b.rs"))?;
+
+        let failure = super::prepare_initial_workspace_from_with_epoch(&context, initial)
+            .await
+            .expect_err("a missing discovered path must refuse its preparation batch");
+        let queued_epoch = failure
+            .queued_epoch
+            .ok_or("preparation refusal must queue a full rebuild")?;
+        assert_eq!(context.validation.observed_epoch(), queued_epoch);
+
+        let later_epoch = context
+            .validation
+            .observe_paths([rift_core::ProjectPath::new("a.rs")?])?;
+        assert_eq!(later_epoch, queued_epoch + 1);
+        let published = Arc::clone(&context.published);
+        let validation = Arc::clone(&context.validation);
+        let error = failure.error;
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_rebuild_failure(&published, &validation, queued_epoch, error)
+        })
+        .await?;
+        assert!(
+            !recorded,
+            "failure for the queued startup epoch cannot replace later watcher state"
+        );
+        assert!(context.published.read().await.failure.is_none());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4078,7 +4959,11 @@ pub(crate) mod tests {
                 .source_visibility()
                 .respect_gitignore()
         );
-        assert!(Arc::ptr_eq(&actual.source_policy, &expected.source_policy));
+        match (&actual.source_policy, &expected.source_policy) {
+            (Some(actual), Some(expected)) => assert!(Arc::ptr_eq(actual, expected)),
+            (None, None) => {}
+            _ => panic!("publications must carry the same source policy state"),
+        }
     }
 
     struct PublicationFixture {
@@ -4326,7 +5211,14 @@ pub(crate) mod tests {
         let _work = validation.take_pending();
         let candidate = candidate_with_limits(directory.path(), epoch, limits)?;
         assert!(candidate.reads.file_digest(&path).is_none());
-        assert!(candidate.source_policy.visible_digest(&absolute).is_err());
+        assert!(
+            candidate
+                .source_policy
+                .as_ref()
+                .expect("candidate carries accepted source policy")
+                .visible_digest(&absolute)
+                .is_err()
+        );
         let state = RwLock::new(IndexState {
             current: before,
             failure: None,
@@ -4361,7 +5253,14 @@ pub(crate) mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&absolute, &absolute)?;
-            assert!(published.source_policy.visible_digest(&absolute).is_err());
+            assert!(
+                published
+                    .source_policy
+                    .as_ref()
+                    .expect("publication carries accepted source policy")
+                    .visible_digest(&absolute)
+                    .is_err()
+            );
             assert_eq!(
                 publish_rebuild(directory.path(), &state, &validation, &published),
                 RebuildOutcome::Superseded,
@@ -4425,6 +5324,29 @@ pub(crate) mod tests {
         let event = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("rift.toml"));
         super::report_watch_outcome(&super::WatchRoots::at(root), &validation, Ok(event));
         assert!(validation.watch_failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pathless_rescan_event_schedules_a_whole_workspace_rebuild() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let event = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        let roots = super::WatchRoots::resolve(&root)?;
+
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &event),
+            super::WatchImpact::WholeWorkspace,
+            "rescan says event history may have gaps, even when event has no paths"
+        );
+        assert_eq!(validation.observe_event(&roots, &event)?, Some(1));
+        let pending = validation.take_pending();
+        assert!(
+            pending.work.covers_whole_workspace(),
+            "pathless rescan must retain whole-workspace recovery"
+        );
+        Ok(())
     }
 
     #[test]
@@ -5101,6 +6023,7 @@ pub(crate) mod tests {
             epoch: previous.epoch + 1,
             work: super::PendingWork::naming([path.clone()]),
             previous: Some(Arc::clone(previous)),
+            cancellation: CancellationToken::new(),
         };
         match build_workspace_candidate(root, WorkspaceIndexLimits::default(), &request)? {
             WorkspaceCandidate::Stable {
@@ -5111,6 +6034,127 @@ pub(crate) mod tests {
                 Err("fixture configuration must remain stable".into())
             }
         }
+    }
+
+    #[test]
+    fn visible_digests_track_unclassified_add_change_and_delete() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("rift.toml"), SMALL_MAX_FILE)?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let path = rift_core::ProjectPath::new("opaque.unknown")?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        assert_eq!(previous.visible_digests.get(&path), None);
+
+        let first = b"unclassified one\n";
+        fs::write(directory.path().join(path.as_str()), first)?;
+        let (added, added_changes) = rebuilt_naming(directory.path(), &previous, &path)?;
+        assert_eq!(
+            added.visible_digests.get(&path),
+            Some(rift_index::FileDigest::of(first)),
+            "publication records unclassified file bytes"
+        );
+        assert!(matches!(added_changes, ChangeSet::Incremental(changes) if changes.len() == 1));
+
+        let second = b"unclassified two\n";
+        fs::write(directory.path().join(path.as_str()), second)?;
+        let (modified, change_set) = rebuilt_naming(directory.path(), &added, &path)?;
+        assert_eq!(
+            modified.visible_digests.get(&path),
+            Some(rift_index::FileDigest::of(second)),
+            "publication replaces unclassified digest"
+        );
+        assert!(matches!(change_set, ChangeSet::Incremental(changes) if changes.len() == 1));
+
+        fs::remove_file(directory.path().join(path.as_str()))?;
+        let (removed, change_set) = rebuilt_naming(directory.path(), &modified, &path)?;
+        assert_eq!(removed.visible_digests.get(&path), None);
+        assert!(matches!(change_set, ChangeSet::Incremental(changes) if changes.len() == 1));
+        Ok(())
+    }
+
+    #[test]
+    fn complete_visible_catalog_matches_live_capture_for_unindexed_files() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(
+            root.join("rift.toml"),
+            "[languages.rust]\nenabled = false\n\n[search.text]\ninclude = [\"**/*.txt\"]\n",
+        )?;
+        let entries: [(&str, &[u8]); 4] = [
+            ("disabled.rs", b"pub fn disabled() {}\n"),
+            ("binary.bin", b"source\0bytes"),
+            ("invalid.bin", &[0xff, 0xfe]),
+            ("opaque.unknown", b"unclassified bytes"),
+        ];
+        for (name, bytes) in entries {
+            fs::write(root.join(name), bytes)?;
+        }
+        let mut previous = stable_candidate(root, 0)?;
+        let policy = previous
+            .source_policy
+            .as_deref()
+            .ok_or("complete source policy")?;
+        assert_eq!(
+            previous.visible_digests.as_ref(),
+            &policy.visible_digests()?
+        );
+        for (name, bytes) in entries {
+            let path = ProjectPath::new(name)?;
+            assert_eq!(
+                previous.reads.file_digest(&path),
+                None,
+                "{name} is unindexed"
+            );
+            assert_eq!(
+                previous.visible_digests.get(&path),
+                Some(rift_index::FileDigest::of(bytes))
+            );
+            fs::write(root.join(name), b"changed raw bytes\0")?;
+            let (next, _) = rebuilt_naming(root, &previous, &path)?;
+            let policy = next
+                .source_policy
+                .as_deref()
+                .ok_or("complete source policy")?;
+            assert_eq!(next.visible_digests.as_ref(), &policy.visible_digests()?);
+            assert_eq!(
+                previous.visible_digests.get(&path),
+                Some(rift_index::FileDigest::of(bytes))
+            );
+            previous = next;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn complete_visible_catalog_replaces_visibility_with_configuration() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join("notes.txt"), "visible bytes\n")?;
+        fs::write(root.join("rift.toml"), "")?;
+        let original = stable_candidate(root, 0)?;
+        let notes = ProjectPath::new("notes.txt")?;
+        assert!(original.visible_digests.get(&notes).is_some());
+
+        fs::write(
+            root.join("rift.toml"),
+            "[source]\nexclude = [\"notes.txt\"]\n",
+        )?;
+        let excluded = stable_candidate(root, 1)?;
+        assert_eq!(excluded.visible_digests.get(&notes), None);
+        let policy = excluded
+            .source_policy
+            .as_deref()
+            .ok_or("complete source policy")?;
+        assert_eq!(
+            excluded.visible_digests.as_ref(),
+            &policy.visible_digests()?
+        );
+        assert!(
+            original.visible_digests.get(&notes).is_some(),
+            "earlier publication retains its catalog"
+        );
+        Ok(())
     }
 
     /// A file left out before its bytes were digested has no digest, and a deleted path
@@ -5140,9 +6184,8 @@ pub(crate) mod tests {
     }
 
     /// A left-out file written again with the same bytes is still on disk and still left
-    /// out, so it keeps its warning. A file past the byte bound records that warning on both
-    /// sides and changes nothing; one holding a NUL byte has no recorded digest to compare,
-    /// so the rebuild reads it again and leaves it out again.
+    /// out, so it keeps its warning. Captured raw digests compare binary files; oversized
+    /// files compare their refusal. Neither unchanged file requires an index rebuild.
     #[test]
     fn a_left_out_file_written_with_the_same_bytes_keeps_its_warning() -> TestResult {
         for (name, bytes) in LEFT_OUT_FILES {
@@ -5158,12 +6201,12 @@ pub(crate) mod tests {
                 expected,
                 "{name}: the warning stays"
             );
-            let read_again = if name == "binary.rs" {
-                vec![name.to_owned()]
-            } else {
-                Vec::new()
-            };
-            assert_eq!(changed_paths(&change_set), Some(read_again), "{name}");
+            assert_eq!(changed_paths(&change_set), Some(Vec::new()), "{name}");
+            assert!(Arc::ptr_eq(&published.reads, &previous.reads));
+            assert!(Arc::ptr_eq(
+                &published.visible_digests,
+                &previous.visible_digests
+            ));
         }
         Ok(())
     }
@@ -5186,6 +6229,7 @@ pub(crate) mod tests {
             epoch: 1,
             work: super::PendingWork::naming([rift_core::ProjectPath::new("pkg")?]),
             previous: Some(previous),
+            cancellation: CancellationToken::new(),
         };
         let configuration = ConfigurationState::accept(directory.path());
         assert_eq!(
@@ -5274,6 +6318,7 @@ pub(crate) mod tests {
                 epoch,
                 work: super::PendingWork::whole_workspace(),
                 previous: Some(Arc::clone(&previous)),
+                cancellation: CancellationToken::new(),
             };
             match build_workspace_candidate(directory.path(), limits, &request)? {
                 WorkspaceCandidate::Stable {
@@ -5324,6 +6369,7 @@ pub(crate) mod tests {
             epoch: 1,
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
+            cancellation: CancellationToken::new(),
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -5356,6 +6402,7 @@ pub(crate) mod tests {
             epoch: 1,
             work: super::PendingWork::naming([rift_core::ProjectPath::new("lib.rs")?]),
             previous: Some(Arc::clone(&previous)),
+            cancellation: CancellationToken::new(),
         };
 
         let limits = WorkspaceIndexLimits::default();
@@ -5390,6 +6437,7 @@ pub(crate) mod tests {
                 epoch: 1,
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
+                cancellation: CancellationToken::new(),
             };
 
             let WorkspaceCandidate::Stable {
@@ -5437,6 +6485,7 @@ pub(crate) mod tests {
                 epoch: 1,
                 work: super::PendingWork::naming([rift_core::ProjectPath::new("rift.toml")?]),
                 previous: Some(Arc::clone(&previous)),
+                cancellation: CancellationToken::new(),
             };
 
             let WorkspaceCandidate::Stable {
@@ -5731,439 +6780,71 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// An epoch that moves while every scan folds the same tree is an observation that
-    /// changed no byte, so the startup build publishes on the second scan. Every one of
-    /// those observations escalates to the whole workspace, which is what makes
-    /// `answered_candidate` refuse: the assertion pins that the content comparison, not
-    /// that one, is what published.
-    #[tokio::test]
-    async fn initial_capture_publishes_when_every_scan_folds_the_same_tree() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
-        let moving = Arc::clone(&validation);
-        let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted = Arc::clone(&scans);
-        let (published, _write) = super::initial_workspace_with(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &validation,
-            &blocking,
-            move |root, limits, request| {
-                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Every capture observes one more filesystem event, so no attempt ever
-                // sees a stable epoch, and none of those events changes a byte.
-                moving.observe_whole_workspace()?;
-                super::build_workspace_candidate(root, limits, request)
-            },
-        )
-        .await?;
-
-        assert_eq!(
-            scans.load(std::sync::atomic::Ordering::Relaxed),
-            2,
-            "the second scan is the first that has a previous one to agree with"
-        );
-        assert_eq!(
-            published.epoch,
-            validation.observed_epoch(),
-            "the publication answers the epoch the observations reached"
-        );
-        assert!(
-            validation.locked_pending().covers_whole_workspace(),
-            "every startup observation escalates, so answered_candidate could not publish"
-        );
-        Ok(())
-    }
-
-    /// A baseline text file folds into the recorded set but not into the syntax-indexed
-    /// tree revision, which is the shape a startup failure showed: the tree revision held
-    /// on every attempt while the folded set moved. The scan that first sees the file
-    /// disagrees with the one before it, and the pair that follows agrees and publishes.
-    #[tokio::test]
-    async fn initial_capture_publishes_once_a_moved_text_set_settles() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
-        let moving = Arc::clone(&validation);
-        let written = directory.path().to_path_buf();
-        let revisions = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = Arc::clone(&revisions);
-        let (published, _write) = super::initial_workspace_with(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &validation,
-            &blocking,
-            move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(root, limits, request)?;
-                let mut seen = seen.lock().expect("the fixture lock is clean");
-                if let WorkspaceCandidate::Stable { published, .. } = &candidate {
-                    seen.push(published.reads.tree_revision().to_owned());
-                }
-                if seen.len() == 1 {
-                    // No language claims this path, so the default `[search.text]`
-                    // `include` of `["**"]` takes it as baseline text: recorded, folded
-                    // into the digest set, and outside the syntax-indexed tree revision.
-                    fs::write(written.join("notes.txt"), "beacon notes\n")
-                        .expect("the fixture write lands");
-                }
-                drop(seen);
-                moving.observe_whole_workspace()?;
-                Ok(candidate)
-            },
-        )
-        .await?;
-
-        let revisions = revisions.lock().expect("the fixture lock is clean");
-        assert_eq!(
-            revisions.len(),
-            3,
-            "the first two scans disagree, so the settled pair is the second and third"
-        );
-        assert!(
-            revisions.windows(2).all(|pair| pair[0] == pair[1]),
-            "the syntax-indexed tree revision holds while the recorded set moves: \
-             {revisions:?}"
-        );
-        assert_eq!(published.epoch, validation.observed_epoch());
-        Ok(())
-    }
-
-    /// A capture that comes back `ConfigurationChanged` folds no tree, so it leaves
-    /// nothing to compare. The refusal names the configuration file rather than reporting
-    /// the workspace as having changed.
-    #[tokio::test]
-    async fn initial_capture_refuses_and_names_a_configuration_that_kept_moving() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
-
-        let error = super::initial_workspace_with(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &validation,
-            &blocking,
-            move |_root, _limits, _request| Ok(super::WorkspaceCandidate::ConfigurationChanged),
-        )
-        .await
-        .expect_err("a configuration that moves during every capture must refuse");
-
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        assert!(
-            error
-                .to_string()
-                .contains("the configuration file moved during every capture"),
-            "{error}"
-        );
-        Ok(())
-    }
-
-    /// A workspace whose every scan folds a different tree is genuinely moving, so the
-    /// bounded attempts still refuse rather than publish a scan nothing confirmed.
-    #[tokio::test]
-    async fn initial_capture_fails_when_every_scan_folds_a_different_tree() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
-        let moving = Arc::clone(&validation);
-        let written = directory.path().to_path_buf();
-        let error = super::initial_workspace_with(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &validation,
-            &blocking,
-            move |root, limits, request| {
-                let candidate = super::build_workspace_candidate(root, limits, request)?;
-                // The next scan reads bytes this one never held.
-                fs::write(
-                    written.join("lib.rs"),
-                    format!("pub fn beacon{}() {{}}\n", request.epoch),
-                )
-                .expect("the fixture write lands");
-                moving.observe_whole_workspace()?;
-                Ok(candidate)
-            },
-        )
-        .await
-        .expect_err("a tree that moves on every attempt must exhaust bounded attempts");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        assert!(
-            error
-                .to_string()
-                .contains("the syntax-indexed files moved between two scans"),
-            "{error}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn initial_capture_fails_while_configuration_keeps_moving() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        let (validation, _receiver) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = crate::server::BlockingExecutor::isolated(2, 60_000);
-        let error = super::initial_workspace_with(
-            directory.path(),
-            WorkspaceIndexLimits::default(),
-            &validation,
-            &blocking,
-            |_, _, _| Ok(WorkspaceCandidate::ConfigurationChanged),
-        )
-        .await
-        .expect_err("a configuration that keeps moving must exhaust capture attempts");
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        Ok(())
-    }
-
-    /// One file event, as the watcher reports a write to `path`.
-    fn file_written(path: &std::path::Path) -> Event {
-        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))).add_path(path.into())
-    }
-
-    /// A capture that scans as production does and, on its first scan only, then runs
-    /// `change` under the canonical root and reports the event it answers to `validation`
-    /// the way the watcher does, before that scan publishes. Answers the capture and the
-    /// count of scans it ran.
-    fn changed_during_first_scan(
-        root: &std::path::Path,
-        validation: &Arc<IndexValidation>,
-        change: impl Fn(&std::path::Path) -> Event + Clone + Send + 'static,
-    ) -> TestResult<(
-        impl super::CaptureWorkspace + Clone + Send + 'static,
-        Arc<std::sync::atomic::AtomicU64>,
-    )> {
-        let roots = super::WatchRoots::resolve(root)?;
-        let watching = Arc::clone(validation);
-        let scans = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted = Arc::clone(&scans);
-        let capture = move |root: &std::path::Path,
-                            limits: WorkspaceIndexLimits,
-                            request: &RebuildRequest|
-              -> Result<WorkspaceCandidate, rift_server::ReadError> {
-            let candidate = build_workspace_candidate(root, limits, request)?;
-            if counted.fetch_add(1, Ordering::Relaxed) == 0 {
-                let event = change(roots.canonical());
-                super::report_watch_outcome(&roots, &watching, Ok(event));
-            }
-            Ok(candidate)
-        };
-        Ok((capture, scans))
-    }
-
-    /// A capture that writes `bytes` to `path` after its first scan, as
-    /// [`changed_during_first_scan`] runs a change.
-    fn written_during_first_scan(
-        root: &std::path::Path,
-        validation: &Arc<IndexValidation>,
-        path: &'static str,
-        bytes: &'static str,
-    ) -> TestResult<(
-        impl super::CaptureWorkspace + Clone + Send + 'static,
-        Arc<std::sync::atomic::AtomicU64>,
-    )> {
-        changed_during_first_scan(root, validation, move |root| {
-            let written = root.join(path);
-            fs::write(&written, bytes).expect("the fixture write lands");
-            file_written(&written)
-        })
-    }
-
-    /// Polls `published` until its snapshot answers `epoch`, and answers that snapshot.
-    async fn published_within_bound(
-        published: &RwLock<IndexState>,
-        epoch: u64,
-    ) -> TestResult<Arc<PublishedWorkspace>> {
-        for _attempt in 0..LANE_ATTEMPTS_MAX {
-            let current = Arc::clone(&published.read().await.current);
-            if current.epoch == epoch {
-                return Ok(current);
-            }
-            tokio::time::sleep(LANE_POLL).await;
-        }
-        let reached = published.read().await.current.epoch;
-        Err(format!("the supervisor never published epoch {epoch}, only {reached}").into())
-    }
-
     /// How many declarations named `name` one snapshot answers.
     fn declarations_named(published: &PublishedWorkspace, name: &str) -> TestResult<usize> {
         let params = serde_json::from_value(serde_json::json!({ "name": name }))?;
         Ok(published.reads.get_symbol(&params)?.hits.len())
     }
 
-    /// Starts the supervisor over `startup`, handing `lane` its rebuilds, as a served
-    /// workspace does once its startup snapshot published.
-    fn supervised_after_startup(
-        root: &std::path::Path,
-        validation: &Arc<IndexValidation>,
-        invalidations: tokio::sync::mpsc::Receiver<()>,
-        startup: &Arc<PublishedWorkspace>,
-        lane: &LexicalLane,
-    ) -> TestResult<(Arc<RwLock<IndexState>>, tokio::task::JoinHandle<()>)> {
-        let published = Arc::new(RwLock::new(IndexState {
-            current: Arc::clone(startup),
-            failure: None,
-        }));
-        let context = super::IndexSupervisorContext {
-            root: root.to_path_buf(),
-            limits: WorkspaceIndexLimits::default(),
-            published: Arc::clone(&published),
-            validation: Arc::clone(validation),
-            blocking: BlockingExecutor::isolated(2, 60_000),
-            population: None,
-            lexical: Some(lane.clone()),
-        };
-        let supervisor = tokio::spawn(super::run_index_supervisor_with(
-            unwatched(root, validation)?,
-            invalidations,
-            context,
-            super::workspace_capture(),
-        ));
-        Ok((published, supervisor))
-    }
-
-    /// A file edited while the startup scan runs is taken as a change after that scan, as
-    /// one after any publication is: the scan publishes under the epoch its capture took,
-    /// the edited path stays the pending work, and the supervisor's first rebuild reads that
-    /// file alone. The lexical lane meets the startup snapshot's whole write first and a
-    /// change naming the edited file right after.
+    /// A file edited after discovery is captured before its first prepared publication.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_file_edited_during_the_startup_scan_is_the_first_incremental_change() -> TestResult {
+    async fn a_file_edited_after_discovery_is_in_the_first_prepared_publication() -> TestResult {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
         let lib = rift_core::ProjectPath::new("lib.rs")?;
-        let other = rift_core::ProjectPath::new("other.rs")?;
-        let (validation, invalidations) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = BlockingExecutor::isolated(2, 60_000);
-        let (capture, scans) = written_during_first_scan(
-            directory.path(),
-            &validation,
-            "lib.rs",
-            "pub fn edited() {}\n",
-        )?;
-        let limits = WorkspaceIndexLimits::default();
-        let (startup, write) = super::initial_workspace_with(
-            directory.path(),
-            limits,
-            &validation,
-            &blocking,
-            capture,
-        )
-        .await?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        fs::write(root.join("lib.rs"), "pub fn edited() {}\n")?;
+        let epoch = context.validation.observe_paths([lib.clone()])?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+        let startup = Arc::clone(&context.published.read().await.current);
 
-        assert_eq!(scans.load(Ordering::Relaxed), 1, "the first scan publishes");
         assert_eq!(
-            startup.epoch, 0,
-            "the snapshot answers the epoch its capture took"
-        );
-        assert_eq!(validation.observed_epoch(), 1);
-        assert_eq!(declarations_named(&startup, "beacon")?, 1);
-        assert!(matches!(write, LexicalWrite::Whole), "{write:?}");
-        let (whole, named) = {
-            let pending = validation.locked_pending();
-            let named: Vec<_> = pending.paths().cloned().collect();
-            (pending.covers_whole_workspace(), named)
-        };
-        assert!(!whole, "the edit named its own path");
-        assert_eq!(named, vec![lib.clone()]);
-
-        let double = StoreDouble::new();
-        let lane = LexicalLane::spawn_over(
-            Arc::clone(&double),
-            super::lexical_double::UNBOUNDED,
-            blocking,
-            validation.cancellation.clone(),
-            Arc::from(super::lexical_double::PRODUCT_VERSION),
-        );
-        lane.request(write, Arc::clone(&startup));
-        double.release_one();
-        let startup_revision = startup.reads.tree_revision();
-        commit_state_within_bound(&lane, startup_revision, LexicalCommitState::Settled).await?;
-        let (published, supervisor) = supervised_after_startup(
-            directory.path(),
-            &validation,
-            invalidations,
-            &startup,
-            &lane,
-        )?;
-        double.release_one();
-        let current = published_within_bound(&published, 1).await?;
-
-        assert_eq!(declarations_named(&current, "edited")?, 1);
-        assert_eq!(declarations_named(&current, "beacon")?, 0);
-        assert_eq!(
-            current.reads.file_digest(&other),
-            startup.reads.file_digest(&other)
-        );
-        let current_revision = current.reads.tree_revision();
-        commit_state_within_bound(&lane, current_revision, LexicalCommitState::Settled).await?;
-        let calls = double.calls();
-        assert_eq!(
-            calls.last(),
-            Some(&("apply", current_revision.to_owned())),
-            "the change commits under the rebuilt tree revision: {calls:?}"
+            startup.epoch, epoch,
+            "preparation captures path event before publishing the file"
         );
         assert_eq!(
-            calls.iter().filter(|(form, _)| *form == "clear").count(),
+            declarations_named(&startup, "edited")?,
             1,
-            "only the startup snapshot's whole write clears the store: {calls:?}"
+            "prepared reads use the current file bytes"
         );
-        assert_eq!(
-            double.applied().last(),
-            Some(&vec![lib]),
-            "the change names the edited file alone"
-        );
-        validation.cancellation.cancel();
-        supervisor.await?;
+        assert_eq!(declarations_named(&startup, "beacon")?, 0);
+        assert!(startup.preparation.is_none());
         Ok(())
     }
 
-    /// A `rift.toml` written while the startup scan runs replaces the policy that scan read
-    /// under, so the scan cannot answer it: startup captures the workspace again, and the
-    /// second scan publishes under the configuration now on disk.
+    /// A configuration change after discovery makes the prepared snapshot wait for a full
+    /// rebuild under the accepted policy.
     #[tokio::test]
-    async fn a_configuration_written_during_the_startup_scan_captures_the_workspace_again()
-    -> TestResult {
+    async fn a_configuration_written_after_discovery_rebuilds_the_prepared_workspace() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::write(directory.path().join("other.rs"), "pub fn lantern() {}\n")?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(root.join("other.rs"), "pub fn lantern() {}\n")?;
         let lib = rift_core::ProjectPath::new("lib.rs")?;
         let other = rift_core::ProjectPath::new("other.rs")?;
-        let (validation, _invalidations) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
         let excluding = "[source]\nexclude = [\"other.rs\"]\n";
-        let (capture, scans) =
-            written_during_first_scan(directory.path(), &validation, "rift.toml", excluding)?;
-        let limits = WorkspaceIndexLimits::default();
-        let (published, _write) = super::initial_workspace_with(
-            directory.path(),
-            limits,
-            &validation,
-            &blocking,
-            capture,
-        )
-        .await?;
-
+        fs::write(root.join("rift.toml"), excluding)?;
+        context.validation.observe_whole_workspace()?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+        let request = context.validation.take_pending();
+        assert!(request.work.covers_whole_workspace());
         assert_eq!(
-            scans.load(Ordering::Relaxed),
-            2,
-            "the first scan read under the configuration the write replaced"
+            super::rebuild_workspace(&context, request, super::workspace_capture()).await?,
+            RebuildOutcome::Published
         );
-        assert_eq!(published.epoch, validation.observed_epoch());
+        let published = Arc::clone(&context.published.read().await.current);
         assert_eq!(
             published.configuration.fingerprint,
-            super::configuration_fingerprint(directory.path())
+            super::configuration_fingerprint(root)
         );
         assert!(published.reads.file_digest(&lib).is_some());
         assert!(
@@ -6173,57 +6854,42 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A directory renamed out of the workspace while the startup scan runs leaves one name
-    /// event and no file event for what it held, whatever its name looks like. Before the
-    /// first publication no index says what the scan read below it, and the scan holds files
-    /// below a path gone from the disk: startup captures the workspace again, and the
-    /// publication holds none of them.
+    /// A directory removed after discovery refuses its selected batch, then full rebuild
+    /// publishes the remaining workspace.
     #[tokio::test]
-    async fn a_directory_renamed_away_during_the_startup_scan_captures_the_workspace_again()
-    -> TestResult {
+    async fn a_directory_renamed_away_after_discovery_rebuilds_the_workspace() -> TestResult {
         for folder in FOLDER_SPELLINGS {
-            renamed_away_during_the_startup_scan(folder).await?;
+            renamed_away_after_discovery(folder).await?;
         }
         Ok(())
     }
 
-    /// Renames `folder` out of the workspace during the startup scan, and proves the
-    /// publication that startup makes holds none of its files.
-    async fn renamed_away_during_the_startup_scan(folder: &str) -> TestResult {
+    /// Renames `folder` out after discovery, then proves the full rebuild drops its files.
+    async fn renamed_away_after_discovery(folder: &str) -> TestResult {
         let directory = tempfile::tempdir()?;
         let elsewhere = tempfile::tempdir()?;
-        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
-        fs::create_dir_all(directory.path().join(folder))?;
-        fs::write(
-            directory.path().join(folder).join("mod.rs"),
-            "pub fn departed() {}\n",
-        )?;
-        let (validation, _invalidations) =
-            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
-        let blocking = BlockingExecutor::isolated(2, 60_000);
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::create_dir_all(root.join(folder))?;
+        fs::write(root.join(folder).join("mod.rs"), "pub fn departed() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
         let destination = elsewhere.path().join(folder);
-        let renamed = folder.to_owned();
-        let rename_away = move |root: &std::path::Path| {
-            fs::rename(root.join(&renamed), &destination).expect("the fixture rename lands");
-            name_event(root, &renamed)
-        };
-        let (capture, scans) =
-            changed_during_first_scan(directory.path(), &validation, rename_away)?;
-        let limits = WorkspaceIndexLimits::default();
-        let (published, _write) = super::initial_workspace_with(
-            directory.path(),
-            limits,
-            &validation,
-            &blocking,
-            capture,
-        )
-        .await?;
-
+        fs::rename(root.join(folder), destination)?;
+        context.validation.observe_whole_workspace()?;
+        let error = super::prepare_initial_workspace_from(&context, initial)
+            .await
+            .expect_err("a renamed discovered directory must refuse its selected paths");
+        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
+        let request = context.validation.take_pending();
+        assert!(request.work.covers_whole_workspace());
         assert_eq!(
-            scans.load(Ordering::Relaxed),
-            2,
-            "{folder}: the first scan read files below the directory that left"
+            super::rebuild_workspace(&context, request, super::workspace_capture()).await?,
+            RebuildOutcome::Published
         );
+        let published = Arc::clone(&context.published.read().await.current);
         assert_eq!(declarations_named(&published, "departed")?, 0, "{folder}");
         assert_eq!(declarations_named(&published, "beacon")?, 1, "{folder}");
         Ok(())
@@ -6310,7 +6976,8 @@ pub(crate) mod tests {
             published: Arc::clone(state),
 
             validation: Arc::clone(validation),
-            blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default()),
+            blocking: BlockingExecutor::for_configuration(&ServerConfiguration::default())
+                .expect("the default server configuration builds a worker pool"),
             population: None,
             lexical,
         };
@@ -6399,6 +7066,35 @@ pub(crate) mod tests {
             cancellation.cancel();
             ended_within_bound(&lane).await?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_prepared_change_owes_a_commit_when_worker_admission_is_closed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = candidate_declaring(directory.path(), 0, "beacon")?;
+        let revision = published.reads.tree_revision().to_owned();
+        let double = StoreDouble::new();
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        blocking.operations.close();
+        let cancellation = CancellationToken::new();
+        let _cancel = cancellation.clone().drop_guard();
+        let lane = LexicalLane::spawn_over(
+            Arc::clone(&double),
+            super::lexical_double::UNBOUNDED,
+            blocking,
+            cancellation.clone(),
+            Arc::from(super::lexical_double::PRODUCT_VERSION),
+        );
+        lane.request(change_naming_lib()?, published);
+        let cause = owed_within_bound(&lane, &revision).await?;
+        assert!(cause.contains("lexical unit derivation"), "{cause}");
+        assert!(
+            double.calls().is_empty(),
+            "admission refusal writes no rows"
+        );
+        cancellation.cancel();
+        ended_within_bound(&lane).await?;
         Ok(())
     }
 
@@ -6888,6 +7584,7 @@ pub(crate) mod tests {
             epoch: 1,
             work: super::PendingWork::naming([rift_core::ProjectPath::new("moved.rs")?]),
             previous: Some(Arc::clone(&first)),
+            cancellation: CancellationToken::new(),
         };
         let limits = WorkspaceIndexLimits::default();
         let WorkspaceCandidate::Stable {
@@ -7719,17 +8416,18 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// One build of 0.0.45, and a dirty rebuild of the same commit.
-    pub(crate) const BUILD_A: &str = "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34";
-    pub(crate) const BUILD_B: &str =
-        "0.0.45+b006b8433ba06679f06a3c7f0743d65634d32c34.dirty.78008464.1790239195123456789";
+    /// Distinct full analyzer digests used to prove persisted derivation changes.
+    pub(crate) const ANALYZER_A: &str =
+        "006b8433ba06679f06a3c7f0743d65634d32c340000000000000000000000000000";
+    pub(crate) const ANALYZER_B: &str =
+        "006b8433ba06679f06a3c7f0743d65634d32c340000000000000000000000000001";
 
-    /// Spawns a lane over `index` deriving under `product_version`, hands it one
+    /// Spawns a lane over `index` deriving under `analyzer_revision`, hands it one
     /// whole write of `published`, and returns the store double once the write settled.
     async fn whole_write_under(
         index: &Arc<SearchIndex>,
         published: &Arc<PublishedWorkspace>,
-        product_version: &str,
+        analyzer_revision: &str,
     ) -> TestResult<Arc<StoreDouble>> {
         let revision = published.reads.tree_revision().to_owned();
         let store = StoreDouble::new();
@@ -7741,7 +8439,7 @@ pub(crate) mod tests {
             super::lexical_double::UNBOUNDED,
             BlockingExecutor::isolated(2, 60_000),
             cancellation.clone(),
-            Arc::from(product_version),
+            Arc::from(analyzer_revision),
         );
         store.release_one();
         lane.request(
@@ -7752,24 +8450,21 @@ pub(crate) mod tests {
         Ok(store)
     }
 
-    /// A restart of the same build derives under the same revision, so it keeps every
-    /// stored row. Another build - another commit, or a dirty build's new stamp - names
-    /// another product version: the next start clears the store and derives every file
-    /// again.
+    /// A restart preserves stored rows while their analyzer and configuration agree.
     #[tokio::test]
-    async fn a_restart_keeps_rows_under_one_build_and_rederives_under_another() -> TestResult {
+    async fn a_restart_keeps_rows_under_one_analyzer_and_rederives_under_another() -> TestResult {
         let directory = tempfile::tempdir()?;
         let published = three_file_publication(directory.path())?;
         let index = Arc::new(search_index(&directory.path().join("search.db")).await?);
 
-        let first = whole_write_under(&index, &published, BUILD_A).await?;
+        let first = whole_write_under(&index, &published, ANALYZER_A).await?;
         let first_written = first.applied().concat();
         assert_eq!(first_written.len(), 3, "the first start derives every file");
 
-        let restarted = whole_write_under(&index, &published, BUILD_A).await?;
+        let restarted = whole_write_under(&index, &published, ANALYZER_A).await?;
         assert!(
             restarted.calls().iter().all(|(form, _)| *form != "clear"),
-            "the same build keeps the store: {:?}",
+            "the same analyzer keeps the store: {:?}",
             restarted.calls()
         );
         assert!(
@@ -7778,10 +8473,10 @@ pub(crate) mod tests {
             restarted.applied()
         );
 
-        let changed = whole_write_under(&index, &published, BUILD_B).await?;
+        let changed = whole_write_under(&index, &published, ANALYZER_B).await?;
         assert!(
             changed.calls().iter().any(|(form, _)| *form == "clear"),
-            "another build clears the store: {:?}",
+            "another analyzer clears the store: {:?}",
             changed.calls()
         );
         let mut rederived = changed.applied().concat();
@@ -7790,13 +8485,14 @@ pub(crate) mod tests {
         expected.sort();
         assert_eq!(
             rederived, expected,
-            "another build derives every file again"
+            "another analyzer derives every file again"
         );
         Ok(())
     }
 
     #[test]
-    fn the_derivation_revision_moves_with_the_build_and_each_index_owned_table() -> TestResult {
+    fn the_derivation_revision_moves_with_the_full_analyzer_and_each_index_owned_table()
+    -> TestResult {
         let directory = tempfile::tempdir()?;
         let accepted = |text: Option<&str>| -> TestResult<super::ConfigurationState> {
             let path = directory.path().join("rift.toml");
@@ -7809,9 +8505,9 @@ pub(crate) mod tests {
             Ok(super::ConfigurationState::accept(directory.path()))
         };
         let base = accepted(None)?;
-        let revision = super::derivation_revision(BUILD_A, &base);
-        assert_eq!(revision, super::derivation_revision(BUILD_A, &base));
-        assert_ne!(revision, super::derivation_revision(BUILD_B, &base));
+        let revision = super::derivation_revision(ANALYZER_A, &base);
+        assert_eq!(revision, super::derivation_revision(ANALYZER_A, &base));
+        assert_ne!(revision, super::derivation_revision(ANALYZER_B, &base));
         for table in [
             "[source]\nfiles = 1000\n",
             "[search.text]\nmax_chunk = \"2kb\"\n",
@@ -7822,7 +8518,7 @@ pub(crate) mod tests {
             let state = accepted(Some(table))?;
             assert!(state.accepted.is_ok(), "{table} must be accepted");
             assert_ne!(
-                super::derivation_revision(BUILD_A, &state),
+                super::derivation_revision(ANALYZER_A, &state),
                 revision,
                 "{table} decides the rows"
             );
@@ -7830,7 +8526,7 @@ pub(crate) mod tests {
         let server = accepted(Some("[server]\nnum_workers = 2\n"))?;
         assert!(server.accepted.is_ok());
         assert_eq!(
-            super::derivation_revision(BUILD_A, &server),
+            super::derivation_revision(ANALYZER_A, &server),
             revision,
             "a table that derives nothing keeps the stored rows"
         );
@@ -8166,6 +8862,29 @@ pub(crate) mod tests {
         false
     }
 
+    /// Settles an empty observation before a test holds the supervisor's worker pool.
+    /// The published epoch proves startup work has finished and the event loop is serving.
+    async fn supervisor_started_within_bound(
+        validation: &IndexValidation,
+        published: &RwLock<IndexState>,
+    ) -> TestResult<u64> {
+        let epoch = validation.observe_paths([])?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let changed = validation.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if published.read().await.snapshot().0.epoch >= epoch {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| "the supervisor must settle its startup observation within three seconds")?;
+        Ok(epoch)
+    }
+
     /// Polls `index` until it carries `revision`, which the lane's pass stamps.
     ///
     /// # Errors
@@ -8479,11 +9198,18 @@ pub(crate) mod tests {
         }));
         let watcher = unwatched(directory.path(), &validation)?;
 
+        let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
+        let supervisor = tokio::spawn(super::run_index_supervisor(
+            watcher,
+            invalidations,
+            cancellation_context(directory.path(), &validation, &published, &blocking),
+        ));
+        let startup_epoch = supervisor_started_within_bound(&validation, &published).await?;
+
         // One blocking slot, held by a placeholder so the supervisor's own rebuild for
-        // epoch 1 is forced to queue behind it - a deterministic gate between the
+        // the next epoch is forced to queue behind it - a deterministic gate between the
         // supervisor capturing that epoch and `accept_rebuild` checking it, exactly where a
         // second observation must land to supersede the rebuild.
-        let blocking = crate::server::BlockingExecutor::isolated(1, 60_000);
         let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::sync_channel::<()>(0);
         let held_blocking = blocking.clone();
@@ -8502,34 +9228,19 @@ pub(crate) mod tests {
             .await
             .expect("held placeholder must occupy the one blocking slot");
 
-        let supervisor = tokio::spawn(super::run_index_supervisor(
-            watcher,
-            invalidations,
-            super::IndexSupervisorContext {
-                root: directory.path().to_path_buf(),
-                limits: WorkspaceIndexLimits::default(),
-                published: Arc::clone(&published),
-
-                validation: Arc::clone(&validation),
-                blocking: blocking.clone(),
-                population: None,
-                lexical: None,
-            },
-        ));
-
         let first_epoch = validation
             .observe_whole_workspace()
             .map_err(|error| format!("first observation must land: {error:?}"))?;
-        assert_eq!(first_epoch, 1);
+        assert_eq!(first_epoch, startup_epoch + 1);
         assert!(
             pending_work_taken_within_bound(&validation).await,
-            "the supervisor must take epoch 1 before the test moves the epoch"
+            "the supervisor must take the rebuild epoch before the test moves it"
         );
 
         // Moves the epoch again with no invalidation signal, so no second rebuild cycle is
-        // ever triggered - only the already-queued rebuild for epoch 1 observes this move.
+        // ever triggered - only the already-queued rebuild observes this move.
         let moved = validation.observed_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        assert_eq!(moved, 2);
+        assert_eq!(moved, first_epoch + 1);
 
         release_sender
             .send(())
@@ -8547,7 +9258,7 @@ pub(crate) mod tests {
         let state = published.read().await;
         let (snapshot, failure) = state.snapshot();
         assert_eq!(
-            snapshot.epoch, 0,
+            snapshot.epoch, startup_epoch,
             "a superseded rebuild must publish nothing"
         );
         assert!(
@@ -8807,5 +9518,218 @@ pub(crate) mod tests {
         let state = fixture.state.blocking_read();
         assert_workspace_identity(&state.current, &fixture.before);
         Ok(())
+    }
+
+    type RelationshipRow = (String, String, String, String, u64, u64, Option<String>);
+
+    /// Complete indexed facts exposed by one immutable read publication.
+    #[derive(Debug, PartialEq)]
+    struct PublishedFacts {
+        digests: rift_index::WorkspaceDigests,
+        map: WorkspaceMap,
+        documents: Vec<IndexDocument>,
+        documentation: serde_json::Value,
+        symbols: BTreeSet<String>,
+        names: BTreeSet<String>,
+        symbol_reads: BTreeMap<String, Vec<serde_json::Value>>,
+        relationships: BTreeSet<RelationshipRow>,
+    }
+
+    fn published_facts(published: &PublishedWorkspace) -> TestResult<PublishedFacts> {
+        let reads = &published.reads;
+        let documents = reads.index_documents();
+        let mut ids = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for document in documents
+            .iter()
+            .filter(|document| document.kind() == DocumentKind::Symbol)
+        {
+            ids.insert(SymbolId::new(document.identity().as_str())?);
+            if let Some(name) = document.fields().get(SearchableField::Name) {
+                names.insert(name.to_owned());
+            }
+        }
+
+        let mut symbol_reads = BTreeMap::new();
+        for name in &names {
+            let mut pages = Vec::new();
+            let mut page_index = 0;
+            loop {
+                let params = serde_json::from_value(serde_json::json!({
+                    "name": name,
+                    "scope": "local",
+                    "include": ["source", "documentation"],
+                    "limit": 64,
+                    "page_index": page_index,
+                }))?;
+                let result = reads.get_symbol(&params)?;
+                if !result.warnings.is_empty() {
+                    return Err(format!(
+                        "symbol read is incomplete for {name}: {:?}",
+                        result.warnings
+                    )
+                    .into());
+                }
+                let total_pages = result.pagination.total_pages;
+                if total_pages > 32 {
+                    return Err(format!("symbol read exceeded 32 pages: {name}").into());
+                }
+                pages.push(serde_json::to_value(&result)?);
+                page_index += 1;
+                if page_index >= total_pages {
+                    break;
+                }
+                if page_index > 32 {
+                    return Err(format!("symbol read exceeded 32 pages: {name}").into());
+                }
+            }
+            symbol_reads.insert(name.clone(), pages);
+        }
+
+        let store = reads.relationships();
+        if !store.is_complete() || store.dropped_edges() != 0 {
+            return Err(format!(
+                "relationship store is incomplete: dropped_edges={}",
+                store.dropped_edges()
+            )
+            .into());
+        }
+        let mut relationships = BTreeSet::new();
+        for id in &ids {
+            for edge in store.outgoing(id).iter().chain(store.incoming(id)) {
+                let occurrence = edge.occurrence();
+                let range = occurrence.range();
+                relationships.insert((
+                    edge.from().as_str().to_owned(),
+                    edge.to().as_str().to_owned(),
+                    serde_json::to_string(&edge.facet())?,
+                    occurrence.unit().to_string(),
+                    range.start(),
+                    range.end(),
+                    occurrence.node().map(|node| node.0.clone()),
+                ));
+            }
+        }
+        if relationships.iter().any(|(from, to, ..)| {
+            !ids.iter().any(|id| id.as_str() == from) || !ids.iter().any(|id| id.as_str() == to)
+        }) {
+            return Err("relationship edge names a symbol absent from index documents".into());
+        }
+
+        Ok(PublishedFacts {
+            digests: reads.workspace_digests(),
+            map: reads.workspace_map(),
+            documents,
+            documentation: serde_json::to_value(reads.documentation_snapshot().index())?,
+            symbols: ids.iter().map(ToString::to_string).collect(),
+            names,
+            symbol_reads,
+            relationships,
+        })
+    }
+
+    async fn publication_matching(
+        published: &RwLock<IndexState>,
+        expected: &rift_index::WorkspaceDigests,
+    ) -> TestResult<Arc<PublishedWorkspace>> {
+        for _attempt in 0..LANE_ATTEMPTS_MAX {
+            let current = Arc::clone(&published.read().await.current);
+            if current.reads.workspace_digests() == *expected {
+                return Ok(current);
+            }
+            tokio::time::sleep(LANE_POLL).await;
+        }
+        Err("the native watcher did not publish the complete changed tree".into())
+    }
+
+    /// A native workspace watcher publishes complete facts equal to a cold build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_watcher_publication_matches_cold_indexed_facts() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::create_dir(root.join("src"))?;
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub struct Beacon;\npub fn old() {}\n",
+        )?;
+        fs::write(root.join("src/removed.rs"), "pub struct Removed;\n")?;
+        fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
+
+        let (context, invalidations) = initial_preparation_context(root)?;
+        let validation = Arc::clone(&context.validation);
+        let watcher = super::workspace_watcher(root, &validation)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        super::prepare_initial_workspace_from(&context, initial).await?;
+        let state = Arc::clone(&context.published);
+        let startup = Arc::clone(&state.read().await.current);
+        assert!(
+            !startup
+                .reads
+                .documentation_snapshot()
+                .index()
+                .references
+                .is_empty(),
+            "fixture must publish documentation references"
+        );
+        let startup_facts = published_facts(&startup)?;
+        let cold_a = stable_candidate(root, 0)?;
+        assert!(
+            startup_facts.relationships.is_empty(),
+            "fixture semantic edges are empty"
+        );
+        let cold_a_facts = published_facts(&cold_a)?;
+        assert_eq!(
+            startup_facts, cold_a_facts,
+            "startup publication facts must equal an independent cold build"
+        );
+
+        let supervisor = tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
+
+        let observed = async {
+            fs::write(
+                root.join("src/lib.rs"),
+                "pub struct Beacon;\npub fn new() {}\n",
+            )?;
+            fs::remove_file(root.join("src/removed.rs"))?;
+            fs::write(root.join("src/added.rs"), "pub struct Added;\n")?;
+            fs::write(root.join("README.md"), "See [new](src/lib.rs#new).\n")?;
+            let cold_b = stable_candidate(root, 0)?;
+            assert!(
+                !cold_b
+                    .reads
+                    .documentation_snapshot()
+                    .index()
+                    .references
+                    .is_empty(),
+                "changed fixture must retain documentation references"
+            );
+            let expected_facts = published_facts(&cold_b)?;
+            let publication = publication_matching(&state, &expected_facts.digests).await?;
+            let watched_facts = published_facts(&publication)?;
+
+            assert!(
+                publication.epoch > startup.epoch,
+                "native watcher must advance publication"
+            );
+            assert_eq!(
+                watched_facts, expected_facts,
+                "watched publication facts must equal an independent cold build"
+            );
+            assert!(
+                watched_facts.names.contains("new") && watched_facts.names.contains("Added"),
+                "new declarations must be present in the watched publication"
+            );
+            assert!(
+                !watched_facts.names.contains("old") && !watched_facts.names.contains("Removed"),
+                "removed declarations must be absent from the watched publication"
+            );
+            Ok::<(), Box<dyn Error>>(())
+        }
+        .await;
+        validation.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
+        observed
     }
 }

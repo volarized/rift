@@ -622,6 +622,19 @@ impl ReadService {
             .collect()
     }
 
+    /// Pairs cached symbol documents with declarations for vector population.
+    #[must_use]
+    pub fn described_symbol_units_by_file<'a>(
+        &'a self,
+        groups: &'a [std::sync::Arc<[IndexDocument]>],
+    ) -> Vec<DescribedUnit<'a>> {
+        groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .filter_map(|document| self.described_unit(document))
+            .collect()
+    }
+
     /// How many visible files this snapshot indexes across syntax and baseline text.
     ///
     /// A caller estimates the vector ranking's preparation work from this count.

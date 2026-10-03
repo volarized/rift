@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
 use serde_json::{Value, json};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -139,6 +139,18 @@ pub(crate) async fn served_root(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    let (client, server_task) = served_root_unsettled(root).await?;
+    await_workspace_ready(&client).await?;
+    Ok((client, server_task))
+}
+
+/// Serves `root` without waiting for initial file preparation.
+pub(crate) async fn served_root_unsettled(
+    root: &Path,
+) -> TestResult<(
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -150,6 +162,40 @@ pub(crate) async fn served_root(
     });
     let client = ().serve(client_transport).await?;
     Ok((client, server_task))
+}
+
+/// Reads map through MCP until local file preparation has completed.
+pub(crate) async fn await_workspace_ready(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult<Value> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+        )
+        .await??;
+        let ResourceContents::TextResourceContents { text, .. } = answer
+            .contents
+            .first()
+            .ok_or("map read answers with one content")?
+        else {
+            return Err("map read answers with text".into());
+        };
+        let body: Value = serde_json::from_str(text)?;
+        let preparing = body["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| warning["code"] == "local_index_preparing");
+        if !preparing {
+            return Ok(body);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("workspace map remained in preparation: {body}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// The path from the process working directory to `target`, as one `..`
