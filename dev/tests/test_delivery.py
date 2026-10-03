@@ -717,8 +717,10 @@ class WindowsUpdateSelection(unittest.TestCase):
         self.assertEqual(
             re.findall(r"-E\s+'([^']+)'", command),
             [
-                "binary_id(=rift::bin/rift) and "
-                "test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)"
+                (
+                    "binary_id(=rift::bin/rift) and "
+                    "test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)"
+                )
             ],
         )
         unit = native_step(
