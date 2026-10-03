@@ -1036,7 +1036,7 @@ mod tests {
         assert_eq!(main_common, linked_common);
         assert_eq!(
             main_repository.index_lock_path(),
-            main_common.join("index.lock")
+            main_repository.common_directory().join("index.lock")
         );
         assert_ne!(
             linked_repository.index_lock_path(),
