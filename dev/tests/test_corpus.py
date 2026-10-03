@@ -13,7 +13,12 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.shared.exceptions import MCPError
-from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_pattern
+from rift_dev.check_corpus import (
+    CLEANUP_RESERVE_SECONDS,
+    Corpus,
+    observed,
+    settled_pattern,
+)
 from rift_dev.commands import GitCommand
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -944,6 +949,64 @@ class PersistedContent(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "row count"),
                 ):
                     lexical_content(root)
+
+
+class LogObservation(unittest.TestCase):
+    """Log observation keeps one deadline when the fixture removes poll delay."""
+
+    def test_zero_poll_delay_observes_record_after_pending_reads(self) -> None:
+        client = AsyncMock(spec=Client)
+        found: list[JsonObject] = [{"message": "index rebuild failed"}]
+        client.resource.side_effect = [
+            {"records": []},
+            {"records": []},
+            {"records": found},
+        ]
+        with patch("rift_dev.check_corpus.POLL_SECONDS", 0.0):
+            answer = asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertEqual(answer, found)
+        self.assertEqual(client.resource.await_count, 3)
+        client.resource.assert_awaited_with("rift://logs/component/index")
+
+    def test_zero_poll_delay_still_times_out_when_record_is_absent(self) -> None:
+        client = AsyncMock(spec=Client)
+        client.resource.return_value = {"records": []}
+        with (
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+            patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertGreater(client.resource.await_count, 0)
+        client.resource.assert_awaited_with("rift://logs/component/index")
+
+    def test_observation_deadline_cancels_held_resource_read(self) -> None:
+        client = AsyncMock(spec=Client)
+        cancelled = False
+
+        async def held_resource(_uri: str) -> JsonObject:
+            nonlocal cancelled
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled = True
+            raise AssertionError("the held resource read must be cancelled")
+
+        client.resource.side_effect = held_resource
+        with (
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+            patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(
+                observed(cast(Client, client), "rift://logs/component/index", bool)
+            )
+        self.assertTrue(cancelled)
+        client.resource.assert_awaited_once_with("rift://logs/component/index")
 
 
 class SourceBound(unittest.TestCase):

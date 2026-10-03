@@ -1041,11 +1041,10 @@ def objects(answer: JsonObject, key: str) -> list[JsonObject]:
 async def observed(
     client: Client, uri: str, predicate: Callable[[list[JsonObject]], bool]
 ) -> list[JsonObject]:
-    """Wait for the log drain under the documented asynchronous logging contract."""
+    """Wait for the log drain under one deadline, including resource calls and polls."""
     async with asyncio.timeout(OBSERVATION_SECONDS):
-        for _ in range(int(OBSERVATION_SECONDS / POLL_SECONDS)):
+        while True:
             found = records(await client.resource(uri))
             if predicate(found):
                 return found
             await asyncio.sleep(POLL_SECONDS)
-    raise AssertionError(f"required record never reached {uri}")
