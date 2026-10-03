@@ -4825,7 +4825,7 @@ done
         Ok(())
     }
 
-    async fn publish_first_source_for_preparation(
+    async fn publish_first_matching_source_for_preparation(
         context: &crate::validation::IndexSupervisorContext,
     ) -> TestResult {
         let current = Arc::clone(&context.published.read().await.current);
@@ -4837,9 +4837,18 @@ done
             context.blocking.content_cache(),
         )?;
         preparation.discover(&current.configuration.source_visibility(), &|| false)?;
-        let index = preparation.advance_to(1, &|| false)?;
+        let index = preparation.advance_to(2, &|| false)?;
         let (source_paths, other_paths) = preparation.prepared_path_classes()?;
-        assert_eq!(source_paths, [CoreProjectPath::new("src/lib.rs")?]);
+        assert_eq!(
+            source_paths,
+            [
+                CoreProjectPath::new("rift.toml")?,
+                CoreProjectPath::new("src/lib.rs")?,
+            ]
+        );
+        assert!(other_paths.is_empty());
+        assert_eq!(preparation.prepared(), 2);
+        assert_eq!(preparation.total(), Some(3));
         let reads = rift_server::ReadService::from_prepared_index(
             index,
             current.source_policy.as_ref().map(Arc::clone),
@@ -4876,7 +4885,8 @@ done
         crate::validation::discover_initial_workspace(&assembled.context)
             .await?
             .ok_or("initial discovery was cancelled")?;
-        publish_first_source_for_preparation(&assembled.context).await?;
+        // Issue #491: TOML configuration is a selected source before either Rust file.
+        publish_first_matching_source_for_preparation(&assembled.context).await?;
         let server = assembled.server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let serving = tokio::spawn(async move {
@@ -4912,7 +4922,7 @@ done
                 .filter(|warning| matches!(
                     warning,
                     ReadWarning::LocalIndexPreparing {
-                        prepared: 1,
+                        prepared: 2,
                         total: Some(3),
                         ready_in: None,
                         ..
@@ -4949,6 +4959,16 @@ done
                 .all(|hit| hit.source.as_deref() == Some("pub fn beacon() {}"))
         );
         assert_ne!(complete.hits[0].symbol.id, complete.hits[1].symbol.id);
+        assert_eq!(
+            complete
+                .hits
+                .iter()
+                .find(|hit| hit.path == partial.hits[0].path)
+                .ok_or("completed source retains its partial name hit")?
+                .symbol
+                .id,
+            partial.hits[0].symbol.id
+        );
         assert!(
             !complete
                 .warnings
@@ -7154,14 +7174,29 @@ done
         }
     }
 
-    /// One `get_symbol` for `beacon` with its history.
+    /// One complete `get_symbol` for `beacon` with its source and history.
     async fn beacon_history(server: &RiftMcp) -> TestResult<rift_protocol::read::SymbolHistory> {
-        let params = serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
+        let params = serde_json::from_value(json!({
+            "name": "beacon", "include": ["source", "history"]
+        }))?;
         let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.get_symbol(Parameters(params)))
             .await
             .map_err(|_| "a history read waits on no fill")??
             .0;
+        assert_eq!(answer.hits.len(), 1, "{answer:#?}");
+        assert!(
+            !answer
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::LocalIndexPreparing { .. })),
+            "{answer:#?}"
+        );
         let hit = answer.hits.into_iter().next().ok_or("beacon answers")?;
+        assert_eq!(
+            hit.path.as_ref().map(|path| path.0.as_str()),
+            Some("lib.rs")
+        );
+        assert_eq!(hit.source.as_deref(), Some("pub fn beacon() {}"));
         Ok(hit.history.ok_or("the hit carries its history")?)
     }
 
@@ -7185,6 +7220,7 @@ done
         .await?;
         let server = assembled.supervised().await;
         held.reached().await?;
+        wait_for_complete_publication(&server).await?;
 
         let lagging = beacon_history(&server).await?;
         let search: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
