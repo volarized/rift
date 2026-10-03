@@ -10,7 +10,9 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from mcp.shared.exceptions import MCPError
 
 from rift_dev.check_corpus import CLEANUP_RESERVE_SECONDS, Corpus, settled_pattern
 from rift_dev.commands import GitCommand
@@ -45,7 +47,13 @@ from rift_dev.corpus_cache import (
     missing_history_objects,
     pins,
 )
-from rift_dev.rift_test_client import Client, JsonObject, object_value
+from rift_dev.rift_test_client import (
+    Client,
+    JsonObject,
+    Server,
+    gate_deadline,
+    object_value,
+)
 
 
 class Measurements(unittest.TestCase):
@@ -937,6 +945,141 @@ class PersistedContent(unittest.TestCase):
                     self.assertRaisesRegex(AssertionError, "row count"),
                 ):
                     lexical_content(root)
+
+
+class SourceBound(unittest.TestCase):
+    """Discovery refusal remains readable after early server publication (#495)."""
+
+    @staticmethod
+    def refusal() -> JsonObject:
+        return {
+            "code": "limit_exceeded",
+            "phase": "read",
+            "limit": {"field": "source.files", "required": 20001, "limit": 20000},
+            "causes": [{"message": "violation too_many_files"}],
+        }
+
+    def exercise(
+        self, responses: list[JsonObject | MCPError]
+    ) -> tuple[Corpus, MagicMock]:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        client = AsyncMock(spec=Client)
+        client.call.side_effect = responses
+        client.resource.return_value = {
+            "records": [
+                {
+                    "message": "index rebuild failed",
+                    "fields": {"error_code": "limit_exceeded"},
+                }
+            ]
+        }
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            patch("rift_dev.check_corpus.POLL_SECONDS", 0.0),
+        ):
+            asyncio.run(corpus.source_bound())
+        configure.assert_any_call("[source]\nfiles = 20000\n")
+        configure.assert_called_with()
+        server.start.assert_called_once_with()
+        server.check_running.assert_called_once_with()
+        server.stop.assert_called_once_with()
+        server.close.assert_called_once_with()
+        client.call.assert_awaited_with("get_symbol", {"name": "corpus_probe"})
+        client.resource.assert_awaited_with("rift://logs/component/index")
+        return corpus, server
+
+    def test_preparing_read_reaches_exact_refusal_and_stops_live_server(self) -> None:
+        corpus, _server = self.exercise(
+            [
+                {"warnings": [{"code": "local_index_preparing"}]},
+                MCPError(-32000, "source limit", self.refusal()),
+            ]
+        )
+        action = object_value(corpus.actions[-1], "source action")
+        self.assertEqual(action["action"], "source_bound")
+        self.assertEqual(action["field"], "source.files")
+        self.assertEqual(action["observed"], 20001)
+        self.assertEqual(action["maximum"], 20000)
+
+    def test_wrong_refusal_code_phase_field_quantities_and_cause_fail(self) -> None:
+        variants = [
+            {"code": "resource_not_found"},
+            {"phase": "initialize"},
+            {
+                "limit": {
+                    "field": "source.workspace_size",
+                    "required": 20001,
+                    "limit": 20000,
+                }
+            },
+            {"limit": {"field": "source.files", "required": 20000, "limit": 20000}},
+            {"limit": {"field": "source.files", "required": 20001, "limit": 20001}},
+            {"causes": [{"message": "another refusal"}]},
+        ]
+        for wrong in variants:
+            with self.subTest(wrong=wrong), self.assertRaises(AssertionError):
+                self.exercise(
+                    [MCPError(-32000, "source limit", {**self.refusal(), **wrong})]
+                )
+
+    def test_complete_read_without_refusal_fails(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "returned a complete read"):
+            self.exercise([{"warnings": []}])
+
+    def test_refusal_wait_keeps_one_deadline_and_closes_on_timeout(self) -> None:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        client = AsyncMock(spec=Client)
+
+        async def held_read(_name: str, _arguments: JsonObject) -> JsonObject:
+            await asyncio.Event().wait()
+            raise AssertionError("the held read must be cancelled")
+
+        client.call.side_effect = held_read
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            patch(
+                "rift_dev.check_corpus.gate_deadline",
+                side_effect=lambda name, _seconds: gate_deadline(name, 0.01),
+            ) as deadline,
+            self.assertRaises(TimeoutError),
+        ):
+            asyncio.run(corpus.source_bound())
+        deadline.assert_called_once_with("source.files refusal", 180.0)
+        self.assertEqual(corpus.actions, [])
+        server.stop.assert_not_called()
+        server.close.assert_called_once_with()
+        configure.assert_called_with()
+
+    def test_stop_failure_cannot_record_passed_source_bound(self) -> None:
+        corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+        server = MagicMock(spec=Server)
+        server.stop.side_effect = AssertionError("server stop exceeded its deadline")
+        client = AsyncMock(spec=Client)
+        client.call.side_effect = MCPError(-32000, "source limit", self.refusal())
+        client.resource.return_value = {
+            "records": [
+                {
+                    "message": "index rebuild failed",
+                    "fields": {"error_code": "limit_exceeded"},
+                }
+            ]
+        }
+        server.connect.return_value.__aenter__.return_value = client
+        with (
+            patch.object(corpus, "server", return_value=server),
+            patch.object(corpus, "configure") as configure,
+            self.assertRaisesRegex(AssertionError, "server stop exceeded"),
+        ):
+            asyncio.run(corpus.source_bound())
+        self.assertEqual(corpus.actions, [])
+        server.close.assert_called_once_with()
+        configure.assert_called_with()
 
 
 class CaseBudgets(unittest.TestCase):

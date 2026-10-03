@@ -808,22 +808,65 @@ class Corpus:
         self.record("shallow_history", complete=False, depth=1)
 
     async def source_bound(self) -> None:
+        # https://github.com/volarized/rift/issues/495
         self.configure("[source]\nfiles = 20000\n")
         server = self.server()
         try:
-            server.start(wait_for_publication=False)
-            await asyncio.to_thread(server.process.wait, timeout=180.0)
-            require(
-                server.process.returncode != 0, "source.files overflow started a server"
-            )
-            detail = server.read_log()
-            expected = "field source.files, observed 20001, maximum 20000"
-            require(
-                expected in detail, f"source bound refusal missing {expected}: {detail}"
-            )
-            self.record(
-                "source_bound", field="source.files", observed=20001, maximum=20000
-            )
+            async with gate_deadline("source.files refusal", 180.0):
+                server.start()
+                async with server.connect() as client:
+                    while True:
+                        try:
+                            answer = await client.call(
+                                "get_symbol", {"name": "corpus_probe"}
+                            )
+                        except MCPError as error:
+                            refusal = object_value(error.error.data, "source refusal")
+                            require(
+                                refusal.get("code") == "limit_exceeded"
+                                and refusal.get("phase") == "read",
+                                f"source bound wrong refusal: {refusal}",
+                            )
+                            limit = object_value(refusal.get("limit"), "source limit")
+                            require(
+                                limit.get("field") == "source.files"
+                                and limit.get("required") == 20001
+                                and limit.get("limit") == 20000,
+                                f"source bound wrong limit: {limit}",
+                            )
+                            require(
+                                any(
+                                    "too_many_files"
+                                    in string_value(
+                                        cause.get("message"), "source cause"
+                                    )
+                                    for cause in objects(refusal, "causes")
+                                ),
+                                f"source bound missing too_many_files cause: {refusal}",
+                            )
+                            break
+                        require(
+                            any(
+                                warning.get("code") == "local_index_preparing"
+                                for warning in warnings(answer)
+                            ),
+                            f"source.files overflow returned a complete read: {answer}",
+                        )
+                        await asyncio.sleep(POLL_SECONDS)
+                    await observed(
+                        client,
+                        "rift://logs/component/index",
+                        lambda rows: any(
+                            row.get("message") == "index rebuild failed"
+                            and fields(row).get("error_code") == "limit_exceeded"
+                            for row in rows
+                        ),
+                    )
+                server.check_running()
+                server.stop()
+                self.record(
+                    "source_bound", field="source.files", observed=20001, maximum=20000
+                )
         finally:
             server.close()
             self.configure()
