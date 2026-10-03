@@ -3530,6 +3530,16 @@ fn publish_preparation_after(
     drop(state);
     drop(pending);
     validation.changed.notify_waiters();
+    if answer.preparation.is_none() {
+        let published_epoch = answer.epoch;
+        tracing::info!(
+            component = "index",
+            operation = "index.publish",
+            trigger = "startup",
+            epoch = published_epoch,
+            "index snapshot published"
+        );
+    }
     RebuildOutcome::Published
 }
 
@@ -6856,6 +6866,151 @@ pub(crate) mod tests {
     fn declarations_named(published: &PublishedWorkspace, name: &str) -> TestResult<usize> {
         let params = serde_json::from_value(serde_json::json!({ "name": name }))?;
         Ok(published.reads.get_symbol(&params)?.hits.len())
+    }
+
+    /// The startup record names the installed epoch after every selected file is prepared.
+    #[test]
+    fn startup_publication_is_recorded_once_after_complete_preparation() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let partial = Arc::clone(&context.published.blocking_read().current);
+        let complete = stable_candidate(root, 0)?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let publish = |candidate| {
+            super::publish_preparation_after(
+                root,
+                &context.published,
+                &context.validation,
+                candidate,
+                None,
+            )
+        };
+
+        assert_eq!(publish(&partial), RebuildOutcome::Published);
+        assert!(queued_records(&mut drain).is_empty());
+        let epoch = context
+            .validation
+            .observe_paths([rift_core::ProjectPath::new("lib.rs")?])?;
+        assert_eq!(publish(&complete), RebuildOutcome::Published);
+        let records = queued_records(&mut drain);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].component(), "index");
+        assert_eq!(records[0].operation(), "index.publish");
+        assert_eq!(records[0].message(), "index snapshot published");
+        let fields: serde_json::Value = serde_json::from_str(records[0].fields())?;
+        assert_eq!(fields["trigger"], "startup");
+        assert_eq!(fields["epoch"], epoch.to_string());
+        let published = context.published.blocking_read();
+        assert!(published.current.preparation.is_none());
+        assert_eq!(published.current.epoch, epoch);
+        drop(published);
+        assert_eq!(publish(&complete), RebuildOutcome::Superseded);
+        assert!(queued_records(&mut drain).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_preparation_emits_no_startup_publication() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+        let (context, _invalidations) = initial_preparation_context(root)?;
+        let complete = stable_candidate(root, 0)?;
+        context.validation.observe_whole_workspace()?;
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        assert_eq!(
+            super::publish_preparation_after(
+                root,
+                &context.published,
+                &context.validation,
+                &complete,
+                None,
+            ),
+            RebuildOutcome::Superseded
+        );
+        assert!(
+            context
+                .published
+                .blocking_read()
+                .current
+                .preparation
+                .is_some()
+        );
+        assert!(queued_records(&mut drain).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preparation_worker_records_only_successful_startup_publication() -> TestResult {
+        for (missing, cancelled) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path();
+            fs::write(root.join("lib.rs"), "pub fn beacon() {}\n")?;
+            let (context, _invalidations) = initial_preparation_context(root)?;
+            let initial = super::discover_initial_workspace(&context)
+                .await?
+                .ok_or("initial discovery was cancelled")?;
+            if missing {
+                fs::remove_file(root.join("lib.rs"))?;
+            }
+            let cancellation = context.validation.cancellation.clone();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let batch = complete_initial_batch(&context, initial);
+            let (sink, mut drain) = crate::logs::log_capture();
+            let subscriber = tracing_subscriber::registry().with(sink);
+            let outcome = tokio::task::spawn_blocking(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    super::prepare_initial_batch(&cancellation, batch)
+                })
+            })
+            .await?;
+            let publications = queued_records(&mut drain)
+                .into_iter()
+                .filter(|record| record.operation() == "index.publish")
+                .collect::<Vec<_>>();
+            if missing || cancelled {
+                assert!(outcome.is_err());
+                assert!(context.published.read().await.current.preparation.is_some());
+                assert!(publications.is_empty());
+            } else {
+                assert_eq!(outcome?.2, RebuildOutcome::Published);
+                assert!(context.published.read().await.current.preparation.is_none());
+                assert_eq!(publications.len(), 1);
+                let fields: serde_json::Value = serde_json::from_str(publications[0].fields())?;
+                assert_eq!(fields["trigger"], "startup");
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_initial_batch(
+        context: &super::IndexSupervisorContext,
+        initial: super::InitialWorkspacePreparation,
+    ) -> super::InitialWorkspaceBatch {
+        super::InitialWorkspaceBatch {
+            preparation: initial.preparation,
+            target: initial.total,
+            complete: true,
+            total: initial.total,
+            root: context.root.clone(),
+            state: Arc::clone(&context.published),
+            validation: Arc::clone(&context.validation),
+            configuration: initial.configuration,
+            source_policy: initial.source_policy,
+            previous_capture: initial.last,
+            map_source_paths: initial.map_source_paths,
+            map_text_paths: initial.map_text_paths,
+            lexical: None,
+        }
     }
 
     /// A file edited after discovery is captured before its first prepared publication.
