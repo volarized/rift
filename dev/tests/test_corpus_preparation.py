@@ -8,9 +8,16 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from rift_dev import check_corpus
 from rift_dev.check_corpus import Corpus, settled_local
+from rift_dev.commands import Process
 from rift_dev.corpus_assertions import CONTEXT_SPAN, SYMBOL_COUNT
 from rift_dev.corpus_cache import pins
-from rift_dev.rift_test_client import Client, JsonObject, Server, gate_deadline
+from rift_dev.rift_test_client import (
+    Client,
+    JsonObject,
+    Server,
+    gate_deadline,
+    object_value,
+)
 
 
 @pytest.mark.parametrize("name", ["bun", "fastapi", "nextjs"])
@@ -36,6 +43,9 @@ def test_baseline_checks_symbol_floor_only_after_preparation(
         "records": [{"message": CONTEXT_SPAN}],
     }
     server = MagicMock(spec=Server)
+    process = MagicMock(spec_set=Process)
+    process.poll.return_value = 0
+    server.process = process
     server.__enter__.return_value = server
     server.connect.return_value.__aenter__.return_value = client
     corpus = Corpus(pins()[name], tmp_path / "rift", tmp_path / "report.json")
@@ -70,8 +80,17 @@ def test_baseline_checks_symbol_floor_only_after_preparation(
     if complete:
         symbols.assert_awaited_once_with(client, settled_candidates)
         server.stop.assert_called_once()
+        process.poll.assert_called_once_with()
+        publication = object_value(corpus.actions[0], "publication action")
+        assert publication["action"] == "publication"
+        assert publication["symbols"] == SYMBOL_COUNT
+        stopped = object_value(corpus.actions[-1], "stop action")
+        assert stopped["action"] == "stop"
+        assert stopped["state"] == "idle"
+        assert stopped["process_gone"] is True
     else:
         symbols.assert_not_awaited()
+        process.poll.assert_not_called()
         assert not corpus.actions
 
 
