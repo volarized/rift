@@ -949,18 +949,18 @@ class Corpus:
         A fill analyzes only the commits the history store lacks, so the case first
         deletes the store the earlier servers filled, in the `.rift` folder of the common
         git directory: this server's fill then owes every commit its plan selects. The
-        fill starts after the startup publication with no request, and while the server
-        runs none, each batch starts as soon as the one before it ends.
+        fill starts independently of source preparation with no request. The owned
+        server document establishes listener readiness; observe the fill from the start
+        of this server's output because it can finish before startup publication.
         """
         common = git(self.root, "rev-parse", "--git-common-dir").output().strip()
         store = self.root / common / ".rift"
         if store.exists():
             shutil.rmtree(store)
         with self.server() as server:
-            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
             output = await observed_state(
                 server,
-                startup.index(STARTUP_PUBLICATION),
+                0,
                 "a history store batch with pending commits",
                 lambda text: open_history_batch(text) is not None,
             )

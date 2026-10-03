@@ -140,15 +140,40 @@ def test_history_stop_waits_until_a_batch_with_pending_commits_is_open(
     assert recorded["process_gone"] is True
 
 
+@pytest.mark.parametrize("startup_published", [False, True])
+def test_history_stop_observes_a_pending_batch_before_source_publication(
+    tmp_path: Path, startup_published: bool
+) -> None:
+    output = batch_start(3) + ANALYZE_CLOSE
+    if startup_published:
+        output += STARTUP
+    server = fill_server(tmp_path, [output])
+    corpus = filled_corpus(tmp_path)
+
+    with (
+        patch.object(corpus, "server", return_value=server),
+        patch("rift_dev.check_corpus.POLL_SECONDS", 0.001),
+        patch("rift_dev.check_corpus.OBSERVATION_SECONDS", 0.05),
+    ):
+        asyncio.run(corpus.stop_during_history_fill())
+
+    server.stop.assert_called_once()
+    server.connect.assert_not_called()
+    recorded = object_value(corpus.actions[-1], "stop action")
+    assert recorded["state"] == "mid_history"
+    assert recorded["stderr"] == batch_start(3).strip()
+    assert recorded["process_gone"] is True
+
+
 @pytest.mark.parametrize(
     "outputs",
     [
         [STARTUP + batch_start(3) + BATCH_CLOSE],
         [STARTUP + batch_start(3) + BATCH_CLOSE + batch_start(0)],
-        [batch_start(3) + STARTUP],
+        [batch_start(3) + BATCH_CLOSE + STARTUP],
         [STARTUP, STARTUP + batch_start(3).rstrip("\n")],
     ],
-    ids=["closed", "drained", "before_startup", "partial_record"],
+    ids=["closed", "drained", "closed_before_startup", "partial_record"],
 )
 def test_history_stop_refuses_to_stop_without_an_open_batch(
     tmp_path: Path, outputs: list[str]
