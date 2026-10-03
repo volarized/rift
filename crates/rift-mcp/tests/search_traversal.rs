@@ -436,10 +436,6 @@ const IMMEDIATE_RETRY: &str = "retry = { delay = \"1ms\", delay_limit = \"1ms\" 
 #[cfg(unix)]
 // Traversal timeout failure: https://github.com/volarized/rift/issues/436
 #[tokio::test]
-#[cfg_attr(
-    all(target_os = "macos", target_arch = "x86_64"),
-    ignore = "https://github.com/volarized/rift/issues/436"
-)]
 async fn search_traversal_abandons_a_retry_in_flight_past_the_readiness_timeout() -> TestResult {
     let log = incoming_walks_past_the_readiness_timeout(HELD_RETRY_ENGINE, IMMEDIATE_RETRY).await?;
     assert!(
