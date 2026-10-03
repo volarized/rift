@@ -275,7 +275,9 @@ def for_leg(text: str, leg: dict[str, Any]) -> str:
 
 def leg_profile(leg: dict[str, Any]) -> str:
     """The nextest profile one native leg runs the unit suite under."""
-    run = native_step(lambda step: "nextest run" in step.get("run", ""))["run"]
+    run = native_step(
+        lambda step: step.get("name") == "Build every target and run the unit suite"
+    )["run"]
     command = for_leg(run, leg)
     matched = re.search(r"--profile\s+(\S+)", command)
     assert matched, f"the native suite names no profile: {command}"
@@ -686,6 +688,74 @@ class NativeRunBounds(unittest.TestCase):
                 report = nextest_profile_setting(profile, "junit", "path")
                 self.assertTrue(report, f"the {profile!r} profile writes no report")
                 self.assertEqual(leg_report(leg), f"{store}/{profile}/{report}")
+
+
+class WindowsUpdateSelection(unittest.TestCase):
+    """The ignored publisher parent runs on both Windows targets without its child.
+
+    The parent needs the built CLI and launches the child with its own fixture
+    environment. A separate nextest profile preserves the unit suite's report.
+    """
+
+    def test_the_windows_run_selects_only_the_ignored_publisher_parent(self) -> None:
+        step = native_step(
+            lambda step: (
+                step.get("name") == "Run the Windows running binary update regression"
+            )
+        )
+        self.assertEqual(step["if"], "${{ !cancelled() && runner.os == 'Windows' }}")
+        self.assertEqual(
+            step["env"]["RIFT_UPDATE_TEST_BINARY"],
+            "${{ github.workspace }}/target/debug/rift.exe",
+        )
+        self.assertEqual(step["env"]["RUSTFLAGS"], "${{ matrix.rustflags }}")
+        command = step["run"]
+        self.assertIn("--run-ignored all", command)
+        self.assertIn("--no-tests fail", command)
+        self.assertIn("--workspace --all-targets --all-features", command)
+        self.assertIn("--profile ci-windows-update", command)
+        self.assertEqual(
+            re.findall(r"-E\s+'([^']+)'", command),
+            [
+                "binary_id(=rift::bin/rift) and "
+                "test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)"
+            ],
+        )
+        unit = native_step(
+            lambda step: step.get("name") == "Build every target and run the unit suite"
+        )["run"]
+        self.assertNotIn("--run-ignored", unit)
+        self.assertIn("not test(/_probe$/)", unit)
+        windows_targets = {
+            leg["target"] for leg in native_legs() if leg["os"].startswith("windows-")
+        }
+        self.assertEqual(
+            windows_targets,
+            {"x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"},
+        )
+
+    def test_the_windows_run_retains_its_report_and_the_original_bounds(self) -> None:
+        configuration = tomllib.loads(NEXTEST_CONFIGURATION.read_text(encoding="utf-8"))
+        profile = configuration["profile"]["ci-windows-update"]
+        self.assertEqual(profile.keys(), {"inherits", "junit"})
+        self.assertEqual(profile["inherits"], CI_PROFILE)
+        upload = native_step(
+            lambda step: (
+                (step.get("with") or {}).get("name")
+                == "native-update-tests-${{ matrix.target }}"
+            )
+        )
+        self.assertEqual(upload["if"], "${{ always() && runner.os == 'Windows' }}")
+        self.assertEqual(
+            upload["with"]["path"],
+            "target/nextest/ci-windows-update/junit.xml",
+        )
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        for setting in ("global-timeout", "slow-timeout", "retries", "leak-timeout"):
+            self.assertEqual(
+                nextest_profile_setting("ci-windows-update", setting),
+                nextest_profile_setting(CI_PROFILE, setting),
+            )
 
 
 class MachineGlobalSuites(unittest.TestCase):

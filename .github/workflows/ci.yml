@@ -566,8 +566,7 @@ jobs:
           retention-days: 7
       # The ci profile's default filter keeps the live and corpus suites out.
       # Ignored regressions retain their issue links and do not run here.
-      # The Windows publisher remains ignored until #477 is resolved:
-      # https://github.com/volarized/rift/issues/477
+      # The Windows publisher's ignored parent runs separately below.
       # Nextest writes each run's report under its selected profile's folder.
       - name: Build every target and run the unit suite
         env:
@@ -583,6 +582,27 @@ jobs:
         with:
           name: native-tests-${{ matrix.target }}
           path: target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
+          if-no-files-found: error
+          retention-days: 7
+      # The parent launches its ignored child probe with the fixture environment.
+      # Select only the parent here; --run-ignored all on the unit suite would
+      # also enable unrelated ignored regressions. Keep both JUnit reports.
+      # https://github.com/volarized/rift/issues/477
+      - name: Run the Windows running binary update regression
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        env:
+          RIFT_UPDATE_TEST_BINARY: ${{ github.workspace }}/target/debug/rift.exe
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >-
+          cargo nextest run --locked
+          --workspace --all-targets --all-features --profile ci-windows-update --no-tests fail
+          --run-ignored all
+          -E 'binary_id(=rift::bin/rift) and test(=update::tests::windows_publish_replaces_running_binary_and_cleans_backup)'
+      - uses: actions/upload-artifact@v6.0.0
+        if: ${{ always() && runner.os == 'Windows' }}
+        with:
+          name: native-update-tests-${{ matrix.target }}
+          path: target/nextest/ci-windows-update/junit.xml
           if-no-files-found: error
           retention-days: 7
       - name: Report the build cache
