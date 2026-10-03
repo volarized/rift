@@ -44,6 +44,7 @@ from rift_dev.corpus_assertions import (
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
+from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.rift_test_client import (
     Client,
     Json,
@@ -957,21 +958,14 @@ async def observed_state(
 
 
 async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
-    """Resend one read until local index preparation completes.
-
-    A `local_index_preparing` answer covers only prepared files. The existing
-    observation deadline bounds every call and poll together; a settled answer
-    keeps the caller's result checks and every other warning.
-    """
-    async with gate_deadline("local index preparation", OBSERVATION_SECONDS):
-        while True:
-            answer = await client.call(name, request)
-            if not any(
-                warning.get("code") == "local_index_preparing"
-                for warning in warnings(answer)
-            ):
-                return answer
-            await asyncio.sleep(POLL_SECONDS)
+    """Resend partial local reads within the existing corpus observation budget."""
+    return await read_settled_local(
+        client,
+        name,
+        request,
+        seconds=OBSERVATION_SECONDS,
+        poll_seconds=POLL_SECONDS,
+    )
 
 
 async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:

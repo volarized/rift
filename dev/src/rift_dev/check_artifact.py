@@ -5,7 +5,9 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from rift_dev.local_index_read import settled_local
 from rift_dev.rift_test_client import (
+    POLL_SECONDS,
     Client,
     JsonObject,
     Server,
@@ -68,7 +70,13 @@ async def incoming_references(client: Client, seed: str) -> JsonObject:
 
 async def check_reads(client: Client) -> None:
     """Read known content and require MCP to return its source."""
-    search = await client.call("search", {"query": "beacon_one", "target": "symbol"})
+    search = await settled_local(
+        client,
+        "search",
+        {"query": "beacon_one", "target": "symbol"},
+        seconds=ARTIFACT_SECONDS,
+        poll_seconds=POLL_SECONDS,
+    )
     require(
         bool(array_value(search.get("results"), "search.results")),
         f"search missed beacon_one: {search}",
