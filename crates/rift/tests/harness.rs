@@ -320,7 +320,7 @@ impl RelayedStderr {
         let captured = Arc::clone(&bytes);
         Self {
             bytes,
-            relay: std::thread::spawn(move || relay_until_closed(stream, captured)),
+            relay: std::thread::spawn(move || relay_until_closed(stream, &captured)),
         }
     }
 
@@ -352,7 +352,7 @@ impl RelayedStderr {
 
 /// Copies `stream` onto this process's stderr until end-of-file, keeping
 /// what it copied, both bounded by [`RELAYED_STDERR_BYTES_MAX`].
-fn relay_until_closed(mut stream: impl Read, captured: Arc<Mutex<Vec<u8>>>) {
+fn relay_until_closed(mut stream: impl Read, captured: &Mutex<Vec<u8>>) {
     let mut buffer = [0_u8; rift_core::STREAM_READ_BYTES];
     loop {
         let read_bytes = match stream.read(&mut buffer) {
