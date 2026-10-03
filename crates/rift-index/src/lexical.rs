@@ -54,7 +54,7 @@ use std::sync::Arc;
 use toasty::Executor;
 use toasty::db::Connection;
 use toasty::migration::{MigrationFile, MigrationSet};
-use toasty::stmt::{Type, Value};
+use toasty::stmt::{IntoInsert, Type, Value};
 
 use crate::change_set::{FileDigest, WorkspaceDigests};
 use crate::database::WorkspaceDatabase;
@@ -73,6 +73,9 @@ const LEXICAL_POOL_SLOTS_DEFAULT: u32 = 4;
 const LEXICAL_BUSY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
 /// The byte width of one recorded file digest, a SHA-256.
 const RECORDED_DIGEST_BYTES: usize = 32;
+/// Typed rows inserted per statement. Each row binds at most 12 values, so one statement
+/// uses at most 768 variables, below bundled SQLite's 32,766-variable limit.
+const LEXICAL_INSERT_ROWS_MAX: usize = 64;
 
 /// Primary key of the single `lexical_index_state` row this adapter maintains.
 const LEXICAL_INDEX_STATE_ID: i64 = 1;
@@ -1206,7 +1209,7 @@ pub(crate) async fn single_i64(
     )
 }
 
-/// Writes each document's typed row, then indexes every row this call wrote in one
+/// Writes bounded batches of typed rows, then indexes every row this call wrote in one
 /// statement, and files the file rows among them for the trigram index.
 ///
 /// The typed row and the index entry carry the same fields because the index reads them
@@ -1220,8 +1223,12 @@ async fn insert_documents(
     documents: &[IndexDocument],
 ) -> Result<(), LexicalIndexError> {
     let last = last_unit_id(&mut *executor).await?;
-    for document in documents {
-        insert_document(&mut *executor, document, project_location(document)?).await?;
+    for documents in documents.chunks(LEXICAL_INSERT_ROWS_MAX) {
+        let mut insert = LexicalDocumentRecord::create_many();
+        for document in documents {
+            insert = insert.item(insert_document(document, project_location(document)?));
+        }
+        insert.exec(&mut *executor).await.map_err(storage_error)?;
     }
     let columns = searchable_columns();
     toasty::sql::statement(format!(
@@ -1235,12 +1242,11 @@ async fn insert_documents(
     crate::trigram_store::file_rows_above(executor, last).await
 }
 
-/// Writes one document's typed row.
-async fn insert_document(
-    executor: &mut dyn Executor,
+/// Builds one document's typed insert, for the batch that writes it.
+fn insert_document(
     document: &IndexDocument,
     path: &ProjectPath,
-) -> Result<(), LexicalIndexError> {
+) -> impl IntoInsert<Model = LexicalDocumentRecord> {
     let fields = document.fields();
     let field = |searchable: SearchableField| fields.get(searchable).map(str::to_owned);
     let content = document.content();
@@ -1258,10 +1264,6 @@ async fn insert_document(
         documentation: field(SearchableField::Documentation),
         file_content: field(SearchableField::FileContent),
     })
-    .exec(executor)
-    .await
-    .map_err(storage_error)?;
-    Ok(())
 }
 
 /// Records the digest each named file's rows were derived from.
