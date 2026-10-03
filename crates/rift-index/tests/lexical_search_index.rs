@@ -1537,8 +1537,9 @@ fn batch_documents(count: usize) -> Result<Vec<IndexDocument>, Box<dyn std::erro
         .map(|number| {
             let identity = format!("batch/{number}");
             if number % 2 == 0 {
+                let byte_offset = u64::try_from(number)? * 32;
                 text_chunk(&identity, "docs/batch.md", &format!("batchmarker {number}"))
-                    .map(|document| document.at_byte_offset(u64::try_from(number).unwrap() * 32))
+                    .map(|document| document.at_byte_offset(byte_offset))
             } else {
                 document(
                     &identity,
