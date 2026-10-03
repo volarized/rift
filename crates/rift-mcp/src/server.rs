@@ -5840,6 +5840,7 @@ done
         Ok(())
     }
 
+    /// Occupied permits do not change the configured worker count (issue #503).
     #[tokio::test]
     async fn server_table_sizes_blocking_pool_and_queue_wait() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5849,7 +5850,14 @@ done
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert_eq!(server.blocking.queue_timeout_ms, 1_250);
-        assert_eq!(server.blocking.operations.available_permits(), 2);
+        let held = tokio::time::timeout(
+            Duration::from_millis(server.blocking.queue_timeout_ms),
+            server.blocking.operations.acquire(),
+        )
+        .await??;
+        assert!(server.blocking.operations.available_permits() < 2);
+        assert_eq!(server.blocking.rayon_pool.current_num_threads(), 2);
+        drop(held);
         Ok(())
     }
 
@@ -5862,7 +5870,7 @@ done
             default_table.worker_queue_timeout.milliseconds()
         );
         assert_eq!(
-            server.blocking.operations.available_permits() as u64,
+            server.blocking.rayon_pool.current_num_threads() as u64,
             default_table.num_workers
         );
         Ok(())
@@ -5880,7 +5888,7 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         let default_table = rift_protocol::configuration::ServerConfiguration::default();
         assert_eq!(
-            server.blocking.operations.available_permits() as u64,
+            server.blocking.rayon_pool.current_num_threads() as u64,
             default_table.num_workers
         );
         Ok(())
