@@ -783,9 +783,6 @@ jobs:
         run: just corpus-sync "${{ matrix.repository }}"
       - name: Run corpus suite
         id: corpus
-        # Churn remains visible but does not fail CI while this issue is open:
-        # https://github.com/volarized/rift/issues/483
-        continue-on-error: ${{ matrix.repository == 'nextjs' && matrix.case == 'churn' }}
         timeout-minutes: ${{ matrix.minutes }}
         env:
           RIFT_CORPUS_REPORT: ${{ github.workspace }}/target/corpus/${{ matrix.repository }}.json

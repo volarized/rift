@@ -625,6 +625,19 @@ class RequiredGate(unittest.TestCase):
             "a job outside the gate's needs merges red without the ruleset seeing it",
         )
 
+    def test_corpus_failures_reach_the_required_gate(self) -> None:
+        corpus = workflow_documents()[COVERAGE_WORKFLOW]["jobs"]["corpus"]
+        self.assertFalse(
+            corpus.get("continue-on-error", False),
+            "a corpus job failure must reach the required gate",
+        )
+        steps = [step for step in corpus["steps"] if step.get("id") == "corpus"]
+        self.assertEqual(len(steps), 1, "the corpus job must run one corpus step")
+        self.assertFalse(
+            steps[0].get("continue-on-error", False),
+            "a corpus test failure must fail its job, including Next.js churn",
+        )
+
 
 class JobBudgets(unittest.TestCase):
     """A job's limit covers the work its steps do not bound."""
