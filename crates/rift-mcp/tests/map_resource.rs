@@ -228,7 +228,7 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
     // map is computed for that same publication.
     let request =
         workspace_client::tool_request("get_symbol", &serde_json::json!({ "name": "beacon" }));
-    client.call_tool(request).await?;
+    let lookup = client.call_tool(request).await?;
 
     let body = resource_body(&client, "rift://map").await?;
     let names: Vec<&str> = body["packages"]
@@ -237,7 +237,12 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
         .iter()
         .filter_map(|package| package["name"].as_str())
         .collect();
-    assert_eq!(names, ["itoa", "serde", "rust"], "{body:#}");
+    assert_eq!(
+        names,
+        ["itoa", "serde", "rust"],
+        "map={body:#}; lookup={lookup:#?}; lockfile={:?}",
+        std::fs::read_to_string(directory.path().join("Cargo.lock"))?
+    );
 
     client.cancel().await?;
     server_task.abort();
