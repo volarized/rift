@@ -15,8 +15,8 @@ mod harness;
 mod rust_engine;
 
 use harness::{
-    StopOnDrop, TestResult, assigned_port_key, laid_out_workspace, proxied_call, proxy_client,
-    require_success, run_rift,
+    StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
+    proxied_call, proxy_client, require_success, run_rift, within,
 };
 use serde_json::json;
 
@@ -53,6 +53,8 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let client = proxy_client(root).await?;
+    // Issue #511: file hits require completed local preparation after transport startup.
+    within("workspace preparation", await_workspace_ready(&client)).await??;
 
     let mdx = proxied_call(
         &client,
