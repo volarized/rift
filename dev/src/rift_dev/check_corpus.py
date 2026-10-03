@@ -930,22 +930,14 @@ class Corpus:
         await self.stop_during_history_fill()
 
     async def stop_during_rebuild(self) -> None:
-        """Observe synchronous output while the rebuild can hold the database writer."""
+        """Observe filesystem rebuild output without a proxy that restarts a stopped server."""
         with self.server() as server:
-            async with server.connect() as client:
-                startup = await observed_output(server, 0, STARTUP_PUBLICATION)
-                (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
-                pending = asyncio.create_task(
-                    client.call("search", {"query": "corpus_probe"})
-                )
-                try:
-                    output = await observed_output(
-                        server, len(startup), "index capture started"
-                    )
-                    await self.stop_observed(server, "rebuild", output)
-                finally:
-                    pending.cancel()
-                    await asyncio.gather(pending, return_exceptions=True)
+            startup = await observed_output(server, 0, STARTUP_PUBLICATION)
+            (self.root / PROBE_PATH).write_text(PROBE_SOURCE)
+            output = await observed_output(
+                server, len(startup), "index capture started"
+            )
+            await self.stop_observed(server, "rebuild", output)
         (self.root / PROBE_PATH).unlink(missing_ok=True)
 
     async def stop_during_history_fill(self) -> None:

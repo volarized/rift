@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from rift_dev.check_corpus import Corpus
+from rift_dev.corpus_assertions import PROBE_PATH, PROBE_SOURCE
 from rift_dev.corpus_cache import git, pins
-from rift_dev.rift_test_client import Client, JsonObject, Server, object_value
+from rift_dev.rift_test_client import Server, object_value
 
 STARTUP = 'INFO index snapshot published operation="index.publish" trigger="startup" epoch=0\n'
 BATCH_SPAN = 'history.batch{component="history" operation="history.batch"}'
@@ -30,35 +31,36 @@ def batch_start(pending: int) -> str:
 
 
 @pytest.mark.parametrize("completed", [False, True])
-def test_stop_observes_an_active_rebuild_while_log_writes_are_pending(
+def test_rebuild_stop_observes_filesystem_work_without_a_reconnecting_proxy(
     tmp_path: Path, completed: bool
 ) -> None:
+    """The stop observer cannot start a replacement server through its proxy (#505)."""
+
     async def exercise() -> None:
         started = 'DEBUG index capture started component="index" operation="index.build" phase="start" epoch=1\n'
-        output = STARTUP
-        cancelled = asyncio.Event()
+        observed = False
 
-        async def request(_name: str, _arguments: JsonObject) -> JsonObject:
-            nonlocal output
-            output += started
+        def read_log() -> str:
+            nonlocal observed
+            if not (tmp_path / PROBE_PATH).exists():
+                return STARTUP
+            assert (tmp_path / PROBE_PATH).read_text() == PROBE_SOURCE
+            observed = True
+            output = STARTUP + started
             if completed:
                 output += "INFO index.build{epoch=1}: rift_mcp::validation: close\n"
-                return {}
-            try:
-                await asyncio.Future[None]()
-            finally:
-                cancelled.set()
-            raise AssertionError("the request must remain active until stop")
+            return output
 
-        client = AsyncMock(spec=Client)
-        client.call.side_effect = request
-        client.resource.side_effect = AssertionError(
-            "the lexical transaction still owns the log store's write turn"
-        )
+        def stop() -> None:
+            assert observed, "the rebuild must be observed before stop"
+
         server = MagicMock(spec=Server)
         server.__enter__.return_value = server
-        server.connect.return_value.__aenter__.return_value = client
-        server.read_log.side_effect = lambda: output
+        server.connect.side_effect = AssertionError(
+            "a rebuild stop needs no proxy request"
+        )
+        server.read_log.side_effect = read_log
+        server.stop.side_effect = stop
         server.log_path = tmp_path / "server.log"
         corpus = Corpus(pins()["bun"], tmp_path / "rift", tmp_path / "bun.json", "stop")
         corpus.root = tmp_path
@@ -67,12 +69,13 @@ def test_stop_observes_an_active_rebuild_while_log_writes_are_pending(
                 with pytest.raises(AssertionError, match="completed before stop"):
                     await corpus.stop_during_rebuild()
                 server.stop.assert_not_called()
+                server.connect.assert_not_called()
                 assert not corpus.actions
                 return
             await corpus.stop_during_rebuild()
         server.stop.assert_called_once()
-        client.resource.assert_not_called()
-        assert cancelled.is_set()
+        server.connect.assert_not_called()
+        assert not (tmp_path / PROBE_PATH).exists()
         recorded = object_value(corpus.actions[-1], "stop action")
         assert recorded["stderr"] == started.strip()
         assert recorded["process_gone"] is True
