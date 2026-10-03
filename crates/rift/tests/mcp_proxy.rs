@@ -602,27 +602,9 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
 /// locking it exclusively.
 const ELECTION_FILE_NAME: &str = "server.lock";
 
-/// The record a spawned server writes when its claim meets a lock and it exits.
-const LOST_ELECTION_RECORD: &str =
-    "another rift server already serves this workspace; this process exits";
-
-/// Reads of `rift server logs` while waiting for one record, at
-/// [`PRESENCE_POLL_INTERVAL`] between reads: each read is a process start, so
-/// the wait stays well inside the proxy's start window.
+/// Polls the proxy's stderr while waiting for a spawned server's refusal,
+/// at [`PRESENCE_POLL_INTERVAL`], inside the proxy's start window.
 const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
-
-/// Polls `rift server logs` until it prints `record`, bounded by
-/// [`RECORD_READ_ATTEMPT_COUNT`] reads.
-async fn await_record(root: &Path, record: &str) -> TestResult {
-    for _ in 0..RECORD_READ_ATTEMPT_COUNT {
-        let printed = run_rift(root, &["server", "logs"]).await?;
-        if String::from_utf8_lossy(&printed.stdout).contains(record) {
-            return Ok(());
-        }
-        tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
-    }
-    Err(format!("no {record:?} record within {RECORD_READ_ATTEMPT_COUNT} reads").into())
-}
 
 /// A claim that meets any lock on the election file loses the start election,
 /// a shared one included. This test keeps a shared lock on the file the way a
@@ -630,6 +612,7 @@ async fn await_record(root: &Path, record: &str) -> TestResult {
 /// locks lazily, so the proxy's first spawned server loses an election no
 /// process holds and exits. Once the lock goes, the proxy spawns again inside
 /// its start window, and the call is served.
+// Startup refusal observation: https://github.com/volarized/rift/issues/490
 #[tokio::test]
 async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
     let directory = workspace()?;
@@ -644,12 +627,26 @@ async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
         .open(root.join(".rift").join(ELECTION_FILE_NAME))?;
     lingering.try_lock_shared()?;
 
-    let client = proxy_client(root).await?;
+    let (client, stderr) = relayed_proxy_client(root).await?;
     let released = async {
-        let lost = await_record(root, LOST_ELECTION_RECORD).await;
+        let lost = wait_for(
+            RECORD_READ_ATTEMPT_COUNT,
+            "the lost election's stderr refusal",
+            || {
+                let printed = stderr.snapshot();
+                printed
+                    .contains("error[server_already_serving]")
+                    .then_some(printed)
+            },
+        )
+        .await;
+        assert!(
+            !root.join(".rift/db").exists(),
+            "a refused child cannot open the held workspace database"
+        );
         lingering.unlock()?;
         drop(lingering);
-        lost
+        lost.map(|_stderr| ())
     };
     let (lookup, lost) = tokio::join!(beacon_lookup(&client), released);
     lost?;
