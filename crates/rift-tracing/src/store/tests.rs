@@ -569,3 +569,49 @@ async fn a_restarted_write_ahead_log_is_cut_to_its_limit() -> TestResult {
     );
     Ok(())
 }
+
+/// A writer thread held inside an append keeps its owner past a close that missed its
+/// deadline, and releases it only once the thread runs the close queued behind the append. The owner stands in
+/// for the election guard the serving process hands the thread.
+#[tokio::test]
+async fn a_held_writer_keeps_its_owner_past_a_missed_close_deadline() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let (owner, released) = release_probe();
+    let weak = Arc::downgrade(&owner);
+    let store = LogStore::open(&metrics_path(&directory), Some(owner)).await?;
+    let holder = rusqlite::Connection::open(metrics_path(&directory))?;
+    holder.execute_batch("BEGIN IMMEDIATE")?;
+    // Queued directly, so the append is ahead of the close in the writer's queue.
+    let (reply, appended) = tokio::sync::oneshot::channel();
+    store
+        .sender
+        .send(super::Command::Append {
+            records: vec![record("held")],
+            retention_records: KEEP_EVERY,
+            reply,
+        })
+        .await
+        .map_err(|_| "the writer thread accepts the append")?;
+
+    let missed = store
+        .close(Instant::now() + Duration::from_millis(50))
+        .await;
+
+    assert!(missed.is_err(), "the close misses its deadline: {missed:?}");
+    assert!(
+        weak.upgrade().is_some(),
+        "the held thread keeps the owner past the missed deadline"
+    );
+    holder.execute_batch("ROLLBACK")?;
+    appended.await??;
+    // The missed close stayed queued behind the append, and the thread runs it next.
+    assert_eq!(
+        released.recv_timeout(THREAD_WAIT_MAX)?.as_deref(),
+        Some("rift-db-metrics")
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "the close the thread ran released the owner"
+    );
+    Ok(())
+}
