@@ -423,10 +423,11 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// `search` does consult it, and the search tier is prepared behind the answers, so this
 /// fixture's default `[search.vector]` table legitimately produces
 /// `vector_index_preparing` while the corpus runs. What it must never produce is
-/// `lexical_ranking_unavailable`: a search waits out a commit in flight within
-/// `[server] readiness_timeout` and a busy connection pool within `[search] busy_timeout`,
-/// so ordinary operation meets none of that warning's causes, and one that fired here
-/// would be one every caller learned to ignore.
+/// `lexical_ranking_unavailable`: a search answers a lexical commit still in flight with
+/// that warning instead of waiting for it, and waits for a busy connection pool within
+/// `[search] busy_timeout`. This suite asserts the warning never fires, so a commit in
+/// flight while it runs, or a pool busy past that bound, fails it rather than becoming a
+/// warning every caller learned to ignore.
 ///
 /// A `get_symbol` or `search` request whose `scope` reaches packages carries the package
 /// warnings and no other: the fixture's path dependency `helper` answers
