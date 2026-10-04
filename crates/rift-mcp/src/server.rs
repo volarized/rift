@@ -9240,12 +9240,12 @@ done
 
         let kept = serde_json::to_value(run_search(&server, "beacon").await?)?;
         assert!(hit_paths(&kept).contains(&"src/lib.rs"), "{kept:#}");
-        let text = serde_json::to_value(run_search(&server, "lantern harbor").await?)?;
+        let text = serde_json::to_value(search_after_population(&server, "lantern harbor").await?)?;
         assert!(
             hit_paths(&text).contains(&"src/blob.rs"),
             "the whole-file row answers: {text:#}"
         );
-        let named = serde_json::to_value(run_search(&server, "BLOB").await?)?;
+        let named = serde_json::to_value(search_after_population(&server, "BLOB").await?)?;
         let named_hits = named["results"].as_array().ok_or("results are an array")?;
         assert!(
             named_hits
