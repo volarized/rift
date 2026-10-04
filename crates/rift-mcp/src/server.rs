@@ -6404,20 +6404,20 @@ done
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
+        let revision = server
+            .published
+            .read()
+            .await
+            .current
+            .reads
+            .tree_revision()
+            .to_owned();
         let first = run_search(&server, "legacy sensor").await?;
-        assert!(
-            !first.results.is_empty(),
-            "the first answer is served whether or not the transaction has landed: {first:#?}"
-        );
         if !store_ranked(&first) {
-            let revision = server
-                .published
-                .read()
-                .await
-                .current
-                .reads
-                .tree_revision()
-                .to_owned();
+            assert!(
+                first.results.is_empty(),
+                "identifier matching has no declaration for the prose query: {first:#?}"
+            );
             let detail = first
                 .warnings
                 .iter()
@@ -6429,6 +6429,12 @@ done
             assert!(
                 detail.contains(&format!("still committing tree revision {revision}")),
                 "{detail}"
+            );
+        } else {
+            let first = serde_json::to_value(&first)?;
+            assert!(
+                hit_paths(&first).contains(&"guide.txt"),
+                "the store-ranked first answer hits the text file: {first:#}"
             );
         }
         let ranked = search_after_population(&server, "legacy sensor").await?;
