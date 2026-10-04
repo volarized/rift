@@ -30,6 +30,7 @@ EXPECTED_EDGES = {
     "rift-cloud-client -> rift-ranking",
     "rift-core -> rift-protocol",
     "rift-core -> rift-error",
+    "rift-error -> rift-error-macros",
     "rift-error-codegen -> rift-error",
     "rift-dependency -> rift-core",
     "rift-dependency -> rift-protocol",

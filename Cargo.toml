@@ -16,6 +16,7 @@ rift-cloud-client = { path = "crates/rift-cloud-client" }
 rift-core = { path = "crates/rift-core" }
 rift-error = { path = "crates/rift-error" }
 rift-error-codegen = { path = "crates/rift-error-codegen" }
+rift-error-macros = { path = "crates/rift-error-macros" }
 rift-dependency = { path = "crates/rift-dependency" }
 rift-history = { path = "crates/rift-history" }
 rift-history-store = { path = "crates/rift-history-store" }
@@ -74,7 +75,6 @@ opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = 
     "rt-tokio",
     "trace",
 ] }
-pastey = "0.2.3"
 percent-encoding = "2.3.1"
 rayon = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["native-tls"] }

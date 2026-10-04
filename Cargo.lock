@@ -4620,7 +4620,7 @@ dependencies = [
 name = "rift-error"
 version = "0.0.47"
 dependencies = [
- "pastey",
+ "rift-error-macros",
 ]
 
 [[package]]
@@ -4633,6 +4633,10 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
 ]
+
+[[package]]
+name = "rift-error-macros"
+version = "0.0.47"
 
 [[package]]
 name = "rift-history"

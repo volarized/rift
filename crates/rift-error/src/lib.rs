@@ -16,9 +16,9 @@ pub mod errors {
 }
 
 pub use evidence::EvidenceFor;
-#[doc(hidden)]
-pub use pastey::paste as __rift_paste;
 pub use representation::IntoRiftError;
+#[doc(hidden)]
+pub use rift_error_macros::paste as __rift_paste;
 pub use runtime::{
     BuilderCore, CAUSE_DEPTH_MAX, ErrorContext, ErrorSlug, ErrorValue, FieldSet, IntoInteger,
     IntoUnsigned, RiftError, Set, SourceView, Unset, causes,
