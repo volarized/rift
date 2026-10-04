@@ -1353,7 +1353,7 @@ fields = { waited = { type = "duration", format = "human" }, listening = { type 
 
 [error.cli.server_logs_unavailable]
 message = "the workspace's recorded server logs could not be read"
-action = "ensure no other process holds `.rift/db` exclusively and retry"
+action = "ensure no other process holds `.rift/metrics` exclusively and retry"
 fields = { operation = { type = "string", optional = true }, detail = { type = "string", optional = true }, source = { type = "rift_error", role = "cause", optional = true } }
 
 [error.cli.update_binary_invalid]

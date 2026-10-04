@@ -691,7 +691,7 @@ pub mod cli {
         server_logs_unavailable,
         slug = "rift.cli.server_logs_unavailable",
         message = "the workspace's recorded server logs could not be read",
-        action = "ensure no other process holds `.rift/db` exclusively and retry",
+        action = "ensure no other process holds `.rift/metrics` exclusively and retry",
         fields = {
             detail: optional(string),
             operation: optional(string),

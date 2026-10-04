@@ -28,6 +28,7 @@ from rift_dev.corpus_assertions import (
     active_stdout,
     build_records,
     chunked_answer,
+    database_bytes,
     exact_degradation,
     language_counts,
     last_line_pattern,
@@ -881,6 +882,31 @@ BEACON_ROW = (
 
 
 class PersistedContent(unittest.TestCase):
+    def test_database_bytes_sizes_each_database_and_its_sidecar_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".rift"
+            state.mkdir()
+            for name, size in (
+                ("index", 4),
+                ("index-wal", 3),
+                ("metrics", 2),
+                ("metrics-wal", 1),
+                ("vectors-shm", 5),
+                ("server.json", 9),
+            ):
+                (state / name).write_bytes(b"x" * size)
+            self.assertEqual(
+                database_bytes(root),
+                {
+                    "index": 4,
+                    "index-wal": 3,
+                    "metrics": 2,
+                    "metrics-wal": 1,
+                    "vectors-shm": 5,
+                },
+            )
+
     def test_reads_close_connections_on_success_and_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

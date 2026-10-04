@@ -463,10 +463,19 @@ def lexical_content(root: Path) -> LexicalContent:
     return LexicalContent(count, size, digest.hexdigest())
 
 
+DATABASE_FILES = tuple(
+    f"{database}{suffix}"
+    for database in ("index", "metrics", "vectors")
+    for suffix in ("", "-wal", "-shm")
+)
+"""Each workspace database below `.rift` and the sidecar files SQLite keeps beside it."""
+
+
 def database_bytes(root: Path) -> JsonObject:
+    """Size each workspace database and its sidecar files; an absent file is left out."""
     return {
         name: path.stat().st_size
-        for name in ("index", "index-wal", "index-shm")
+        for name in DATABASE_FILES
         if (path := root / ".rift" / name).is_file()
     }
 
