@@ -1212,6 +1212,16 @@ message = "history store database operation failed: {operation}: {detail}"
 action = "check the history store database and retry"
 fields = { operation = { type = "string" }, detail = { type = "error", role = "source" } }
 
+[error.tracing.log_store_failed]
+message = "metrics database operation failed: {operation} {path}: {detail}"
+action = "check the metrics database file and its permissions, then retry"
+fields = { operation = { type = "string" }, path = { type = "path", format = "display" }, detail = { type = "error", role = "source" } }
+
+[error.tracing.log_batch_limit]
+message = "log batch holds more records than its accepted limit of {maximum}"
+action = "split the batch below {maximum} records and retry"
+fields = { observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
 [error.history.contribution_invalid]
 message = "history Contribution conversion rejected: {detail}"
 action = "check the history Contribution data and retry"

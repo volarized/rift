@@ -61,7 +61,7 @@ pub(crate) fn validate(raw: schema::RawRegistry) -> Result<ir::Registry, Codegen
                     "error {slug} has invalid field name {name:?}"
                 )));
             }
-            validate_field(&slug, &name, &field)?;
+            let kind = validate_field(&slug, &name, &field)?;
             if let Some(role) = field.role {
                 *role_counts.entry(role).or_default() += 1;
             }
@@ -72,10 +72,8 @@ pub(crate) fn validate(raw: schema::RawRegistry) -> Result<ir::Registry, Codegen
             }
             fields.push(ir::Field {
                 name,
-                field_type: field.field_type,
+                kind,
                 optional: field.optional,
-                format: field.format,
-                role: field.role,
                 display: field.display,
                 sensitive: field.sensitive,
             });
@@ -133,7 +131,11 @@ fn insert_method(
     Ok(())
 }
 
-fn validate_field(slug: &str, name: &str, field: &schema::RawField) -> Result<(), CodegenError> {
+fn validate_field(
+    slug: &str,
+    name: &str,
+    field: &schema::RawField,
+) -> Result<ir::FieldKind, CodegenError> {
     use schema::{FieldFormat as Format, FieldRole as Role, FieldType as Type};
     match (field.field_type, field.format) {
         (Type::Path, Some(Format::Display)) | (Type::Duration, Some(Format::Human)) => {}
@@ -155,25 +157,26 @@ fn validate_field(slug: &str, name: &str, field: &schema::RawField) -> Result<()
         (_, None) => {}
     }
     match (field.role, field.field_type) {
-        (Some(Role::Source), Type::Error) | (Some(Role::Cause), Type::RiftError) => {}
-        (Some(Role::Source), _) => {
-            return Err(invalid(format!(
-                "error {slug} source role requires type = error"
-            )));
-        }
-        (Some(Role::Cause), _) => {
-            return Err(invalid(format!(
-                "error {slug} cause role requires type = rift_error"
-            )));
-        }
-        (None, Type::Error | Type::RiftError) => {
-            return Err(invalid(format!(
-                "error {slug} field {name} requires role = source or cause"
-            )));
-        }
-        (None, _) => {}
+        (Some(Role::Source), Type::Error) => Ok(ir::FieldKind::Source),
+        (Some(Role::Cause), Type::RiftError) => Ok(ir::FieldKind::Cause),
+        (Some(Role::Source), _) => Err(invalid(format!(
+            "error {slug} source role requires type = error"
+        ))),
+        (Some(Role::Cause), _) => Err(invalid(format!(
+            "error {slug} cause role requires type = rift_error"
+        ))),
+        (None, Type::Error | Type::RiftError) => Err(invalid(format!(
+            "error {slug} field {name} requires role = source or cause"
+        ))),
+        (None, Type::String) => Ok(ir::FieldKind::String),
+        (None, Type::Bool) => Ok(ir::FieldKind::Bool),
+        (None, Type::Integer) => Ok(ir::FieldKind::Integer),
+        (None, Type::Unsigned) => Ok(ir::FieldKind::Unsigned),
+        (None, Type::Pid) => Ok(ir::FieldKind::Pid),
+        (None, Type::Port) => Ok(ir::FieldKind::Port),
+        (None, Type::Path) => Ok(ir::FieldKind::Path),
+        (None, Type::Duration) => Ok(ir::FieldKind::Duration),
     }
-    Ok(())
 }
 
 fn validate_placeholders(

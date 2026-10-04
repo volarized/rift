@@ -430,6 +430,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.syntax.too_many_captures",
                 "rift.syntax.too_many_markdown_inline_ranges",
                 "rift.syntax.too_many_nodes",
+                "rift.tracing.log_batch_limit",
             ],
         ),
         (
@@ -465,6 +466,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.mcp.election_storage_failed",
                 "rift.ranking.reader_failed",
                 "rift.server.read_storage",
+                "rift.tracing.log_store_failed",
             ],
         ),
         (
