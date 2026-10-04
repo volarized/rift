@@ -40,6 +40,7 @@ use crate::election::{ServerPresence, StaleReason, probe, probe_state_directory}
 use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
+use crate::output::OutputPolicy;
 use crate::repository::{
     ServerConfigurationSelection, repository_election_directory, select_server_configuration,
 };
@@ -62,6 +63,10 @@ const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 /// Serves agents over stdio MCP, forwarding every request to the
 /// workspace's elected server, as the build `checkout` describes.
 ///
+/// `output` selects which representations of tool answers the proxy
+/// forwards; it stays fixed for the proxy's lifetime and across upstream
+/// reconnects.
+///
 /// Serving starts immediately: a background warmup attempts the first
 /// upstream connect - starting a server when the workspace has none - and
 /// each request that arrives earlier waits on the same single-flight
@@ -76,12 +81,16 @@ const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 ///
 /// Dropping this future closes the owned MCP service and the upstream
 /// connection; the detached server keeps serving the workspace.
-pub async fn serve_proxy(root: &Path, checkout: BuildCheckout) -> Result<(), RiftError> {
+pub async fn serve_proxy(
+    root: &Path,
+    checkout: BuildCheckout,
+    output: OutputPolicy,
+) -> Result<(), RiftError> {
     tracing::info!(component = "mcp", transport = "stdio", "MCP proxy starting");
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
-    let proxy = RiftProxy::new(root, identity);
+    let proxy = RiftProxy::new(root, identity, output);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
@@ -164,6 +173,9 @@ struct RiftProxy {
     advertised: Arc<std::sync::Mutex<Option<ServerConfig>>>,
     /// How long one forwarded request may go unanswered: see [`forward_budget`].
     forward_budget: Duration,
+    /// Which representations of tool answers this proxy forwards. It lives
+    /// here, not on the upstream slot, so a reconnect keeps it.
+    output: OutputPolicy,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -252,8 +264,9 @@ struct Upstream {
 
 impl RiftProxy {
     /// A proxy for the workspace at `root`, bounding its forwards by the
-    /// `[server]` table the workspace accepts when the proxy starts.
-    fn new(root: &Path, identity: ProductIdentity) -> Self {
+    /// `[server]` table the workspace accepts when the proxy starts, and
+    /// forwarding tool answers as `output` selects.
+    fn new(root: &Path, identity: ProductIdentity, output: OutputPolicy) -> Self {
         let server = ConfigurationState::accept(root).server_configuration();
         Self {
             root: Arc::from(root),
@@ -261,6 +274,35 @@ impl RiftProxy {
             upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot::empty())),
             advertised: Arc::new(std::sync::Mutex::new(None)),
             forward_budget: forward_budget(&server),
+            output,
+        }
+    }
+
+    /// A forwarded `tools/call` answer, as this proxy's output policy
+    /// selects it.
+    ///
+    /// Only a completed result carries `structuredContent`; an input
+    /// request and a task pass through untouched.
+    fn selected_response(&self, response: CallToolResponse) -> CallToolResponse {
+        match response {
+            CallToolResponse::Complete(result) => {
+                CallToolResponse::Complete(self.output.select_result(result))
+            }
+            other => other,
+        }
+    }
+
+    /// A forwarded `resources/read` answer, as this proxy's output policy
+    /// selects it.
+    ///
+    /// Only a completed read carries contents; an input request passes
+    /// through untouched.
+    fn selected_resource(&self, response: ReadResourceResponse) -> ReadResourceResponse {
+        match response {
+            ReadResourceResponse::Complete(result) => {
+                ReadResourceResponse::Complete(self.output.select_resource(result))
+            }
+            other => other,
         }
     }
 
@@ -1099,11 +1141,13 @@ impl ServerHandler for RiftProxy {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        self.forward(list_tools_request(request), |result| match result {
-            ServerResult::ListToolsResult(result) => Some(result),
-            _ => None,
-        })
-        .await
+        let listing = self
+            .forward(list_tools_request(request), |result| match result {
+                ServerResult::ListToolsResult(result) => Some(result),
+                _ => None,
+            })
+            .await?;
+        Ok(self.output.select_listing(listing))
     }
 
     async fn call_tool(
@@ -1118,7 +1162,7 @@ impl ServerHandler for RiftProxy {
             request_id = %context.id,
             tool = %request.name
         );
-        async {
+        let response = async {
             tracing::debug!("tool forward started");
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
             let result = self
@@ -1137,7 +1181,8 @@ impl ServerHandler for RiftProxy {
             result
         }
         .instrument(span)
-        .await
+        .await?;
+        Ok(self.selected_response(response))
     }
 
     async fn list_resources(
@@ -1180,16 +1225,18 @@ impl ServerHandler for RiftProxy {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let request = ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request));
-        self.forward(request, |result| match result {
-            ServerResult::ReadResourceResult(result) => {
-                Some(ReadResourceResponse::Complete(result))
-            }
-            ServerResult::InputRequiredResult(result) => {
-                Some(ReadResourceResponse::InputRequired(result))
-            }
-            _ => None,
-        })
-        .await
+        let response = self
+            .forward(request, |result| match result {
+                ServerResult::ReadResourceResult(result) => {
+                    Some(ReadResourceResponse::Complete(result))
+                }
+                ServerResult::InputRequiredResult(result) => {
+                    Some(ReadResourceResponse::InputRequired(result))
+                }
+                _ => None,
+            })
+            .await?;
+        Ok(self.selected_resource(response))
     }
 }
 
@@ -1211,8 +1258,15 @@ mod tests {
     use std::time::Duration;
 
     use rift_protocol::lock::{ProductIdentity, SERVER_TOKEN_LENGTH, ServerLock};
-    use rmcp::model::{ProtocolVersion, ServerCapabilities, ServerPeerInfo, ServerResult};
-    use rmcp::service::{QuitReason, RoleClient, RunningService, serve_directly};
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, CreateTaskResult,
+        InputRequiredResult, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerPeerInfo, ServerResult, Task, TaskStatus, Tool,
+    };
+    use rmcp::service::{
+        QuitReason, RequestContext, RoleClient, RoleServer, RunningService, serve_directly,
+    };
     use rmcp::transport::DynamicTransportError;
     use rmcp::{ErrorData, ServiceError};
     use serde_json::json;
@@ -1225,6 +1279,7 @@ mod tests {
         server_start_failed, start_window_refusal, transport_failed,
     };
     use crate::election::{ServerPresence, StaleReason, claim};
+    use crate::output::OutputPolicy;
     use rift_core::CapturedStream;
     use rift_error::errors;
     use rift_protocol::error as wire;
@@ -1819,7 +1874,7 @@ mod tests {
     #[test]
     fn advertised_info_serves_the_fallback_then_the_recorded_mirror() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
         assert_eq!(proxy.advertised_info().server_info.name, "rift");
         let mirrored = fallback_info(&test_identity()).with_instructions("recorded");
         *proxy.lock_advertised() = Some(mirrored);
@@ -1883,7 +1938,7 @@ mod tests {
             directory.path().join("rift.toml"),
             "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
         )?;
-        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
         let (running, upstream_silent) = direct_upstream();
         {
             let mut slot = proxy.upstream.lock().await;
@@ -1951,7 +2006,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_skips_an_upstream_without_negotiated_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
         let (running, _upstream_alive) = direct_upstream();
         proxy.mirror_advertised(&running);
         assert!(
@@ -1963,7 +2018,7 @@ mod tests {
     #[test]
     fn poisoned_advertised_lock_still_serves_info() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
         let poisoner = proxy.clone();
         std::thread::spawn(move || {
             let _guard = poisoner
@@ -2212,7 +2267,7 @@ mod tests {
         let (server_transport, client_transport) = tokio::io::duplex(1024);
         drop(client_transport);
         let error = Box::pin(serve_connection(
-            RiftProxy::new(directory.path(), test_identity()),
+            RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default()),
             server_transport,
         ))
         .await
@@ -2247,7 +2302,7 @@ mod tests {
         let upstream = upstream?;
         // Advance the upstream's IDs so matching the downstream ID cannot pass by chance.
         upstream.list_tools(None).await?;
-        let proxy = RiftProxy::new(directory.path(), test_identity());
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
         {
             let mut slot = proxy.upstream.lock().await;
             slot.connected = Some(Upstream {
@@ -2278,14 +2333,15 @@ mod tests {
             .call_tool(super::CallToolRequestParams::new("nodes").with_arguments(
                 serde_json::from_value(json!({"path": "../outside.rs", "position": 0}))?,
             ))
-            .await
-            .expect_err("invalid paths retain the wire refusal");
-        let ServiceError::McpError(invalid) = invalid else {
-            return Err("invalid paths must return an MCP error".into());
-        };
-        assert_eq!(
-            invalid.data.as_ref().and_then(|data| data.get("code")),
-            Some(&json!("invalid_request"))
+            .await?;
+        assert_eq!(invalid.is_error, Some(true), "{invalid:?}");
+        assert!(
+            invalid
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .is_some_and(|block| block.text.contains("invalid_request")),
+            "invalid paths retain the refusal code: {invalid:?}"
         );
         let records = std::fs::read_to_string(log.path())?;
         assert_tool_diagnostics(&records, &request_id)?;
@@ -2351,7 +2407,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(serve_connection(
-            RiftProxy::new(directory.path(), test_identity()),
+            RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default()),
             server_transport,
         ));
         let client = ().serve(client_transport).await.expect("client must initialize");
@@ -2369,5 +2425,283 @@ mod tests {
             .await
             .expect("serve task must join")
             .expect("a cancelled client must end the connection cleanly");
+    }
+
+    /// An upstream that lists two tools over two pages, each with an output
+    /// schema, and answers a call with structured content, as the shared
+    /// server does.
+    #[derive(Clone)]
+    struct StructuredUpstream;
+
+    const SECOND_PAGE_CURSOR: &str = "second-page";
+    /// A resource the upstream answers with compact text and JSON.
+    const TWO_CONTENT_URI: &str = "rift://map";
+    /// A resource the upstream answers with JSON alone.
+    const JSON_ONLY_URI: &str = "rift://json-only";
+
+    fn upstream_tool(name: &'static str) -> Tool {
+        let object = |value: serde_json::Value| -> JsonObject {
+            serde_json::from_value(value).expect("test schema must be a JSON object")
+        };
+        Tool::new(name, "an upstream tool", object(json!({"type": "object"})))
+            .with_raw_output_schema(object(json!({"type": "object"})).into())
+    }
+
+    impl rmcp::ServerHandler for StructuredUpstream {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            rmcp::model::ServerConfig::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .build(),
+            )
+        }
+
+        async fn read_resource(
+            &self,
+            request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResponse, ErrorData> {
+            let uri = request.uri.as_str();
+            match uri {
+                TWO_CONTENT_URI => Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text("map 3f9a1c2e", uri).with_mime_type("text/plain"),
+                    ResourceContents::text("{\"revision\":\"3f9a1c2e\"}", uri)
+                        .with_mime_type("application/json"),
+                ])
+                .into()),
+                JSON_ONLY_URI => Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text("{}", uri).with_mime_type("application/json"),
+                ])
+                .into()),
+                other => Err(ErrorData::resource_not_found(
+                    format!("no resource is published at {other:?}"),
+                    None,
+                )),
+            }
+        }
+
+        async fn list_tools(
+            &self,
+            request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let second = request
+                .and_then(|page| page.cursor)
+                .is_some_and(|cursor| cursor == SECOND_PAGE_CURSOR);
+            if second {
+                return Ok(ListToolsResult::with_all_items(vec![upstream_tool(
+                    "nodes",
+                )]));
+            }
+            let mut first = ListToolsResult::with_all_items(vec![upstream_tool("search")]);
+            first.next_cursor = Some(SECOND_PAGE_CURSOR.to_owned());
+            Ok(first)
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            match request.name.as_ref() {
+                "search" => Ok(CallToolResult::structured(json!({"results": 0})).into()),
+                "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
+                other => Err(ErrorData::invalid_params(
+                    format!("unknown tool {other}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    /// A downstream client talking to a proxy under `output`, whose upstream
+    /// is [`StructuredUpstream`]. The fields keep the connection tasks alive.
+    struct ProxiedClient {
+        client: RunningService<RoleClient, ()>,
+        _upstream: RunningService<RoleServer, StructuredUpstream>,
+        _connection: tokio::task::JoinHandle<Result<(), rift_error::RiftError>>,
+        _directory: tempfile::TempDir,
+    }
+
+    async fn proxied_client(output: OutputPolicy) -> TestResult<ProxiedClient> {
+        use rmcp::ServiceExt as _;
+        let directory = tempfile::tempdir()?;
+        let proxy = RiftProxy::new(directory.path(), test_identity(), output);
+        let (upstream_client_half, upstream_server_half) = tokio::io::duplex(64 * 1024);
+        let (running, upstream) = tokio::join!(
+            ().serve(upstream_client_half),
+            StructuredUpstream.serve(upstream_server_half)
+        );
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running: running?,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
+        let connection = tokio::spawn(serve_connection(proxy, proxy_half));
+        Ok(ProxiedClient {
+            client: ().serve(client_half).await?,
+            _upstream: upstream?,
+            _connection: connection,
+            _directory: directory,
+        })
+    }
+
+    #[tokio::test]
+    async fn text_output_strips_schemas_and_structured_content_through_the_handlers() -> TestResult
+    {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let tools = proxied.client.list_all_tools().await?;
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, ["search", "nodes"], "every page must be listed");
+        assert!(
+            tools.iter().all(|tool| tool.output_schema.is_none()),
+            "text output must list no output schema on any page: {tools:?}"
+        );
+
+        let result = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("search"))
+            .await?;
+        assert_eq!(result.structured_content, None);
+        assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
+        assert_eq!(result.is_error, Some(false));
+        Ok(())
+    }
+
+    /// The media type of every content one read returned.
+    fn media_types(result: &ReadResourceResult) -> Vec<Option<&str>> {
+        result
+            .contents
+            .iter()
+            .map(|content| match content {
+                ResourceContents::TextResourceContents { mime_type, .. } => mime_type.as_deref(),
+                other => unreachable!("the upstream answers text, not {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn text_output_keeps_the_text_content_of_a_resource_read() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let result = proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+            .await?;
+        assert_eq!(media_types(&result), [Some("text/plain")]);
+        match &result.contents[..] {
+            [ResourceContents::TextResourceContents { uri, text, .. }] => {
+                assert_eq!(uri, TWO_CONTENT_URI);
+                assert_eq!(text, "map 3f9a1c2e");
+            }
+            other => panic!("one text content must stay, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn text_output_keeps_a_resource_that_holds_json_alone() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let result = proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new(JSON_ONLY_URI))
+            .await?;
+        assert_eq!(media_types(&result), [Some("application/json")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_output_keeps_both_contents_of_a_resource_read() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::All).await?;
+        let result = proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new(TWO_CONTENT_URI))
+            .await?;
+        assert_eq!(
+            media_types(&result),
+            [Some("text/plain"), Some("application/json")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_output_passes_an_input_required_resource_read_through() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::Text);
+        let input_required = InputRequiredResult::from_request_state("opaque");
+        match proxy.selected_resource(ReadResourceResponse::InputRequired(input_required.clone())) {
+            ReadResourceResponse::InputRequired(passed) => {
+                assert_eq!(passed.request_state, input_required.request_state);
+            }
+            other => panic!("an input request must pass through, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_output_keeps_is_error_on_a_failing_result() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let result = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("failing"))
+            .await?;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, None);
+        assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_output_keeps_schemas_and_structured_content_through_the_handlers() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::All).await?;
+        let tools = proxied.client.list_all_tools().await?;
+        assert_eq!(tools.len(), 2, "every page must be listed");
+        assert!(
+            tools.iter().all(|tool| tool.output_schema.is_some()),
+            "all output must list the output schema on every page: {tools:?}"
+        );
+
+        let result = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("search"))
+            .await?;
+        assert_eq!(result.structured_content, Some(json!({"results": 0})));
+        assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_proxy_clone_keeps_the_output_policy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::Text);
+        assert_eq!(proxy.clone().output, OutputPolicy::Text);
+    }
+
+    #[test]
+    fn text_output_passes_input_required_and_task_answers_through() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::Text);
+
+        let input_required = InputRequiredResult::from_request_state("opaque");
+        match proxy.selected_response(CallToolResponse::InputRequired(input_required.clone())) {
+            CallToolResponse::InputRequired(passed) => {
+                assert_eq!(passed.request_state, input_required.request_state);
+            }
+            other => panic!("an input request must pass through, got {other:?}"),
+        }
+
+        let task = CreateTaskResult::new(Task::new(
+            "task-1",
+            TaskStatus::Working,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ));
+        match proxy.selected_response(CallToolResponse::Task(task.clone())) {
+            CallToolResponse::Task(passed) => assert_eq!(passed, task),
+            other => panic!("a task answer must pass through, got {other:?}"),
+        }
     }
 }

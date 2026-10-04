@@ -122,9 +122,10 @@ pub struct LimitEvidence {
     pub required: u64,
 }
 
-/// The `data` object on every Rift MCP failure. `code` and `retry` are what a caller
-/// branches on, `message` is for a human, and the remaining fields carry the evidence
-/// available for that failure.
+/// The typed Rift MCP failure. A JSON-RPC error object carries it as `data`, and a failed
+/// tool call serves it as the compact text of a result with `isError`. `code` and `retry`
+/// are what a caller branches on, `message` is for a human, and the remaining fields carry
+/// the evidence available for that failure.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::error_limit_rides_limit_exceeded)]

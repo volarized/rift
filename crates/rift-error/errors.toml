@@ -1137,6 +1137,21 @@ message = "project hit identity was refused by ranking"
 action = "report this internal failure with its full context"
 fields = { hit = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
 
+[error.mcp.answer_text_limit]
+message = "answer text exceeds its accepted limit of {limit} bytes"
+action = "narrow the request or lower `limit`, then resend the request"
+fields = { limit = { type = "unsigned" } }
+
+[error.mcp.answer_text_failed]
+message = "answer text could not be written: {source}"
+action = "report this internal failure with its full context"
+fields = { source = { type = "error", role = "source" } }
+
+[error.mcp.answer_structure_failed]
+message = "answer could not be serialized into structured content: {source}"
+action = "report this internal failure with its full context"
+fields = { source = { type = "error", role = "source" } }
+
 [error.index.workspace_documentation_limit]
 message = "workspace documentation sources exceed their accepted limit of {maximum}"
 action = "reduce documentation sources below {maximum} and retry"

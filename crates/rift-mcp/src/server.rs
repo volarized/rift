@@ -42,14 +42,14 @@ use rift_server::{
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
     ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::{ErrorData, Json, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -62,6 +62,7 @@ use crate::global::{
 use crate::history::{AnalysisGate, HistoryLane};
 use crate::http::IdleTracker;
 use crate::identity::BuildCheckout;
+use crate::output::{Json, ToolFailure};
 use crate::parameters::Parameters;
 use crate::resource;
 use crate::storage::WorkspaceStorage;
@@ -3885,13 +3886,13 @@ impl RiftMcp {
         // record would answer without it. This waits for the lane to reach what it has taken.
         crate::logs::settle_for_read().await;
         let Some(store) = self.logs.as_ref() else {
-            return Ok(resource::logs_unavailable(
+            return resource::logs_unavailable(
                 uri,
                 "the workspace log store could not be opened, so this run recorded nothing",
-            ));
+            );
         };
         match store.recent(&query).await {
-            Ok(records) => Ok(resource::rendered_logs(uri, &records)),
+            Ok(records) => resource::rendered_logs(uri, &records),
             Err(error) => {
                 ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
                     .fail()
@@ -3959,7 +3960,7 @@ impl RiftMcp {
                 total_pages: u64::try_from(total_pages).unwrap_or(u64::MAX),
             },
         };
-        Ok(resource::rendered_workspace(uri, &page))
+        resource::rendered_workspace(uri, &page)
     }
 
     /// Answers the `rift://map` read from the current publication's cached snapshot: a
@@ -3968,7 +3969,7 @@ impl RiftMcp {
     async fn read_map(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
         self.ensure_workspace_root().await?;
         let current = Arc::clone(&self.published.read().await.current);
-        Ok(resource::rendered_map(uri, &current.map))
+        resource::rendered_map(uri, &current.map)
     }
 
     /// Refuses cached workspace resources after their root disappears.
@@ -4009,6 +4010,10 @@ fn file_digest_revision(digest: rift_index::FileDigest) -> String {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RiftMcp {
+    /// Routes the call as the generated `call_tool` does, then completes a Rift operating
+    /// failure, including a refused parameter, as an `isError` result.
+    ///
+    /// Any other error stays the JSON-RPC error the router returned.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -4023,10 +4028,13 @@ impl ServerHandler for RiftMcp {
         );
         async {
             tracing::debug!("tool request started");
-            let tcc = ToolCallContext::new(self, request, context);
-            let result = self.tool_router.call(tcc).await;
+            let routed = ToolCallContext::new(self, request, context);
+            let result = self.tool_router.call(routed).await;
             tracing::debug!(is_error = result.is_err(), "tool request completed");
-            result
+            match result {
+                Err(error) => ToolFailure::from(error).into_call_tool_result(),
+                Ok(response) => Ok(response),
+            }
         }
         .instrument(span)
         .await
@@ -4617,14 +4625,8 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let languages = body["languages"]
             .as_array()
             .expect("workspace languages are an array");
@@ -4687,7 +4689,7 @@ done
 
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
-    use rmcp::model::{CallToolRequestParams, ErrorCode};
+    use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorCode};
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
 
@@ -4730,12 +4732,65 @@ done
         let answer = client
             .read_resource(rmcp::model::ReadResourceRequestParams::new(uri.to_owned()))
             .await?;
-        let Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) =
-            answer.contents.first()
-        else {
-            return Err("resource must contain its serialized publication".into());
-        };
-        Ok(serde_json::from_str(text)?)
+        Ok(serde_json::from_str(&resource_json_text(&answer, uri)?)?)
+    }
+
+    /// The text of the one `application/json` content of a resource read.
+    ///
+    /// A read answers the compact `text/plain` content first and the JSON body second; every
+    /// content carries the requested `uri`.
+    fn resource_json_text(
+        answer: &rmcp::model::ReadResourceResult,
+        uri: &str,
+    ) -> TestResult<String> {
+        let mut json = None;
+        for content in &answer.contents {
+            let rmcp::model::ResourceContents::TextResourceContents {
+                uri: found,
+                mime_type,
+                text,
+                ..
+            } = content
+            else {
+                return Err(format!("{uri}: every content must be text: {content:?}").into());
+            };
+            assert_eq!(found, uri, "every content carries the requested uri");
+            match mime_type.as_deref() {
+                Some("application/json") => {
+                    assert!(
+                        json.replace(text.clone()).is_none(),
+                        "{uri}: one JSON content"
+                    );
+                }
+                Some("text/plain") => {}
+                other => return Err(format!("{uri}: unexpected media type {other:?}").into()),
+            }
+        }
+        json.ok_or_else(|| format!("{uri}: no application/json content").into())
+    }
+
+    /// The compact text of a resource read: its first content, non-empty `text/plain`.
+    fn resource_compact_text(
+        answer: &rmcp::model::ReadResourceResult,
+        uri: &str,
+    ) -> TestResult<String> {
+        match answer.contents.first() {
+            Some(rmcp::model::ResourceContents::TextResourceContents {
+                uri: found,
+                mime_type,
+                text,
+                ..
+            }) if found == uri
+                && mime_type.as_deref() == Some("text/plain")
+                && !text.is_empty() =>
+            {
+                Ok(text.clone())
+            }
+            other => Err(format!(
+                "{uri}: the first content must be non-empty text/plain: {other:?}"
+            )
+            .into()),
+        }
     }
 
     async fn served_nodes(
@@ -4812,30 +4867,18 @@ done
                 CallToolRequestParams::new("nodes")
                     .with_arguments(arguments(&json!({"path": "../outside.rs", "position": 8}))?),
             )
-            .await
-            .expect_err("a parent path must remain a typed refusal");
-        let ServiceError::McpError(data) = invalid else {
-            return Err("invalid path must return an MCP error".into());
-        };
-        assert_eq!(data.code, ErrorCode(-32000));
-        assert_eq!(
-            data.message,
-            "the request does not match the documented form: field path, \
-             violation project path contains a dot segment: cause project path contains a dot segment; \
-             use a workspace-relative path with `/` separators and no `.` or `..` components; \
-             correct the reported field and resend the request"
+            .await?;
+        let text = assert_error_result(&invalid, "invalid_request")?;
+        assert!(
+            text.contains("the request does not match the documented form: field path"),
+            "{text}"
         );
-        let wire = data.data.ok_or("invalid path carries wire error data")?;
-        assert_eq!(wire["code"], "invalid_request");
-        assert_eq!(wire["retry"], "never");
-        assert_eq!(wire["phase"], "read");
-        assert!(wire["causes"].as_array().is_some_and(|causes| {
-            causes.iter().any(|cause| {
-                cause["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("project path contains a dot segment"))
-            })
-        }));
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("\t\t") && line.contains("project path contains a dot segment")
+            }),
+            "{text}"
+        );
         Ok(())
     }
 
@@ -6651,8 +6694,29 @@ done
         Ok(())
     }
 
-    /// Calls one tool expecting a Rift wire error and returns the JSON-RPC
-    /// error object.
+    /// Asserts a completed tool error: `isError`, no structured content, and one text
+    /// block whose title counts the errors and whose first entry head names `code`.
+    /// Returns that text.
+    fn assert_error_result(result: &CallToolResult, code: &str) -> TestResult<String> {
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, None);
+        let [block] = result.content.as_slice() else {
+            return Err("a completed error carries one content block".into());
+        };
+        let text = block.as_text().ok_or("the block is text")?.text.clone();
+        let mut lines = text.lines();
+        let title = lines.next().ok_or("the error text is empty")?;
+        assert!(title == "1 error" || title.ends_with(" errors"), "{text}");
+        assert_eq!(
+            lines.next(),
+            Some(format!("\t{code} · retry never").as_str()),
+            "{text}"
+        );
+        assert!(!text.contains("phase"), "{text}");
+        Ok(text)
+    }
+
+    /// Calls one tool through a client and returns the completed result.
     ///
     /// The population lane's first pass is waited for before the call, so a refusal is
     /// read from a server whose store already holds the served tree rather than from one
@@ -6661,7 +6725,7 @@ done
     async fn failing_call(
         arguments_value: &serde_json::Value,
         tool: &'static str,
-    ) -> TestResult<rmcp::ErrorData> {
+    ) -> TestResult<CallToolResult> {
         let (_directory, server) = Box::pin(fixture()).await?;
         search_after_population(&server, "beacon").await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
@@ -6673,54 +6737,38 @@ done
             service.waiting().await.expect("server must stop cleanly");
         });
         let client = ().serve(client_transport).await?;
-        let error = client
+        let result = client
             .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(arguments_value)?))
-            .await
-            .expect_err("the request must be rejected");
+            .await;
         client.cancel().await?;
         server_task.await?;
-        let ServiceError::McpError(data) = error else {
-            panic!("expected protocol-level McpError, got {error:?}");
-        };
-        Ok(data)
+        Ok(result?)
     }
 
     #[tokio::test]
     async fn client_rejects_empty_search_query_with_typed_wire_error() -> TestResult {
-        let data = failing_call(&json!({"query": ""}), "search").await?;
-        assert_eq!(data.code, ErrorCode(-32000));
+        let result = failing_call(&json!({"query": ""}), "search").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert_eq!(
-            data.message.as_ref(),
-            "the request does not match the documented form: field query, \
-             violation empty; correct the reported field and resend the request"
-        );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
-        assert_eq!(wire["phase"], json!("read"));
-        assert!(
-            wire.get("causes").is_none(),
-            "a failure with no causal chain must omit causes"
+            text,
+            "1 error\n\tinvalid_request · retry never\n\
+             \t\tthe request does not match the documented form: field query, \
+             violation empty; \
+             correct the reported field and resend the request\n"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn client_rejects_zero_result_limit_as_invalid_request() -> TestResult {
-        let data = failing_call(&json!({"name": "beacon", "limit": 0}), "get_symbol").await?;
-        assert_eq!(data.code, ErrorCode(-32000));
+        let result = failing_call(&json!({"name": "beacon", "limit": 0}), "get_symbol").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert_eq!(
-            data.message.as_ref(),
-            "the request does not match the documented form: field limit, \
-             violation zero; correct the reported field and resend the request"
-        );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
-        assert_eq!(wire["phase"], json!("read"));
-        assert!(
-            wire.get("causes").is_none(),
-            "a failure with no causal chain must omit causes"
+            text,
+            "1 error\n\tinvalid_request · retry never\n\
+             \t\tthe request does not match the documented form: field limit, \
+             violation zero; \
+             correct the reported field and resend the request\n"
         );
         Ok(())
     }
@@ -6734,22 +6782,21 @@ done
     /// back verbatim.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
-        let data = failing_call(
+        let result = failing_call(
             &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
             "search",
         )
         .await?;
-        assert_eq!(data.code, ErrorCode(-32000));
-        assert_eq!(
-            data.message.as_ref(),
-            "tool arguments do not match the served schema: accepted exclude, force_include, \
-             include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-             field paths, tool search; \
-             correct the reported field and resend the request"
+        let text = assert_error_result(&result, "invalid_request")?;
+        assert!(
+            text.contains(
+                "tool arguments do not match the served schema: accepted exclude, force_include, \
+                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
+                 field paths, tool search; \
+                 correct the reported field and resend the request"
+            ),
+            "{text}"
         );
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
@@ -6757,46 +6804,52 @@ done
     /// does, and an example of the whole request.
     #[tokio::test]
     async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
-        let data =
+        let result =
             failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
-        let message = data.message.as_ref();
+        let text = assert_error_result(&result, "invalid_request")?;
         assert!(
-            message.starts_with("tool arguments do not match the served schema: accepted "),
-            "{message}"
+            text.contains("tool arguments do not match the served schema: accepted "),
+            "{text}"
         );
-        assert!(message.contains("tool search"), "{message}");
-        assert!(message.contains("paths"), "{message}");
-        assert!(message.contains("example {"), "{message}");
+        assert!(text.contains("tool search"), "{text}");
+        assert!(text.contains("paths"), "{text}");
+        assert!(text.contains("example {"), "{text}");
         assert!(
-            !message.contains("unknown field") && !message.contains("struct"),
-            "a refusal never speaks serde's grammar: {message}"
+            !text.contains("unknown field") && !text.contains("struct"),
+            "a refusal never speaks serde's grammar: {text}"
         );
-        assert_eq!(data.code, ErrorCode(-32000));
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
         Ok(())
     }
 
     /// A closed set's member is refused by listing the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let data = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
-        let message = data.message.as_ref();
+        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let text = assert_error_result(&result, "invalid_request")?;
         assert!(
-            message.contains("accepted all, commit, documentation, file, symbol"),
-            "{message}"
+            text.contains("accepted all, commit, documentation, file, symbol"),
+            "{text}"
         );
-        assert!(message.contains("field target"), "{message}");
-        assert!(message.contains("tool search"), "{message}");
+        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("tool search"), "{text}");
         assert!(
-            !message.contains("unknown variant"),
-            "a refusal never speaks serde's grammar: {message}"
+            !text.contains("unknown variant"),
+            "a refusal never speaks serde's grammar: {text}"
         );
-        assert_eq!(data.code, ErrorCode(-32000));
-        let wire = data.data.ok_or("wire error data must be present")?;
-        assert_eq!(wire["code"], json!("invalid_request"));
-        assert_eq!(wire["retry"], json!("never"));
+        Ok(())
+    }
+
+    /// A tool name the router does not hold is a protocol failure: the JSON-RPC error stays.
+    #[tokio::test]
+    async fn an_unknown_tool_stays_a_json_rpc_error() -> TestResult {
+        let error = failing_call(&json!({}), "no_such_tool")
+            .await
+            .expect_err("an unknown tool must be a protocol error");
+        let Some(ServiceError::McpError(data)) = error.downcast_ref::<ServiceError>() else {
+            return Err(format!("expected a JSON-RPC error, got {error:?}").into());
+        };
+        assert_eq!(data.code, ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("tool not found"), "{data:?}");
         Ok(())
     }
 
@@ -8988,18 +9041,26 @@ done
         Ok(())
     }
 
+    /// A read answers two contents for the requested URI: compact text, then the JSON body.
+    #[tokio::test]
+    async fn workspace_resource_answers_compact_text_then_json() -> TestResult {
+        let (_directory, server) = fixture().await?;
+        let answer = server.read_workspace("rift://workspace").await?;
+        assert_eq!(answer.contents.len(), 2, "{:?}", answer.contents);
+        let compact = resource_compact_text(&answer, "rift://workspace")?;
+        assert!(compact.starts_with("workspace "), "{compact}");
+        let body: serde_json::Value =
+            serde_json::from_str(&resource_json_text(&answer, "rift://workspace")?)?;
+        assert!(body["languages"].is_array(), "{body}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn workspace_resource_reads_effective_languages_and_source() -> TestResult {
         let (_directory, server) = fixture().await?;
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         assert_eq!(
             body["configuration_revision"].as_str().map(str::len),
             Some(8),
@@ -9041,14 +9102,8 @@ done
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let lock = body["source"]
             .as_array()
             .and_then(|source| {
@@ -9096,14 +9151,8 @@ done
         )?;
 
         let answer = server.read_workspace("rift://workspace").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a workspace read answers with one content")
-        else {
-            unreachable!("a workspace read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://workspace")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         let source = body["source"]
             .as_array()
             .expect("workspace source is an array");
@@ -9150,14 +9199,8 @@ done
 
         // The read is the whole point of the resource: the request that just refused is
         // the one whose reason lives in these records.
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .expect("a log read answers with one content")
-        else {
-            unreachable!("a log read answers with text");
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&answer, "rift://logs")?;
+        let body: serde_json::Value = serde_json::from_str(&text)?;
         assert!(body["records"].is_array(), "{text}");
         Ok(())
     }
@@ -9227,13 +9270,7 @@ done
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs")?;
         assert!(
             text.contains("file left out of the index")
                 && text.contains("src/deep.rs")
@@ -9306,14 +9343,8 @@ done
         cancellation.cancel();
         drain_task.await?;
         let logs = server.read_logs("rift://logs/component/index").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
-        let page: serde_json::Value = serde_json::from_str(text)?;
+        let text = resource_json_text(&logs, "rift://logs/component/index")?;
+        let page: serde_json::Value = serde_json::from_str(&text)?;
         let records = page["records"]
             .as_array()
             .ok_or("a log page carries records")?;
@@ -9391,13 +9422,7 @@ done
 
         tracing::warn!(component = "engine", "the beacon engine did not start");
         let logs = server.read_logs("rift://logs/component/engine").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs/component/engine")?;
         let answered = text.clone();
 
         cancellation.cancel();
@@ -9446,13 +9471,7 @@ done
 
         let _answered = run_search(&server, SECRET_TERM).await?;
         let logs = server.read_logs("rift://logs/component/search").await?;
-        let rmcp::model::ResourceContents::TextResourceContents { text, .. } = logs
-            .contents
-            .first()
-            .ok_or("a log read answers with one content")?
-        else {
-            return Err("a log read answers with text".into());
-        };
+        let text = resource_json_text(&logs, "rift://logs/component/search")?;
         let answered = text.clone();
 
         cancellation.cancel();

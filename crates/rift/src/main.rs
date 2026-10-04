@@ -6,6 +6,7 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod install;
+mod mcp;
 mod otlp;
 mod progress;
 mod server;
@@ -63,7 +64,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Serve agents over stdio MCP by proxying this workspace's rift server.
-    Mcp,
+    Mcp {
+        /// Forwards text and structured tool answers with `all`, and text alone with `text`.
+        #[arg(long, value_enum, default_value_t = mcp::OutputMode::All, value_name = "MODE")]
+        output: mcp::OutputMode,
+    },
     /// Manage this workspace's HTTP MCP server.
     Server {
         #[command(subcommand)]
@@ -399,8 +404,8 @@ async fn run(
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
-        Some(CliCommand::Mcp) => {
-            rift_mcp::serve_proxy(Path::new("."), BUILD_CHECKOUT)
+        Some(CliCommand::Mcp { output }) => {
+            rift_mcp::serve_proxy(Path::new("."), BUILD_CHECKOUT, output.into())
                 .await
                 .map_err(|error| CliError::Mcp(error.mcp()))?;
             Ok(None)
@@ -437,7 +442,7 @@ mod tests {
     use std::error::Error as _;
     use std::sync::{Arc, Mutex};
 
-    use super::{Cli, CliCommand, CliError, cli_code, cli_command};
+    use super::{Cli, CliCommand, CliError, cli_code, cli_command, mcp};
     use clap::Parser;
     use tracing::span::{Attributes, Id};
     use tracing_subscriber::layer::{Context, SubscriberExt as _};
@@ -554,15 +559,57 @@ mod tests {
         );
     }
 
+    fn parsed_output(arguments: &[&str]) -> mcp::OutputMode {
+        let parsed = Cli::try_parse_from(arguments).expect("mcp must parse");
+        let Some(CliCommand::Mcp { output }) = parsed.command else {
+            panic!("expected the mcp command, got {:?}", parsed.command);
+        };
+        output
+    }
+
     #[test]
-    fn mcp_command_accepts_no_extra_arguments() {
-        let parsed = Cli::try_parse_from(["rift", "mcp"]).expect("mcp must parse");
-        assert!(matches!(parsed.command, Some(CliCommand::Mcp)));
-        assert!(
-            Cli::try_parse_from(["rift", "mcp", "--blocking-queue-timeout-ms", "1250"]).is_err(),
-            "blocking bounds live in rift.toml's [server] table, not CLI flags"
-        );
-        assert!(Cli::try_parse_from(["rift", "mcp", "--root", "."]).is_err());
+    fn mcp_command_defaults_to_all_output() {
+        assert_eq!(parsed_output(&["rift", "mcp"]), mcp::OutputMode::All);
+    }
+
+    #[test]
+    fn mcp_command_accepts_each_output_spelling() {
+        for (arguments, expected) in [
+            (
+                ["rift", "mcp", "--output=all"].as_slice(),
+                mcp::OutputMode::All,
+            ),
+            (
+                ["rift", "mcp", "--output", "all"].as_slice(),
+                mcp::OutputMode::All,
+            ),
+            (
+                ["rift", "mcp", "--output=text"].as_slice(),
+                mcp::OutputMode::Text,
+            ),
+            (
+                ["rift", "mcp", "--output", "text"].as_slice(),
+                mcp::OutputMode::Text,
+            ),
+        ] {
+            assert_eq!(parsed_output(arguments), expected, "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_command_rejects_unknown_output_and_other_flags() {
+        for arguments in [
+            ["rift", "mcp", "--output=json"].as_slice(),
+            ["rift", "mcp", "--output"].as_slice(),
+            ["rift", "mcp", "--blocking-queue-timeout-ms", "1250"].as_slice(),
+            ["rift", "mcp", "--root", "."].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "an unknown value or flag is rejected before the proxy starts; blocking bounds live in \
+                 rift.toml's [server] table, not CLI flags: {arguments:?}"
+            );
+        }
     }
 
     #[test]
