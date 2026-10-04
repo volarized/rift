@@ -1035,6 +1035,8 @@ fn foreground_selection(
 /// index supervisor left of `deadline`. When the write turn a rebuild holds
 /// does not free in time, the drain drops its last batch with its own
 /// "refused a batch" stderr line, and this abort stops it waiting further.
+/// The join runs inside a `server.stop` span, so its close carries the stage's
+/// elapsed time beside the stages the transport records.
 async fn stop_log_drain(
     drain: Option<tokio::task::JoinHandle<()>>,
     deadline: tokio::time::Instant,
@@ -1042,15 +1044,25 @@ async fn stop_log_drain(
     let Some(mut drain) = drain else {
         return;
     };
-    match tokio::time::timeout_at(deadline, &mut drain).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!(component = "logs", %error, "log drain task failed"),
-        Err(_) => {
-            drain.abort();
-            let _ = drain.await;
-            tracing::warn!(component = "logs", "log drain outlasted the stop deadline");
+    rift_core::traced_async!(
+        component = "logs",
+        operation = "server.stop",
+        stage = "log drain",
+        {
+            match tokio::time::timeout_at(deadline, &mut drain).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(component = "logs", %error, "log drain task failed");
+                }
+                Err(_) => {
+                    drain.abort();
+                    let _ = drain.await;
+                    tracing::warn!(component = "logs", "log drain outlasted the stop deadline");
+                }
+            }
         }
-    }
+    )
+    .await;
 }
 
 /// Cancels `shutdown` when the process receives an interrupt.

@@ -229,6 +229,18 @@ impl StderrWatch {
         String::from_utf8_lossy(&retained).into_owned()
     }
 
+    /// Standard error retained once the child's stream closed, for a failure after the
+    /// child ended.
+    ///
+    /// The wait for the reader is bounded, so a stream another process still holds open
+    /// delays the failure message and never the test's own deadline.
+    fn after_exit(&self) -> String {
+        let _ = wait_for(GONE_POLL_ATTEMPT_COUNT, "the stderr reader to end", || {
+            self.reader.is_finished().then_some(())
+        });
+        self.snapshot()
+    }
+
     /// Waits for the reader once the foreground child ended.
     fn finished(self) -> TestResult<String> {
         let Self { bytes, reader } = self;
@@ -578,7 +590,16 @@ fn start_foreground_server(root: &Path) -> TestResult<(Child, ServerLock)> {
     Ok((child, serving))
 }
 
-fn stop_foreground_server(root: &Path, child: &mut Child) -> TestResult {
+/// Stops the foreground server and requires a clean exit inside the stop bound.
+///
+/// A failure after the stop request carries the server's exit status and, when `stderr`
+/// watches the child, everything the server wrote to its standard error: the rendered
+/// error behind a failed status and the record of each stop stage.
+fn stop_foreground_server(
+    root: &Path,
+    child: &mut Child,
+    stderr: Option<&StderrWatch>,
+) -> TestResult {
     let started = std::time::Instant::now();
     let deadline = started + DATABASE_REOPEN_STOP_BOUND;
     let mut stop = Command::new(rift_binary()?)
@@ -600,7 +621,8 @@ fn stop_foreground_server(root: &Path, child: &mut Child) -> TestResult {
             );
             assert!(
                 server_status.success(),
-                "foreground server must exit cleanly: {server_status:?}"
+                "foreground server must exit cleanly: {server_status:?}; stderr: {}",
+                stderr.map(StderrWatch::after_exit).unwrap_or_default()
             );
             assert!(
                 started.elapsed() <= DATABASE_REOPEN_STOP_BOUND,
@@ -613,12 +635,12 @@ fn stop_foreground_server(root: &Path, child: &mut Child) -> TestResult {
             let _ = stop.wait();
             let _ = child.kill();
             let server_status = child.wait()?;
-            return Err(
-                format!(
-                    "stop and process exit exceeded {DATABASE_REOPEN_STOP_BOUND:?}; server status: {server_status:?}"
-                )
-                .into(),
-            );
+            return Err(format!(
+                "stop and process exit exceeded {DATABASE_REOPEN_STOP_BOUND:?}; server status: \
+                 {server_status:?}; stderr: {}",
+                stderr.map(StderrWatch::after_exit).unwrap_or_default()
+            )
+            .into());
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -766,7 +788,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "notes.md",
     )?;
 
-    stop_foreground_server(root, &mut child)?;
+    stop_foreground_server(root, &mut child, None)?;
     wait_until_port_refuses(serving.port)?;
 
     let (mut child, reopened) = start_foreground_server(root)?;
@@ -779,7 +801,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
     )?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
-    stop_foreground_server(root, &mut child)?;
+    stop_foreground_server(root, &mut child, None)?;
     wait_until_port_refuses(reopened.port)?;
     Ok(())
 }
@@ -1044,7 +1066,7 @@ fn a_stop_after_a_long_serving_span_still_runs_every_stage_inside_its_budget() -
     // The server serves past its own stop span before anyone asks it to stop, so a
     // deadline derived at startup would leave every later stage nothing to spend.
     std::thread::sleep(IDLE_SPAN_PAST_STOP_DEADLINE);
-    stop_foreground_server(root, &mut child)?;
+    stop_foreground_server(root, &mut child, Some(&stderr))?;
 
     wait_for(
         GONE_POLL_ATTEMPT_COUNT,
@@ -1091,7 +1113,7 @@ fn stop_after_large_workspace_binds_ends_the_process() -> TestResult {
 
     // The document appears after HTTP binds, while source preparation can still run.
     // The lane's injected cancellation tests separately prove held transaction abort.
-    stop_foreground_server(root, &mut child)?;
+    stop_foreground_server(root, &mut child, Some(&stderr))?;
 
     // The stop helper already observes CLI completion and process exit within five seconds.
     let status = wait_for(
@@ -1140,7 +1162,7 @@ fn stop_after_large_fixture_rewrite_ends_the_process() -> TestResult {
     // invalidations during preparation or a later rebuild. Injected supervisor tests
     // separately prove cancellation while a capture remains held.
     write_large_fixture_with_value(root, 1)?;
-    stop_foreground_server(root, &mut child)?;
+    stop_foreground_server(root, &mut child, Some(&stderr))?;
 
     // The stop helper already observes CLI completion and process exit within five seconds.
     let status = wait_for(
@@ -1208,7 +1230,8 @@ fn stop_after_large_fixture_rewrite_ends_the_process_as_the_document_goes() -> T
     )?;
     assert!(
         status.success(),
-        "a stopped foreground server exits cleanly: {status:?}"
+        "a stopped foreground server exits cleanly: {status:?}; stderr: {}",
+        stderr.after_exit()
     );
     assert!(
         stop_started.elapsed() <= DATABASE_REOPEN_STOP_BOUND,
