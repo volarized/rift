@@ -10,9 +10,8 @@ use rift_error::{RiftError, errors};
 #[cfg(test)]
 use rift_index::capture_digests_with_languages;
 use rift_index::{
-    ChangeSet, LastCapture, LexicalIndexLimits, LogStore, PathChange, PathChanges,
-    WorkspaceDigests, WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy,
-    is_connection_unavailable,
+    ChangeSet, LastCapture, LexicalIndexLimits, PathChange, PathChanges, WorkspaceDigests,
+    WorkspaceFingerprint, WorkspaceIndexLimits, WorkspaceSourcePolicy, is_connection_unavailable,
 };
 use rift_protocol::configuration::{
     Duration as WireDuration, EmbeddingConfiguration, LspConfiguration, SEARCH_BUSY_TIMEOUT_MS_MAX,
@@ -41,6 +40,7 @@ use rift_server::{
     CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadService,
     StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
+use rift_tracing::LogStore;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{IntoCallToolResult, ToolCallContext};
 use rmcp::model::{
@@ -1952,9 +1952,9 @@ impl RiftMcp {
                 spawn_lexical(index, blocking.clone(), cancellation, analyzer_revision)
             },
         );
-        // The log store shares the database owner without depending on index readiness. Its
-        // reads use committed WAL snapshots, so `rift://logs` can answer while a rebuild is
-        // still preparing the next publication.
+        // The log store is a database of its own and waits on no index readiness. Each read
+        // opens a connection of its own on the last committed WAL snapshot, so `rift://logs`
+        // answers while a rebuild holds the workspace database.
         let logs = storage.logs();
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
@@ -3891,12 +3891,19 @@ impl RiftMcp {
                 "the workspace log store could not be opened, so this run recorded nothing",
             );
         };
-        match store.recent(&query).await {
-            Ok(records) => resource::rendered_logs(uri, &records),
-            Err(error) => {
+        let reader = store.reader();
+        let read = tokio::task::spawn_blocking(move || reader.connect()?.recent(&query)).await;
+        match read {
+            Ok(Ok(records)) => resource::rendered_logs(uri, &records),
+            Ok(Err(error)) => {
                 ErrorData::internal_error(format!("the log store refused the read: {error}"), None)
                     .fail()
             }
+            Err(error) => ErrorData::internal_error(
+                format!("the log read stopped before it answered: {error}"),
+                None,
+            )
+            .fail(),
         }
     }
 
@@ -6601,7 +6608,8 @@ done
     }
 
     /// Corrupt bytes fail `SQLite`'s file-format check deterministically. The server starts
-    /// without database-backed search or logs and leaves those bytes in place for recovery.
+    /// without database-backed search, keeps its logs in the metrics database, and leaves
+    /// those bytes in place for recovery.
     #[tokio::test]
     async fn build_preserves_a_corrupt_database_and_serves_without_it() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -6618,13 +6626,86 @@ done
             .map_err(|error| format!("corrupt database must not fail startup: {error:?}"))?;
 
         assert!(server.search_index.is_none());
+        assert!(
+            server.logs.is_some(),
+            "the metrics database opens on its own"
+        );
+        let answer = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
+        assert!(!answer.contains("could not be opened"), "{answer}");
+        assert_eq!(fs::read(database_path)?, corrupt);
+        Ok(())
+    }
+
+    /// A corrupt metrics database leaves the run unrecorded: `rift://logs` answers an empty
+    /// set with the reason, search keeps its database, and the bytes stay for recovery.
+    #[tokio::test]
+    async fn build_preserves_a_corrupt_metrics_database_and_answers_why_logs_are_empty()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let state_directory = directory.path().join(".rift");
+        fs::create_dir_all(&state_directory)?;
+        let metrics_path = state_directory.join("metrics");
+        let corrupt = b"not a sqlite database";
+        fs::write(&metrics_path, corrupt)?;
+        super::hermetic_workspace(directory.path(), "")?;
+
+        let server = RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default())
+            .await
+            .map_err(|error| format!("corrupt metrics must not fail startup: {error:?}"))?;
+
+        assert!(server.search_index.is_some());
         assert!(server.logs.is_none());
         let unavailable = serde_json::to_string(&server.read_logs("rift://logs").await?)?;
         assert!(
             unavailable.contains("the workspace log store could not be opened"),
             "{unavailable}"
         );
-        assert_eq!(fs::read(database_path)?, corrupt);
+        assert_eq!(fs::read(metrics_path)?, corrupt);
+        Ok(())
+    }
+
+    /// Logs record and answer while the workspace database is refused: `rift://logs`
+    /// returns the `database.open` warning the refusal produced.
+    #[tokio::test]
+    async fn a_refused_workspace_database_is_recorded_in_the_logs() -> TestResult {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        super::hermetic_workspace(directory.path(), "")?;
+        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        let (sink, drain) = crate::logs::log_capture();
+        let capture = crate::logs::logs_configuration(directory.path()).capture;
+        let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
+        let subscriber = tracing_subscriber::registry().with(sink.with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)?;
+
+        let storage = crate::storage::WorkspaceStorage::open(directory.path()).await;
+        let store = storage
+            .logs()
+            .ok_or("the metrics database opens on its own")?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let drain_task = tokio::spawn(drain.run(store, 10_000, cancellation.clone()));
+        let server = RiftMcp::build_settled_with_storage(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            storage,
+            crate::identity::BuildCheckout::Unversioned,
+        )
+        .await?;
+        assert!(server.search_index.is_none());
+
+        let logs = server.read_logs("rift://logs/component/storage").await?;
+        let text = resource_json_text(&logs, "rift://logs/component/storage")?;
+        assert!(
+            text.contains("database.open")
+                && text.contains("the workspace database failed to open"),
+            "the refusal is recorded: {text}"
+        );
+        cancellation.cancel();
+        drain_task.await?;
         Ok(())
     }
 

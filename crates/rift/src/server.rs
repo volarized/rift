@@ -19,9 +19,7 @@ use jiff::Timestamp;
 use jiff::fmt::temporal::DateTimePrinter;
 use jiff::tz::TimeZone;
 
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
 use rift_error::{ErrorContext, RiftError, errors};
-use rift_index::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord};
 use rift_mcp::{
     LogDrain, PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, ServerPresence,
     SpawnPollOutcome, SpawnedServer, StaleReason, StartSpawns, StartedServer, StopRequestFailure,
@@ -29,6 +27,9 @@ use rift_mcp::{
     serve_elected_with_storage, spawn_detached_server,
 };
 use rift_protocol::lock::ServerLock;
+use rift_tracing::{
+    LOG_PAGE_RECORDS_MAX, LogQuery, LogReader, LogReads, LogRecord, StoredLogRecord,
+};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 use waitpid_any::WaitHandle;
@@ -1308,9 +1309,10 @@ fn logs_query(
 
 /// Prints this workspace's recorded diagnostics, oldest first.
 ///
-/// The store is read directly, so a workspace whose server has stopped still
-/// answers. A workspace holding no `.rift/db` prints nothing, says so on
-/// stderr, and creates no state directory.
+/// The metrics database is read directly, so a workspace whose server has stopped still
+/// answers, with no server, no workspace database, and no valid `rift.toml`. A workspace
+/// holding no `.rift/metrics` prints nothing, says so on stderr, and creates no state
+/// directory.
 async fn print_logs(
     root: &Path,
     query: &LogQuery,
@@ -1318,26 +1320,41 @@ async fn print_logs(
     mode: &LogsMode,
     time_zone: &TimeZone,
 ) -> Result<(), RiftError> {
-    let database = root
-        .join(RIFT_STATE_DIRECTORY)
-        .join(WORKSPACE_DATABASE_FILE_NAME);
-    if !database.exists() {
+    let Some(reader) = WorkspaceStorage::open_logs(root) else {
         eprintln!("{NO_RECORDED_LOGS}");
         return Ok(());
-    }
-    let Some(store) = WorkspaceStorage::open(root).await.logs() else {
-        return errors::cli::server_logs_unavailable()
-            .detail("the workspace database at `.rift/db` did not open")
-            .fail();
     };
     let printed = match tail {
-        TailCount::All => print_records_after(&store, query, 0, time_zone).await?,
-        TailCount::Newest(_) => print_newest_records(&store, query, time_zone).await?,
+        TailCount::All => print_records_after(&reader, query, 0, time_zone).await?,
+        TailCount::Newest(_) => print_newest_records(&reader, query, time_zone).await?,
     };
     match mode {
         LogsMode::Once => Ok(()),
-        LogsMode::Following => follow_records(&store, query, printed, time_zone).await,
+        LogsMode::Following => follow_records(&reader, query, printed, time_zone).await,
     }
+}
+
+/// One read of the metrics database on a blocking thread, through a connection of its own.
+async fn read_records(
+    reader: &LogReader,
+    query: LogQuery,
+    read: fn(&LogReads, &LogQuery) -> Result<Vec<StoredLogRecord>, RiftError>,
+) -> Result<Vec<StoredLogRecord>, RiftError> {
+    let reader = reader.clone();
+    let records = tokio::task::spawn_blocking(move || read(&reader.connect()?, &query))
+        .await
+        .map_err(|error| {
+            errors::cli::server_logs_unavailable()
+                .operation("read recorded logs")
+                .detail(error.to_string())
+                .error()
+        })?;
+    records.map_err(|source| {
+        errors::cli::server_logs_unavailable()
+            .operation("read recorded logs")
+            .source(source)
+            .error()
+    })
 }
 
 /// Prints every record after `after`, oldest first, and returns the newest
@@ -1347,22 +1364,14 @@ async fn print_logs(
 /// [`LOG_PAGE_RECORDS_MAX`]. The loop repeats only while a page comes back
 /// full, and the store's retention bounds how many full pages there can be.
 async fn print_records_after(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     after: i64,
     time_zone: &TimeZone,
 ) -> Result<i64, RiftError> {
     let mut newest = after;
     loop {
-        let page = store
-            .following(&query.clone().after(newest))
-            .await
-            .map_err(|source| {
-                errors::cli::server_logs_unavailable()
-                    .operation("read recorded logs")
-                    .source(source)
-                    .error()
-            })?;
+        let page = read_records(reader, query.clone().after(newest), LogReads::following).await?;
         for stored in &page {
             let line = rendered_record(stored, time_zone);
             println!("{line}");
@@ -1377,16 +1386,11 @@ async fn print_records_after(
 /// Prints the newest records the query selects, oldest first, and returns the
 /// newest identity it printed. The read is bounded by the query's own page.
 async fn print_newest_records(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     time_zone: &TimeZone,
 ) -> Result<i64, RiftError> {
-    let mut records = store.recent(query).await.map_err(|source| {
-        errors::cli::server_logs_unavailable()
-            .operation("read recorded logs")
-            .source(source)
-            .error()
-    })?;
+    let mut records = read_records(reader, query.clone(), LogReads::recent).await?;
     records.reverse();
     let mut newest = 0;
     for stored in &records {
@@ -1399,14 +1403,14 @@ async fn print_newest_records(
 
 /// Prints records as the server writes them, until the operator interrupts.
 async fn follow_records(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     printed: i64,
     time_zone: &TimeZone,
 ) -> Result<(), RiftError> {
     let interrupted = CancellationToken::new();
     let interrupt = tokio::spawn(cancel_on_interrupt(interrupted.clone()));
-    let followed = follow_until_interrupt(store, query, printed, &interrupted, time_zone).await;
+    let followed = follow_until_interrupt(reader, query, printed, &interrupted, time_zone).await;
     interrupt.abort();
     let _ = interrupt.await;
     followed
@@ -1418,7 +1422,7 @@ async fn follow_records(
 /// interrupt, as `docker logs -f` does. Each iteration reads one page, bounded
 /// by the query's own limit.
 async fn follow_until_interrupt(
-    store: &LogStore,
+    reader: &LogReader,
     query: &LogQuery,
     printed: i64,
     interrupted: &CancellationToken,
@@ -1426,7 +1430,7 @@ async fn follow_until_interrupt(
 ) -> Result<(), RiftError> {
     let mut newest = printed;
     while !interrupted.is_cancelled() {
-        newest = print_records_after(store, query, newest, time_zone).await?;
+        newest = print_records_after(reader, query, newest, time_zone).await?;
         tokio::select! {
             () = interrupted.cancelled() => {}
             () = tokio::time::sleep(LOG_FOLLOW_POLL_INTERVAL) => {}
@@ -1542,11 +1546,11 @@ mod tests {
     };
     use jiff::tz::{Offset, TimeZone};
     use rift_error::errors;
-    use rift_index::{
-        LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
-    };
     use rift_mcp::{START_SPAWN_COUNT_MAX, StartExit};
     use rift_protocol::lock::{ProductIdentity, ServerLock, ServerLockViolation};
+    use rift_tracing::{
+        LOG_BATCH_RECORDS_MAX, LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogRecord, LogStore,
+    };
     use std::path::Path;
 
     /// Milliseconds in one hour, for fixture instants only.
@@ -2911,14 +2915,9 @@ mod tests {
         Ok(())
     }
 
-    /// A log store on a temporary database, for the reads these cases drive.
+    /// A log store on a temporary metrics database, for the reads these cases drive.
     async fn log_store(directory: &tempfile::TempDir) -> TestResult<LogStore> {
-        let database = rift_index::WorkspaceDatabase::open(
-            &directory.path().join("db"),
-            rift_index::DatabasePool::new(2, 1_000),
-        )
-        .await?;
-        Ok(LogStore::attached(database))
+        Ok(LogStore::open(&directory.path().join("metrics"), None).await?)
     }
 
     #[test]
@@ -2999,9 +2998,12 @@ mod tests {
         assert_eq!(since.milliseconds(), 600_000);
         assert!(rift_protocol::configuration::Duration::parse("10").is_err());
 
-        let read = store
-            .following(&logs_query(TailCount::All, Some(since), None, None))
-            .await?;
+        let read = store.reader().connect()?.following(&logs_query(
+            TailCount::All,
+            Some(since),
+            None,
+            None,
+        ))?;
 
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].record().message(), "fresh");
@@ -3029,17 +3031,59 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn an_unopened_database_names_itself_in_the_refusal() {
-        let error = errors::cli::server_logs_unavailable()
-            .detail("the workspace database at `.rift/db` did not open")
-            .error();
+    /// `rift server logs` needs no server and no workspace database: with only
+    /// `.rift/metrics` present it reads the records and creates nothing else.
+    #[tokio::test]
+    async fn logs_print_from_the_metrics_database_alone() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state_directory = directory.path().join(".rift");
+        std::fs::create_dir(&state_directory)?;
+        let store = LogStore::open(&state_directory.join("metrics"), None).await?;
+        store
+            .append(
+                &[LogRecord::new(
+                    0,
+                    "info",
+                    "rift",
+                    "index",
+                    "index.build",
+                    "kept",
+                    "{}",
+                )],
+                1_000,
+            )
+            .await?;
+        store
+            .close(tokio::time::Instant::now() + SERVER_STOP_DEADLINE)
+            .await?;
+        let query = logs_query(TailCount::All, None, None, None);
 
-        assert_eq!(error.slug(), errors::cli::server_logs_unavailable::SLUG);
-        let rendered = error.to_string();
-        assert!(rendered.contains("did not open"), "{rendered}");
-        assert!(rendered.contains(".rift/db"), "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        print_logs(
+            directory.path(),
+            &query,
+            TailCount::All,
+            &LogsMode::Once,
+            &TimeZone::UTC,
+        )
+        .await?;
+        print_logs(
+            directory.path(),
+            &query,
+            TailCount::Newest(5),
+            &LogsMode::Once,
+            &TimeZone::UTC,
+        )
+        .await?;
+
+        let mut names: Vec<String> = std::fs::read_dir(&state_directory)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_, _>>()?;
+        names.retain(|name| !name.starts_with("metrics"));
+        assert!(
+            names.is_empty(),
+            "a logs read creates no other state: {names:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

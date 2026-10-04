@@ -4509,6 +4509,7 @@ dependencies = [
  "rift-search",
  "rift-server",
  "rift-syntax",
+ "rift-tracing",
  "rmcp",
  "semver",
  "serde",
@@ -4677,6 +4678,7 @@ dependencies = [
  "rift-provider",
  "rift-ranking",
  "rift-syntax",
+ "rift-tracing",
  "rusqlite",
  "same-file",
  "serde",
@@ -4732,6 +4734,7 @@ dependencies = [
  "rift-ranking",
  "rift-search",
  "rift-server",
+ "rift-tracing",
  "rmcp",
  "rusqlite",
  "schemars 1.2.2",
@@ -4889,6 +4892,16 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+]
+
+[[package]]
+name = "rift-tracing"
+version = "0.0.47"
+dependencies = [
+ "rift-error",
+ "rusqlite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

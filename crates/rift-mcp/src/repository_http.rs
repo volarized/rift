@@ -132,6 +132,7 @@ pub(crate) async fn serve_repository_http(
         supervisor: None,
         engines: None,
         search_index: None,
+        logs: None,
         repository_workspaces: Some(registry),
     })
 }
@@ -142,6 +143,7 @@ struct RepositoryWorkspace {
     supervisor: IndexSupervisor,
     engines: Arc<EngineHold>,
     database: Option<Arc<rift_index::WorkspaceDatabase>>,
+    logs: Option<Arc<rift_tracing::LogStore>>,
     stop: CancellationToken,
     activity: Arc<IdleTracker>,
     lease: AsyncMutex<Option<Arc<ElectionGuard>>>,
@@ -418,6 +420,7 @@ impl RepositoryWorkspaceRegistry {
         let lease = Arc::new(lease);
         let storage = WorkspaceStorage::open_with_owner(&root, Some(Arc::clone(&lease))).await;
         let database = storage.database();
+        let logs = storage.logs();
         let server = RiftMcp::build_with_storage_and_executor(
             &root,
             self.limits,
@@ -445,6 +448,7 @@ impl RepositoryWorkspaceRegistry {
             supervisor,
             engines,
             database,
+            logs,
             stop: service_stop,
             activity,
             lease: AsyncMutex::new(Some(lease)),
@@ -606,7 +610,8 @@ async fn stop_repository_workspace(
     } else {
         Ok(())
     };
-    let outcome = engines.and(supervisor).and(database);
+    let logs = crate::http::close_logs(workspace.logs.as_deref(), deadline).await;
+    let outcome = engines.and(supervisor).and(database).and(logs);
     if outcome.is_ok() {
         drop(workspace.lease.lock().await.take());
     }

@@ -35,6 +35,7 @@ rift-dependency.workspace = true
 rift-history.workspace = true
 rift-history-store.workspace = true
 rift-index.workspace = true
+rift-tracing.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-search.workspace = true

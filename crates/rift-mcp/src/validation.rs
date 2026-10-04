@@ -7877,7 +7877,7 @@ pub(crate) mod tests {
     }
 
     /// Drains what the queue currently holds, without a store.
-    fn queued_records(drain: &mut crate::logs::LogDrain) -> Vec<rift_index::LogRecord> {
+    fn queued_records(drain: &mut crate::logs::LogDrain) -> Vec<rift_tracing::LogRecord> {
         let mut records = Vec::new();
         while let Ok(record) = drain.try_recv_record() {
             records.push(record);
