@@ -896,6 +896,7 @@ mod tests {
 
     /// The `sqlite_schema` rows a new index database holds, one block per row in name
     /// order: `type`, `name`, `tbl_name`, then `sql`, bare where `SQLite` stores none.
+    /// Compared through [`fixture_text`], whatever line endings the checkout wrote.
     const INDEX_SCHEMA: &str = include_str!("../tests/fixtures/index_schema.txt");
     /// The `sqlite_schema` rows a new vectors database holds, spelled as [`INDEX_SCHEMA`].
     const VECTORS_SCHEMA: &str = include_str!("../tests/fixtures/vectors_schema.txt");
@@ -918,6 +919,15 @@ mod tests {
         })?;
         let blocks = rows.collect::<Result<Vec<String>, _>>()?;
         Ok(blocks.join("\n"))
+    }
+
+    /// `fixture` with every line ending `\n`, as `SQLite` stores the schema text.
+    ///
+    /// A checkout's line endings follow its host's git configuration: a Windows runner
+    /// converts every fixture line to `\r\n`, and `include_str!` keeps those bytes, while
+    /// the schema text comes from string literals `rustc` reads with `\n` endings.
+    fn fixture_text(fixture: &str) -> String {
+        fixture.replace("\r\n", "\n")
     }
 
     /// The migrations the file at `path` recorded, as `(id, name)` in id order.
@@ -944,9 +954,21 @@ mod tests {
             database
                 .shutdown(tokio::time::Instant::now() + HELD_POOL_READ_MAX)
                 .await?;
-            assert_eq!(rendered_schema(&path)?, expected, "schema of {name}");
+            assert_eq!(
+                rendered_schema(&path)?,
+                fixture_text(expected),
+                "schema of {name}"
+            );
         }
         Ok(())
+    }
+
+    /// A fixture a Windows checkout rewrote to `\r\n` reads as the one with `\n` endings.
+    #[test]
+    fn a_crlf_checkout_of_a_schema_fixture_reads_as_written() {
+        let crlf = INDEX_SCHEMA.replace("\r\n", "\n").replace('\n', "\r\n");
+        assert_eq!(fixture_text(&crlf), fixture_text(INDEX_SCHEMA));
+        assert!(!fixture_text(&crlf).contains('\r'));
     }
 
     /// Toasty records a migration set per file: two databases opened in one directory
