@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rift_core::constants::{
@@ -173,12 +174,14 @@ impl std::fmt::Display for DatabaseName {
 /// takes it at most one span after the holder releases it.
 const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(10);
 
-/// Connection count, wait bounds, and memory map size for one database file.
+/// Connection count, wait bounds, memory map size, and write-ahead log size limit for one
+/// database file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabasePool {
     slots: u32,
     busy_timeout_ms: u32,
     mmap_bytes: u64,
+    journal_size_limit_bytes: Option<u64>,
 }
 
 impl DatabasePool {
@@ -186,14 +189,37 @@ impl DatabasePool {
     /// that bounds a caller's wait for a free slot, the wait `SQLite` grants a
     /// connection for another process's lock before it refuses, and an open's
     /// wait for another process's migration lock. Connections read through
-    /// `SQLite`'s page cache alone until [`Self::memory_mapped`] sets a map.
+    /// `SQLite`'s page cache alone until [`Self::memory_mapped`] sets a map, and
+    /// keep `SQLite`'s unlimited write-ahead log until [`Self::journal_size_limited`]
+    /// sets a limit.
     #[must_use]
     pub const fn new(slots: u32, busy_timeout_ms: u32) -> Self {
         Self {
             slots,
             busy_timeout_ms,
             mmap_bytes: 0,
+            journal_size_limit_bytes: None,
         }
+    }
+
+    /// The same pool with the write-ahead log cut back to `bytes` at the commit that
+    /// restarts it, the `[search] journal_size_limit` key.
+    ///
+    /// `SQLite` truncates the log to the limit only when a commit completes the first
+    /// transaction of a restarted log, so a larger transaction still grows the file past
+    /// it until then. The limit is a setting of one connection, so every checkout sets it.
+    #[must_use]
+    pub const fn journal_size_limited(self, bytes: u64) -> Self {
+        Self {
+            journal_size_limit_bytes: Some(bytes),
+            ..self
+        }
+    }
+
+    /// The write-ahead log size limit in bytes; `None` keeps `SQLite`'s default of no limit.
+    #[must_use]
+    pub const fn journal_size_limit_bytes(self) -> Option<u64> {
+        self.journal_size_limit_bytes
     }
 
     /// The same pool with each connection mapping up to `mmap_bytes` of the file,
@@ -237,6 +263,38 @@ pub struct WorkspaceDatabase {
     /// `SQLite` admits one writer per file. Writes queue here before taking a
     /// connection, so in-process writers never compete for `SQLite`'s file lock.
     writes: Mutex<()>,
+    /// Whether a shutdown has already run the close checkpoint.
+    checkpointed: AtomicBool,
+}
+
+/// The row `PRAGMA wal_checkpoint(TRUNCATE)` answers: whether it met another connection's
+/// lock, the frames the write-ahead log held, and the frames it moved into the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WalCheckpoint {
+    busy: bool,
+    log: i64,
+    checkpointed: i64,
+}
+
+impl WalCheckpoint {
+    /// Reads the one row of three integers the pragma answers.
+    fn from_row(rows: &[Value]) -> Result<Self, RiftError> {
+        if let [Value::Record(record)] = rows
+            && let [Value::I64(busy), Value::I64(log), Value::I64(checkpointed)] = record.as_slice()
+        {
+            return Ok(Self {
+                busy: *busy != 0,
+                log: *log,
+                checkpointed: *checkpointed,
+            });
+        }
+        errors::index::lexical_storage()
+            .with(rift_error::ErrorContext::new(
+                "pragma",
+                format!("unexpected wal_checkpoint row: rows={rows:?}"),
+            ))
+            .fail()
+    }
 }
 
 impl WorkspaceDatabase {
@@ -324,6 +382,7 @@ impl WorkspaceDatabase {
             pool,
             thread,
             writes: Mutex::new(()),
+            checkpointed: AtomicBool::new(false),
         }))
     }
 
@@ -339,16 +398,80 @@ impl WorkspaceDatabase {
         self.pool
     }
 
-    /// Stops the SQLite worker by the shared shutdown deadline.
+    /// Checkpoints the write-ahead log, then stops the SQLite worker, both by `deadline`.
+    ///
+    /// The checkpoint waits for the file's write turn, sets the busy timeout of its write
+    /// connection to zero, and runs `PRAGMA wal_checkpoint(TRUNCATE)`, which empties the log
+    /// file unless another connection holds it busy. It records the `busy`, `log`, and
+    /// `checkpointed` row as a `database.close` event. A turn not free by `deadline`, a busy
+    /// answer, or a refused checkpoint does not fail the close: the worker still stops,
+    /// and `SQLite` recovers whatever the log holds at the next open. The worker drops every
+    /// connection it holds, and the last connection's close removes the log file.
+    ///
+    /// Only the first call checkpoints; a later one awaits the worker's stop alone.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the worker stops responding or panics.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future during the checkpoint releases the write turn; a worker stop
+    /// already queued still completes.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
+        if !self.checkpointed.swap(true, Ordering::AcqRel) {
+            self.checkpoint_before_close(deadline).await;
+        }
         self.thread
             .shutdown(deadline)
             .await
             .map_err(|source| errors::index::lexical_storage().source(source).error())
+    }
+
+    /// The truncate checkpoint of [`Self::shutdown`], recorded and never failing the close.
+    async fn checkpoint_before_close(&self, deadline: tokio::time::Instant) {
+        let database = self.name.label();
+        match tokio::time::timeout_at(deadline, self.truncate_write_ahead_log()).await {
+            Ok(Ok(checkpoint)) => tracing::info!(
+                component = "storage",
+                operation = "database.close",
+                database,
+                busy = checkpoint.busy,
+                log = checkpoint.log,
+                checkpointed = checkpoint.checkpointed,
+                "database checkpointed its write-ahead log"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                component = "storage",
+                operation = "database.close",
+                database,
+                %error,
+                "database checkpoint failed; the write-ahead log stays for the next open"
+            ),
+            Err(_elapsed) => tracing::warn!(
+                component = "storage",
+                operation = "database.close",
+                database,
+                "database checkpoint outlasted the shutdown deadline; the write-ahead log \
+                 stays for the next open"
+            ),
+        }
+    }
+
+    /// Takes the write turn and truncates the write-ahead log without waiting on another
+    /// connection's lock.
+    async fn truncate_write_ahead_log(&self) -> Result<WalCheckpoint, RiftError> {
+        let mut access = self.writing().await?;
+        toasty::sql::query("PRAGMA busy_timeout = 0")
+            .exec(&mut access.connection)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        let rows = toasty::sql::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .column_types([Type::I64, Type::I64, Type::I64])
+            .exec(&mut access.connection)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+        WalCheckpoint::from_row(&rows)
     }
 
     /// Exclusive write access to the file: the file's write turn, and a
@@ -566,7 +689,8 @@ async fn configure_journal(connection: &mut Connection) -> Result<(), RiftError>
     require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
 }
 
-/// Applies connection-local durability, lock wait, memory map, and access policy.
+/// Applies connection-local durability, lock wait, memory map, write-ahead log limit, and
+/// access policy.
 ///
 /// Every checkout sets each pragma again, one statement each, so a pooled connection
 /// answers under this pool's policy whichever checkout opened it.
@@ -586,6 +710,15 @@ async fn configure_connection(
         .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let mmap_bytes = pool.mmap_bytes();
     toasty::sql::query(format!("PRAGMA mmap_size = {mmap_bytes}"))
+        .exec(&mut *connection)
+        .await
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+    // `-1` is `SQLite`'s own default, no limit; a value past `i64::MAX` cannot be stored, and
+    // no configuration accepts one.
+    let journal_size_limit = pool
+        .journal_size_limit_bytes()
+        .map_or(-1, |bytes| i64::try_from(bytes).unwrap_or(i64::MAX));
+    toasty::sql::query(format!("PRAGMA journal_size_limit = {journal_size_limit}"))
         .exec(&mut *connection)
         .await
         .map_err(|source| errors::index::lexical_storage().source(source).error())?;
@@ -1564,5 +1697,209 @@ mod tests {
             "the index write meets the held lock and refuses"
         );
         Ok(())
+    }
+
+    /// The write-ahead log limit the WAL tests set: small enough that one test write
+    /// passes it many times over.
+    const WAL_TEST_LIMIT_BYTES: u64 = 64 << 10;
+    /// Blobs of [`WAL_TEST_LIMIT_BYTES`] one test write commits.
+    const WAL_TEST_ROWS: i64 = 16;
+
+    async fn limited_database(
+        path: &Path,
+        name: DatabaseName,
+    ) -> Result<Arc<WorkspaceDatabase>, Box<dyn std::error::Error>> {
+        let pool = DatabasePool::new(4, 1_000).journal_size_limited(WAL_TEST_LIMIT_BYTES);
+        Ok(WorkspaceDatabase::open(path, name, pool).await?)
+    }
+
+    /// Commits [`WAL_TEST_ROWS`] blobs of the limit's size into a scratch table through the
+    /// write turn.
+    async fn write_past_the_limit(database: &WorkspaceDatabase) -> TestResult {
+        let mut writing = database.writing().await?;
+        let mut transaction = writing.transaction().await?;
+        toasty::sql::statement("CREATE TABLE IF NOT EXISTS wal_scratch(payload BLOB)")
+            .exec(&mut transaction)
+            .await?;
+        toasty::sql::statement(format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {WAL_TEST_ROWS}) \
+             INSERT INTO wal_scratch SELECT randomblob({WAL_TEST_LIMIT_BYTES}) FROM n"
+        ))
+        .exec(&mut transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    fn wal_bytes(path: &Path) -> std::io::Result<Option<u64>> {
+        match std::fs::metadata(super::appended(
+            path,
+            rift_core::constants::WRITE_AHEAD_LOG_SUFFIX,
+        )) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A close checkpoints and drops every connection, so a log written past the limit
+    /// leaves no `-wal` file, for each database.
+    #[tokio::test]
+    async fn a_closed_database_leaves_no_write_ahead_log() -> TestResult {
+        for name in [DatabaseName::Index, DatabaseName::Vectors] {
+            let directory = tempfile::tempdir()?;
+            let path = name.path(directory.path());
+            let database = limited_database(&path, name).await?;
+            write_past_the_limit(&database).await?;
+            let written = wal_bytes(&path)?.ok_or("the write leaves a write-ahead log")?;
+            assert!(
+                written > WAL_TEST_LIMIT_BYTES,
+                "the {name} write must pass the limit before the close: written={written}"
+            );
+
+            database
+                .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await?;
+
+            assert_eq!(
+                wal_bytes(&path)?,
+                None,
+                "a closed {name} database must leave no write-ahead log"
+            );
+        }
+        Ok(())
+    }
+
+    /// With another connection still open on the file, the log outlives the close but the
+    /// truncate checkpoint leaves it empty.
+    #[tokio::test]
+    async fn a_close_beside_another_connection_leaves_an_empty_write_ahead_log() -> TestResult {
+        for name in [DatabaseName::Index, DatabaseName::Vectors] {
+            let directory = tempfile::tempdir()?;
+            let path = name.path(directory.path());
+            let database = limited_database(&path, name).await?;
+            write_past_the_limit(&database).await?;
+            let other = rusqlite::Connection::open(&path)?;
+            let rows: i64 =
+                other.query_row("SELECT COUNT(*) FROM wal_scratch", [], |row| row.get(0))?;
+            assert_eq!(
+                rows, WAL_TEST_ROWS,
+                "the other connection reads the committed rows"
+            );
+
+            database
+                .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await?;
+
+            assert_eq!(
+                wal_bytes(&path)?,
+                Some(0),
+                "the checkpoint must empty the {name} write-ahead log the other connection keeps"
+            );
+            drop(other);
+        }
+        Ok(())
+    }
+
+    /// Once a checkpoint restarts the log, the next commit cuts the file to the limit.
+    #[tokio::test]
+    async fn the_commit_that_restarts_the_log_cuts_it_to_the_limit() -> TestResult {
+        for name in [DatabaseName::Index, DatabaseName::Vectors] {
+            let directory = tempfile::tempdir()?;
+            let path = name.path(directory.path());
+            let database = limited_database(&path, name).await?;
+            write_past_the_limit(&database).await?;
+            let grown = wal_bytes(&path)?.ok_or("the write leaves a write-ahead log")?;
+            assert!(
+                grown > WAL_TEST_LIMIT_BYTES,
+                "the {name} write must grow the log past the limit: grown={grown}"
+            );
+            let other = rusqlite::Connection::open(&path)?;
+            let busy: i64 =
+                other.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(0))?;
+            assert_eq!(
+                busy, 0,
+                "the passive checkpoint must copy every {name} frame"
+            );
+            drop(other);
+
+            let mut writing = database.writing().await?;
+            let mut transaction = writing.transaction().await?;
+            toasty::sql::statement("INSERT INTO wal_scratch VALUES (x'00')")
+                .exec(&mut transaction)
+                .await?;
+            transaction.commit().await?;
+            drop(writing);
+
+            let restarted = wal_bytes(&path)?.ok_or("the commit keeps a write-ahead log")?;
+            assert!(
+                restarted <= WAL_TEST_LIMIT_BYTES,
+                "the commit restarting the {name} log must cut it to the limit: \
+                 restarted={restarted}, limit={WAL_TEST_LIMIT_BYTES}"
+            );
+            database
+                .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// A second shutdown runs no second checkpoint and answers as the first did.
+    #[tokio::test]
+    async fn a_second_shutdown_answers_without_a_second_checkpoint() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = DatabaseName::Index.path(directory.path());
+        let database = limited_database(&path, DatabaseName::Index).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        database.shutdown(deadline).await?;
+        database.shutdown(deadline).await?;
+        Ok(())
+    }
+
+    /// Every checkout sets the pool's write-ahead log limit, and a pool without one keeps
+    /// `SQLite`'s default of no limit.
+    #[tokio::test]
+    async fn every_checkout_sets_the_pool_journal_size_limit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let limited =
+            limited_database(&directory.path().join("limited"), DatabaseName::Index).await?;
+        let unlimited = WorkspaceDatabase::open(
+            &directory.path().join("unlimited"),
+            DatabaseName::Index,
+            pool(),
+        )
+        .await?;
+        for (database, expected) in [
+            (&limited, i64::try_from(WAL_TEST_LIMIT_BYTES)?),
+            (&unlimited, -1),
+        ] {
+            let mut reading = database.connection().await?;
+            let limit = toasty::sql::query("PRAGMA journal_size_limit")
+                .column_types([Type::I64])
+                .exec(&mut reading)
+                .await?;
+            crate::lexical::require_pragma_row(&limit, &[Value::I64(expected)])?;
+        }
+        Ok(())
+    }
+
+    /// A checkpoint row of another shape is a storage failure, not a guess.
+    #[test]
+    fn a_checkpoint_row_of_another_shape_is_refused() {
+        let row = Value::Record(toasty_core::stmt::ValueRecord::from_vec(vec![
+            Value::I64(1),
+            Value::I64(4),
+            Value::I64(3),
+        ]));
+        let checkpoint = super::WalCheckpoint::from_row(std::slice::from_ref(&row));
+        assert_eq!(
+            checkpoint.ok(),
+            Some(super::WalCheckpoint {
+                busy: true,
+                log: 4,
+                checkpointed: 3,
+            })
+        );
+        assert!(super::WalCheckpoint::from_row(&[]).is_err());
     }
 }

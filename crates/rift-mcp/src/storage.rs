@@ -135,6 +135,7 @@ fn configured_pool(root: &Path) -> DatabasePool {
         u32::try_from(search.busy_timeout.milliseconds()).unwrap_or(u32::MAX),
     )
     .memory_mapped(search.lexical.mmap_size.bytes())
+    .journal_size_limited(search.journal_size_limit.bytes())
 }
 
 /// The workspace state directory, created when absent; `None` when it cannot be.
@@ -399,6 +400,28 @@ mod tests {
         assert_eq!(
             super::configured_pool(directory.path()).mmap_bytes(),
             8 << 20
+        );
+    }
+
+    #[test]
+    fn the_pool_limits_the_write_ahead_log_to_search_journal_size_limit() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let default = rift_protocol::configuration::SearchConfiguration::default()
+            .journal_size_limit
+            .bytes();
+        assert_eq!(
+            super::configured_pool(directory.path()).journal_size_limit_bytes(),
+            Some(default),
+            "an absent key limits the log to the default"
+        );
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            "[search]\njournal_size_limit = \"8mb\"\n",
+        )
+        .expect("the workspace configuration writes");
+        assert_eq!(
+            super::configured_pool(directory.path()).journal_size_limit_bytes(),
+            Some(8 << 20)
         );
     }
 
