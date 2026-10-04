@@ -1400,15 +1400,12 @@ const WALK_BUDGET_RESERVE_DIVISOR: u32 = 10;
 /// such as one queued behind other work on the worker pool.
 const WALK_CAPTURE_RESERVE_FACTOR: u32 = 2;
 
-/// The instant every wait inside one request must end by.
+/// The instant every readiness wait inside one request must end by.
 ///
 /// `[server] readiness_timeout` bounds one request, not each wait that request makes. A
-/// search waits for a publication, then for the lexical lane's transaction, then repeats
-/// both when the tree moves under it, and handing each of those waits its own copy of the
-/// timeout let one read spend the operator's budget several times over: the corpus
-/// recorded a first `search` at 25.08 seconds against 6.21 for a `get_symbol` that made
-/// one wait. The deadline is taken once, where the request enters, and every wait inside
-/// it spends what remains.
+/// search can wait for a publication, recapture when the tree moves, and wait for language
+/// engine references. The deadline is taken once, where the request enters, and each wait
+/// spends what remains.
 ///
 /// A wait started past the deadline still resolves whatever is already available:
 /// `tokio::time::timeout_at` polls its future before its timer, so a publication the
@@ -1428,7 +1425,7 @@ impl RequestDeadline {
         }
     }
 
-    /// The instant the request's waits end at.
+    /// The instant the request's readiness waits end at.
     fn at(self) -> tokio::time::Instant {
         self.at
     }
@@ -1438,7 +1435,7 @@ impl RequestDeadline {
         self.budget
     }
 
-    /// What is left of the budget, zero once it is spent.
+    /// What is left of the budget for readiness waits, zero once it is spent.
     fn remaining(self) -> Duration {
         self.at
             .saturating_duration_since(tokio::time::Instant::now())
@@ -1462,38 +1459,6 @@ impl RequestDeadline {
         let floor = self.budget / WALK_BUDGET_RESERVE_DIVISOR;
         let check = capture_elapsed.saturating_mul(WALK_CAPTURE_RESERVE_FACTOR);
         self.at - floor.max(check).min(self.budget)
-    }
-}
-
-/// Where `tree_revision` stands with `lane` once the commit for it has landed, or once
-/// `deadline` passed with the lane still holding it: `Committing` in the second case
-/// alone.
-///
-/// The wake-up is subscribed before each state read, so a landing between the read and
-/// the await is never missed: tokio's `Notified` "is guaranteed to receive wakeups from
-/// `notify_waiters()` as soon as it has been created, even if it has not yet been
-/// polled". A landing for another revision - the one running ahead of a held write -
-/// wakes the wait, which reads the state again under the same deadline; the loop runs
-/// once per landing inside the request's remaining budget.
-///
-/// # Cancel safety
-///
-/// Dropping the future drops its subscription; the lane is never written.
-async fn commit_landed(
-    lane: &LexicalLane,
-    tree_revision: &str,
-    deadline: RequestDeadline,
-) -> LexicalCommitState {
-    let deadline = deadline.at();
-    loop {
-        let landed = lane.landed();
-        let commit_state = lane.commit_state(tree_revision);
-        if commit_state != LexicalCommitState::Committing {
-            return commit_state;
-        }
-        if tokio::time::timeout_at(deadline, landed).await.is_err() {
-            return commit_state;
-        }
     }
 }
 
@@ -2361,10 +2326,9 @@ impl RiftMcp {
     /// past the captured publication ends this attempt rather than ranking rows the answer
     /// cannot place. The next attempt captures the publication the store already holds, and
     /// the bound is the same one `reconcile_workspace` applies to a tree that keeps moving.
-    /// The publication wait, each attempt's wait for a lexical commit in flight, and the
-    /// reference reads all spend one [`RequestDeadline`], taken once from
-    /// `[server] readiness_timeout`: that key bounds the request, so a read that waits
-    /// three times over cannot cost three times the budget the operator set.
+    /// The publication and reference waits spend one [`RequestDeadline`], taken once
+    /// from `[server] readiness_timeout`. Recapturing a publication does not grant a new
+    /// budget.
     ///
     /// A request whose attempts or whose deadline are spent answers from the publication
     /// it holds, with the ranked tier reported unavailable. Capturing the publication the
@@ -2383,7 +2347,7 @@ impl RiftMcp {
         let mut resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
-        let mut ranking = self.ranking(&params, &resolved.published, deadline).await?;
+        let mut ranking = self.ranking(&params, &resolved.published).await?;
         for _retry in 1..INDEX_CAPTURE_ATTEMPTS_MAX {
             // A spent deadline ends the retries before a landed ranking does: another
             // capture has nothing left to wait with, so it would only refuse.
@@ -2393,7 +2357,7 @@ impl RiftMcp {
             resolved = self
                 .published_workspace(wire::ErrorPhase::Read, deadline)
                 .await?;
-            ranking = self.ranking(&params, &resolved.published, deadline).await?;
+            ranking = self.ranking(&params, &resolved.published).await?;
         }
         let requested = &params;
         let (resolved, ranking, mut references) = tokio::time::timeout_at(
@@ -2621,9 +2585,8 @@ impl RiftMcp {
 
     /// Repeats engine reads against a fresh publication when their captured tree moves.
     ///
-    /// The publication and ranking waits this recapture makes spend the same
-    /// [`RequestDeadline`] the whole request runs under, which the caller also ends the
-    /// exchange at.
+    /// The publication waits this recapture makes spend the same [`RequestDeadline`] the
+    /// whole request runs under, which the caller also ends the exchange at.
     async fn current_tree_references(
         &self,
         mut resolved: ResolvedWorkspace,
@@ -2639,7 +2602,7 @@ impl RiftMcp {
                 resolved = self
                     .published_workspace(wire::ErrorPhase::Read, deadline)
                     .await?;
-                ranking = self.ranking(params, &resolved.published, deadline).await?;
+                ranking = self.ranking(params, &resolved.published).await?;
             }
         }
         Err(ReadFault::unavailable(
@@ -2793,17 +2756,15 @@ impl RiftMcp {
     /// Returns nothing when the store has moved past `published`'s tree to a newer
     /// publication, which asks the caller to capture the publication the store already
     /// answers for. Every other outcome ranks: an index that could not be opened, one the
-    /// lexical lane is still committing this tree into once `deadline` passed, and one
-    /// that missed a commit warn `lexical_ranking_unavailable` and leave identifier
-    /// search to answer alone. A query-term limit the index refuses surfaces as this
-    /// request's own `limit_exceeded` error, never a silent degrade. A `global` scope
-    /// never consults the index: the ranked lane serves the project alone, so nothing
-    /// about it rides that answer.
+    /// lexical lane is still committing this tree into, and one that missed a commit warn
+    /// `lexical_ranking_unavailable` and leave identifier search to answer alone. A
+    /// query-term limit the index refuses surfaces as this request's own `limit_exceeded`
+    /// error, never a silent degrade. A `global` scope never consults the index: the ranked
+    /// lane serves the project alone, so nothing about it rides that answer.
     async fn ranking(
         &self,
         params: &SearchParams,
         published: &PublishedWorkspace,
-        deadline: RequestDeadline,
     ) -> Result<Option<SearchRanking>, ErrorData> {
         if params.pattern.is_some() {
             return self.pattern_ranking(params, published).await.map(Some);
@@ -2840,8 +2801,7 @@ impl RiftMcp {
         };
         let tree_revision = published.reads.tree_revision();
         let stored = rift_core::traced_async!(component = "search", operation = "search.store", {
-            self.store_answer(index, tree_revision, &parsed, deadline)
-                .await
+            self.store_answer(index, tree_revision, &parsed).await
         })
         .await;
         let (searched, commit_state) = match stored {
@@ -3020,25 +2980,20 @@ impl RiftMcp {
             .map_err(StoreReadFailure::from)
     }
 
-    /// The store's answer for `tree_revision` and where that revision stands with the
-    /// lexical lane, after waiting out a commit in flight.
-    ///
-    /// A store that does not hold the captured tree while the lane is still committing
-    /// it is a transient condition: the read waits for that commit to land by
-    /// `deadline`, then reads the store and the state again once. `Owed` and `Settled`
-    /// never wait, since no held transaction can change either. A wait that reaches the
-    /// deadline leaves `Committing` standing, which is what [`ranking_of`] warns about.
-    /// Without a lane the revision counts as settled: nothing could commit it.
+    /// The store's answer for `tree_revision` and the lexical lane's state after one read.
+    /// A `Committing` lane leaves the store answer unmatched, so [`ranking_of`] returns
+    /// identifier matching with `lexical_ranking_unavailable`. A later request can read
+    /// the full-text tier after the write lands. Without a lane, the revision counts as
+    /// settled because nothing could commit it.
     ///
     /// # Cancel safety
     ///
-    /// Dropping the future drops the wait and the store read; nothing is written.
+    /// Dropping the future drops the store read; nothing is written.
     async fn store_answer(
         &self,
         index: &SearchIndex,
         tree_revision: &str,
         query: &ParsedQuery,
-        deadline: RequestDeadline,
     ) -> Result<(RevisionScoped<PhasedRanking>, LexicalCommitState), StoreReadFailure> {
         let searched = rift_core::traced_async!(
             component = "search",
@@ -3051,22 +3006,6 @@ impl RiftMcp {
             return Ok((searched, LexicalCommitState::Settled));
         };
         let commit_state = lane.commit_state(tree_revision);
-        let matched = matches!(searched, RevisionScoped::Matched(_));
-        if matched || commit_state != LexicalCommitState::Committing {
-            return Ok((searched, commit_state));
-        }
-        let commit_state =
-            rift_core::traced_async!(component = "search", operation = "search.commit_landed", {
-                commit_landed(lane, tree_revision, deadline).await
-            })
-            .await;
-        let searched = rift_core::traced_async!(
-            component = "search",
-            operation = "search.read_store",
-            attempt = 2_u8,
-            { self.read_store(index, tree_revision, query).await }
-        )
-        .await?;
         Ok((searched, commit_state))
     }
 
@@ -3299,8 +3238,8 @@ impl RiftMcp {
     /// `[server] readiness_timeout` on the last accepted `rift.toml` - the
     /// default table's value while the file is invalid, since the acceptance
     /// failure itself is what a request meets once the wait ends. Index
-    /// validation, the lexical lane's transaction, and a specific engine's
-    /// readiness all spend that one budget, never a fresh one each.
+    /// validation and a specific engine's readiness spend that one budget, never a fresh
+    /// one each.
     async fn published_workspace(
         &self,
         phase: wire::ErrorPhase,
@@ -4614,9 +4553,9 @@ done
     use crate::storage::WorkspaceStorage;
     use crate::validation::lexical_double::StoreDouble;
     use crate::validation::{
-        LEXICAL_COMMIT_TIMEOUT, LexicalCommitState, LexicalLane, PublishedWorkspace,
-        RebuildOutcome, WorkspaceCandidate, build_workspace_candidate, rebuild_workspace,
-        record_rebuild_failure, unwatched, workspace_capture,
+        LexicalCommitState, LexicalLane, PublishedWorkspace, RebuildOutcome, WorkspaceCandidate,
+        build_workspace_candidate, rebuild_workspace, record_rebuild_failure, unwatched,
+        workspace_capture,
     };
     use rift_core::ProjectPath as CoreProjectPath;
 
@@ -6486,7 +6425,7 @@ done
                     ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
                     _ => None,
                 })
-                .ok_or("an unranked first answer names the commit it is waiting on")?;
+                .ok_or("an unranked first answer names the commit that has not landed")?;
             assert!(
                 detail.contains(&format!("still committing tree revision {revision}")),
                 "{detail}"
@@ -8113,10 +8052,8 @@ done
         assert_eq!(super::bounded_detail(multibyte, 3), "\u{e9}");
     }
 
-    /// How long after a search starts waiting the gated commit is released.
-    const COMMIT_LANDING_DELAY: Duration = Duration::from_millis(50);
-    /// A commit wait budget a held commit never lands inside.
-    const COMMIT_WAIT_BUDGET: Duration = Duration::from_millis(100);
+    /// A deadline budget for tests that do not involve a held lexical commit.
+    const REQUEST_DEADLINE_TEST_BUDGET: Duration = Duration::from_millis(100);
 
     /// A server over a one-declaration workspace whose lexical lane runs over a
     /// [`StoreDouble`] holding every write at its gate, with the double the test releases
@@ -8384,9 +8321,8 @@ done
     ) -> TestResult<rift_index::PatternCandidates> {
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             let published = current_publication(server).await;
-            let budget = server.readiness_timeout().await;
             let ranking = server
-                .ranking(params, &published, RequestDeadline::starting(budget))
+                .ranking(params, &published)
                 .await?
                 .ok_or("a pattern always ranks")?;
             let candidates = ranking
@@ -8494,9 +8430,8 @@ done
         );
 
         let published = current_publication(&server).await;
-        let budget = server.readiness_timeout().await;
         let ranking = server
-            .ranking(&params, &published, RequestDeadline::starting(budget))
+            .ranking(&params, &published)
             .await?
             .ok_or("a pattern always ranks")?;
         let unindexed = ranking
@@ -8589,15 +8524,10 @@ done
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_search_before_the_first_lexical_commit_lands_names_the_revision() -> TestResult {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
+    async fn a_search_answers_by_identifier_before_the_lexical_commit_lands() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let (sink, mut drain) = crate::logs::log_capture();
-        let subscriber = tracing_subscriber::registry().with(sink);
-        let _guard = tracing::subscriber::set_default(subscriber);
         let (server, double) =
-            server_over_gated_store(directory.path(), "[server]\nreadiness_timeout = \"1s\"\n")
+            server_over_gated_store(directory.path(), "[server]\nreadiness_timeout = \"30s\"\n")
                 .await?;
         let revision = current_publication(&server)
             .await
@@ -8607,7 +8537,7 @@ done
 
         let answer = tokio::time::timeout(UNWAITED_READ_MAX, run_search(&server, "beacon"))
             .await
-            .map_err(|_| "the first search exceeded its read bound")??;
+            .map_err(|_| "the identifier answer waits behind the held lexical write")??;
         assert!(
             !answer.results.is_empty(),
             "identifier matching answers while the commit is held"
@@ -8619,107 +8549,23 @@ done
                 ReadWarning::LexicalRankingUnavailable { detail } => Some(detail.clone()),
                 _ => None,
             })
-            .ok_or("the search warns once its budget ran out with the transaction still held")?;
+            .ok_or("the identifier answer names the held lexical commit")?;
         assert!(
             detail.contains(&format!("still committing tree revision {revision}")),
             "{detail}"
         );
 
-        // The read above and the next one use the SQLite and Rayon workers, so keep
-        // wall-clock time for those operations. Only this lane timer advances virtually.
-        tokio::time::pause();
-        tokio::time::sleep(LEXICAL_COMMIT_TIMEOUT + Duration::from_millis(1)).await;
-        let mut records = Vec::new();
-        while let Ok(record) = drain.try_recv_record() {
-            records.push(record);
-        }
-        let delayed = records
-            .iter()
-            .find(|record| record.message().contains("ran past its deadline"))
-            .ok_or("a transaction past its deadline is recorded")?;
-        assert_eq!(delayed.level(), "error");
-        tokio::time::resume();
-        let again = run_search(&server, "beacon").await?;
-        assert!(
-            !again.results.is_empty() && !store_ranked(&again),
-            "the answer keeps coming from identifier matching past the deadline: {:?}",
-            again.warnings
-        );
-
         double.release_one();
         let ranked = search_after_population(&server, "beacon").await?;
         assert!(
-            ranked.warnings.is_empty(),
+            store_ranked(&ranked) && ranked.warnings.is_empty(),
             "a landed commit clears the warning: {:?}",
             ranked.warnings
         );
         Ok(())
     }
 
-    /// A commit that lands inside the budget is waited out: the answer is store-ranked,
-    /// and the operator-action warning is never spent.
-    #[tokio::test(start_paused = true)]
-    async fn a_search_waits_out_a_commit_that_lands_inside_its_budget() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let (server, double) = server_over_gated_store(directory.path(), "").await?;
-        let release = tokio::spawn({
-            let double = Arc::clone(&double);
-            async move {
-                tokio::time::sleep(COMMIT_LANDING_DELAY).await;
-                double.release_one();
-            }
-        });
-        let started = tokio::time::Instant::now();
-        let answer = run_search(&server, "beacon").await?;
-        let waited = started.elapsed();
-        release.await?;
-        assert!(
-            store_ranked(&answer) && !answer.results.is_empty(),
-            "the landed commit ranks the answer: {:?}",
-            answer.warnings
-        );
-        assert!(
-            waited >= COMMIT_LANDING_DELAY && waited < Duration::from_secs(1),
-            "the search waited for the landing and no longer: {waited:?}"
-        );
-        Ok(())
-    }
-
-    /// A commit that never lands inside the budget leaves the answer ranked by identifier
-    /// matching, warning that the tree is still committing, once the budget ran out.
-    #[tokio::test(start_paused = true)]
-    async fn a_search_whose_commit_never_lands_inside_its_budget_warns() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let (server, _double) = server_over_gated_store(directory.path(), "").await?;
-        let published = current_publication(&server).await;
-        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let started = tokio::time::Instant::now();
-        let ranking = server
-            .ranking(
-                &params,
-                &published,
-                RequestDeadline::starting(COMMIT_WAIT_BUDGET),
-            )
-            .await?
-            .ok_or("a tree still committing ranks by identifier matching alone")?;
-        let waited = started.elapsed();
-        let detail =
-            unavailable_detail(&ranking).ok_or("the tier warns once the budget ran out")?;
-        assert!(
-            detail.contains(&format!(
-                "still committing tree revision {}",
-                published.reads.tree_revision()
-            )),
-            "{detail}"
-        );
-        assert!(
-            waited >= COMMIT_WAIT_BUDGET && waited < COMMIT_WAIT_BUDGET * 2,
-            "the wait spent its budget and no more: {waited:?}"
-        );
-        Ok(())
-    }
-
-    /// A settled store never waits: the answer comes back at once, far under the budget.
+    /// A settled store ranks the answer without warnings.
     #[tokio::test(start_paused = true)]
     async fn a_search_over_a_settled_store_never_waits() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -8728,79 +8574,40 @@ done
         search_after_population(&server, "beacon").await?;
         let published = current_publication(&server).await;
         let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let budget = server.readiness_timeout().await;
-        let started = tokio::time::Instant::now();
         let ranking = server
-            .ranking(&params, &published, RequestDeadline::starting(budget))
+            .ranking(&params, &published)
             .await?
             .ok_or("a settled store ranks")?;
-        let waited = started.elapsed();
         assert!(
             ranking.warnings.is_empty(),
             "a settled store warns nothing: {:?}",
             ranking.warnings
         );
-        assert!(
-            waited < budget / 100,
-            "a settled store answers without waiting: {waited:?} under {budget:?}"
-        );
         Ok(())
     }
 
-    /// One request's budget, spent across the waits it makes rather than once per wait.
+    /// One request's budget, spent across its waits rather than once per wait.
     #[tokio::test(start_paused = true)]
     async fn a_request_deadline_spends_one_budget_across_its_waits() -> TestResult {
-        let deadline = RequestDeadline::starting(COMMIT_WAIT_BUDGET);
+        let deadline = RequestDeadline::starting(REQUEST_DEADLINE_TEST_BUDGET);
 
-        assert_eq!(deadline.budget(), COMMIT_WAIT_BUDGET);
-        assert_eq!(deadline.remaining(), COMMIT_WAIT_BUDGET);
+        assert_eq!(deadline.budget(), REQUEST_DEADLINE_TEST_BUDGET);
+        assert_eq!(deadline.remaining(), REQUEST_DEADLINE_TEST_BUDGET);
         assert!(
             !deadline.is_spent(),
             "a request that just entered has its budget"
         );
 
-        tokio::time::sleep(COMMIT_WAIT_BUDGET / 4).await;
+        tokio::time::sleep(REQUEST_DEADLINE_TEST_BUDGET / 4).await;
         assert_eq!(
             deadline.remaining(),
-            COMMIT_WAIT_BUDGET * 3 / 4,
+            REQUEST_DEADLINE_TEST_BUDGET * 3 / 4,
             "a wait leaves the rest of the budget, not a fresh one"
         );
 
-        tokio::time::sleep(COMMIT_WAIT_BUDGET).await;
+        tokio::time::sleep(REQUEST_DEADLINE_TEST_BUDGET).await;
         assert_eq!(deadline.remaining(), Duration::ZERO);
         assert!(deadline.is_spent(), "the budget does not go negative");
-        Ok(())
-    }
-
-    /// A commit wait handed a deadline an earlier wait already spent part of waits out
-    /// what remains of that budget, never a fresh one.
-    #[tokio::test(start_paused = true)]
-    async fn a_commit_wait_spends_what_the_request_deadline_has_left() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let (server, _double) = server_over_gated_store(directory.path(), "").await?;
-        let published = current_publication(&server).await;
-        let params: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let deadline = RequestDeadline::starting(COMMIT_WAIT_BUDGET);
-        // An earlier wait in the same request took half of it.
-        tokio::time::sleep(COMMIT_WAIT_BUDGET / 2).await;
-
-        let started = tokio::time::Instant::now();
-        let ranking = server
-            .ranking(&params, &published, deadline)
-            .await?
-            .ok_or("a tree still committing ranks by identifier matching alone")?;
-        let waited = started.elapsed();
-
-        assert!(
-            unavailable_detail(&ranking).is_some(),
-            "the held transaction leaves the ranked tier unavailable: {:?}",
-            ranking.warnings
-        );
-        assert!(deadline.is_spent(), "the original request budget is spent");
-        assert!(
-            waited >= COMMIT_WAIT_BUDGET / 4 && waited < COMMIT_WAIT_BUDGET,
-            "the wait uses remaining budget, never a fresh full budget: {waited:?}"
-        );
         Ok(())
     }
 
@@ -10143,9 +9950,8 @@ done
         fs::write(other.path().join("lib.rs"), "pub fn lantern() {}\n")?;
         let moved = stable_candidate(other.path(), 0)?;
         let params: SearchParams = serde_json::from_value(json!({"query": "lantern"}))?;
-        let deadline = server.request_deadline().await;
         assert!(
-            server.ranking(&params, &moved, deadline).await?.is_none(),
+            server.ranking(&params, &moved).await?.is_none(),
             "a store that never held this tree ends the attempt rather than ranking"
         );
         Ok(())

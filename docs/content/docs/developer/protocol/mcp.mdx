@@ -1181,12 +1181,11 @@ The search ranking tiers carry their own warnings:
   missed a commit, holds no indexed tree, failed to load, got no database connection within
   `[search] busy_timeout`, or still answers for a newer publication after the request's capture
   attempts; the `detail` names which, with the tree revision in the first three cases. Ranking
-  falls back to identifier matching, so a query phrased as prose finds nothing; the tier is read
+  falls back to identifier matching, so a query phrased as prose finds nothing. The tier is read
   under the answer's own tree revision, so one that has moved past it is recaptured, up to those
   attempts, rather than warned about, a case a caller cannot otherwise tell apart from a tier
-  that searched and found nothing. A read waits for a commit in flight until its
-  `[server] readiness_timeout` budget is spent, and warns only then; the wait shares that
-  budget with everything else the read waits for.
+  that searched and found nothing. A pending commit keeps this warning in the answer; a later
+  search can use the full-text tier after the commit lands.
 - `history_store_filling` - a [commit search](#search-commits) answered while the history store
   lacks some of the commits its latest fill selects, or the commit `HEAD` names; `analyzed` and
   `total` state how far the fill has got.
