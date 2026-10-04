@@ -14,10 +14,9 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
-use serde_json::{Value, json};
-use workspace_client::await_workspace_ready;
+use serde_json::json;
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -39,16 +38,7 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
 /// The paths of the documentation hits a `lighthouse` query answers, sorted.
 async fn documentation_paths(client: &RunningService<RoleClient, ()>) -> TestResult<Vec<String>> {
     let arguments = json!({ "query": "lighthouse", "target": "documentation", "limit": 50 });
-    let arguments = arguments
-        .as_object()
-        .cloned()
-        .ok_or("tool arguments must be an object")?;
-    let result = client
-        .call_tool(CallToolRequestParams::new("search").with_arguments(arguments))
-        .await?;
-    let answer: Value = result
-        .structured_content
-        .ok_or("search must return structured content")?;
+    let answer = search_after_population(client, &arguments).await?;
     let mut paths: Vec<String> = answer["results"]
         .as_array()
         .ok_or_else(|| format!("search must answer results: {answer:#}"))?

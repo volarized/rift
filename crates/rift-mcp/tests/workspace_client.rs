@@ -198,6 +198,56 @@ pub(crate) async fn await_workspace_ready(
     }
 }
 
+/// Calls `search` until the lexical population pass has landed.
+///
+/// Workspace map readiness covers local file preparation. The lexical lane commits its
+/// initial write behind that publication, so a search can still return identifier matches
+/// with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+///
+/// # Errors
+///
+/// Returns the last answer if the store does not rank it within three seconds.
+pub(crate) async fn search_after_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &Value,
+) -> TestResult<Value> {
+    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
+    const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let query = arguments["query"].as_str().unwrap_or("<missing query>");
+    let mut answer = client
+        .call_tool(tool_request("search", arguments))
+        .await?
+        .structured_content
+        .ok_or("search must return structured content")?;
+    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+        let population_pending =
+            answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some("lexical_ranking_unavailable" | "stale_index")
+                    )
+                });
+        if !population_pending {
+            return Ok(answer);
+        }
+        tokio::time::sleep(SEARCH_TIER_POLL).await;
+        answer = client
+            .call_tool(tool_request("search", arguments))
+            .await?
+            .structured_content
+            .ok_or("search must return structured content")?;
+    }
+    Err(format!(
+        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    )
+    .into())
+}
+
 /// The path from the process working directory to `target`, as one `..`
 /// segment per directory above the working directory followed by the
 /// target's own segments.
