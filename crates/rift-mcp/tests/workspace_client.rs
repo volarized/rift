@@ -206,7 +206,8 @@ pub(crate) async fn await_workspace_ready(
 ///
 /// # Errors
 ///
-/// Returns the last answer if the store does not rank it within three seconds.
+/// Returns the last answer if the store does not rank it within three seconds, or an
+/// acceptance error after eight refused attempts.
 pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,
@@ -215,11 +216,7 @@ pub(crate) async fn search_after_population(
     const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
     let query = arguments["query"].as_str().unwrap_or("<missing query>");
-    let mut answer = client
-        .call_tool(tool_request("search", arguments))
-        .await?
-        .structured_content
-        .ok_or("search must return structured content")?;
+    let mut answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
     for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
         let population_pending =
             answer["warnings"]
@@ -236,11 +233,7 @@ pub(crate) async fn search_after_population(
             return Ok(answer);
         }
         tokio::time::sleep(SEARCH_TIER_POLL).await;
-        answer = client
-            .call_tool(tool_request("search", arguments))
-            .await?
-            .structured_content
-            .ok_or("search must return structured content")?;
+        answer = call_retrying_acceptance(client, tool_request("search", arguments)).await?;
     }
     Err(format!(
         "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"

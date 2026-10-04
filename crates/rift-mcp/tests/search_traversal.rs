@@ -29,7 +29,9 @@ mod typescript_install;
 mod workspace_client;
 
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_workspace, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, search_after_population, served_workspace, tool_request,
+};
 
 /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`:
 ///
@@ -1058,16 +1060,13 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
 
-    let merged = call_retrying_acceptance(
+    let merged = search_after_population(
         &client,
-        tool_request(
-            "search",
-            &json!({
-                "query": "branch_a",
-                "target": "symbol",
-                "traversal": { "seed": ROOT, "direction": "outgoing", "facets": ["calls"] }
-            }),
-        ),
+        &json!({
+            "query": "branch_a",
+            "target": "symbol",
+            "traversal": { "seed": ROOT, "direction": "outgoing", "facets": ["calls"] }
+        }),
     )
     .await?;
     let hit = results(&merged)
@@ -1079,16 +1078,13 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
     assert!(matched_by.contains(&json!("relationship")), "{hit}");
     assert!(merged["warnings"].is_null(), "{merged}");
 
-    let warned = call_retrying_acceptance(
+    let warned = search_after_population(
         &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": ROOT, "direction": "outgoing", "facets": ["references", "calls"]
-                }
-            }),
-        ),
+        &json!({
+            "traversal": {
+                "seed": ROOT, "direction": "outgoing", "facets": ["references", "calls"]
+            }
+        }),
     )
     .await?;
     assert_eq!(symbol_names(&warned), ["branch_a", "branch_b"], "{warned}");
