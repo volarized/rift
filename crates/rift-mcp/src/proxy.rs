@@ -547,6 +547,13 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 /// the refusal is one the caller resends; any other exhaustion refuses with
 /// the operator's next step.
 ///
+/// A workspace whose settings select a repository server asks that server
+/// first, and again on each poll round while its answer is
+/// [`RepositoryAsk::Transient`]: the repository server claims the
+/// workspace's election and publishes no document there, so the workspace's
+/// own election probes as [`ServerPresence::Starting`] until the window
+/// closes. A [`RepositoryAsk::Terminal`] answer ends the asking.
+///
 /// A recorded server of another identity is weighed by [`ServerStanding`].
 /// One this process replaces is asked to stop first, and the spawn waits
 /// until that server has released the election, so the new server never
@@ -564,9 +571,24 @@ async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
 ) -> Result<RunningService<RoleClient, ()>, ErrorData> {
-    if let Some(running) = connect_repository_server(root, identity).await? {
-        return Ok(running);
-    }
+    connect_upstream_with(root, identity, || connect_repository_server(root, identity)).await
+}
+
+/// [`connect_upstream`] over any ask of the repository server, so a test
+/// can order what each ask answers.
+async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
+    root: &Path,
+    identity: &ProductIdentity,
+    mut ask_repository: impl FnMut() -> Asking,
+) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+    let mut reported = None;
+    let asked = ask_repository().await;
+    asked.report_change(&mut reported);
+    let mut repository_transient = match asked {
+        RepositoryAsk::Connected(running) => return Ok(running),
+        RepositoryAsk::Transient(_) => true,
+        RepositoryAsk::Terminal(_) => false,
+    };
     let mut replacement = Replacement::default();
     if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
         return Ok(running);
@@ -609,6 +631,15 @@ async fn connect_upstream(
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
+        if repository_transient {
+            let asked = ask_repository().await;
+            asked.report_change(&mut reported);
+            match asked {
+                RepositoryAsk::Connected(running) => return Ok(running),
+                RepositoryAsk::Transient(_) => {}
+                RepositoryAsk::Terminal(_) => repository_transient = false,
+            }
+        }
     }
     if let Some(refusal) = still_serving {
         return refusal.fail();
@@ -800,44 +831,181 @@ async fn adopt_presence(
     }
 }
 
+/// What one ask of the repository server answered.
+#[derive(Debug)]
+enum RepositoryAsk {
+    /// The repository server answered for this workspace.
+    Connected(RunningService<RoleClient, ()>),
+    /// A later ask within the start window can connect: the repository
+    /// server is not serving yet, or did not answer the connect while it
+    /// builds the workspace inside the initialize request.
+    Transient(RepositoryMiss),
+    /// No later ask within the start window connects: the workspace selects
+    /// its own server, or the repository server is one this process does not
+    /// adopt.
+    Terminal(RepositoryMiss),
+}
+
+impl RepositoryAsk {
+    /// Logs this ask's miss when its arm differs from the arm `reported`
+    /// holds, so a start window of repeated misses logs each change of arm
+    /// once, not once per poll round.
+    fn report_change(&self, reported: &mut Option<std::mem::Discriminant<RepositoryMiss>>) {
+        let (Self::Transient(miss) | Self::Terminal(miss)) = self else {
+            return;
+        };
+        let arm = std::mem::discriminant(miss);
+        if *reported != Some(arm) {
+            *reported = Some(arm);
+            miss.report();
+        }
+    }
+}
+
+/// Why one ask of the repository server did not connect.
+#[derive(Debug)]
+enum RepositoryMiss {
+    /// The workspace's settings select its own server.
+    NotRepository,
+    /// The workspace configuration was refused, or reading it did not finish.
+    SelectionRefused { detail: String },
+    /// The repository election directory could not be named.
+    ElectionDirectory { detail: String },
+    /// The repository election names no serving server.
+    NotServing { presence: String },
+    /// The serving server records other settings or another identity.
+    NotAdopted {
+        pid: u32,
+        settings_match: bool,
+        identity_adopted: bool,
+    },
+    /// The serving server did not answer the connect.
+    Unanswered {
+        pid: u32,
+        port: u16,
+        elapsed_ms: u128,
+        detail: String,
+    },
+}
+
+impl RepositoryMiss {
+    /// Logs this miss. A workspace that selects its own server is the
+    /// ordinary case and logs nothing.
+    fn report(&self) {
+        match self {
+            Self::NotRepository => {}
+            Self::SelectionRefused { detail } => tracing::info!(
+                component = "mcp",
+                %detail,
+                "server configuration selection refused; polling the workspace election"
+            ),
+            Self::ElectionDirectory { detail } => tracing::info!(
+                component = "mcp",
+                %detail,
+                "repository election directory unavailable; polling the workspace election"
+            ),
+            Self::NotServing { presence } => tracing::info!(
+                component = "mcp",
+                %presence,
+                "repository server not serving; polling the workspace election"
+            ),
+            Self::NotAdopted {
+                pid,
+                settings_match,
+                identity_adopted,
+            } => tracing::info!(
+                component = "mcp",
+                pid,
+                settings_match,
+                identity_adopted,
+                "repository server not adopted; polling the workspace election"
+            ),
+            Self::Unanswered {
+                pid,
+                port,
+                elapsed_ms,
+                detail,
+            } => tracing::info!(
+                component = "mcp",
+                pid,
+                port,
+                elapsed_ms,
+                %detail,
+                "repository server did not answer; polling the workspace election"
+            ),
+        }
+    }
+}
+
+/// Asks the repository server the workspace's settings select, once.
+///
+/// # Cancel safety
+///
+/// Dropping this future abandons the ask; it changes nothing.
 async fn connect_repository_server(
     workspace_root: &Path,
     identity: &ProductIdentity,
-) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+) -> RepositoryAsk {
     let root = workspace_root.to_path_buf();
-    let selection = tokio::task::spawn_blocking(move || select_server_configuration(&root, None))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    let Some(ServerConfigurationSelection::Repository {
+    let selection =
+        match tokio::task::spawn_blocking(move || select_server_configuration(&root, None)).await {
+            Ok(Ok(selection)) => selection,
+            Ok(Err(refusal)) => {
+                return RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused {
+                    detail: refusal.message.to_string(),
+                });
+            }
+            Err(error) => {
+                return RepositoryAsk::Terminal(RepositoryMiss::SelectionRefused {
+                    detail: error.to_string(),
+                });
+            }
+        };
+    let ServerConfigurationSelection::Repository {
         common_directory,
         server,
         ..
-    }) = selection
+    } = selection
     else {
-        return Ok(None);
+        return RepositoryAsk::Terminal(RepositoryMiss::NotRepository);
     };
-    let Some(state_directory) = repository_election_directory(&common_directory, identity).ok()
-    else {
-        return Ok(None);
+    let state_directory = match repository_election_directory(&common_directory, identity) {
+        Ok(state_directory) => state_directory,
+        Err(refusal) => {
+            return RepositoryAsk::Terminal(RepositoryMiss::ElectionDirectory {
+                detail: refusal.message.to_string(),
+            });
+        }
     };
     let presence = tokio::task::spawn_blocking(move || probe_state_directory(&state_directory))
         .await
         .unwrap_or(ServerPresence::Stale(StaleReason::ElectionUnobservable));
     let ServerPresence::Serving(lock) = presence else {
-        return Ok(None);
+        return RepositoryAsk::Transient(RepositoryMiss::NotServing {
+            presence: format!("{presence:?}"),
+        });
     };
-    if lock.server.as_ref() != Some(&server)
-        || !matches!(
-            ServerStanding::of(identity, &lock.identity),
-            ServerStanding::Adopt
-        )
-    {
-        return Ok(None);
+    let settings_match = lock.server.as_ref() == Some(&server);
+    let identity_adopted = matches!(
+        ServerStanding::of(identity, &lock.identity),
+        ServerStanding::Adopt
+    );
+    if !settings_match || !identity_adopted {
+        return RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+            pid: lock.pid,
+            settings_match,
+            identity_adopted,
+        });
     }
+    let started = tokio::time::Instant::now();
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, workspace_root).await {
-        Ok(running) => Ok(Some(running)),
-        Err(_) => Ok(None),
+        Ok(running) => RepositoryAsk::Connected(running),
+        Err(failure) => RepositoryAsk::Transient(RepositoryMiss::Unanswered {
+            pid: lock.pid,
+            port: lock.port,
+            elapsed_ms: started.elapsed().as_millis(),
+            detail: failure.detail(),
+        }),
     }
 }
 
@@ -1274,10 +1442,11 @@ mod tests {
     use tokio::io::AsyncBufReadExt as _;
 
     use super::{
-        ConnectAttemptFailure, Replacement, RiftProxy, ServerStanding, Upstream, UpstreamSlot,
-        adopt_serving, connect_recorded, connect_upstream, fallback_info, forwarded_error,
-        identity_refusal, mirrored_info, quit_reason_result, reuse_current, serve_connection,
-        server_start_failed, start_window_refusal, transport_failed,
+        ConnectAttemptFailure, Replacement, RepositoryAsk, RepositoryMiss, RiftProxy,
+        ServerStanding, Upstream, UpstreamSlot, adopt_serving, connect_recorded, connect_upstream,
+        connect_upstream_with, fallback_info, forwarded_error, identity_refusal, mirrored_info,
+        quit_reason_result, reuse_current, serve_connection, server_start_failed,
+        start_window_refusal, transport_failed,
     };
     use crate::election::{ServerPresence, StaleReason, claim};
     use crate::output::OutputPolicy;
@@ -2096,6 +2265,68 @@ mod tests {
         let refusal = connect_upstream(directory.path(), &test_identity())
             .await
             .expect_err("a holder that never publishes must exhaust the start window");
+        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            refusal
+                .message
+                .contains("no rift server answered for this workspace within 30s"),
+            "{}",
+            refusal.message
+        );
+        Ok(())
+    }
+
+    /// A repository server holds the workspace's election and publishes no
+    /// document there, which the held election below stands in for. Its first
+    /// ask misses through a transient arm, and the start window asks again on
+    /// the next poll round, which connects.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_repository_miss_is_asked_again_inside_the_start_window() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let (running, _kept_alive) = direct_upstream();
+        let mut answers = vec![
+            RepositoryAsk::Connected(running),
+            RepositoryAsk::Transient(RepositoryMiss::Unanswered {
+                pid: 4_242,
+                port: 0,
+                elapsed_ms: 5_000,
+                detail: "connect timed out after 5s".to_owned(),
+            }),
+        ];
+        let mut asked = 0_u32;
+        let connected = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(
+                answers
+                    .pop()
+                    .unwrap_or(RepositoryAsk::Terminal(RepositoryMiss::NotRepository)),
+            )
+        })
+        .await;
+        assert!(connected.is_ok(), "{connected:?}");
+        assert_eq!(asked, 2, "the second ask connects");
+        Ok(())
+    }
+
+    /// A terminal repository miss ends the asking, and the workspace's own
+    /// election decides the start window as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_repository_miss_is_asked_once() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let _guard = claim(directory.path())?;
+        let mut asked = 0_u32;
+        let refusal = connect_upstream_with(directory.path(), &test_identity(), || {
+            asked += 1;
+            std::future::ready(RepositoryAsk::Terminal(RepositoryMiss::NotAdopted {
+                pid: 4_242,
+                settings_match: false,
+                identity_adopted: true,
+            }))
+        })
+        .await
+        .expect_err("a holder that never publishes must exhaust the start window");
+        assert_eq!(asked, 1, "a terminal miss is asked once");
         assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
         assert!(
             refusal
