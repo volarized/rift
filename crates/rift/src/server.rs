@@ -633,8 +633,11 @@ where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
     Observation: std::future::Future<Output = ServerPresence>,
 {
-    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
+    let started = tokio::time::Instant::now();
+    let deadline = started + poll_window(attempt_count);
+    let mut probe_count = 0;
     for _ in 0..attempt_count {
+        probe_count += 1;
         let presence = observe(root).await;
         let election_held = presence.election_held();
         let serving = match presence {
@@ -659,7 +662,21 @@ where
             })?,
             SpawnPollOutcome::Waiting => {}
         }
-        if tokio::time::Instant::now() >= deadline {
+        let observed = tokio::time::Instant::now();
+        let deadline_reached = observed >= deadline;
+        tracing::debug!(
+            component = "cli",
+            operation = "server.start",
+            probe_count,
+            attempt_count,
+            waited = ?(observed - started),
+            window = ?poll_window(attempt_count),
+            ?observed,
+            ?deadline,
+            deadline_reached,
+            "server wait probe completed"
+        );
+        if deadline_reached {
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
@@ -673,6 +690,15 @@ where
     }
     // A holder that has not published is starting, whether the document is
     // absent or still the pre-spawn leftover it has yet to scrub.
+    tracing::debug!(
+        component = "cli",
+        operation = "server.start",
+        probe_count = probe_count + 1,
+        waited = ?started.elapsed(),
+        ?deadline,
+        closing = true,
+        "server start closing probe"
+    );
     let presence = observe(root).await;
     let holder_unpublished = matches!(presence, ServerPresence::Starting)
         || (presence.election_held() && leftover_unscrubbed(root, stale_bytes));
@@ -733,13 +759,28 @@ async fn await_election_released_with_probe<Observation>(
 where
     Observation: std::future::Future<Output = ServerPresence>,
 {
-    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
+    let started = tokio::time::Instant::now();
+    let deadline = started + poll_window(attempt_count);
     let mut process = ProcessExit::open(pid);
-    for _ in 0..attempt_count {
+    for probe_index in 0..attempt_count {
         if process.exited() || !observe(root).await.election_held() {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        let observed = tokio::time::Instant::now();
+        let deadline_reached = observed >= deadline;
+        tracing::debug!(
+            component = "cli",
+            operation = "server.election",
+            probe_count = probe_index + 1,
+            attempt_count,
+            waited = ?(observed - started),
+            window = ?poll_window(attempt_count),
+            ?observed,
+            ?deadline,
+            deadline_reached,
+            "server wait probe completed"
+        );
+        if deadline_reached {
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
@@ -1182,12 +1223,27 @@ async fn await_stopped_with_probe<Observation>(
 where
     Observation: std::future::Future<Output = ServerPresence>,
 {
-    let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
-    for _ in 0..attempt_count {
+    let started = tokio::time::Instant::now();
+    let deadline = started + poll_window(attempt_count);
+    for probe_index in 0..attempt_count {
         if process.exited() || !observe(root).await.election_held() {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        let observed = tokio::time::Instant::now();
+        let deadline_reached = observed >= deadline;
+        tracing::debug!(
+            component = "cli",
+            operation = "server.stop",
+            probe_count = probe_index + 1,
+            attempt_count,
+            waited = ?(observed - started),
+            window = ?poll_window(attempt_count),
+            ?observed,
+            ?deadline,
+            deadline_reached,
+            "server wait probe completed"
+        );
+        if deadline_reached {
             break;
         }
         tokio::time::sleep(PRESENCE_POLL_INTERVAL).await;
@@ -1548,11 +1604,27 @@ mod tests {
         pid: u32,
         observations: &std::cell::RefCell<Vec<std::time::Duration>>,
         started: tokio::time::Instant,
+        wall_started: std::time::Instant,
     ) -> rift_mcp::ServerPresence {
-        observations.borrow_mut().push(started.elapsed());
+        let logical_start = started.elapsed();
+        let wall_start = wall_started.elapsed();
+        observations.borrow_mut().push(logical_start);
+        let probe_count = observations.borrow().len();
+        eprintln!(
+            "probe started: probe_count={probe_count}, clock=paused, \
+             logical_start={logical_start:?}, wall_start={wall_start:?}, requested={SLOW_PROBE_COST:?}"
+        );
         // Advancing the paused clock proves the polling window independently of
         // how long an OS sleep takes (issue #536).
         tokio::time::advance(SLOW_PROBE_COST).await;
+        let logical_end = started.elapsed();
+        let wall_end = wall_started.elapsed();
+        eprintln!(
+            "probe completed: probe_count={probe_count}, logical_end={logical_end:?}, \
+             logical_cost={:?}, wall_end={wall_end:?}, wall_cost={:?}",
+            logical_end.checked_sub(logical_start),
+            wall_end.checked_sub(wall_start),
+        );
         rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { pid })
     }
 
@@ -2428,20 +2500,34 @@ mod tests {
     /// A stop wait with slow probes ends inside its polling window.
     #[tokio::test(start_paused = true)]
     async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let process = ProcessExit::open(pid);
         let probe_times = std::cell::RefCell::new(Vec::new());
         let started = tokio::time::Instant::now();
-        let error = await_stopped_with_probe(
+        let wall_started = std::time::Instant::now();
+        let result = await_stopped_with_probe(
             directory.path(),
             holder(),
             process,
             SLOW_PROBE_ATTEMPT_COUNT,
-            |_| slow_port_probe(pid, &probe_times, started),
+            |_| slow_port_probe(pid, &probe_times, started, wall_started),
         )
-        .await
-        .expect_err("a held election times the stop wait out");
+        .await;
+        eprintln!(
+            "wait completed: clock=paused, probe_count={}, logical_elapsed={:?}, wall_elapsed={:?}, result={result:?}",
+            probe_times.borrow().len(),
+            started.elapsed(),
+            wall_started.elapsed(),
+        );
+        let error = result.expect_err("a held election times the stop wait out");
         assert_eq!(
             *probe_times.borrow(),
             [0, 400, 800].map(std::time::Duration::from_millis),
@@ -2457,18 +2543,32 @@ mod tests {
     /// The wait for a holder to release its election ends at its window under slow probes.
     #[tokio::test(start_paused = true)]
     async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let probe_times = std::cell::RefCell::new(Vec::new());
         let started = tokio::time::Instant::now();
-        let error = await_election_released_with_probe(
+        let wall_started = std::time::Instant::now();
+        let result = await_election_released_with_probe(
             directory.path(),
             pid,
             SLOW_PROBE_ATTEMPT_COUNT,
-            |_| slow_port_probe(pid, &probe_times, started),
+            |_| slow_port_probe(pid, &probe_times, started, wall_started),
         )
-        .await
-        .expect_err("a held election times the wait out");
+        .await;
+        eprintln!(
+            "wait completed: clock=paused, probe_count={}, logical_elapsed={:?}, wall_elapsed={:?}, result={result:?}",
+            probe_times.borrow().len(),
+            started.elapsed(),
+            wall_started.elapsed(),
+        );
+        let error = result.expect_err("a held election times the wait out");
         assert_eq!(
             *probe_times.borrow(),
             [0, 400, 800].map(std::time::Duration::from_millis),
@@ -2485,20 +2585,35 @@ mod tests {
     /// one probe it adds past the window.
     #[tokio::test(start_paused = true)]
     async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
         let probe_times = std::cell::RefCell::new(Vec::new());
         let started = tokio::time::Instant::now();
-        let error = await_serving_with_probe(
+        let wall_started = std::time::Instant::now();
+        let result = await_serving_with_probe(
             directory.path(),
             SLOW_PROBE_ATTEMPT_COUNT,
             None,
             &mut spawns,
             no_launch,
-            |_| slow_port_probe(std::process::id(), &probe_times, started),
+            |_| slow_port_probe(std::process::id(), &probe_times, started, wall_started),
         )
-        .await
-        .expect_err("a held election whose port does not answer never serves this start");
+        .await;
+        eprintln!(
+            "wait completed: clock=paused, probe_count={}, logical_elapsed={:?}, wall_elapsed={:?}, result={result:?}",
+            probe_times.borrow().len(),
+            started.elapsed(),
+            wall_started.elapsed(),
+        );
+        let error =
+            result.expect_err("a held election whose port does not answer never serves this start");
         assert_eq!(
             *probe_times.borrow(),
             [0, 400, 800, 1100].map(std::time::Duration::from_millis),
@@ -2508,6 +2623,81 @@ mod tests {
             error.slug() == errors::cli::server_start_timed_out::SLUG,
             "{error:?}"
         );
+        Ok(())
+    }
+
+    /// Records actual blocking probe costs alongside the start wait's deadline decisions.
+    #[tokio::test]
+    async fn a_start_wait_records_synchronous_probe_costs() -> TestResult {
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let directory = tempfile::tempdir()?;
+        let mut spawns = StartSpawns::<FakeChild>::default();
+        let mut observations = Vec::new();
+        let started = tokio::time::Instant::now();
+        let wall_started = std::time::Instant::now();
+        let result = await_serving_with_probe(
+            directory.path(),
+            SLOW_PROBE_ATTEMPT_COUNT,
+            None,
+            &mut spawns,
+            no_launch,
+            |_| {
+                let logical_start = started.elapsed();
+                let wall_start = wall_started.elapsed();
+                let probe_count = observations.len() + 1;
+                eprintln!(
+                    "probe started: probe_count={probe_count}, clock=running, \
+                     logical_start={logical_start:?}, wall_start={wall_start:?}, requested={SLOW_PROBE_COST:?}"
+                );
+                let sleep_started = std::time::Instant::now();
+                std::thread::sleep(SLOW_PROBE_COST);
+                let sleep_cost = sleep_started.elapsed();
+                let logical_end = started.elapsed();
+                let wall_end = wall_started.elapsed();
+                eprintln!(
+                    "probe completed: probe_count={probe_count}, logical_end={logical_end:?}, \
+                     logical_cost={:?}, wall_end={wall_end:?}, wall_cost={:?}, sleep_cost={sleep_cost:?}",
+                    logical_end.checked_sub(logical_start),
+                    wall_end.checked_sub(wall_start),
+                );
+                observations.push((wall_start, wall_end, sleep_cost));
+                std::future::ready(rift_mcp::ServerPresence::Stale(
+                    StaleReason::PortUnreachable {
+                        pid: std::process::id(),
+                    },
+                ))
+            },
+        )
+        .await;
+        let wall_elapsed = wall_started.elapsed();
+        eprintln!(
+            "wait completed: clock=running, probe_count={}, logical_elapsed={:?}, \
+             wall_elapsed={wall_elapsed:?}, observations={observations:?}, result={result:?}",
+            observations.len(),
+            started.elapsed(),
+        );
+        let error =
+            result.expect_err("a held election whose port does not answer never serves this start");
+        assert_eq!(error.slug(), errors::cli::server_start_timed_out::SLUG);
+        assert!((2..=SLOW_PROBE_ATTEMPT_COUNT as usize + 1).contains(&observations.len()));
+        // The OS sleep guarantees a minimum cost, not an upper bound. The paused
+        // cases prove the deadline; this case retains each real cost and decision.
+        let mut previous_end = std::time::Duration::ZERO;
+        for (start, end, sleep_cost) in observations {
+            assert!(start >= previous_end, "probes must complete in order");
+            assert!(
+                sleep_cost >= SLOW_PROBE_COST,
+                "the sleep must spend its requested cost"
+            );
+            assert!(end <= wall_elapsed, "the wait must include every probe");
+            previous_end = end;
+        }
         Ok(())
     }
 
