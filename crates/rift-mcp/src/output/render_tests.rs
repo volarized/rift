@@ -1099,6 +1099,28 @@ fn the_inline_writer_refuses_shapes_it_does_not_write() {
 #[derive(Serialize)]
 struct Marker(u8, u8);
 
+#[derive(Serialize)]
+struct Empty;
+
+#[derive(Serialize)]
+struct Wrapped(u8);
+
+#[derive(Serialize)]
+struct Wrappers {
+    empty: Empty,
+    wrapped: Wrapped,
+}
+
+#[test]
+fn the_inline_writer_leaves_out_a_unit_struct_and_writes_a_newtype_struct_as_its_value() {
+    let fields = fields_of(&Wrappers {
+        empty: Empty,
+        wrapped: Wrapped(9),
+    })
+    .expect("fields");
+    assert_eq!(fields, [("wrapped", "9".to_owned())]);
+}
+
 // Symbol hits.
 
 #[test]
@@ -1748,6 +1770,15 @@ fn a_root_that_is_no_hit_is_one_line_at_its_identity() {
             "\t\t\tat rift://symbol/rust/src/app.rs/run",
         ],
     );
+}
+
+#[test]
+fn a_walk_node_whose_hit_is_not_a_symbol_writes_nothing() {
+    let mut out = TextWriter::new(1 << 10);
+    let mut lines = super::layout::Lines::node(&mut out, 0, None);
+    super::search::walk_node(&mut lines, &readme_hit(), super::walk::Labels::Root)
+        .expect("a hit that is not a symbol writes nothing");
+    assert_eq!(out.finish(), Ok(String::new()));
 }
 
 #[test]
@@ -3644,6 +3675,14 @@ fn a_failure_message_with_a_line_feed_stays_on_one_line() {
             "\tinternal_error · retry never",
             "\t\tfirst\\nerror cancelled\\t \\u{1b}",
         ],
+    );
+}
+
+#[test]
+fn a_failure_with_an_empty_message_writes_its_head_and_no_message_entry() {
+    golden(
+        &error_data(ErrorCode::InternalError, ""),
+        &["1 error", "\tinternal_error · retry never"],
     );
 }
 

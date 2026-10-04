@@ -2615,6 +2615,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resource_the_upstream_does_not_publish_stays_refused_through_the_proxy() -> TestResult
+    {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let refused = proxied
+            .client
+            .read_resource(ReadResourceRequestParams::new("rift://unpublished"))
+            .await
+            .expect_err("an unpublished resource must be refused");
+        assert!(
+            format!("{refused:?}").contains("no resource is published at"),
+            "the upstream refusal must reach the client: {refused:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tool_the_upstream_does_not_serve_stays_refused_through_the_proxy() -> TestResult {
+        let proxied = proxied_client(OutputPolicy::Text).await?;
+        let refused = proxied
+            .client
+            .call_tool(CallToolRequestParams::new("unserved"))
+            .await
+            .expect_err("an unserved tool must be refused");
+        assert!(
+            format!("{refused:?}").contains("unknown tool unserved"),
+            "the upstream refusal must reach the client: {refused:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn all_output_keeps_both_contents_of_a_resource_read() -> TestResult {
         let proxied = proxied_client(OutputPolicy::All).await?;
         let result = proxied
