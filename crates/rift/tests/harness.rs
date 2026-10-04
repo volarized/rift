@@ -621,7 +621,9 @@ async fn proxied_result_within(
 pub(crate) struct ToolFailure {
     /// The code of the first entry head.
     pub(crate) code: ErrorCode,
-    /// Line 3 with `\n`, `\r`, `\t` and `\u{HEX}` turned back into characters.
+    /// Line 3 as written, without its indent. The text writes control characters as
+    /// `\n`, `\r`, `\t` and `\u{HEX}` and leaves backslash as it is, so a Windows path such
+    /// as `C:\Users\runneradmin` holds the same `\r`: the line cannot be turned back.
     pub(crate) message: String,
     /// The retry directive of the first entry head.
     pub(crate) retry: RetryDirective,
@@ -664,7 +666,7 @@ pub(crate) fn tool_failure(result: &CallToolResult) -> TestResult<ToolFailure> {
     let (code, retry) = failure_head(head)?;
     Ok(ToolFailure {
         code,
-        message: unescaped_line(message),
+        message: message.to_owned(),
         retry,
         text,
     })
@@ -695,38 +697,4 @@ fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
         serde_json::from_value(serde_json::Value::String(code.to_owned()))?,
         serde_json::from_value(serde_json::Value::String(retry.to_owned()))?,
     ))
-}
-
-/// Turns `\n`, `\r`, `\t` and `\u{HEX}` back into characters; any other backslash stays.
-fn unescaped_line(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some((before, after)) = rest.split_once('\\') {
-        out.push_str(before);
-        if let Some((character, tail)) = escape_at(after) {
-            out.push(character);
-            rest = tail;
-        } else {
-            out.push('\\');
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The character the escape at the start of `after` stands for, and the text past it.
-fn escape_at(after: &str) -> Option<(char, &str)> {
-    if let Some(tail) = after.strip_prefix('n') {
-        return Some(('\n', tail));
-    }
-    if let Some(tail) = after.strip_prefix('r') {
-        return Some(('\r', tail));
-    }
-    if let Some(tail) = after.strip_prefix('t') {
-        return Some(('\t', tail));
-    }
-    let (digits, tail) = after.strip_prefix("u{")?.split_once('}')?;
-    let character = char::from_u32(u32::from_str_radix(digits, 16).ok()?)?;
-    Some((character, tail))
 }
