@@ -6413,7 +6413,13 @@ done
             .tree_revision()
             .to_owned();
         let first = run_search(&server, "legacy sensor").await?;
-        if !store_ranked(&first) {
+        if store_ranked(&first) {
+            let first = serde_json::to_value(&first)?;
+            assert!(
+                hit_paths(&first).contains(&"guide.txt"),
+                "the store-ranked first answer hits the text file: {first:#}"
+            );
+        } else {
             assert!(
                 first.results.is_empty(),
                 "identifier matching has no declaration for the prose query: {first:#?}"
@@ -6429,12 +6435,6 @@ done
             assert!(
                 detail.contains(&format!("still committing tree revision {revision}")),
                 "{detail}"
-            );
-        } else {
-            let first = serde_json::to_value(&first)?;
-            assert!(
-                hit_paths(&first).contains(&"guide.txt"),
-                "the store-ranked first answer hits the text file: {first:#}"
             );
         }
         let ranked = search_after_population(&server, "legacy sensor").await?;
