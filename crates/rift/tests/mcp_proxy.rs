@@ -364,6 +364,33 @@ async fn a_competing_foreground_start_preserves_repository_logs(
     Ok(())
 }
 
+async fn repository_workspace_facts(
+    root: &Path,
+    name: &str,
+    names: &[&str],
+) -> TestResult<(
+    rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    String,
+    String,
+)> {
+    let workspace = format!("workspace {name} at {}", root.display());
+    let client = proxy_client(root)
+        .await
+        .map_err(|error| format!("{workspace} proxy startup: {error:?}"))?;
+    let revision = repository_workspace_reads(&client, name, names)
+        .await
+        .map_err(|error| format!("{workspace} read: {error:?}"))?;
+    let source_digest = repository_workspace_resource_digest(&client)
+        .await
+        .map_err(|error| format!("{workspace} resource digest: {error:?}"))?;
+    assert!(claim(root).is_err(), "repository owns this workspace store");
+    assert!(
+        !document_path(root).exists(),
+        "workspace has no separate serving document"
+    );
+    Ok((client, revision, source_digest))
+}
+
 /// All internal root routes share one elected process and retain separate workspace facts.
 #[tokio::test]
 async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
@@ -413,25 +440,10 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let mut revisions = std::collections::BTreeSet::new();
     let mut source_digests = std::collections::BTreeSet::new();
     for (root, name) in roots.iter().zip(names) {
-        let workspace = format!("workspace {name} at {}", root.display());
-        let client = proxy_client(root)
-            .await
-            .map_err(|error| format!("{workspace} proxy startup: {error:?}"))?;
-        revisions.insert(
-            repository_workspace_reads(&client, name, &names)
-                .await
-                .map_err(|error| format!("{workspace} read: {error:?}"))?,
-        );
-        source_digests.insert(
-            repository_workspace_resource_digest(&client)
-                .await
-                .map_err(|error| format!("{workspace} resource digest: {error:?}"))?,
-        );
-        assert!(claim(root).is_err(), "repository owns this workspace store");
-        assert!(
-            !document_path(root).exists(),
-            "workspace has no separate serving document"
-        );
+        let (client, revision, source_digest) =
+            repository_workspace_facts(root, name, &names).await?;
+        revisions.insert(revision);
+        source_digests.insert(source_digest);
         clients.push(client);
     }
     a_competing_foreground_start_preserves_repository_logs(&roots[0], &clients[0]).await?;
