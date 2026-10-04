@@ -17,11 +17,13 @@ use global_api::{
     BODY_BOUND_CURSOR, BODY_MATCH_QUERY, COLLECTED_UNIT, FixtureOptions, GlobalFixture, Hold,
     SymbolFixture, UNSATISFIED_REQUIREMENT,
 };
+use rift_protocol::error::ErrorCode;
 use rmcp::model::ReadResourceRequestParams;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use workspace_client::{
-    ServedWorkspace, TestResult, call_retrying_acceptance, served_workspace, tool_request,
+    ServedWorkspace, TestResult, call_retrying_acceptance, failed_call, served_workspace,
+    tool_request,
 };
 
 const LOCK_WITH_HELPER: &str = "version = 4\n\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n]\n";
@@ -851,18 +853,15 @@ async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResul
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let error = client
-        .call_tool(tool_request(
-            "search",
-            &json!({"pattern": "beacon(", "scope": "global"}),
-        ))
-        .await
-        .expect_err("a pattern that does not parse is refused");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
-    let wire = error.data.ok_or("a refusal carries its wire data")?;
-    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({"pattern": "beacon(", "scope": "global"}),
+            ))
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::InvalidRequest, "{}", failure.text);
     assert!(fixture.requests().await.is_empty());
     drop(directory);
     client.cancel().await?;
@@ -1110,23 +1109,19 @@ async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> Test
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
     call_tool(&client, "search", json!({"query": "local_beacon"})).await?;
 
-    let error = client
-        .call_tool(tool_request(
-            "search",
-            &json!({"query": "local_beacon", "scope": "all", "rev": "main"}),
-        ))
-        .await
-        .expect_err("rev pairs with the project scope alone");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
-
-    let wire = error.data.ok_or("a refusal carries its wire data")?;
-    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({"query": "local_beacon", "scope": "all", "rev": "main"}),
+            ))
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::InvalidRequest, "{}", failure.text);
     assert!(
-        error.message.contains("scope"),
+        failure.message.contains("scope"),
         "the refusal names the field: {}",
-        error.message
+        failure.message
     );
     client.cancel().await?;
     server_task.await?;
@@ -1464,23 +1459,17 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
     ];
     for (tool, request, field) in refused {
-        let error = client
-            .call_tool(tool_request(tool, &request))
-            .await
-            .expect_err("the read refuses before any package is asked");
-        let rmcp::ServiceError::McpError(error) = error else {
-            panic!("the refusal must arrive as an MCP error: {error}");
-        };
-        let wire = error.data.ok_or("a refusal carries its wire data")?;
+        let failure = failed_call(client.call_tool(tool_request(tool, &request)).await)?;
         assert_eq!(
-            wire["code"],
-            json!("invalid_request"),
-            "{request}: {wire:#}"
+            failure.code,
+            ErrorCode::InvalidRequest,
+            "{request}: {}",
+            failure.text
         );
         assert!(
-            error.message.contains(&format!("field {field}")),
+            failure.message.contains(&format!("field {field}")),
             "{request}: {}",
-            error.message
+            failure.message
         );
     }
     assert!(fixture.requests().await.is_empty());

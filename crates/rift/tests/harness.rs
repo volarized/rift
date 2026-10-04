@@ -18,7 +18,11 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
+use rift_protocol::error::{ErrorCode, RetryDirective};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ReadResourceResult,
+    ResourceContents,
+};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ServiceExt as _, transport::child_process::TokioChildProcessBuilder};
@@ -255,11 +259,12 @@ pub(crate) async fn within<Value>(
 ///
 /// `NO_COLOR` keeps the traced lines plain, since they end up in a test's
 /// captured output rather than on a terminal; the server the proxy spawns
-/// inherits both variables.
-fn base_command(root: &Path) -> tokio::process::Command {
+/// inherits both variables. `arguments` follow the `mcp` subcommand.
+fn base_command(root: &Path, arguments: &[&str]) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(rift_binary());
     command
         .arg("mcp")
+        .args(arguments)
         .current_dir(root)
         .env("RUST_LOG", "rift=info,rift_mcp=info,rift_server=info")
         .env("NO_COLOR", "1");
@@ -267,13 +272,23 @@ fn base_command(root: &Path) -> tokio::process::Command {
 }
 
 /// The `rift mcp` child command for one fixture workspace.
-fn proxy_command(root: &Path) -> TokioChildProcessBuilder {
-    TokioChildProcess::builder(base_command(root))
+fn proxy_command(root: &Path, arguments: &[&str]) -> TokioChildProcessBuilder {
+    TokioChildProcess::builder(base_command(root, arguments))
 }
 
 /// One connected `rift mcp` child whose stderr is relayed onto the test's own.
 pub(crate) async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let (client, _stderr) = relayed_proxy_client(root).await?;
+    proxy_client_with(root, &[]).await
+}
+
+/// One connected `rift mcp` child started with `arguments` after the
+/// subcommand, such as `--output=text`; its stderr is relayed like
+/// [`proxy_client`]'s.
+pub(crate) async fn proxy_client_with(
+    root: &Path,
+    arguments: &[&str],
+) -> TestResult<RunningService<RoleClient, ()>> {
+    let (client, _stderr) = relayed_proxy_client_with(root, arguments).await?;
     Ok(client)
 }
 
@@ -285,8 +300,16 @@ pub(crate) async fn proxy_client(root: &Path) -> TestResult<RunningService<RoleC
 pub(crate) async fn relayed_proxy_client(
     root: &Path,
 ) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
+    relayed_proxy_client_with(root, &[]).await
+}
+
+/// [`relayed_proxy_client`] with `arguments` after the `mcp` subcommand.
+async fn relayed_proxy_client_with(
+    root: &Path,
+    arguments: &[&str],
+) -> TestResult<(RunningService<RoleClient, ()>, RelayedStderr)> {
     let (reader, writer) = std::io::pipe()?;
-    let (transport, _stderr) = proxy_command(root).stderr(writer).spawn()?;
+    let (transport, _stderr) = proxy_command(root, arguments).stderr(writer).spawn()?;
     let stderr = RelayedStderr::spawn(reader);
     Ok((().serve(transport).await?, stderr))
 }
@@ -396,6 +419,84 @@ pub(crate) async fn proxied_call(
     proxied_call_within(client, name, call_arguments, PROXIED_CALL_MAX).await
 }
 
+/// One proxied tool call returning the whole result, with the same retry as
+/// [`proxied_call`]; `content` and `structured_content` are the caller's to
+/// read. A failure that is not retryable comes back as its error result.
+pub(crate) async fn proxied_result(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+) -> TestResult<CallToolResult> {
+    proxied_result_within(client, name, call_arguments, PROXIED_CALL_MAX).await
+}
+
+/// MIME type of the compact text content a resource read returns first.
+const RESOURCE_TEXT_MIME: &str = "text/plain";
+/// MIME type of the JSON body a resource read returns second.
+const RESOURCE_JSON_MIME: &str = "application/json";
+
+/// The `(mime type, text)` of every content of a resource read; each must be text and carry
+/// the requested `uri`.
+fn resource_texts<'a>(
+    answer: &'a ReadResourceResult,
+    uri: &str,
+) -> TestResult<Vec<(&'a str, &'a str)>> {
+    let mut texts = Vec::with_capacity(answer.contents.len());
+    for content in &answer.contents {
+        let ResourceContents::TextResourceContents {
+            uri: found,
+            mime_type,
+            text,
+            ..
+        } = content
+        else {
+            return Err(format!("{uri}: every content must be text: {content:?}").into());
+        };
+        if found != uri {
+            return Err(format!("{uri}: a content carries uri {found}").into());
+        }
+        texts.push((mime_type.as_deref().unwrap_or_default(), text.as_str()));
+    }
+    Ok(texts)
+}
+
+/// The JSON body of a resource read.
+///
+/// Requires exactly one `application/json` content; when two contents arrive, the other is
+/// `text/plain`. Every content carries `uri`.
+pub(crate) fn resource_json(
+    answer: &ReadResourceResult,
+    uri: &str,
+) -> TestResult<serde_json::Value> {
+    let texts = resource_texts(answer, uri)?;
+    let (json, others): (Vec<_>, Vec<_>) = texts
+        .iter()
+        .partition(|(mime, _)| *mime == RESOURCE_JSON_MIME);
+    let [(_, body)] = json.as_slice() else {
+        return Err(
+            format!("{uri}: want exactly one {RESOURCE_JSON_MIME} content: {texts:?}").into(),
+        );
+    };
+    if others.len() > 1 || others.iter().any(|(mime, _)| *mime != RESOURCE_TEXT_MIME) {
+        return Err(
+            format!("{uri}: the other content must be {RESOURCE_TEXT_MIME}: {texts:?}").into(),
+        );
+    }
+    Ok(serde_json::from_str(body)?)
+}
+
+/// The compact text of a resource read: its first content, which must be non-empty
+/// `text/plain` carrying `uri`.
+pub(crate) fn resource_text<'a>(answer: &'a ReadResourceResult, uri: &str) -> TestResult<&'a str> {
+    match resource_texts(answer, uri)?.first() {
+        Some((mime, text)) if *mime == RESOURCE_TEXT_MIME && !text.is_empty() => Ok(*text),
+        other => Err(format!(
+            "{uri}: the first content must be non-empty {RESOURCE_TEXT_MIME}: {other:?}"
+        )
+        .into()),
+    }
+}
+
 /// Reads map until workspace file preparation finishes, within fixture bound.
 pub(crate) async fn await_workspace_ready(
     client: &RunningService<RoleClient, ()>,
@@ -407,14 +508,7 @@ pub(crate) async fn await_workspace_ready(
             client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
         )
         .await??;
-        let ResourceContents::TextResourceContents { text, .. } = answer
-            .contents
-            .first()
-            .ok_or("map read answers with one content")?
-        else {
-            return Err("map read answers with text".into());
-        };
-        let body: serde_json::Value = serde_json::from_str(text)?;
+        let body = resource_json(&answer, "rift://map")?;
         let preparing = body["warnings"]
             .as_array()
             .into_iter()
@@ -425,6 +519,39 @@ pub(crate) async fn await_workspace_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("workspace map remained in preparation: {body}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Reads map until workspace file preparation finishes, judging by its compact text.
+///
+/// The text content arrives through a proxy of any `--output` mode, so this serves a
+/// `text` proxy too, which carries no JSON body. A warning line is `  <code>` (2 spaces)
+/// followed by a space, a colon, or the end of the line.
+pub(crate) async fn await_workspace_text(
+    client: &RunningService<RoleClient, ()>,
+) -> TestResult<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = tokio::time::timeout_at(
+            deadline,
+            client.read_resource(ReadResourceRequestParams::new("rift://map".to_owned())),
+        )
+        .await??;
+        let text = resource_text(&answer, "rift://map")?;
+        if !text.starts_with("map ") {
+            return Err(format!("the map text must open with `map `: {text}").into());
+        }
+        let preparing = text.lines().any(|line| {
+            line.strip_prefix("\tlocal_index_preparing")
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':']))
+        });
+        if !preparing {
+            return Ok(text.to_owned());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("workspace map remained in preparation: {text}").into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -446,24 +573,160 @@ async fn proxied_call_within(
     call_arguments: &serde_json::Value,
     timeout: Duration,
 ) -> TestResult<serde_json::Value> {
+    let called = proxied_result_within(client, name, call_arguments, timeout).await?;
+    if called.is_error == Some(true) {
+        return Err(format!("{name} failed: {}", tool_failure(&called)?.text).into());
+    }
+    called
+        .structured_content
+        .ok_or_else(|| format!("{name} must return structured content").into())
+}
+
+/// One retrying proxied call returning the whole result under its caller-owned
+/// wall-clock bound.
+async fn proxied_result_within(
+    client: &RunningService<RoleClient, ()>,
+    name: &'static str,
+    call_arguments: &serde_json::Value,
+    timeout: Duration,
+) -> TestResult<CallToolResult> {
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
-        match tokio::time::timeout(timeout, client.call_tool(params))
+        let called = match tokio::time::timeout(timeout, client.call_tool(params))
             .await
             .map_err(|_elapsed| format!("timed out waiting for {name}"))?
         {
-            Ok(called) => {
-                return called
-                    .structured_content
-                    .ok_or_else(|| format!("{name} must return structured content").into());
-            }
+            Ok(called) => called,
             Err(rmcp::ServiceError::McpError(error))
                 if error
                     .data
                     .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
+                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error.into()),
+        };
+        if called.is_error != Some(true)
+            || tool_failure(&called)?.retry != RetryDirective::SameRequest
+        {
+            return Ok(called);
         }
     }
     Err(format!("the server kept refusing {name}").into())
+}
+
+/// The facts of one failed tool call, read from its error text.
+#[derive(Debug)]
+pub(crate) struct ToolFailure {
+    /// The code of the first entry head.
+    pub(crate) code: ErrorCode,
+    /// Line 3 with `\n`, `\r`, `\t` and `\u{HEX}` turned back into characters.
+    pub(crate) message: String,
+    /// The retry directive of the first entry head.
+    pub(crate) retry: RetryDirective,
+    /// The whole text block, for assertions on `limit`, cause entry and diagnostic lines.
+    pub(crate) text: String,
+}
+
+/// Reads the failure of an error result.
+///
+/// Requires `is_error == Some(true)`, no structured content, and exactly one text block.
+/// Line 1 is `N error(s)`; line 2 is the first entry head `  <code> · retry <directive>`;
+/// line 3 is its message at 4 spaces, on one line.
+pub(crate) fn tool_failure(result: &CallToolResult) -> TestResult<ToolFailure> {
+    if result.is_error != Some(true) {
+        return Err(format!("is_error must be Some(true), got {:?}", result.is_error).into());
+    }
+    if result.structured_content.is_some() {
+        return Err("an error result must carry no structured content".into());
+    }
+    let [block] = result.content.as_slice() else {
+        return Err(format!("content must be one block, got {:?}", result.content).into());
+    };
+    let text = block
+        .as_text()
+        .ok_or("the content block must be text")?
+        .text
+        .clone();
+    let mut lines = text.lines();
+    let title = lines.next().ok_or("the error text is empty")?;
+    if !failure_title(title) {
+        return Err(format!("line 1 must be `N error(s)`: {title}").into());
+    }
+    let head = lines
+        .next()
+        .ok_or_else(|| format!("the error text has no entry head: {text}"))?;
+    let message = lines
+        .next()
+        .and_then(|line| line.strip_prefix(FAILURE_LINE_INDENT))
+        .ok_or_else(|| format!("line 3 must be the message at two levels: {text}"))?;
+    let (code, retry) = failure_head(head)?;
+    Ok(ToolFailure {
+        code,
+        message: unescaped_line(message),
+        retry,
+        text,
+    })
+}
+
+/// Text of one indent level of an answer text.
+const INDENT_UNIT: &str = "\t";
+/// Indent of the lines under an entry head of a failure text: two levels.
+const FAILURE_LINE_INDENT: &str = "\t\t";
+
+/// Whether `line` is the title of a failure: `N error` or `N errors`.
+fn failure_title(line: &str) -> bool {
+    line.strip_suffix(" errors")
+        .or_else(|| line.strip_suffix(" error"))
+        .is_some_and(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// The code and retry directive of the entry head `<code> · retry <directive>`, one level deep.
+fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
+    let (code, retry) = line
+        .strip_prefix(INDENT_UNIT)
+        .filter(|rest| !rest.starts_with(INDENT_UNIT))
+        .and_then(|rest| rest.split_once(" · retry "))
+        .ok_or_else(|| {
+            format!("line 2 must be `<code> · retry <directive>` at one level: {line}")
+        })?;
+    Ok((
+        serde_json::from_value(serde_json::Value::String(code.to_owned()))?,
+        serde_json::from_value(serde_json::Value::String(retry.to_owned()))?,
+    ))
+}
+
+/// Turns `\n`, `\r`, `\t` and `\u{HEX}` back into characters; any other backslash stays.
+fn unescaped_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some((before, after)) = rest.split_once('\\') {
+        out.push_str(before);
+        if let Some((character, tail)) = escape_at(after) {
+            out.push(character);
+            rest = tail;
+        } else {
+            out.push('\\');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character the escape at the start of `after` stands for, and the text past it.
+fn escape_at(after: &str) -> Option<(char, &str)> {
+    if let Some(tail) = after.strip_prefix('n') {
+        return Some(('\n', tail));
+    }
+    if let Some(tail) = after.strip_prefix('r') {
+        return Some(('\r', tail));
+    }
+    if let Some(tail) = after.strip_prefix('t') {
+        return Some(('\t', tail));
+    }
+    let (digits, tail) = after.strip_prefix("u{")?.split_once('}')?;
+    let character = char::from_u32(u32::from_str_radix(digits, 16).ok()?)?;
+    Some((character, tail))
 }

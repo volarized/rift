@@ -28,9 +28,11 @@ mod typescript_install;
 #[allow(dead_code)]
 mod workspace_client;
 
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, search_after_population, served_workspace, tool_request,
+    TestResult, call_retrying_acceptance, failed_call, search_after_population, served_workspace,
+    tool_request,
 };
 
 /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`:
@@ -258,7 +260,7 @@ async fn search_traversal_over_only_unproduced_facets_refuses() -> TestResult {
     )
     .await?;
 
-    assert_eq!(code, json!("capability_unavailable"));
+    assert_eq!(code, ErrorCode::CapabilityUnavailable);
 
     client.cancel().await?;
     Ok(())
@@ -303,7 +305,7 @@ async fn search_traversal_without_a_seed_refuses() -> TestResult {
 
     let code = refusal_code(&client, &json!({"traversal": {"direction": "incoming"}})).await?;
 
-    assert_eq!(code, json!("invalid_request"));
+    assert_eq!(code, ErrorCode::InvalidRequest);
 
     client.cancel().await?;
     Ok(())
@@ -321,7 +323,7 @@ async fn search_traversal_without_an_engine_refuses_capability_unavailable() -> 
     )
     .await?;
 
-    assert_eq!(code, json!("capability_unavailable"));
+    assert_eq!(code, ErrorCode::CapabilityUnavailable);
 
     client.cancel().await?;
     Ok(())
@@ -342,7 +344,7 @@ async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> Te
     )
     .await?;
 
-    assert_eq!(code, json!("capability_unavailable"));
+    assert_eq!(code, ErrorCode::CapabilityUnavailable);
 
     client.cancel().await?;
     Ok(())
@@ -1099,7 +1101,7 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
         &json!({"traversal": {"seed": ROOT, "direction": "outgoing", "facets": ["references"]}}),
     )
     .await?;
-    assert_eq!(code, json!("capability_unavailable"));
+    assert_eq!(code, ErrorCode::CapabilityUnavailable);
 
     client.cancel().await?;
     Ok(())
@@ -1177,22 +1179,22 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "Beacon"}))).await?;
 
-    let error = client
-        .call_tool(tool_request(
-            "search",
-            &json!({
-                "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
-            }),
-        ))
-        .await
-        .expect_err("the ready engine prepares no call hierarchy item at a struct");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
-    eprintln!("refusal: message={:?} data={:?}", error.message, error.data);
-    let data = error.data.clone().unwrap_or_default();
-    assert_eq!(data["code"], json!("capability_unavailable"), "{error:?}");
-    assert!(error.message.contains("of kind `struct`"), "{error:?}");
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({
+                    "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
+                }),
+            ))
+            .await,
+    )?;
+    assert_eq!(
+        failure.code,
+        ErrorCode::CapabilityUnavailable,
+        "{failure:?}"
+    );
+    assert!(failure.message.contains("of kind `struct`"), "{failure:?}");
 
     let code = refusal_code(
         &client,
@@ -1202,7 +1204,7 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
         }),
     )
     .await?;
-    assert_eq!(code, json!("capability_unavailable"));
+    assert_eq!(code, ErrorCode::CapabilityUnavailable);
 
     client.cancel().await?;
     Ok(())
@@ -1380,12 +1382,13 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
     );
 
-    let Err(rmcp::ServiceError::McpError(refused)) = client.call_tool(walk.clone()).await else {
-        return Err("the walk past the request deadline must be refused".into());
-    };
-    let data = refused.data.clone().unwrap_or(Value::Null);
-    assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
-    assert_eq!(data["retry"], json!("same_request"), "{data}");
+    let refused = failed_call(client.call_tool(walk.clone()).await)?;
+    assert_eq!(
+        refused.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{refused:?}"
+    );
+    assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
     assert!(
         refused.message.contains("request deadline exceeded"),
         "{}",
@@ -1465,12 +1468,13 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
         &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
     );
 
-    let Err(rmcp::ServiceError::McpError(refused)) = client.call_tool(walk.clone()).await else {
-        return Err("the walk past the request deadline must be refused".into());
-    };
-    let data = refused.data.clone().unwrap_or(Value::Null);
-    assert_eq!(data["code"], json!("temporarily_unavailable"), "{data}");
-    assert_eq!(data["retry"], json!("same_request"), "{data}");
+    let refused = failed_call(client.call_tool(walk.clone()).await)?;
+    assert_eq!(
+        refused.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{refused:?}"
+    );
+    assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
 
     let structured = call_retrying_acceptance(&client, walk).await?;
     assert_eq!(
@@ -1583,27 +1587,23 @@ async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult 
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
 
-    let error = client
-        .call_tool(tool_request(
-            "search",
-            &json!({
-                "query": "beacon",
-                "scope": "global",
-                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
-            }),
-        ))
-        .await
-        .expect_err("the server must refuse a global walk");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
-
-    let wire = error.data.ok_or("a refusal carries its wire data")?;
-    assert_eq!(wire["code"], json!("invalid_request"), "{wire:#}");
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({
+                    "query": "beacon",
+                    "scope": "global",
+                    "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+                }),
+            ))
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::InvalidRequest, "{}", failure.text);
     assert!(
-        error.message.contains("traversal"),
+        failure.message.contains("traversal"),
         "the refusal names the field: {}",
-        error.message
+        failure.message
     );
 
     client.cancel().await?;
@@ -2076,20 +2076,8 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
 async fn refusal_code(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,
-) -> TestResult<Value> {
-    let error = client
-        .call_tool(tool_request("search", arguments))
-        .await
-        .expect_err("the server must refuse this walk");
-    let rmcp::ServiceError::McpError(error) = error else {
-        panic!("the refusal must arrive as an MCP error: {error}");
-    };
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .cloned()
-        .ok_or_else(|| "a refusal carries its code".into())
+) -> TestResult<ErrorCode> {
+    Ok(failed_call(client.call_tool(tool_request("search", arguments)).await)?.code)
 }
 
 fn results(structured: &Value) -> Vec<Value> {

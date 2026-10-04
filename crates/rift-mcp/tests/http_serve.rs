@@ -5,7 +5,7 @@ mod hermetic_search;
 #[allow(dead_code)]
 mod workspace_client;
 
-use workspace_client::await_workspace_ready;
+use workspace_client::{await_workspace_ready, failed_call};
 
 use std::error::Error;
 use std::fs;
@@ -13,6 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rift_mcp::{HttpServer, TokenCheck, schema, serve_http};
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use rift_protocol::lock::ProductIdentity;
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
@@ -315,19 +316,16 @@ async fn invalid_configuration_still_serves_typed_refusals() -> TestResult {
     let (shutdown, server) = served(directory.path()).await?;
     let client = connected_client(&server).await?;
 
-    let error = client
-        .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
-        )
-        .await
-        .expect_err("the request must be refused while rift.toml is invalid");
-    let rmcp::ServiceError::McpError(data) = error else {
-        panic!("expected protocol-level McpError, got {error:?}");
-    };
-    let wire = data.data.ok_or("wire error data must be present")?;
-    assert_eq!(wire["code"], json!("configuration_invalid"));
-    assert_eq!(wire["retry"], json!("operator_action"));
+    let failure = failed_call(
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::ConfigurationInvalid);
+    assert_eq!(failure.retry, RetryDirective::OperatorAction);
 
     client.cancel().await?;
     shutdown.cancel();

@@ -22,9 +22,11 @@ mod workspace_client;
 use std::fs;
 
 use rift_core::constants::{FORCE_INCLUDE_FILES_MAX, READ_RESULTS_MAX_DEFAULT};
+use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, served_root, served_root_unsettled, served_workspace, tool_request,
+    TestResult, failed_call, served_root, served_root_unsettled, served_workspace, tool_failure,
+    tool_request,
 };
 
 /// Polls of one served answer a test waits on before it gives up: two seconds, at
@@ -323,20 +325,15 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let params = tool_request("get_symbol", &json!({"name": "beacon"}));
     let refusal = loop {
-        let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await?;
-        match result {
-            Err(rmcp::ServiceError::McpError(error))
-                if error.message.contains("source.workspace_size") =>
-            {
-                break error;
+        let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await??;
+        if result.is_error == Some(true) {
+            let failure = tool_failure(&result)?;
+            if failure.message.contains("source.workspace_size") {
+                break failure;
             }
-            Err(rmcp::ServiceError::McpError(error))
-                if error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) => {}
-            Err(error) => return Err(error.into()),
-            Ok(_) => {}
+            if failure.retry != RetryDirective::SameRequest {
+                return Err(format!("unexpected failure: {}", failure.text).into());
+            }
         }
         tokio::time::sleep(ANSWER_POLL).await;
     };
@@ -350,18 +347,14 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
         "the read refusal must retain its exact bound and path: {}",
         refusal.message
     );
-    let data = refusal.data.expect("the refusal carries wire data");
-    assert_eq!(data["code"], json!("limit_exceeded"), "{data:#}");
-    assert_eq!(data["retry"], json!("never"), "{data:#}");
-    assert_eq!(data["phase"], json!("read"), "{data:#}");
-    assert_eq!(
-        data["limit"],
-        json!({
-            "field": "source.workspace_size",
-            "limit": 16_777_216_u64,
-            "required": 16_777_322_u64,
-        }),
-        "the refusal must carry exact typed bound evidence: {data:#}"
+    assert_eq!(refusal.code, ErrorCode::LimitExceeded, "{}", refusal.text);
+    assert_eq!(refusal.retry, RetryDirective::Never, "{}", refusal.text);
+    assert!(
+        refusal
+            .text
+            .contains("limit source.workspace_size: 16777322 over 16777216"),
+        "the refusal must carry exact bound evidence: {}",
+        refusal.text
     );
     client.cancel().await?;
     server_task.await?;
@@ -435,12 +428,11 @@ fn force_include_files() -> Vec<(String, String)> {
     files
 }
 
-/// The wire `data` of one refused tool call.
-fn refusal_data(error: rmcp::ServiceError) -> Value {
-    match error {
-        rmcp::ServiceError::McpError(data) => data.data.expect("wire error data must be present"),
-        other => panic!("expected a protocol-level McpError, got {other:?}"),
-    }
+/// The `limit` line a refusal of `paths.force_include` must carry.
+fn force_include_limit_line() -> String {
+    format!(
+        "\t\tlimit paths.force_include: {FORCE_INCLUDE_FILE_COUNT} over {FORCE_INCLUDE_FILES_MAX}"
+    )
 }
 
 #[tokio::test]
@@ -454,18 +446,16 @@ async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evi
             "search",
             &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
         ))
-        .await
-        .expect_err("a force_include past its file bound refuses the request");
-    let wire = refusal_data(refused);
-    assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
-    assert_eq!(
-        wire["limit"],
-        json!({
-            "field": "paths.force_include",
-            "limit": FORCE_INCLUDE_FILES_MAX,
-            "required": FORCE_INCLUDE_FILE_COUNT
-        }),
-        "the refusal must carry typed wire evidence: {wire:#}"
+        .await;
+    let failure = failed_call(refused)?;
+    assert_eq!(failure.code, ErrorCode::LimitExceeded, "{}", failure.text);
+    assert!(
+        failure
+            .text
+            .lines()
+            .any(|line| line == force_include_limit_line()),
+        "the refusal must carry the limit line: {}",
+        failure.text
     );
 
     client.cancel().await?;
@@ -490,18 +480,16 @@ async fn a_force_include_past_its_file_bound_refuses_when_the_index_fills_the_po
             "search",
             &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
         ))
-        .await
-        .expect_err("a force_include past its file bound refuses whatever the index yields");
-    let wire = refusal_data(refused);
-    assert_eq!(wire["code"], json!("limit_exceeded"), "{wire:#}");
-    assert_eq!(
-        wire["limit"],
-        json!({
-            "field": "paths.force_include",
-            "limit": FORCE_INCLUDE_FILES_MAX,
-            "required": FORCE_INCLUDE_FILE_COUNT
-        }),
-        "the refusal must carry typed wire evidence: {wire:#}"
+        .await;
+    let failure = failed_call(refused)?;
+    assert_eq!(failure.code, ErrorCode::LimitExceeded, "{}", failure.text);
+    assert!(
+        failure
+            .text
+            .lines()
+            .any(|line| line == force_include_limit_line()),
+        "the refusal must carry the limit line: {}",
+        failure.text
     );
 
     client.cancel().await?;
