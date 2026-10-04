@@ -1,7 +1,8 @@
 """Own real Rift processes and validate messages through the MCP Python SDK.
 
 MCP 1.26.0 ClientSession.call_tool validates structured content against the
-advertised output schema. This module also validates requests and tool errors.
+advertised output schema. This module also validates requests and parses a
+completed tool result with `isError` into `ToolFailure`.
 The SDK owns the stdio proxy and its bounded shutdown. The foreground server
 inherits the caller environment, including LLVM_PROFILE_FILE; overrides win.
 Harness output always lives outside the served workspace.
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -21,7 +23,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Self, TextIO, TypeAlias, cast
+from typing import BinaryIO, NamedTuple, Self, TextIO, TypeAlias, cast
 
 import psutil
 import tomllib
@@ -254,6 +256,138 @@ def stderr_log(
             raise RuntimeError("SDK stderr collection failed") from drain.error
 
 
+FAILURE_TITLE = re.compile(r"([0-9]+) (errors?)")
+INDENT_UNIT = "\t"
+FAILURE_HEAD = re.compile(re.escape(INDENT_UNIT) + r"(\S+) · retry (\S+)")
+FAILURE_LIMIT = re.compile(r"limit (\S+): (\d+) over (\d+)")
+FAILURE_LINE_INDENT = INDENT_UNIT * 2
+FAILURE_ESCAPE = re.compile(r"\\(?:([nrt])|u\{([0-9A-Fa-f]+)\})")
+FAILURE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t"}
+
+
+class FailureLimit(NamedTuple):
+    """Limit evidence of a failure: `limit <field>: <required> over <limit>`."""
+
+    field: str
+    required: int
+    limit: int
+
+
+class FailureCause(NamedTuple):
+    """One cause entry: its head code and retry directive, and its message."""
+
+    code: str
+    message: str
+    retry: str
+
+
+class ToolFailure(Exception):
+    """A Rift operating failure returned as a completed tool result with `isError`.
+
+    `text` is the raw content. `diagnostics` keeps the lines of the first entry
+    after its message and limit line as raw text, without the two-level indent.
+    """
+
+    def __init__(
+        self,
+        tool: str,
+        text: str,
+        code: str,
+        message: str,
+        retry: str,
+        limit: FailureLimit | None = None,
+        causes: Sequence[FailureCause] = (),
+        diagnostics: Sequence[str] = (),
+    ) -> None:
+        """Keep the parsed lines and the raw text."""
+        super().__init__(f"{tool} failed: {text}")
+        self.tool = tool
+        self.text = text
+        self.code = code
+        self.message = message
+        self.retry = retry
+        self.limit = limit
+        self.causes = list(causes)
+        self.diagnostics = list(diagnostics)
+
+
+def unescape_message(line: str) -> str:
+    """Undo `\\n`, `\\r`, `\\t`, and `\\u{HEX}`; other backslashes stay."""
+
+    def replace(found: re.Match[str]) -> str:
+        short, code_point = found.groups()
+        return FAILURE_ESCAPES[short] if short else chr(int(code_point, 16))
+
+    return FAILURE_ESCAPE.sub(replace, line)
+
+
+def parse_failure(tool: str, text: str) -> ToolFailure:
+    """Parse the failure text of a tool result; the only place that decodes it.
+
+    Line 1 is the title `N error(s)`. Each entry is a head line at one level,
+    `<code> · retry <directive>`, then lines at two levels. A level is one tab. The first entry is the
+    failure: its message, an optional `limit` line, then raw diagnostic lines.
+    Every later entry is a cause and has its message only. N must equal the
+    number of entries.
+    """
+    lines = text.rstrip("\n").split("\n")
+    title = FAILURE_TITLE.fullmatch(lines[0])
+    require(title is not None, f"{tool} failed without an errors title: {text!r}")
+    assert title is not None
+    count = int(title[1])
+    require(
+        (title[2] == "error") == (count == 1),
+        f"{tool} failure title has the wrong noun number: {lines[0]!r}",
+    )
+    entries: list[tuple[str, str, list[str]]] = []
+    for line in lines[1:]:
+        if line.startswith(FAILURE_LINE_INDENT):
+            require(
+                len(entries) > 0, f"{tool} failure has a line before an entry: {line!r}"
+            )
+            entries[-1][2].append(line[len(FAILURE_LINE_INDENT) :])
+            continue
+        head = FAILURE_HEAD.fullmatch(line)
+        require(head is not None, f"{tool} failure has a bad entry head: {line!r}")
+        assert head is not None
+        entries.append((head[1], head[2], []))
+    require(
+        len(entries) == count,
+        f"{tool} failure title counts {count} entries, text has {len(entries)}: {text!r}",
+    )
+    for code, _retry, body in entries:
+        require(
+            len(body) > 0 and body[0] != "",
+            f"{tool} failure entry {code} lacks a message: {text!r}",
+        )
+    code, retry, body = entries[0]
+    limit: FailureLimit | None = None
+    diagnostics: list[str] = []
+    for line in body[1:]:
+        if line.startswith("limit "):
+            found = FAILURE_LIMIT.fullmatch(line)
+            require(
+                found is not None and limit is None,
+                f"{tool} failure has a bad limit line: {line!r}",
+            )
+            assert found is not None
+            limit = FailureLimit(found[1], int(found[2]), int(found[3]))
+        else:
+            diagnostics.append(line)
+    causes: list[FailureCause] = []
+    for cause_code, cause_retry, cause_body in entries[1:]:
+        require(
+            len(cause_body) == 1,
+            f"{tool} failure cause {cause_code} has more than a message: {text!r}",
+        )
+        causes.append(
+            FailureCause(cause_code, unescape_message(cause_body[0]), cause_retry)
+        )
+    return ToolFailure(
+        tool, text, code, unescape_message(body[0]), retry, limit, causes, diagnostics
+    )
+
+
 class Client:
     """Validate calls against the schemas advertised by one SDK session."""
 
@@ -291,11 +425,24 @@ class Client:
         raise AssertionError(f"tools/list exceeded {PAGE_COUNT_MAX} pages")
 
     async def call(self, name: str, arguments: JsonObject) -> JsonObject:
-        """Validate requests and structured answers, preserving refusal values."""
+        """Validate requests and structured answers; raise `ToolFailure` on `isError`.
+
+        A failed result carries no `structuredContent`, so it never meets the
+        success `outputSchema`. JSON-RPC errors still raise as the SDK raises them.
+        """
         tool = self.tools[name]
         Draft202012Validator(tool.input_schema).validate(arguments)
         async with asyncio.timeout(self.call_seconds):
             result = await self.session.call_tool(name, arguments)
+        if result.is_error:
+            raise parse_failure(
+                name,
+                "\n".join(
+                    block.text
+                    for block in result.content
+                    if isinstance(block, types.TextContent)
+                ),
+            )
         answer = object_value(result.structured_content, name)
         require(
             len(json.dumps(answer).encode()) <= MESSAGE_BYTES_MAX,
@@ -304,27 +451,40 @@ class Client:
         if tool.output_schema is None:
             raise AssertionError(f"{name} has no output schema")
         Draft202012Validator(tool.output_schema).validate(answer)
-        require(not result.is_error, f"{name} reported a tool error: {answer}")
         self.exercised.add(name)
         return answer
 
     async def resource(self, uri: str) -> JsonObject:
-        """Require the SDK resource envelope to contain exactly one JSON document."""
+        """Select the JSON document from the SDK resource envelope.
+
+        The envelope holds one or two contents for `uri`: exactly one
+        `application/json`, and when there are two, the other is `text/plain`.
+        """
         async with asyncio.timeout(self.call_seconds):
             result = await self.session.read_resource(uri)
-        require(len(result.contents) == 1, f"{uri}: expected one resource document")
-        content = result.contents[0]
-        if not isinstance(content, types.TextResourceContents):
-            raise TypeError(f"{uri}: expected text content")
-        require(str(content.uri) == uri, f"{uri}: resource returned {content.uri}")
         require(
-            content.mime_type == "application/json", f"{uri}: expected application/json"
+            len(result.contents) in (1, 2),
+            f"{uri}: expected one or two resource contents",
         )
+        texts: list[types.TextResourceContents] = []
+        for content in result.contents:
+            if not isinstance(content, types.TextResourceContents):
+                raise TypeError(f"{uri}: expected text content")
+            require(str(content.uri) == uri, f"{uri}: resource returned {content.uri}")
+            texts.append(content)
+        documents = [text for text in texts if text.mime_type == "application/json"]
+        require(len(documents) == 1, f"{uri}: expected one application/json content")
         require(
-            len(content.text.encode()) <= MESSAGE_BYTES_MAX,
+            len(texts) == 1
+            or {text.mime_type for text in texts} == {"text/plain", "application/json"},
+            f"{uri}: expected text/plain beside application/json",
+        )
+        document = documents[0]
+        require(
+            len(document.text.encode()) <= MESSAGE_BYTES_MAX,
             f"{uri}: document too large",
         )
-        return object_value(json.loads(content.text), uri)
+        return object_value(json.loads(document.text), uri)
 
     def require_complete(self, read_tools: set[str]) -> None:
         """Require every selected read tool to be advertised and exercised."""

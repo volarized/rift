@@ -168,8 +168,7 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
     from typing import cast
     from unittest.mock import AsyncMock
 
-    from mcp.shared.exceptions import MCPError
-    from rift_dev.rift_test_client import Client, JsonObject
+    from rift_dev.rift_test_client import Client, JsonObject, parse_failure
 
     client = AsyncMock(spec=Client)
     reads = []
@@ -177,28 +176,14 @@ def test_missing_engine_requires_launch_failure_and_preserves_syntax_reads(
     async def call(name: str, arguments: JsonObject) -> JsonObject:
         if name == "search":
             if failed_launch:
-                raise MCPError(
-                    code=-32000,
-                    message="language engine could not start",
-                    data={
-                        "code": "capability_unavailable",
-                        "retry": "operator_action",
-                        "phase": "read",
-                        **(
-                            {
-                                "causes": [
-                                    {
-                                        "code": "capability_unavailable",
-                                        "message": cause_message,
-                                        "retry": "operator_action",
-                                    }
-                                ]
-                            }
-                            if cause_message is not None
-                            else {}
-                        ),
-                    },
-                )
+                head = "\tcapability_unavailable · retry operator_action\n"
+                text = f"1 error\n{head}\t\tlanguage engine could not start\n"
+                if cause_message is not None:
+                    text = (
+                        f"2 errors\n{head}\t\tlanguage engine could not start\n"
+                        f"{head}\t\t{cause_message}\n"
+                    )
+                raise parse_failure(name, text)
             return {"results": []}
         assert name == "get_symbol"
         reads.append(arguments)

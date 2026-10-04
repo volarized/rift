@@ -16,7 +16,15 @@ import pytest
 from jsonschema import ValidationError
 from mcp import ClientSession, types
 from rift_dev.commands import Command, Process
-from rift_dev.rift_test_client import Client, Server, outside_workspace
+from rift_dev.rift_test_client import (
+    Client,
+    FailureCause,
+    FailureLimit,
+    Server,
+    ToolFailure,
+    outside_workspace,
+    parse_failure,
+)
 
 SCHEMA = {
     "type": "object",
@@ -35,15 +43,152 @@ def client_with_result(result: types.CallToolResult) -> Client:
     return client
 
 
-@pytest.mark.parametrize("error", [False, True])
-def test_invalid_structured_answer_fails_including_tool_errors(error: bool) -> None:
+def test_invalid_structured_answer_fails() -> None:
     client = client_with_result(
-        types.CallToolResult(
-            content=[], structured_content={"status": "unknown"}, is_error=error
-        )
+        types.CallToolResult(content=[], structured_content={"status": "unknown"})
     )
     with pytest.raises(ValidationError):
         asyncio.run(client.call("search", {}))
+
+
+def failed_result(*lines: str) -> types.CallToolResult:
+    text = types.TextContent(text="".join(f"{line}\n" for line in lines))
+    return types.CallToolResult(content=[text], is_error=True)
+
+
+def test_success_result_returns_the_structured_answer() -> None:
+    client = client_with_result(
+        types.CallToolResult(
+            content=[types.TextContent(text="0 results\n")],
+            structured_content={"results": []},
+        )
+    )
+    assert asyncio.run(client.call("search", {})) == {"results": []}
+    assert client.exercised == {"search"}
+
+
+def test_tool_error_is_parsed_without_the_output_schema() -> None:
+    client = client_with_result(
+        failed_result("1 error", "\tinvalid_request · retry never", "\t\tbad request")
+    )
+    with pytest.raises(ToolFailure) as caught:
+        asyncio.run(client.call("search", {}))
+    failure = caught.value
+    assert failure.tool == "search"
+    assert failure.code == "invalid_request"
+    assert failure.message == "bad request"
+    assert failure.retry == "never"
+    assert failure.limit is None
+    assert failure.causes == []
+    assert failure.diagnostics == []
+    assert "invalid_request" in str(failure)
+    assert client.exercised == set()
+
+
+def test_tool_error_message_is_unescaped() -> None:
+    failure = parse_failure(
+        "nodes",
+        "1 error\n\tinternal_error · retry never\n"
+        '\t\tfirst\\nsecond\\r\\t\\u{1b} "quoted" back\\slash\n',
+    )
+    assert failure.message == 'first\nsecond\r\t\x1b "quoted" back\\slash'
+
+
+def test_tool_error_keeps_the_limit_line() -> None:
+    failure = parse_failure(
+        "search",
+        "1 error\n\tlimit_exceeded · retry never\n\t\tcrosses a limit\n"
+        "\t\tlimit source.files: 20001 over 20000\n",
+    )
+    assert failure.limit == FailureLimit("source.files", 20001, 20000)
+    assert (failure.limit.field, failure.limit.required, failure.limit.limit) == (
+        "source.files",
+        20001,
+        20000,
+    )
+
+
+def test_tool_error_causes_write_their_own_code_and_retry() -> None:
+    failure = parse_failure(
+        "search",
+        "5 errors\n"
+        "\tstorage_failure · retry same_request\n\t\tstore failed\n"
+        "\tstorage_failure · retry same_request\n\t\tdisk refused\n"
+        "\tinternal_error · retry same_request\n\t\ttask ended\n"
+        "\tstorage_failure · retry never\n\t\tagain\n"
+        "\tinternal_error · retry operator_action\n\t\tother\n",
+    )
+    assert failure.code == "storage_failure"
+    assert failure.message == "store failed"
+    assert failure.causes == [
+        FailureCause("storage_failure", "disk refused", "same_request"),
+        FailureCause("internal_error", "task ended", "same_request"),
+        FailureCause("storage_failure", "again", "never"),
+        FailureCause("internal_error", "other", "operator_action"),
+    ]
+
+
+def test_tool_error_keeps_diagnostics_lines_raw() -> None:
+    failure = parse_failure(
+        "search",
+        "2 errors\n\tinvalid_request · retry never\n\t\tbad query\n"
+        "\t\tlimit query.length: 9 over 8\n"
+        "\t\terror rift.toml:3:1: unknown key\n"
+        "\t\twarning rift.toml:4:2: unused\n"
+        "\tinvalid_request · retry never\n\t\tnested\n",
+    )
+    assert failure.diagnostics == [
+        "error rift.toml:3:1: unknown key",
+        "warning rift.toml:4:2: unused",
+    ]
+    assert failure.causes == [FailureCause("invalid_request", "nested", "never")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "no error here",
+        "error x · retry never\nmessage",
+        "1 error",
+        "1 error\n\tx · retry never",
+        "1 error\n\tx · retry never\n\n\t\tmessage",
+        "1 error\n\tx retry never\n\t\tmessage",
+        "1 error\n x · retry never\n\t\tmessage",
+        "1 error\nx · retry never\n\t\tmessage",
+        "1 error\n\t\tmessage\n\tx · retry never",
+        "1 error\n\tx · retry never\n\t\tmessage\n\t\tlimit a: one over 2",
+        (
+            "1 error\n\tx · retry never\n\t\tmessage\n\t\tlimit a: 1 over 2\n\t\tlimit b: 1 over 2"
+        ),
+        "2 errors\n\tx · retry never\n\t\tmessage",
+        "1 error\n\tx · retry never\n\t\tmessage\n\ty · retry never\n\t\tcause",
+        "1 errors\n\tx · retry never\n\t\tmessage",
+        "2 error\n\tx · retry never\n\t\ta\n\ty · retry never\n\t\tb",
+        "2 errors\n\tx · retry never\n\t\ta\n\ty · retry never",
+        "2 errors\n\tx · retry never\n\t\ta\n\ty · retry never\n\t\tb\n\t\tc",
+        "2 errors\n\tx · retry never\n\t\ta\n\ty\n\t\tb",
+    ],
+)
+def test_malformed_tool_error_text_fails(text: str) -> None:
+    client = client_with_result(
+        types.CallToolResult(content=[types.TextContent(text=text)], is_error=True)
+    )
+    with pytest.raises(AssertionError):
+        asyncio.run(client.call("search", {}))
+
+
+def test_json_rpc_error_still_raises_from_the_session() -> None:
+    from mcp.shared.exceptions import MCPError
+
+    client = client_with_result(types.CallToolResult(content=[]))
+    cast(AsyncMock, client.session.call_tool).side_effect = MCPError(
+        code=-32601, message="unknown tool", data={"code": "x"}
+    )
+    with pytest.raises(MCPError) as caught:
+        asyncio.run(client.call("search", {}))
+    assert caught.value.error.code == -32601
+    assert not isinstance(caught.value, ToolFailure)
 
 
 def test_missing_structured_answer_fails() -> None:
@@ -77,17 +222,60 @@ def test_invalid_input_never_reaches_server() -> None:
     cast(AsyncMock, client.session.call_tool).assert_not_called()
 
 
-def test_resource_rejects_wrong_uri() -> None:
+def resource_client(*contents: tuple[str, str, str]) -> Client:
     session = AsyncMock(spec=ClientSession)
     session.read_resource.return_value = types.ReadResourceResult(
         contents=[
-            types.TextResourceContents(
-                uri="rift://map", mime_type="application/json", text="{}"
-            ),
+            types.TextResourceContents(uri=uri, mime_type=mime_type, text=text)
+            for uri, mime_type, text in contents
         ]
     )
+    return Client(cast(ClientSession, session))
+
+
+def test_resource_selects_the_json_content_of_two() -> None:
+    client = resource_client(
+        ("rift://map", "text/plain", "map 3f9a1c2e\n"),
+        ("rift://map", "application/json", '{"revision": 1}'),
+    )
+    assert asyncio.run(client.resource("rift://map")) == {"revision": 1}
+
+
+def test_resource_reads_one_json_content() -> None:
+    client = resource_client(("rift://map", "application/json", '{"revision": 1}'))
+    assert asyncio.run(client.resource("rift://map")) == {"revision": 1}
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        [("rift://map", "text/plain", "a"), ("rift://map", "text/plain", "b")],
+        [("rift://map", "text/plain", "a")],
+        [("rift://map", "application/json", "{}"), ("rift://map", "text/html", "a")],
+        [("rift://map", "application/json", "{}")] * 2,
+        [("rift://map", "application/json", "{}")] * 3,
+    ],
+)
+def test_resource_without_exactly_one_json_content_fails(
+    contents: list[tuple[str, str, str]],
+) -> None:
+    with pytest.raises(AssertionError):
+        asyncio.run(resource_client(*contents).resource("rift://map"))
+
+
+def test_resource_rejects_wrong_uri() -> None:
+    client = resource_client(("rift://map", "application/json", "{}"))
     with pytest.raises(AssertionError, match="resource returned"):
-        asyncio.run(Client(cast(ClientSession, session)).resource("rift://logs"))
+        asyncio.run(client.resource("rift://logs"))
+
+
+def test_resource_rejects_wrong_uri_on_the_text_content() -> None:
+    client = resource_client(
+        ("rift://logs", "text/plain", "a"),
+        ("rift://map", "application/json", "{}"),
+    )
+    with pytest.raises(AssertionError, match="resource returned"):
+        asyncio.run(client.resource("rift://map"))
 
 
 def test_log_path_cannot_be_inside_served_workspace(tmp_path: Path) -> None:
@@ -322,12 +510,12 @@ def test_server_drain_stops_at_its_byte_bound(tmp_path: Path) -> None:
 
 def test_tool_error_cannot_satisfy_a_read() -> None:
     client = client_with_result(
-        types.CallToolResult(
-            content=[], structured_content={"results": []}, is_error=True
-        )
+        failed_result("1 error", "\tinternal_error · retry never", "\t\toops")
     )
-    with pytest.raises(AssertionError, match="reported a tool error"):
+    with pytest.raises(ToolFailure, match="oops"):
         asyncio.run(client.call("search", {}))
+    with pytest.raises(AssertionError, match="unexercised tools.*search"):
+        client.require_complete({"search"})
 
 
 def test_failed_process_creation_restores_signal_handler(tmp_path: Path) -> None:

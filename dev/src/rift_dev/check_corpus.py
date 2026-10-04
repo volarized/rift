@@ -13,8 +13,6 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from mcp.shared.exceptions import MCPError
-
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
     CONTEXT_SPAN,
@@ -48,9 +46,11 @@ from rift_dev.corpus_cache import Pin, git
 from rift_dev.local_index_read import settled_local as read_settled_local
 from rift_dev.rift_test_client import (
     Client,
+    FailureLimit,
     Json,
     JsonObject,
     Server,
+    ToolFailure,
     array_value,
     gate_deadline,
     object_value,
@@ -614,10 +614,9 @@ class Corpus:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
             await client.call("nodes", {"path": path, "position": 0})
-        except MCPError as error:
+        except ToolFailure as error:
             require(
-                object_value(error.error.data, "nodes refusal").get("code")
-                == "resource_not_found",
+                error.code == "resource_not_found",
                 f"symlink nodes wrong refusal: {error}",
             )
         else:
@@ -830,17 +829,13 @@ class Corpus:
                             answer = await client.call(
                                 "get_symbol", {"name": "corpus_probe"}
                             )
-                        except MCPError as error:
-                            refusal = object_value(error.error.data, "source refusal")
+                        except ToolFailure as error:
                             require(
-                                refusal.get("code") == "limit_exceeded"
-                                and refusal.get("phase") == "read"
-                                and refusal.get("retry") == "never",
-                                f"source bound wrong refusal: {refusal}",
+                                error.code == "limit_exceeded"
+                                and error.retry == "never",
+                                f"source bound wrong refusal: {error}",
                             )
-                            message = string_value(
-                                refusal.get("message"), "source refusal message"
-                            )
+                            message = error.message
                             prefix = (
                                 "workspace contains more files than its accepted limit of 20000: "
                                 "field source.files, observed 20001, path "
@@ -858,17 +853,14 @@ class Corpus:
                                 reported != root and reported.is_relative_to(root),
                                 f"source bound path is outside the workspace: {path}",
                             )
-                            limit = object_value(refusal.get("limit"), "source limit")
                             require(
-                                limit.get("field") == "source.files"
-                                and limit.get("required") == 20001
-                                and limit.get("limit") == 20000,
-                                f"source bound wrong limit: {limit}",
+                                error.limit
+                                == FailureLimit("source.files", 20001, 20000),
+                                f"source bound wrong limit: {error}",
                             )
-                            causes = refusal.get("causes", [])
                             require(
-                                causes == [],
-                                f"direct source bound has unexpected causes: {causes}",
+                                error.causes == [],
+                                f"direct source bound has unexpected causes: {error.causes}",
                             )
                             break
                         require(

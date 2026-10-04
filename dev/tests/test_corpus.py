@@ -9,10 +9,9 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from mcp.shared.exceptions import MCPError
 from rift_dev.check_corpus import (
     CLEANUP_RESERVE_SECONDS,
     Corpus,
@@ -53,8 +52,11 @@ from rift_dev.corpus_cache import (
 )
 from rift_dev.rift_test_client import (
     Client,
+    FailureCause,
+    FailureLimit,
     JsonObject,
     Server,
+    ToolFailure,
     gate_deadline,
     object_value,
 )
@@ -1016,9 +1018,10 @@ class SourceBound(unittest.TestCase):
     """Discovery refusal remains readable after early server publication (#495)."""
 
     @staticmethod
-    def refusal() -> JsonObject:
-        return {
+    def refusal(**wrong: Any) -> ToolFailure:
+        found: dict[str, Any] = {
             "code": "limit_exceeded",
+            "limit": FailureLimit("source.files", 20001, 20000),
             "message": (
                 "workspace contains more files than its accepted limit of 20000: "
                 "field source.files, observed 20001, "
@@ -1026,12 +1029,20 @@ class SourceBound(unittest.TestCase):
                 "reduce workspace files below 20000 and retry"
             ),
             "retry": "never",
-            "phase": "read",
-            "limit": {"field": "source.files", "required": 20001, "limit": 20000},
-        }
+            "causes": (),
+        } | wrong
+        return ToolFailure(
+            "get_symbol",
+            "error text",
+            found["code"],
+            found["message"],
+            found["retry"],
+            found["limit"],
+            found["causes"],
+        )
 
     def exercise(
-        self, responses: list[JsonObject | MCPError]
+        self, responses: list[JsonObject | ToolFailure]
     ) -> tuple[Corpus, MagicMock]:
         corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
         server = MagicMock(spec=Server)
@@ -1066,7 +1077,7 @@ class SourceBound(unittest.TestCase):
         corpus, _server = self.exercise(
             [
                 {"warnings": [{"code": "local_index_preparing"}]},
-                MCPError(-32000, "source limit", self.refusal()),
+                self.refusal(),
             ]
         )
         action = object_value(corpus.actions[-1], "source action")
@@ -1075,31 +1086,47 @@ class SourceBound(unittest.TestCase):
         self.assertEqual(action["observed"], 20001)
         self.assertEqual(action["maximum"], 20000)
 
-    def test_wrong_refusal_code_retry_message_phase_and_limit_fail(self) -> None:
+    def test_wrong_refusal_code_retry_message_limit_and_causes_fail(self) -> None:
         variants = [
             {"code": "resource_not_found"},
             {"retry": "same_request"},
             {"message": "workspace has too many files"},
-            {"phase": "initialize"},
+            {"limit": FailureLimit("source.workspace_size", 20001, 20000)},
+            {"limit": FailureLimit("source.files", 20000, 20000)},
+            {"limit": FailureLimit("source.files", 20001, 20001)},
             {
-                "limit": {
-                    "field": "source.workspace_size",
-                    "required": 20001,
-                    "limit": 20000,
-                }
+                "causes": [
+                    FailureCause("internal_error", "unexpected nested refusal", "never")
+                ]
             },
-            {"limit": {"field": "source.files", "required": 20000, "limit": 20000}},
-            {"limit": {"field": "source.files", "required": 20001, "limit": 20001}},
-            {"causes": [{"message": "unexpected nested refusal"}]},
         ]
         for wrong in variants:
             with self.subTest(wrong=wrong), self.assertRaises(AssertionError):
-                self.exercise(
-                    [MCPError(-32000, "source limit", {**self.refusal(), **wrong})]
-                )
+                self.exercise([self.refusal(**wrong)])
+
+    def test_symlink_nodes_refusal_is_a_tool_failure_with_the_expected_code(
+        self,
+    ) -> None:
+        for code, passes in (("resource_not_found", True), ("internal_error", False)):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                corpus = Corpus(pins()["nextjs"], Path("rift"), Path("report.json"))
+                corpus.root = Path(directory)
+                (corpus.root / "target").write_text("x")
+                (corpus.root / "link").symlink_to("target")
+                client = AsyncMock(spec=Client)
+                client.call.side_effect = [
+                    self.refusal(code=code),
+                    {"results": []},
+                ]
+                run = corpus.symlink_refused(client, "link", set())
+                if passes:
+                    asyncio.run(run)
+                else:
+                    with self.assertRaisesRegex(AssertionError, "wrong refusal"):
+                        asyncio.run(run)
 
     def test_missing_or_wrong_source_path_and_action_fail(self) -> None:
-        message = cast(str, self.refusal()["message"])
+        message = self.refusal().message
         path = str(Path.cwd() / "test/e2e/app/page.js")
         action = "; reduce workspace files below 20000 and retry"
         variants = [
@@ -1114,13 +1141,7 @@ class SourceBound(unittest.TestCase):
         ]
         for wrong in variants:
             with self.subTest(message=wrong), self.assertRaises(AssertionError):
-                self.exercise(
-                    [
-                        MCPError(
-                            -32000, "source limit", {**self.refusal(), "message": wrong}
-                        )
-                    ]
-                )
+                self.exercise([self.refusal(message=wrong)])
 
     def test_complete_read_without_refusal_fails(self) -> None:
         with self.assertRaisesRegex(AssertionError, "returned a complete read"):
@@ -1158,7 +1179,7 @@ class SourceBound(unittest.TestCase):
         server = MagicMock(spec=Server)
         server.stop.side_effect = AssertionError("server stop exceeded its deadline")
         client = AsyncMock(spec=Client)
-        client.call.side_effect = MCPError(-32000, "source limit", self.refusal())
+        client.call.side_effect = self.refusal()
         client.resource.return_value = {
             "records": [
                 {
