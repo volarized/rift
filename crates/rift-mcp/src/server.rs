@@ -1957,7 +1957,7 @@ impl RiftMcp {
         );
         // The log store is a database of its own and waits on no index readiness. Each read
         // opens a connection of its own on the last committed WAL snapshot, so `rift://logs`
-        // answers while a rebuild holds the workspace database.
+        // answers while a rebuild holds the index database.
         let logs = storage.logs();
         let published = Arc::new(RwLock::new(IndexState {
             current: published,
@@ -6668,7 +6668,7 @@ done
         Ok(())
     }
 
-    /// Logs record and answer while the workspace database is refused: `rift://logs`
+    /// Logs record and answer while the index database is refused: `rift://logs`
     /// returns the `database.open` warning the refusal produced.
     #[tokio::test]
     async fn a_refused_index_database_is_recorded_in_the_logs() -> TestResult {

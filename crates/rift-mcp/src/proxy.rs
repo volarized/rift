@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 use axum::http::{HeaderName, HeaderValue};
 use rift_core::CapturedStream;
 use rift_core::constants::{
-    INDEX_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY, WRITE_AHEAD_LOG_SUFFIX,
+    INDEX_DATABASE_FILE_NAME, METRICS_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY,
+    WRITE_AHEAD_LOG_SUFFIX,
 };
 use rift_error::{RiftError, errors};
 use rift_protocol::configuration::ServerConfiguration;
@@ -616,19 +617,20 @@ async fn connect_upstream(
     start_window_refusal(building && opened != closed).fail()
 }
 
-/// What the index database's files looked like at one instant: each
+/// What the index and metrics databases' files looked like at one instant: each
 /// file's length and modification time, or nothing for an absent file.
 ///
-/// A server writes `.rift/index` while it builds its first index, and `SQLite`
-/// in WAL mode appends each commit to the write-ahead log. Two readings that differ
+/// A server writes `.rift/index` while it builds its first index and records its
+/// diagnostics into `.rift/metrics`, and `SQLite` in WAL mode appends each commit to
+/// the database's write-ahead log. Two readings that differ in any of the four files
 /// therefore show that a process wrote between them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseActivity {
-    files: [Option<(u64, SystemTime)>; 2],
+    files: [Option<(u64, SystemTime)>; 4],
 }
 
 impl DatabaseActivity {
-    /// Reads the database file and its write-ahead log below `root`, and none
+    /// Reads each database file and its write-ahead log below `root`, and none
     /// of their bytes, on the blocking pool. A reading the pool could not
     /// finish names no file.
     ///
@@ -639,20 +641,22 @@ impl DatabaseActivity {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || Self::read(&root))
             .await
-            .unwrap_or(Self {
-                files: [None, None],
-            })
+            .unwrap_or(Self { files: [None; 4] })
     }
 
-    /// Reads the database file and its write-ahead log below `root`.
+    /// Reads the index and metrics database files and their write-ahead logs below
+    /// `root`.
     fn read(root: &Path) -> Self {
         let state = root.join(RIFT_STATE_DIRECTORY);
-        let database = state.join(INDEX_DATABASE_FILE_NAME);
-        let log = state.join(format!(
-            "{INDEX_DATABASE_FILE_NAME}{WRITE_AHEAD_LOG_SUFFIX}"
-        ));
+        let log = |database: &str| state.join(format!("{database}{WRITE_AHEAD_LOG_SUFFIX}"));
+        let paths = [
+            state.join(INDEX_DATABASE_FILE_NAME),
+            log(INDEX_DATABASE_FILE_NAME),
+            state.join(METRICS_DATABASE_FILE_NAME),
+            log(METRICS_DATABASE_FILE_NAME),
+        ];
         Self {
-            files: [database, log].map(|path| {
+            files: paths.map(|path| {
                 let metadata = std::fs::metadata(path).ok()?;
                 Some((metadata.len(), metadata.modified().ok()?))
             }),
@@ -2103,14 +2107,23 @@ mod tests {
         Ok(())
     }
 
-    /// A holder of the election that publishes nothing but writes to the
-    /// workspace database during the start window is still building: the
-    /// connect refuses with a refusal the caller resends, naming the build.
+    /// A holder of the election that publishes nothing but writes the
+    /// index database's or the metrics database's write-ahead log alone during
+    /// the start window is still building: the connect refuses with a refusal
+    /// the caller resends, naming the build.
     #[tokio::test(start_paused = true)]
     async fn a_building_holder_refuses_with_a_retryable_refusal() -> TestResult {
+        for written_log in ["index-wal", "metrics-wal"] {
+            building_holder_refuses_after_writing(written_log).await?;
+        }
+        Ok(())
+    }
+
+    /// One start window whose election holder writes `written_log` below `.rift`.
+    async fn building_holder_refuses_after_writing(written_log: &str) -> TestResult {
         let directory = tempfile::tempdir()?;
         let _guard = claim(directory.path())?;
-        let log = directory.path().join(".rift").join("index-wal");
+        let log = directory.path().join(".rift").join(written_log);
         let writing = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             std::fs::write(&log, b"a commit the building server wrote")
@@ -2179,21 +2192,24 @@ mod tests {
     }
 
     /// Database activity reads each file's length and modification time, and
-    /// moves when either file is written.
+    /// moves when any one of the four files is written alone.
     #[test]
-    fn database_activity_moves_when_the_database_is_written() -> TestResult {
+    fn database_activity_moves_when_any_database_file_is_written() -> TestResult {
         let directory = tempfile::tempdir()?;
         let before = super::DatabaseActivity::read(directory.path());
-        assert_eq!(before.files, [None, None]);
-        std::fs::create_dir_all(directory.path().join(".rift"))?;
-        std::fs::write(directory.path().join(".rift").join("index"), b"pages")?;
-        let written = super::DatabaseActivity::read(directory.path());
-        assert_ne!(written, before);
-        std::fs::write(
-            directory.path().join(".rift").join("index-wal"),
-            b"a commit",
-        )?;
-        assert_ne!(super::DatabaseActivity::read(directory.path()), written);
+        assert_eq!(before.files, [None; 4]);
+        let state = directory.path().join(".rift");
+        std::fs::create_dir_all(&state)?;
+        let mut previous = before;
+        for file in ["index", "index-wal", "metrics", "metrics-wal"] {
+            std::fs::write(state.join(file), b"a commit")?;
+            let written = super::DatabaseActivity::read(directory.path());
+            assert_ne!(
+                written, previous,
+                "writing {file} alone must move the reading"
+            );
+            previous = written;
+        }
         Ok(())
     }
 

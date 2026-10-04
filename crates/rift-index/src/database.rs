@@ -1375,8 +1375,8 @@ mod tests {
     #[test]
     fn the_migration_lock_path_appends_to_the_whole_file_name() {
         assert_eq!(
-            super::migration_lock_path(Path::new("/workspace/.rift/db")),
-            Path::new("/workspace/.rift/db.lock")
+            super::migration_lock_path(Path::new("/workspace/.rift/index")),
+            Path::new("/workspace/.rift/index.lock")
         );
         assert_eq!(
             super::migration_lock_path(Path::new("state/db.sqlite")),

@@ -896,7 +896,7 @@ fn process_absent(error: &io::Error) -> bool {
 /// The listening line prints before blocking. Ctrl-C, and SIGTERM on unix,
 /// cancel the shutdown token; an authorized stop request and the idle timeout
 /// end serving the same way. This is the process that records: the drain
-/// writes what the tracing layer queued into the workspace database until the
+/// writes what the tracing layer queued into the metrics database until the
 /// same token stops it.
 ///
 /// The stop runs in one order under [`SERVER_STOP_DEADLINE`]: the serving
@@ -1371,7 +1371,7 @@ fn logs_query(
 /// Prints this workspace's recorded diagnostics, oldest first.
 ///
 /// The metrics database is read directly, so a workspace whose server has stopped still
-/// answers, with no server, no workspace database, and no valid `rift.toml`. A workspace
+/// answers, with no server, no index database, and no valid `rift.toml`. A workspace
 /// holding no `.rift/metrics` prints nothing, says so on stderr, and creates no state
 /// directory.
 async fn print_logs(
@@ -3138,7 +3138,7 @@ mod tests {
         Ok(())
     }
 
-    /// `rift server logs` needs no server and no workspace database: with only
+    /// `rift server logs` needs no server and no index database: with only
     /// `.rift/metrics` present it reads the records and creates nothing else.
     #[tokio::test]
     async fn logs_print_from_the_metrics_database_alone() -> TestResult {

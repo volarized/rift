@@ -5562,8 +5562,8 @@ pub(crate) mod tests {
 
     /// A server does not index its own state. The walk's hard floor prunes `.rift` by
     /// name before either lane sees it, so neither the syntax-indexed files nor the
-    /// recorded set holds the workspace database, whose bytes move for as long as SQLite
-    /// runs.
+    /// recorded set holds the index, metrics, and vectors databases, whose bytes move for
+    /// as long as SQLite runs.
     #[test]
     fn the_index_holds_no_path_under_the_state_directory() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -5572,7 +5572,15 @@ pub(crate) mod tests {
             .path()
             .join(rift_core::constants::RIFT_STATE_DIRECTORY);
         fs::create_dir_all(&state)?;
-        for name in ["db", "db-shm", "db-wal", "server.json"] {
+        for name in [
+            "index",
+            "index-shm",
+            "index-wal",
+            "metrics",
+            "metrics-wal",
+            "vectors",
+            "server.json",
+        ] {
             fs::write(state.join(name), "state\n")?;
         }
 
@@ -5612,7 +5620,7 @@ pub(crate) mod tests {
         let canonical = directory.path().canonicalize()?;
         let state = canonical
             .join(rift_core::constants::RIFT_STATE_DIRECTORY)
-            .join("db");
+            .join(rift_core::constants::METRICS_DATABASE_FILE_NAME);
         let (validation, _invalidations) =
             IndexValidation::new(WorkspaceIndexLimits::default().files_max());
         let written = |path: &std::path::Path| {
@@ -5640,7 +5648,7 @@ pub(crate) mod tests {
             let roots = super::WatchRoots::resolve(&linked)?;
             let linked_state = linked
                 .join(rift_core::constants::RIFT_STATE_DIRECTORY)
-                .join("db");
+                .join(rift_core::constants::INDEX_DATABASE_FILE_NAME);
             assert_eq!(
                 super::watch_event_impact(&roots, &validation, &written(&linked_state)),
                 super::WatchImpact::None,
@@ -7630,7 +7638,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("kept.rs"), "pub fn keptalpha() {}\n")?;
         let first = candidate_declaring(directory.path(), 0, "firstbeta")?;
-        // The store lives outside the captured tree, as `.rift/db` does: the second capture
+        // The store lives outside the captured tree, as `.rift/index` does: the second capture
         // runs after the open, and a file the open writes beside the database would join
         // the tree as a moved file.
         let state = tempfile::tempdir()?;
