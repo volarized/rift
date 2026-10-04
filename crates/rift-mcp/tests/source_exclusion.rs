@@ -213,12 +213,8 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     )?;
     let client = client_for(directory.path()).await?;
 
-    let hidden = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let search_arguments = json!({ "query": "wandering falcon migrations" });
+    let hidden = search_after_population(&client, &search_arguments).await?;
     assert!(
         hidden["results"].as_array().is_some_and(|results| !results
             .iter()
@@ -233,12 +229,7 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     );
     fs::write(directory.path().join("rift.toml"), forcing_configuration)?;
 
-    let reached = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let reached = search_after_population(&client, &search_arguments).await?;
     assert!(
         reached["results"].as_array().is_some_and(|results| results
             .iter()
