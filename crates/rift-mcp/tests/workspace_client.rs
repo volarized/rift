@@ -206,8 +206,10 @@ pub(crate) async fn await_workspace_ready(
 ///
 /// # Errors
 ///
-/// Returns the last answer if the store does not rank it within three seconds, or an
-/// acceptance error after eight refused attempts.
+/// Returns an error containing the last answer after 60 polling delays and up to 60
+/// follow-up requests if the store does not rank the answer. The 50 ms delays total at
+/// most three seconds; request time is additional. Each request allows up to eight
+/// attempts for acceptance refusals and has no elapsed-time deadline.
 pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &Value,

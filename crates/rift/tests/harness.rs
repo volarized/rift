@@ -438,8 +438,10 @@ pub(crate) async fn await_workspace_ready(
 ///
 /// # Errors
 ///
-/// Returns an error if the store does not rank the answer after 60 polls at 50 ms.
-/// Each request uses the existing proxied call bound.
+/// Returns an error if the store does not rank the answer after 60 polling delays and up
+/// to 60 follow-up requests. The 50 ms delays total at most three seconds; request time
+/// is additional. Each proxied call allows up to eight attempts, each with a 45-second
+/// timeout.
 pub(crate) async fn search_after_population(
     client: &RunningService<RoleClient, ()>,
     arguments: &serde_json::Value,
