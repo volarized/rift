@@ -226,17 +226,78 @@ impl DeferredDatabaseShutdown {
     /// cannot stop before the deadline.
     pub async fn shutdown(self, deadline: Instant) -> Result<(), RiftError> {
         let database = match self.0 {
-            Some(search_index) => search_index.shutdown(deadline).await.map_err(|error| {
-                errors::mcp::http_serve_failed()
-                    .operation("SQLite worker shutdown")
-                    .cause(error)
-                    .error()
-            }),
+            Some(search_index) => {
+                stop_stage("SQLite worker shutdown", deadline, async {
+                    search_index.shutdown(deadline).await.map_err(|error| {
+                        errors::mcp::http_serve_failed()
+                            .operation("SQLite worker shutdown")
+                            .cause(error)
+                            .error()
+                    })
+                })
+                .await
+            }
             None => Ok(()),
         };
         let logs = close_logs(self.1.as_deref(), deadline).await;
         database.and(logs)
     }
+}
+
+/// Runs one stage of a server stop inside a `server.stop` span and records how it ended.
+///
+/// The span's close carries the stage's elapsed time. The `stop stage ended` record
+/// carries the stage's name, what it left of the stop's shared `deadline`, its outcome,
+/// and, for a failure, the error and its causes, so a stop that leaves with a failure
+/// names the stage that returned it.
+///
+/// # Errors
+///
+/// Returns the error `work` returned, unchanged.
+///
+/// # Cancel safety
+///
+/// Dropping the future drops `work` and records nothing.
+#[doc(hidden)]
+pub async fn stop_stage<Value>(
+    stage: &'static str,
+    deadline: Instant,
+    work: impl std::future::Future<Output = Result<Value, RiftError>>,
+) -> Result<Value, RiftError> {
+    rift_core::traced_async!(
+        component = "mcp",
+        operation = "server.stop",
+        stage = stage,
+        {
+            let outcome = work.await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match &outcome {
+                Ok(_) => tracing::info!(
+                    component = "mcp",
+                    operation = "server.stop",
+                    stage,
+                    ?remaining,
+                    outcome = "ok",
+                    "stop stage ended"
+                ),
+                Err(error) => {
+                    let causes = rift_error::causes(error).join(": ");
+                    tracing::warn!(
+                        component = "mcp",
+                        operation = "server.stop",
+                        stage,
+                        ?remaining,
+                        outcome = "error",
+                        %error,
+                        causes,
+                        "stop stage ended"
+                    );
+                }
+            }
+            outcome
+        }
+    )
+    .await
 }
 
 /// Closes the metrics database by `deadline`, when it opened.
@@ -245,16 +306,30 @@ pub(crate) async fn close_logs(
     deadline: Instant,
 ) -> Result<(), RiftError> {
     match logs {
-        Some(logs) => logs
-            .close(deadline)
+        Some(logs) => {
+            stop_stage("metrics database close", deadline, async {
+                logs.close(deadline)
+                    .await
+                    .map(|checkpoint| {
+                        tracing::info!(
+                            component = "storage",
+                            operation = "database.close",
+                            database = "metrics",
+                            busy = checkpoint.is_busy(),
+                            log = checkpoint.log(),
+                            checkpointed = checkpoint.checkpointed(),
+                            "database checkpointed its write-ahead log"
+                        );
+                    })
+                    .map_err(|error| {
+                        errors::mcp::http_serve_failed()
+                            .operation("metrics database close")
+                            .cause(error)
+                            .error()
+                    })
+            })
             .await
-            .map(|_checkpoint| ())
-            .map_err(|error| {
-                errors::mcp::http_serve_failed()
-                    .operation("metrics database close")
-                    .cause(error)
-                    .error()
-            }),
+        }
         None => Ok(()),
     }
 }
@@ -336,47 +411,64 @@ impl HttpServer {
         // The stop's deadline starts where the stop began: one derived where
         // the server began listening is already spent when the stop arrives.
         let deadline = Instant::now() + budget;
+        tracing::info!(
+            component = "mcp",
+            operation = "server.stop",
+            ?budget,
+            "MCP server stopping"
+        );
         // The serve loop can end on its own I/O error, where nothing has
         // cancelled the token yet; cancelling here unblocks the idle watch
         // on every path.
         self.stop.cancel();
-        let serve_result = match ended_before_the_stop {
-            Some(outcome) => classify_serve_outcome(outcome),
-            None => drained_serve_outcome(&mut serving, deadline).await,
-        };
-        let idle_outcome = self.idle_watch.await;
+        let serve_result = stopped_serving(ended_before_the_stop, &mut serving, deadline).await;
+        let idle_outcome = stop_stage("idle watch task", deadline, async {
+            self.idle_watch.await.map_err(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("idle watch task")
+                    .source(error)
+                    .error()
+            })
+        })
+        .await;
         let repository_idle_outcome = match self.repository_idle_watch {
-            Some(mut watch) => match tokio::time::timeout_at(deadline, &mut watch).await {
-                Ok(outcome) => outcome.map_err(|error| {
-                    errors::mcp::http_serve_failed()
-                        .operation("workspace idle watch task")
-                        .source(error)
-                        .error()
-                }),
-                Err(error) => {
-                    watch.abort();
-                    let _ = watch.await;
-                    errors::mcp::http_serve_failed()
-                        .operation("workspace idle watch task")
-                        .source(error)
-                        .fail()
-                }
-            },
+            Some(watch) => stopped_repository_idle_watch(watch, deadline).await,
             None => Ok(()),
         };
         let engines_stopped = match self.engines {
-            Some(engines) => tokio::time::timeout_at(deadline, engines.shutdown())
-                .await
-                .is_ok(),
+            Some(engines) => stop_stage("engines shutdown", deadline, async {
+                tokio::time::timeout_at(deadline, engines.shutdown())
+                    .await
+                    .map_err(|error| {
+                        errors::mcp::http_serve_failed()
+                            .operation("engines shutdown")
+                            .source(error)
+                            .error()
+                    })
+            })
+            .await
+            .is_ok(),
             None => true,
         };
         let supervisor_outcome = if let Some(supervisor) = self.supervisor.as_ref() {
-            supervisor.shutdown(deadline).await
+            stop_stage(
+                "index supervisor shutdown",
+                deadline,
+                supervisor.shutdown(deadline),
+            )
+            .await
         } else {
             Ok(())
         };
         let repository_outcome = match self.repository_workspaces {
-            Some(registry) => registry.shutdown(deadline).await,
+            Some(registry) => {
+                stop_stage(
+                    "repository workspaces shutdown",
+                    deadline,
+                    registry.shutdown(deadline),
+                )
+                .await
+            }
             None => Ok(()),
         };
         // The last supervisor can own the whole published index. Freeing it here
@@ -402,19 +494,56 @@ impl HttpServer {
             .and(repository_outcome)
             .and(repository_idle_outcome)
             .and(serve_result)
-            .and_then(|()| {
-                idle_outcome.map_err(|error| {
-                    errors::mcp::http_serve_failed()
-                        .operation("idle watch task")
-                        .source(error)
-                        .error()
-                })
-            });
+            .and(idle_outcome);
         (
             deadline,
             stopped,
             DeferredDatabaseShutdown(self.search_index, self.logs),
         )
+    }
+}
+
+/// The serving stage of a stop: the serve loop's own outcome when it ended before the
+/// stop, or the drain of the requests still in flight, by `deadline`.
+async fn stopped_serving(
+    ended_before_the_stop: Option<Result<Result<(), std::io::Error>, tokio::task::JoinError>>,
+    serving: &mut JoinHandle<Result<(), std::io::Error>>,
+    deadline: Instant,
+) -> Result<(), RiftError> {
+    if let Some(outcome) = ended_before_the_stop {
+        return stop_stage("http serve loop", deadline, async {
+            classify_serve_outcome(outcome)
+        })
+        .await;
+    }
+    stop_stage(
+        "http serve drain",
+        deadline,
+        drained_serve_outcome(serving, deadline),
+    )
+    .await
+}
+
+/// Joins the repository idle watch by `deadline`, aborting a watch that outlasts it.
+async fn stopped_repository_idle_watch(
+    mut watch: JoinHandle<()>,
+    deadline: Instant,
+) -> Result<(), RiftError> {
+    match tokio::time::timeout_at(deadline, &mut watch).await {
+        Ok(outcome) => outcome.map_err(|error| {
+            errors::mcp::http_serve_failed()
+                .operation("workspace idle watch task")
+                .source(error)
+                .error()
+        }),
+        Err(error) => {
+            watch.abort();
+            let _ = watch.await;
+            errors::mcp::http_serve_failed()
+                .operation("workspace idle watch task")
+                .source(error)
+                .fail()
+        }
     }
 }
 
@@ -1046,6 +1175,55 @@ mod tests {
             .expect_err("an aborted serving task must classify as an error");
         let rendered = error.to_string();
         assert!(rendered.contains("http serve task"), "{rendered}");
+    }
+
+    /// A stop stage passes its outcome through unchanged and records its name, its
+    /// outcome, and a failure's error.
+    #[test]
+    fn a_stop_stage_records_its_name_outcome_and_error() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (sink, mut drain) = crate::logs::log_capture();
+        let subscriber = tracing_subscriber::registry().with(sink);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the fixture runtime must start");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let (passed, failed) = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let passed = super::stop_stage("passing stage", deadline, async {
+                    Ok::<_, rift_error::RiftError>(7)
+                })
+                .await;
+                let failed = super::stop_stage("failing stage", deadline, async {
+                    errors::mcp::http_serve_failed()
+                        .operation("failing stage")
+                        .source(std::io::Error::other("injected stage failure"))
+                        .fail::<()>()
+                })
+                .await;
+                (passed, failed)
+            })
+        });
+
+        assert_eq!(passed.ok(), Some(7));
+        assert!(failed.is_err(), "the stage failure passes through");
+        let ended = std::iter::from_fn(|| drain.try_recv_record().ok())
+            .filter(|record| record.message() == "stop stage ended")
+            .collect::<Vec<_>>();
+        assert_eq!(ended.len(), 2, "one record per stage: {ended:?}");
+        assert!(ended[0].fields().contains("passing stage"), "{ended:?}");
+        assert!(
+            ended[0].fields().contains("\"outcome\":\"ok\""),
+            "{ended:?}"
+        );
+        assert_eq!(ended[1].level(), "warn");
+        assert!(ended[1].fields().contains("failing stage"), "{ended:?}");
+        assert!(
+            ended[1].fields().contains("injected stage failure"),
+            "{ended:?}"
+        );
     }
 
     #[test]
