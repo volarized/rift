@@ -2457,13 +2457,13 @@ mod tests {
             )
         }
 
-        async fn read_resource(
+        fn read_resource(
             &self,
             request: ReadResourceRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<ReadResourceResponse, ErrorData> {
+        ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> {
             let uri = request.uri.as_str();
-            match uri {
+            std::future::ready(match uri {
                 TWO_CONTENT_URI => Ok(ReadResourceResult::new(vec![
                     ResourceContents::text("map 3f9a1c2e", uri).with_mime_type("text/plain"),
                     ResourceContents::text("{\"revision\":\"3f9a1c2e\"}", uri)
@@ -2478,40 +2478,40 @@ mod tests {
                     format!("no resource is published at {other:?}"),
                     None,
                 )),
-            }
+            })
         }
 
-        async fn list_tools(
+        fn list_tools(
             &self,
             request: Option<PaginatedRequestParams>,
             _context: RequestContext<RoleServer>,
-        ) -> Result<ListToolsResult, ErrorData> {
+        ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> {
             let second = request
                 .and_then(|page| page.cursor)
                 .is_some_and(|cursor| cursor == SECOND_PAGE_CURSOR);
             if second {
-                return Ok(ListToolsResult::with_all_items(vec![upstream_tool(
-                    "nodes",
-                )]));
+                return std::future::ready(Ok(ListToolsResult::with_all_items(vec![
+                    upstream_tool("nodes"),
+                ])));
             }
             let mut first = ListToolsResult::with_all_items(vec![upstream_tool("search")]);
             first.next_cursor = Some(SECOND_PAGE_CURSOR.to_owned());
-            Ok(first)
+            std::future::ready(Ok(first))
         }
 
-        async fn call_tool(
+        fn call_tool(
             &self,
             request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<CallToolResponse, ErrorData> {
-            match request.name.as_ref() {
+        ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> {
+            std::future::ready(match request.name.as_ref() {
                 "search" => Ok(CallToolResult::structured(json!({"results": 0})).into()),
                 "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool {other}"),
                     None,
                 )),
-            }
+            })
         }
     }
 
