@@ -9038,7 +9038,7 @@ done
         )
         .await?;
 
-        let held = serde_json::to_value(run_search(&server, "wide_marker").await?)?;
+        let held = serde_json::to_value(search_after_population(&server, "wide_marker").await?)?;
         assert!(
             hit_paths(&held).contains(&"src/wide.rs"),
             "the held file's text answers search: {held:#}"
