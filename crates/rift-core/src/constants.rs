@@ -41,10 +41,13 @@ pub const WORKSPACE_CONFIGURATION_FILE: &str = "rift.toml";
 
 /// The file name a version-control ignore list carries, at the workspace root and below.
 pub const VCS_IGNORE_FILE: &str = ".gitignore";
-/// Workspace database file, below [`RIFT_STATE_DIRECTORY`]: one `SQLite`
-/// database at `.rift/db` holds every store Rift persists for the
+/// Workspace database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
+/// database at `.rift/db` holds the search stores Rift persists for the
 /// workspace.
 pub const WORKSPACE_DATABASE_FILE_NAME: &str = "db";
+/// Metrics database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
+/// database at `.rift/metrics` holds the server's own log records.
+pub const METRICS_DATABASE_FILE_NAME: &str = "metrics";
 /// Maximum ASCII bytes in one provider-composition stage name.
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.

@@ -24,6 +24,7 @@ EXPECTED_EDGES = {
     "rift -> rift-search",
     "rift -> rift-server",
     "rift -> rift-syntax",
+    "rift -> rift-tracing",
     "rift-cloud-client -> rift-core",
     "rift-cloud-client -> rift-protocol",
     "rift-cloud-client -> rift-ranking",
@@ -53,6 +54,7 @@ EXPECTED_EDGES = {
     "rift-index -> rift-ranking",
     "rift-index -> rift-syntax",
     "rift-index -> rift-error",
+    "rift-index -> rift-tracing",
     "rift-lsp -> rift-core",
     "rift-lsp -> rift-error",
     "rift-lsp -> rift-provider",
@@ -68,6 +70,7 @@ EXPECTED_EDGES = {
     "rift-mcp -> rift-ranking",
     "rift-mcp -> rift-search",
     "rift-mcp -> rift-server",
+    "rift-mcp -> rift-tracing",
     "rift-provider -> rift-core",
     "rift-provider -> rift-error",
     "rift-provider -> rift-protocol",
@@ -98,6 +101,7 @@ EXPECTED_EDGES = {
     "rift-syntax -> rift-error",
     "rift-syntax -> rift-protocol",
     "rift-syntax -> rift-provider",
+    "rift-tracing -> rift-error",
 }
 
 

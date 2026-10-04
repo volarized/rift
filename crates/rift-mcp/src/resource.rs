@@ -9,9 +9,9 @@
 //! because the case that needs the logs most is the one where the workspace
 //! reads refuse.
 
-use rift_index::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::workspace::WorkspaceResourcePage;
+use rift_tracing::{LOG_LEVELS, LOG_PAGE_RECORDS_MAX, LogQuery, StoredLogRecord};
 use rmcp::ErrorData;
 use rmcp::model::{ReadResourceResult, Resource, ResourceContents, ResourceTemplate};
 use serde_json::{Value, json};
@@ -299,10 +299,10 @@ mod tests {
         logs_unavailable, rendered_logs, rendered_map, rendered_workspace, workspace_page_index,
     };
     use crate::output::resource_text;
-    use rift_index::{LOG_PAGE_RECORDS_MAX, LogRecord, LogStore, StoredLogRecord};
     use rift_protocol::map::WorkspaceMap;
     use rift_protocol::read::{Digest, Pagination};
     use rift_protocol::workspace::WorkspaceResourcePage;
+    use rift_tracing::{LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord};
     use rmcp::model::{ReadResourceResult, ResourceContents};
     use serde_json::{Value, json};
 
@@ -411,13 +411,9 @@ mod tests {
     /// Two stored records, the older one with object fields and the newer one with text.
     async fn stored_records() -> Vec<StoredLogRecord> {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        let database = rift_index::WorkspaceDatabase::open(
-            &directory.path().join("db"),
-            rift_index::DatabasePool::new(2, 1_000),
-        )
-        .await
-        .expect("the database opens");
-        let store = LogStore::attached(database);
+        let store = LogStore::open(&directory.path().join("metrics"), None)
+            .await
+            .expect("the metrics database opens");
         store
             .append(
                 &[
@@ -445,8 +441,9 @@ mod tests {
             .await
             .expect("the records land");
         store
-            .recent(&rift_index::LogQuery::newest(10))
-            .await
+            .reader()
+            .connect()
+            .and_then(|reads| reads.recent(&LogQuery::newest(10)))
             .expect("the read answers")
     }
 

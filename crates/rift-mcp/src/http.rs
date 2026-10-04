@@ -142,6 +142,7 @@ pub(crate) async fn serve_http_with_storage(
     checkout: BuildCheckout,
 ) -> Result<HttpServer, RiftError> {
     tracing::info!(component = "mcp", transport = "http", "MCP server starting");
+    let logs = storage.logs();
     let server = RiftMcp::build_with_storage(root, limits, storage, checkout).await?;
     let identity = server.product_identity().clone();
     let search_index = server.search_index_handle();
@@ -185,6 +186,7 @@ pub(crate) async fn serve_http_with_storage(
         supervisor: Some(supervisor),
         engines: Some(engines),
         search_index,
+        logs,
         repository_workspaces: None,
     })
 }
@@ -203,21 +205,27 @@ pub struct HttpServer {
     pub(crate) supervisor: Option<IndexSupervisor>,
     pub(crate) engines: Option<Arc<EngineHold>>,
     pub(crate) search_index: Option<Arc<rift_search::SearchIndex>>,
+    pub(crate) logs: Option<Arc<rift_tracing::LogStore>>,
     pub(crate) repository_workspaces: Option<Arc<RepositoryWorkspaceRegistry>>,
 }
 
 /// SQLite close held until process log writes finish.
 #[doc(hidden)]
-pub struct DeferredDatabaseShutdown(Option<Arc<SearchIndex>>);
+pub struct DeferredDatabaseShutdown(
+    Option<Arc<SearchIndex>>,
+    Option<Arc<rift_tracing::LogStore>>,
+);
 
 impl DeferredDatabaseShutdown {
-    /// Closes process-owned SQLite worker by shared stop deadline.
+    /// Closes the process-owned workspace database, then the metrics database, by the
+    /// shared stop deadline.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] if the SQLite worker fails or cannot stop before the deadline.
+    /// Returns [`RiftError`] if the SQLite worker or the metrics writer thread fails or
+    /// cannot stop before the deadline.
     pub async fn shutdown(self, deadline: Instant) -> Result<(), RiftError> {
-        match self.0 {
+        let database = match self.0 {
             Some(search_index) => search_index.shutdown(deadline).await.map_err(|error| {
                 errors::mcp::http_serve_failed()
                     .operation("SQLite worker shutdown")
@@ -225,7 +233,29 @@ impl DeferredDatabaseShutdown {
                     .error()
             }),
             None => Ok(()),
-        }
+        };
+        let logs = close_logs(self.1.as_deref(), deadline).await;
+        database.and(logs)
+    }
+}
+
+/// Closes the metrics database by `deadline`, when it opened.
+pub(crate) async fn close_logs(
+    logs: Option<&rift_tracing::LogStore>,
+    deadline: Instant,
+) -> Result<(), RiftError> {
+    match logs {
+        Some(logs) => logs
+            .close(deadline)
+            .await
+            .map(|_checkpoint| ())
+            .map_err(|error| {
+                errors::mcp::http_serve_failed()
+                    .operation("metrics database close")
+                    .cause(error)
+                    .error()
+            }),
+        None => Ok(()),
     }
 }
 
@@ -383,7 +413,7 @@ impl HttpServer {
         (
             deadline,
             stopped,
-            DeferredDatabaseShutdown(self.search_index),
+            DeferredDatabaseShutdown(self.search_index, self.logs),
         )
     }
 }
@@ -1056,6 +1086,7 @@ mod tests {
                     BTreeMap::new(),
                 ))),
                 search_index: None,
+                logs: None,
                 repository_workspaces: None,
             };
             let (occupied, ready) = tokio::sync::oneshot::channel();
@@ -1128,6 +1159,7 @@ mod tests {
                 BTreeMap::new(),
             ))),
             search_index: None,
+            logs: None,
             repository_workspaces: None,
         };
 
@@ -1186,6 +1218,7 @@ mod tests {
                 BTreeMap::new(),
             ))),
             search_index: None,
+            logs: None,
             repository_workspaces: None,
         };
 

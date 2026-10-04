@@ -28,6 +28,7 @@ rift-ranking = { path = "crates/rift-ranking" }
 rift-provider = { path = "crates/rift-provider" }
 rift-server = { path = "crates/rift-server" }
 rift-syntax = { path = "crates/rift-syntax" }
+rift-tracing = { path = "crates/rift-tracing" }
 
 anyhow = "1.0"
 proc-macro2 = "1.0.107"

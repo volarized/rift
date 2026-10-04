@@ -37,7 +37,6 @@ use crate::documentation_store::{
 };
 use crate::lexical::{LexicalDocumentRecord, LexicalFileRecord, LexicalIndexStateRecord};
 use crate::lexical::{MIGRATIONS, bound_as_usize, require_pragma_row};
-use crate::log::LogRecordRow;
 use crate::vector::VectorRecord;
 
 /// Suffix the migration lock file appends to the database file's whole name: the
@@ -160,8 +159,7 @@ impl WorkspaceDatabase {
                 DocumentationManifestRecord,
                 DocumentationSourceRecord,
                 DocumentationReferenceRecord,
-                VectorRecord,
-                LogRecordRow
+                VectorRecord
             ))
             .max_pool_size(bound_as_usize(pool.slots()))
             // The pool waits for a free slot without a bound unless told one ("Passing
@@ -498,7 +496,7 @@ mod tests {
 
     use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase, errors};
     use crate::lexical::{LexicalIndexLimits, LexicalSearchIndex};
-    use crate::log::LogRecordRow;
+    use crate::vector::VectorRecord;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -768,6 +766,41 @@ mod tests {
         assert_crash_recovery_matches_cold(&database_path).await
     }
 
+    /// The `sqlite_schema` rows a new workspace database holds, one block per row in
+    /// name order: `type`, `name`, `tbl_name`, then `sql`, bare where `SQLite` stores none.
+    const SCHEMA_BASELINE: &str = include_str!("../tests/fixtures/sqlite_schema.txt");
+
+    /// The schema rows of the file at `path`, rendered as [`SCHEMA_BASELINE`] spells them.
+    fn rendered_schema(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+        let connection = rusqlite::Connection::open(path)?;
+        let mut statement = connection
+            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name")?;
+        let rows = statement.query_map([], |row| {
+            let sql = row
+                .get::<_, Option<String>>(3)?
+                .map_or_else(String::new, |sql| format!(" {sql}"));
+            Ok(format!(
+                "type: {}\nname: {}\ntbl_name: {}\nsql:{sql}\n",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let blocks = rows.collect::<Result<Vec<String>, _>>()?;
+        Ok(blocks.join("\n"))
+    }
+
+    /// A new workspace database holds exactly the recorded tables, indexes, and triggers.
+    #[tokio::test]
+    async fn a_new_database_holds_the_recorded_schema() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("db");
+        let _database = WorkspaceDatabase::open(&path, pool()).await?;
+
+        assert_eq!(rendered_schema(&path)?, SCHEMA_BASELINE);
+        Ok(())
+    }
+
     /// The busy-wait budget of the one-slot pool a held-slot case reads from: the least
     /// `[search] busy_timeout` accepts.
     const HELD_POOL_BUSY_TIMEOUT_MS: u32 = 100;
@@ -782,12 +815,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
         let database = WorkspaceDatabase::open(&directory.path().join("db"), one_slot).await?;
-        let logs = crate::log::LogStore::attached(Arc::clone(&database));
         let held = database.connection().await?;
 
         let started = std::time::Instant::now();
-        let newest = crate::log::LogQuery::newest(1);
-        let refused = tokio::time::timeout(HELD_POOL_READ_MAX, logs.recent(&newest))
+        let refused = tokio::time::timeout(HELD_POOL_READ_MAX, database.connection())
             .await
             .map_err(|_elapsed| "the read kept waiting for the held slot past its budget")?;
         let waited = started.elapsed();
@@ -801,8 +832,9 @@ mod tests {
             "the read waits out the budget first: waited={waited:?}"
         );
         drop(held);
-        let released = logs.recent(&crate::log::LogQuery::newest(1)).await?;
-        assert!(released.is_empty(), "a freed slot serves the read again");
+        let mut released = database.connection().await?;
+        let vectors = VectorRecord::all().count().exec(&mut released).await?;
+        assert_eq!(vectors, 0, "a freed slot serves the read again");
         Ok(())
     }
 
@@ -841,7 +873,7 @@ mod tests {
         path: &Path,
     ) -> Result<(toasty::Db, toasty::db::Connection), Box<dyn std::error::Error>> {
         let mut builder = toasty::Db::builder();
-        builder.models(toasty::models!(LogRecordRow));
+        builder.models(toasty::models!(VectorRecord));
         let writer = builder.build(Sqlite::open(path)).await?;
         let mut writing = writer.connection().await?;
         toasty::sql::statement("BEGIN IMMEDIATE")
@@ -1158,15 +1190,12 @@ mod tests {
         let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
         let mut writing = database.writing().await?;
         let mut transaction = writing.transaction().await?;
-        LogRecordRow::create()
-            .id(1)
-            .recorded_at(1)
-            .level("info".to_owned())
-            .target("rift_index::database".to_owned())
-            .component("storage".to_owned())
-            .operation("database.test".to_owned())
-            .message("uncommitted".to_owned())
-            .fields("{}".to_owned())
+        VectorRecord::create()
+            .identity("uncommitted".to_owned())
+            .model("model".to_owned())
+            .digest("digest".to_owned())
+            .dimension(1)
+            .vector(vec![0_u8; 4])
             .exec(&mut transaction)
             .await?;
         let reader_database = Arc::clone(&database);
@@ -1175,7 +1204,7 @@ mod tests {
                 .connection()
                 .await
                 .expect("the read connection opens");
-            LogRecordRow::all()
+            VectorRecord::all()
                 .count()
                 .exec(&mut connection)
                 .await
@@ -1185,6 +1214,94 @@ mod tests {
         let visible = tokio::time::timeout(Duration::from_secs(1), reader).await??;
         assert_eq!(visible, 0, "a reader must see the last committed snapshot");
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Failure bound on one log write or read beside a held index transaction; never a
+    /// way to order two events.
+    const LOG_BESIDE_INDEX_MAX: Duration = Duration::from_secs(10);
+
+    fn log_record(message: &str) -> rift_tracing::LogRecord {
+        rift_tracing::LogRecord::new(
+            1,
+            "info",
+            "rift_index::tests",
+            "index",
+            "index.commit",
+            message,
+            "{}",
+        )
+    }
+
+    /// A log append and a log read on the metrics database complete while an index commit
+    /// is held open on the index database's worker, after its SQL ran and before `COMMIT`.
+    #[tokio::test]
+    async fn a_held_index_commit_delays_no_log_write_or_read() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let logs = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
+        let index =
+            LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+        let (started, release) = database.thread.hold_next_commit_for_test().await?;
+        let documents = crash_documents(true)?;
+        let commit = tokio::spawn(async move { index.replace_all(&documents, "held").await });
+        tokio::time::timeout(LOG_BESIDE_INDEX_MAX, started).await??;
+
+        tokio::time::timeout(
+            LOG_BESIDE_INDEX_MAX,
+            logs.append(&[log_record("beside")], 100),
+        )
+        .await
+        .map_err(|_elapsed| "the log append waited on the held index commit")??;
+        let read = logs
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(10))?;
+        assert_eq!(read.len(), 1);
+        assert!(!commit.is_finished(), "the index commit is still held");
+
+        release
+            .send(())
+            .map_err(|()| "the index worker dropped the hold")?;
+        tokio::time::timeout(LOG_BESIDE_INDEX_MAX, commit).await???;
+        Ok(())
+    }
+
+    /// Another connection's write lock on the index database delays no log write or read,
+    /// while an index write waits out its own busy timeout and refuses.
+    #[tokio::test]
+    async fn another_write_lock_on_the_index_delays_no_log_write_or_read() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let index_path = directory.path().join("db");
+        let database =
+            WorkspaceDatabase::open(&index_path, DatabasePool::new(4, HELD_POOL_BUSY_TIMEOUT_MS))
+                .await?;
+        let logs = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
+        let index =
+            LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
+        let (_writer, _writing) = hold_write_lock(&index_path).await?;
+
+        tokio::time::timeout(
+            LOG_BESIDE_INDEX_MAX,
+            logs.append(&[log_record("beside")], 100),
+        )
+        .await
+        .map_err(|_elapsed| "the log append waited on the index write lock")??;
+        let read = logs
+            .reader()
+            .connect()?
+            .recent(&rift_tracing::LogQuery::newest(10))?;
+        assert_eq!(read.len(), 1);
+        let refused = tokio::time::timeout(
+            LOG_BESIDE_INDEX_MAX,
+            index.replace_all(&crash_documents(true)?, "locked"),
+        )
+        .await
+        .map_err(|_elapsed| "the index write kept waiting past its own busy timeout")?;
+        assert!(
+            refused.is_err(),
+            "the index write meets the held lock and refuses"
+        );
         Ok(())
     }
 }

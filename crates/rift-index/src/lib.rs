@@ -10,7 +10,6 @@ mod documentation;
 mod documentation_store;
 mod language;
 mod lexical;
-mod log;
 mod semantic;
 mod trigram_store;
 
@@ -29,10 +28,6 @@ pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
 pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
-};
-pub use log::{
-    LOG_BATCH_RECORDS_MAX, LOG_FIELDS_BYTES_MAX, LOG_LABEL_BYTES_MAX, LOG_LEVELS,
-    LOG_MESSAGE_BYTES_MAX, LOG_PAGE_RECORDS_MAX, LogQuery, LogRecord, LogStore, StoredLogRecord,
 };
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;

@@ -1,11 +1,11 @@
-//! Recording the server's own diagnostics into the workspace database.
+//! Recording the server's own diagnostics into the metrics database.
 //!
 //! Stderr is where a `tracing` event goes by default, and the agent holding the
 //! MCP connection cannot read it: the server's terminal belongs to whoever
 //! started it. A request that refuses because the index will not settle
 //! therefore carries no way to find out why. The layer here copies every event
 //! the process filter admits into a bounded queue, and one drain task writes
-//! that queue into the workspace database, where `rift://logs` reads it back.
+//! that queue into the metrics database, where `rift://logs` reads it back.
 //!
 //! The queue is bounded and the send never blocks: a traced call site pays a
 //! `try_send`, and a full queue drops the record and counts it. Losing a record
@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rift_error::causes;
-use rift_index::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use rift_protocol::configuration::LogsConfiguration;
+use rift_tracing::{LOG_BATCH_RECORDS_MAX, LogRecord, LogStore};
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
@@ -50,25 +50,10 @@ const LOG_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Bytes of one span's own fields the close record keeps, at most. A longer set
 /// is cut at a character boundary, the way a message past
-/// [`rift_index::LOG_MESSAGE_BYTES_MAX`] is, and the bound leaves the close
+/// [`rift_tracing::LOG_MESSAGE_BYTES_MAX`] is, and the bound leaves the close
 /// record's `span` and `elapsed_ms` members room under
-/// [`rift_index::LOG_FIELDS_BYTES_MAX`].
+/// [`rift_tracing::LOG_FIELDS_BYTES_MAX`].
 const SPAN_FIELDS_BYTES_MAX: usize = 1 << 10;
-
-tokio::task_local! {
-    /// Set while the drain writes one batch. A record the write itself produces is not a
-    /// record of this workspace's own work: `[logs] capture` accepts any filter that parses,
-    /// so a filter admitting the storage driver's targets would otherwise make each batch
-    /// written produce the records of the next one. The marker is task-local and the write
-    /// runs on the drain's task alone, so an event another task emits during the write is
-    /// still recorded.
-    static WRITING_BATCH: ();
-}
-
-/// Whether this event came out of the drain's own write.
-fn inside_the_drains_write() -> bool {
-    WRITING_BATCH.try_with(|()| ()).is_ok()
-}
 
 /// One record on its way to the drain, under the sequence the sink stamped on it.
 ///
@@ -204,9 +189,6 @@ impl LogSink {
     /// The record takes its sequence before the send, and a send that finds no room finishes
     /// it again: a read waiting on the sequence must never wait for a record no drain sees.
     fn send(&self, record: LogRecord) {
-        if inside_the_drains_write() {
-            return;
-        }
         let sequence = self.settlement.accept();
         match self.sender.try_send(QueuedRecord { sequence, record }) {
             Err(TrySendError::Full(_)) => {
@@ -329,10 +311,7 @@ impl LogDrain {
 
     async fn write_batch(&self, store: &LogStore, batch: &[LogRecord], retention_records: u64) {
         for attempt in 1..=LOG_WRITE_ATTEMPTS_MAX {
-            match WRITING_BATCH
-                .scope((), store.append(batch, retention_records))
-                .await
-            {
+            match store.append(batch, retention_records).await {
                 Ok(_dropped) => return,
                 Err(error) if attempt == LOG_WRITE_ATTEMPTS_MAX => {
                     self.dropped
@@ -743,9 +722,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use rift_index::{
-        DatabasePool, LOG_BATCH_RECORDS_MAX, LogQuery, LogRecord, LogStore, WorkspaceDatabase,
-    };
+    use rift_tracing::{LOG_BATCH_RECORDS_MAX, LogQuery, LogRecord, LogStore};
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -802,47 +779,40 @@ mod tests {
         );
     }
 
-    /// A record the queue had no room for settles as it is accepted, so a read never waits out
-    /// the bound for a record no drain will ever see.
-    /// A record the drain's own write produced is not a record. `[logs] capture` accepts any
-    /// filter that parses, and one admitting the storage driver made each batch written produce
-    /// the records of the next, so the queue dropped the diagnostics the operator wanted.
+    /// The log write emits no record. Under a capture filter that admits every target at
+    /// `trace`, appends and a close on the metrics database leave the queue holding only the
+    /// record the test emitted: no write of a batch produces the records of the next one.
     #[tokio::test]
-    async fn a_record_the_drains_write_produced_is_not_queued() {
-        let (sink, mut drain) = log_capture();
-        super::WRITING_BATCH
-            .scope((), async {
-                sink.send(record("the storage driver wrote a batch"));
-            })
-            .await;
-        assert!(
-            queued(&mut drain).is_empty(),
-            "the write's own record stays out of the queue it is draining"
-        );
-        assert_eq!(
-            sink.settlement.accepted.load(Ordering::SeqCst),
-            0,
-            "a record the lane never takes advances no sequence"
-        );
-    }
+    async fn a_log_write_emits_no_record() {
+        use tracing_subscriber::Layer as _;
 
-    /// The marker is task-local, so a record another task emits while the drain writes is still
-    /// recorded: the lane suppresses its own writes, not the workspace's work.
-    #[tokio::test]
-    async fn a_record_from_another_task_during_the_write_is_queued() {
         let (sink, mut drain) = log_capture();
-        let emitter = sink.clone();
-        super::WRITING_BATCH
-            .scope((), async move {
-                tokio::spawn(async move { emitter.send(record("the index left a file out")) })
-                    .await
-                    .expect("the emitting task runs");
-            })
-            .await;
+        let subscriber = tracing_subscriber::registry()
+            .with(sink.with_filter(tracing_subscriber::EnvFilter::new("trace")));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this case owns the process's subscriber");
+        let (_directory, store) = store().await;
+
+        tracing::info!(component = "logs", "emitted by the test");
+        for index in 0..4 {
+            store
+                .append(&[record(&format!("batch {index}"))], 10_000)
+                .await
+                .expect("the batch lands");
+        }
+        store
+            .close(tokio::time::Instant::now() + LOG_SETTLE_TIMEOUT)
+            .await
+            .expect("the store closes");
+
+        let records = queued(&mut drain);
         assert_eq!(
-            queued(&mut drain).len(),
-            1,
-            "another task's record is unaffected by the drain's write"
+            records
+                .iter()
+                .map(rift_tracing::LogRecord::message)
+                .collect::<Vec<_>>(),
+            ["emitted by the test"],
+            "the queue holds only what the test emitted"
         );
     }
 
@@ -870,7 +840,7 @@ mod tests {
         }
         drain.write_turn(&store, &mut batch, 10_000).await;
         assert_eq!(
-            store.count().await.expect("the count reads"),
+            count(&store),
             9,
             "the first turn writes its records and one drop notice"
         );
@@ -979,7 +949,7 @@ mod tests {
     use tracing_subscriber::util::SubscriberInitExt;
 
     /// Drains what the queue currently holds, without a store.
-    fn queued(drain: &mut super::LogDrain) -> Vec<rift_index::LogRecord> {
+    fn queued(drain: &mut super::LogDrain) -> Vec<rift_tracing::LogRecord> {
         let mut records = Vec::new();
         while let Ok(record) = drain.receiver.try_recv() {
             records.push(record.record);
@@ -1001,11 +971,19 @@ mod tests {
 
     async fn store() -> (tempfile::TempDir, Arc<LogStore>) {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        let database =
-            WorkspaceDatabase::open(&directory.path().join("db"), DatabasePool::new(4, 1_000))
-                .await
-                .expect("the database opens");
-        (directory, Arc::new(LogStore::attached(database)))
+        let store = LogStore::open(&directory.path().join("metrics"), None)
+            .await
+            .expect("the metrics database opens");
+        (directory, Arc::new(store))
+    }
+
+    /// How many records `store` holds, read on a connection of its own.
+    fn count(store: &LogStore) -> u64 {
+        store
+            .reader()
+            .connect()
+            .and_then(|reads| reads.count())
+            .expect("the count reads")
     }
 
     #[test]
@@ -1033,7 +1011,7 @@ mod tests {
 
     /// The records a case cares about: the events, without the span-close
     /// records the layer writes when a span ends.
-    fn events(records: Vec<rift_index::LogRecord>) -> Vec<rift_index::LogRecord> {
+    fn events(records: Vec<rift_tracing::LogRecord>) -> Vec<rift_tracing::LogRecord> {
         records
             .into_iter()
             .filter(|record| !record.fields().contains("\"span\":\"closed\""))
@@ -1091,7 +1069,7 @@ mod tests {
     }
 
     /// The one span-close record a case wrote.
-    fn closed(records: Vec<rift_index::LogRecord>) -> rift_index::LogRecord {
+    fn closed(records: Vec<rift_tracing::LogRecord>) -> rift_tracing::LogRecord {
         records
             .into_iter()
             .find(|record| record.fields().contains("\"span\":\"closed\""))
@@ -1219,7 +1197,7 @@ mod tests {
 
         drain.run(Arc::clone(&store), 10_000, cancellation).await;
 
-        assert_eq!(store.count().await.expect("the count reads"), 3);
+        assert_eq!(count(&store), 3);
     }
 
     #[tokio::test]
@@ -1234,13 +1212,11 @@ mod tests {
 
         drain.run(Arc::clone(&store), 10_000, cancellation).await;
 
-        assert_eq!(
-            store.count().await.expect("the count reads"),
-            (LOG_QUEUE_RECORDS + 1) as u64
-        );
+        assert_eq!(count(&store), (LOG_QUEUE_RECORDS + 1) as u64);
         let latest = store
-            .recent(&LogQuery::newest(1))
-            .await
+            .reader()
+            .connect()
+            .and_then(|reads| reads.recent(&LogQuery::newest(1)))
             .expect("the latest record reads");
         assert_eq!(
             latest[0].record().message(),
@@ -1261,7 +1237,7 @@ mod tests {
             drain.dropped.load(Ordering::Relaxed),
             oversized.len() as u64
         );
-        assert_eq!(store.count().await.expect("the count reads"), 0);
+        assert_eq!(count(&store), 0);
     }
 
     #[test]

@@ -1,15 +1,18 @@
-//! The serving process's one handle on the workspace database at `.rift/db`.
+//! The serving process's handles on the workspace's databases below `.rift`.
 //!
-//! Every store in that file attaches to this owner. Opening a store never opens the file,
-//! and an open failure never deletes it: the database contains recorded diagnostics as well
-//! as derived search rows.
+//! The metrics database at `.rift/metrics` holds the server's own log records; the
+//! workspace database at `.rift/db` holds the search rows. Each opens on its own, so one
+//! that fails leaves the other serving, and an open failure never deletes a file.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+use rift_core::constants::{
+    METRICS_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME,
+};
 use rift_error::causes;
-use rift_index::{DatabasePool, LogStore, WorkspaceDatabase};
+use rift_index::{DatabasePool, WorkspaceDatabase};
+use rift_tracing::{LogReader, LogStore};
 
 /// One serving process's storage handles for a workspace.
 #[derive(Clone, Debug)]
@@ -20,9 +23,10 @@ pub struct WorkspaceStorage {
 }
 
 impl WorkspaceStorage {
-    /// Opens the workspace database once and attaches every store to it.
+    /// Opens the metrics database, then the workspace database.
     ///
-    /// A database failure leaves both handles absent so identifier search can still serve.
+    /// A failure leaves that one handle absent: without the workspace database identifier
+    /// search still serves, and without the metrics database the run records nothing.
     /// The existing file stays in place for inspection and recovery.
     ///
     /// # Cancel safety
@@ -35,8 +39,8 @@ impl WorkspaceStorage {
 
     /// Opens storage only while this process holds the workspace election.
     ///
-    /// The SQLite worker keeps the guard until it exits, including after cancellation
-    /// or a shutdown timeout.
+    /// The SQLite worker and the metrics writer thread each keep the guard until they
+    /// exit, including after cancellation or a shutdown timeout.
     ///
     /// # Errors
     ///
@@ -50,7 +54,10 @@ impl WorkspaceStorage {
         Ok(Self::open_with_owner(root, Some(guard)).await)
     }
 
-    /// Opens workspace storage with an owner held by its SQLite worker until it ends.
+    /// Opens workspace storage with an owner held by each database thread until it ends.
+    ///
+    /// The metrics database opens first, so the workspace database's open lands as a
+    /// record.
     pub(crate) async fn open_with_owner(
         root: &Path,
         election: Option<Arc<crate::ElectionGuard>>,
@@ -59,10 +66,14 @@ impl WorkspaceStorage {
             let owner: Arc<dyn Send + Sync> = Arc::<crate::ElectionGuard>::clone(guard);
             owner
         });
-        let database = open_workspace_database(root, owner).await;
-        let logs = database
-            .as_ref()
-            .map(|database| Arc::new(LogStore::attached(Arc::clone(database))));
+        let (logs, database) = match state_directory(root).await {
+            Some(state_directory) => {
+                let logs = open_log_store(&state_directory, owner.clone()).await;
+                let database = open_workspace_database(root, &state_directory, owner).await;
+                (logs, database)
+            }
+            None => (None, None),
+        };
         Self {
             database,
             logs,
@@ -82,10 +93,22 @@ impl WorkspaceStorage {
         self.database.as_ref().map(Arc::clone)
     }
 
-    /// The recorded diagnostics store, when the database opened.
+    /// The recorded diagnostics store, when the metrics database opened.
     #[must_use]
     pub fn logs(&self) -> Option<Arc<LogStore>> {
         self.logs.as_ref().map(Arc::clone)
+    }
+
+    /// A reader of this workspace's metrics database, when the file exists.
+    ///
+    /// Nothing is opened or created: no writer thread starts, no schema changes, and no
+    /// state directory appears. The reader needs no server and no valid `rift.toml`.
+    #[must_use]
+    pub fn open_logs(root: &Path) -> Option<LogReader> {
+        let path = root
+            .join(RIFT_STATE_DIRECTORY)
+            .join(METRICS_DATABASE_FILE_NAME);
+        path.exists().then(|| LogReader::new(&path))
     }
 }
 
@@ -99,27 +122,55 @@ fn configured_pool(root: &Path) -> DatabasePool {
     .memory_mapped(search.lexical.mmap_size.bytes())
 }
 
-/// Opens the file without replacing a failed database.
-async fn open_workspace_database(
-    root: &Path,
-    owner: Option<Arc<dyn Send + Sync>>,
-) -> Option<Arc<WorkspaceDatabase>> {
+/// The workspace state directory, created when absent; `None` when it cannot be.
+async fn state_directory(root: &Path) -> Option<std::path::PathBuf> {
     let state_directory = root.join(RIFT_STATE_DIRECTORY);
     match tokio::fs::create_dir(&state_directory).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Ok(()) => Some(state_directory),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Some(state_directory),
         Err(error) => {
             tracing::warn!(
                 component = "storage",
                 operation = "database.open",
                 path = %state_directory.display(),
                 error = %error,
-                "could not create the workspace state directory; the server starts without the \
-                 workspace database"
+                "could not create the workspace state directory; the server starts without its \
+                 databases"
             );
-            return None;
+            None
         }
     }
+}
+
+/// Opens the metrics database without replacing a failed file.
+async fn open_log_store(
+    state_directory: &Path,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Option<Arc<LogStore>> {
+    let metrics_path = state_directory.join(METRICS_DATABASE_FILE_NAME);
+    match LogStore::open(&metrics_path, owner).await {
+        Ok(logs) => Some(Arc::new(logs)),
+        Err(error) => {
+            let causes = causes(&error).join(": ");
+            tracing::warn!(
+                component = "storage",
+                operation = "database.open",
+                path = %metrics_path.display(),
+                error = %error,
+                causes,
+                "the metrics database failed to open; the server starts without recorded logs"
+            );
+            None
+        }
+    }
+}
+
+/// Opens the workspace database without replacing a failed file.
+async fn open_workspace_database(
+    root: &Path,
+    state_directory: &Path,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> Option<Arc<WorkspaceDatabase>> {
     let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
     match WorkspaceDatabase::open_with_owner(&database_path, configured_pool(root), owner).await {
         Ok(database) => Some(database),
@@ -176,6 +227,50 @@ mod tests {
         );
     }
 
+    /// Logs record and answer while the workspace database is refused: the metrics
+    /// database opens on its own.
+    #[tokio::test]
+    async fn a_refused_workspace_database_leaves_the_logs_recording() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database_path = directory
+            .path()
+            .join(RIFT_STATE_DIRECTORY)
+            .join(WORKSPACE_DATABASE_FILE_NAME);
+        std::fs::create_dir_all(&database_path).expect("a directory occupies the database path");
+
+        let storage = WorkspaceStorage::open(directory.path()).await;
+
+        assert!(storage.database.is_none());
+        let logs = storage
+            .logs()
+            .expect("the metrics database opens on its own");
+        let record = rift_tracing::LogRecord::new(
+            1,
+            "warn",
+            "rift",
+            "storage",
+            "database.open",
+            "refused",
+            "{}",
+        );
+        logs.append(&[record], 10).await.expect("the record lands");
+        let reader =
+            WorkspaceStorage::open_logs(directory.path()).expect("the metrics file exists");
+        let read = reader
+            .connect()
+            .and_then(|reads| reads.recent(&rift_tracing::LogQuery::newest(10)))
+            .expect("the record reads back");
+        assert_eq!(read.len(), 1);
+    }
+
+    #[test]
+    fn a_workspace_without_a_metrics_database_has_no_log_reader() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+
+        assert!(WorkspaceStorage::open_logs(directory.path()).is_none());
+        assert!(!directory.path().join(RIFT_STATE_DIRECTORY).exists());
+    }
+
     #[tokio::test]
     async fn elected_storage_refuses_another_workspaces_guard_before_opening() {
         let held = tempfile::tempdir().expect("held workspace");
@@ -192,6 +287,7 @@ mod tests {
                 .any(|(key, value)| key == "operation" && value == "validate workspace election")
         );
         assert!(!requested.path().join(".rift/db").exists());
+        assert!(!requested.path().join(".rift/metrics").exists());
     }
 
     #[test]
