@@ -615,23 +615,27 @@ async fn await_serving<Spawned>(
 where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
 {
-    await_serving_with_probe(root, attempt_count, stale_bytes, spawns, launch, probe).await
+    await_serving_with_probe(root, attempt_count, stale_bytes, spawns, launch, |root| {
+        std::future::ready(probe(root))
+    })
+    .await
 }
 
-async fn await_serving_with_probe<Spawned>(
+async fn await_serving_with_probe<Spawned, Observation>(
     root: &Path,
     attempt_count: u32,
     stale_bytes: Option<&[u8]>,
     spawns: &mut StartSpawns<Spawned>,
     mut launch: impl FnMut() -> io::Result<Spawned>,
-    mut observe: impl FnMut(&Path) -> ServerPresence,
+    mut observe: impl FnMut(&Path) -> Observation,
 ) -> Result<ServerOutcome, RiftError>
 where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
+    Observation: std::future::Future<Output = ServerPresence>,
 {
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
-        let presence = observe(root);
+        let presence = observe(root).await;
         let election_held = presence.election_held();
         let serving = match presence {
             ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(lock),
@@ -669,7 +673,7 @@ where
     }
     // A holder that has not published is starting, whether the document is
     // absent or still the pre-spawn leftover it has yet to scrub.
-    let presence = observe(root);
+    let presence = observe(root).await;
     let holder_unpublished = matches!(presence, ServerPresence::Starting)
         || (presence.election_held() && leftover_unscrubbed(root, stale_bytes));
     if holder_unpublished {
@@ -714,19 +718,25 @@ async fn await_election_released(
     pid: u32,
     attempt_count: u32,
 ) -> Result<(), RiftError> {
-    await_election_released_with_probe(root, pid, attempt_count, probe).await
+    await_election_released_with_probe(root, pid, attempt_count, |root| {
+        std::future::ready(probe(root))
+    })
+    .await
 }
 
-async fn await_election_released_with_probe(
+async fn await_election_released_with_probe<Observation>(
     root: &Path,
     pid: u32,
     attempt_count: u32,
-    mut observe: impl FnMut(&Path) -> ServerPresence,
-) -> Result<(), RiftError> {
+    mut observe: impl FnMut(&Path) -> Observation,
+) -> Result<(), RiftError>
+where
+    Observation: std::future::Future<Output = ServerPresence>,
+{
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     let mut process = ProcessExit::open(pid);
     for _ in 0..attempt_count {
-        if process.exited() || !observe(root).election_held() {
+        if process.exited() || !observe(root).await.election_held() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1156,19 +1166,25 @@ async fn await_stopped(
     process: ProcessExit,
     attempt_count: u32,
 ) -> Result<(), RiftError> {
-    await_stopped_with_probe(root, holder, process, attempt_count, probe).await
+    await_stopped_with_probe(root, holder, process, attempt_count, |root| {
+        std::future::ready(probe(root))
+    })
+    .await
 }
 
-async fn await_stopped_with_probe(
+async fn await_stopped_with_probe<Observation>(
     root: &Path,
     holder: ServerLock,
     mut process: ProcessExit,
     attempt_count: u32,
-    mut observe: impl FnMut(&Path) -> ServerPresence,
-) -> Result<(), RiftError> {
+    mut observe: impl FnMut(&Path) -> Observation,
+) -> Result<(), RiftError>
+where
+    Observation: std::future::Future<Output = ServerPresence>,
+{
     let deadline = tokio::time::Instant::now() + poll_window(attempt_count);
     for _ in 0..attempt_count {
-        if process.exited() || !observe(root).election_held() {
+        if process.exited() || !observe(root).await.election_held() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1456,7 +1472,7 @@ mod tests {
     use std::future::IntoFuture as _;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         AuthMode, ChildWatch, LogLevel, LogsMode, PRESENCE_POLL_INTERVAL, ProcessExit,
@@ -1525,37 +1541,19 @@ mod tests {
 
     /// Probes the slow-probe cases allow: a one-second window at the poll interval.
     const SLOW_PROBE_ATTEMPT_COUNT: u32 = 10;
-    /// Duration each test observation blocks before returning a held election.
+    /// Duration each test observation advances before returning a held election.
     const SLOW_PROBE_COST: std::time::Duration = std::time::Duration::from_millis(300);
 
-    fn slow_port_probe(
+    async fn slow_port_probe(
         pid: u32,
-        observations: std::sync::Arc<AtomicUsize>,
-    ) -> impl FnMut(&std::path::Path) -> rift_mcp::ServerPresence {
-        move |_| {
-            observations.fetch_add(1, Ordering::Relaxed);
-            std::thread::sleep(SLOW_PROBE_COST);
-            rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { pid })
-        }
-    }
-
-    fn assert_probe_wait_within_window(
-        what: &str,
-        waited: std::time::Duration,
-        probe_count: usize,
-        max_probe_count: usize,
-    ) {
-        let window = PRESENCE_POLL_INTERVAL * SLOW_PROBE_ATTEMPT_COUNT;
-        let allowed = window + SLOW_PROBE_COST * 3;
-        assert!(
-            waited <= allowed,
-            "{what} must end inside its window however long each probe takes: \
-             waited={waited:?}, window={window:?}, probe_cost={SLOW_PROBE_COST:?}, allowed={allowed:?}"
-        );
-        assert!(
-            (2..=max_probe_count).contains(&probe_count),
-            "{what} made {probe_count} probes, expected between 2 and {max_probe_count}"
-        );
+        observations: &std::cell::RefCell<Vec<std::time::Duration>>,
+        started: tokio::time::Instant,
+    ) -> rift_mcp::ServerPresence {
+        observations.borrow_mut().push(started.elapsed());
+        // Advancing the paused clock proves the polling window independently of
+        // how long an OS sleep takes (issue #536).
+        tokio::time::advance(SLOW_PROBE_COST).await;
+        rift_mcp::ServerPresence::Stale(StaleReason::PortUnreachable { pid })
     }
 
     /// A stand-in for the spawned server: running until told otherwise, and
@@ -2428,28 +2426,27 @@ mod tests {
     }
 
     /// A stop wait with slow probes ends inside its polling window.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stop_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
         let process = ProcessExit::open(pid);
-        let probe_count = Arc::new(AtomicUsize::new(0));
-        let started = std::time::Instant::now();
+        let probe_times = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
         let error = await_stopped_with_probe(
             directory.path(),
             holder(),
             process,
             SLOW_PROBE_ATTEMPT_COUNT,
-            slow_port_probe(pid, Arc::clone(&probe_count)),
+            |_| slow_port_probe(pid, &probe_times, started),
         )
         .await
         .expect_err("a held election times the stop wait out");
-        assert_probe_wait_within_window(
-            "the stop wait",
-            started.elapsed(),
-            probe_count.load(Ordering::Relaxed),
-            SLOW_PROBE_ATTEMPT_COUNT as usize,
+        assert_eq!(
+            *probe_times.borrow(),
+            [0, 400, 800].map(std::time::Duration::from_millis),
         );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(1100));
         assert!(
             error.slug() == errors::cli::server_stop_timed_out::SLUG,
             "{error:?}"
@@ -2458,26 +2455,25 @@ mod tests {
     }
 
     /// The wait for a holder to release its election ends at its window under slow probes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_election_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
         let pid = std::process::id();
-        let probe_count = Arc::new(AtomicUsize::new(0));
-        let started = std::time::Instant::now();
+        let probe_times = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
         let error = await_election_released_with_probe(
             directory.path(),
             pid,
             SLOW_PROBE_ATTEMPT_COUNT,
-            slow_port_probe(pid, Arc::clone(&probe_count)),
+            |_| slow_port_probe(pid, &probe_times, started),
         )
         .await
         .expect_err("a held election times the wait out");
-        assert_probe_wait_within_window(
-            "the election wait",
-            started.elapsed(),
-            probe_count.load(Ordering::Relaxed),
-            SLOW_PROBE_ATTEMPT_COUNT as usize,
+        assert_eq!(
+            *probe_times.borrow(),
+            [0, 400, 800].map(std::time::Duration::from_millis),
         );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(1100));
         assert!(
             error.slug() == errors::cli::server_election_unreleased::SLUG,
             "{error:?}"
@@ -2487,28 +2483,27 @@ mod tests {
 
     /// The start wait ends at its window under slow probes, and its closing probe is the
     /// one probe it adds past the window.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_start_wait_ends_at_its_window_when_every_probe_is_slow() -> TestResult {
         let directory = tempfile::tempdir()?;
         let mut spawns = StartSpawns::<FakeChild>::default();
-        let probe_count = Arc::new(AtomicUsize::new(0));
-        let started = std::time::Instant::now();
+        let probe_times = std::cell::RefCell::new(Vec::new());
+        let started = tokio::time::Instant::now();
         let error = await_serving_with_probe(
             directory.path(),
             SLOW_PROBE_ATTEMPT_COUNT,
             None,
             &mut spawns,
             no_launch,
-            slow_port_probe(std::process::id(), Arc::clone(&probe_count)),
+            |_| slow_port_probe(std::process::id(), &probe_times, started),
         )
         .await
         .expect_err("a held election whose port does not answer never serves this start");
-        assert_probe_wait_within_window(
-            "the start wait",
-            started.elapsed(),
-            probe_count.load(Ordering::Relaxed),
-            SLOW_PROBE_ATTEMPT_COUNT as usize + 1,
+        assert_eq!(
+            *probe_times.borrow(),
+            [0, 400, 800, 1100].map(std::time::Duration::from_millis),
         );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(1400));
         assert!(
             error.slug() == errors::cli::server_start_timed_out::SLUG,
             "{error:?}"

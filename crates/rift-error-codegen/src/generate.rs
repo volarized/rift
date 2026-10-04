@@ -68,21 +68,18 @@ pub(crate) fn generate(registry: &ir::Registry) -> Result<String, CodegenError> 
     let has_source = fields
         .iter()
         .any(|field| matches!(field.role, Some(schema::FieldRole::Source)));
-    let mut import_paths = vec![
-        ("rift_error", "BuilderCore", None),
-        ("rift_error", "ErrorContext", None),
-        ("rift_error", "ErrorSlug", None),
-        ("rift_error", "EvidenceFor", None),
-        ("rift_error", "IntoRiftError", None),
-        ("rift_error", "RiftError", None),
-        ("std", "marker::PhantomData", None),
-    ];
+    let mut import_paths = vec![("rift_error", "__rift_error_definition", None)];
     if has_fields {
         import_paths.push(("rift_error", "ErrorValue", None));
     }
     if has_required {
         import_paths.push(("rift_error", "Set", Some("SetState")));
-        import_paths.push(("rift_error", "Unset", None));
+    }
+    if fields
+        .iter()
+        .any(|field| field.field_type == schema::FieldType::RiftError)
+    {
+        import_paths.push(("rift_error", "IntoRiftError", None));
     }
     if has_display {
         import_paths.push(("std", "fmt::Display", None));
@@ -200,20 +197,12 @@ fn scope_import_names(node: &Node<'_>) -> BTreeSet<&'static str> {
 }
 
 fn error_import_names(error: &ir::Error) -> BTreeSet<&'static str> {
-    let mut names = BTreeSet::from([
-        "BuilderCore",
-        "ErrorContext",
-        "ErrorSlug",
-        "EvidenceFor",
-        "IntoRiftError",
-        "PhantomData",
-        "RiftError",
-    ]);
+    let mut names = BTreeSet::from(["__rift_error_definition"]);
     if !error.fields.is_empty() {
         names.insert("ErrorValue");
     }
     if error.fields.iter().any(|field| !field.optional) {
-        names.extend(["SetState", "Unset"]);
+        names.insert("SetState");
     }
     for field in &error.fields {
         add_bound_imports(&mut names, field);
@@ -271,175 +260,33 @@ fn render_error(error: &ir::Error) -> TokenStream {
     let state_names = (0..required.len())
         .map(|index| format_ident!("State{index}"))
         .collect::<Vec<_>>();
-    let initial_states = vec![quote! { Unset }; required.len()];
     let complete_states = vec![quote! { SetState }; required.len()];
-    let all_state_args = generic_args(&state_names);
-    let builder_generics = generic_decl(&state_names);
-    let defaults = generic_defaults(&state_names);
-    let phantom = phantom_type(&state_names);
-    let initial_builder = builder_type(&initial_states);
-    let complete_builder = builder_type(&complete_states);
-
     let field_count = fields.len();
-    let error_imports = super_imports(&error_import_names(error));
-    let ambient_methods = quote! {
-        #[must_use]
-        pub fn with(mut self, context: ErrorContext) -> Self {
-            self.core.with(context);
-            self
-        }
-        pub fn evidence<E, O>(self, evidence: E) -> O
-        where E: EvidenceFor<Self, O, EvidenceTag>
-        {
-            evidence.apply_evidence(self)
-        }
+    let mut names = error_import_names(error);
+    names.remove("__rift_error_definition");
+    let error_imports = if names.is_empty() {
+        quote! {}
+    } else {
+        super_imports(&names)
     };
-    let field_modules = fields
+    let field_descriptors = fields
         .iter()
         .enumerate()
-        .map(|(index, field)| render_field(error, field, index, &required, &state_names));
-    let setters = fields.iter().map(|field| {
-        let name = ident(&field.name);
-        let field_module = ident(&field.name);
-        let bound = setter_bound(field);
-        let optional_setter = if field.optional {
-            let maybe_name = format_ident!("maybe_{}", field.name);
-            quote! {
-                pub fn #maybe_name<T>(
-                    self,
-                    value: Option<T>,
-                ) -> <#field_module::Field as #field_module::SetOptional<Self>>::Output
-                where T: #bound
-                {
-                    <#field_module::Field as #field_module::SetOptional<Self>>::set_optional(
-                        self,
-                        #field_module::optional_value(value),
-                    )
-                }
-            }
-        } else {
-            quote! {}
-        };
-        quote! {
-            pub fn #name<T>(
-                self,
-                value: T,
-            ) -> <#field_module::Field as #field_module::Set<Self>>::Output
-            where T: #bound
-            {
-                <#field_module::Field as #field_module::Set<Self>>::set(
-                    self,
-                    #field_module::value(value),
-                )
-            }
-            #optional_setter
-        }
-    });
-
-    let builder_def = if state_names.is_empty() {
-        quote! {
-            pub struct Builder {
-                pub(super) core: BuilderCore,
-                pub(super) marker: PhantomData<()>,
-            }
-        }
-    } else {
-        quote! {
-            pub struct Builder #defaults {
-                pub(super) core: BuilderCore,
-                pub(super) marker: PhantomData<#phantom>,
-            }
-        }
-    };
-    let alias_input = quote! { pub type EvidenceInput = #initial_builder; };
-    let alias_output = quote! { pub type EvidenceOutput = #complete_builder; };
-    let function_builder = if state_names.is_empty() {
-        quote! { #function::Builder }
-    } else {
-        quote! { #function::Builder<#(#initial_states),*> }
-    };
-    let builder_impl = if state_names.is_empty() {
-        quote! { impl Builder {
-            #(#setters)*
-            #ambient_methods
-        } }
-    } else {
-        quote! { impl #builder_generics Builder<#(#all_state_args),*> {
-            #(#setters)*
-            #ambient_methods
-        } }
-    };
-    let finish = quote! {
-        fn finish(self) -> RiftError {
-            self.core.finish()
-        }
-    };
-    let terminal = if state_names.is_empty() {
-        quote! {
-            impl Builder {
-                #[must_use]
-                pub fn error(self) -> RiftError { self.finish() }
-                /// Return this registered error as a failed result.
-                ///
-                /// # Errors
-                ///
-                /// Always returns this registered error.
-                pub fn fail<T>(self) -> Result<T, RiftError> { Err(self.finish()) }
-                #finish
-            }
-            impl IntoRiftError for Builder {
-                fn into_rift_error(self) -> RiftError { self.finish() }
-            }
-        }
-    } else {
-        quote! {
-            impl Builder<#(#complete_states),*> {
-                #[must_use]
-                pub fn error(self) -> RiftError { self.finish() }
-                /// Return this registered error as a failed result.
-                ///
-                /// # Errors
-                ///
-                /// Always returns this registered error.
-                pub fn fail<T>(self) -> Result<T, RiftError> { Err(self.finish()) }
-                #finish
-            }
-            impl IntoRiftError for Builder<#(#complete_states),*> {
-                fn into_rift_error(self) -> RiftError { self.finish() }
-            }
-        }
-    };
-    let function_body = quote! {
-        #[must_use]
-        pub fn #function() -> #function_builder {
-            #function::Builder {
-                core: BuilderCore::new(ErrorSlug::new(#slug), #message, #action, #field_count),
-                marker: PhantomData,
-            }
-        }
-    };
-    let _ = &function_builder;
+        .map(|(index, field)| render_field(field, index, &required, &state_names));
     quote! {
-        #[allow(non_camel_case_types, missing_docs, unused_parens)]
-        pub mod #function {
-            #error_imports
-            pub use super::{FieldSet, OptionalFieldSet};
-            /// Stable registry identity for this error.
-            pub const SLUG: ErrorSlug = ErrorSlug::new(#slug);
-            pub struct EvidenceTag;
-            #builder_def
-            #alias_input
-            #alias_output
-            #(#field_modules)*
-            #builder_impl
-            #terminal
+        __rift_error_definition! {
+            error #function;
+            imports { #error_imports }
+            metadata [#slug, #message, #action, #field_count];
+            builder Builder;
+            states [#(#state_names),*];
+            complete [#(#complete_states),*];
+            fields { #(#field_descriptors)* }
         }
-        #function_body
     }
 }
 
 fn render_field(
-    error: &ir::Error,
     field: &ir::Field,
     index: usize,
     required: &[&ir::Field],
@@ -451,11 +298,7 @@ fn render_field(
     let sensitive = field.sensitive;
     let key = &field.name;
     let bound = setter_bound(field);
-    let value = conversion(field);
-    let optional_value = quote! { value.map(self::value) };
-    let target_states = generic_args(state_names);
-    let target = builder_type(&target_states);
-    let input_generics = generic_decl(state_names);
+    let conversion = conversion(field);
     let output_states = required
         .iter()
         .enumerate()
@@ -468,117 +311,30 @@ fn render_field(
             }
         })
         .collect::<Vec<_>>();
-    let output = builder_type(&output_states);
-    let output_value = builder_value_type(&output_states);
-    let implementation = if state_names.is_empty() {
-        quote! { impl Set<Builder> for Field {
-            type Output = Builder;
-            fn set(mut target: Builder, value: ErrorValue) -> Self::Output {
-                target.core.set(#index as usize, #key, value, #display, #sensitive);
-                target
-            }
-        } }
-    } else {
-        quote! { impl #input_generics Set<#target> for Field {
-            type Output = #output;
-            fn set(mut target: #target, value: ErrorValue) -> Self::Output {
-                target.core.set(#index as usize, #key, value, #display, #sensitive);
-                #output_value { core: target.core, marker: PhantomData }
-            }
-        } }
-    };
-    let optional_impl = if field.optional {
-        if state_names.is_empty() {
-            quote! { impl SetOptional<Builder> for Field {
-                type Output = Builder;
-                fn set_optional(mut target: Builder, value: Option<ErrorValue>) -> Self::Output {
-                    target.core.set_optional(#index as usize, #key, value, #display, #sensitive);
-                    target
-                }
-            } }
-        } else {
-            quote! { impl #input_generics SetOptional<#target> for Field {
-                type Output = #target;
-                fn set_optional(mut target: #target, value: Option<ErrorValue>) -> Self::Output {
-                    target.core.set_optional(#index as usize, #key, value, #display, #sensitive);
-                    target
-                }
-            } }
-        }
+    let optional = if field.optional {
+        let maybe_name = format_ident!("maybe_{}", field.name);
+        quote! { #maybe_name }
     } else {
         quote! {}
     };
-    let _ = error;
     let mut imports = BTreeSet::from(["Builder", "ErrorValue"]);
-    if !required.is_empty() {
-        imports.insert("PhantomData");
-    }
     if !field.optional {
         imports.insert("SetState");
     }
     add_bound_imports(&mut imports, field);
     let imports = super_imports(&imports);
-    let optional_set_reexport = if field.optional {
-        quote! { pub use super::OptionalFieldSet as SetOptional; }
-    } else {
-        quote! {}
-    };
+    let value = ident("value");
     quote! {
-        pub mod #name {
-            #imports
-            pub use super::FieldSet as Set;
-            #optional_set_reexport
-            pub struct Field;
-            #implementation
-            #optional_impl
-            pub fn value<T>(value: T) -> ErrorValue where T: #bound { #value }
-            pub fn optional_value<T>(value: Option<T>) -> Option<ErrorValue> where T: #bound { #optional_value }
+        #name {
+            imports { #imports }
+            output [#(#output_states),*];
+            index #index;
+            key #key;
+            flags [#display, #sensitive];
+            bound [#bound];
+            value #value => [#conversion];
+            optional [#optional];
         }
-    }
-}
-
-fn builder_type(states: &[TokenStream]) -> TokenStream {
-    if states.is_empty() {
-        quote! { Builder }
-    } else {
-        quote! { Builder<#(#states),*> }
-    }
-}
-
-fn builder_value_type(states: &[TokenStream]) -> TokenStream {
-    if states.is_empty() {
-        quote! { Builder }
-    } else {
-        quote! { Builder::<#(#states),*> }
-    }
-}
-
-fn generic_args(states: &[Ident]) -> Vec<TokenStream> {
-    states.iter().map(|state| quote! { #state }).collect()
-}
-
-fn generic_decl(states: &[Ident]) -> TokenStream {
-    if states.is_empty() {
-        quote! {}
-    } else {
-        quote! { <#(#states),*> }
-    }
-}
-
-fn generic_defaults(states: &[Ident]) -> TokenStream {
-    if states.is_empty() {
-        quote! {}
-    } else {
-        let defaults = states.iter().map(|_| quote! { Unset }).collect::<Vec<_>>();
-        quote! { <#(#states = #defaults),*> }
-    }
-}
-
-fn phantom_type(states: &[Ident]) -> TokenStream {
-    match states {
-        [] => quote! { () },
-        [state] => quote! { #state },
-        _ => quote! { (#(#states),*) },
     }
 }
 

@@ -3,6 +3,7 @@
 extern crate self as rift_error;
 
 mod evidence;
+mod generated_support;
 mod representation;
 mod runtime;
 

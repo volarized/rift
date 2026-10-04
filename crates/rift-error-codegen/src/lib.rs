@@ -122,21 +122,29 @@ action = "provide a token"
         let generated = generate_source(source).expect("generate source");
         assert!(generated.contains("rift.cloud.auth.token_expired"));
         assert!(generated.contains("REGISTERED_SLUGS"));
-        assert!(generated.contains("pub fn token_expired"));
-        assert!(generated.contains(
-            "pub const SLUG: ErrorSlug = ErrorSlug::new(\"rift.cloud.auth.token_expired\")"
-        ));
-        assert!(generated.contains("pub fn maybe_token"));
-        assert!(generated.contains("pub type EvidenceInput"));
-        assert!(generated.contains("pub fn fail<T>"));
+        assert!(generated.contains("__rift_error_definition!"));
+        assert!(generated.contains("error token_expired;"));
+        assert!(generated.contains("optional[maybe_token]"));
+        assert!(generated.contains("states[State0]"));
+        assert!(generated.contains("complete[SetState]"));
         assert!(generated.starts_with("pub use rift_error::{FieldSet, OptionalFieldSet};"));
         assert!(!generated.contains("::rift_error::"));
         assert!(!generated.contains("::std::"));
         assert!(!generated.contains("allow(unused_imports)"));
-        assert!(generated.contains("pub fn no_token"));
+        assert!(generated.contains("error no_token;"));
         assert_eq!(
             generated,
             generate_source(source).expect("generate same source")
+        );
+    }
+
+    #[test]
+    fn committed_registry_stays_within_generated_line_bound() {
+        let generated = generate_source(include_str!("../../rift-error/errors.toml"))
+            .expect("generate committed registry");
+        assert!(
+            generated.lines().count() <= 10_000,
+            "generated source exceeds 10,000 lines"
         );
     }
 

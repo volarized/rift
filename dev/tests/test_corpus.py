@@ -1019,7 +1019,12 @@ class SourceBound(unittest.TestCase):
     def refusal() -> JsonObject:
         return {
             "code": "limit_exceeded",
-            "message": "workspace contains more files than its accepted limit of 20000: field source.files, observed 20001",
+            "message": (
+                "workspace contains more files than its accepted limit of 20000: "
+                "field source.files, observed 20001, "
+                f"path {Path.cwd() / 'test/e2e/app/page.js'}; "
+                "reduce workspace files below 20000 and retry"
+            ),
             "retry": "never",
             "phase": "read",
             "limit": {"field": "source.files", "required": 20001, "limit": 20000},
@@ -1091,6 +1096,30 @@ class SourceBound(unittest.TestCase):
             with self.subTest(wrong=wrong), self.assertRaises(AssertionError):
                 self.exercise(
                     [MCPError(-32000, "source limit", {**self.refusal(), **wrong})]
+                )
+
+    def test_missing_or_wrong_source_path_and_action_fail(self) -> None:
+        message = cast(str, self.refusal()["message"])
+        path = str(Path.cwd() / "test/e2e/app/page.js")
+        action = "; reduce workspace files below 20000 and retry"
+        variants = [
+            message.replace(f", path {path}", ""),
+            message.replace(path, ""),
+            message.replace(path, " "),
+            message.replace(path, str(Path.cwd().parent / "outside.js")),
+            message.replace(path, str(Path.cwd() / ".." / "outside.js")),
+            message.replace(action, ""),
+            message.replace(action, "; reduce workspace files below 20001 and retry"),
+            message.replace("observed 20001", "observed 20000"),
+        ]
+        for wrong in variants:
+            with self.subTest(message=wrong), self.assertRaises(AssertionError):
+                self.exercise(
+                    [
+                        MCPError(
+                            -32000, "source limit", {**self.refusal(), "message": wrong}
+                        )
+                    ]
                 )
 
     def test_complete_read_without_refusal_fails(self) -> None:

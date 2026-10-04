@@ -841,11 +841,22 @@ class Corpus:
                             message = string_value(
                                 refusal.get("message"), "source refusal message"
                             )
+                            prefix = (
+                                "workspace contains more files than its accepted limit of 20000: "
+                                "field source.files, observed 20001, path "
+                            )
+                            action = "; reduce workspace files below 20000 and retry"
                             require(
-                                message
-                                == "workspace contains more files than its accepted limit of 20000: "
-                                "field source.files, observed 20001",
+                                message.startswith(prefix) and message.endswith(action),
                                 f"source bound wrong message: {message}",
+                            )
+                            path = message[len(prefix) : -len(action)]
+                            require(bool(path.strip()), "source bound omitted its path")
+                            reported = Path(path).resolve()
+                            root = self.root.resolve()
+                            require(
+                                reported != root and reported.is_relative_to(root),
+                                f"source bound path is outside the workspace: {path}",
                             )
                             limit = object_value(refusal.get("limit"), "source limit")
                             require(
