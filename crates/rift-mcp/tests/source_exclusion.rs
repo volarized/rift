@@ -21,7 +21,7 @@ use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::await_workspace_ready;
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -95,12 +95,8 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
         "the symbol must be indexed before exclusion: {symbol:#}"
     );
 
-    let prose = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let prose_arguments = json!({ "query": "wandering falcon migrations" });
+    let prose = search_after_population(&client, &prose_arguments).await?;
     assert!(
         prose["results"].as_array().is_some_and(|results| results
             .iter()
@@ -129,12 +125,7 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
         "an excluded symbol must leave get_symbol on the next request: {symbol_after:#}"
     );
 
-    let prose_after = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let prose_after = search_after_population(&client, &prose_arguments).await?;
     assert!(
         prose_after["results"].as_array().is_some_and(Vec::is_empty),
         "an excluded text file must leave the lexical store on the next request: \
