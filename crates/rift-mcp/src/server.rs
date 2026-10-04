@@ -588,23 +588,26 @@ fn ranking_weights(search: &SearchConfiguration) -> RankingWeights {
     .unwrap_or_else(|error| unreachable!("accepted ranking shares must fuse: error={error}"))
 }
 
-/// Attaches the search tiers to the process's one workspace database.
+/// Attaches the search tiers to the process's index database and vectors database handle.
 ///
-/// [`WorkspaceStorage`] opens the database once for every store in the process. The server
-/// serves identifier search alone when the database did not open.
+/// [`WorkspaceStorage`] opens the index database once for every store in the process, and
+/// holds the handle the vector tier opens the vectors database through at its first
+/// vector operation. The server serves identifier search alone when the index database
+/// did not open.
 fn open_search_index(
     storage: &WorkspaceStorage,
     limits: SearchIndexLimits,
 ) -> Option<Arc<SearchIndex>> {
     let database = storage.database()?;
-    match SearchIndex::attached(database, limits) {
+    let vectors = storage.vectors()?;
+    match SearchIndex::attached(database, vectors, limits) {
         Ok(index) => Some(Arc::new(index)),
         Err(error) => {
             tracing::warn!(
                 component = "search",
                 operation = "search.open",
                 error = %error,
-                "the search tiers could not attach to the workspace database; the server \
+                "the search tiers could not attach to the index database; the server \
                  starts without the search index"
             );
             None
@@ -6616,7 +6619,7 @@ done
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let state_directory = directory.path().join(".rift");
         fs::create_dir_all(&state_directory)?;
-        let database_path = state_directory.join("db");
+        let database_path = state_directory.join("index");
         let corrupt = b"not a sqlite database";
         fs::write(&database_path, corrupt)?;
         super::hermetic_workspace(directory.path(), "")?;
@@ -6668,14 +6671,14 @@ done
     /// Logs record and answer while the workspace database is refused: `rift://logs`
     /// returns the `database.open` warning the refusal produced.
     #[tokio::test]
-    async fn a_refused_workspace_database_is_recorded_in_the_logs() -> TestResult {
+    async fn a_refused_index_database_is_recorded_in_the_logs() -> TestResult {
         use tracing_subscriber::Layer as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let (sink, drain) = crate::logs::log_capture();
         let capture = crate::logs::logs_configuration(directory.path()).capture;
         let filter = tracing_subscriber::EnvFilter::try_new(&capture)?;
@@ -6700,8 +6703,7 @@ done
         let logs = server.read_logs("rift://logs/component/storage").await?;
         let text = resource_json_text(&logs, "rift://logs/component/storage")?;
         assert!(
-            text.contains("database.open")
-                && text.contains("the workspace database failed to open"),
+            text.contains("database.open") && text.contains("the index database failed to open"),
             "the refusal is recorded: {text}"
         );
         cancellation.cancel();
@@ -8585,7 +8587,7 @@ done
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         super::hermetic_workspace(directory.path(), "")?;
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(server.search_index.is_none());
@@ -9825,7 +9827,7 @@ done
         // A directory at the database path makes SQLite reject the open without changing
         // the unexpected filesystem entry.
         super::hermetic_workspace(directory.path(), "")?;
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(
@@ -10450,7 +10452,7 @@ done
         super::hermetic_workspace(directory.path(), "")?;
         // A directory at the database path exhausts the open retry, so the handle is absent
         // and a current-tree search says so. A revision search must stay silent about it.
-        fs::create_dir_all(directory.path().join(".rift/db"))?;
+        fs::create_dir_all(directory.path().join(".rift/index"))?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
         assert!(server.search_index.is_none());

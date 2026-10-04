@@ -131,46 +131,6 @@ name: lexical_trigram_pending
 tbl_name: lexical_trigram_pending
 sql: CREATE TABLE lexical_trigram_pending(id INTEGER PRIMARY KEY)
 
-type: table
-name: log_records
-tbl_name: log_records
-sql: CREATE TABLE log_records(
-        id BIGINT PRIMARY KEY NOT NULL,
-        recorded_at BIGINT NOT NULL,
-        level TEXT NOT NULL,
-        target TEXT NOT NULL,
-        component TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        message TEXT NOT NULL,
-        fields TEXT NOT NULL
-    )
-
-type: index
-name: log_records_component
-tbl_name: log_records
-sql: CREATE INDEX log_records_component ON log_records(component)
-
-type: index
-name: log_records_level
-tbl_name: log_records
-sql: CREATE INDEX log_records_level ON log_records(level)
-
-type: table
-name: semantic_vectors
-tbl_name: semantic_vectors
-sql: CREATE TABLE semantic_vectors(
-        identity TEXT PRIMARY KEY NOT NULL,
-        model TEXT NOT NULL,
-        digest TEXT NOT NULL,
-        dimension BIGINT NOT NULL,
-        vector BLOB NOT NULL
-    )
-
-type: index
-name: semantic_vectors_model
-tbl_name: semantic_vectors
-sql: CREATE INDEX semantic_vectors_model ON semantic_vectors(model)
-
 type: index
 name: sqlite_autoindex_documentation_manifest_1
 tbl_name: documentation_manifest
@@ -199,14 +159,4 @@ sql:
 type: index
 name: sqlite_autoindex_lexical_index_state_1
 tbl_name: lexical_index_state
-sql:
-
-type: index
-name: sqlite_autoindex_log_records_1
-tbl_name: log_records
-sql:
-
-type: index
-name: sqlite_autoindex_semantic_vectors_1
-tbl_name: semantic_vectors
 sql:

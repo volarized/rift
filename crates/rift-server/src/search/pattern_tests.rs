@@ -68,7 +68,9 @@ async fn written_store(directory: &TempDir, service: &ReadService) -> TestResult
     let limits = SearchIndexLimits::builder(LexicalIndexLimits::default())
         .disable_vector()
         .build();
-    let store = SearchIndex::open(&directory.path().join(".rift-test-db"), limits).await?;
+    let state = directory.path().join(".rift-test-db");
+    std::fs::create_dir_all(&state)?;
+    let store = SearchIndex::open(&state, limits).await?;
     store
         .replace_lexical(&service.index_documents(), service.tree_revision())
         .await?;

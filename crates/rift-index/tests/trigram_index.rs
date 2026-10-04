@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
+use rift_index::DatabaseName;
 use rift_index::{
     DatabasePool, LexicalChange, LexicalIndexLimits, LexicalSearchIndex, LexicalStamp,
     PatternCandidates, RevisionScoped, TrigramBatch, UnindexedRows, WorkspaceDatabase,
@@ -174,7 +175,7 @@ fn database_path(directory: &TempDir) -> PathBuf {
 
 async fn store(directory: &TempDir) -> TestResult<LexicalSearchIndex> {
     Ok(LexicalSearchIndex::attached(
-        WorkspaceDatabase::open(&database_path(directory), pool()).await?,
+        WorkspaceDatabase::open(&database_path(directory), DatabaseName::Index, pool()).await?,
         LexicalIndexLimits::default(),
     ))
 }
@@ -643,7 +644,7 @@ async fn a_trigram_batch_stops_at_the_transaction_bounds_and_always_takes_a_row(
         let directory = TempDir::new()?;
         let path = database_path(&directory);
         let index = LexicalSearchIndex::attached(
-            WorkspaceDatabase::open(&path, pool()).await?,
+            WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?,
             LexicalIndexLimits::default().with_transaction_bounds(units, bytes),
         );
         index

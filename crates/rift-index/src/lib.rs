@@ -9,6 +9,7 @@ mod database_thread;
 mod documentation;
 mod documentation_store;
 mod language;
+mod lazy_database;
 mod lexical;
 mod semantic;
 mod trigram_store;
@@ -23,8 +24,9 @@ pub use change_set::{
     ChangeSet, FileDigest, FileRecord, PathChange, PathChanges, WorkspaceDigests,
 };
 pub use content_cache::WorkspaceContentCache;
-pub use database::{DatabasePool, HeldConnection, WorkspaceDatabase};
+pub use database::{DatabaseName, DatabasePool, HeldConnection, WorkspaceDatabase};
 pub use language::{EffectiveLanguage, WorkspaceLanguagePolicy};
+pub use lazy_database::LazyDatabase;
 pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,

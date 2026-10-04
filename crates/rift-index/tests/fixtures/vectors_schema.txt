@@ -1,0 +1,29 @@
+type: table
+name: __toasty_migrations
+tbl_name: __toasty_migrations
+sql: CREATE TABLE __toasty_migrations (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+
+type: table
+name: semantic_vectors
+tbl_name: semantic_vectors
+sql: CREATE TABLE semantic_vectors(
+        identity TEXT PRIMARY KEY NOT NULL,
+        model TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        dimension BIGINT NOT NULL,
+        vector BLOB NOT NULL
+    )
+
+type: index
+name: semantic_vectors_model
+tbl_name: semantic_vectors
+sql: CREATE INDEX semantic_vectors_model ON semantic_vectors(model)
+
+type: index
+name: sqlite_autoindex_semantic_vectors_1
+tbl_name: semantic_vectors
+sql:

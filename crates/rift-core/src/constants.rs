@@ -41,13 +41,21 @@ pub const WORKSPACE_CONFIGURATION_FILE: &str = "rift.toml";
 
 /// The file name a version-control ignore list carries, at the workspace root and below.
 pub const VCS_IGNORE_FILE: &str = ".gitignore";
-/// Workspace database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
-/// database at `.rift/db` holds the search stores Rift persists for the
-/// workspace.
-pub const WORKSPACE_DATABASE_FILE_NAME: &str = "db";
+/// Index database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
+/// database at `.rift/index` holds the lexical and documentation rows Rift
+/// persists for the workspace.
+pub const INDEX_DATABASE_FILE_NAME: &str = "index";
 /// Metrics database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
 /// database at `.rift/metrics` holds the server's own log records.
 pub const METRICS_DATABASE_FILE_NAME: &str = "metrics";
+/// Vectors database file, below [`RIFT_STATE_DIRECTORY`]: the `SQLite`
+/// database at `.rift/vectors` holds the vector ranking's stored vectors. A
+/// server creates it at its first vector operation, never while vector ranking
+/// is disabled.
+pub const VECTORS_DATABASE_FILE_NAME: &str = "vectors";
+/// The suffix `SQLite` gives a WAL database's write-ahead log, appended to the
+/// database file's whole name: `.rift/index` writes `.rift/index-wal`.
+pub const WRITE_AHEAD_LOG_SUFFIX: &str = "-wal";
 /// Maximum ASCII bytes in one provider-composition stage name.
 pub const STAGE_NAME_BYTES_MAX: usize = 64;
 /// Punctuation accepted in provider-composition stage names.

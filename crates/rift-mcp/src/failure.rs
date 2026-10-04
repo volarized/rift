@@ -461,6 +461,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.history.storage",
                 "rift.history_store.database",
                 "rift.history_store.folder",
+                "rift.index.database_failed",
                 "rift.index.lexical_storage",
                 "rift.index.workspace_filesystem",
                 "rift.mcp.election_storage_failed",

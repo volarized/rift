@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
+use rift_index::DatabaseName;
 use rift_index::{
     DatabasePool, LexicalIndexLimits, LexicalSearchIndex, PublishedIndex, RevisionScoped,
     WorkspaceDatabase, WorkspaceIndex, WorkspaceIndexLimits,
@@ -137,8 +138,12 @@ fn targets(documents: &[IndexDocument]) -> BTreeMap<String, DocumentIdentity> {
 /// The stored corpus, published and stamped.
 async fn stored(documents: &[IndexDocument], directory: &Path) -> TestResult<LexicalSearchIndex> {
     std::fs::create_dir_all(directory)?;
-    let database =
-        WorkspaceDatabase::open(&directory.join("db"), DatabasePool::new(2, 5_000)).await?;
+    let database = WorkspaceDatabase::open(
+        &directory.join("db"),
+        DatabaseName::Index,
+        DatabasePool::new(2, 5_000),
+    )
+    .await?;
     let store = LexicalSearchIndex::attached(database, LexicalIndexLimits::default());
     store.replace_all(documents, "corpus").await?;
     Ok(store)

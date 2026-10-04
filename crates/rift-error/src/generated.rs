@@ -155,6 +155,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.history_store.database",
     "rift.history_store.folder",
     "rift.history_store.lock_unstable",
+    "rift.index.database_failed",
     "rift.index.lexical_document_location_unsupported",
     "rift.index.lexical_duplicate_identity",
     "rift.index.lexical_record_limit",
@@ -1977,6 +1978,18 @@ pub mod history_store {
 /// Registered errors under `rift.index`.
 pub mod index {
     use super::__rift_error_definition;
+
+    __rift_error_definition!(
+        database_failed,
+        slug = "rift.index.database_failed",
+        message = "index storage failed on the {database} database at {path}",
+        action = "check filesystem permissions and free space below the workspace state directory, then retry",
+        fields = {
+            database: required(string),
+            path: required(path),
+            source: required(source),
+        },
+    );
 
     __rift_error_definition!(
         lexical_document_location_unsupported,

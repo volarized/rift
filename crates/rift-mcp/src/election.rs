@@ -1506,7 +1506,7 @@ mod tests {
                 .any(|(key, value)| key == "operation" && value == "validate workspace storage")
         );
         assert!(!document_path(requested.path()).exists());
-        assert!(!requested.path().join(".rift/db").exists());
+        assert!(!requested.path().join(".rift/index").exists());
         Ok(())
     }
 
@@ -1518,7 +1518,7 @@ mod tests {
             .await
             .expect_err("a competing owner refuses the start");
         assert_eq!(error.slug(), errors::mcp::election_already_serving::SLUG);
-        assert!(!directory.path().join(".rift/db").exists());
+        assert!(!directory.path().join(".rift/index").exists());
         Ok(())
     }
 

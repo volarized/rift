@@ -36,8 +36,10 @@ fn service(root: &Path, files: &[(&str, &str)]) -> TestResult<ReadService> {
 
 /// The store `service` publishes into, below `directory`.
 async fn published(directory: &Path, service: &ReadService) -> TestResult<SearchIndex> {
+    let state = directory.join("search.db");
+    std::fs::create_dir_all(&state)?;
     let store = SearchIndex::open(
-        &directory.join("search.db"),
+        &state,
         SearchIndexLimits::builder(LexicalIndexLimits::default())
             .disable_vector()
             .build(),

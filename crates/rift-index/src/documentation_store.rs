@@ -563,6 +563,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -610,6 +611,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &directory.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -694,6 +696,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &directory.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -756,6 +759,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -828,6 +832,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -915,6 +920,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -976,6 +982,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;
@@ -1081,6 +1088,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let database = crate::WorkspaceDatabase::open(
             &temp.path().join("index.db"),
+            crate::DatabaseName::Index,
             crate::DatabasePool::new(2, 1000),
         )
         .await?;

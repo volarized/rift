@@ -1,20 +1,23 @@
-//! The workspace database at `.rift/db`, and the one connection pool every
-//! store in it shares.
+//! The two workspace databases `rift-index` owns, `.rift/index` and
+//! `.rift/vectors`, and the one connection pool each opens.
 //!
-//! `SQLite` serializes writers per file, not per connection: two handles on one
-//! file take the same write lock, and the loser is refused. Opening a handle
-//! per store therefore bought nothing and cost correctness - a log write that
-//! met an index rebuild came back `database is locked`. One pool, opened once
-//! and shared, is what every store attaches to.
+//! Each database is one [`WorkspaceDatabase`]: its own worker thread, its own
+//! pool, its own write turn, and its own busy timeout, so a write to one never
+//! queues behind a transaction on the other. `SQLite` serializes writers per
+//! file, not per connection: two handles on one file take the same write lock,
+//! and the loser is refused. Within one file, one pool, opened once and shared,
+//! is what every store of that file attaches to.
 //!
 //! Read checkouts use WAL snapshots with `query_only` enabled. Write checkouts
-//! wait for one process-wide turn and start with `BEGIN IMMEDIATE`. A checkout
+//! wait for the file's write turn and start with `BEGIN IMMEDIATE`. A checkout
 //! waits for a free connection at most the pool's busy-wait budget, the same
 //! budget a connection waits for a lock another process holds.
 //!
-//! Opening the file switches it to WAL and applies the schema migrations under
-//! the file's migration lock, so processes opening one new file prepare it one
-//! after the other.
+//! Opening a file switches it to WAL and applies its database's migration set
+//! under the file's migration lock, so processes opening one new file prepare
+//! it one after the other. Toasty reads and records applied migrations in the
+//! `__toasty_migrations` table of the file it opened, so each database carries
+//! a migration set of its own, numbered from 1.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -22,10 +25,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rift_core::constants::{
+    INDEX_DATABASE_FILE_NAME, VECTORS_DATABASE_FILE_NAME, WRITE_AHEAD_LOG_SUFFIX,
+};
 use rift_error::{RiftError, errors};
-use toasty::Db;
 use toasty::db::{Connection, Transaction};
+use toasty::migration::MigrationSet;
 use toasty::stmt::{Type, Value};
+use toasty::{Db, ModelSet};
 use toasty_core::driver::operation::TransactionMode;
 use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, MutexGuard};
@@ -35,13 +42,130 @@ use crate::database_thread::{DatabaseThread, SqliteThreadDriver};
 use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
 };
+use crate::lexical::{INDEX_MIGRATIONS, bound_as_usize, require_pragma_row};
 use crate::lexical::{LexicalDocumentRecord, LexicalFileRecord, LexicalIndexStateRecord};
-use crate::lexical::{MIGRATIONS, bound_as_usize, require_pragma_row};
-use crate::vector::VectorRecord;
+use crate::vector::{VECTORS_MIGRATIONS, VectorRecord};
 
 /// Suffix the migration lock file appends to the database file's whole name: the
-/// database `.rift/db` is prepared under `.rift/db.lock`.
+/// database `.rift/index` is prepared under `.rift/index.lock`.
 const MIGRATION_LOCK_SUFFIX: &str = ".lock";
+
+/// One of the two databases `rift-index` owns below the workspace state directory.
+///
+/// The name decides the file, the models a pool registers, the migration set it
+/// applies, and the worker thread's name. Its label equals its file name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DatabaseName {
+    /// `.rift/index`: lexical, trigram, and documentation rows.
+    Index,
+    /// `.rift/vectors`: the vector ranking's stored vectors.
+    Vectors,
+}
+
+impl DatabaseName {
+    /// The label a record or an error names this database by, equal to its file name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Index => INDEX_DATABASE_FILE_NAME,
+            Self::Vectors => VECTORS_DATABASE_FILE_NAME,
+        }
+    }
+
+    /// The database file below `state_directory`.
+    #[must_use]
+    pub fn path(self, state_directory: &Path) -> PathBuf {
+        state_directory.join(self.label())
+    }
+
+    /// The write-ahead log `SQLite` keeps beside the database file below
+    /// `state_directory`.
+    #[must_use]
+    pub fn write_ahead_log_path(self, state_directory: &Path) -> PathBuf {
+        appended(&self.path(state_directory), WRITE_AHEAD_LOG_SUFFIX)
+    }
+
+    /// The migration lock file beside the database file below `state_directory`.
+    #[must_use]
+    pub fn migration_lock_path(self, state_directory: &Path) -> PathBuf {
+        migration_lock_path(&self.path(state_directory))
+    }
+
+    /// The name of this database's worker thread. Linux keeps 15 bytes of a thread
+    /// name, and both names fit.
+    #[must_use]
+    pub const fn thread_name(self) -> &'static str {
+        match self {
+            Self::Index => "rift-db-index",
+            Self::Vectors => "rift-db-vectors",
+        }
+    }
+
+    /// Asserts that a store attaching here attaches to `expected`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this is another database: a store attached to the wrong file
+    /// finds none of its tables.
+    #[track_caller]
+    pub(crate) fn assert_is(self, expected: Self) {
+        assert_eq!(
+            self, expected,
+            "a store must attach to its own database: attached={self:?}, expected={expected:?}"
+        );
+    }
+
+    /// The models a pool on this database registers.
+    fn models(self) -> ModelSet {
+        match self {
+            Self::Index => toasty::models!(
+                LexicalDocumentRecord,
+                LexicalFileRecord,
+                LexicalIndexStateRecord,
+                DocumentationManifestRecord,
+                DocumentationSourceRecord,
+                DocumentationReferenceRecord
+            ),
+            Self::Vectors => toasty::models!(VectorRecord),
+        }
+    }
+
+    /// The migration set this database applies at open.
+    const fn migrations(self) -> MigrationSet {
+        match self {
+            Self::Index => INDEX_MIGRATIONS,
+            Self::Vectors => VECTORS_MIGRATIONS,
+        }
+    }
+
+    /// The pool this database opens under, from the configured one:
+    /// `[search.lexical] mmap_size` maps the index database alone.
+    const fn pool(self, configured: DatabasePool) -> DatabasePool {
+        match self {
+            Self::Index => configured,
+            Self::Vectors => configured.memory_mapped(0),
+        }
+    }
+
+    /// The failure of an open of this database at `path`.
+    pub(crate) fn failed(
+        self,
+        path: &Path,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> RiftError {
+        errors::index::database_failed()
+            .database(self.label())
+            .path(path)
+            .source(source)
+            .error()
+    }
+}
+
+impl std::fmt::Display for DatabaseName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
 
 /// Wall-clock span between two attempts at a migration lock another process holds.
 ///
@@ -104,6 +228,7 @@ impl DatabasePool {
 /// Cloning the [`Arc`] shares the pool; opening the file twice does not.
 #[derive(Debug)]
 pub struct WorkspaceDatabase {
+    name: DatabaseName,
     database: Db,
     pool: DatabasePool,
     thread: Arc<DatabaseThread>,
@@ -115,8 +240,8 @@ pub struct WorkspaceDatabase {
 }
 
 impl WorkspaceDatabase {
-    /// Opens (creating if absent) the workspace database at `database_path` and
-    /// applies the schema every store in it declares.
+    /// Opens (creating if absent) the database `name` at `database_path` and applies
+    /// that database's migration set.
     ///
     /// The WAL switch and the migrations run under the file's migration lock, so a
     /// process that opens a new file while another prepares it waits, then finds WAL
@@ -133,11 +258,15 @@ impl WorkspaceDatabase {
     /// Cancellation may leave the database file created without its schema
     /// applied. Reopening retries safely: schema migrations are idempotent, and
     /// the migration lock releases with the dropped future.
-    pub async fn open(database_path: &Path, pool: DatabasePool) -> Result<Arc<Self>, RiftError> {
-        Self::open_with_owner(database_path, pool, None).await
+    pub async fn open(
+        database_path: &Path,
+        name: DatabaseName,
+        pool: DatabasePool,
+    ) -> Result<Arc<Self>, RiftError> {
+        Self::open_with_owner(database_path, name, pool, None).await
     }
 
-    /// Opens the workspace database while retaining its serving owner until the SQLite worker ends.
+    /// Opens the database while retaining its serving owner until the SQLite worker ends.
     ///
     /// Once the worker starts, its owner remains held after a shutdown deadline or a cancelled opening future.
     ///
@@ -146,21 +275,15 @@ impl WorkspaceDatabase {
     /// Returns the same storage failures as [`Self::open`].
     pub async fn open_with_owner(
         database_path: &Path,
+        name: DatabaseName,
         pool: DatabasePool,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>, RiftError> {
-        let migration_lock = MigrationLock::acquire(database_path, pool).await?;
+        let pool = name.pool(pool);
+        let migration_lock = MigrationLock::acquire(database_path, name, pool).await?;
         let mut builder = Db::builder();
         builder
-            .models(toasty::models!(
-                LexicalDocumentRecord,
-                LexicalFileRecord,
-                LexicalIndexStateRecord,
-                DocumentationManifestRecord,
-                DocumentationSourceRecord,
-                DocumentationReferenceRecord,
-                VectorRecord
-            ))
+            .models(name.models())
             .max_pool_size(bound_as_usize(pool.slots()))
             // The pool waits for a free slot without a bound unless told one ("Passing
             // `None` disables the timeout, which is the default"), and a read that met a
@@ -170,47 +293,50 @@ impl WorkspaceDatabase {
             ))));
         let sqlite = Arc::new(Sqlite::open(database_path));
         let thread = DatabaseThread::spawn(
+            name,
             Arc::clone(&sqlite),
             bound_as_usize(pool.slots()),
             Duration::from_millis(u64::from(pool.busy_timeout_ms())),
             owner,
         )
         .await
-        .map_err(|source| {
-            errors::index::lexical_storage()
-                .path(database_path)
-                .source(source)
-                .error()
-        })?;
+        .map_err(|source| name.failed(database_path, source))?;
         let database = builder
             .build(SqliteThreadDriver::new(sqlite, Arc::clone(&thread)))
             .await
-            .map_err(|source| {
-                errors::index::lexical_storage()
-                    .path(database_path)
-                    .source(source)
-                    .error()
-            })?;
+            .map_err(|source| name.failed(database_path, source))?;
         let mut connection = database
             .connection()
             .await
-            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
+            .map_err(|source| name.failed(database_path, source))?;
         configure_journal(&mut connection).await?;
         configure_connection(&mut connection, pool, ConnectionAccess::Write).await?;
         drop(connection);
-        let _migration_report = MIGRATIONS.apply(&database).await.map_err(|source| {
-            errors::index::lexical_storage()
-                .path(database_path)
-                .source(source)
-                .error()
-        })?;
+        let _migration_report = name
+            .migrations()
+            .apply(&database)
+            .await
+            .map_err(|source| name.failed(database_path, source))?;
         drop(migration_lock);
         Ok(Arc::new(Self {
+            name,
             database,
             pool,
             thread,
             writes: Mutex::new(()),
         }))
+    }
+
+    /// Which database this is.
+    #[must_use]
+    pub const fn name(&self) -> DatabaseName {
+        self.name
+    }
+
+    /// The pool bounds this database opened under.
+    #[must_use]
+    pub const fn pool(&self) -> DatabasePool {
+        self.pool
     }
 
     /// Stops the SQLite worker by the shared shutdown deadline.
@@ -374,36 +500,29 @@ impl MigrationLock {
     /// # Cancel safety
     ///
     /// Dropping the future gives up the wait; the lock is not held.
-    async fn acquire(database_path: &Path, pool: DatabasePool) -> Result<Self, RiftError> {
+    async fn acquire(
+        database_path: &Path,
+        name: DatabaseName,
+        pool: DatabasePool,
+    ) -> Result<Self, RiftError> {
         let lock_path = migration_lock_path(database_path);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|source| {
-                errors::index::lexical_storage()
-                    .path(&lock_path)
-                    .source(source)
-                    .error()
-            })?;
+            .map_err(|source| name.failed(&lock_path, source))?;
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(pool.busy_timeout_ms()));
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(TryLockError::Error(source)) => {
-                    return errors::index::lexical_storage()
-                        .path(&lock_path)
-                        .source(source)
-                        .fail();
+                    return Err(name.failed(&lock_path, source));
                 }
                 Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
                     let held = migration_lock_held(pool.busy_timeout_ms());
-                    return errors::index::lexical_storage()
-                        .path(&lock_path)
-                        .source(held)
-                        .fail();
+                    return Err(name.failed(&lock_path, held));
                 }
                 Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
             }
@@ -414,12 +533,17 @@ impl MigrationLock {
 /// The migration lock file of the database at `database_path`: the suffix appended to
 /// the whole file name, beside the database.
 fn migration_lock_path(database_path: &Path) -> PathBuf {
-    let mut lock_path = OsString::from(database_path);
-    lock_path.push(MIGRATION_LOCK_SUFFIX);
-    PathBuf::from(lock_path)
+    appended(database_path, MIGRATION_LOCK_SUFFIX)
 }
 
-/// A migration lock failure, naming the lock file.
+/// `path` with `suffix` appended to its whole file name, as `SQLite` names its
+/// sidecar files.
+fn appended(path: &Path, suffix: &str) -> PathBuf {
+    let mut appended = OsString::from(path);
+    appended.push(suffix);
+    PathBuf::from(appended)
+}
+
 /// The cause an open reports when another process kept the migration lock for the
 /// whole budget.
 fn migration_lock_held(busy_timeout_ms: u32) -> std::io::Error {
@@ -494,7 +618,9 @@ mod tests {
     use toasty::stmt::{Type, Value};
     use toasty_driver_sqlite::Sqlite;
 
-    use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase, errors};
+    use super::{
+        DatabaseName, DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase, errors,
+    };
     use crate::lexical::{LexicalIndexLimits, LexicalSearchIndex};
     use crate::vector::VectorRecord;
 
@@ -563,7 +689,8 @@ mod tests {
         let database_path =
             std::env::var_os(CRASH_DATABASE).ok_or("crash child has no database path")?;
         let marker_path = std::env::var_os(CRASH_MARKER).ok_or("crash child has no marker path")?;
-        let database = WorkspaceDatabase::open(Path::new(&database_path), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(Path::new(&database_path), DatabaseName::Index, pool()).await?;
         let store =
             LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
         let previous = crash_documents(true)?;
@@ -710,7 +837,7 @@ mod tests {
 
     async fn assert_crash_recovery_matches_cold(database_path: &Path) -> TestResult {
         let previous = crash_documents(true)?;
-        let reopened = WorkspaceDatabase::open(database_path, pool()).await?;
+        let reopened = WorkspaceDatabase::open(database_path, DatabaseName::Index, pool()).await?;
         let recovered =
             LexicalSearchIndex::attached(Arc::clone(&reopened), LexicalIndexLimits::default());
         assert_eq!(
@@ -725,7 +852,8 @@ mod tests {
 
         let cold_directory = tempfile::tempdir()?;
         let cold_path = cold_directory.path().join("db");
-        let cold_database = WorkspaceDatabase::open(&cold_path, pool()).await?;
+        let cold_database =
+            WorkspaceDatabase::open(&cold_path, DatabaseName::Index, pool()).await?;
         let cold =
             LexicalSearchIndex::attached(Arc::clone(&cold_database), LexicalIndexLimits::default());
         cold.replace_all(&previous, "before-crash").await?;
@@ -766,11 +894,13 @@ mod tests {
         assert_crash_recovery_matches_cold(&database_path).await
     }
 
-    /// The `sqlite_schema` rows a new workspace database holds, one block per row in
-    /// name order: `type`, `name`, `tbl_name`, then `sql`, bare where `SQLite` stores none.
-    const SCHEMA_BASELINE: &str = include_str!("../tests/fixtures/sqlite_schema.txt");
+    /// The `sqlite_schema` rows a new index database holds, one block per row in name
+    /// order: `type`, `name`, `tbl_name`, then `sql`, bare where `SQLite` stores none.
+    const INDEX_SCHEMA: &str = include_str!("../tests/fixtures/index_schema.txt");
+    /// The `sqlite_schema` rows a new vectors database holds, spelled as [`INDEX_SCHEMA`].
+    const VECTORS_SCHEMA: &str = include_str!("../tests/fixtures/vectors_schema.txt");
 
-    /// The schema rows of the file at `path`, rendered as [`SCHEMA_BASELINE`] spells them.
+    /// The schema rows of the file at `path`, rendered as [`INDEX_SCHEMA`] spells them.
     fn rendered_schema(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
         let connection = rusqlite::Connection::open(path)?;
         let mut statement = connection
@@ -790,15 +920,121 @@ mod tests {
         Ok(blocks.join("\n"))
     }
 
-    /// A new workspace database holds exactly the recorded tables, indexes, and triggers.
-    #[tokio::test]
-    async fn a_new_database_holds_the_recorded_schema() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("db");
-        let _database = WorkspaceDatabase::open(&path, pool()).await?;
+    /// The migrations the file at `path` recorded, as `(id, name)` in id order.
+    fn recorded_migrations(path: &Path) -> Result<Vec<(i64, String)>, Box<dyn std::error::Error>> {
+        let connection = rusqlite::Connection::open(path)?;
+        let mut statement =
+            connection.prepare("SELECT id, name FROM __toasty_migrations ORDER BY id")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 
-        assert_eq!(rendered_schema(&path)?, SCHEMA_BASELINE);
+    /// Each new database holds exactly its recorded tables, indexes, and triggers: the
+    /// index database every lexical and documentation table, the vectors database
+    /// `semantic_vectors` alone, and neither a log table.
+    #[tokio::test]
+    async fn each_new_database_holds_its_recorded_schema() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        for (name, expected) in [
+            (DatabaseName::Index, INDEX_SCHEMA),
+            (DatabaseName::Vectors, VECTORS_SCHEMA),
+        ] {
+            let path = name.path(directory.path());
+            let database = WorkspaceDatabase::open(&path, name, pool()).await?;
+            database
+                .shutdown(tokio::time::Instant::now() + HELD_POOL_READ_MAX)
+                .await?;
+            assert_eq!(rendered_schema(&path)?, expected, "schema of {name}");
+        }
         Ok(())
+    }
+
+    /// Toasty records a migration set per file: two databases opened in one directory
+    /// each apply their own migration 1 and record it in their own table.
+    #[tokio::test]
+    async fn each_database_records_its_own_migration_set() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let index_path = DatabaseName::Index.path(directory.path());
+        let vectors_path = DatabaseName::Vectors.path(directory.path());
+        let index = WorkspaceDatabase::open(&index_path, DatabaseName::Index, pool()).await?;
+        let vectors = WorkspaceDatabase::open(&vectors_path, DatabaseName::Vectors, pool()).await?;
+        let reopened = WorkspaceDatabase::open(&index_path, DatabaseName::Index, pool()).await?;
+
+        assert_eq!(index.name(), DatabaseName::Index);
+        assert_eq!(vectors.name(), DatabaseName::Vectors);
+        assert_eq!(
+            recorded_migrations(&index_path)?,
+            [(1, "index_schema".to_owned())]
+        );
+        assert_eq!(
+            recorded_migrations(&vectors_path)?,
+            [(1, "semantic_vectors".to_owned())]
+        );
+        drop(reopened);
+        Ok(())
+    }
+
+    /// A store attached to the other database's file panics before it reads.
+    #[tokio::test]
+    #[should_panic(expected = "a store must attach to its own database")]
+    async fn a_vector_store_refuses_the_index_database() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database = WorkspaceDatabase::open(
+            &DatabaseName::Index.path(directory.path()),
+            DatabaseName::Index,
+            pool(),
+        )
+        .await
+        .expect("the index database opens");
+        let _store = crate::VectorStore::attached(database);
+    }
+
+    /// A lexical store attached to the vectors database panics before it reads.
+    #[tokio::test]
+    #[should_panic(expected = "a store must attach to its own database")]
+    async fn a_lexical_store_refuses_the_vectors_database() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database = WorkspaceDatabase::open(
+            &DatabaseName::Vectors.path(directory.path()),
+            DatabaseName::Vectors,
+            pool(),
+        )
+        .await
+        .expect("the vectors database opens");
+        let _store = LexicalSearchIndex::attached(database, LexicalIndexLimits::default());
+    }
+
+    /// Each name answers its file, write-ahead log, and migration lock below the state
+    /// directory, labelled as its file is named.
+    #[test]
+    fn each_database_name_answers_its_own_files() {
+        let state = Path::new("/workspace/.rift");
+        assert_eq!(DatabaseName::Index.label(), "index");
+        assert_eq!(DatabaseName::Vectors.to_string(), "vectors");
+        assert_eq!(
+            DatabaseName::Index.path(state),
+            Path::new("/workspace/.rift/index")
+        );
+        assert_eq!(
+            DatabaseName::Vectors.write_ahead_log_path(state),
+            Path::new("/workspace/.rift/vectors-wal")
+        );
+        assert_eq!(
+            DatabaseName::Index.migration_lock_path(state),
+            Path::new("/workspace/.rift/index.lock")
+        );
+        assert_eq!(
+            DatabaseName::Vectors
+                .pool(pool().memory_mapped(1 << 20))
+                .mmap_bytes(),
+            0
+        );
+        assert_eq!(
+            DatabaseName::Index
+                .pool(pool().memory_mapped(1 << 20))
+                .mmap_bytes(),
+            1 << 20
+        );
     }
 
     /// The busy-wait budget of the one-slot pool a held-slot case reads from: the least
@@ -814,7 +1050,12 @@ mod tests {
     async fn a_read_that_meets_a_held_pool_refuses_within_the_busy_wait_budget() -> TestResult {
         let directory = tempfile::tempdir()?;
         let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), one_slot).await?;
+        let database = WorkspaceDatabase::open(
+            &directory.path().join("db"),
+            DatabaseName::Vectors,
+            one_slot,
+        )
+        .await?;
         let held = database.connection().await?;
 
         let started = std::time::Instant::now();
@@ -844,7 +1085,9 @@ mod tests {
     async fn a_held_connection_keeps_its_slot_until_it_drops() -> TestResult {
         let directory = tempfile::tempdir()?;
         let one_slot = DatabasePool::new(1, HELD_POOL_BUSY_TIMEOUT_MS);
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), one_slot).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, one_slot)
+                .await?;
         let held = database.hold_connection().await?;
         let refused = database
             .hold_connection()
@@ -895,9 +1138,9 @@ mod tests {
     async fn a_first_open_waits_while_another_process_prepares_the_file() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
-        let preparing = MigrationLock::acquire(&path, pool()).await?;
+        let preparing = MigrationLock::acquire(&path, DatabaseName::Index, pool()).await?;
         let (writer, mut writing) = hold_write_lock(&path).await?;
-        let contender = WorkspaceDatabase::open(&path, pool());
+        let contender = WorkspaceDatabase::open(&path, DatabaseName::Index, pool());
         tokio::pin!(contender);
         tokio::select! {
             biased;
@@ -918,7 +1161,7 @@ mod tests {
         let tables = toasty::sql::query(
             "SELECT COUNT(*) FROM sqlite_master \
              WHERE type = 'table' \
-             AND name IN ('lexical_documents', 'semantic_vectors', 'log_records')",
+             AND name IN ('lexical_documents', 'lexical_files', 'documentation_sources')",
         )
         .column_types([Type::I64])
         .exec(&mut connection)
@@ -935,10 +1178,10 @@ mod tests {
     async fn a_migration_lock_held_past_the_budget_refuses_the_open() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
-        let held = MigrationLock::acquire(&path, pool()).await?;
+        let held = MigrationLock::acquire(&path, DatabaseName::Index, pool()).await?;
         let started = tokio::time::Instant::now();
 
-        let refused = WorkspaceDatabase::open(&path, pool())
+        let refused = WorkspaceDatabase::open(&path, DatabaseName::Index, pool())
             .await
             .expect_err("a held migration lock refuses the open once the budget passes");
 
@@ -947,8 +1190,9 @@ mod tests {
             waited >= Duration::from_millis(u64::from(pool().busy_timeout_ms())),
             "the open waits out the budget first: waited={waited:?}"
         );
-        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
         let rendered = refused.to_string();
+        assert!(rendered.contains("index database"), "{rendered}");
         assert!(rendered.contains("db.lock"), "{rendered}");
         let causes = rift_error::causes(&refused).join(": ");
         assert!(causes.contains("busy-wait budget"), "{causes}");
@@ -964,11 +1208,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("missing").join("db");
 
-        let refused = WorkspaceDatabase::open(&path, pool())
+        let refused = WorkspaceDatabase::open(&path, DatabaseName::Index, pool())
             .await
             .expect_err("no lock file can be created under a missing directory");
 
-        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
+        assert_eq!(refused.slug().as_str(), "rift.index.database_failed");
         assert!(refused.to_string().contains("db.lock"), "{refused}");
         Ok(())
     }
@@ -986,30 +1230,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_open_serves_every_store_in_the_file() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
-
-        let mut connection = database.connection().await?;
-        let tables = toasty::sql::query(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'table' \
-             AND name IN ('lexical_documents', 'semantic_vectors', 'log_records')",
-        )
-        .column_types([toasty::stmt::Type::I64])
-        .exec(&mut connection)
-        .await?;
-        crate::lexical::require_pragma_row(&tables, &[toasty::stmt::Value::I64(3)])?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn a_reopened_database_applies_no_migration_twice() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
-        let _first = WorkspaceDatabase::open(&path, pool()).await?;
+        let _first = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?;
 
-        let reopened = WorkspaceDatabase::open(&path, pool()).await;
+        let reopened = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await;
 
         assert!(reopened.is_ok(), "reopening must be idempotent");
         Ok(())
@@ -1018,7 +1244,9 @@ mod tests {
     #[tokio::test]
     async fn checkouts_carry_wal_normal_sync_busy_wait_and_access_policy() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, pool())
+                .await?;
         let mut reading = database.connection().await?;
 
         let journal = toasty::sql::query("PRAGMA journal_mode")
@@ -1042,7 +1270,7 @@ mod tests {
         crate::lexical::require_pragma_row(&synchronous, &[Value::I64(1)])?;
         crate::lexical::require_pragma_row(&busy_timeout, &[Value::I64(1_000)])?;
         crate::lexical::require_pragma_row(&query_only, &[Value::I64(1)])?;
-        let refused = toasty::sql::statement("DELETE FROM log_records")
+        let refused = toasty::sql::statement("DELETE FROM lexical_files")
             .exec(&mut reading)
             .await;
         assert!(refused.is_err(), "a read checkout must refuse a write");
@@ -1062,7 +1290,9 @@ mod tests {
     #[tokio::test]
     async fn dropping_write_transaction_rolls_back_before_connection_reuse() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, pool())
+                .await?;
         let mut writing = database.writing().await?;
         let transaction = writing.transaction().await?;
         drop(transaction);
@@ -1077,7 +1307,7 @@ mod tests {
     async fn sqlite_lock_wait_does_not_block_async_runtime() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
-        let database = WorkspaceDatabase::open(&path, pool()).await?;
+        let database = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?;
         let mut writing = database.writing().await?;
 
         let lock_path = path.clone();
@@ -1132,7 +1362,7 @@ mod tests {
     async fn every_checkout_maps_the_pool_memory_map_size() -> TestResult {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("db");
-        let unmapped = WorkspaceDatabase::open(&path, pool()).await?;
+        let unmapped = WorkspaceDatabase::open(&path, DatabaseName::Index, pool()).await?;
         let mut reading = unmapped.connection().await?;
         let unmapped_size = toasty::sql::query("PRAGMA mmap_size")
             .column_types([Type::I64])
@@ -1144,7 +1374,7 @@ mod tests {
 
         let mapped_pool = pool().memory_mapped(1 << 20);
         assert_eq!(mapped_pool.mmap_bytes(), 1 << 20);
-        let database = WorkspaceDatabase::open(&path, mapped_pool).await?;
+        let database = WorkspaceDatabase::open(&path, DatabaseName::Index, mapped_pool).await?;
         let mut reading = database.connection().await?;
         let read_size = toasty::sql::query("PRAGMA mmap_size")
             .column_types([Type::I64])
@@ -1166,7 +1396,9 @@ mod tests {
     #[tokio::test]
     async fn write_checkouts_wait_for_the_process_write_turn() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, pool())
+                .await?;
         let first = database.writing().await?;
         let (waiting, reached_wait) = tokio::sync::oneshot::channel();
         let contender_database = Arc::clone(&database);
@@ -1187,7 +1419,9 @@ mod tests {
     #[tokio::test]
     async fn wal_read_completes_while_an_immediate_write_is_uncommitted() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Vectors, pool())
+                .await?;
         let mut writing = database.writing().await?;
         let mut transaction = writing.transaction().await?;
         VectorRecord::create()
@@ -1238,7 +1472,9 @@ mod tests {
     #[tokio::test]
     async fn a_held_index_commit_delays_no_log_write_or_read() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let database = WorkspaceDatabase::open(&directory.path().join("db"), pool()).await?;
+        let database =
+            WorkspaceDatabase::open(&directory.path().join("db"), DatabaseName::Index, pool())
+                .await?;
         let logs = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
         let index =
             LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());
@@ -1273,9 +1509,12 @@ mod tests {
     async fn another_write_lock_on_the_index_delays_no_log_write_or_read() -> TestResult {
         let directory = tempfile::tempdir()?;
         let index_path = directory.path().join("db");
-        let database =
-            WorkspaceDatabase::open(&index_path, DatabasePool::new(4, HELD_POOL_BUSY_TIMEOUT_MS))
-                .await?;
+        let database = WorkspaceDatabase::open(
+            &index_path,
+            DatabaseName::Index,
+            DatabasePool::new(4, HELD_POOL_BUSY_TIMEOUT_MS),
+        )
+        .await?;
         let logs = rift_tracing::LogStore::open(&directory.path().join("metrics"), None).await?;
         let index =
             LexicalSearchIndex::attached(Arc::clone(&database), LexicalIndexLimits::default());

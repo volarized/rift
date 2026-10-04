@@ -15,6 +15,8 @@ use toasty_driver_sqlite::Sqlite;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout_at};
 
+use crate::database::DatabaseName;
+
 const CONNECTION_REAP_SPAN: Duration = Duration::from_millis(100);
 
 pub(crate) struct DatabaseThread {
@@ -39,7 +41,10 @@ impl std::fmt::Debug for DatabaseThread {
 }
 
 impl DatabaseThread {
+    /// Starts the worker thread of the database `name`, named for it, which keeps `owner`
+    /// from thread entry until the thread exits.
     pub(crate) async fn spawn(
+        name: DatabaseName,
         driver: Arc<Sqlite>,
         connections_max: usize,
         queue_timeout: Duration,
@@ -50,7 +55,7 @@ impl DatabaseThread {
         let (ready_tx, ready_rx) = oneshot::channel();
         let startup_deadline = Instant::now() + queue_timeout;
         let join = thread::Builder::new()
-            .name("rift-sqlite".to_owned())
+            .name(name.thread_name().to_owned())
             .spawn(move || {
                 let _owner = owner;
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -386,6 +391,8 @@ enum Command {
     },
     #[cfg(test)]
     Noop(oneshot::Sender<()>),
+    #[cfg(test)]
+    ThreadName(oneshot::Sender<Option<String>>),
 }
 
 struct OwnedConnection {
@@ -507,6 +514,10 @@ impl DatabaseWorker {
             #[cfg(test)]
             Command::Noop(reply) => {
                 let _ = reply.send(());
+            }
+            #[cfg(test)]
+            Command::ThreadName(reply) => {
+                let _ = reply.send(thread::current().name().map(str::to_owned));
             }
         }
         true
@@ -664,15 +675,22 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{Command, DatabaseThread, SqliteThreadDriver};
+    use crate::database::DatabaseName;
 
     async fn driver(
         path: &std::path::Path,
         queue_timeout: Duration,
     ) -> (Arc<DatabaseThread>, SqliteThreadDriver) {
         let sqlite = Arc::new(Sqlite::open(path));
-        let actor = DatabaseThread::spawn(Arc::clone(&sqlite), 1, queue_timeout, None)
-            .await
-            .expect("SQLite worker must start");
+        let actor = DatabaseThread::spawn(
+            DatabaseName::Index,
+            Arc::clone(&sqlite),
+            1,
+            queue_timeout,
+            None,
+        )
+        .await
+        .expect("SQLite worker must start");
         let driver = SqliteThreadDriver::new(sqlite, Arc::clone(&actor));
         (actor, driver)
     }
@@ -880,6 +898,7 @@ mod tests {
         owner.lock().expect("owner locks its file");
         let retained = Arc::downgrade(&owner);
         let actor = DatabaseThread::spawn(
+            DatabaseName::Index,
             Arc::new(Sqlite::open(directory.path().join("db"))),
             1,
             Duration::from_secs(1),
@@ -964,5 +983,39 @@ mod tests {
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await
             .expect("cancelled shutdown must leave accepted join awaitable");
+    }
+
+    /// Each database's worker thread carries the database's own name, short enough that
+    /// Linux keeps it whole.
+    #[tokio::test]
+    async fn each_database_worker_is_named_for_its_database() {
+        let directory = tempfile::tempdir().expect("fixture directory must open");
+        for (name, expected) in [
+            (DatabaseName::Index, "rift-db-index"),
+            (DatabaseName::Vectors, "rift-db-vectors"),
+        ] {
+            let actor = DatabaseThread::spawn(
+                name,
+                Arc::new(Sqlite::open(name.path(directory.path()))),
+                1,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect("SQLite worker starts");
+            let (reply, named) = oneshot::channel();
+            actor
+                .sender
+                .send(Command::ThreadName(reply))
+                .await
+                .expect("name request queues");
+            let named = named.await.expect("worker answers its name");
+            assert_eq!(named.as_deref(), Some(expected));
+            assert!(expected.len() <= 15, "Linux keeps 15 bytes: {expected}");
+            actor
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("worker must stop");
+        }
     }
 }

@@ -91,7 +91,7 @@ fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
 
 fn indexed_workspace(root: &Path) -> TestResult {
     fs::create_dir_all(root.join(".rift"))?;
-    fs::write(root.join(".rift").join("db"), b"")?;
+    fs::write(root.join(".rift").join("index"), b"")?;
     fs::create_dir(root.join(".git"))?;
     Ok(())
 }

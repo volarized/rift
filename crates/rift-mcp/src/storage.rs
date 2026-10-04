@@ -1,31 +1,33 @@
 //! The serving process's handles on the workspace's databases below `.rift`.
 //!
-//! The metrics database at `.rift/metrics` holds the server's own log records; the
-//! workspace database at `.rift/db` holds the search rows. Each opens on its own, so one
-//! that fails leaves the other serving, and an open failure never deletes a file.
+//! The metrics database at `.rift/metrics` holds the server's own log records; the index
+//! database at `.rift/index` holds the lexical and documentation rows; the vectors
+//! database at `.rift/vectors` holds the vector ranking's rows and opens at the first
+//! vector operation, never at start. Each opens on its own, so one that fails leaves the
+//! others serving, and an open failure never deletes a file.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use rift_core::constants::{
-    METRICS_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME,
-};
+use rift_core::constants::{METRICS_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY};
 use rift_error::causes;
-use rift_index::{DatabasePool, WorkspaceDatabase};
+use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
 use rift_tracing::{LogReader, LogStore};
 
 /// One serving process's storage handles for a workspace.
 #[derive(Clone, Debug)]
 pub struct WorkspaceStorage {
     database: Option<Arc<WorkspaceDatabase>>,
+    vectors: Option<Arc<LazyDatabase>>,
     logs: Option<Arc<LogStore>>,
     election: Option<Arc<crate::ElectionGuard>>,
 }
 
 impl WorkspaceStorage {
-    /// Opens the metrics database, then the workspace database.
+    /// Opens the metrics database, then the index database, and keeps a handle that opens
+    /// the vectors database at its first use.
     ///
-    /// A failure leaves that one handle absent: without the workspace database identifier
+    /// A failure leaves that one handle absent: without the index database identifier
     /// search still serves, and without the metrics database the run records nothing.
     /// The existing file stays in place for inspection and recovery.
     ///
@@ -39,8 +41,9 @@ impl WorkspaceStorage {
 
     /// Opens storage only while this process holds the workspace election.
     ///
-    /// The SQLite worker and the metrics writer thread each keep the guard until they
-    /// exit, including after cancellation or a shutdown timeout.
+    /// Each database's worker thread and the metrics writer thread keep the guard until
+    /// they exit, including after cancellation or a shutdown timeout. The vectors
+    /// database's worker receives the same guard when it opens.
     ///
     /// # Errors
     ///
@@ -56,8 +59,8 @@ impl WorkspaceStorage {
 
     /// Opens workspace storage with an owner held by each database thread until it ends.
     ///
-    /// The metrics database opens first, so the workspace database's open lands as a
-    /// record.
+    /// The metrics database opens first, so the index database's open lands as a record.
+    /// The vectors database opens at the first vector operation, under the same owner.
     pub(crate) async fn open_with_owner(
         root: &Path,
         election: Option<Arc<crate::ElectionGuard>>,
@@ -66,16 +69,22 @@ impl WorkspaceStorage {
             let owner: Arc<dyn Send + Sync> = Arc::<crate::ElectionGuard>::clone(guard);
             owner
         });
-        let (logs, database) = match state_directory(root).await {
+        let (logs, database, vectors) = match state_directory(root).await {
             Some(state_directory) => {
                 let logs = open_log_store(&state_directory, owner.clone()).await;
-                let database = open_workspace_database(root, &state_directory, owner).await;
-                (logs, database)
+                let database = open_index_database(root, &state_directory, owner.clone()).await;
+                let vectors = LazyDatabase::new(
+                    &DatabaseName::Vectors.path(&state_directory),
+                    DatabaseName::Vectors,
+                    owner,
+                );
+                (logs, database, Some(Arc::new(vectors)))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         Self {
             database,
+            vectors,
             logs,
             election,
         }
@@ -88,9 +97,15 @@ impl WorkspaceStorage {
             .is_some_and(|owner| Arc::ptr_eq(owner, guard))
     }
 
-    /// The workspace database, when it opened.
+    /// The index database, when it opened.
     pub(crate) fn database(&self) -> Option<Arc<WorkspaceDatabase>> {
         self.database.as_ref().map(Arc::clone)
+    }
+
+    /// The handle that opens the vectors database at its first use, when the state
+    /// directory exists.
+    pub(crate) fn vectors(&self) -> Option<Arc<LazyDatabase>> {
+        self.vectors.as_ref().map(Arc::clone)
     }
 
     /// The recorded diagnostics store, when the metrics database opened.
@@ -165,14 +180,21 @@ async fn open_log_store(
     }
 }
 
-/// Opens the workspace database without replacing a failed file.
-async fn open_workspace_database(
+/// Opens the index database without replacing a failed file.
+async fn open_index_database(
     root: &Path,
     state_directory: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Option<Arc<WorkspaceDatabase>> {
-    let database_path = state_directory.join(WORKSPACE_DATABASE_FILE_NAME);
-    match WorkspaceDatabase::open_with_owner(&database_path, configured_pool(root), owner).await {
+    let database_path = DatabaseName::Index.path(state_directory);
+    match WorkspaceDatabase::open_with_owner(
+        &database_path,
+        DatabaseName::Index,
+        configured_pool(root),
+        owner,
+    )
+    .await
+    {
         Ok(database) => Some(database),
         Err(error) => {
             let causes = causes(&error).join(": ");
@@ -182,7 +204,8 @@ async fn open_workspace_database(
                 path = %database_path.display(),
                 error = %error,
                 causes,
-                "the workspace database failed to open; the server starts without it"
+                database = %DatabaseName::Index,
+                "the index database failed to open; the server starts without it"
             );
             None
         }
@@ -194,7 +217,7 @@ mod tests {
     use rift_error::errors;
     use std::sync::Arc;
 
-    use rift_core::constants::{RIFT_STATE_DIRECTORY, WORKSPACE_DATABASE_FILE_NAME};
+    use rift_core::constants::{INDEX_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY};
 
     use super::WorkspaceStorage;
 
@@ -215,7 +238,7 @@ mod tests {
         let database_path = directory
             .path()
             .join(RIFT_STATE_DIRECTORY)
-            .join(WORKSPACE_DATABASE_FILE_NAME);
+            .join(INDEX_DATABASE_FILE_NAME);
         std::fs::create_dir_all(&database_path).expect("a directory occupies the database path");
 
         let storage = WorkspaceStorage::open(directory.path()).await;
@@ -235,7 +258,7 @@ mod tests {
         let database_path = directory
             .path()
             .join(RIFT_STATE_DIRECTORY)
-            .join(WORKSPACE_DATABASE_FILE_NAME);
+            .join(INDEX_DATABASE_FILE_NAME);
         std::fs::create_dir_all(&database_path).expect("a directory occupies the database path");
 
         let storage = WorkspaceStorage::open(directory.path()).await;
@@ -286,8 +309,12 @@ mod tests {
                 .context()
                 .any(|(key, value)| key == "operation" && value == "validate workspace election")
         );
-        assert!(!requested.path().join(".rift/db").exists());
-        assert!(!requested.path().join(".rift/metrics").exists());
+        for name in ["index", "metrics", "vectors"] {
+            assert!(
+                !requested.path().join(".rift").join(name).exists(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
