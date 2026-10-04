@@ -510,8 +510,8 @@ mod tests {
         assert_eq!(
             contents(&rendered, LOGS_URI).0,
             "2 records\n\
-             \x20\x202026-10-04 10:42:07.120 info - - · not an object\n\
-             \x20\x201970-01-01 00:00:00.007 warn index index.reconcile: the capture disagreed · epoch 4\n"
+             \t2026-10-04 10:42:07.120 info - - · not an object\n\
+             \t1970-01-01 00:00:00.007 warn index index.reconcile: the capture disagreed · epoch 4\n"
         );
     }
 
