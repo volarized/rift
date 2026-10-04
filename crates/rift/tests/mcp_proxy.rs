@@ -243,18 +243,24 @@ async fn repository_workspace_reads(
     name: &str,
     names: &[&str],
 ) -> TestResult<String> {
-    let map = await_workspace_ready(client).await?;
+    let map = await_workspace_ready(client)
+        .await
+        .map_err(|error| format!("map resource: {error:?}"))?;
     let revision = map["revision"]
         .as_str()
         .ok_or("map carries its revision")?
         .to_owned();
-    let lookup = proxied_call(client, "get_symbol", &json!({"name": name})).await?;
+    let lookup = proxied_call(client, "get_symbol", &json!({"name": name}))
+        .await
+        .map_err(|error| format!("positive get_symbol: {error:?}"))?;
     assert_eq!(lookup["hits"][0]["symbol"]["name"], name, "{lookup}");
     let other = names
         .iter()
         .find(|other| **other != name)
         .ok_or("fixture has another symbol")?;
-    let absent = proxied_call(client, "get_symbol", &json!({"name": other})).await?;
+    let absent = proxied_call(client, "get_symbol", &json!({"name": other}))
+        .await
+        .map_err(|error| format!("negative get_symbol: {error:?}"))?;
     assert!(
         absent["hits"]
             .as_array()
@@ -267,7 +273,8 @@ async fn repository_workspace_reads(
         "search",
         &json!({"query": name, "target": "symbol"}),
     )
-    .await?;
+    .await
+    .map_err(|error| format!("search: {error:?}"))?;
     assert!(
         search["results"]
             .as_array()
@@ -276,7 +283,9 @@ async fn repository_workspace_reads(
             .any(|hit| hit["hit"]["symbol"]["name"] == name),
         "{search}"
     );
-    let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8})).await?;
+    let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8}))
+        .await
+        .map_err(|error| format!("nodes: {error:?}"))?;
     assert!(
         nodes["source"]
             .as_array()
@@ -404,9 +413,20 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let mut revisions = std::collections::BTreeSet::new();
     let mut source_digests = std::collections::BTreeSet::new();
     for (root, name) in roots.iter().zip(names) {
-        let client = proxy_client(root).await?;
-        revisions.insert(repository_workspace_reads(&client, name, &names).await?);
-        source_digests.insert(repository_workspace_resource_digest(&client).await?);
+        let workspace = format!("workspace {name} at {}", root.display());
+        let client = proxy_client(root)
+            .await
+            .map_err(|error| format!("{workspace} proxy startup: {error:?}"))?;
+        revisions.insert(
+            repository_workspace_reads(&client, name, &names)
+                .await
+                .map_err(|error| format!("{workspace} read: {error:?}"))?,
+        );
+        source_digests.insert(
+            repository_workspace_resource_digest(&client)
+                .await
+                .map_err(|error| format!("{workspace} resource digest: {error:?}"))?,
+        );
         assert!(claim(root).is_err(), "repository owns this workspace store");
         assert!(
             !document_path(root).exists(),
@@ -432,7 +452,9 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let changed = fs::read_to_string(main.path().join("rift.toml"))?
         .replace("[server]\n", "[server]\nnum_workers = 2\n");
     fs::write(main.path().join("rift.toml"), &changed)?;
-    let pinned = proxied_call(&clients[3], "get_symbol", &json!({"name": "quartz"})).await?;
+    let pinned = proxied_call(&clients[3], "get_symbol", &json!({"name": "quartz"}))
+        .await
+        .map_err(|error| format!("workspace quartz after settings change get_symbol: {error:?}"))?;
     assert_eq!(pinned["hits"][0]["symbol"]["name"], "quartz", "{pinned}");
     require_success(
         &run_rift(&roots[3], &["server", "status", "--repository"]).await?,
