@@ -1019,7 +1019,7 @@
     },
     "SearchConfiguration": {
       "additionalProperties": false,
-      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files,\n`pool_slots` and `busy_timeout` bound the shared `SQLite` connections\nbehind search and logs, and the `pattern_` keys bound one regex\n`pattern` search.",
+      "description": "The `[search]` table. `ranking` weighs the ranking inputs against each\nother, `lexical` and `vector` bound the two indexed rankings, `text`\nbounds the lexical chunks derived from visible text files,\n`pool_slots`, `busy_timeout`, and `journal_size_limit` bound the `SQLite`\nconnections of the index database and of the vectors database, and the\n`pattern_` keys bound one regex `pattern` search.",
       "properties": {
         "busy_timeout": {
           "$ref": "#/$defs/Duration",
@@ -1028,6 +1028,15 @@
           "rift:range": {
             "max": "30s",
             "min": "100ms"
+          }
+        },
+        "journal_size_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64mb",
+          "description": "Size the write-ahead log of `.rift/index`, and separately of\n`.rift/vectors`, is cut back to at the commit that restarts it after a\ncheckpoint, 0b to 64gb. A transaction larger than this still grows the\nlog past it until that commit.",
+          "rift:range": {
+            "max": "64gb",
+            "min": "0b"
           }
         },
         "lexical": {
@@ -1076,7 +1085,7 @@
         },
         "pool_slots": {
           "default": 4,
-          "description": "Pooled `SQLite` connections the workspace database may open at once,\n1 to 16. Search reads and stored logs share this pool.",
+          "description": "Pooled `SQLite` connections the index database may open at once, and\nseparately the vectors database, 1 to 16.",
           "format": "uint64",
           "maximum": 16,
           "minimum": 1,
@@ -1544,6 +1553,7 @@
       "$ref": "#/$defs/SearchConfiguration",
       "default": {
         "busy_timeout": "5s",
+        "journal_size_limit": "64mb",
         "lexical": {
           "mmap_size": "1gb",
           "transaction_size": "16mb",

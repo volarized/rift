@@ -1195,9 +1195,9 @@ impl ExecutionConfiguration {
 /// The `[search]` table. `ranking` weighs the ranking inputs against each
 /// other, `lexical` and `vector` bound the two indexed rankings, `text`
 /// bounds the lexical chunks derived from visible text files,
-/// `pool_slots` and `busy_timeout` bound the shared `SQLite` connections
-/// behind search and logs, and the `pattern_` keys bound one regex
-/// `pattern` search.
+/// `pool_slots`, `busy_timeout`, and `journal_size_limit` bound the `SQLite`
+/// connections of the index database and of the vectors database, and the
+/// `pattern_` keys bound one regex `pattern` search.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
@@ -1211,8 +1211,8 @@ pub struct SearchConfiguration {
     /// The embedding model that adds vector ranking, and the bounds its
     /// preparation runs under.
     pub vector: VectorSearchConfiguration,
-    /// Pooled `SQLite` connections the workspace database may open at once,
-    /// 1 to 16. Search reads and stored logs share this pool.
+    /// Pooled `SQLite` connections the index database may open at once, and
+    /// separately the vectors database, 1 to 16.
     #[schemars(range(min = 1, max = 16))]
     #[serde(default = "default_search_pool_slots")]
     pub pool_slots: u64,
@@ -1221,6 +1221,11 @@ pub struct SearchConfiguration {
     /// before `SQLITE_BUSY`, 100ms to 30s.
     #[serde(default = "default_search_busy_timeout")]
     pub busy_timeout: Duration,
+    /// Size the write-ahead log of `.rift/index`, and separately of
+    /// `.rift/vectors`, is cut back to at the commit that restarts it after a
+    /// checkpoint, 0b to 64gb. A transaction larger than this still grows the
+    /// log past it until that commit.
+    pub journal_size_limit: ByteSize,
     /// Most bytes the matcher one search `pattern` compiles to may take, 64kb to
     /// 64mb. A pattern whose matcher compiles past it is refused naming this key.
     pub pattern_compiled_size: ByteSize,
@@ -1253,6 +1258,7 @@ impl Default for SearchConfiguration {
             vector: VectorSearchConfiguration::default(),
             pool_slots: SEARCH_POOL_SLOTS_DEFAULT,
             busy_timeout: default_search_busy_timeout(),
+            journal_size_limit: ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT),
             pattern_compiled_size: ByteSize::from_bytes(SEARCH_PATTERN_COMPILED_BYTES_DEFAULT),
             pattern_candidate_rows: SEARCH_PATTERN_CANDIDATE_ROWS_DEFAULT,
             pattern_verified_size: ByteSize::from_bytes(SEARCH_PATTERN_VERIFIED_BYTES_DEFAULT),
@@ -1284,6 +1290,12 @@ impl SearchConfiguration {
                         self.busy_timeout.milliseconds(),
                         SEARCH_BUSY_TIMEOUT_MS_MIN,
                         SEARCH_BUSY_TIMEOUT_MS_MAX,
+                    ),
+                    (
+                        "search.journal_size_limit",
+                        self.journal_size_limit.bytes(),
+                        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
+                        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX,
                     ),
                     (
                         "search.pattern_compiled_size",
@@ -1326,6 +1338,14 @@ pub const SEARCH_BUSY_TIMEOUT_MS_MIN: u64 = 100;
 pub const SEARCH_BUSY_TIMEOUT_MS_MAX: u64 = 30_000;
 /// Milliseconds `search.busy_timeout` holds when the key is absent.
 const SEARCH_BUSY_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+/// Bytes `search.journal_size_limit` may hold, at least: `0b` cuts the log to its
+/// smallest size at each restart.
+pub const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN: u64 = 0;
+/// Bytes `search.journal_size_limit` may hold, at most: the most text `[source]
+/// workspace_size` lets a workspace hold.
+pub const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX: u64 = crate::source::SOURCE_WORKSPACE_BYTES_MAX;
+/// Bytes `search.journal_size_limit` holds when the key is absent.
+const SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT: u64 = 64 << 20;
 /// Bytes `search.pattern_compiled_size` may hold, at least: room for a pattern of a few
 /// Unicode word classes, the largest the text-search evaluation compiled at 51,116 bytes.
 pub const SEARCH_PATTERN_COMPILED_BYTES_MIN: u64 = 64 << 10;
@@ -5274,6 +5294,61 @@ mod tests {
         assert_eq!(
             schema["$defs"]["TextSearchConfiguration"]["properties"]["large_files"]["default"],
             json!("split")
+        );
+    }
+
+    #[test]
+    fn test_search_journal_size_limit_defaults_bounds_and_advertises_its_range() {
+        assert_eq!(
+            SearchConfiguration::default().journal_size_limit,
+            ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT)
+        );
+        let mut configuration = WorkspaceConfiguration::default();
+        for bytes in [
+            SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
+            SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX,
+        ] {
+            configuration.search.journal_size_limit = ByteSize::from_bytes(bytes);
+            assert_eq!(
+                configuration.validate(),
+                Ok(()),
+                "journal_size_limit {bytes}"
+            );
+        }
+        configuration.search.journal_size_limit =
+            ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX + 1);
+        assert!(
+            matches!(
+                configuration.validate(),
+                Err(ConfigurationViolation::LimitOutOfRange {
+                    field: "search.journal_size_limit",
+                    ..
+                })
+            ),
+            "a limit past the maximum must be refused naming the key"
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration)).expect("schema");
+        let property = &schema["$defs"]["SearchConfiguration"]["properties"]["journal_size_limit"];
+        assert_eq!(
+            property["rift:range"],
+            json!({
+                "min": ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN),
+                "max": ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX),
+            })
+        );
+        assert_eq!(
+            property["default"],
+            json!(ByteSize::from_bytes(
+                SEARCH_JOURNAL_SIZE_LIMIT_BYTES_DEFAULT
+            ))
+        );
+        let written = json!({ "search": { "journal_size_limit": "16mb" } });
+        let configuration: WorkspaceConfiguration =
+            serde_json::from_value(written).expect("the journal size limit deserializes");
+        assert_eq!(
+            configuration.search.journal_size_limit,
+            ByteSize::from_bytes(16 << 20)
         );
     }
 

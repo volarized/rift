@@ -1048,6 +1048,7 @@ pub fn declare_server_ranges(schema: &mut Schema) {
 pub fn declare_search_ranges(schema: &mut Schema) {
     use crate::configuration::{
         ByteSize, Duration, SEARCH_BUSY_TIMEOUT_MS_MAX, SEARCH_BUSY_TIMEOUT_MS_MIN,
+        SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX, SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN,
         SEARCH_PATTERN_COMPILED_BYTES_MAX, SEARCH_PATTERN_COMPILED_BYTES_MIN,
         SEARCH_PATTERN_VERIFIED_BYTES_MAX, SEARCH_PATTERN_VERIFIED_BYTES_MIN, SearchConfiguration,
     };
@@ -1058,6 +1059,15 @@ pub fn declare_search_ranges(schema: &mut Schema) {
         range(
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MIN),
             &Duration::from_millis(SEARCH_BUSY_TIMEOUT_MS_MAX),
+        ),
+    );
+    annotate_property(
+        schema,
+        property!(SearchConfiguration, journal_size_limit),
+        RIFT_RANGE,
+        range(
+            &ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MIN),
+            &ByteSize::from_bytes(SEARCH_JOURNAL_SIZE_LIMIT_BYTES_MAX),
         ),
     );
     annotate_property(
