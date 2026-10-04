@@ -574,7 +574,9 @@ The macros in `crates/rift-error/src/definition` expand each declaration into th
 kind to the Rust bound a setter accepts and the `ErrorValue` conversion it applies. Each required field adds one builder
 type parameter that starts at `Unset` and becomes `Set` when its setter runs; `.error()`, `.fail()`, and the
 `IntoRiftError` implementation exist only once every parameter is `Set`. Each optional field adds `.maybe_<field>()`,
-which takes `Option<T>` and leaves the builder type unchanged. The `maybe_<field>` names come from `pastey`.
+which takes `Option<T>` and leaves the builder type unchanged. The `maybe_<field>` and `<Field>State` names come from
+`rift-error-macros`, which depends on `proc_macro` alone. A crate that reaches `rift-error` by path, such as the
+generated-code compile test in `rift-error-codegen`, therefore builds it with `--offline` and no downloaded crates.
 
 A `source` field retains an underlying Rust error and exposes it through `std::error::Error::source`.
 A `cause` field retains another `RiftError` in that chain. The runtime also converts owned and
