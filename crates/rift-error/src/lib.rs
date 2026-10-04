@@ -2,8 +2,8 @@
 
 extern crate self as rift_error;
 
+mod definition;
 mod evidence;
-mod generated_support;
 mod representation;
 mod runtime;
 
@@ -16,10 +16,12 @@ pub mod errors {
 }
 
 pub use evidence::EvidenceFor;
+#[doc(hidden)]
+pub use pastey::paste as __rift_paste;
 pub use representation::IntoRiftError;
 pub use runtime::{
     BuilderCore, CAUSE_DEPTH_MAX, ErrorContext, ErrorSlug, ErrorValue, FieldSet, IntoInteger,
-    IntoUnsigned, OptionalFieldSet, RiftError, Set, SourceView, Unset, causes,
+    IntoUnsigned, RiftError, Set, SourceView, Unset, causes,
 };
 
 #[doc(hidden)]

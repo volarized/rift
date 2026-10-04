@@ -104,34 +104,58 @@ mod tests {
     use super::generate_source;
 
     #[test]
-    fn emits_stable_nested_modules_and_required_setters() {
+    fn emits_compact_semantic_declarations() {
         let source = r#"
 [registry]
 namespace = "rift.cloud"
 schema = 1
 
 [error.auth.token_expired]
-message = "token expired for {subject}"
+message = "token \"expired\" for {subject} under C:\\keys"
 action = "renew token for {subject}"
-        fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true } }
+fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true }, internal = { type = "string", optional = true, display = false } }
 
 [error.auth.no_token]
 message = "token is missing"
 action = "provide a token"
 "#;
         let generated = generate_source(source).expect("generate source");
-        assert!(generated.contains("rift.cloud.auth.token_expired"));
-        assert!(generated.contains("REGISTERED_SLUGS"));
-        assert!(generated.contains("__rift_error_definition!"));
-        assert!(generated.contains("error token_expired;"));
-        assert!(generated.contains("optional[maybe_token]"));
-        assert!(generated.contains("states[State0]"));
-        assert!(generated.contains("complete[SetState]"));
-        assert!(generated.starts_with("pub use rift_error::{FieldSet, OptionalFieldSet};"));
-        assert!(!generated.contains("::rift_error::"));
-        assert!(!generated.contains("::std::"));
-        assert!(!generated.contains("allow(unused_imports)"));
-        assert!(generated.contains("error no_token;"));
+        let expected = r#"use rift_error::__rift_error_definition;
+
+#[doc(hidden)]
+pub const REGISTRY_NAMESPACE: &str = "rift.cloud";
+#[doc(hidden)]
+pub const REGISTERED_SLUGS: &[&str] = &[
+    "rift.cloud.auth.no_token",
+    "rift.cloud.auth.token_expired",
+];
+
+/// Registered errors under `rift.cloud.auth`.
+pub mod auth {
+    use super::__rift_error_definition;
+
+    __rift_error_definition!(
+        no_token,
+        slug = "rift.cloud.auth.no_token",
+        message = "token is missing",
+        action = "provide a token",
+        fields = {},
+    );
+
+    __rift_error_definition!(
+        token_expired,
+        slug = "rift.cloud.auth.token_expired",
+        message = "token \"expired\" for {subject} under C:\\keys",
+        action = "renew token for {subject}",
+        fields = {
+            internal: optional(string, hidden),
+            subject: required(string),
+            token: optional(bool, sensitive),
+        },
+    );
+}
+"#;
+        assert_eq!(generated, expected);
         assert_eq!(
             generated,
             generate_source(source).expect("generate same source")
@@ -143,78 +167,33 @@ action = "provide a token"
         let generated = generate_source(include_str!("../../rift-error/errors.toml"))
             .expect("generate committed registry");
         assert!(
-            generated.lines().count() <= 10_000,
-            "generated source exceeds 10,000 lines"
+            generated.lines().count() <= 4_500,
+            "generated source exceeds 4,500 lines"
         );
     }
 
     #[test]
-    fn generated_imports_are_grouped_unique_and_ordered() {
-        use quote::ToTokens as _;
-        use syn::Item;
+    fn generated_registry_is_rustfmt_stable() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
 
-        let source = r#"
-[registry]
-namespace = "rift.cloud"
-schema = 1
-
-[error.auth.token_expired]
-message = "token expired for {subject}"
-action = "renew token for {subject}"
-fields = { subject = { type = "string" }, token = { type = "bool", optional = true, sensitive = true }, pid = { type = "pid" }, port = { type = "port" } }
-"#;
-        let generated = generate_source(source).expect("generate source");
-        let file = syn::parse_file(&generated).expect("generated Rust parses");
-        let imports = file
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Use(item) if matches!(item.vis, syn::Visibility::Inherited) => {
-                    Some(item.to_token_stream().to_string())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            imports.len(),
-            2,
-            "one grouped import per namespace: {imports:?}"
-        );
-        assert!(imports[0].starts_with("use rift_error"), "{imports:?}");
-        assert!(imports[1].starts_with("use std"), "{imports:?}");
-        let mut sorted = imports.clone();
-        sorted.sort();
-        assert_eq!(imports, sorted, "imports sort by namespace: {imports:?}");
-        let mut unique = imports.clone();
-        unique.dedup();
-        assert_eq!(imports, unique, "imports have no duplicates: {imports:?}");
-        assert!(imports[1].contains("borrow :: Borrow"), "{imports:?}");
-        fn contains_glob(tree: &syn::UseTree) -> bool {
-            match tree {
-                syn::UseTree::Glob(_) => true,
-                syn::UseTree::Group(group) => group.items.iter().any(contains_glob),
-                syn::UseTree::Path(path) => contains_glob(&path.tree),
-                syn::UseTree::Name(_) | syn::UseTree::Rename(_) => false,
-            }
-        }
-        fn assert_no_wildcard_imports(items: &[Item]) {
-            for item in items {
-                match item {
-                    Item::Use(item) => assert!(
-                        !contains_glob(&item.tree),
-                        "wildcard import: {}",
-                        item.to_token_stream()
-                    ),
-                    Item::Mod(item) => {
-                        if let Some((_, items)) = &item.content {
-                            assert_no_wildcard_imports(items);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_no_wildcard_imports(&file.items);
+        let generated = generate_source(include_str!("../../rift-error/errors.toml"))
+            .expect("generate committed registry");
+        let mut rustfmt = Command::new("rustfmt")
+            .args(["--edition", "2024", "--emit", "stdout"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("run rustfmt");
+        rustfmt
+            .stdin
+            .take()
+            .expect("rustfmt stdin")
+            .write_all(generated.as_bytes())
+            .expect("write generated source to rustfmt");
+        let output = rustfmt.wait_with_output().expect("wait for rustfmt");
+        assert!(output.status.success(), "rustfmt rejected generated source");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), generated);
     }
 
     #[test]
