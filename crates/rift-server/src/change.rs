@@ -29,7 +29,7 @@ use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadError, ReadFault, ReadService, file_id, page, project_path, results_truncation_warning,
+    ReadService, RiftError, file_id, page, project_path, results_truncation_warning,
     source_warnings, wire_index_warning,
 };
 use crate::search::{
@@ -45,7 +45,7 @@ use crate::search::{
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the request combines `change` with a field that
+/// Returns [`RiftError`] when the request combines `change` with a field that
 /// selects another result set, when a revision spelling breaks its contract or
 /// resolves to no commit, when the workspace has no version-control repository,
 /// or when one side's changed paths cannot be indexed within bounds.
@@ -57,7 +57,7 @@ pub fn search_change(
     limits: WorkspaceIndexLimits,
     visibility: &SourceVisibility,
     (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
-) -> Result<SearchResult, ReadError> {
+) -> Result<SearchResult, RiftError> {
     validate_search(params)?;
     let limit = search_page_limit(params)?;
     let compared = ComparedRevisions::open(
@@ -161,12 +161,10 @@ impl<'current> ComparedRevisions<'current> {
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
-    ) -> Result<Self, ReadError> {
-        let repository = Repository::open(root).map_err(ReadFault::history)?;
-        let base = repository
-            .resolve(&change.base.0)
-            .map_err(ReadFault::history)?;
-        let visible = RevisionPaths::build(root, visibility).map_err(ReadFault::index)?;
+    ) -> Result<Self, RiftError> {
+        let repository = Repository::open(root)?;
+        let base = repository.resolve(&change.base.0)?;
+        let visible = RevisionPaths::build(root, visibility)?;
         let requested = path_matcher(root, selector)?;
         let compared = |path: &str| {
             visible.includes(path)
@@ -184,12 +182,11 @@ impl<'current> ComparedRevisions<'current> {
                 (limits, visibility, (text_inclusion, languages)),
             );
         };
-        let head = repository.resolve(&head.0).map_err(ReadFault::history)?;
+        let head = repository.resolve(&head.0)?;
         let changed =
             rift_core::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_files(&base, &head, &compared, paths_max)
-            })
-            .map_err(ReadFault::history)?;
+            })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let holds = |path: &str| selected.contains(path);
         let index_side = |revision| {
@@ -202,7 +199,6 @@ impl<'current> ComparedRevisions<'current> {
                 languages,
                 &holds,
             )
-            .map_err(ReadFault::index)
         };
         let base_index =
             rift_core::traced!(component = "search", operation = "search.change_base", {
@@ -242,7 +238,7 @@ impl<'current> ComparedRevisions<'current> {
             &SourceVisibility,
             (&TextFileInclusion, &LanguageFileSelections),
         ),
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let root = repository.root();
         let served: HashSet<&str> = published
             .files()
@@ -257,10 +253,9 @@ impl<'current> ComparedRevisions<'current> {
         let changed =
             rift_core::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_working_files(base, &served_paths, &listed, paths_max)
-            })
-            .map_err(ReadFault::history)?;
+            })?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
-        let mut forms = repository.working_forms().map_err(ReadFault::history)?;
+        let mut forms = repository.working_forms()?;
         let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
         let base_index =
             rift_core::traced!(component = "search", operation = "search.change_base", {
@@ -284,8 +279,7 @@ impl<'current> ComparedRevisions<'current> {
                         }
                     },
                 )
-            })
-            .map_err(ReadFault::index)?;
+            })?;
         let kept: Vec<String> = changed
             .paths()
             .iter()
@@ -315,7 +309,7 @@ impl<'current> ComparedRevisions<'current> {
     ///
     /// `target: "file"` answers none of them, the way a traversal does: a
     /// comparison reaches declarations alone.
-    fn hits(&self, params: &SearchParams) -> Result<Vec<SearchHit>, ReadError> {
+    fn hits(&self, params: &SearchParams) -> Result<Vec<SearchHit>, RiftError> {
         if params.target == SearchParamsTarget::File {
             return Ok(Vec::new());
         }
@@ -339,7 +333,7 @@ impl<'current> ComparedRevisions<'current> {
         payloads: HitPayloads,
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         match (self.base.file(path), self.head().file(path)) {
             (Some(base_file), Some(head_file)) => {
                 self.compare_files(path, (base_file, head_file), payloads, results, unpaired)
@@ -366,7 +360,7 @@ impl<'current> ComparedRevisions<'current> {
         payloads: HitPayloads,
         results: &mut Vec<SearchHit>,
         unpaired: &mut UnpairedDeclarations<'sides>,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         let base = declarations(base_file);
         let head = declarations(head_file);
         for (key, head_symbol) in &head {
@@ -563,7 +557,7 @@ impl UnpairedDeclarations<'_> {
     /// additions, two removals, or one of each in the same path - leaves both
     /// sides standing on their own, because no evidence says which addition
     /// answers which removal.
-    fn resolve(self, payloads: HitPayloads, results: &mut Vec<SearchHit>) -> Result<(), ReadError> {
+    fn resolve(self, payloads: HitPayloads, results: &mut Vec<SearchHit>) -> Result<(), RiftError> {
         let mut groups: HashMap<MoveKey, MoveGroup> = HashMap::new();
         for (position, added) in self.added.iter().enumerate() {
             groups.entry(added.move_key()).or_default().0.push(position);
@@ -634,7 +628,7 @@ fn changed_hit(
     declaration: &Declaration<'_>,
     change: SymbolChange,
     payloads: HitPayloads,
-) -> Result<SearchHit, ReadError> {
+) -> Result<SearchHit, RiftError> {
     let matched = SymbolMatch {
         file: declaration.file,
         symbol: declaration.symbol,
@@ -748,7 +742,7 @@ mod tests {
 
         /// Answers the comparison `params` asks for over this fixture, against a
         /// current index built from the working tree as it stands.
-        fn search(&self, params: &serde_json::Value) -> Result<SearchResult, ReadError> {
+        fn search(&self, params: &serde_json::Value) -> Result<SearchResult, RiftError> {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
@@ -772,7 +766,7 @@ mod tests {
         }
 
         /// The comparison of `baseline` against `HEAD`, with no other criteria.
-        fn baseline_to_head(&self) -> Result<SearchResult, ReadError> {
+        fn baseline_to_head(&self) -> Result<SearchResult, RiftError> {
             self.search(&json!({"change": {"base": "baseline"}}))
         }
     }
@@ -814,7 +808,7 @@ mod tests {
         value.as_str().unwrap_or_default().to_owned()
     }
 
-    fn wire_code(error: &ReadError) -> ErrorName {
+    fn wire_code(error: &RiftError) -> ErrorName {
         error.fault().name()
     }
 

@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rift_core::{
-    Contribution, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProviderId, ProviderRevision,
-};
-use serde::Serialize;
+use rift_core::{Contribution, ProviderId, ProviderRevision};
+use rift_error::{RiftError, errors};
 
 /// Default provider count bound for one publication set.
 pub const PROVIDERS_MAX_DEFAULT: usize = 64;
@@ -26,12 +24,12 @@ impl PublicationLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`PublicationError`] when any bound is zero.
+    /// Returns [`RiftError`] when any bound is zero.
     pub fn new(
         providers_max: usize,
         contributions_per_provider_max: usize,
         contributions_total_max: usize,
-    ) -> Result<Self, PublicationError> {
+    ) -> Result<Self, RiftError> {
         if [
             providers_max,
             contributions_per_provider_max,
@@ -39,7 +37,9 @@ impl PublicationLimits {
         ]
         .contains(&0)
         {
-            return Err(publication_error(PublicationViolation::ZeroLimit, "limits"));
+            return errors::provider::publication_zero_limit()
+                .field("limits")
+                .fail();
         }
         Ok(Self {
             providers: providers_max,
@@ -90,18 +90,17 @@ impl ProviderPublication {
     ///
     /// # Errors
     ///
-    /// Returns [`PublicationError`] for a bound, mismatched key, or duplicate provider symbol.
+    /// Returns [`RiftError`] for a bound, mismatched key, or duplicate provider symbol.
     pub fn new(
         provider: ProviderId,
         revision: ProviderRevision,
         contributions: Vec<Contribution>,
         limits: PublicationLimits,
-    ) -> Result<Self, PublicationError> {
+    ) -> Result<Self, RiftError> {
         if contributions.len() > limits.contributions_per_provider {
-            return Err(publication_error(
-                PublicationViolation::ProviderContributionLimit,
-                "contributions",
-            ));
+            return errors::provider::publication_provider_contribution_limit()
+                .field("contributions")
+                .fail();
         }
         validate_keys(&provider, revision, &contributions)?;
         Ok(Self {
@@ -134,27 +133,24 @@ fn validate_keys(
     provider: &ProviderId,
     revision: ProviderRevision,
     contributions: &[Contribution],
-) -> Result<(), PublicationError> {
+) -> Result<(), RiftError> {
     let mut symbols = BTreeSet::new();
     for contribution in contributions {
         let key = contribution.key();
         if key.reference().provider() != provider {
-            return Err(publication_error(
-                PublicationViolation::ProviderMismatch,
-                "contribution.provider",
-            ));
+            return errors::provider::publication_provider_mismatch()
+                .field("contribution.provider")
+                .fail();
         }
         if key.publication() != revision {
-            return Err(publication_error(
-                PublicationViolation::RevisionMismatch,
-                "contribution.publication",
-            ));
+            return errors::provider::publication_revision_mismatch()
+                .field("contribution.publication")
+                .fail();
         }
         if !symbols.insert(key.reference().symbol()) {
-            return Err(publication_error(
-                PublicationViolation::DuplicateProviderSymbol,
-                "contribution.provider_symbol",
-            ));
+            return errors::provider::publication_duplicate_symbol()
+                .field("contribution.provider_symbol")
+                .fail();
         }
     }
     Ok(())
@@ -185,14 +181,13 @@ impl PublicationSet {
     ///
     /// # Errors
     ///
-    /// Returns [`PublicationError`] when provider or total Contribution bound is crossed.
-    pub fn replaced(&self, publication: ProviderPublication) -> Result<Self, PublicationError> {
+    /// Returns [`RiftError`] when provider or total Contribution bound is crossed.
+    pub fn replaced(&self, publication: ProviderPublication) -> Result<Self, RiftError> {
         let replacing = self.publications.contains_key(publication.provider());
         if !replacing && self.publications.len() >= self.limits.providers {
-            return Err(publication_error(
-                PublicationViolation::ProviderLimit,
-                "providers",
-            ));
+            return errors::provider::publication_provider_limit()
+                .field("providers")
+                .fail();
         }
         let old_count = self
             .publications
@@ -202,18 +197,21 @@ impl PublicationSet {
             .contribution_count
             .checked_sub(old_count)
             .ok_or_else(|| {
-                publication_error(PublicationViolation::ContributionLimit, "contributions")
+                errors::provider::publication_contribution_limit()
+                    .field("contributions")
+                    .error()
             })?;
         let next_count = without_old
             .checked_add(publication.contributions.len())
             .ok_or_else(|| {
-                publication_error(PublicationViolation::ContributionLimit, "contributions")
+                errors::provider::publication_contribution_limit()
+                    .field("contributions")
+                    .error()
             })?;
         if next_count > self.limits.contributions_total {
-            return Err(publication_error(
-                PublicationViolation::ContributionLimit,
-                "contributions",
-            ));
+            return errors::provider::publication_contribution_limit()
+                .field("contributions")
+                .fail();
         }
         let mut publications = self.publications.clone();
         publications.insert(publication.provider.clone(), Arc::new(publication));
@@ -275,11 +273,11 @@ impl PublicationStore {
     ///
     /// # Errors
     ///
-    /// Returns [`PublicationError`] when new set crosses a configured bound.
+    /// Returns [`RiftError`] when new set crosses a configured bound.
     pub fn replace(
         &self,
         publication: ProviderPublication,
-    ) -> Result<Arc<PublicationSet>, PublicationError> {
+    ) -> Result<Arc<PublicationSet>, RiftError> {
         let mut current = write_current(&self.current);
         let next = Arc::new(current.replaced(publication)?);
         *current = Arc::clone(&next);
@@ -301,61 +299,6 @@ fn write_current(lock: &RwLock<Arc<PublicationSet>>) -> RwLockWriteGuard<'_, Arc
     }
 }
 
-/// Stable provider-publication refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicationViolation {
-    /// One publication bound is zero.
-    ZeroLimit,
-    /// Publication provider and Contribution provider differ.
-    ProviderMismatch,
-    /// Publication revision and Contribution revision differ.
-    RevisionMismatch,
-    /// One provider publication repeats a provider-local symbol.
-    DuplicateProviderSymbol,
-    /// Publication set exceeds provider count bound.
-    ProviderLimit,
-    /// One provider exceeds its Contribution count bound.
-    ProviderContributionLimit,
-    /// Publication set exceeds total Contribution count bound.
-    ContributionLimit,
-}
-
-/// Provider publication refusal and field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicationFault {
-    violation: PublicationViolation,
-    field: &'static str,
-}
-
-impl PublicationFault {
-    /// Returns violated rule.
-    #[must_use]
-    pub const fn violation(&self) -> PublicationViolation {
-        self.violation
-    }
-}
-
-impl Fault for PublicationFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::InvalidRequest)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("field", self.field),
-            ErrorContext::new("violation", rift_core::fault_label(&self.violation)),
-        ]
-    }
-}
-
-/// Invalid provider publication.
-pub type PublicationError = Error<PublicationFault>;
-
-fn publication_error(violation: PublicationViolation, field: &'static str) -> PublicationError {
-    Error::new(PublicationFault { violation, field })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, RwLock};
@@ -366,7 +309,7 @@ mod tests {
         SourceKind,
     };
 
-    use super::{ProviderPublication, PublicationLimits, PublicationStore, PublicationViolation};
+    use super::{ProviderPublication, PublicationLimits, PublicationStore};
 
     fn provider(value: &str) -> ProviderId {
         ProviderId::new(value).expect("provider")
@@ -412,16 +355,19 @@ mod tests {
         )
         .expect_err("duplicate provider symbol");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::DuplicateProviderSymbol
+            error.slug().as_str(),
+            "rift.provider.publication_duplicate_symbol"
         );
     }
 
     #[test]
     fn publication_limits_keys_and_accessors_are_enforced() {
         let error = PublicationLimits::new(0, 1, 1).expect_err("zero limit");
-        assert_eq!(error.fault().violation(), PublicationViolation::ZeroLimit);
-        assert_eq!(error.context()[0].key(), "field");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.provider.publication_zero_limit"
+        );
+        assert_eq!(error.context().next().map(|(key, _)| key), Some("field"));
         assert!(error.to_string().contains("limits"));
 
         let limits = PublicationLimits::new(1, 1, 2).expect("limits");
@@ -451,8 +397,8 @@ mod tests {
         )
         .expect_err("provider contribution bound");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::ProviderContributionLimit
+            error.slug().as_str(),
+            "rift.provider.publication_provider_contribution_limit"
         );
 
         let error = ProviderPublication::new(
@@ -463,8 +409,8 @@ mod tests {
         )
         .expect_err("provider mismatch");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::ProviderMismatch
+            error.slug().as_str(),
+            "rift.provider.publication_provider_mismatch"
         );
 
         let error = ProviderPublication::new(
@@ -475,8 +421,8 @@ mod tests {
         )
         .expect_err("revision mismatch");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::RevisionMismatch
+            error.slug().as_str(),
+            "rift.provider.publication_revision_mismatch"
         );
     }
 
@@ -509,8 +455,8 @@ mod tests {
         .expect("second publication");
         let error = store.replace(second).expect_err("provider bound");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::ProviderLimit
+            error.slug().as_str(),
+            "rift.provider.publication_provider_limit"
         );
     }
 
@@ -600,8 +546,8 @@ mod tests {
             .replace(replacement)
             .expect_err("replacement must cross total bound");
         assert_eq!(
-            error.fault().violation(),
-            PublicationViolation::ContributionLimit
+            error.slug().as_str(),
+            "rift.provider.publication_contribution_limit"
         );
         assert_eq!(store.snapshot().contribution_count(), 2);
     }

@@ -518,6 +518,19 @@ A `PostgreSQL` or REST adapter therefore consumes the same decisions and the sam
 identities rather than copying the algorithms; resolving an identity to a declaration needs the
 store that published it, and deciding which identities win does not.
 
+## Error registry
+
+`crates/rift-error/errors.toml` defines concrete Rift failures and evidence fields. `rift-error-codegen` validates
+those definitions and emits typed builders in `crates/rift-error/src/generated.rs`. The runtime
+stores each failure's slug, rendered message, action, context, and optional source. Domain code
+selects generated errors and supplies evidence with typed builder methods; `.error()` constructs a
+`RiftError`, and `.fail()` returns it immediately.
+
+The `rift-error` crate owns evidence extraction and representation extensions. The MCP crate
+registers `.mcp()` conversion to `McpFailure`, while the registry remains independent of MCP
+types. `cargo xtask errors generate` updates generated Rust. `cargo xtask errors check` compares
+generated output without writing it; CI runs that check through `just generate-check`.
+
 ## Vector search
 
 <VersionBadge

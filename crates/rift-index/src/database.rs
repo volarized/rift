@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rift_error::{RiftError, errors};
 use toasty::Db;
 use toasty::db::{Connection, Transaction};
 use toasty::stmt::{Type, Value};
@@ -35,10 +36,7 @@ use crate::documentation_store::{
     DocumentationManifestRecord, DocumentationReferenceRecord, DocumentationSourceRecord,
 };
 use crate::lexical::{LexicalDocumentRecord, LexicalFileRecord, LexicalIndexStateRecord};
-use crate::lexical::{
-    LexicalIndexError, MIGRATIONS, bound_as_usize, lexical_error_caused_by, require_pragma_row,
-    storage_error,
-};
+use crate::lexical::{MIGRATIONS, bound_as_usize, require_pragma_row};
 use crate::log::LogRecordRow;
 use crate::vector::VectorRecord;
 
@@ -127,7 +125,7 @@ impl WorkspaceDatabase {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the database cannot be opened, another
+    /// Returns [`RiftError`] when the database cannot be opened, another
     /// process holds its migration lock past the pool's busy-wait budget, or its
     /// schema migration fails.
     ///
@@ -136,10 +134,7 @@ impl WorkspaceDatabase {
     /// Cancellation may leave the database file created without its schema
     /// applied. Reopening retries safely: schema migrations are idempotent, and
     /// the migration lock releases with the dropped future.
-    pub async fn open(
-        database_path: &Path,
-        pool: DatabasePool,
-    ) -> Result<Arc<Self>, LexicalIndexError> {
+    pub async fn open(database_path: &Path, pool: DatabasePool) -> Result<Arc<Self>, RiftError> {
         Self::open_with_owner(database_path, pool, None).await
     }
 
@@ -154,7 +149,7 @@ impl WorkspaceDatabase {
         database_path: &Path,
         pool: DatabasePool,
         owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<Arc<Self>, LexicalIndexError> {
+    ) -> Result<Arc<Self>, RiftError> {
         let migration_lock = MigrationLock::acquire(database_path, pool).await?;
         let mut builder = Db::builder();
         builder
@@ -184,32 +179,32 @@ impl WorkspaceDatabase {
         )
         .await
         .map_err(|source| {
-            lexical_error_caused_by(
-                crate::lexical::LexicalIndexViolation::Storage,
-                Some(database_path),
-                source,
-            )
+            errors::index::lexical_storage()
+                .path(database_path)
+                .source(source)
+                .error()
         })?;
         let database = builder
             .build(SqliteThreadDriver::new(sqlite, Arc::clone(&thread)))
             .await
             .map_err(|source| {
-                lexical_error_caused_by(
-                    crate::lexical::LexicalIndexViolation::Storage,
-                    Some(database_path),
-                    source,
-                )
+                errors::index::lexical_storage()
+                    .path(database_path)
+                    .source(source)
+                    .error()
             })?;
-        let mut connection = database.connection().await.map_err(storage_error)?;
+        let mut connection = database
+            .connection()
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         configure_journal(&mut connection).await?;
         configure_connection(&mut connection, pool, ConnectionAccess::Write).await?;
         drop(connection);
         let _migration_report = MIGRATIONS.apply(&database).await.map_err(|source| {
-            lexical_error_caused_by(
-                crate::lexical::LexicalIndexViolation::Storage,
-                Some(database_path),
-                source,
-            )
+            errors::index::lexical_storage()
+                .path(database_path)
+                .source(source)
+                .error()
         })?;
         drop(migration_lock);
         Ok(Arc::new(Self {
@@ -224,11 +219,12 @@ impl WorkspaceDatabase {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the worker stops responding or panics.
-    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), LexicalIndexError> {
-        self.thread.shutdown(deadline).await.map_err(|source| {
-            lexical_error_caused_by(crate::lexical::LexicalIndexViolation::Storage, None, source)
-        })
+    /// Returns [`RiftError`] when the worker stops responding or panics.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), RiftError> {
+        self.thread
+            .shutdown(deadline)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())
     }
 
     /// Exclusive write access to the file: the file's write turn, and a
@@ -240,12 +236,12 @@ impl WorkspaceDatabase {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when no connection can be configured.
+    /// Returns [`RiftError`] when no connection can be configured.
     ///
     /// # Cancel safety
     ///
     /// Dropping the returned future releases the turn without writing.
-    pub(crate) async fn writing(&self) -> Result<WriteAccess<'_>, LexicalIndexError> {
+    pub(crate) async fn writing(&self) -> Result<WriteAccess<'_>, RiftError> {
         let turn = self.writes.lock().await;
         let connection = self.configured_connection(ConnectionAccess::Write).await?;
         Ok(WriteAccess {
@@ -263,15 +259,19 @@ impl WorkspaceDatabase {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when no slot frees within the pool's
+    /// Returns [`RiftError`] when no slot frees within the pool's
     /// busy-wait budget.
     ///
     /// # Cancel safety
     ///
     /// Dropping the returned future gives up the wait; no slot is held.
-    pub async fn hold_connection(&self) -> Result<HeldConnection, LexicalIndexError> {
+    pub async fn hold_connection(&self) -> Result<HeldConnection, RiftError> {
         Ok(HeldConnection {
-            _connection: self.database.connection().await.map_err(storage_error)?,
+            _connection: self
+                .database
+                .connection()
+                .await
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?,
         })
     }
 
@@ -279,7 +279,7 @@ impl WorkspaceDatabase {
     ///
     /// Foreign keys are not configured: no table here carries a foreign-key
     /// relationship to another.
-    pub(crate) async fn connection(&self) -> Result<Connection, LexicalIndexError> {
+    pub(crate) async fn connection(&self) -> Result<Connection, RiftError> {
         self.configured_connection(ConnectionAccess::Read).await
     }
 
@@ -287,7 +287,7 @@ impl WorkspaceDatabase {
     async fn configured_connection(
         &self,
         access: ConnectionAccess,
-    ) -> Result<Connection, LexicalIndexError> {
+    ) -> Result<Connection, RiftError> {
         // Every store operation checks a connection out, so the span sits at debug: an info
         // filter would print one closing line per checkout.
         let mut connection = self
@@ -299,7 +299,7 @@ impl WorkspaceDatabase {
                 operation = "database.checkout"
             ))
             .await
-            .map_err(storage_error)?;
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         configure_connection(&mut connection, self.pool, access).await?;
         Ok(connection)
     }
@@ -325,13 +325,13 @@ impl WriteAccess<'_> {
     ///
     /// The write lock is acquired before any read prerequisite, so a transaction never
     /// asks `SQLite` to upgrade a shared lock while another process writes.
-    pub(crate) async fn transaction(&mut self) -> Result<Transaction<'_>, LexicalIndexError> {
+    pub(crate) async fn transaction(&mut self) -> Result<Transaction<'_>, RiftError> {
         self.connection
             .transaction_builder()
             .mode(TransactionMode::Immediate)
             .begin()
             .await
-            .map_err(storage_error)
+            .map_err(|source| errors::index::lexical_storage().source(source).error())
     }
 }
 
@@ -370,31 +370,42 @@ impl MigrationLock {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the lock file cannot be opened or locked, or
+    /// Returns [`RiftError`] when the lock file cannot be opened or locked, or
     /// when another process still holds the lock once the budget has passed.
     ///
     /// # Cancel safety
     ///
     /// Dropping the future gives up the wait; the lock is not held.
-    async fn acquire(database_path: &Path, pool: DatabasePool) -> Result<Self, LexicalIndexError> {
+    async fn acquire(database_path: &Path, pool: DatabasePool) -> Result<Self, RiftError> {
         let lock_path = migration_lock_path(database_path);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&lock_path)
-            .map_err(|source| migration_lock_error(&lock_path, source))?;
+            .map_err(|source| {
+                errors::index::lexical_storage()
+                    .path(&lock_path)
+                    .source(source)
+                    .error()
+            })?;
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(pool.busy_timeout_ms()));
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(TryLockError::Error(source)) => {
-                    return Err(migration_lock_error(&lock_path, source));
+                    return errors::index::lexical_storage()
+                        .path(&lock_path)
+                        .source(source)
+                        .fail();
                 }
                 Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
                     let held = migration_lock_held(pool.busy_timeout_ms());
-                    return Err(migration_lock_error(&lock_path, held));
+                    return errors::index::lexical_storage()
+                        .path(&lock_path)
+                        .source(held)
+                        .fail();
                 }
                 Err(TryLockError::WouldBlock) => tokio::time::sleep(MIGRATION_LOCK_POLL).await,
             }
@@ -411,17 +422,6 @@ fn migration_lock_path(database_path: &Path) -> PathBuf {
 }
 
 /// A migration lock failure, naming the lock file.
-fn migration_lock_error(
-    lock_path: &Path,
-    source: impl std::error::Error + Send + Sync + 'static,
-) -> LexicalIndexError {
-    lexical_error_caused_by(
-        crate::lexical::LexicalIndexViolation::Storage,
-        Some(lock_path),
-        source,
-    )
-}
-
 /// The cause an open reports when another process kept the migration lock for the
 /// whole budget.
 fn migration_lock_held(busy_timeout_ms: u32) -> std::io::Error {
@@ -435,12 +435,12 @@ fn migration_lock_held(busy_timeout_ms: u32) -> std::io::Error {
 }
 
 /// Selects WAL once for the database file.
-async fn configure_journal(connection: &mut Connection) -> Result<(), LexicalIndexError> {
+async fn configure_journal(connection: &mut Connection) -> Result<(), RiftError> {
     let journal_mode = toasty::sql::query("PRAGMA journal_mode = WAL")
         .column_types([Type::String])
         .exec(connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     require_pragma_row(&journal_mode, &[Value::String("wal".to_owned())])
 }
 
@@ -452,21 +452,21 @@ async fn configure_connection(
     connection: &mut Connection,
     pool: DatabasePool,
     access: ConnectionAccess,
-) -> Result<(), LexicalIndexError> {
+) -> Result<(), RiftError> {
     toasty::sql::query("PRAGMA synchronous = NORMAL")
         .exec(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let busy_timeout_ms = pool.busy_timeout_ms();
     toasty::sql::query(format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
         .exec(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let mmap_bytes = pool.mmap_bytes();
     toasty::sql::query(format!("PRAGMA mmap_size = {mmap_bytes}"))
         .exec(&mut *connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let query_only = match access {
         ConnectionAccess::Read => "ON",
         ConnectionAccess::Write => "OFF",
@@ -474,7 +474,7 @@ async fn configure_connection(
     toasty::sql::query(format!("PRAGMA query_only = {query_only}"))
         .exec(connection)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(())
 }
 
@@ -496,7 +496,7 @@ mod tests {
     use toasty::stmt::{Type, Value};
     use toasty_driver_sqlite::Sqlite;
 
-    use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase};
+    use super::{DatabasePool, MIGRATION_LOCK_POLL, MigrationLock, WorkspaceDatabase, errors};
     use crate::lexical::{LexicalIndexLimits, LexicalSearchIndex};
     use crate::log::LogRecordRow;
 
@@ -793,12 +793,8 @@ mod tests {
         let waited = started.elapsed();
         let error = refused.expect_err("a read that meets a held pool refuses");
 
-        assert_eq!(error.descriptor().code(), "storage_failure");
-        assert!(
-            error.fault().is_connection_unavailable(),
-            "the refusal names the missing connection: {error}"
-        );
-        let causes = rift_core::causes(&error).join(": ");
+        assert_eq!(error.slug().as_str(), "rift.index.lexical_storage");
+        let causes = rift_error::causes(&error).join(": ");
         assert!(causes.contains("waiting for a slot"), "{causes}");
         assert!(
             waited >= Duration::from_millis(u64::from(HELD_POOL_BUSY_TIMEOUT_MS)),
@@ -822,18 +818,19 @@ mod tests {
             .hold_connection()
             .await
             .expect_err("a second hold meets no free slot");
-        assert!(refused.fault().is_connection_unavailable(), "{refused}");
+        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
         drop(held);
         let _again = database.hold_connection().await?;
 
-        let unrelated = super::lexical_error_caused_by(
-            crate::lexical::LexicalIndexViolation::Storage,
-            None,
-            std::io::Error::other("disk gone"),
-        );
-        assert!(
-            !unrelated.fault().is_connection_unavailable(),
-            "a store refusal is not a missing connection"
+        let unrelated = errors::index::lexical_storage()
+            .source(std::io::Error::other("disk gone"))
+            .error();
+        assert_eq!(unrelated.slug().as_str(), "rift.index.lexical_storage");
+        assert_eq!(
+            std::error::Error::source(&unrelated)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("disk gone")
         );
         Ok(())
     }
@@ -918,10 +915,10 @@ mod tests {
             waited >= Duration::from_millis(u64::from(pool().busy_timeout_ms())),
             "the open waits out the budget first: waited={waited:?}"
         );
-        assert_eq!(refused.descriptor().code(), "storage_failure");
+        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
         let rendered = refused.to_string();
         assert!(rendered.contains("db.lock"), "{rendered}");
-        let causes = rift_core::causes(&refused).join(": ");
+        let causes = rift_error::causes(&refused).join(": ");
         assert!(causes.contains("busy-wait budget"), "{causes}");
         assert!(!path.exists(), "a refused open creates no database file");
         drop(held);
@@ -939,7 +936,7 @@ mod tests {
             .await
             .expect_err("no lock file can be created under a missing directory");
 
-        assert_eq!(refused.descriptor().code(), "storage_failure");
+        assert_eq!(refused.slug().as_str(), "rift.index.lexical_storage");
         assert!(refused.to_string().contains("db.lock"), "{refused}");
         Ok(())
     }

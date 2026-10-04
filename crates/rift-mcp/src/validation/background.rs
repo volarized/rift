@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rift_index::{
+use rift_error::errors;
     LastCapture, PathChange, PathChanges, capture_visible_digests_with_languages_cancellable,
 };
 use rift_protocol::configuration::ServerConfiguration;
-use rift_server::ReadError;
+use rift_server::RiftError;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,7 @@ pub(super) enum Trigger {
 /// Freezes startup settings and resolves the worktree's control path on the worker pool.
 pub(super) async fn start(
     context: &IndexSupervisorContext,
-) -> Result<Option<(BackgroundValidation, VersionControlHold)>, ReadError> {
+) -> Result<Option<(BackgroundValidation, VersionControlHold)>, RiftError> {
     let configuration = context
         .published
         .read()
@@ -90,7 +91,7 @@ impl BackgroundValidation {
     pub(super) async fn validate(
         &mut self,
         context: &IndexSupervisorContext,
-    ) -> Result<(), ReadError> {
+    ) -> Result<(), RiftError> {
         let (current, failure) = context.published.read().await.snapshot();
         let recovering = failure.is_some();
         let root = context.root.clone();
@@ -114,8 +115,7 @@ impl BackgroundValidation {
                             &current.configuration.language_file_selections(),
                             &last,
                             &|| cancellation.is_cancelled(),
-                        )
-                        .map_err(rift_server::ReadFault::index)?;
+                        )?;
                     tracing::debug!(
                         component = "index",
                         operation = "index.validate",
@@ -229,7 +229,7 @@ impl VersionControlHold {
     pub(super) async fn wait(
         &mut self,
         context: &IndexSupervisorContext,
-    ) -> Result<bool, ReadError> {
+    ) -> Result<bool, RiftError> {
         let Some(lock) = self.lock.clone() else {
             return Ok(true);
         };
@@ -242,10 +242,7 @@ impl VersionControlHold {
                 move |_| match std::fs::symlink_metadata(&path) {
                     Ok(_) => Ok(true),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(error) => Err(rift_server::ReadFault::unavailable(
-                        "Git index lock validation",
-                        error.to_string(),
-                    )),
+                    Err(error) => errors::server::read_unavailable().operation("Git index lock validation").detail(error.to_string()).fail(),
                 },
             );
             let present = tokio::select! {
@@ -541,10 +538,7 @@ mod tests {
             |_root: &std::path::Path,
              _limits: rift_index::WorkspaceIndexLimits,
              _request: &super::super::RebuildRequest| {
-                Err(rift_server::ReadFault::unavailable(
-                    "workspace capture",
-                    "forced capture failure",
-                ))
+                errors::server::read_unavailable().operation("workspace capture").detail("forced capture failure").fail()
             },
         )
         .await

@@ -2,130 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
+use rift_error::{RiftError, ctx, errors};
 
 /// Tree entries one revision listing may visit, files and directories alike.
 /// The traversal refuses a larger tree rather than truncating it silently.
 pub const REVISION_TREE_ENTRIES_MAX: usize = 65_536;
-
-/// One version-control access failure: what was asked of the repository, and
-/// why it cannot be answered.
-#[derive(Debug)]
-pub enum HistoryFault {
-    /// The workspace has no version-control repository to read revisions from.
-    Unversioned {
-        /// The workspace root that no repository versions.
-        root: PathBuf,
-    },
-    /// The revision spelling does not resolve in the repository.
-    RevisionUnknown {
-        /// The spelling the request carried.
-        rev: String,
-    },
-    /// The revision resolves to an object that is not a commit.
-    RevisionNotCommit {
-        /// The spelling the request carried.
-        rev: String,
-        /// The kind of object the spelling resolved to.
-        kind: String,
-    },
-    /// The revision's tree holds more entries than the traversal bound.
-    TreeTooLarge {
-        /// The entry bound the traversal enforces.
-        entries_max: usize,
-    },
-    /// One committed file is larger than the per-file byte bound.
-    BlobTooLarge {
-        /// The workspace-relative path of the oversized file.
-        path: String,
-        /// The per-file byte bound in force.
-        bytes_max: usize,
-        /// The committed file's actual size.
-        size: u64,
-    },
-    /// The repository holds more tags than one listing reads.
-    TooManyTags {
-        /// The tag bound the listing enforces.
-        tags_max: usize,
-    },
-    /// A committed path inside the workspace is not valid UTF-8.
-    PathUnrepresentable {
-        /// The offending path, rendered lossily for the reader.
-        path: String,
-    },
-    /// The repository's object store could not be read.
-    Storage {
-        /// The repository operation that failed.
-        operation: &'static str,
-        /// The rendered underlying failure.
-        detail: String,
-    },
-}
-
-impl Fault for HistoryFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::Unversioned { .. } => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
-            Self::RevisionUnknown { .. } | Self::RevisionNotCommit { .. } => {
-                ErrorName::Wire(ErrorCode::ResourceNotFound)
-            }
-            Self::TreeTooLarge { .. } | Self::BlobTooLarge { .. } | Self::TooManyTags { .. } => {
-                ErrorName::Wire(ErrorCode::LimitExceeded)
-            }
-            Self::PathUnrepresentable { .. } => ErrorName::Wire(ErrorCode::UnsupportedPath),
-            Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Unversioned { root } => vec![
-                ErrorContext::new("workspace", root.display().to_string()),
-                ErrorContext::new(
-                    "requires",
-                    "a git repository - run `git init`, or omit `rev` to read the current tree",
-                ),
-            ],
-            Self::RevisionUnknown { rev } => vec![
-                ErrorContext::new("rev", rev.clone()),
-                ErrorContext::new(
-                    "requires",
-                    "a revision the repository resolves - a branch, tag, or commit id",
-                ),
-            ],
-            Self::RevisionNotCommit { rev, kind } => vec![
-                ErrorContext::new("rev", rev.clone()),
-                ErrorContext::new("resolved_kind", kind.clone()),
-                ErrorContext::new("requires", "a revision that names a commit"),
-            ],
-            Self::TreeTooLarge { entries_max } => vec![
-                ErrorContext::new("limit", "revision_tree_entries_max"),
-                ErrorContext::new("entries_max", entries_max.to_string()),
-            ],
-            Self::BlobTooLarge {
-                path,
-                bytes_max,
-                size,
-            } => vec![
-                ErrorContext::new("path", path.clone()),
-                ErrorContext::new("bytes_max", bytes_max.to_string()),
-                ErrorContext::new("size", size.to_string()),
-            ],
-            Self::TooManyTags { tags_max } => vec![
-                ErrorContext::new("limit", "tags_max"),
-                ErrorContext::new("tags_max", tags_max.to_string()),
-            ],
-            Self::PathUnrepresentable { path } => vec![ErrorContext::new("path", path.clone())],
-            Self::Storage { operation, detail } => vec![
-                ErrorContext::new("operation", *operation),
-                ErrorContext::new("detail", detail.clone()),
-            ],
-        }
-    }
-}
-
-/// Opaque version-control access failure.
-pub type HistoryError = Error<HistoryFault>;
 
 /// One revision resolved to the commit it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,18 +166,32 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when no repository versions `root`, or when
+    /// Returns [`RiftError`] when no repository versions `root`, or when
     /// the filesystem cannot be read while discovering one.
-    pub fn open(root: &Path) -> Result<Self, HistoryError> {
+    pub fn open(root: &Path) -> Result<Self, RiftError> {
         let root = std::fs::canonicalize(root).map_err(|error| {
-            storage("canonicalize workspace root", &error)
-                .with_context(ErrorContext::new("workspace", root.display().to_string()))
+            errors::history::storage()
+                .operation("canonicalize workspace root")
+                .detail(&error)
+                .error()
+                .with(ctx::workspace(root))
         })?;
-        let unversioned = || Error::new(HistoryFault::Unversioned { root: root.clone() });
+        let unversioned = || {
+            errors::history::unversioned()
+                .workspace(&root)
+                .requires(
+                    "a git repository - run `git init`, or omit `rev` to read the current tree",
+                )
+                .error()
+        };
         let inner = gix::discover(&root).map_err(|_| unversioned())?;
         let workdir = inner.workdir().ok_or_else(unversioned)?;
-        let workdir = std::fs::canonicalize(workdir)
-            .map_err(|error| storage("canonicalize repository root", &error))?;
+        let workdir = std::fs::canonicalize(workdir).map_err(|error| {
+            errors::history::storage()
+                .operation("canonicalize repository root")
+                .detail(&error)
+                .error()
+        })?;
         let prefix = root
             .strip_prefix(&workdir)
             .map_err(|_| unversioned())?
@@ -352,13 +247,14 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the spelling resolves to nothing, or to
+    /// Returns [`RiftError`] when the spelling resolves to nothing, or to
     /// an object that is not a commit.
-    pub fn resolve(&self, rev: &str) -> Result<ResolvedRevision, HistoryError> {
+    pub fn resolve(&self, rev: &str) -> Result<ResolvedRevision, RiftError> {
         let unknown = || {
-            Error::new(HistoryFault::RevisionUnknown {
-                rev: rev.to_owned(),
-            })
+            errors::history::revision_unknown()
+                .rev(rev)
+                .requires("a revision the repository resolves - a branch, tag, or commit id")
+                .error()
         };
         let id = self
             .inner
@@ -368,10 +264,11 @@ impl Repository {
         let commit = object
             .peel_to_kind(gix::object::Kind::Commit)
             .map_err(|_| {
-                Error::new(HistoryFault::RevisionNotCommit {
-                    rev: rev.to_owned(),
-                    kind: object_kind(&self.inner, id.detach()),
-                })
+                errors::history::revision_not_commit()
+                    .rev(rev)
+                    .resolved_kind(object_kind(&self.inner, id.detach()))
+                    .requires("a revision that names a commit")
+                    .error()
             })?;
         Ok(ResolvedRevision { commit: commit.id })
     }
@@ -386,27 +283,38 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an unreadable object store, a committed
+    /// Returns [`RiftError`] for an unreadable object store, a committed
     /// non-UTF-8 path inside the workspace, or a tree over the entry bound.
     pub fn tree_files(
         &self,
         revision: &ResolvedRevision,
         includes: &dyn Fn(&str) -> bool,
         entries_max: usize,
-    ) -> Result<Vec<TreeFile>, HistoryError> {
-        let commit = self
-            .inner
-            .find_commit(revision.commit)
-            .map_err(|error| storage("read commit", &error))?;
-        let tree = commit
-            .tree()
-            .map_err(|error| storage("read commit tree", &error))?;
+    ) -> Result<Vec<TreeFile>, RiftError> {
+        let commit = self.inner.find_commit(revision.commit).map_err(|error| {
+            errors::history::storage()
+                .operation("read commit")
+                .detail(&error)
+                .error()
+        })?;
+        let tree = commit.tree().map_err(|error| {
+            errors::history::storage()
+                .operation("read commit tree")
+                .detail(&error)
+                .error()
+        })?;
         let mut recorder = BoundedRecorder::new(entries_max);
-        tree.traverse()
-            .depthfirst(&mut recorder)
-            .map_err(|error| storage("walk commit tree", &error))?;
+        tree.traverse().depthfirst(&mut recorder).map_err(|error| {
+            errors::history::storage()
+                .operation("walk commit tree")
+                .detail(&error)
+                .error()
+        })?;
         if recorder.exhausted {
-            return Err(Error::new(HistoryFault::TreeTooLarge { entries_max }));
+            return errors::history::tree_too_large()
+                .limit("revision_tree_entries_max")
+                .entries_max(entries_max)
+                .fail();
         }
         let mut files = Vec::new();
         for record in recorder.inner.records {
@@ -433,24 +341,28 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an oversized blob or an unreadable
+    /// Returns [`RiftError`] for an oversized blob or an unreadable
     /// object store.
-    pub fn blob_bytes(&self, file: &TreeFile, bytes_max: usize) -> Result<Vec<u8>, HistoryError> {
-        let header = self
-            .inner
-            .find_header(file.blob)
-            .map_err(|error| storage("read blob header", &error))?;
+    pub fn blob_bytes(&self, file: &TreeFile, bytes_max: usize) -> Result<Vec<u8>, RiftError> {
+        let header = self.inner.find_header(file.blob).map_err(|error| {
+            errors::history::storage()
+                .operation("read blob header")
+                .detail(&error)
+                .error()
+        })?;
         if header.size() > bytes_max as u64 {
-            return Err(Error::new(HistoryFault::BlobTooLarge {
-                path: file.path.clone(),
-                bytes_max,
-                size: header.size(),
-            }));
+            return errors::history::blob_too_large()
+                .path(Path::new(&file.path))
+                .bytes_max(bytes_max)
+                .size(header.size())
+                .fail();
         }
-        let object = self
-            .inner
-            .find_object(file.blob)
-            .map_err(|error| storage("read blob", &error))?;
+        let object = self.inner.find_object(file.blob).map_err(|error| {
+            errors::history::storage()
+                .operation("read blob")
+                .detail(&error)
+                .error()
+        })?;
         Ok(object.detach().data)
     }
 
@@ -474,7 +386,7 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] for an unreadable object store or a tree
+    /// Returns [`RiftError`] for an unreadable object store or a tree
     /// that cannot be decoded.
     pub fn changed_files(
         &self,
@@ -482,7 +394,7 @@ impl Repository {
         head: &ResolvedRevision,
         includes: &dyn Fn(&str) -> bool,
         paths_max: usize,
-    ) -> Result<ChangedFiles, HistoryError> {
+    ) -> Result<ChangedFiles, RiftError> {
         let base_tree = self.commit_tree(base)?;
         let head_tree = self.commit_tree(head)?;
         let mut recorder = ChangedPathRecorder::new(self.prefix.as_bytes(), includes, paths_max);
@@ -499,7 +411,12 @@ impl Repository {
         match outcome {
             Ok(()) => {}
             Err(gix::diff::tree::Error::Cancelled) if recorder.truncated => {}
-            Err(error) => return Err(storage("compare commit trees", &error)),
+            Err(error) => {
+                return errors::history::storage()
+                    .operation("compare commit trees")
+                    .detail(&error)
+                    .fail();
+            }
         }
         let truncated = recorder.truncated;
         let paths = recorder
@@ -514,12 +431,22 @@ impl Repository {
     pub(crate) fn commit_tree(
         &self,
         revision: &ResolvedRevision,
-    ) -> Result<gix::Tree<'_>, HistoryError> {
+    ) -> Result<gix::Tree<'_>, RiftError> {
         self.inner
             .find_commit(revision.commit)
-            .map_err(|error| storage("read commit", &error))?
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read commit")
+                    .detail(&error)
+                    .error()
+            })?
             .tree()
-            .map_err(|error| storage("read commit tree", &error))
+            .map_err(|error| {
+                errors::history::storage()
+                    .operation("read commit tree")
+                    .detail(&error)
+                    .error()
+            })
     }
 
     /// Lists the first-parent commits from `revision` whose tree changed
@@ -543,23 +470,27 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`HistoryError`] when the object store or the `shallow`
+    /// Returns [`RiftError`] when the object store or the `shallow`
     /// file cannot be read.
     pub fn path_revisions(
         &self,
         revision: &ResolvedRevision,
         path: &str,
         revisions_max: usize,
-    ) -> Result<PathHistory, HistoryError> {
+    ) -> Result<PathHistory, RiftError> {
         let repository_path = self.repository_path(path);
-        let shallow = self
-            .inner
-            .shallow_commits()
-            .map_err(|error| storage("read shallow file", &error))?;
-        let mut commit = self
-            .inner
-            .find_commit(revision.commit)
-            .map_err(|error| storage("read commit", &error))?;
+        let shallow = self.inner.shallow_commits().map_err(|error| {
+            errors::history::storage()
+                .operation("read shallow file")
+                .detail(&error)
+                .error()
+        })?;
+        let mut commit = self.inner.find_commit(revision.commit).map_err(|error| {
+            errors::history::storage()
+                .operation("read commit")
+                .detail(&error)
+                .error()
+        })?;
         let mut entry = blob_entry(&commit, &repository_path)?;
         let mut revisions = Vec::new();
         let mut complete = false;
@@ -572,10 +503,12 @@ impl Repository {
             };
             let (parent, parent_entry) = match parent_id {
                 Some(id) => {
-                    let parent = self
-                        .inner
-                        .find_commit(id)
-                        .map_err(|error| storage("read commit", &error))?;
+                    let parent = self.inner.find_commit(id).map_err(|error| {
+                        errors::history::storage()
+                            .operation("read commit")
+                            .detail(&error)
+                            .error()
+                    })?;
                     let parent_entry = blob_entry(&parent, &repository_path)?;
                     (Some(parent), parent_entry)
                 }
@@ -609,7 +542,7 @@ impl Repository {
     /// The workspace-relative form of one repository-relative path: `None`
     /// when the path lies outside the workspace, an error when its bytes
     /// inside the workspace are not UTF-8.
-    fn workspace_relative(&self, filepath: &[u8]) -> Result<Option<String>, HistoryError> {
+    fn workspace_relative(&self, filepath: &[u8]) -> Result<Option<String>, RiftError> {
         let Some(relative) = strip_workspace_prefix(filepath, self.prefix.as_bytes()) else {
             return Ok(None);
         };
@@ -632,13 +565,21 @@ pub(crate) fn strip_workspace_prefix<'a>(filepath: &'a [u8], prefix: &[u8]) -> O
 fn blob_entry(
     commit: &gix::Commit<'_>,
     repository_path: &str,
-) -> Result<Option<gix::ObjectId>, HistoryError> {
-    let tree = commit
-        .tree()
-        .map_err(|error| storage("read commit tree", &error))?;
+) -> Result<Option<gix::ObjectId>, RiftError> {
+    let tree = commit.tree().map_err(|error| {
+        errors::history::storage()
+            .operation("read commit tree")
+            .detail(&error)
+            .error()
+    })?;
     let entry = tree
         .lookup_entry_by_path(repository_path)
-        .map_err(|error| storage("read tree entry", &error))?;
+        .map_err(|error| {
+            errors::history::storage()
+                .operation("read tree entry")
+                .detail(&error)
+                .error()
+        })?;
     Ok(entry
         .filter(|entry| entry.mode().is_blob())
         .map(|entry| entry.object_id()))
@@ -657,16 +598,29 @@ fn path_revision(
     commit: &gix::Commit<'_>,
     path: &str,
     blob: Option<gix::ObjectId>,
-) -> Result<PathRevision, HistoryError> {
-    let time = commit
-        .time()
-        .map_err(|error| storage("read commit time", &error))?;
+) -> Result<PathRevision, RiftError> {
+    let time = commit.time().map_err(|error| {
+        errors::history::storage()
+            .operation("read commit time")
+            .detail(&error)
+            .error()
+    })?;
     let timestamp = time
         .format(gix::date::time::format::ISO8601_STRICT)
-        .map_err(|error| storage("render commit time", &error))?;
+        .map_err(|error| {
+            errors::history::storage()
+                .operation("render commit time")
+                .detail(&error)
+                .error()
+        })?;
     let summary = commit
         .message()
-        .map_err(|error| storage("read commit message", &error))?
+        .map_err(|error| {
+            errors::history::storage()
+                .operation("read commit message")
+                .detail(&error)
+                .error()
+        })?
         .summary()
         .to_string();
     let (author_name, author_email) = commit_author(commit)?;
@@ -685,10 +639,13 @@ fn path_revision(
 
 /// The name and email address `commit`'s author line records, trimmed of the
 /// whitespace the signature parser keeps.
-pub(crate) fn commit_author(commit: &gix::Commit<'_>) -> Result<(String, String), HistoryError> {
-    let author = commit
-        .author()
-        .map_err(|error| storage("read commit author", &error))?;
+pub(crate) fn commit_author(commit: &gix::Commit<'_>) -> Result<(String, String), RiftError> {
+    let author = commit.author().map_err(|error| {
+        errors::history::storage()
+            .operation("read commit author")
+            .detail(&error)
+            .error()
+    })?;
     Ok((
         author.name.to_str_lossy().trim().to_owned(),
         author.email.to_str_lossy().trim().to_owned(),
@@ -697,13 +654,13 @@ pub(crate) fn commit_author(commit: &gix::Commit<'_>) -> Result<(String, String)
 
 /// One committed path's UTF-8 form. The refusal renders the full
 /// repository-relative spelling, so the reader sees the path git records.
-fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, HistoryError> {
+fn utf8_path(relative: &[u8], filepath: &[u8]) -> Result<String, RiftError> {
     std::str::from_utf8(relative)
         .map(str::to_owned)
         .map_err(|_| {
-            Error::new(HistoryFault::PathUnrepresentable {
-                path: String::from_utf8_lossy(filepath).into_owned(),
-            })
+            errors::history::path_unrepresentable()
+                .path(String::from_utf8_lossy(filepath).into_owned())
+                .error()
         })
 }
 
@@ -934,13 +891,6 @@ fn object_kind(repository: &gix::Repository, id: gix::ObjectId) -> String {
     repository
         .find_header(id)
         .map_or_else(|_| "unknown".to_owned(), |header| header.kind().to_string())
-}
-
-pub(crate) fn storage(operation: &'static str, error: &dyn std::fmt::Display) -> HistoryError {
-    Error::new(HistoryFault::Storage {
-        operation,
-        detail: error.to_string(),
-    })
 }
 
 /// The existing canonical root of `repository`'s main worktree, when it is
@@ -1235,30 +1185,29 @@ mod tests {
             .changed_files(&base, &broken, &include_all, 64)
             .expect_err("an unreadable tree must refuse");
 
-        assert!(matches!(
-            error.fault(),
-            HistoryFault::Storage {
-                operation: "compare commit trees",
-                ..
-            }
-        ));
+        assert_eq!(error.slug(), errors::history::storage::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "compare commit trees")
+        );
     }
 
     #[test]
     fn test_open_refuses_a_workspace_without_version_control() {
         let directory = tempfile::tempdir().expect("temp dir");
         let error = Repository::open(directory.path()).expect_err("no repository");
-        assert!(matches!(error.fault(), HistoryFault::Unversioned { .. }));
+        assert_eq!(error.slug(), errors::history::unversioned::SLUG);
         let canonical = fs::canonicalize(directory.path()).expect("canonical root");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "no configured provider serves this request: workspace {}, \
-                 requires a git repository - run `git init`, or omit `rev` to \
-                 read the current tree; adjust the request to a served \
-                 capability, or configure a provider that serves it",
-                canonical.display()
-            )
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "workspace" && value == canonical.display().to_string())
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "requires" && value.contains("git init"))
         );
     }
 
@@ -1266,7 +1215,7 @@ mod tests {
     fn test_open_refuses_a_missing_root_as_storage() {
         let error =
             Repository::open(Path::new("missing-rift-history-root")).expect_err("missing root");
-        assert!(matches!(error.fault(), HistoryFault::Storage { .. }));
+        assert_eq!(error.slug(), errors::history::storage::SLUG);
     }
 
     #[test]
@@ -1302,17 +1251,13 @@ mod tests {
         let error = repository
             .resolve("feature/absent")
             .expect_err("unknown revision");
-        assert!(matches!(
-            error.fault(),
-            HistoryFault::RevisionUnknown { .. }
-        ));
-        assert_eq!(
-            error.to_string(),
-            "the requested resource does not exist in the current snapshot: \
-             rev feature/absent, requires a revision the repository resolves - \
-             a branch, tag, or commit id; search or list first, then retry \
-             with an identity that answer returned"
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "rev" && value == "feature/absent")
         );
+        assert!(error.to_string().contains("feature/absent"));
     }
 
     #[test]
@@ -1322,10 +1267,12 @@ mod tests {
         let error = repository
             .resolve("main^{tree}")
             .expect_err("a tree is not a commit");
-        let HistoryFault::RevisionNotCommit { kind, .. } = error.fault() else {
-            panic!("expected RevisionNotCommit, got {:?}", error.fault());
-        };
-        assert_eq!(kind, "tree");
+        assert_eq!(error.slug(), errors::history::revision_not_commit::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "resolved_kind" && value == "tree")
+        );
     }
 
     #[test]
@@ -1437,10 +1384,12 @@ mod tests {
         let error = repository
             .tree_files(&head, &include_all, 2)
             .expect_err("four entries must refuse a two-entry budget");
-        let HistoryFault::TreeTooLarge { entries_max } = error.fault() else {
-            panic!("expected TreeTooLarge, got {:?}", error.fault());
-        };
-        assert_eq!(*entries_max, 2);
+        assert_eq!(error.slug(), errors::history::tree_too_large::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "entries_max" && value == "2")
+        );
         let exactly_enough = repository
             .tree_files(&head, &include_all, 4)
             .expect("a budget covering every entry lists the tree");
@@ -1462,10 +1411,12 @@ mod tests {
         let error = repository
             .blob_bytes(&files[0], 4)
             .expect_err("blob over the byte bound");
-        let HistoryFault::BlobTooLarge { size, .. } = error.fault() else {
-            panic!("expected BlobTooLarge, got {:?}", error.fault());
-        };
-        assert_eq!(*size, 19);
+        assert_eq!(error.slug(), errors::history::blob_too_large::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "size" && value == "19")
+        );
     }
 
     #[test]
@@ -1474,76 +1425,83 @@ mod tests {
         init(directory.path());
         let repository = Repository::open(directory.path()).expect("repository");
         let error = repository.resolve("HEAD").expect_err("unborn branch");
-        assert!(matches!(
-            error.fault(),
-            HistoryFault::RevisionUnknown { .. }
-        ));
+        assert_eq!(error.slug(), errors::history::revision_unknown::SLUG);
     }
 
     #[test]
-    fn test_every_fault_renders_its_registry_identity_and_evidence() {
-        let cases: Vec<(HistoryFault, &str, &str)> = vec![
+    fn test_every_history_error_renders_its_registered_identity_and_evidence() {
+        let cases = [
             (
-                HistoryFault::Unversioned {
-                    root: PathBuf::from("/workspace"),
-                },
-                "capability_unavailable",
+                errors::history::unversioned()
+                    .workspace(Path::new("/workspace"))
+                    .requires("run git init")
+                    .error(),
+                errors::history::unversioned::SLUG,
                 "workspace",
             ),
             (
-                HistoryFault::RevisionUnknown {
-                    rev: "feature/absent".to_owned(),
-                },
-                "resource_not_found",
+                errors::history::revision_unknown()
+                    .rev("feature/absent")
+                    .requires("use a known revision")
+                    .error(),
+                errors::history::revision_unknown::SLUG,
                 "rev",
             ),
             (
-                HistoryFault::RevisionNotCommit {
-                    rev: "main^{tree}".to_owned(),
-                    kind: "tree".to_owned(),
-                },
-                "resource_not_found",
+                errors::history::revision_not_commit()
+                    .rev("main^{tree}")
+                    .resolved_kind("tree")
+                    .requires("use a commit")
+                    .error(),
+                errors::history::revision_not_commit::SLUG,
                 "resolved_kind",
             ),
             (
-                HistoryFault::TreeTooLarge { entries_max: 4 },
-                "limit_exceeded",
+                errors::history::tree_too_large()
+                    .limit("revision_tree_entries_max")
+                    .entries_max(4_usize)
+                    .error(),
+                errors::history::tree_too_large::SLUG,
                 "entries_max",
             ),
             (
-                HistoryFault::BlobTooLarge {
-                    path: "src/lib.rs".to_owned(),
-                    bytes_max: 4,
-                    size: 19,
-                },
-                "limit_exceeded",
+                errors::history::blob_too_large()
+                    .path(Path::new("src/lib.rs"))
+                    .bytes_max(4_usize)
+                    .size(19_u64)
+                    .error(),
+                errors::history::blob_too_large::SLUG,
                 "bytes_max",
             ),
             (
-                HistoryFault::PathUnrepresentable {
-                    path: "src/evil".to_owned(),
-                },
-                "unsupported_path",
+                errors::history::too_many_tags()
+                    .limit("tags_max")
+                    .tags_max(4_usize)
+                    .error(),
+                errors::history::too_many_tags::SLUG,
+                "tags_max",
+            ),
+            (
+                errors::history::path_unrepresentable()
+                    .path("src/evil")
+                    .error(),
+                errors::history::path_unrepresentable::SLUG,
                 "path",
             ),
             (
-                HistoryFault::Storage {
-                    operation: "read blob",
-                    detail: "object store gone".to_owned(),
-                },
-                "storage_failure",
+                errors::history::storage()
+                    .operation("read blob")
+                    .detail("object store gone")
+                    .error(),
+                errors::history::storage::SLUG,
                 "operation",
             ),
         ];
-        for (fault, code, evidence_key) in cases {
-            let error = HistoryError::from(fault);
-            assert_eq!(error.descriptor().code(), code, "{error}");
+        for (error, slug, evidence_key) in cases {
+            assert_eq!(error.slug(), slug);
             assert!(
-                error
-                    .context()
-                    .iter()
-                    .any(|entry| entry.key() == evidence_key),
-                "the {code} fault must carry {evidence_key} evidence: {error}"
+                error.context().any(|(key, _)| key == evidence_key),
+                "{slug} must carry {evidence_key} evidence: {error}"
             );
         }
     }
@@ -1561,7 +1519,7 @@ mod tests {
         let error = repository
             .tree_files(&head, &include_all, 1)
             .expect_err("a subtree past the budget must refuse, not descend");
-        assert!(matches!(error.fault(), HistoryFault::TreeTooLarge { .. }));
+        assert_eq!(error.slug(), errors::history::tree_too_large::SLUG);
     }
 
     /// A workspace whose lib.rs changed in three commits, with one commit
@@ -1858,10 +1816,12 @@ mod tests {
         let error = repository
             .path_revisions(&head, "lib.rs", 100)
             .expect_err("a parent absent without a shallow boundary is a storage failure");
-        let HistoryFault::Storage { operation, .. } = error.fault() else {
-            panic!("expected Storage, got {:?}", error.fault());
-        };
-        assert_eq!(*operation, "read commit");
+        assert_eq!(error.slug(), errors::history::storage::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "read commit")
+        );
     }
 
     #[test]
@@ -1873,10 +1833,11 @@ mod tests {
         let error = repository
             .tree_files(&raw, &include_all, REVISION_TREE_ENTRIES_MAX)
             .expect_err("a committed non-UTF-8 path must refuse");
-        assert!(matches!(
-            error.fault(),
-            HistoryFault::PathUnrepresentable { .. }
-        ));
-        assert_eq!(error.descriptor().code(), "unsupported_path");
+        assert_eq!(error.slug(), errors::history::path_unrepresentable::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "path" && value.contains("evil"))
+        );
     }
 }

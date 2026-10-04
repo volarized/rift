@@ -10,6 +10,7 @@ generate:
 
 generate-check:
     {{ rift_dev }} generate --check
+    cargo xtask errors check
 
 check:
     cargo metadata --locked --format-version 1 > /dev/null

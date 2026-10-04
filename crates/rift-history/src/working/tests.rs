@@ -366,10 +366,15 @@ fn a_working_form_past_the_byte_bound_refuses_the_blob() {
         .form(&files[0], 4)
         .expect_err("the blob is past 4 bytes");
 
-    assert!(matches!(
-        error.fault(),
-        crate::HistoryFault::BlobTooLarge { bytes_max: 4, .. }
-    ));
+    assert_eq!(
+        error.slug(),
+        rift_error::errors::history::blob_too_large::SLUG
+    );
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "bytes_max" && value == "4")
+    );
     let rendered = format!("{converter:?}");
     assert!(rendered.starts_with("WorkingForms"), "{rendered}");
 }

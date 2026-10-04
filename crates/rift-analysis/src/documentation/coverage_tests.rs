@@ -193,7 +193,12 @@ fn malformed_publication_facts_are_refused_at_boundary() {
         };
         (case.mutate)(&mut index);
         let error = DocumentationCollection::new(index).expect_err(case.name);
-        assert_eq!(error.fault().violation(), case.expected, "{}", case.name);
+        assert_eq!(
+            crate::documentation::failure::violation(&error),
+            case.expected,
+            "{}",
+            case.name
+        );
     }
 }
 

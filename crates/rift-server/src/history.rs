@@ -16,9 +16,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rift_core::ProjectPath;
-use rift_history::{
-    HistoryFault, PathHistory, PathRevision, Repository, ResolvedRevision, TreeFile,
-};
+use rift_error::errors;
+use rift_history::{PathHistory, PathRevision, Repository, ResolvedRevision, TreeFile};
 use rift_history_store::{StoreReader, StoreReads, StoredCommit};
 use rift_index::SymbolMatch;
 use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration, HistoryStrategy};
@@ -28,7 +27,7 @@ use rift_protocol::read::{
 };
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
 
-use crate::read::{ReadError, ReadFault, project_path, symbol_id};
+use crate::read::{RiftError, project_path, symbol_id};
 
 /// One parse cache key: the path selects the provider and symbol space, the
 /// blob id the exact committed bytes.
@@ -73,8 +72,8 @@ impl StoredHistory {
     }
 
     /// Opens one read connection to the store.
-    pub(crate) fn connect(&self) -> Result<StoreReads, ReadError> {
-        self.reader.connect().map_err(ReadFault::history_store)
+    pub(crate) fn connect(&self) -> Result<StoreReads, RiftError> {
+        self.reader.connect()
     }
 
     /// How far the history task's latest fill has got, which the task records
@@ -96,25 +95,21 @@ impl StoredHistory {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when `HEAD` does not resolve or the store cannot
+    /// Returns [`RiftError`] when `HEAD` does not resolve or the store cannot
     /// be read.
     pub(crate) fn filling(
         &self,
         reads: &StoreReads,
         root: &Path,
-    ) -> Result<Option<ReadWarning>, ReadError> {
+    ) -> Result<Option<ReadWarning>, RiftError> {
         let Some(counts) = self.progress.counts() else {
             return Ok(None);
         };
         let head_missing = match self.strategy {
             HistoryStrategy::Everything => {
-                let head = Repository::open(root)
-                    .and_then(|repository| repository.resolve("HEAD"))
-                    .map_err(ReadFault::history)?;
-                reads
-                    .commit(&head.commit_id())
-                    .map_err(ReadFault::history_store)?
-                    .is_none()
+                let head =
+                    Repository::open(root).and_then(|repository| repository.resolve("HEAD"))?;
+                reads.commit(&head.commit_id())?.is_none()
             }
             HistoryStrategy::Selective => false,
         };
@@ -251,7 +246,7 @@ impl SymbolTimelines {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`]: `unsupported` when `[providers.history]` is
+    /// Returns [`RiftError`]: `unsupported` when `[providers.history]` is
     /// disabled, the version-control fault when the workspace has no
     /// repository or its head does not resolve, and the store fault when the
     /// attached store cannot be read.
@@ -261,18 +256,17 @@ impl SymbolTimelines {
         history: &HistoryConfiguration,
         syntax: SyntaxLimits,
         store: Option<&StoredHistory>,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         if !history.enabled {
-            return Err(ReadFault::unsupported(
-                "symbol history (providers.history disabled)",
-            ));
+            return errors::server::read_unsupported()
+                .capability("symbol history (providers.history disabled)")
+                .fail();
         }
-        let repository = Repository::open(root).map_err(ReadFault::history)?;
+        let repository = Repository::open(root)?;
         let start = match revision {
             Some(revision) => repository.resolve(&revision.0),
             None => repository.resolve("HEAD"),
-        }
-        .map_err(ReadFault::history)?;
+        }?;
         let revisions_max =
             usize::try_from(history.max_revisions.min(HISTORY_REVISIONS_MAX)).unwrap_or(usize::MAX);
         let span = tracing::debug_span!(
@@ -313,14 +307,14 @@ impl SymbolTimelines {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the repository or the store cannot be
+    /// Returns [`RiftError`] when the repository or the store cannot be
     /// read. A blob the tier cannot analyze contributes no version instead of
     /// failing.
     pub(crate) fn timeline(
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
-    ) -> Result<SymbolHistory, ReadError> {
+    ) -> Result<SymbolHistory, RiftError> {
         match &mut self.source {
             TimelineSource::Store(stored) => stored.timeline(matched),
             TimelineSource::Walk(walked) => walked.timeline(provider, matched),
@@ -350,19 +344,14 @@ impl StoredTimelines {
         served: &ResolvedRevision,
         revision_read: bool,
         revisions_max: usize,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let reads = stored.connect()?;
         let start = match (stored.strategy, revision_read) {
-            (HistoryStrategy::Selective, false) => {
-                reads.chain_head().map_err(ReadFault::history_store)?
-            }
+            (HistoryStrategy::Selective, false) => reads.chain_head()?,
             _ => Some(served.commit_id()),
         };
         let held = match &start {
-            Some(start) => reads
-                .commit(start)
-                .map_err(ReadFault::history_store)?
-                .is_some(),
+            Some(start) => reads.commit(start)?.is_some(),
             None => false,
         };
         if !held && !revision_read {
@@ -386,7 +375,7 @@ impl StoredTimelines {
     /// when it meets a commit the store does not hold, a boundary, or the
     /// `max_revisions` bound first, nor when the store holds no commit to
     /// start at, as a `selective` store holding no release yet does.
-    fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, ReadError> {
+    fn timeline(&self, matched: SymbolMatch<'_>) -> Result<SymbolHistory, RiftError> {
         let symbol = symbol_id(matched.file, matched.symbol);
         let Some(start) = self.start.clone() else {
             return Ok(timeline_answer(symbol, Vec::new(), false));
@@ -401,29 +390,21 @@ impl StoredTimelines {
                 complete = true;
                 break;
             };
-            let Some(commit) = self.reads.commit(&id).map_err(ReadFault::history_store)? else {
+            let Some(commit) = self.reads.commit(&id)? else {
                 break;
             };
             if let Some(kind) = self
                 .reads
-                .declaration_change(&commit, &path, qualified_name)
-                .map_err(ReadFault::history_store)?
+                .declaration_change(&commit, &path, qualified_name)?
             {
                 versions.push(stored_version(&commit, &path, kind));
                 if kind == SymbolVersionKind::Moved
-                    && let Some(old_path) = self
-                        .reads
-                        .moved_from(&commit, &path, qualified_name)
-                        .map_err(ReadFault::history_store)?
+                    && let Some(old_path) = self.reads.moved_from(&commit, &path, qualified_name)?
                 {
                     path = old_path;
                 }
             }
-            if let Some(old_path) = self
-                .reads
-                .renamed_from(&commit, &path)
-                .map_err(ReadFault::history_store)?
-            {
+            if let Some(old_path) = self.reads.renamed_from(&commit, &path)? {
                 versions.push(stored_version(&commit, &path, SymbolVersionKind::Moved));
                 path = old_path;
             }
@@ -481,7 +462,7 @@ impl WalkedTimelines {
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
-    ) -> Result<SymbolHistory, ReadError> {
+    ) -> Result<SymbolHistory, RiftError> {
         let path = matched.file.path();
         let Self {
             repository,
@@ -493,11 +474,9 @@ impl WalkedTimelines {
         } = self;
         let history = match walks.entry(path.as_str().to_owned()) {
             Entry::Occupied(walked) => walked.into_mut(),
-            Entry::Vacant(unwalked) => unwalked.insert(
-                repository
-                    .path_revisions(start, path.as_str(), *revisions_max)
-                    .map_err(ReadFault::history)?,
-            ),
+            Entry::Vacant(unwalked) => {
+                unwalked.insert(repository.path_revisions(start, path.as_str(), *revisions_max)?)
+            }
         };
         let mut states = Vec::with_capacity(history.revisions().len());
         for revision in history.revisions() {
@@ -557,7 +536,7 @@ fn revision_state(
     path: &ProjectPath,
     revision: &PathRevision,
     qualified_name: &str,
-) -> Result<SymbolState, ReadError> {
+) -> Result<SymbolState, RiftError> {
     let Some(blob) = revision.blob() else {
         return Ok(SymbolState::Absent);
     };
@@ -587,7 +566,7 @@ fn revision_state(
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when the object store cannot be read; every
+/// Returns [`RiftError`] when the object store cannot be read; every
 /// per-blob analysis refusal degrades to `None` instead.
 fn parse_blob(
     repository: &Repository,
@@ -595,14 +574,14 @@ fn parse_blob(
     syntax: SyntaxLimits,
     path: &ProjectPath,
     blob: &TreeFile,
-) -> Result<Option<ParsedRevision>, ReadError> {
+) -> Result<Option<ParsedRevision>, RiftError> {
     let bytes = match repository.blob_bytes(blob, syntax.source_bytes_max()) {
         Ok(bytes) => bytes,
         Err(error) => {
-            return match error.fault() {
-                HistoryFault::BlobTooLarge { .. } => Ok(None),
-                _ => Err(ReadFault::history(error)),
-            };
+            if error.slug() == errors::history::blob_too_large::SLUG {
+                return Ok(None);
+            }
+            return Err(error);
         }
     };
     let Ok(text) = String::from_utf8(bytes) else {
@@ -1035,7 +1014,7 @@ mod tests {
             None,
         )
         .expect_err("a disabled provider must refuse before any repository access");
-        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+        assert!((error.slug() == rift_error::errors::server::read_unsupported::SLUG));
     }
 
     #[test]
@@ -1050,7 +1029,7 @@ mod tests {
             None,
         )
         .expect_err("a repository without commits resolves no HEAD");
-        assert!(matches!(error.fault(), ReadFault::History(_)));
+        assert_eq!(error.slug(), rift_error::errors::history::unversioned::SLUG);
     }
 
     /// One `beacon_one` timeline over the shared-path fixture, composed

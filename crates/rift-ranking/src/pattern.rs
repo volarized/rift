@@ -31,8 +31,8 @@ use regex_syntax::hir::{
     Repetition,
 };
 
-use crate::error::{RankingError, RankingViolation, refuse};
 use crate::trigram::{fold, trigram_set};
+use rift_error::{RiftError, errors};
 
 /// Most distinct folded characters a class expands into before it requires nothing.
 /// `['"]` and every case class of one letter fit; `[0-9a-f]` and `\w` do not.
@@ -184,16 +184,20 @@ impl Pattern {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingViolation::PatternSyntax`] for a pattern that does not parse,
-    /// carrying the parser's own message, and [`RankingViolation::PatternSize`] when the
+    /// Returns a syntax error for a pattern that does not parse,
+    /// carrying the parser's own message, and a size error when the
     /// compiled matcher passes `size_limit`.
-    pub fn parse(pattern: &str, size_limit: usize) -> Result<Self, RankingError> {
+    pub fn parse(pattern: &str, size_limit: usize) -> Result<Self, RiftError> {
         let parsed = ParserBuilder::new()
             .multi_line(true)
             .crlf(false)
             .build()
             .parse(pattern)
-            .map_err(|error| refuse(RankingViolation::PatternSyntax, &error.to_string()))?;
+            .map_err(|error| {
+                errors::ranking::pattern_syntax()
+                    .subject(error.to_string())
+                    .error()
+            })?;
         let hir = without_line_feed_in_classes(&parsed);
         let matcher = Regex::builder()
             .configure(
@@ -203,11 +207,12 @@ impl Pattern {
             )
             .build_from_hir(&hir)
             .map_err(|error| match error.size_limit() {
-                Some(_) => refuse(
-                    RankingViolation::PatternSize,
-                    &format!("the compiled pattern exceeds {size_limit} bytes"),
-                ),
-                None => refuse(RankingViolation::PatternSyntax, &error.to_string()),
+                Some(_) => errors::ranking::pattern_size()
+                    .subject(format!("the compiled pattern exceeds {size_limit} bytes"))
+                    .error(),
+                None => errors::ranking::pattern_syntax()
+                    .subject(error.to_string())
+                    .error(),
             })?;
         Ok(Self {
             prefilter: prefilter(&hir),

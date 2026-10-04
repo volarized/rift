@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
+use rift_error::errors;
 use rift_history::{
-    ChangedBlob, HistoryFault, REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile,
+    ChangedBlob, REVISION_TREE_ENTRIES_MAX, Repository, ResolvedRevision, TreeFile,
 };
 use rift_history_store::{
     ChangedPath, CommitRecord, DeclarationChange, HeldCommit, MovedDeclaration,
@@ -27,7 +28,7 @@ use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 use rift_syntax::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 use crate::history::{SymbolShape, SymbolState, classify};
-use crate::read::{ReadError, ReadFault};
+use crate::read::RiftError;
 
 /// Tags one release selection reads, at most.
 pub const RELEASE_TAGS_MAX: usize = 65_536;
@@ -151,17 +152,17 @@ struct ReleasePatterns {
 
 impl ReleasePatterns {
     /// Compiles each pattern.
-    fn compile(patterns: &[String]) -> Result<Self, ReadError> {
+    fn compile(patterns: &[String]) -> Result<Self, RiftError> {
         let compiled = patterns
             .iter()
             .map(|pattern| {
                 release_matcher(pattern)
                     .map(|matcher| (pattern.clone(), matcher))
                     .map_err(|error| {
-                        ReadFault::invalid(
-                            "providers.history.releases",
-                            format!("{pattern} is no tag pattern: {error}"),
-                        )
+                        errors::server::read_invalid()
+                            .field("providers.history.releases")
+                            .violation(format!("{pattern} is no tag pattern: {error}"))
+                            .error()
                     })
             })
             .collect::<Result<_, _>>()?;
@@ -240,7 +241,7 @@ impl HistoryAnalysis {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when no repository versions `root`, a
+    /// Returns [`RiftError`] when no repository versions `root`, a
     /// `[source]` or language pattern does not compile, or a release
     /// pattern is no tag pattern.
     pub fn open(
@@ -252,12 +253,11 @@ impl HistoryAnalysis {
             &LanguageFileSelections,
         ),
         syntax: SyntaxLimits,
-    ) -> Result<Self, ReadError> {
-        let repository = Repository::open(root).map_err(ReadFault::history)?;
-        let visible =
-            RevisionPaths::build(repository.root(), visibility).map_err(ReadFault::index)?;
-        let language = WorkspaceLanguagePolicy::build(repository.root(), languages, text_inclusion)
-            .map_err(ReadFault::index)?;
+    ) -> Result<Self, RiftError> {
+        let repository = Repository::open(root)?;
+        let visible = RevisionPaths::build(repository.root(), visibility)?;
+        let language =
+            WorkspaceLanguagePolicy::build(repository.root(), languages, text_inclusion)?;
         let releases = match history.strategy {
             HistoryStrategy::Everything => None,
             HistoryStrategy::Selective => Some(ReleasePatterns::compile(&history.releases)?),
@@ -293,8 +293,8 @@ impl HistoryAnalysis {
     }
 
     /// The repository, opened for one plan or one analysis.
-    fn repository(&self) -> Result<Repository, ReadError> {
-        Repository::open(&self.root).map_err(ReadFault::history)
+    fn repository(&self) -> Result<Repository, RiftError> {
+        Repository::open(&self.root)
     }
 
     /// What the store owes the strategy, given what it `held`.
@@ -306,8 +306,8 @@ impl HistoryAnalysis {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the repository cannot be read.
-    pub fn plan(&self, held: &HashMap<String, HeldCommit>) -> Result<FillPlan, ReadError> {
+    /// Returns [`RiftError`] when the repository cannot be read.
+    pub fn plan(&self, held: &HashMap<String, HeldCommit>) -> Result<FillPlan, RiftError> {
         let selected = match (&self.strategy, &self.releases) {
             (HistoryStrategy::Selective, Some(releases)) => self.selected_releases(releases)?,
             _ => self.selected_windows()?,
@@ -319,14 +319,12 @@ impl HistoryAnalysis {
     }
 
     /// Every live worktree's window, each commit once, newest first.
-    fn selected_windows(&self) -> Result<FillPlan, ReadError> {
+    fn selected_windows(&self) -> Result<FillPlan, RiftError> {
         let repository = self.repository()?;
-        let heads = repository.live_heads().map_err(ReadFault::history)?;
+        let heads = repository.live_heads()?;
         let mut plan = FillPlan::default();
         for head in &heads {
-            let window = repository
-                .first_parent_window(head, self.revisions_max)
-                .map_err(ReadFault::history)?;
+            let window = repository.first_parent_window(head, self.revisions_max)?;
             for commit in window {
                 if !plan.keep.insert(commit.revision().commit_id()) {
                     continue;
@@ -343,11 +341,8 @@ impl HistoryAnalysis {
 
     /// The newest `max_revisions` releases `releases` selects, each compared
     /// with the one before it in version order, the oldest with nothing.
-    fn selected_releases(&self, releases: &ReleasePatterns) -> Result<FillPlan, ReadError> {
-        let tagged = self
-            .repository()?
-            .tagged_commits(RELEASE_TAGS_MAX)
-            .map_err(ReadFault::history)?;
+    fn selected_releases(&self, releases: &ReleasePatterns) -> Result<FillPlan, RiftError> {
+        let tagged = self.repository()?.tagged_commits(RELEASE_TAGS_MAX)?;
         let mut plan = FillPlan::default();
         let mut versioned: Vec<(semver::Version, String, ResolvedRevision)> = Vec::new();
         for tag in tagged {
@@ -392,16 +387,14 @@ impl HistoryAnalysis {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the repository cannot be read.
+    /// Returns [`RiftError`] when the repository cannot be read.
     pub fn analyze(
         &self,
         pending: &PendingCommit,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<Option<AnalyzedCommit>, ReadError> {
+    ) -> Result<Option<AnalyzedCommit>, RiftError> {
         let repository = self.repository()?;
-        let facts = repository
-            .commit_facts(&pending.revision)
-            .map_err(ReadFault::history)?;
+        let facts = repository.commit_facts(&pending.revision)?;
         let mut record = CommitRecord {
             id: pending.revision.commit_id(),
             base: pending.base.as_ref().map(ResolvedRevision::commit_id),
@@ -426,14 +419,12 @@ impl HistoryAnalysis {
             }));
         }
         let includes = |path: &str| self.records(path);
-        let changed = repository
-            .changed_blobs(
-                pending.base.as_ref(),
-                &pending.revision,
-                &includes,
-                REVISION_TREE_ENTRIES_MAX,
-            )
-            .map_err(ReadFault::history)?;
+        let changed = repository.changed_blobs(
+            pending.base.as_ref(),
+            &pending.revision,
+            &includes,
+            REVISION_TREE_ENTRIES_MAX,
+        )?;
         if changed.is_truncated() {
             record.boundary = true;
             return Ok(Some(AnalyzedCommit {
@@ -501,15 +492,11 @@ impl HistoryAnalysis {
         blob: &ChangedBlob,
         declarations: &mut Vec<DeclarationChange>,
         candidates: &mut MoveCandidates,
-    ) -> Result<u64, ReadError> {
+    ) -> Result<u64, RiftError> {
         let Ok(path) = ProjectPath::new(blob.path().to_owned()) else {
             return Ok(0);
         };
-        let Some(provider) = self
-            .language
-            .syntax_provider_for(Path::new(blob.path()))
-            .map_err(ReadFault::index)?
-        else {
+        let Some(provider) = self.language.syntax_provider_for(Path::new(blob.path()))? else {
             return Ok(0);
         };
         let older = self.side(repository, provider, &path, blob.old_blob())?;
@@ -539,16 +526,16 @@ impl HistoryAnalysis {
         provider: &dyn SyntaxProvider,
         path: &ProjectPath,
         blob: Option<&TreeFile>,
-    ) -> Result<ParsedSide, ReadError> {
+    ) -> Result<ParsedSide, RiftError> {
         let Some(blob) = blob else {
             return Ok(ParsedSide::absent());
         };
         let bytes = match repository.blob_bytes(blob, self.syntax.source_bytes_max()) {
             Ok(bytes) => bytes,
-            Err(error) if matches!(error.fault(), HistoryFault::BlobTooLarge { .. }) => {
+            Err(error) if error.slug() == errors::history::blob_too_large::SLUG => {
                 return Ok(ParsedSide::unknown(0));
             }
-            Err(error) => return Err(ReadFault::history(error)),
+            Err(error) => return Err(error),
         };
         let parsed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let Ok(text) = String::from_utf8(bytes) else {

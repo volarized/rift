@@ -19,12 +19,13 @@ use rift_syntax::{
     SyntaxProvider, SyntaxSource,
 };
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::identity::{canonical_digest, content_digest};
 use super::input::{slice, source_file_path};
 use super::{
     DocumentationCollection, DocumentationDeclaration, DocumentationInput, DocumentationSourceSet,
 };
+use rift_error::RiftError;
 
 /// Collects metadata without acquiring bytes or retaining another text copy.
 ///
@@ -38,7 +39,7 @@ use super::{
 pub fn collect_documentation(
     sources: &DocumentationSourceSet<'_>,
     declarations: &[DocumentationDeclaration<'_>],
-) -> Result<DocumentationCollection, DocumentationError> {
+) -> Result<DocumentationCollection, RiftError> {
     collect_documentation_incremental(None, sources, declarations)
 }
 
@@ -54,7 +55,7 @@ pub fn collect_documentation_incremental(
     previous: Option<&DocumentationCollection>,
     sources: &DocumentationSourceSet<'_>,
     declarations: &[DocumentationDeclaration<'_>],
-) -> Result<DocumentationCollection, DocumentationError> {
+) -> Result<DocumentationCollection, RiftError> {
     if declarations.len() > PACKAGE_SYMBOLS_MAX as usize {
         return Err(refused(DocumentationViolation::LimitExceeded, "references"));
     }
@@ -71,7 +72,7 @@ pub fn collect_documentation_incremental(
 
 /// One source's extraction key and facts: reused from `previous` when the key matches,
 /// extracted otherwise.
-type ExtractedSource = Result<(DocumentationDigest, Arc<Collected>), DocumentationError>;
+type ExtractedSource = Result<(DocumentationDigest, Arc<Collected>), RiftError>;
 type AttachedDeclaration = (
     rift_protocol::read::SymbolId,
     rift_protocol::read::TextRange,
@@ -120,7 +121,7 @@ fn collect_source_facts(
     previous: Option<&DocumentationCollection>,
     sources: &DocumentationSourceSet<'_>,
     attached: &AttachedDeclarations,
-) -> Result<(Collected<DocumentationBlock>, ExtractionCache), DocumentationError> {
+) -> Result<(Collected<DocumentationBlock>, ExtractionCache), RiftError> {
     let mut output = Collected::<DocumentationBlock>::default();
     let mut cache = ExtractionCache::default();
     let extracted = extract_sources(previous, sources.sources(), attached);
@@ -146,7 +147,7 @@ fn resolve_collected(
     declarations: &[DocumentationDeclaration<'_>],
     records: &[rift_protocol::documentation::DocumentationSource],
     output: &mut Collected<DocumentationBlock>,
-) -> Result<Option<super::resolution::ResolutionCache>, DocumentationError> {
+) -> Result<Option<super::resolution::ResolutionCache>, RiftError> {
     let input = super::resolution::ResolutionInput {
         sources: records,
         blocks: &output.blocks,
@@ -187,7 +188,7 @@ fn build_collection(
     output: Collected<DocumentationBlock>,
     cache: ExtractionCache,
     resolution_cache: Option<super::resolution::ResolutionCache>,
-) -> Result<DocumentationCollection, DocumentationError> {
+) -> Result<DocumentationCollection, RiftError> {
     let selected = u32::try_from(sources.sources().len())
         .map_err(|_| refused(DocumentationViolation::LimitExceeded, "sources"))?;
     let records = sources
@@ -303,7 +304,7 @@ fn extraction_key(
     input: &DocumentationInput<'_>,
     attached: &[AttachedDeclaration],
     symbols: &AttachedSymbols,
-) -> Result<DocumentationDigest, DocumentationError> {
+) -> Result<DocumentationDigest, RiftError> {
     let syntax_facts = attached_syntax_facts(input, symbols)?;
     canonical_digest(&(
         input.source(),
@@ -317,7 +318,7 @@ fn extraction_key(
 fn attached_syntax_facts(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
-) -> Result<AttachedSyntaxFacts, DocumentationError> {
+) -> Result<AttachedSyntaxFacts, RiftError> {
     let Some(syntax) = input.syntax() else {
         return Ok(None);
     };
@@ -373,7 +374,7 @@ fn attached_symbols(attached: &[AttachedDeclaration]) -> AttachedSymbols {
 fn extract_source_facts(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
-) -> Result<Arc<Collected>, DocumentationError> {
+) -> Result<Arc<Collected>, RiftError> {
     let mut facts = Collected::default();
     if let Err(error) = extract_source(input, symbols, &mut facts) {
         let Some(kind) = recoverable_source_error(input, &error) else {
@@ -433,13 +434,16 @@ fn merge_source(
 
 fn recoverable_source_error(
     input: &DocumentationInput<'_>,
-    error: &DocumentationError,
+    error: &RiftError,
 ) -> Option<DocumentationWarningKind> {
-    let fault = error.fault();
-    match fault.violation() {
-        DocumentationViolation::LimitExceeded => Some(DocumentationWarningKind::LimitExceeded),
-        DocumentationViolation::Format
-            if fault.field() == "markdown"
+    match error.slug().as_str() {
+        "rift.analysis.documentation_limit_exceeded" => {
+            Some(DocumentationWarningKind::LimitExceeded)
+        }
+        "rift.analysis.documentation_format_invalid"
+            if error
+                .context()
+                .any(|(key, value)| key == "field" && value == "markdown")
                 && matches!(
                     input.source().format,
                     DocumentationSourceFormat::Markdown | DocumentationSourceFormat::Mdx
@@ -455,7 +459,7 @@ fn extract_source(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
     output: &mut Collected,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     use DocumentationSourceFormat as Format;
     match input.source().format {
         Format::Markdown | Format::Mdx => extract_markdown(input, output),
@@ -470,7 +474,7 @@ fn extract_attached_comments(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
     output: &mut Collected,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let Some(syntax) = input.syntax() else {
         output.omitted += 1;
         warn(
@@ -513,10 +517,7 @@ fn extract_attached_comments(
     Ok(())
 }
 
-fn extract_rst(
-    input: &DocumentationInput<'_>,
-    output: &mut Collected,
-) -> Result<(), DocumentationError> {
+fn extract_rst(input: &DocumentationInput<'_>, output: &mut Collected) -> Result<(), RiftError> {
     let path = source_file_path(input.source())?;
     let facts = super::rst::extract_rst_facts(input.text(), &path)?;
     let mut ordinals = BTreeMap::new();
@@ -568,7 +569,7 @@ fn append_rst_targets_and_links(
     blocks: &BTreeMap<(u64, u64), DocumentationDigest>,
     target_facts: &[super::rst::RstTargetFact],
     links: Vec<super::rst::RstLinkFact>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let mut targets = BTreeMap::<String, RstReferenceTarget>::new();
     for target in target_facts {
         if target.name.is_empty() {
@@ -655,10 +656,7 @@ fn rst_reference_name(name: &str) -> String {
         .to_lowercase()
 }
 
-fn extract_cell(
-    input: &DocumentationInput<'_>,
-    output: &mut Collected,
-) -> Result<(), DocumentationError> {
+fn extract_cell(input: &DocumentationInput<'_>, output: &mut Collected) -> Result<(), RiftError> {
     match input.source().identity.cell.as_ref().map(|cell| cell.kind) {
         Some(NotebookCellKind::Markdown) => extract_markdown(input, output),
         Some(NotebookCellKind::Code) => {
@@ -688,7 +686,7 @@ fn extract_cell(
     }
 }
 
-fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, DocumentationError> {
+fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, RiftError> {
     if let Some(syntax) = input.shared_syntax() {
         if syntax.markdown_facts().is_none() {
             return Err(refused(DocumentationViolation::Format, "syntax"));
@@ -705,10 +703,7 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Do
             SyntaxLimits::default(),
         )
         .map_err(|error| {
-            rift_core::Error::new(
-                super::DocumentationFault::new(DocumentationViolation::Format, "markdown")
-                    .caused_by(error),
-            )
+            super::failure::refused_by(DocumentationViolation::Format, "markdown", error)
         })?;
     Ok(document.into_facts())
 }
@@ -716,7 +711,7 @@ fn markdown_facts(input: &DocumentationInput<'_>) -> Result<Arc<SyntaxFacts>, Do
 fn extract_markdown(
     input: &DocumentationInput<'_>,
     output: &mut Collected,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let syntax = markdown_facts(input)?;
     let facts = syntax
         .markdown_facts()
@@ -795,7 +790,7 @@ fn append_markdown_references(
     output: &mut Collected,
     facts: &rift_syntax::MarkdownFacts,
     blocks: &BTreeMap<(u64, u64), DocumentationDigest>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     for candidate in facts.reference_candidates() {
         let Some(block) = blocks.get(&(candidate.block_range.start, candidate.block_range.end))
         else {
@@ -825,7 +820,7 @@ fn append_markdown_link(
     link: &rift_syntax::MarkdownLinkFact,
     blocks: &BTreeMap<(u64, u64), DocumentationDigest>,
     definitions: &BTreeMap<String, String>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let Some(block) = blocks.get(&(link.block_range.start, link.block_range.end)) else {
         return Ok(());
     };
@@ -855,7 +850,7 @@ fn append_markdown_link(
 fn markdown_definitions(
     text: &str,
     facts: &rift_syntax::MarkdownFacts,
-) -> Result<BTreeMap<String, String>, DocumentationError> {
+) -> Result<BTreeMap<String, String>, RiftError> {
     let mut definitions = BTreeMap::new();
     for link in facts
         .links()
@@ -886,7 +881,7 @@ fn markdown_destination(
     text: &str,
     link: &rift_syntax::MarkdownLinkFact,
     definitions: &BTreeMap<String, String>,
-) -> Result<(Option<String>, bool), DocumentationError> {
+) -> Result<(Option<String>, bool), RiftError> {
     if let Some(destination) = link.destination_range {
         return Ok((
             Some(slice(text, &wire_range(destination))?.to_owned()),
@@ -918,7 +913,7 @@ fn append_block(
     output: &mut Collected,
     draft: BlockDraft,
     ordinals: &mut BTreeMap<String, u32>,
-) -> Result<DocumentationDigest, DocumentationError> {
+) -> Result<DocumentationDigest, RiftError> {
     let exact = slice(input.text(), &draft.range)?;
     if output.blocks.len() >= DOCUMENTATION_BLOCKS_MAX as usize {
         return Err(refused(DocumentationViolation::LimitExceeded, "blocks"));
@@ -947,10 +942,7 @@ fn append_block(
     Ok(identity)
 }
 
-fn extract_text(
-    input: &DocumentationInput<'_>,
-    output: &mut Collected,
-) -> Result<(), DocumentationError> {
+fn extract_text(input: &DocumentationInput<'_>, output: &mut Collected) -> Result<(), RiftError> {
     let starts = line_starts(input.text());
     let mut range_start = None;
     let mut offset = 0_u64;
@@ -980,7 +972,7 @@ fn append_paragraph(
     end: u64,
     starts: &[usize],
     ordinals: &mut BTreeMap<String, u32>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let Some(start) = start else {
         return Ok(());
     };
@@ -1178,6 +1170,9 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
         )
         .expect_err("invalid range");
-        assert_eq!(error.fault().violation(), DocumentationViolation::Range);
+        assert_eq!(
+            crate::documentation::failure::violation(&error),
+            DocumentationViolation::Range
+        );
     }
 }

@@ -1,10 +1,7 @@
-//! Registry conformance for the configuration model's fault types, and the
-//! policy values `rift-index` reads out of it.
+//! Configuration error conversion and policy values `rift-index` reads.
 //!
 //! The `rift.toml` model lives in `rift-protocol`, below this crate, so its
-//! fault types cannot implement [`Fault`] where they are defined. This module
-//! implements the registry trait over them, giving every configuration
-//! refusal the registry's identity, explanation, and rendering. It also
+//! errors are represented by registered Rift errors in this module. It also
 //! holds [`SourceVisibility`]: `rift-index` has no dependency on
 //! `rift-protocol`, so the workspace's `[source]` table is translated into
 //! this plain value here, beside the wire type it comes from. For the same
@@ -13,14 +10,15 @@
 
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
-    ConfigurationViolation, EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy,
-    UnitParseError, WorkspaceConfiguration,
+    EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy, WorkspaceConfiguration,
 };
 use rift_protocol::documentation::DocumentationConfiguration;
 use rift_protocol::source::SourceConfiguration;
 
-use crate::error::{ErrorContext, ErrorName, Fault, fault_label};
-use rift_protocol::error::ErrorCode;
+#[cfg(test)]
+use rift_error::{ErrorContext, RiftError, errors};
+#[cfg(test)]
+use rift_protocol::configuration::{ConfigurationViolation, UnitParseError};
 
 /// Which files below a workspace root the index may see: the resolved
 /// `[source]` policy, independent of the wire model it was read from.
@@ -294,39 +292,122 @@ impl From<&WorkspaceConfiguration> for TextFileInclusion {
     }
 }
 
-impl Fault for UnitParseError {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![
-            ErrorContext::new("value", self.value()),
-            ErrorContext::new("expected", self.expected()),
-        ]
-    }
+#[cfg(test)]
+pub(crate) fn unit_parse_error(error: &UnitParseError) -> RiftError {
+    errors::core::configuration_unit_parse()
+        .value(error.value())
+        .expected(error.expected())
+        .error()
 }
 
-impl Fault for ConfigurationViolation {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+#[cfg(test)]
+pub(crate) fn configuration_violation_error(violation: &ConfigurationViolation) -> RiftError {
+    macro_rules! build {
+        ($builder:expr) => {{
+            let mut builder = $builder;
+            for (key, value) in violation.evidence() {
+                builder = builder.with(ErrorContext::new(key, value));
+            }
+            builder.error()
+        }};
     }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("violation", fault_label(self))];
-        context.extend(
-            self.evidence()
-                .into_iter()
-                .map(|(key, value)| ErrorContext::new(key, value)),
-        );
-        context
+    match violation {
+        ConfigurationViolation::LimitOutOfRange { .. } => {
+            build!(errors::core::configuration_limit_out_of_range())
+        }
+        ConfigurationViolation::LanguageIdentityInvalid { .. } => {
+            build!(errors::core::configuration_language_identity_invalid())
+        }
+        ConfigurationViolation::LanguageLspUnknown { .. } => {
+            build!(errors::core::configuration_language_lsp_unknown())
+        }
+        ConfigurationViolation::LanguageIncludeDuplicate { .. } => {
+            build!(errors::core::configuration_language_include_duplicate())
+        }
+        ConfigurationViolation::EmbeddingModelInvalid { .. } => {
+            build!(errors::core::configuration_embedding_model_invalid())
+        }
+        ConfigurationViolation::EmbeddingEndpointInvalid { .. } => {
+            build!(errors::core::configuration_embedding_endpoint_invalid())
+        }
+        ConfigurationViolation::EmbeddingIdentifierInvalid { .. } => {
+            build!(errors::core::configuration_embedding_identifier_invalid())
+        }
+        ConfigurationViolation::SearchWeightsInvalid { .. } => {
+            build!(errors::core::configuration_search_weights_invalid())
+        }
+        ConfigurationViolation::CommandProgramEmpty { .. } => {
+            build!(errors::core::configuration_command_program_empty())
+        }
+        ConfigurationViolation::CommandProgramWhitespace { .. } => {
+            build!(errors::core::configuration_command_program_whitespace())
+        }
+        ConfigurationViolation::CommandProgramAbsolute { .. } => {
+            build!(errors::core::configuration_command_program_absolute())
+        }
+        ConfigurationViolation::CommandProgramDotSegment { .. } => {
+            build!(errors::core::configuration_command_program_dot_segment())
+        }
+        ConfigurationViolation::CommandArgumentOversized { .. } => {
+            build!(errors::core::configuration_command_argument_oversized())
+        }
+        ConfigurationViolation::CommandProgramOversized { .. } => {
+            build!(errors::core::configuration_command_program_oversized())
+        }
+        ConfigurationViolation::LspNameInvalid { .. } => {
+            build!(errors::core::configuration_lsp_name_invalid())
+        }
+        ConfigurationViolation::LspEnvironmentKeyInvalid { .. } => {
+            build!(errors::core::configuration_lsp_environment_key_invalid())
+        }
+        ConfigurationViolation::LspInitializationOptionsNotObject { .. } => {
+            build!(errors::core::configuration_lsp_initialization_options_not_object())
+        }
+        ConfigurationViolation::LspEngineSelectionConflict { .. } => {
+            build!(errors::core::configuration_lsp_engine_selection_conflict())
+        }
+        ConfigurationViolation::LspEngineMissing { .. } => {
+            build!(errors::core::configuration_lsp_engine_missing())
+        }
+        ConfigurationViolation::LspEmbeddedExtras { .. } => {
+            build!(errors::core::configuration_lsp_embedded_extras())
+        }
+        ConfigurationViolation::PathPatternInvalid { .. } => {
+            build!(errors::core::configuration_path_pattern_invalid())
+        }
+        ConfigurationViolation::FileNameInvalid { .. } => {
+            build!(errors::core::configuration_file_name_invalid())
+        }
+        ConfigurationViolation::PackageSelectorInvalid { .. } => {
+            build!(errors::core::configuration_package_selector_invalid())
+        }
+        ConfigurationViolation::LogCaptureInvalid { .. } => {
+            build!(errors::core::configuration_log_capture_invalid())
+        }
+        ConfigurationViolation::PortSelectionConflict => {
+            build!(errors::core::configuration_port_selection_conflict())
+        }
+        ConfigurationViolation::PortRangeInverted { .. } => {
+            build!(errors::core::configuration_port_range_inverted())
+        }
+        ConfigurationViolation::HistoryCpuShareInvalid { .. } => {
+            build!(errors::core::configuration_history_cpu_share_invalid())
+        }
+        ConfigurationViolation::HistoryReleasesMissing => {
+            build!(errors::core::configuration_history_releases_missing())
+        }
+        ConfigurationViolation::HistoryReleasesOutsideSelective => {
+            build!(errors::core::configuration_history_releases_outside_selective())
+        }
+        ConfigurationViolation::HistoryReleasePatternInvalid { .. } => {
+            build!(errors::core::configuration_history_release_pattern_invalid())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use rift_protocol::configuration::{ByteSize, Duration};
     use rift_protocol::read::PathPattern;
 
@@ -397,16 +478,17 @@ mod tests {
     #[test]
     fn test_unit_parse_failure_renders_through_the_registry() {
         let fault = ByteSize::parse("16KiB").expect_err("an uppercase unit must be refused");
-        let error = Error::from(fault);
-        assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-        );
+        let error = unit_parse_error(&fault);
+        assert_eq!(error.slug().as_str(), "rift.core.configuration_unit_parse");
         let message = error.to_string();
         assert!(
-            message.contains("the workspace configuration failed validation")
-                && message.contains("value 16KiB")
-                && message.contains("16kb")
+            message.contains("configuration value does not use its required unit form")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "value" && value == "16KiB")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "expected" && value.contains("16kb"))
                 && message.contains("correct the reported configuration field"),
             "the render must carry explanation, evidence, and action: {message}"
         );
@@ -418,16 +500,20 @@ mod tests {
             field: "languages.rust.lsp.command",
             program: "/bin/cargo".to_owned(),
         };
-        let error = Error::from(violation);
+        let error = configuration_violation_error(&violation);
         assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+            error.slug().as_str(),
+            "rift.core.configuration_command_program_absolute"
         );
         let message = error.to_string();
         assert!(
-            message.contains("violation command_program_absolute")
-                && message.contains("field languages.rust.lsp.command")
-                && message.contains("program /bin/cargo")
+            message.contains("configured command executable is an absolute path")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "languages.rust.lsp.command")
+                && error
+                    .context()
+                    .any(|(key, value)| key == "program" && value == "/bin/cargo")
                 && message.contains("correct the reported configuration field"),
             "the render must carry the serde label, the evidence, and the action: {message}"
         );
@@ -436,10 +522,10 @@ mod tests {
     #[test]
     fn test_duration_parse_failure_carries_its_own_expected_form() {
         let fault = Duration::parse("30 s").expect_err("an inner space must be refused");
-        let context = fault.context();
-        let keys: Vec<&str> = context.iter().map(ErrorContext::key).collect();
-        assert_eq!(keys, ["value", "expected"]);
-        let expected = context[1].value();
+        let context = unit_parse_error(&fault).context().collect::<Vec<_>>();
+        let keys: Vec<&str> = context.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, ["expected", "value"]);
+        let expected = &context[0].1;
         assert!(
             expected.contains("30s"),
             "the expected form must name 30s: {expected}"

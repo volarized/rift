@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
+use rift_error::{RiftError, errors};
 use toasty::db::Connection;
 
 use crate::database::WorkspaceDatabase;
-use crate::lexical::{LexicalIndexError, storage_error};
 
 /// Most records one append may carry. A drain task holding more splits.
 pub const LOG_BATCH_RECORDS_MAX: usize = 4_096;
@@ -236,7 +236,7 @@ impl LogStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the batch is oversized or a write
+    /// Returns [`RiftError`] when the batch is oversized or a write
     /// fails.
     ///
     /// # Cancel safety
@@ -247,16 +247,16 @@ impl LogStore {
         &self,
         records: &[LogRecord],
         retention_records: u64,
-    ) -> Result<u64, LexicalIndexError> {
+    ) -> Result<u64, RiftError> {
         if records.is_empty() {
             return Ok(0);
         }
         if records.len() > LOG_BATCH_RECORDS_MAX {
-            return Err(crate::lexical::batch_limit_error(
-                "logs.batch_records",
-                records.len() as u64,
-                LOG_BATCH_RECORDS_MAX as u64,
-            ));
+            return errors::index::lexical_record_limit()
+                .field("logs.batch_records")
+                .observed(records.len() as u64)
+                .maximum(LOG_BATCH_RECORDS_MAX as u64)
+                .fail();
         }
         let mut access = self.database.writing().await?;
         let mut transaction = access.transaction().await?;
@@ -265,7 +265,7 @@ impl LogStore {
             .first()
             .exec(&mut transaction)
             .await
-            .map_err(storage_error)?;
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         let first_identity = newest.map_or(1, |row| row.id.saturating_add(1));
         for (offset, record) in records.iter().enumerate() {
             LogRecordRow::create()
@@ -279,10 +279,13 @@ impl LogStore {
                 .fields(record.fields.clone())
                 .exec(&mut transaction)
                 .await
-                .map_err(storage_error)?;
+                .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         }
         let dropped = trim(&mut transaction, retention_records).await?;
-        transaction.commit().await.map_err(storage_error)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         Ok(dropped)
     }
 
@@ -290,15 +293,12 @@ impl LogStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query fails.
+    /// Returns [`RiftError`] when the query fails.
     ///
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only query.
-    pub async fn recent(
-        &self,
-        query: &LogQuery,
-    ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
+    pub async fn recent(&self, query: &LogQuery) -> Result<Vec<StoredLogRecord>, RiftError> {
         self.page(query, &RecordOrder::Newest).await
     }
 
@@ -311,15 +311,12 @@ impl LogStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query fails.
+    /// Returns [`RiftError`] when the query fails.
     ///
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only query.
-    pub async fn following(
-        &self,
-        query: &LogQuery,
-    ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
+    pub async fn following(&self, query: &LogQuery) -> Result<Vec<StoredLogRecord>, RiftError> {
         self.page(query, &RecordOrder::Oldest).await
     }
 
@@ -328,7 +325,7 @@ impl LogStore {
         &self,
         query: &LogQuery,
         order: &RecordOrder,
-    ) -> Result<Vec<StoredLogRecord>, LexicalIndexError> {
+    ) -> Result<Vec<StoredLogRecord>, RiftError> {
         let mut connection = self.connection().await?;
         let identity = LogRecordRow::fields().id();
         let ordering = match order {
@@ -350,7 +347,10 @@ impl LogStore {
         if let Some(recorded_at_ms) = query.since_ms {
             rows = rows.filter(LogRecordRow::fields().recorded_at().ge(recorded_at_ms));
         }
-        let found = rows.exec(&mut connection).await.map_err(storage_error)?;
+        let found = rows
+            .exec(&mut connection)
+            .await
+            .map_err(|source| errors::index::lexical_storage().source(source).error())?;
         Ok(found.into_iter().map(stored_record).collect())
     }
 
@@ -358,22 +358,22 @@ impl LogStore {
     ///
     /// # Errors
     ///
-    /// Returns [`LexicalIndexError`] when the query fails.
+    /// Returns [`RiftError`] when the query fails.
     ///
     /// # Cancel safety
     ///
     /// Cancellation performs no writes; this issues one read-only query.
-    pub async fn count(&self) -> Result<u64, LexicalIndexError> {
+    pub async fn count(&self) -> Result<u64, RiftError> {
         let mut connection = self.connection().await?;
         LogRecordRow::all()
             .count()
             .exec(&mut connection)
             .await
-            .map_err(storage_error)
+            .map_err(|source| errors::index::lexical_storage().source(source).error())
     }
 
     /// A pooled connection carrying the workspace database's required pragmas.
-    async fn connection(&self) -> Result<Connection, LexicalIndexError> {
+    async fn connection(&self) -> Result<Connection, RiftError> {
         self.database.connection().await
     }
 }
@@ -393,12 +393,12 @@ enum RecordOrder {
 async fn trim(
     transaction: &mut toasty::db::Transaction<'_>,
     retention_records: u64,
-) -> Result<u64, LexicalIndexError> {
+) -> Result<u64, RiftError> {
     let held = LogRecordRow::all()
         .count()
         .exec(&mut *transaction)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let dropped = held.saturating_sub(retention_records);
     if dropped == 0 {
         return Ok(0);
@@ -411,7 +411,7 @@ async fn trim(
         .first()
         .exec(&mut *transaction)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     let Some(threshold) = threshold else {
         return Ok(0);
     };
@@ -420,7 +420,7 @@ async fn trim(
         .delete()
         .exec(transaction)
         .await
-        .map_err(storage_error)?;
+        .map_err(|source| errors::index::lexical_storage().source(source).error())?;
     Ok(dropped)
 }
 

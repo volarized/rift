@@ -5,7 +5,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use rift_core::{ErrorCode, ErrorName, SourceVisibility};
+use rift_core::SourceVisibility;
+#[cfg(test)]
+use rift_core::{ErrorCode, ErrorName};
+use rift_error::errors;
 #[cfg(test)]
 use rift_index::capture_digests_with_languages;
 use rift_index::{
@@ -36,8 +39,8 @@ use rift_search::{
     SearchIndexLimits, StoreRanking, VectorReadiness,
 };
 use rift_server::{
-    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadError, ReadFault,
-    ReadService, StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
+    CalleeRoots, EnginePool, EngineReferences, LspProcessKey, PatternBounds, ReadService,
+    RiftError, StoreAnswer, resolve_engine_references, uses_engine_references, wire_digest,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{
@@ -114,7 +117,7 @@ pub(crate) struct BlockingExecutor {
 impl BlockingExecutor {
     /// Sizes the workspace's pool and queue wait from one accepted
     /// `[server]` table.
-    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Result<Self, ReadError> {
+    pub(crate) fn for_configuration(server: &ServerConfiguration) -> Result<Self, RiftError> {
         // Acceptance bounds the value to 1..=SERVER_NUM_WORKERS_MAX, so
         // the clamp only guards the usize conversion.
         let workers = usize::try_from(server.num_workers.min(SERVER_NUM_WORKERS_MAX))
@@ -124,7 +127,9 @@ impl BlockingExecutor {
             .num_threads(workers)
             .thread_name(|index| format!("rift-index-{index}"))
             .build()
-            .map_err(|error| ReadFault::task("index worker pool", error.to_string()))?;
+            .map_err(|error| {
+                errors::server::read_task().operation("index worker pool").detail(error.to_string()).error()
+            })?;
         Ok(Self {
             operations: Arc::new(Semaphore::new(workers)),
             queue_timeout_ms: server.worker_queue_timeout.milliseconds(),
@@ -165,8 +170,8 @@ impl BlockingExecutor {
     pub(crate) async fn run<Output>(
         &self,
         operation: &'static str,
-        work: impl FnOnce() -> Result<Output, ReadError> + Send + 'static,
-    ) -> Result<Output, ReadError>
+        work: impl FnOnce() -> Result<Output, RiftError> + Send + 'static,
+    ) -> Result<Output, RiftError>
     where
         Output: Send + 'static,
     {
@@ -180,8 +185,8 @@ impl BlockingExecutor {
         &self,
         operation: &'static str,
         cancellation: CancellationToken,
-        work: impl FnOnce(&CancellationToken) -> Result<Output, ReadError> + Send + 'static,
-    ) -> Result<Output, ReadError>
+        work: impl FnOnce(&CancellationToken) -> Result<Output, RiftError> + Send + 'static,
+    ) -> Result<Output, RiftError>
     where
         Output: Send + 'static,
     {
@@ -192,11 +197,11 @@ impl BlockingExecutor {
         let permit_result = async {
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => Err(ReadFault::cancelled()),
+                () = cancellation.cancelled() => errors::server::read_cancelled().fail(),
                 result = tokio::time::timeout(Duration::from_millis(queue_timeout_ms), acquire) => {
                     result
-                        .map_err(|_| ReadFault::capacity_timeout(operation, queue_timeout_ms))?
-                        .map_err(|error| ReadFault::task(operation, error.to_string()))
+                        .map_err(|_| errors::server::read_capacity_timeout().operation(operation).timeout_ms(queue_timeout_ms).error())?
+                        .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())
                 }
             }
         }
@@ -209,7 +214,7 @@ impl BlockingExecutor {
         let permit = permit_result?;
         if cancellation.is_cancelled() {
             drop(permit);
-            return Err(ReadFault::cancelled());
+            return errors::server::read_cancelled().fail();
         }
         let rayon_pool = Arc::clone(&self.rayon_pool);
         async move {
@@ -233,7 +238,7 @@ impl BlockingExecutor {
             operation = "worker.run"
         ))
         .await
-        .map_err(|error| ReadFault::task(operation, error.to_string()))?
+        .map_err(|error| errors::server::read_task().operation(operation).detail(error.to_string()).error())?
     }
 }
 
@@ -256,9 +261,10 @@ impl BlockingExecutor {
 /// and why it refuses `..` in every address below the root.
 ///
 /// [`ProjectPath`]: rift_protocol::path::ProjectPath
-fn absolute_root(root: &Path) -> Result<PathBuf, ReadError> {
-    let absolute = std::path::absolute(root)
-        .map_err(|error| ReadFault::task("workspace root resolution", error.to_string()))?;
+fn absolute_root(root: &Path) -> Result<PathBuf, RiftError> {
+    let absolute = std::path::absolute(root).map_err(|error| {
+        errors::server::read_task().operation("workspace root resolution").detail(error.to_string()).error()
+    })?;
     let mut segments: Vec<Component<'_>> = Vec::new();
     for component in absolute.components() {
         match component {
@@ -961,10 +967,7 @@ fn finish_reconciliation(
             spent.capture_elapsed,
         );
     }
-    Err(ReadFault::unavailable(
-        "current workspace read",
-        "workspace changed across bounded reconciliation attempts",
-    )
+    Err(errors::server::read_unavailable().operation("current workspace read").detail("workspace changed across bounded reconciliation attempts").error()
     .tool_error(phase))
 }
 
@@ -1037,7 +1040,7 @@ pub(crate) fn moved_paths(changes: &PathChanges) -> Option<String> {
 
 /// The request-time capture a test forces in place of reading the tree.
 #[cfg(test)]
-type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+type ForcedTreeCapture = dyn Fn(&PublishedWorkspace) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
     + Send
     + Sync;
 
@@ -1083,7 +1086,7 @@ impl RiftMcp {
     pub(crate) async fn build_settled(
         root: &Path,
         limits: WorkspaceIndexLimits,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self::assemble_settled(
             absolute_root(root)?,
             limits,
@@ -1104,7 +1107,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self::assemble_settled(
             absolute_root(root)?,
             limits,
@@ -1134,7 +1137,7 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         history_gate: Option<AnalysisGate>,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         let assembled = Self::assemble(
             root,
             limits,
@@ -1154,7 +1157,7 @@ impl RiftMcp {
         &self,
         capture: impl Fn(
             &PublishedWorkspace,
-        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
         + Send
         + Sync
         + 'static,
@@ -1169,7 +1172,7 @@ impl RiftMcp {
         delay: Duration,
         capture: impl Fn(
             &PublishedWorkspace,
-        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError>
+        ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError>
         + Send
         + Sync
         + 'static,
@@ -1231,7 +1234,7 @@ struct RecordedRebuildFailure {
     epoch: u64,
     /// The filesystem epoch the tree is at now.
     observed_epoch: u64,
-    error: Arc<ReadError>,
+    error: Arc<RiftError>,
 }
 
 impl RecordedRebuildFailure {
@@ -1720,7 +1723,7 @@ impl RiftMcp {
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] when the root, configuration bounds, or runtime cannot be opened.
+    /// Returns [`RiftError`] when the root, configuration bounds, or runtime cannot be opened.
     /// Discovery and analysis failures are recorded by the background supervisor.
     ///
     /// # Cancel safety
@@ -1730,7 +1733,7 @@ impl RiftMcp {
     ///
     /// The server names itself as [`BuildCheckout::Unversioned`]: no binary's
     /// build script recorded a checkout for a server built in-process.
-    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, ReadError> {
+    pub async fn build(root: &Path, limits: WorkspaceIndexLimits) -> Result<Self, RiftError> {
         Self::build_at(
             absolute_root(root)?,
             limits,
@@ -1747,7 +1750,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         Self::build_at(absolute_root(root)?, limits, Some(storage), checkout).await
     }
 
@@ -1758,7 +1761,7 @@ impl RiftMcp {
         storage: WorkspaceStorage,
         checkout: BuildCheckout,
         blocking: BlockingExecutor,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let assembled = Self::assemble_with_executor(
             absolute_root(root)?,
             limits,
@@ -1783,11 +1786,13 @@ impl RiftMcp {
     }
 
     /// Accepts startup configuration without blocking the serving runtime.
-    async fn startup_configuration(root: &Path) -> Result<ConfigurationState, ReadError> {
+    async fn startup_configuration(root: &Path) -> Result<ConfigurationState, RiftError> {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || ConfigurationState::accept(&root))
             .await
-            .map_err(|error| ReadFault::task("configuration acceptance", error.to_string()))
+            .map_err(|error| {
+                errors::server::read_task().operation("configuration acceptance").detail(error.to_string()).error()
+            })
     }
 
     /// Builds from one resolved root and its process-owned storage.
@@ -1796,7 +1801,7 @@ impl RiftMcp {
         limits: WorkspaceIndexLimits,
         storage: Option<WorkspaceStorage>,
         checkout: BuildCheckout,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let assembled = Self::assemble(
             root,
             limits,
@@ -1831,7 +1836,7 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         history_gate: Option<AnalysisGate>,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         Self::assemble_with_executor(
             root,
             limits,
@@ -1863,10 +1868,12 @@ impl RiftMcp {
             Arc<str>,
         ) -> LexicalLane,
         options: AssembleOptions,
-    ) -> Result<AssembledServer, ReadError> {
+    ) -> Result<AssembledServer, RiftError> {
         let identity = crate::identity::product_identity(options.checkout)
             .await
-            .map_err(|error| ReadFault::task("product identity", error.to_string()))?;
+            .map_err(|error| {
+                errors::server::read_task().operation("product identity").detail(error.to_string()).error()
+            })?;
         let analyzer_revision: Arc<str> = Arc::from(rift_analysis::analyzer_digest());
         let startup_configuration = Self::startup_configuration(&root).await?;
         let blocking = match options.blocking {
@@ -1982,7 +1989,7 @@ impl RiftMcp {
         configuration: &ConfigurationState,
         validation: &IndexValidation,
         blocking: &BlockingExecutor,
-    ) -> Result<Arc<PublishedWorkspace>, ReadError> {
+    ) -> Result<Arc<PublishedWorkspace>, RiftError> {
         let root = root.to_path_buf();
         let configuration = configuration.clone();
         let epoch = validation.observed_epoch();
@@ -2017,7 +2024,7 @@ impl RiftMcp {
         validation: &Arc<IndexValidation>,
         blocking: &BlockingExecutor,
         watch: impl WatchWorkspace,
-    ) -> Result<notify::RecommendedWatcher, ReadError> {
+    ) -> Result<notify::RecommendedWatcher, RiftError> {
         let watch_root = root.to_path_buf();
         let watch_validation = Arc::clone(validation);
         blocking
@@ -2373,7 +2380,7 @@ impl RiftMcp {
         )
         .await
         .map_err(|_| {
-            ReadFault::unavailable("engine references", "request deadline exceeded")
+            errors::server::read_unavailable().operation("engine references").detail("request deadline exceeded").error()
                 .tool_error(wire::ErrorPhase::Read)
         })??;
         let callee_warnings = self
@@ -2605,10 +2612,7 @@ impl RiftMcp {
                 ranking = self.ranking(params, &resolved.published).await?;
             }
         }
-        Err(ReadFault::unavailable(
-            "engine references",
-            "source or configuration kept changing during the bounded reference reads",
-        )
+        Err(errors::server::read_unavailable().operation("engine references").detail("source or configuration kept changing during the bounded reference reads").error()
         .tool_error(wire::ErrorPhase::Read))
     }
 
@@ -3042,13 +3046,8 @@ impl RiftMcp {
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
         let preparation = resolved.published.preparation.as_ref();
-        let path = rift_core::ProjectPath::new(params.path.0.clone()).map_err(|error| {
-            ReadError::from(ReadFault::Invalid {
-                field: "path",
-                violation: rift_core::fault_label(&error.fault().violation()),
-            })
-            .tool_error(wire::ErrorPhase::Read)
-        })?;
+        let path = rift_core::ProjectPath::new(params.path.0.clone())
+            .map_err(|error| error.tool_error(wire::ErrorPhase::Read))?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
             return Ok(Json(nodes_preparing_answer(&resolved)));
         }
@@ -3081,7 +3080,7 @@ impl RiftMcp {
     async fn read_at<Answer>(
         &self,
         rev: Option<rift_protocol::read::RevisionId>,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
     ) -> Result<Json<Answer>, ErrorData>
     where
         Answer: ReadAnswer + Send + 'static,
@@ -3133,9 +3132,7 @@ impl RiftMcp {
     fn revision_read(&self, published: &PublishedWorkspace) -> Result<RevisionRead, ErrorData> {
         let configuration = published.configuration.accepted(wire::ErrorPhase::Read)?;
         if !configuration.providers.history.enabled {
-            return Err(ReadError::from(ReadFault::Unsupported {
-                capability: "revision reads (providers.history disabled)".to_owned(),
-            })
+            return Err(errors::server::read_unsupported().capability("revision reads (providers.history disabled)").error()
             .tool_error(wire::ErrorPhase::Read));
         }
         Ok(RevisionRead {
@@ -3161,7 +3158,7 @@ impl RiftMcp {
         &self,
         resolved: &ResolvedWorkspace,
         include_local_preparation: bool,
-        operation: impl FnOnce(&ReadService) -> Result<Answer, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<Answer, RiftError> + Send + 'static,
     ) -> Result<Json<Answer>, ErrorData>
     where
         Answer: ReadAnswer + Send + 'static,
@@ -3200,7 +3197,7 @@ impl RiftMcp {
         &self,
         resolved: &ResolvedWorkspace,
         deadline: RequestDeadline,
-        operation: impl FnOnce(&ReadService) -> Result<NodesResult, ReadError> + Send + 'static,
+        operation: impl FnOnce(&ReadService) -> Result<NodesResult, RiftError> + Send + 'static,
     ) -> Result<Json<NodesResult>, ErrorData> {
         resolved
             .published
@@ -3214,7 +3211,7 @@ impl RiftMcp {
             cancellation,
             move |cancellation| {
                 if cancellation.is_cancelled() {
-                    return Err(ReadFault::cancelled());
+                    return errors::server::read_cancelled().fail();
                 }
                 operation(&reads)
             },
@@ -3255,7 +3252,10 @@ impl RiftMcp {
                 detail = detail.as_str(),
                 "a request spent its whole readiness budget"
             );
-            return Err(ReadFault::unavailable("current workspace read", detail).tool_error(phase));
+            return Err(
+                errors::server::read_unavailable().operation("current workspace read").detail(detail).error()
+                    .tool_error(phase),
+            );
         };
         result
     }
@@ -3482,7 +3482,7 @@ impl RiftMcp {
         phase: wire::ErrorPhase,
     ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ErrorData> {
         self.capture_tree(current).await.map_err(|error| {
-            if error.descriptor().name() != ErrorName::Wire(ErrorCode::Cancelled) {
+            if error.slug() != errors::server::read_cancelled::SLUG {
                 let _ = self.validation.observe_whole_workspace();
             }
             error.tool_error(phase)
@@ -3582,7 +3582,7 @@ impl RiftMcp {
     async fn capture_tree(
         &self,
         current: &Arc<PublishedWorkspace>,
-    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError> {
         #[cfg(test)]
         if let Some((forced, delay)) = self.forced_capture.installed() {
             if !delay.is_zero() {
@@ -3615,8 +3615,7 @@ impl RiftMcp {
                     &languages,
                     &last,
                     &|| cancellation.is_cancelled(),
-                )
-                .map_err(|error| ReadError::from(ReadFault::Index(error)))?;
+                )?;
                 *last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -3641,7 +3640,7 @@ impl RiftMcp {
     async fn capture_prepared_tree(
         &self,
         current: &Arc<PublishedWorkspace>,
-    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), ReadError> {
+    ) -> Result<(WorkspaceDigests, ConfigurationFingerprint), RiftError> {
         let published = Arc::clone(current);
         let root = self.root.clone();
         let last_capture = Arc::clone(&self.last_capture);
@@ -3698,10 +3697,7 @@ impl RiftMcp {
             let (current, failure) = state.snapshot();
             drop(state);
             if self.validation.watch_failed.load(Ordering::Acquire) {
-                return Err(ReadFault::unavailable(
-                    "current workspace read",
-                    "filesystem watcher failed",
-                )
+                return Err(errors::server::read_unavailable().operation("current workspace read").detail("filesystem watcher failed").error()
                 .tool_error(phase));
             }
             if current.epoch == observed_epoch {
@@ -3711,17 +3707,14 @@ impl RiftMcp {
             // meet again, so waiting for them spends the whole readiness budget to reach
             // the same refusal, once per request, forever.
             if !self.validation.supervisor_running.load(Ordering::Acquire) {
-                return Err(ReadFault::unavailable(
-                    "current workspace read",
-                    format!(
+                return Err(errors::server::read_unavailable().operation("current workspace read").detail(format!(
                         "the index supervisor stopped, so the index stays {behind} filesystem \
                          events behind the tree (published epoch {published}, observed epoch \
                          {observed_epoch}); restart the workspace server, and read \
                          rift://logs for what it did before it stopped",
                         behind = observed_epoch.saturating_sub(current.epoch),
                         published = current.epoch,
-                    ),
-                )
+                    )).error()
                 .tool_error(phase));
             }
             if let Some((failed_epoch, error)) = failure
@@ -3859,21 +3852,13 @@ impl RiftMcp {
     async fn ensure_workspace_root(&self) -> Result<(), ErrorData> {
         match tokio::fs::metadata(&self.root).await {
             Ok(metadata) if metadata.is_dir() => Ok(()),
-            Ok(_) => Err(ReadError::from(ReadFault::NotFound {
-                path: self.root.display().to_string(),
-            })
-            .tool_error(wire::ErrorPhase::Read)),
+            Ok(_) => Err(errors::server::read_not_found().path(self.root.display()).error()
+                .tool_error(wire::ErrorPhase::Read)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(ReadError::from(ReadFault::NotFound {
-                    path: self.root.display().to_string(),
-                })
-                .tool_error(wire::ErrorPhase::Read))
+                Err(errors::server::read_not_found().path(self.root.display()).error()
+                    .tool_error(wire::ErrorPhase::Read))
             }
-            Err(error) => Err(ReadError::from(ReadFault::Storage {
-                path: self.root.display().to_string(),
-                operation: "read workspace root",
-                io: error.to_string(),
-            })
+            Err(error) => Err(errors::server::read_storage().path(self.root.display()).operation("read workspace root").io(&error).error()
             .tool_error(wire::ErrorPhase::Read)),
         }
     }
@@ -4539,7 +4524,7 @@ done
     };
     use rift_ranking::{RankingInputKind, RankingWeights};
     use rift_search::{ModelSource, RevisionScoped, VectorReadiness};
-    use rift_server::{LspProcessKey, ReadError, ReadFault, StoreAnswer};
+    use rift_server::{LspProcessKey, RiftError, StoreAnswer};
 
     use rmcp::ServiceError;
     use rmcp::ServiceExt as _;
@@ -5913,7 +5898,7 @@ done
             })
             .await
             .expect_err("pre-cancelled work must not dispatch");
-        assert!(matches!(error.fault(), ReadFault::Cancelled));
+        assert_eq!(error.slug(), errors::server::read_cancelled::SLUG);
         assert!(!started.load(Ordering::SeqCst));
         executor
             .run("operation after cancellation", || Ok(()))
@@ -5972,7 +5957,7 @@ done
             .await
             .expect("cancelled queued task must join")
             .expect_err("cancelled queue wait must fail");
-        assert!(matches!(error.fault(), ReadFault::Cancelled));
+        assert_eq!(error.slug(), errors::server::read_cancelled::SLUG);
         assert!(!started.load(Ordering::SeqCst));
 
         release_sender
@@ -6024,17 +6009,13 @@ done
             .await
             .expect("queued task must join")
             .expect_err("queue wait beyond timeout must fail");
-        assert!(matches!(
-            error.fault(),
-            ReadFault::CapacityTimeout {
-                operation: "queued operation",
-                timeout_ms: QUEUE_TIMEOUT_MS,
-            }
-        ));
-        assert_eq!(error.descriptor().code(), "temporarily_unavailable");
-        let context = error.context();
-        assert_eq!(context[0].value(), "queued operation");
-        assert_eq!(context[1].value(), QUEUE_TIMEOUT_MS.to_string());
+        assert_eq!(error.slug(), errors::server::read_capacity_timeout::SLUG);
+        assert!(error
+            .context()
+            .any(|(key, value)| key == "operation" && value == "queued operation"));
+        assert!(error.context().any(|(key, value)| {
+            key == "timeout_ms" && value == QUEUE_TIMEOUT_MS.to_string()
+        }));
 
         release_sender
             .send(())
@@ -6052,14 +6033,14 @@ done
     async fn blocking_executor_preserves_work_error() {
         let executor = BlockingExecutor::isolated(1, 1_000);
         let error = executor
-            .run("refused operation", || -> Result<(), ReadError> {
-                Err(ReadError::from(ReadFault::Unsupported {
-                    capability: "probe".to_owned(),
-                }))
+            .run("refused operation", || {
+                errors::server::read_unsupported()
+                    .capability("probe")
+                    .fail()
             })
             .await
             .expect_err("work refusal must survive blocking executor");
-        assert!(matches!(error.fault(), ReadFault::Unsupported { .. }));
+        assert_eq!(error.slug(), errors::server::read_unsupported::SLUG);
     }
 
     #[tokio::test]
@@ -6106,15 +6087,17 @@ done
         let error = executor
             .run(
                 "panicking operation",
-                || -> Result<(), rift_server::ReadError> { panic!("test blocking worker panic") },
+                || -> Result<(), rift_server::RiftError> { panic!("test blocking worker panic") },
             )
             .await
             .expect_err("worker panic must become task failure");
-        let ReadFault::Task { operation, detail } = error.fault() else {
-            panic!("worker panic must classify as task failure: {error:?}");
-        };
-        assert_eq!(*operation, "panicking operation");
-        assert!(detail.contains("panic"), "{detail}");
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
+        assert!(error.context().any(|(key, value)| {
+            key == "operation" && value == "panicking operation"
+        }));
+        assert!(error
+            .context()
+            .any(|(key, value)| key == "detail" && value.contains("panic")));
         executor
             .run("operation after panic", || Ok(()))
             .await
@@ -6129,7 +6112,7 @@ done
             .run("closed queue operation", || Ok(()))
             .await
             .expect_err("closed semaphore must fail acceptance");
-        assert!(matches!(error.fault(), ReadFault::Task { .. }));
+        assert_eq!(error.slug(), errors::server::read_task::SLUG);
     }
 
     #[tokio::test]
@@ -6989,7 +6972,7 @@ done
                 &published,
                 &validation,
                 epoch,
-                ReadFault::unavailable("test rebuild", "injected failure"),
+                errors::server::read_unavailable().operation("test rebuild").detail("injected failure").error(),
             )
         })
         .await?;
@@ -7509,7 +7492,7 @@ done
     fn captured_tree(
         root: &std::path::Path,
         current: &super::PublishedWorkspace,
-    ) -> Result<(super::WorkspaceDigests, super::ConfigurationFingerprint), super::ReadError> {
+    ) -> Result<(super::WorkspaceDigests, super::ConfigurationFingerprint), super::RiftError> {
         let limits = current
             .configuration
             .index_limits(WorkspaceIndexLimits::default())?;
@@ -7523,8 +7506,7 @@ done
             &text_inclusion,
             &languages,
             &super::LastCapture::default(),
-        )
-        .map_err(|error| super::ReadError::from(ReadFault::Index(error)))?;
+        )?;
         Ok((digests, super::configuration_fingerprint(root)))
     }
 
@@ -7650,10 +7632,7 @@ done
     async fn a_read_whose_capture_fails_refuses() -> TestResult {
         let (_directory, server) = fixture().await?;
         server.force_capture(|_current| {
-            Err(ReadFault::unavailable(
-                "test capture",
-                "injected capture failure",
-            ))
+            errors::server::read_unavailable().operation("test capture").detail("injected capture failure").fail()
         });
 
         let refusal = tokio::time::timeout(RECONCILED_READ_MAX, get_symbol(&server, "beacon"))

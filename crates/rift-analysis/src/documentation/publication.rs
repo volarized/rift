@@ -14,9 +14,10 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{Digest, SymbolId, TextRange};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::identity::{is_digest, is_revision_digest};
 use super::input::{source_selection_digest, validate_identity, validate_source_metadata};
+use rift_error::RiftError;
 
 /// Validates one read payload without requiring its remote revision to equal this build.
 ///
@@ -27,7 +28,7 @@ use super::input::{source_selection_digest, validate_identity, validate_source_m
 /// Refuses source, block, identity, range, digest, and count violations.
 pub fn validate_documentation_hit(
     hit: &rift_protocol::documentation::DocumentationHit,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     if !is_revision_digest(&hit.documentation_revision) || hit.block.source != hit.source.identity {
         return Err(refused(DocumentationViolation::Identity, "documentation"));
     }
@@ -43,7 +44,7 @@ pub fn validate_documentation_hit(
 pub fn validate_documentation_context(
     context: &rift_protocol::documentation::DocumentationContext,
     symbol: &SymbolId,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     use rift_protocol::documentation::{
         DOCUMENTATION_EXCERPT_BYTES_MAX, DOCUMENTATION_SYMBOL_REFERENCES_MAX,
     };
@@ -133,7 +134,7 @@ impl DocumentationCollection {
         documentation_revision: Digest,
         mut sources: Vec<DocumentationSource>,
         mut blocks: Vec<DocumentationBlock>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if sources.len() > DOCUMENTATION_SOURCES_MAX as usize
             || blocks.len() > DOCUMENTATION_BLOCKS_MAX as usize
         {
@@ -180,7 +181,7 @@ impl DocumentationCollection {
     /// # Errors
     ///
     /// Returns a typed refusal for invalid identities, ranges, ordering, or relationships.
-    pub fn new(index: DocumentationIndex) -> Result<Self, DocumentationError> {
+    pub fn new(index: DocumentationIndex) -> Result<Self, RiftError> {
         validate_counts(&index)?;
         if index.documentation_revision != super::documentation_revision() {
             return Err(refused(
@@ -268,7 +269,7 @@ impl DocumentationCollection {
     pub fn with_source_omissions(
         self,
         omissions: Vec<(DocumentationContentIdentity, DocumentationWarningKind)>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if omissions.len() > DOCUMENTATION_SOURCES_MAX as usize {
             return Err(refused(DocumentationViolation::LimitExceeded, "sources"));
         }
@@ -553,7 +554,7 @@ fn link_address(link: &DocumentationLink) -> LinkAddress {
     (link.block.clone(), link.range.start, link.range.end)
 }
 
-fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError> {
+fn validate_counts(index: &DocumentationIndex) -> Result<(), RiftError> {
     let counts = [
         ("sources", index.sources.len(), DOCUMENTATION_SOURCES_MAX),
         ("blocks", index.blocks.len(), DOCUMENTATION_BLOCKS_MAX),
@@ -602,7 +603,7 @@ fn validate_counts(index: &DocumentationIndex) -> Result<(), DocumentationError>
 
 fn validate_sources(
     index: &DocumentationIndex,
-) -> Result<BTreeMap<&DocumentationContentIdentity, &DocumentationSource>, DocumentationError> {
+) -> Result<BTreeMap<&DocumentationContentIdentity, &DocumentationSource>, RiftError> {
     let mut sources = BTreeMap::new();
     let mut previous = None;
     let mut total_bytes = 0_u64;
@@ -624,7 +625,7 @@ fn validate_sources(
 fn validate_blocks<'index>(
     index: &'index DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
-) -> Result<BTreeMap<&'index DocumentationDigest, &'index DocumentationBlock>, DocumentationError> {
+) -> Result<BTreeMap<&'index DocumentationDigest, &'index DocumentationBlock>, RiftError> {
     let mut blocks = BTreeMap::new();
     let mut previous = None;
     for block in &index.blocks {
@@ -652,7 +653,7 @@ fn validate_blocks<'index>(
 fn validate_block(
     block: &DocumentationBlock,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let range_valid = block.range.end > block.range.start && block.range.end <= source.byte_length;
     let line_valid = block.line > 0 && block.line <= source.byte_length;
     if !range_valid || !line_valid {
@@ -688,7 +689,7 @@ fn valid_symbol_identity(symbol: &SymbolId) -> bool {
     rift_core::parse_symbol_identity(&symbol.0).is_ok()
 }
 
-fn validate_headings(block: &DocumentationBlock) -> Result<(), DocumentationError> {
+fn validate_headings(block: &DocumentationBlock) -> Result<(), RiftError> {
     if block.heading_path.len() > DOCUMENTATION_HEADING_DEPTH_MAX as usize {
         return Err(refused(
             DocumentationViolation::LimitExceeded,
@@ -710,7 +711,7 @@ fn validate_headings(block: &DocumentationBlock) -> Result<(), DocumentationErro
 fn validate_chunks(
     block: &DocumentationBlock,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     if block.chunks.len() > DOCUMENTATION_BLOCKS_MAX as usize {
         return Err(refused(DocumentationViolation::LimitExceeded, "chunks"));
     }
@@ -747,7 +748,7 @@ fn validate_links(
     index: &DocumentationIndex,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let mut addresses = BTreeSet::new();
     for link in &index.links {
         let block = blocks
@@ -770,7 +771,7 @@ fn validate_link_target(
     target: &DocumentationTarget,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     match target {
         DocumentationTarget::Block { identity } => {
             if blocks.contains_key(identity) {
@@ -813,7 +814,7 @@ fn validate_warnings(
     warnings: &[DocumentationWarning],
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     complete: bool,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let mut prior = Vec::new();
     for warning in warnings {
         validate_identity(&warning.source)?;
@@ -844,7 +845,7 @@ fn validate_warnings(
 fn validate_references(
     index: &DocumentationIndex,
     blocks: &BTreeMap<&DocumentationDigest, &DocumentationBlock>,
-) -> Result<BTreeMap<SymbolId, Vec<usize>>, DocumentationError> {
+) -> Result<BTreeMap<SymbolId, Vec<usize>>, RiftError> {
     let mut identities = BTreeSet::new();
     let mut reverse: BTreeMap<SymbolId, Vec<usize>> = BTreeMap::new();
     let mut previous = None;
@@ -992,7 +993,10 @@ mod tests {
 
     fn refused_field(candidate: DocumentationIndex, expected: &str) {
         let error = DocumentationCollection::new(candidate).expect_err("invalid candidate");
-        assert_eq!(error.fault().field(), expected);
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -1006,40 +1010,36 @@ mod tests {
         let mut missing_link_block = candidate.clone();
         missing_link_block.links[0].block = content_digest(b"missing");
         assert_eq!(
-            DocumentationCollection::new(missing_link_block)
-                .expect_err("missing link block")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(missing_link_block).expect_err("missing link block")
+            ),
             DocumentationViolation::MissingTarget
         );
 
         let mut invalid_source = candidate.clone();
         invalid_source.sources[0].origin.location = None;
         assert_eq!(
-            DocumentationCollection::new(invalid_source)
-                .expect_err("invalid source origin")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(invalid_source).expect_err("invalid source origin")
+            ),
             DocumentationViolation::Origin
         );
 
         let mut bad_selection = candidate.clone();
         bad_selection.selection_digest = content_digest(b"other selection");
         assert_eq!(
-            DocumentationCollection::new(bad_selection)
-                .expect_err("mismatched selection")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(bad_selection).expect_err("mismatched selection")
+            ),
             DocumentationViolation::Digest
         );
 
         let mut bad_revision = candidate.clone();
         bad_revision.documentation_revision = Digest("invalid".to_owned());
         assert_eq!(
-            DocumentationCollection::new(bad_revision)
-                .expect_err("stale revision")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(bad_revision).expect_err("stale revision")
+            ),
             DocumentationViolation::Revision
         );
     }
@@ -1059,7 +1059,10 @@ mod tests {
                 count: 0,
             });
         match DocumentationCollection::new(candidate) {
-            Err(error) => assert_eq!(error.fault().violation(), DocumentationViolation::Range),
+            Err(error) => assert_eq!(
+                crate::documentation::failure::violation(&error),
+                DocumentationViolation::Range
+            ),
             Ok(replacement) => active = replacement,
         }
         assert_eq!(active.index(), &prior);
@@ -1089,10 +1092,9 @@ mod tests {
 
         candidate.references[0].target = SymbolId("invalid".to_owned());
         assert_eq!(
-            DocumentationCollection::new(candidate)
-                .expect_err("invalid symbol")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(candidate).expect_err("invalid symbol")
+            ),
             DocumentationViolation::Identity
         );
     }
@@ -1132,10 +1134,9 @@ mod tests {
             },
         };
         assert_eq!(
-            DocumentationCollection::new(invalid_target)
-                .expect_err("invalid symbol target")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(invalid_target).expect_err("invalid symbol target")
+            ),
             DocumentationViolation::Identity
         );
 
@@ -1143,10 +1144,9 @@ mod tests {
         let warning = duplicate_warning.warnings[0].clone();
         duplicate_warning.warnings.push(warning);
         assert_eq!(
-            DocumentationCollection::new(duplicate_warning)
-                .expect_err("duplicate warning")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(duplicate_warning).expect_err("duplicate warning")
+            ),
             DocumentationViolation::Identity
         );
     }
@@ -1202,10 +1202,9 @@ mod tests {
         }
         let candidate = index(sources);
         assert_eq!(
-            DocumentationCollection::new(candidate)
-                .expect_err("aggregate bytes over bound")
-                .fault()
-                .violation(),
+            crate::documentation::failure::violation(
+                &DocumentationCollection::new(candidate).expect_err("aggregate bytes over bound")
+            ),
             DocumentationViolation::LimitExceeded
         );
     }

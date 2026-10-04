@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
+use rift_error::errors;
 use rift_protocol::read::{CommitAuthor, SymbolVersionKind};
 
 use crate::lock::{LIVE_LOCK_ATTEMPTS_MAX, lock_live_checked};
 use crate::{
     ChangedPath, CommitRecord, DeclarationChange, HistoryStore, MovedDeclaration, RenamedPath,
-    STORE_FOLDER_NAME, StoreFault, StoreLocation,
+    STORE_FOLDER_NAME, StoreLocation,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -208,7 +209,7 @@ fn a_delete_without_the_index_command_fails_the_integrity_check() -> TestResult 
     let refused = filler
         .check_message_index()
         .expect_err("the index names a row the table no longer holds");
-    assert!(matches!(refused.fault(), StoreFault::Database { .. }));
+    assert_eq!(refused.slug(), errors::history_store::database::SLUG);
     Ok(())
 }
 
@@ -289,19 +290,23 @@ fn an_opener_refuses_a_lock_file_replaced_on_every_attempt() -> TestResult {
     .expect_err("the path never names the locked file");
 
     assert_eq!(attempts, LIVE_LOCK_ATTEMPTS_MAX);
-    assert!(matches!(
-        refused.fault(),
-        StoreFault::LockUnstable { attempts, .. } if *attempts == LIVE_LOCK_ATTEMPTS_MAX
-    ));
-    assert!(refused.fault().folder_cause().is_none());
+    assert_eq!(refused.slug(), errors::history_store::lock_unstable::SLUG);
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| key == "attempts" && value == LIVE_LOCK_ATTEMPTS_MAX.to_string())
+    );
     assert!(
         std::error::Error::source(&refused).is_none(),
         "no filesystem call failed, so no cause rides the chain"
     );
     let rendered = refused.to_string();
-    assert!(rendered.contains("lock live store"), "{rendered}");
     assert!(
-        rendered.contains(&format!("attempts {LIVE_LOCK_ATTEMPTS_MAX}")),
+        rendered.contains("history store live lock changed"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("during {LIVE_LOCK_ATTEMPTS_MAX} attempts")),
         "{rendered}"
     );
     Ok(())
@@ -317,9 +322,8 @@ fn a_read_only_common_git_directory_refuses_the_folder_without_a_fallback() -> T
     std::fs::set_permissions(folder.path(), std::fs::Permissions::from_mode(0o755))?;
 
     let refused = opened.expect_err("the folder refuses the store");
-    let cause = refused
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(&refused)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     Ok(())
@@ -345,10 +349,8 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree() -> TestRes
         .worktree_fallback()
         .ok_or("the store names the refusal")?;
     assert_eq!(fallback.refused(), git.join(STORE_FOLDER_NAME));
-    let cause = fallback
-        .cause()
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(fallback.cause())
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(store.location().folder(), worktree_state);
@@ -377,9 +379,8 @@ fn a_folder_refusal_other_than_access_keeps_the_refusal_without_a_fallback() -> 
 
     let refused = HistoryStore::open(&location).expect_err("no folder is created below a file");
 
-    let cause = refused
-        .fault()
-        .folder_cause()
+    let cause = std::error::Error::source(&refused)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
         .ok_or("the refusal is the folder's")?;
     assert_ne!(cause.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
@@ -408,7 +409,7 @@ fn sweep_reports_a_live_lock_it_cannot_open_and_sweeps_the_rest() -> TestResult 
     let [failure] = swept.failures() else {
         panic!("one lock the sweep cannot open: {:?}", swept.failures());
     };
-    assert!(failure.fault().folder_cause().is_some());
+    assert!(std::error::Error::source(failure).is_some());
     let rendered = failure.to_string();
     assert!(rendered.contains("open swept live lock"), "{rendered}");
     assert!(rendered.contains("store-zz.live.lock"), "{rendered}");
@@ -430,7 +431,7 @@ fn sweep_reports_a_file_it_cannot_delete_and_keeps_the_revisions_live_lock() -> 
     assert!(swept.deleted().is_empty());
     assert_eq!(swept.failures().len(), 1, "one refused deletion");
     let failure = &swept.failures()[0];
-    assert!(failure.fault().folder_cause().is_some());
+    assert!(std::error::Error::source(failure).is_some());
     let rendered = failure.to_string();
     assert!(rendered.contains("delete swept store file"), "{rendered}");
     assert!(

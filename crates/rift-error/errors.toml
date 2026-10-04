@@ -1,0 +1,1455 @@
+[registry]
+namespace = "rift"
+schema = 1
+
+[error.ranking.query_empty]
+message = "query is empty"
+action = "provide query text and resend the request"
+fields = { subject = { type = "string", optional = true } }
+
+[error.ranking.query_length]
+message = "query exceeds its accepted byte limit of {limit} bytes"
+action = "shorten the query below {limit} bytes and resend the request"
+fields = { subject = { type = "string" }, field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.ranking.query_term_length]
+message = "query term exceeds its accepted byte limit of {limit} bytes"
+action = "shorten the query term below {limit} bytes and resend the request"
+fields = { subject = { type = "string" }, field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.ranking.query_quote_unterminated]
+message = "query contains an unclosed quote"
+action = "close every quoted phrase and resend the request"
+fields = { subject = { type = "string", optional = true } }
+
+[error.ranking.query_phrase_limit]
+message = "query contains more quoted phrases than the accepted limit of {limit}"
+action = "reduce quoted phrases to {limit} and resend the request"
+fields = { subject = { type = "string" }, field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.ranking.document_identity_empty]
+message = "document identity is empty"
+action = "report this internal failure with its full context"
+fields = { subject = { type = "string", optional = true } }
+
+[error.ranking.document_field_length]
+message = "document field {subject} exceeds its accepted byte limit of {limit} bytes"
+action = "report this internal failure with its full context"
+fields = { subject = { type = "string" }, field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.ranking.ranking_weights_invalid]
+message = "ranking shares must be finite values from zero to one with a positive sum"
+action = "set finite ranking shares from zero to one with a positive sum, then retry"
+fields = { subject = { type = "string" } }
+
+[error.ranking.fusion_constant_invalid]
+message = "ranking constant is outside its accepted range"
+action = "set the ranking constant within its accepted range, then retry"
+fields = { subject = { type = "string" } }
+
+[error.ranking.capabilities_incompatible]
+message = "index capabilities cannot be combined for ranking"
+action = "report this internal failure with its full context"
+
+[error.ranking.reader_failed]
+message = "search reader failed"
+action = "check filesystem permissions and free space, then retry"
+fields = { subject = { type = "string", optional = true }, source = { type = "error", role = "source" } }
+
+[error.ranking.pattern_syntax]
+message = "pattern syntax is invalid: {subject}"
+action = "correct the pattern syntax and retry"
+fields = { subject = { type = "string" } }
+
+[error.ranking.pattern_size]
+message = "compiled pattern exceeds its accepted size: {subject}"
+action = "reduce the compiled pattern size and retry"
+fields = { subject = { type = "string" } }
+
+[error.core.identity_invalid]
+message = "identity is empty or contains a control character"
+action = "correct the reported field and resend the request"
+
+[error.core.revision_zero]
+message = "revision is zero"
+action = "correct the reported field and resend the request"
+
+[error.core.resolver_id_empty]
+message = "source resolver identity is empty"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.resolver_id_too_long]
+message = "source resolver identity exceeds its accepted byte limit"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.resolver_id_invalid_character]
+message = "source resolver identity is not canonical lowercase syntax"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.path_empty]
+message = "{path_kind} path is empty"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_too_long]
+message = "{path_kind} path exceeds its accepted byte limit"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_absolute]
+message = "{path_kind} path is absolute"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_dot_segment]
+message = "{path_kind} path contains a dot segment"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_empty_segment]
+message = "project path contains an empty segment"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_backslash]
+message = "{path_kind} path contains a backslash"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_control_character]
+message = "{path_kind} path contains a control character"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_non_canonical_unicode]
+message = "project path does not use Unicode NFC"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.path_rift_state]
+message = "project path addresses Rift state"
+action = "use a workspace-relative path with `/` separators and no `.` or `..` components"
+fields = { path_kind = { type = "string" } }
+
+[error.core.contribution_invalid_name]
+message = "contribution field {field} violates rule: portable name is empty, oversized, or contains control text"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_language]
+message = "contribution field {field} violates rule: language identity does not use canonical lowercase syntax"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_kind]
+message = "contribution field {field} violates rule: exact kind does not use provider-kind syntax"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_source_range]
+message = "contribution field {field} violates rule: source range is empty or reversed"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_origin]
+message = "contribution field {field} violates rule: source location and source kind disagree"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_unbound_identity]
+message = "contribution field {field} violates rule: identity anchor has no exact source binding"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_too_many_facts]
+message = "contribution field {field} violates rule: portable facts exceed their count bound"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_too_much_evidence]
+message = "contribution field {field} violates rule: equivalence evidence exceeds its count bound"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_too_many_namespaced_facts]
+message = "contribution field {field} violates rule: provider-specific facts exceed count or byte bound"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_namespace]
+message = "contribution field {field} violates rule: provider-specific fact key is not reverse-domain syntax"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_namespace_version]
+message = "contribution field {field} violates rule: provider-specific fact version is zero"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_reference]
+message = "contribution field {field} violates rule: reference targets are empty, duplicated, or oversized"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_duplicate_fact]
+message = "contribution field {field} violates rule: portable facets contain duplicates"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.contribution_invalid_record]
+message = "contribution field {field} violates rule: normalized record state, identity, or members disagree"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" } }
+
+[error.core.configuration_unreadable]
+message = "workspace configuration could not be read"
+action = "check filesystem permissions and free space, then retry"
+fields = { file = { type = "string" }, path = { type = "string" }, io = { type = "string" } }
+
+[error.core.configuration_is_directory]
+message = "workspace configuration path is a directory"
+action = "correct the reported configuration field, then retry"
+fields = { file = { type = "string" }, path = { type = "string" }, detail = { type = "string" } }
+
+[error.core.configuration_oversized]
+message = "workspace configuration exceeds its accepted byte limit"
+action = "correct the reported configuration field, then retry"
+fields = { file = { type = "string" }, bytes = { type = "unsigned" }, bytes_max = { type = "unsigned" } }
+
+[error.core.configuration_malformed]
+message = "workspace configuration does not match its documented shape"
+action = "correct the reported configuration field, then retry"
+fields = { file = { type = "string" }, key = { type = "string", optional = true }, location = { type = "string", optional = true }, accepted = { type = "string", optional = true }, example = { type = "string", optional = true } }
+
+[error.core.configuration_variable_malformed]
+message = "configuration variable value does not match its documented shape"
+action = "correct the reported configuration field, then retry"
+fields = { variable = { type = "string" }, key = { type = "string" }, accepted = { type = "string", optional = true }, example = { type = "string", optional = true } }
+
+[error.core.configuration_variable_unknown]
+message = "configuration variable names no declared key"
+action = "correct the reported configuration field, then retry"
+fields = { variable = { type = "string" }, accepted = { type = "string" } }
+
+[error.core.configuration_variable_not_unicode]
+message = "configuration variable value is not UTF-8"
+action = "correct the reported configuration field, then retry"
+fields = { variable = { type = "string" }, detail = { type = "string" } }
+
+[error.core.configuration_invalid]
+message = "workspace configuration failed validation"
+action = "correct the reported configuration field, then retry"
+fields = { file = { type = "string", optional = true }, field = { type = "string", optional = true }, value = { type = "string", optional = true }, range = { type = "string", optional = true }, language = { type = "string", optional = true }, lsp = { type = "string", optional = true }, pattern = { type = "string", optional = true }, first = { type = "string", optional = true }, second = { type = "string", optional = true }, name = { type = "string", optional = true }, key = { type = "string", optional = true }, detail = { type = "string", optional = true }, variables = { type = "string", optional = true } }
+
+[error.core.configuration_unit_parse]
+message = "configuration value does not use its required unit form"
+action = "correct the reported configuration field, then retry"
+fields = { value = { type = "string" }, expected = { type = "string" } }
+
+[error.core.configuration_limit_out_of_range]
+message = 'numeric configuration value is outside its documented range'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, value = { type = "string", optional = true }, range = { type = "string", optional = true } }
+
+[error.core.configuration_language_identity_invalid]
+message = 'language table key is not a canonical language identity'
+action = "correct the reported configuration field, then retry"
+fields = { language = { type = "string", optional = true } }
+
+[error.core.configuration_language_lsp_unknown]
+message = 'language names an LSP process that is not declared'
+action = "correct the reported configuration field, then retry"
+fields = { language = { type = "string", optional = true }, lsp = { type = "string", optional = true } }
+
+[error.core.configuration_language_include_duplicate]
+message = 'two language entries use same include pattern'
+action = "correct the reported configuration field, then retry"
+fields = { pattern = { type = "string", optional = true }, first = { type = "string", optional = true }, second = { type = "string", optional = true } }
+
+[error.core.configuration_embedding_model_invalid]
+message = 'embedding model value does not match its configured kind'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, value = { type = "string", optional = true } }
+
+[error.core.configuration_embedding_endpoint_invalid]
+message = 'embedding endpoint is not an accepted URL'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, value = { type = "string", optional = true } }
+
+[error.core.configuration_embedding_identifier_invalid]
+message = 'embedding identifier value is empty or too long'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, value = { type = "string", optional = true } }
+
+[error.core.configuration_search_weights_invalid]
+message = 'search ranking weights are not a usable set'
+action = "correct the reported configuration field, then retry"
+fields = { identifier_weight = { type = "string", optional = true }, lexical_weight = { type = "string", optional = true }, vector_weight = { type = "string", optional = true } }
+
+[error.core.configuration_command_program_empty]
+message = 'configured command has no executable'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true } }
+
+[error.core.configuration_command_program_whitespace]
+message = 'configured command executable contains whitespace'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, program = { type = "string", optional = true } }
+
+[error.core.configuration_command_program_absolute]
+message = 'configured command executable is an absolute path'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, program = { type = "string", optional = true } }
+
+[error.core.configuration_command_program_dot_segment]
+message = 'configured command executable contains a dot segment'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, program = { type = "string", optional = true } }
+
+[error.core.configuration_command_argument_oversized]
+message = 'configured command argument exceeds its byte limit'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, bytes = { type = "string", optional = true }, bytes_max = { type = "string", optional = true } }
+
+[error.core.configuration_command_program_oversized]
+message = 'configured command executable exceeds its byte limit'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, bytes = { type = "string", optional = true }, bytes_max = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_name_invalid]
+message = 'LSP process name is not a lowercase word'
+action = "correct the reported configuration field, then retry"
+fields = { name = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_environment_key_invalid]
+message = 'LSP environment key is empty or contains a forbidden character'
+action = "correct the reported configuration field, then retry"
+fields = { lsp = { type = "string", optional = true }, key = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_initialization_options_not_object]
+message = 'LSP initialization options are not a JSON object'
+action = "correct the reported configuration field, then retry"
+fields = { lsp = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_engine_selection_conflict]
+message = 'LSP table selects command and embedded engines'
+action = "correct the reported configuration field, then retry"
+fields = { lsp = { type = "string", optional = true }, fields = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_engine_missing]
+message = 'LSP table selects no engine'
+action = "correct the reported configuration field, then retry"
+fields = { lsp = { type = "string", optional = true }, fields = { type = "string", optional = true } }
+
+[error.core.configuration_lsp_embedded_extras]
+message = 'embedded LSP engine has a spawned-process setting'
+action = "correct the reported configuration field, then retry"
+fields = { lsp = { type = "string", optional = true }, field = { type = "string", optional = true } }
+
+[error.core.configuration_path_pattern_invalid]
+message = 'configuration path pattern breaks forward-slash path rules'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, pattern = { type = "string", optional = true } }
+
+[error.core.configuration_file_name_invalid]
+message = 'excluded lockfile value is not one file name'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, name = { type = "string", optional = true } }
+
+[error.core.configuration_package_selector_invalid]
+message = 'dependency package has conflicting or missing version selector'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, package = { type = "string", optional = true } }
+
+[error.core.configuration_log_capture_invalid]
+message = 'logs.capture is not a tracing filter directive'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, capture = { type = "string", optional = true }, detail = { type = "string", optional = true } }
+
+[error.core.configuration_port_selection_conflict]
+message = 'server selects port and port range together'
+action = "correct the reported configuration field, then retry"
+fields = { fields = { type = "string", optional = true } }
+
+[error.core.configuration_port_range_inverted]
+message = 'server port range maximum is below minimum'
+action = "correct the reported configuration field, then retry"
+fields = { min = { type = "string", optional = true }, max = { type = "string", optional = true } }
+
+[error.core.configuration_history_cpu_share_invalid]
+message = 'history CPU share is outside its accepted range'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, share = { type = "string", optional = true } }
+
+[error.core.configuration_history_releases_missing]
+message = 'selective history strategy has no release pattern'
+action = "correct the reported configuration field, then retry"
+fields = { fields = { type = "string", optional = true } }
+
+[error.core.configuration_history_releases_outside_selective]
+message = 'history release patterns require selective strategy'
+action = "correct the reported configuration field, then retry"
+fields = { fields = { type = "string", optional = true } }
+
+[error.core.configuration_history_release_pattern_invalid]
+message = 'history release pattern is invalid'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, pattern = { type = "string", optional = true }, detail = { type = "string", optional = true } }
+
+[error.core.source_unit_id_too_long]
+message = "source-unit identity exceeds its protocol byte limit"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.source_unit_id_invalid_address]
+message = "source-unit identity does not use canonical Rift address structure"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.source_unit_id_invalid_resolver]
+message = "source-unit resolver identity is invalid: {cause}"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" }, cause = { type = "rift_error", role = "cause" } }
+
+[error.core.source_unit_id_invalid_encoding]
+message = "source-unit key has malformed percent encoding or invalid UTF-8"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.core.source_unit_id_invalid_key]
+message = "source-unit key breaks source-path rules: {cause}"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" }, cause = { type = "rift_error", role = "cause" } }
+
+[error.core.source_unit_id_non_canonical]
+message = "source-unit address is not in canonical form"
+action = "correct the reported field and resend the request"
+fields = { identity = { type = "string" } }
+
+[error.index.lexical_storage]
+message = "lexical index operation failed"
+action = "check filesystem permissions and free space, then retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.lexical_unit_limit]
+message = "lexical index received more units than its accepted limit of {maximum}"
+action = "reduce indexed units below {maximum} and retry"
+fields = { field = { type = "string" }, observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.index.lexical_unit_too_large]
+message = "document content exceeds its accepted byte limit of {maximum}"
+action = "shorten document content below {maximum} bytes and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string" }, observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.index.lexical_stored_path_invalid]
+message = "stored project path is invalid"
+action = "repair the indexed path and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.lexical_stored_kind_invalid]
+message = "stored document kind is invalid"
+action = "repair the indexed document kind and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.lexical_document_location_unsupported]
+message = "lexical index cannot store this document location"
+action = "store package documents in the global index"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.index.lexical_duplicate_identity]
+message = "lexical index received a repeated document identity"
+action = "send each document identity once and retry"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.index.lexical_record_limit]
+message = "lexical index received more records than its accepted limit of {maximum}"
+action = "reduce records below {maximum} and retry"
+fields = { field = { type = "string" }, observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.index.workspace_zero_limit]
+message = "workspace index bound is zero"
+action = "set every workspace index bound above zero"
+fields = { source = { type = "error", role = "source", optional = true }, field = { type = "string", optional = true } }
+
+[error.index.workspace_invalid_root]
+message = "workspace root cannot be read as a directory"
+action = "provide a readable workspace directory and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_too_deep]
+message = "workspace directory depth exceeds its accepted limit of {maximum}"
+action = "reduce directory depth below {maximum} and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string", optional = true }, observed = { type = "unsigned", optional = true }, maximum = { type = "unsigned" } }
+
+[error.index.workspace_too_many_files]
+message = "workspace contains more files than its accepted limit of {maximum}"
+action = "reduce workspace files below {maximum} and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string", optional = true }, observed = { type = "unsigned", optional = true }, maximum = { type = "unsigned", optional = true } }
+
+[error.index.workspace_file_too_large]
+message = "source file exceeds its accepted byte limit of {maximum}"
+action = "reduce source file size below {maximum} bytes and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string", optional = true }, observed = { type = "unsigned", optional = true }, maximum = { type = "unsigned", optional = true } }
+
+[error.index.workspace_workspace_too_large]
+message = "workspace source bytes exceed their accepted limit of {maximum}"
+action = "reduce workspace source bytes below {maximum} and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string", optional = true }, observed = { type = "unsigned", optional = true }, maximum = { type = "unsigned", optional = true } }
+
+[error.index.workspace_invalid_path]
+message = "workspace path is not valid project syntax"
+action = "use a canonical project path and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_invalid_source]
+message = "source file bytes are not valid UTF-8"
+action = "save source file as UTF-8 and retry"
+fields = { source = { type = "error", role = "source", optional = true }, path = { type = "path", format = "display", optional = true } }
+
+[error.index.workspace_filesystem]
+message = "workspace filesystem operation failed"
+action = "check filesystem permissions and free space, then retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_changed_during_capture]
+message = "source file changed while its bytes were captured"
+action = "retry workspace indexing"
+fields = { source = { type = "error", role = "source", optional = true }, path = { type = "path", format = "display", optional = true } }
+
+[error.index.workspace_cancelled]
+message = "workspace indexing was cancelled"
+action = "retry workspace indexing"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.index.workspace_syntax]
+message = "Rust syntax analysis failed"
+action = "correct the source syntax and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_provider]
+message = "provider publication failed"
+action = "report this internal failure with its full context"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_composition]
+message = "workspace composition failed validation"
+action = "report this internal failure with its full context"
+fields = { source = { type = "error", role = "source", optional = true } }
+
+[error.index.workspace_result_limit]
+message = "workspace search returned more results than its accepted limit of {maximum}"
+action = "reduce requested results below {maximum} and retry"
+fields = { field = { type = "string", optional = true }, observed = { type = "unsigned", optional = true }, maximum = { type = "unsigned", optional = true } }
+
+[error.index.workspace_language_include_required]
+message = "unshipped language has no nonempty include list"
+action = "add a nonempty include list for this language and retry"
+fields = { language = { type = "string", optional = true } }
+
+[error.index.workspace_language_match_conflict]
+message = "workspace path matches two language entries"
+action = "make language include lists distinct and retry"
+fields = { path = { type = "path", format = "display", optional = true }, language = { type = "string", optional = true } }
+
+[error.index.workspace_history]
+message = "workspace history operation failed"
+action = "check repository state and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.lsp.capabilities_position_encoding_unsupported]
+message = "language engine selected unsupported position encoding {encoding}"
+action = "configure the engine to use UTF-8 or UTF-16 positions"
+fields = { encoding = { type = "string" } }
+
+[error.lsp.framing_header_too_long]
+message = "language engine message header exceeds its byte limit"
+action = "reduce the message header and retry"
+fields = { }
+
+[error.lsp.framing_message_too_long]
+message = "language engine message body of {announced_bytes} bytes exceeds limit {limit}"
+action = "reduce the message body below {limit} bytes and retry"
+fields = { announced_bytes = { type = "unsigned" }, field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.lsp.framing_header_malformed]
+message = "language engine message header is malformed"
+action = "check the language engine's LSP framing and retry"
+fields = { }
+
+[error.lsp.framing_content_length_missing]
+message = "language engine message header has no Content-Length"
+action = "check the language engine's LSP framing and retry"
+fields = { }
+
+[error.lsp.framing_content_length_invalid]
+message = "language engine message has invalid Content-Length {value}"
+action = "send Content-Length as a decimal byte count"
+fields = { value = { type = "string" } }
+
+[error.lsp.correlation_pending_requests_exceeded]
+message = "language engine has more than {limit} pending requests"
+action = "wait for a pending request to finish before sending another"
+fields = { field = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.lsp.correlation_response_unknown]
+message = "language engine answered unknown request id {id}"
+action = "check the language engine's request and response correlation"
+fields = { id = { type = "string" } }
+
+[error.lsp.position_line_out_of_range]
+message = "position line {line} is outside document line count {line_count}"
+action = "use a line within the document"
+fields = { line = { type = "unsigned" }, line_count = { type = "unsigned" } }
+
+[error.lsp.position_character_out_of_range]
+message = "character {character} is outside line {line} length {line_units}"
+action = "use a character offset within the line"
+fields = { line = { type = "unsigned" }, character = { type = "unsigned" }, line_units = { type = "unsigned" } }
+
+[error.lsp.position_character_misaligned]
+message = "character {character} splits an encoded character on line {line}"
+action = "use a character offset on an encoding boundary"
+fields = { line = { type = "unsigned" }, character = { type = "unsigned" } }
+
+[error.lsp.position_offset_out_of_range]
+message = "byte offset {byte_offset} exceeds document size {document_bytes}"
+action = "use a byte offset within the document"
+fields = { byte_offset = { type = "unsigned" }, document_bytes = { type = "unsigned" } }
+
+[error.lsp.position_offset_misaligned]
+message = "byte offset {byte_offset} splits a UTF-8 character"
+action = "use a byte offset on a UTF-8 boundary"
+fields = { byte_offset = { type = "unsigned" } }
+
+[error.lsp.position_offset_inside_line_ending]
+message = "byte offset {byte_offset} falls inside a line ending"
+action = "use a byte offset before or after the line ending"
+fields = { byte_offset = { type = "unsigned" } }
+
+[error.lsp.uri_root_not_absolute]
+message = "language engine workspace root {root} is not absolute"
+action = "configure an absolute workspace root"
+fields = { root = { type = "string" } }
+
+[error.lsp.uri_root_not_unicode]
+message = "language engine workspace root is not valid Unicode"
+action = "use a workspace root with a Unicode path"
+fields = { }
+
+[error.lsp.uri_uri_malformed]
+message = "language engine returned malformed document URI {uri}"
+action = "use a valid file URI for the document"
+fields = { uri = { type = "string" } }
+
+[error.lsp.uri_scheme_refused]
+message = "document URI scheme {scheme} is not supported"
+action = "use a file URI for the document"
+fields = { scheme = { type = "string" } }
+
+[error.lsp.uri_host_refused]
+message = "document URI host {host} is not supported"
+action = "use a hostless file URI for the document"
+fields = { host = { type = "string" } }
+
+[error.lsp.uri_path_not_decodable]
+message = "document URI path does not decode to Unicode"
+action = "use a file URI with a UTF-8 path"
+fields = { }
+
+[error.lsp.uri_outside_root]
+message = "document URI is outside the workspace root"
+action = "use a document URI under the workspace root"
+fields = { }
+
+[error.lsp.engine_program_empty]
+message = "language engine program is empty"
+action = "set a program for the language engine"
+fields = { }
+
+[error.lsp.engine_program_absolute]
+message = "language engine program {program} is an absolute path"
+action = "set a program name resolved from the inherited PATH"
+fields = { program = { type = "string" } }
+
+[error.lsp.engine_launch_failed]
+message = "language engine could not start"
+action = "check the configured program and process limits"
+fields = { source = { type = "error", role = "source" } }
+
+[error.lsp.engine_connection_closed]
+message = "language engine closed connection during {method}"
+action = "restart the language engine and retry"
+fields = { method = { type = "string" } }
+
+[error.lsp.engine_timed_out]
+message = "language engine timed out during {method} after {timeout_ms} ms"
+action = "retry the request after checking language engine load"
+fields = { method = { type = "string" }, timeout_ms = { type = "unsigned" } }
+
+[error.lsp.engine_message_unreadable]
+message = "language engine response is not a JSON-RPC envelope"
+action = "check the language engine's LSP response"
+fields = { }
+
+[error.lsp.engine_result_invalid]
+message = "language engine response for {method} has an invalid result"
+action = "check the language engine's response for {method}"
+fields = { method = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.lsp.engine_capability_absent]
+message = "language engine does not advertise {capability}"
+action = "configure an engine that advertises {capability}"
+fields = { capability = { type = "string" } }
+
+[error.lsp.engine_analyzing]
+message = "language engine remained analyzing after {attempts} attempts"
+action = "wait for language engine analysis to finish and retry"
+fields = { attempts = { type = "unsigned" } }
+
+[error.lsp.engine_ended]
+message = "language engine session has ended"
+action = "start a new language engine session"
+fields = { }
+
+[error.lsp.engine_refused_retryable]
+message = "language engine refused {method} with code {code}: {message}"
+action = "resend the same request after the engine finishes its current work"
+fields = { method = { type = "string" }, code = { type = "integer" }, message = { type = "string" } }
+
+[error.lsp.engine_refused_terminal]
+message = "language engine refused {method} with code {code}: {message}"
+action = "correct the request and retry"
+fields = { method = { type = "string" }, code = { type = "integer" }, message = { type = "string" } }
+[error.search.model_file_missing]
+message = "model directory is missing file {subject}"
+action = "supply the missing model file and retry"
+fields = { subject = { type = "path", format = "display" } }
+
+[error.search.model_source_invalid]
+message = "model source {model} has invalid form; expected {expected}"
+action = "use a model source in the expected form and retry"
+fields = { model = { type = "string" }, expected = { type = "string" } }
+[error.search.model_cache_unavailable]
+message = "model cache directory could not be resolved"
+action = "set a model cache directory and retry"
+fields = { }
+[error.search.model_download_failed]
+message = "model file download failed: {subject}"
+action = "check network access and retry"
+fields = { subject = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.search.model_download_too_large]
+message = "model file body at {url} is empty or exceeds accepted byte limit {bytes_max}"
+action = "provide a nonempty model file within its byte limit and retry"
+fields = { url = { type = "string" }, bytes_max = { type = "unsigned" } }
+[error.search.model_configuration_invalid]
+message = "model configuration is invalid"
+action = "provide a model configuration this encoder serves and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.search.tokenizer_unreadable]
+message = "model tokenizer is unreadable"
+action = "repair the model tokenizer file and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.search.weights_unreadable]
+message = "model weights are unreadable"
+action = "repair the model weights file and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.search.encode_failed]
+message = "text encoding failed"
+action = "check model input and retry"
+fields = { stage = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.search.task_failed]
+message = "search task did not return"
+action = "retry search"
+fields = { source = { type = "error", role = "source", optional = true } }
+[error.search.text_limit]
+message = "encoder received {observed} texts, exceeding accepted limit {limit}"
+action = "reduce input texts below {limit} and retry"
+fields = { limit = { type = "unsigned" }, observed = { type = "unsigned" } }
+[error.search.vector_width_mismatch]
+message = "query vector width {query_width} does not match stored vector width {stored_width}"
+action = "use vectors with the stored width and retry"
+fields = { query_width = { type = "unsigned" }, stored_width = { type = "unsigned" } }
+
+[error.search.vector_coordinate_invalid]
+message = "embedded coordinate {coordinate} cannot be represented in the stored f32 format"
+action = "use an embedding model that returns finite coordinates within the stored range"
+fields = { coordinate = { type = "string" } }
+[error.syntax.zero_limit]
+message = "syntax bound {bound} is zero"
+action = "set syntax bounds above zero"
+fields = { bound = { type = "string" } }
+
+[error.syntax.source_too_large]
+message = "source bytes {source_bytes} exceed accepted limit {source_bytes_max}"
+action = "reduce source bytes below {source_bytes_max} and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source_bytes = { type = "unsigned" }, source_bytes_max = { type = "unsigned" } }
+
+[error.syntax.too_many_nodes]
+message = "syntax tree node count exceeds accepted limit {syntax_nodes_max}"
+action = "reduce syntax tree node count below {syntax_nodes_max} and retry"
+fields = { path = { type = "path", format = "display" }, syntax_nodes_max = { type = "unsigned" } }
+
+[error.syntax.too_deep]
+message = "syntax tree depth exceeds accepted limit {syntax_depth_max}"
+action = "reduce syntax tree depth below {syntax_depth_max} and retry"
+fields = { path = { type = "path", format = "display" }, syntax_depth_max = { type = "unsigned" } }
+
+[error.syntax.incompatible_grammar]
+message = "grammar ABI {grammar_abi_version} is outside runtime range {runtime_abi_min} to {runtime_abi_max}"
+action = "use a grammar built for the accepted runtime ABI range"
+fields = { grammar_abi_version = { type = "unsigned" }, runtime_abi_min = { type = "unsigned" }, runtime_abi_max = { type = "unsigned" } }
+
+[error.syntax.parse_cancelled]
+message = "syntax parser returned no tree"
+action = "retry syntax parsing"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.syntax.position_overflow]
+message = "syntax node position does not fit the accepted byte width"
+action = "report this internal failure with its full context"
+fields = { node_kind = { type = "string" }, start_byte = { type = "unsigned" }, end_byte = { type = "unsigned" }, source = { type = "error", role = "source" } }
+
+[error.syntax.invalid_query]
+message = "syntax query is invalid at line {line_number}: {line_text}"
+action = "correct the query line and retry"
+fields = { line_number = { type = "unsigned" }, line_text = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.syntax.too_many_captures]
+message = "syntax query produced more than {captures_max} captures"
+action = "reduce query captures below {captures_max} and retry"
+fields = { captures_max = { type = "unsigned" } }
+
+[error.syntax.too_many_markdown_inline_ranges]
+message = "Markdown inline ranges {observed} exceed accepted limit {inline_ranges_max}"
+action = "reduce Markdown inline ranges below {inline_ranges_max} and retry"
+fields = { path = { type = "path", format = "display" }, inline_ranges_max = { type = "unsigned" }, observed = { type = "unsigned" } }
+
+[error.syntax.markdown_progress_exceeded]
+message = "Markdown parser exceeded progress callback limit {progress_callbacks_max}"
+action = "reduce Markdown source size and retry"
+fields = { path = { type = "path", format = "display" }, progress_callbacks_max = { type = "unsigned" } }
+
+[error.syntax.invalid_markdown_ranges]
+message = "Tree-sitter rejected Markdown inline ranges"
+action = "report this internal failure with its full context"
+fields = { path = { type = "path", format = "display" } }
+
+[error.syntax.unknown_node_kind]
+message = "node kind {node_kind} is outside interpreted grammar vocabulary"
+action = "report this internal failure with its full context"
+fields = { node_kind = { type = "string" } }
+
+[error.analysis.package_identity_invalid]
+message = "package identity cannot form a source unit, resolver, or symbol"
+action = "correct package identity and retry"
+fields = { package = { type = "string" }, path = { type = "path", format = "display", optional = true }, cause = { type = "rift_error", role = "cause", optional = true } }
+
+[error.analysis.package_syntax_unavailable]
+message = "no shipped syntax provider accepts package file extension"
+action = "use a supported package file extension and retry"
+fields = { package = { type = "string" }, path = { type = "path", format = "display" } }
+
+[error.analysis.package_provider_failed]
+message = "package semantic publication failed"
+action = "report this internal failure with its full context"
+fields = { package = { type = "string" }, path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.package_declarations_exceeded]
+message = "package declaration count exceeds its accepted limit"
+action = "reduce package declarations below the accepted limit and retry"
+fields = { package = { type = "string" }, path = { type = "path", format = "display", optional = true } }
+
+[error.analysis.documentation_limit_exceeded]
+message = "documentation field {field} exceeds its accepted limit"
+action = "reduce documentation field {field} below its accepted limit and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_identity_invalid]
+message = "documentation field {field} has an invalid identity"
+action = "correct documentation field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_duplicate_source]
+message = "documentation field {field} names a duplicate source"
+action = "send each documentation source once and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_digest_mismatch]
+message = "documentation field {field} has a digest mismatch"
+action = "supply bytes matching the recorded digest and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_origin_invalid]
+message = "documentation field {field} conflicts with its source address"
+action = "correct documentation field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_format_invalid]
+message = "documentation field {field} has an invalid format"
+action = "correct documentation field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_range_invalid]
+message = "documentation field {field} has a range outside source bytes"
+action = "correct documentation field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_order_invalid]
+message = "documentation field {field} is not in required order"
+action = "order documentation field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_target_missing]
+message = "documentation field {field} names a missing target"
+action = "supply an existing target for documentation field {field}"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_notebook_invalid]
+message = "documentation field {field} has an invalid notebook shape"
+action = "correct notebook field {field} and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_revision_invalid]
+message = "documentation field {field} has an unsupported publication revision"
+action = "use the supported publication revision and retry"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.documentation_encoding_failed]
+message = "documentation field {field} could not be encoded as canonical JSON"
+action = "report this internal failure with its full context"
+fields = { field = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.source_pattern_invalid]
+message = "source path pattern is invalid"
+action = "correct the source path pattern and retry"
+fields = { pattern = { type = "string", optional = true }, source = { type = "error", role = "source" } }
+
+[error.analysis.package_input_identity_invalid]
+message = "package identity cannot form a source unit"
+action = "correct package identity and retry"
+fields = { path = { type = "path", format = "display", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.package_input_origin_invalid]
+message = "package source origin does not identify this package"
+action = "correct package source origin and retry"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.analysis.package_input_duplicate_path]
+message = "package source path appears more than once"
+action = "send each package source path once and retry"
+fields = { path = { type = "path", format = "display", optional = true } }
+
+[error.analysis.package_input_too_many_files]
+message = "package source count exceeds its accepted limit"
+action = "reduce package source count below its accepted limit and retry"
+fields = { field = { type = "string" }, bound = { type = "unsigned" }, observed = { type = "unsigned" } }
+
+[error.analysis.package_input_too_many_bytes]
+message = "package source bytes exceed their accepted limit"
+action = "reduce package source bytes below its accepted limit and retry"
+fields = { field = { type = "string" }, bound = { type = "unsigned" }, observed = { type = "unsigned" } }
+
+[error.analysis.context7_oversized]
+message = "context7.json exceeds its accepted byte limit"
+action = "reduce context7.json below its accepted byte limit and retry"
+fields = { file = { type = "string" }, key = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.context7_malformed]
+message = "context7.json has an invalid JSON shape"
+action = "correct context7.json shape and retry"
+fields = { file = { type = "string" }, key = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.context7_too_many_entries]
+message = "context7.json key {key} exceeds its entry limit"
+action = "reduce entries for key {key} below its accepted limit and retry"
+fields = { file = { type = "string" }, key = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.analysis.context7_entry_invalid]
+message = "context7.json key {key} contains an invalid entry"
+action = "correct the entry for key {key} and retry"
+fields = { file = { type = "string" }, key = { type = "string", optional = true }, entry = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+[error.provider.composition_invalid_name]
+message = "composition stage name is invalid"
+action = "use a canonical stage name and retry"
+
+[error.provider.composition_duplicate_stage]
+message = "composition stage path already exists"
+action = "use a unique stage path and retry"
+fields = { stage = { type = "string" } }
+
+[error.provider.composition_foreign_flow]
+message = "composition flow belongs to another builder"
+action = "use flow handles from this builder and retry"
+
+[error.provider.composition_type_mismatch]
+message = "composition stage input and output types do not match"
+action = "connect stages with matching types and retry"
+fields = { stage = { type = "string" } }
+
+[error.provider.composition_stage_not_found]
+message = "composition stage does not exist"
+action = "use an existing stage path and retry"
+fields = { stage = { type = "string" } }
+
+[error.provider.composition_dangling_input]
+message = "composition stage still has a consumer"
+action = "remove consumers before removing stage and retry"
+fields = { stage = { type = "string" } }
+
+[error.provider.composition_missing_output]
+message = "composition has no selected output"
+action = "select one output stage and retry"
+
+[error.provider.cache_too_many_keys]
+message = "cache key count exceeds its configured limit"
+action = "reduce cache keys to its configured limit and retry"
+
+[error.provider.publication_zero_limit]
+message = "provider publication limit is zero"
+action = "set each provider publication limit above zero and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_provider_mismatch]
+message = "contribution provider does not match publication provider"
+action = "publish contributions under matching provider identity and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_revision_mismatch]
+message = "contribution revision does not match publication revision"
+action = "publish contributions under matching revision and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_duplicate_symbol]
+message = "provider publication repeats a provider symbol"
+action = "publish each provider symbol once and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_provider_limit]
+message = "provider publication count exceeds its configured limit"
+action = "reduce provider publications to configured limit and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_provider_contribution_limit]
+message = "provider contribution count exceeds its configured limit"
+action = "reduce provider contributions to configured limit and retry"
+fields = { field = { type = "string" } }
+
+[error.provider.publication_contribution_limit]
+message = "total contribution count exceeds its configured limit"
+action = "reduce total contributions to configured limit and retry"
+fields = { field = { type = "string" } }
+[error.mcp.parameter_invalid]
+message = "tool arguments do not match the served schema"
+action = "correct the reported field and resend the request"
+fields = { tool = { type = "string" }, field = { type = "string", optional = true }, accepted = { type = "string", optional = true }, example = { type = "string", optional = true } }
+
+[error.mcp.arguments_not_object]
+message = "tool call arguments are not a JSON object"
+action = "send tool call arguments as a JSON object and resend the request"
+fields = { field = { type = "string" } }
+
+[error.mcp.election_already_serving]
+message = "another process already serves this workspace"
+action = "connect to the serving process or stop it before starting another"
+
+[error.mcp.election_storage_failed]
+message = "workspace server election state could not be read or written"
+action = "check filesystem permissions and free space, then retry"
+fields = { operation = { type = "string" }, path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.mcp.election_document_invalid]
+message = "server lock document failed validation"
+action = "report this internal failure with its full context"
+
+[error.mcp.http_ports_exhausted]
+message = "every loopback port in the serving range is bound"
+action = "stop a process using a serving port, then retry"
+fields = { port_min = { type = "port" }, port_max = { type = "port" } }
+
+[error.mcp.http_serve_failed]
+message = "HTTP MCP server failed while serving"
+action = "report this internal failure with its full context"
+fields = { operation = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.mcp.proxy_identity_failed]
+message = "MCP proxy could not determine product identity"
+action = "report this internal failure with its full context"
+fields = { source = { type = "error", role = "source" } }
+
+[error.mcp.proxy_initialization_failed]
+message = "MCP proxy initialization failed"
+action = "resend the same request after a short delay"
+fields = { source = { type = "error", role = "source" } }
+
+[error.mcp.proxy_task_failed]
+message = "MCP proxy service task failed"
+action = "report this internal failure with its full context"
+fields = { source = { type = "error", role = "source" } }
+
+[error.mcp.proxy_unexpected_quit]
+message = "MCP proxy service ended unexpectedly"
+action = "report this internal failure with its full context"
+
+[error.mcp.forward_unanswered]
+message = "workspace server did not answer forwarded request within {waited}"
+action = "resend the same request after a short delay"
+fields = { waited = { type = "duration", format = "human" } }
+
+[error.mcp.start_building]
+message = "workspace server did not finish building its first index within {waited}"
+action = "resend the same request after a short delay"
+fields = { waited = { type = "duration", format = "human" } }
+
+[error.mcp.spawn_no_output]
+message = "spawned server exited before serving and wrote no standard error"
+action = "report this internal failure with its full context"
+
+[error.mcp.spawn_failed]
+message = "spawned server exited before serving"
+action = "report this internal failure with its full context"
+fields = { stderr = { type = "string", sensitive = true }, stderr_truncated = { type = "bool", optional = true } }
+
+[error.mcp.project_hit_identity_missing]
+message = "project hit has no identity"
+action = "report this internal failure with its full context"
+fields = { hit = { type = "string" } }
+
+[error.mcp.project_hit_identity_undecodable]
+message = "project hit identity is not a qualified name"
+action = "report this internal failure with its full context"
+fields = { hit = { type = "string" } }
+
+[error.mcp.project_hit_name_unmatched]
+message = "project hit name does not match requested name"
+action = "report this internal failure with its full context"
+fields = { hit = { type = "string" } }
+
+[error.mcp.project_hit_unit_invalid]
+message = "project hit unit is not a source unit address"
+action = "report this internal failure with its full context"
+fields = { hit = { type = "string" } }
+
+[error.mcp.project_hit_identity_refused]
+message = "project hit identity was refused by ranking"
+action = "report this internal failure with its full context"
+fields = { hit = { type = "string" } }
+
+[error.index.workspace_documentation_limit]
+message = "workspace documentation sources exceed their accepted limit of {maximum}"
+action = "reduce documentation sources below {maximum} and retry"
+fields = { path = { type = "path", format = "display", optional = true }, field = { type = "string" }, observed = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.history.unversioned]
+message = "workspace has no git repository: {workspace}"
+action = "run `git init`, or omit `rev` to read current tree"
+fields = { workspace = { type = "path", format = "display" }, requires = { type = "string" } }
+
+[error.history.revision_unknown]
+message = "revision does not resolve: {rev}"
+action = "use a branch, tag, or commit id this repository resolves"
+fields = { rev = { type = "string" }, requires = { type = "string" } }
+
+[error.history.revision_not_commit]
+message = "revision {rev} resolves to {resolved_kind}, not a commit"
+action = "use a revision that names a commit"
+fields = { rev = { type = "string" }, resolved_kind = { type = "string" }, requires = { type = "string" } }
+
+[error.history.tree_too_large]
+message = "revision tree exceeds accepted entry limit {entries_max}"
+action = "use a revision with a smaller tree"
+fields = { limit = { type = "string" }, entries_max = { type = "unsigned" } }
+
+[error.history.blob_too_large]
+message = "committed file {path} has {size} bytes, above accepted limit {bytes_max}"
+action = "use a revision with a smaller file"
+fields = { path = { type = "path", format = "display" }, bytes_max = { type = "unsigned" }, size = { type = "unsigned" } }
+
+[error.history.too_many_tags]
+message = "repository tag count exceeds accepted limit {tags_max}"
+action = "reduce repository tags or raise the tag limit"
+fields = { limit = { type = "string" }, tags_max = { type = "unsigned" } }
+
+[error.history.path_unrepresentable]
+message = "committed path cannot be represented as UTF-8: {path}"
+action = "rename the committed path to valid UTF-8 and retry"
+fields = { path = { type = "string" } }
+
+[error.history.storage]
+message = "repository storage failed during {operation}: {detail}"
+action = "check repository storage and retry"
+fields = { operation = { type = "string" }, detail = { type = "string" } }
+
+[error.history_store.folder]
+message = "history store folder operation failed: {operation} {path}: {detail}"
+action = "check the history store path and permissions"
+fields = { operation = { type = "string" }, path = { type = "path", format = "display" }, detail = { type = "error", role = "source" } }
+
+[error.history_store.lock_unstable]
+message = "history store live lock changed during {attempts} attempts: {path}"
+action = "retry after concurrent history store cleanup finishes"
+fields = { path = { type = "path", format = "display" }, attempts = { type = "unsigned" } }
+
+[error.history_store.database]
+message = "history store database operation failed: {operation}: {detail}"
+action = "check the history store database and retry"
+fields = { operation = { type = "string" }, detail = { type = "error", role = "source" } }
+
+[error.history.contribution_invalid]
+message = "history Contribution conversion rejected: {detail}"
+action = "check the history Contribution data and retry"
+fields = { detail = { type = "string" } }
+
+[error.server.read_unsupported]
+message = "request uses unsupported capability {capability}"
+action = "adjust the request to a served capability, or configure a provider that serves it"
+fields = { capability = { type = "string" } }
+
+[error.server.read_unclaimed_extension]
+message = "no shipped syntax provider parses path extension {extension}"
+action = "address a path a shipped provider parses"
+fields = { extension = { type = "string" } }
+
+[error.server.read_invalid]
+message = "request field {field} is invalid: {violation}"
+action = "correct the reported field and resend the request"
+fields = { field = { type = "string" }, violation = { type = "string" } }
+
+[error.server.read_not_found]
+message = "requested source path does not exist: {path}"
+action = "search or list first, then retry with a path that answer returned"
+fields = { path = { type = "string" } }
+
+[error.server.read_source_unavailable]
+message = "claimed source path is not available in the index: {path}"
+action = "request the declaration without its body, or read a source-backed unit"
+fields = { path = { type = "string" } }
+
+[error.server.read_storage]
+message = "workspace file operation failed: {operation}"
+action = "check filesystem permissions and free space, then retry"
+fields = { path = { type = "string" }, operation = { type = "string" }, io = { type = "string" } }
+
+[error.server.read_task]
+message = "workspace read task failed: {operation}"
+action = "report this internal failure with its full context"
+fields = { operation = { type = "string" }, detail = { type = "string" } }
+
+[error.server.read_unavailable]
+message = "workspace index is unavailable during {operation}"
+action = "resend the same request after a short delay"
+fields = { operation = { type = "string" }, detail = { type = "string" } }
+
+[error.server.read_engine_answer]
+message = "language engine answer does not match served revision during {operation}"
+action = "read the request again once the engine has read the served revision"
+fields = { operation = { type = "string" }, detail = { type = "string" } }
+
+[error.server.read_capacity_timeout]
+message = "workspace read waited too long for blocking capacity during {operation}"
+action = "resend the same request after a short delay"
+fields = { operation = { type = "string" }, timeout_ms = { type = "unsigned" } }
+
+[error.server.read_cancelled]
+message = "workspace read was cancelled"
+action = "resend the request if the result is still needed"
+
+[error.cli.install_home_unresolved]
+message = "the operator's home directory could not be resolved"
+action = "set HOME (or USERPROFILE on Windows) and retry `rift install claude --user`"
+fields = { checked = { type = "string" } }
+
+[error.cli.install_template_missing_tool]
+message = "the generated Claude Code skill names a tool the served MCP surface does not have: {tool}"
+action = "rebuild rift so the binary and its served tool surface match, then retry `rift install claude`"
+fields = { tool = { type = "string" } }
+
+[error.cli.install_write_failed]
+message = "the generated Claude Code skill could not be written: {path}"
+action = "ensure the target directory is writable and retry `rift install claude`"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.install_remove_failed]
+message = "the generated Claude Code skill could not be removed: {path}"
+action = "ensure the target directory is writable and retry `rift install claude --remove`"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.install_settings_unparsable]
+message = "the target settings.json could not be read as a JSON hook document: {path}"
+action = "fix or remove the file, then run the same `rift install` command again"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.server_already_serving]
+message = "another rift server already serves this workspace"
+action = "connect to the listed server, or run `rift server stop` before serving again"
+fields = { listening = { type = "string", optional = true }, pid = { type = "pid", optional = true }, detail = { type = "string", optional = true } }
+
+[error.cli.server_spawn_failed]
+message = "the rift server process could not be started: {source}"
+action = "check that the rift binary is runnable, or run `rift server start --foreground` to serve in this process"
+fields = { operation = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.cli.server_start_exited]
+message = "the spawned rift server exited before publishing its lock document: process {pid}"
+action = "read `.rift/server.stderr`, or run `rift server logs --level error`, for what the server reported before it exited"
+fields = { pid = { type = "pid" } }
+
+[error.cli.server_start_timed_out]
+message = "the started rift server did not report serving within {waited}"
+action = "run `rift server start --foreground` to see the server's diagnostics on stderr"
+fields = { waited = { type = "duration", format = "human" } }
+
+[error.cli.server_election_unreleased]
+message = "server stopped answering its port but still holds the election: process {pid}, waited {waited}"
+action = "retry `rift server stop`; if the refusal repeats, end the reported pid manually"
+fields = { pid = { type = "pid" }, waited = { type = "duration", format = "human" } }
+
+[error.cli.server_stop_request_failed]
+message = "the server stop request could not be delivered: {source}"
+action = "retry `rift server stop`; if the refusal repeats, end the reported pid manually"
+fields = { operation = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.cli.server_stop_refused]
+message = "the server refused the stop request with status {status}"
+action = "retry `rift server stop`; if the refusal repeats, end the reported pid manually"
+fields = { status = { type = "unsigned" }, detail = { type = "string", optional = true } }
+
+[error.cli.server_stop_timed_out]
+message = "the server accepted the stop request but kept serving after {waited}"
+action = "retry `rift server stop`; if the refusal repeats, end the reported pid manually"
+fields = { waited = { type = "duration", format = "human" }, listening = { type = "string", optional = true }, pid = { type = "pid", optional = true }, detail = { type = "string", optional = true } }
+
+[error.cli.server_logs_unavailable]
+message = "the workspace's recorded server logs could not be read"
+action = "ensure no other process holds `.rift/db` exclusively and retry"
+fields = { operation = { type = "string", optional = true }, detail = { type = "string", optional = true }, source = { type = "rift_error", role = "cause", optional = true } }
+
+[error.cli.update_binary_invalid]
+message = "current Rift executable (invoked as `{invoked_as}`) could not be located: {source}: reinstall Rift if the binary was moved or deleted"
+action = "reinstall Rift if the binary was moved or deleted"
+fields = { invoked_as = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_version_invalid]
+message = "installed Rift version `{raw}` at `{path}` is invalid: {source}: reinstall Rift from an official release"
+action = "reinstall Rift from an official release"
+fields = { raw = { type = "string" }, path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_staging_failed]
+message = "update staging directory could not be created under `{path}` ({space}): {source}: ensure the directory is writable and has free space, then retry `rift update`"
+action = "ensure the directory is writable and has free space, then retry `rift update`"
+fields = { path = { type = "path", format = "display" }, space = { type = "string" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_release_tag_invalid]
+message = "release tag `{tag}` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
+action = "use a stable release tag of the form `vMAJOR.MINOR.PATCH`"
+fields = { tag = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.cli.update_prerelease_unsupported]
+message = "release tag `{tag}` is a pre-release or build: only stable releases of the form `vMAJOR.MINOR.PATCH` are supported"
+action = "use a stable release tag of the form `vMAJOR.MINOR.PATCH`"
+fields = { tag = { type = "string" } }
+
+[error.cli.update_release_file_inspection_failed]
+message = "downloaded release file at `{path}` could not be inspected: {source}: retry `rift update`"
+action = "retry `rift update`"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_release_file_not_regular]
+message = "downloaded release file at `{path}` is not a regular file: retry `rift update` or create an issue at https://github.com/volarized/rift/issues"
+action = "retry `rift update` or create an issue"
+fields = { path = { type = "path", format = "display" } }
+
+[error.cli.update_release_file_size_invalid]
+message = "downloaded release file at `{path}` has incorrect size of {size} bytes, expected between 1 and {bytes_max} bytes: retry `rift update` or create an issue at https://github.com/volarized/rift/issues"
+action = "retry `rift update` or create an issue"
+fields = { path = { type = "path", format = "display" }, size = { type = "unsigned" }, bytes_max = { type = "unsigned" } }
+
+[error.cli.update_archive_file_inspection_failed]
+message = "downloaded release file at `{path}` could not be inspected: {source}: retry `rift update`"
+action = "retry `rift update`"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_archive_file_not_regular]
+message = "downloaded release file at `{path}` is not a regular file: retry `rift update` or create an issue at https://github.com/volarized/rift/issues"
+action = "retry `rift update` or create an issue"
+fields = { path = { type = "path", format = "display" } }
+
+[error.cli.update_archive_file_size_invalid]
+message = "downloaded release file at `{path}` has incorrect size of {size} bytes, expected between 1 and {bytes_max} bytes: retry `rift update` or create an issue at https://github.com/volarized/rift/issues"
+action = "retry `rift update` or create an issue"
+fields = { path = { type = "path", format = "display" }, size = { type = "unsigned" }, bytes_max = { type = "unsigned" } }
+
+[error.cli.update_checksum_mismatch]
+message = "the downloaded release does not match its published checksum: expected {expected}, actual {actual}; retry `rift update`, and raise an issue at https://github.com/volarized/rift/issues if the mismatch repeats"
+action = "retry `rift update` and raise an issue if mismatch repeats"
+fields = { expected = { type = "string" }, actual = { type = "string" } }
+
+[error.cli.update_checksum_manifest_invalid]
+message = "release checksum manifest is invalid: expected `sha256sum`-format lines naming the release archive exactly once; retry `rift update`"
+action = "retry `rift update`"
+
+[error.cli.update_checksum_read_failed]
+message = "release checksum could not be verified: retry `rift update`"
+action = "retry `rift update`"
+fields = { source = { type = "error", role = "source" } }
+
+[error.cli.update_release_metadata_invalid]
+message = "latest release metadata is invalid: retry `rift update` or check https://github.com/volarized/rift/releases"
+action = "retry `rift update` or check the release page"
+fields = { source = { type = "error", role = "source" } }
+
+[error.cli.update_download_failed]
+message = "release download failed: check network access to github.com and retry `rift update`"
+action = "check network access to github.com and retry `rift update`"
+fields = { source = { type = "error", role = "source" } }
+
+[error.cli.update_download_too_large]
+message = "release download was empty or exceeded {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
+action = "retry `rift update`; if this persists the release assets may be malformed"
+fields = { bytes_max = { type = "unsigned" } }
+
+[error.cli.update_archive_member_too_large]
+message = "release archive member is empty or exceeds {bytes_max} bytes: retry `rift update`; if this persists the release may be malformed"
+action = "retry `rift update`; if this persists the release may be malformed"
+fields = { bytes_max = { type = "unsigned" } }
+
+[error.cli.update_archive_contents_invalid]
+message = "release archive contents are invalid: expected exactly one binary, README.md, and LICENSE.md member; retry `rift update`"
+action = "retry `rift update`"
+
+[error.cli.update_archive_extraction_failed]
+message = "release archive could not be extracted: retry `rift update`; if this persists the download may be corrupted"
+action = "retry `rift update`; if this persists the download may be corrupted"
+fields = { source = { type = "error", role = "source" } }
+
+[error.cli.update_publish_copy_failed]
+message = "Rift update could not be published: copying the downloaded binary into `{path}` failed: ensure the directory is writable and has free space, then retry `rift update`"
+action = "ensure the directory is writable and has free space, then retry `rift update`"
+fields = { path = { type = "path", format = "display" }, cause = { type = "rift_error", role = "cause" } }
+
+[error.cli.update_publish_pending_cleanup]
+message = "another Rift update is pending cleanup: retry after the previous Rift process exits, or delete `{path}`"
+action = "retry after the previous Rift process exits, or delete the pending file"
+fields = { path = { type = "path", format = "display" } }
+
+[error.cli.update_rollback_failed]
+message = "Rift update publish and rollback of `{path}` both failed: reinstall Rift from an official release"
+action = "reinstall Rift from an official release"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_publish_parent_missing]
+message = "current executable `{path}` has no parent directory: install Rift in a regular directory before updating"
+action = "install Rift in a regular directory before updating"
+fields = { path = { type = "path", format = "display" } }
+
+[error.cli.update_publish_failed]
+message = "Rift update could not be published: {operation} `{path}` failed: {source}: ensure the directory is writable and retry `rift update`"
+action = "ensure the directory is writable and retry `rift update`"
+fields = { operation = { type = "string" }, path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
+[error.cli.update_rollback_cleanup_failed]
+message = "We were not able to clean up the old binary at `{path}`: {source}: delete the file manually"
+action = "delete the file manually"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }

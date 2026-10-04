@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use super::commit::{commit_conflict, commit_hit};
 use crate::HistoryAnalysis;
 use crate::history::{FillProgress, StoredHistory};
-use crate::read::{ReadFault, ReadService};
+use crate::read::ReadService;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -391,10 +391,16 @@ fn a_commit_search_refuses_every_field_beside_query() -> TestResult {
         merge(&mut request, &extra);
         let params: SearchParams = serde_json::from_value(request.clone())?;
         let refusal = commit_conflict(&params).ok_or(format!("{request} is refused"))?;
-        let ReadFault::Invalid { field: named, .. } = refusal.fault() else {
-            return Err(format!("expected invalid_request, found {refusal}").into());
-        };
-        assert_eq!(*named, field, "{request}: {refusal}");
+        assert_eq!(
+            refusal.slug(),
+            rift_error::errors::server::read_invalid::SLUG
+        );
+        assert!(
+            refusal
+                .context()
+                .any(|(key, value)| key == "field" && value == field),
+            "{request}: {refusal}"
+        );
     }
     let plain: SearchParams = serde_json::from_value(json!({"query": "beacon", "pattern": "b"}))?;
     assert!(
@@ -426,14 +432,20 @@ fn a_commit_search_refuses_a_missing_or_empty_query() -> TestResult {
         let Err(refusal) = service.search_commits(&params) else {
             return Err(format!("{request} is refused").into());
         };
-        let ReadFault::Invalid {
-            field,
-            violation: named,
-        } = refusal.fault()
-        else {
-            return Err(format!("expected invalid_request, found {refusal}").into());
-        };
-        assert_eq!((*field, named.as_str()), ("query", violation), "{request}");
+        assert_eq!(
+            refusal.slug(),
+            rift_error::errors::server::read_invalid::SLUG
+        );
+        assert!(
+            refusal
+                .context()
+                .any(|(key, value)| key == "field" && value == "query")
+        );
+        assert!(
+            refusal
+                .context()
+                .any(|(key, value)| key == "violation" && value == violation)
+        );
     }
     Ok(())
 }

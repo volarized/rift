@@ -33,10 +33,9 @@ pub use error::{
     LimitEvidence, RetryDirective, RiftError, causes, fault_label, render_failure,
 };
 pub use identity::{
-    CompositionId, CompositionRevision, IdError, IdFault, IndexRevision, ModelId, ModelRevision,
-    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId, RevisionError,
-    RevisionFault, SourceResolverId, SourceResolverIdError, SourceResolverIdFault,
-    SourceResolverIdViolation, SourceRevision, SourceUnitId, SourceUnitIdError, SourceUnitIdFault,
+    CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision,
+    ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId,
+    SourceResolverId, SourceRevision, SourceUnitId,
     SymbolId, SymbolIdentityError, TreeRevision, WorkspaceId, encode_path, parse_symbol_identity,
     symbol_identity,
 };
@@ -45,11 +44,11 @@ pub use measurement::{
     ClockRegression, MonotonicClock, PerformanceMeasurement, SystemMonotonicClock,
 };
 pub use name::is_canonical_ascii_name;
-pub use path::{PathError, PathFault, PathKind, PathViolation, ProjectPath, SourcePath};
+pub use path::{PathKind, PathViolation, ProjectPath, SourcePath};
 pub use semantic::{
     CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
-    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder, ContributionError,
-    ContributionFault, ContributionKey, ContributionOrigin, ContributionReference,
+    CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionBuilder,
+    ContributionKey, ContributionOrigin, ContributionReference,
     ContributionRelationship, ContributionViolation, DeclarationBinding, Documentation,
     DocumentationFormat, EquivalenceEvidence, ExactKind, ExtensionKey, ExtensionValue, Extensions,
     Language, NodeId, PROVIDER_SYMBOL_ID_BYTES_MAX, PackageIdentity, PortableSymbolFacts,

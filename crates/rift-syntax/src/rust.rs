@@ -5,14 +5,14 @@ mod blanking;
 
 use std::sync::OnceLock;
 
-use rift_core::Error;
+use rift_error::errors;
 use rift_protocol::read::{Language, NodeFacet, SymbolFacet};
 use strum::VariantArray;
 use tree_sitter::{Node, Parser, Query as TreeSitterQuery, QueryCursor, StreamingIterator};
 
 use crate::document::{ByteRange, SyntaxDocument};
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault, incompatible_grammar, invalid_query};
+use crate::failure::{RiftError, invalid_query};
 use crate::provider::{SOURCE_BYTES_MAX_DEFAULT, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 /// Rust declaration kind emitted by the Tree-sitter provider.
@@ -169,11 +169,11 @@ impl RustGrammarNodeKind {
 }
 
 impl std::str::FromStr for RustGrammarNodeKind {
-    type Err = SyntaxError;
+    type Err = RiftError;
 
     fn from_str(kind: &str) -> Result<Self, Self::Err> {
         Self::from_kind(kind)
-            .ok_or_else(|| Error::new(SyntaxFault::UnknownNodeKind { kind: kind.into() }))
+            .ok_or_else(|| errors::syntax::unknown_node_kind().node_kind(kind).error())
     }
 }
 
@@ -259,8 +259,8 @@ impl RustQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] when query cannot compile.
-    pub fn new(source: &str) -> Result<Self, SyntaxError> {
+    /// Returns [`RiftError`] when query cannot compile.
+    pub fn new(source: &str) -> Result<Self, RiftError> {
         let language = rust_grammar();
         let inner = TreeSitterQuery::new(&language, source)
             .map_err(|error| invalid_query(source, error))?;
@@ -283,36 +283,35 @@ impl RustQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] for zero bound, incompatible grammar,
+    /// Returns [`RiftError`] for zero bound, incompatible grammar,
     /// cancellation, oversized source, or capture overflow.
     pub fn captures(
         &self,
         source: &str,
         captures_max: usize,
-    ) -> Result<Vec<RustQueryCapture>, SyntaxError> {
+    ) -> Result<Vec<RustQueryCapture>, RiftError> {
         if captures_max == 0 {
-            return Err(Error::new(SyntaxFault::ZeroLimit {
-                bound: SyntaxBound::CapturesMax,
-            }));
+            return errors::syntax::zero_limit().bound("captures_max").fail();
         }
         if source.len() > SOURCE_BYTES_MAX_DEFAULT {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: None,
-                source_bytes: source.len(),
-                source_bytes_max: SOURCE_BYTES_MAX_DEFAULT,
-            }));
+            return errors::syntax::source_too_large()
+                .source_bytes(source.len())
+                .source_bytes_max(SOURCE_BYTES_MAX_DEFAULT)
+                .fail();
         }
         let mut parser = rust_parser()?;
         let parsed = blanking::blank_const_trait_keywords(source);
         let tree = parser
             .parse(parsed.as_ref(), None)
-            .ok_or_else(|| Error::new(SyntaxFault::ParseCancelled { path: None }))?;
+            .ok_or_else(|| errors::syntax::parse_cancelled().error())?;
         let mut cursor = QueryCursor::new();
         let mut query_captures = cursor.captures(&self.inner, tree.root_node(), source.as_bytes());
         let mut captures = Vec::new();
         while let Some((query_match, capture_index)) = query_captures.next() {
             if captures.len() >= captures_max {
-                return Err(Error::new(SyntaxFault::TooManyCaptures { captures_max }));
+                return errors::syntax::too_many_captures()
+                    .captures_max(captures_max)
+                    .fail();
             }
             let capture = query_match.captures[*capture_index];
             captures.push(RustQueryCapture {
@@ -350,15 +349,13 @@ impl SyntaxProvider for RustSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let mut parser = rust_parser()?;
         let parsed = blanking::blank_const_trait_keywords(source.text);
-        let tree = parser.parse(parsed.as_ref(), None).ok_or_else(|| {
-            Error::new(SyntaxFault::ParseCancelled {
-                path: Some(source.path.clone()),
-            })
-        })?;
+        let tree = parser
+            .parse(parsed.as_ref(), None)
+            .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let (nodes, symbols) = extract::extract(
             tree.root_node(),
             source,
@@ -399,7 +396,7 @@ impl SyntaxProvider for RustSyntaxProvider {
 struct RustGrammarRules;
 
 impl GrammarRules for RustGrammarRules {
-    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, SyntaxError> {
+    fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         node.child_by_field_name(RustGrammarField::Name.as_str())
             .map(extract::byte_range)
             .transpose()
@@ -409,7 +406,7 @@ impl GrammarRules for RustGrammarRules {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         let Some(kind) =
             RustGrammarNodeKind::from_kind(node.kind()).and_then(RustGrammarNodeKind::symbol_kind)
@@ -471,12 +468,16 @@ fn rust_grammar() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
-fn rust_parser() -> Result<Parser, SyntaxError> {
+fn rust_parser() -> Result<Parser, RiftError> {
     let language = rust_grammar();
     let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|_| incompatible_grammar(&language))?;
+    parser.set_language(&language).map_err(|_| {
+        errors::syntax::incompatible_grammar()
+            .grammar_abi_version(language.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error()
+    })?;
     Ok(parser)
 }
 
@@ -625,7 +626,7 @@ fn is_entrypoint(visited: Visited<'_, '_>, kind: RustSymbolKind, name: &str) -> 
 /// The implementation part of one declaration: its grammar `body` or `value`
 /// field's span. `None` when the kind declares no such field, or when this
 /// node omits it - a unit struct, a `mod name;`, a valueless trait constant.
-fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>, SyntaxError> {
+fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>, RiftError> {
     let Some(field) = kind.body_field() else {
         return Ok(None);
     };
@@ -637,12 +638,11 @@ fn body_range(node: Node<'_>, kind: RustSymbolKind) -> Result<Option<ByteRange>,
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-
-    use rift_core::{ErrorCode, ErrorContext, ErrorName, ProjectPath};
+    use rift_core::ProjectPath;
+    use rift_error::errors;
 
     use super::*;
-    use crate::failure::{SyntaxViolation, position_overflow};
+    use crate::failure::{parse_cancelled, position_overflow};
 
     fn text_at(text: &str, range: ByteRange) -> &str {
         let start = usize::try_from(range.start).expect("range starts within source");
@@ -1038,16 +1038,14 @@ mod tests {
             query
                 .captures("fn first() {} fn second() {}", 1)
                 .expect_err("capture overflow must fail")
-                .fault()
-                .violation(),
-            SyntaxViolation::TooManyCaptures
+                .slug(),
+            rift_error::errors::syntax::too_many_captures::SLUG
         );
         assert_eq!(
             RustQuery::new("(missing_node) @rift.name")
                 .expect_err("invalid node kind must fail")
-                .fault()
-                .violation(),
-            SyntaxViolation::InvalidQuery
+                .slug(),
+            rift_error::errors::syntax::invalid_query::SLUG
         );
     }
 
@@ -1061,11 +1059,8 @@ mod tests {
     #[test]
     fn test_provider_enforces_source_node_depth_and_positive_limits() {
         assert_eq!(
-            SyntaxLimits::new(0, 1, 1)
-                .expect_err("zero limit")
-                .fault()
-                .violation(),
-            SyntaxViolation::ZeroLimit,
+            SyntaxLimits::new(0, 1, 1).expect_err("zero limit").slug(),
+            rift_error::errors::syntax::zero_limit::SLUG,
         );
         let source_error = RustSyntaxProvider::default()
             .analyze(
@@ -1077,8 +1072,8 @@ mod tests {
             )
             .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = RustSyntaxProvider::default()
@@ -1091,8 +1086,8 @@ mod tests {
             )
             .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = RustSyntaxProvider::default()
@@ -1104,7 +1099,10 @@ mod tests {
                 SyntaxLimits::new(100, 20, 1).expect("positive limits"),
             )
             .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     #[test]
@@ -1120,17 +1118,10 @@ mod tests {
         let error = "flumph_item"
             .parse::<RustGrammarNodeKind>()
             .expect_err("unknown kind");
-        assert_eq!(error.fault().violation(), SyntaxViolation::UnknownNodeKind);
+        assert_eq!(error.slug(), errors::syntax::unknown_node_kind::SLUG);
         assert_eq!(
-            error.descriptor().name(),
-            ErrorName::Wire(ErrorCode::InternalError)
-        );
-        assert!(error.source().is_none());
-        assert_eq!(
-            error.to_string(),
-            "the server failed in a way it did not classify: \
-             node_kind flumph_item; \
-             retry once, and report the full message if the failure repeats"
+            error.context().collect::<Vec<_>>(),
+            vec![("node_kind", "flumph_item".to_owned())]
         );
     }
 
@@ -1150,29 +1141,22 @@ mod tests {
             (SyntaxLimits::new(1, 0, 1), "syntax_nodes_max"),
             (SyntaxLimits::new(1, 1, 0), "syntax_depth_max"),
         ];
-        for (result, bound_name) in cases {
+        for (result, bound) in cases {
             let error = result.expect_err("zero bound");
+            assert_eq!(error.slug(), errors::syntax::zero_limit::SLUG);
             assert_eq!(
-                error.descriptor().name(),
-                ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-            );
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "the workspace configuration failed validation: bound {bound_name}; \
-                     correct the reported configuration field, then retry"
-                )
+                error.context().collect::<Vec<_>>(),
+                vec![("bound", bound.to_owned())]
             );
         }
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
         let error = query
             .captures("fn a() {}", 0)
             .expect_err("zero captures_max");
-        assert_eq!(error.fault().violation(), SyntaxViolation::ZeroLimit);
+        assert_eq!(error.slug(), errors::syntax::zero_limit::SLUG);
         assert_eq!(
-            error.to_string(),
-            "the workspace configuration failed validation: bound captures_max; \
-             correct the reported configuration field, then retry"
+            error.context().collect::<Vec<_>>(),
+            vec![("bound", "captures_max".to_owned())]
         );
     }
 
@@ -1187,32 +1171,25 @@ mod tests {
                 SyntaxLimits::new(3, 10, 10).expect("positive limits"),
             )
             .expect_err("source bound");
+        assert_eq!(error.slug(), errors::syntax::source_too_large::SLUG);
         assert_eq!(
-            error.descriptor().name(),
-            ErrorName::Wire(ErrorCode::LimitExceeded)
+            error.context().collect::<Vec<_>>(),
+            vec![
+                ("path", "src/lib.rs".to_owned()),
+                ("source_bytes", "9".to_owned()),
+                ("source_bytes_max", "3".to_owned()),
+            ]
         );
-        assert_eq!(
-            error.to_string(),
-            "the request exceeded a declared resource limit: \
-             path src/lib.rs, source_bytes 9, source_bytes_max 3; \
-             resize the request below the named limit, or raise that limit \
-             in the workspace configuration"
-        );
-
         let query = RustQuery::new("(function_item) @rift.item").expect("valid Rust query");
         let oversized = "a".repeat(SOURCE_BYTES_MAX_DEFAULT + 1);
         let error = query.captures(&oversized, 1).expect_err("oversized source");
-        assert_eq!(error.fault().violation(), SyntaxViolation::SourceTooLarge);
+        assert_eq!(error.slug(), errors::syntax::source_too_large::SLUG);
         assert_eq!(
-            error.to_string(),
-            format!(
-                "the request exceeded a declared resource limit: \
-                 path <raw text>, source_bytes {bytes}, source_bytes_max {max}; \
-                 resize the request below the named limit, or raise that limit \
-                 in the workspace configuration",
-                bytes = SOURCE_BYTES_MAX_DEFAULT + 1,
-                max = SOURCE_BYTES_MAX_DEFAULT,
-            )
+            error.context().collect::<Vec<_>>(),
+            vec![
+                ("source_bytes", (SOURCE_BYTES_MAX_DEFAULT + 1).to_string()),
+                ("source_bytes_max", SOURCE_BYTES_MAX_DEFAULT.to_string()),
+            ]
         );
     }
 
@@ -1227,13 +1204,18 @@ mod tests {
                 SyntaxLimits::new(100, 1, 10).expect("positive limits"),
             )
             .expect_err("node bound");
-        assert_eq!(
-            node_error.to_string(),
-            "the request exceeded a declared resource limit: \
-             path src/lib.rs, syntax_nodes_max 1; \
-             resize the request below the named limit, or raise that limit \
-             in the workspace configuration"
+        assert_eq!(node_error.slug(), errors::syntax::too_many_nodes::SLUG);
+        assert!(
+            node_error
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/lib.rs")
         );
+        assert!(
+            node_error
+                .context()
+                .any(|(key, value)| key == "syntax_nodes_max" && value == "1")
+        );
+        assert!(node_error.to_string().contains("src/lib.rs"));
 
         let depth_error = RustSyntaxProvider::default()
             .analyze(
@@ -1244,52 +1226,46 @@ mod tests {
                 SyntaxLimits::new(100, 20, 1).expect("positive limits"),
             )
             .expect_err("depth bound");
-        assert_eq!(
-            depth_error.to_string(),
-            "the request exceeded a declared resource limit: \
-             path src/lib.rs, syntax_depth_max 1; \
-             resize the request below the named limit, or raise that limit \
-             in the workspace configuration"
+        assert_eq!(depth_error.slug(), errors::syntax::too_deep::SLUG);
+        assert!(
+            depth_error
+                .context()
+                .any(|(key, value)| key == "path" && value == "src/lib.rs")
         );
+        assert!(
+            depth_error
+                .context()
+                .any(|(key, value)| key == "syntax_depth_max" && value == "1")
+        );
+        assert!(depth_error.to_string().contains("src/lib.rs"));
     }
 
     #[test]
     fn test_query_errors_report_line_reason_and_capture_limit() {
         let error = RustQuery::new("(missing_node) @rift.name").expect_err("invalid node kind");
-        assert!(error.source().is_some(), "keeps tree-sitter source");
-        assert_eq!(
-            error.descriptor().name(),
-            ErrorName::Wire(ErrorCode::InternalError)
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.slug(), errors::syntax::invalid_query::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "line_number" && value == "1")
         );
-        assert_eq!(
-            error.to_string(),
-            "the server failed in a way it did not classify: \
-             line_number 1, line_text (missing_node) @rift.name; \
-             retry once, and report the full message if the failure repeats"
-        );
-
         let query = RustQuery::new("(function_item name: (identifier) @rift.name)")
             .expect("valid Rust query");
         let error = query
             .captures("fn first() {} fn second() {}", 1)
             .expect_err("capture overflow");
-        assert_eq!(
-            error.descriptor().name(),
-            ErrorName::Wire(ErrorCode::LimitExceeded)
-        );
-        assert_eq!(
-            error.to_string(),
-            "the request exceeded a declared resource limit: \
-             captures_max 1; \
-             resize the request below the named limit, or raise that limit \
-             in the workspace configuration"
+        assert_eq!(error.slug(), errors::syntax::too_many_captures::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "captures_max" && value == "1")
         );
     }
 
     #[test]
     fn test_invalid_query_reason_covers_every_tree_sitter_error_kind() {
         use tree_sitter::QueryErrorKind;
-
         let cases = [
             ("(((", QueryErrorKind::Syntax),
             (
@@ -1302,82 +1278,54 @@ mod tests {
         ];
         for (query, kind) in cases {
             let error = RustQuery::new(query).expect_err("query must be rejected");
-            assert_eq!(error.fault().violation(), SyntaxViolation::InvalidQuery);
-            match error.fault() {
-                SyntaxFault::InvalidQuery { source, .. } => {
-                    assert_eq!(source.kind, kind, "classifies {query}");
-                }
-                other => panic!("expected InvalidQuery, got {other:?}"),
-            }
+            assert_eq!(error.slug(), errors::syntax::invalid_query::SLUG);
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<tree_sitter::QueryError>()
+                    .unwrap()
+                    .kind,
+                kind,
+                "classifies {query}"
+            );
         }
     }
 
     #[test]
     fn test_runtime_only_errors_render_full_context() {
-        let grammar = incompatible_grammar(&rust_grammar());
-        assert_eq!(
-            grammar.fault().violation(),
-            SyntaxViolation::IncompatibleGrammar
+        let language = rust_grammar();
+        let grammar = errors::syntax::incompatible_grammar()
+            .grammar_abi_version(language.abi_version())
+            .runtime_abi_min(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION)
+            .runtime_abi_max(tree_sitter::LANGUAGE_VERSION)
+            .error();
+        assert_eq!(grammar.slug(), errors::syntax::incompatible_grammar::SLUG);
+        assert!(
+            grammar
+                .context()
+                .any(|(key, _)| key == "grammar_abi_version")
         );
+        let cancelled = errors::syntax::parse_cancelled().path(&path()).error();
+        assert_eq!(cancelled.slug(), errors::syntax::parse_cancelled::SLUG);
         assert_eq!(
-            grammar.descriptor().name(),
-            ErrorName::Wire(ErrorCode::InternalError)
+            cancelled.context().collect::<Vec<_>>(),
+            vec![("path", "src/lib.rs".to_owned())]
         );
+        let cancelled_query = errors::syntax::parse_cancelled().error();
         assert_eq!(
-            grammar.to_string(),
-            format!(
-                "the server failed in a way it did not classify: \
-                 grammar_abi_version {abi}, runtime_abi_min {min}, runtime_abi_max {max}; \
-                 retry once, and report the full message if the failure repeats",
-                abi = rust_grammar().abi_version(),
-                min = tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
-                max = tree_sitter::LANGUAGE_VERSION,
-            )
+            cancelled_query.slug(),
+            errors::syntax::parse_cancelled::SLUG
         );
-
-        let cancelled = SyntaxError::new(SyntaxFault::ParseCancelled { path: Some(path()) });
-        assert_eq!(
-            cancelled.fault().violation(),
-            SyntaxViolation::ParseCancelled
-        );
-        assert_eq!(
-            cancelled.descriptor().name(),
-            ErrorName::Wire(ErrorCode::Cancelled)
-        );
-        assert!(cancelled.source().is_none());
-        assert_eq!(
-            cancelled.to_string(),
-            "the request was cancelled before it completed: path src/lib.rs; \
-             resend the request if the result is still needed"
-        );
-        let cancelled_query = SyntaxError::new(SyntaxFault::ParseCancelled { path: None });
-        assert_eq!(
-            cancelled_query.to_string(),
-            "the request was cancelled before it completed; \
-             resend the request if the result is still needed"
-        );
-
+        assert_eq!(cancelled_query.context().count(), 0);
         let mut parser = rust_parser().expect("pinned grammar loads");
         let tree = parser.parse("fn x() {}", None).expect("fixture parses");
         let overflow = position_overflow(
             tree.root_node(),
             u32::try_from(u64::MAX).expect_err("u64::MAX exceeds u32"),
         );
-        assert_eq!(
-            overflow.fault().violation(),
-            SyntaxViolation::PositionOverflow
-        );
-        assert_eq!(
-            overflow.descriptor().name(),
-            ErrorName::Wire(ErrorCode::InternalError)
-        );
-        assert!(overflow.source().is_some(), "keeps conversion source");
-        assert_eq!(
-            overflow.to_string(),
-            "the server failed in a way it did not classify: \
-             node_kind source_file, start_byte 0, end_byte 9; \
-             retry once, and report the full message if the failure repeats"
-        );
+        assert_eq!(overflow.slug(), errors::syntax::position_overflow::SLUG);
+        assert!(std::error::Error::source(&overflow).is_some());
+        assert!(overflow.context().any(|(key, _)| key == "node_kind"));
     }
 
     #[test]
@@ -1385,22 +1333,16 @@ mod tests {
         let unknown = "bogus"
             .parse::<RustGrammarNodeKind>()
             .expect_err("unregistered kind");
+        assert_eq!(unknown.slug(), errors::syntax::unknown_node_kind::SLUG);
         assert_eq!(
-            unknown.fault().violation(),
-            SyntaxViolation::UnknownNodeKind
+            unknown.context().collect::<Vec<_>>(),
+            vec![("node_kind", "bogus".to_owned())]
         );
-        assert_eq!(unknown.descriptor().code(), "internal_error");
-        assert_eq!(
-            unknown.context(),
-            vec![ErrorContext::new("node_kind", "bogus")]
-        );
-
         let zero = SyntaxLimits::new(0, 1, 1).expect_err("zero source bound");
-        assert_eq!(zero.fault().violation(), SyntaxViolation::ZeroLimit);
-        assert_eq!(zero.descriptor().code(), "configuration_invalid");
+        assert_eq!(zero.slug(), errors::syntax::zero_limit::SLUG);
         assert_eq!(
-            zero.context(),
-            vec![ErrorContext::new("bound", "source_bytes_max")]
+            zero.context().collect::<Vec<_>>(),
+            vec![("bound", "source_bytes_max".to_owned())]
         );
     }
 

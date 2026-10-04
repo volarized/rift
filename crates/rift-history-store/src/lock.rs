@@ -11,10 +11,8 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use rift_core::Error;
+use rift_error::{RiftError, errors};
 use same_file::Handle;
-
-use crate::error::{StoreError, StoreFault, folder_error};
 
 /// Attempts one opener makes to lock a live lock a sweeper keeps replacing.
 pub(crate) const LIVE_LOCK_ATTEMPTS_MAX: usize = 3;
@@ -36,10 +34,10 @@ pub(crate) fn open_lock(path: &Path) -> std::io::Result<File> {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] when the lock file cannot be opened or locked, or
+/// Returns [`RiftError`] when the lock file cannot be opened or locked, or
 /// when [`LIVE_LOCK_ATTEMPTS_MAX`] attempts each locked a file the path no
 /// longer named.
-pub(crate) fn lock_live(path: &Path) -> Result<File, StoreError> {
+pub(crate) fn lock_live(path: &Path) -> Result<File, RiftError> {
     lock_live_checked(path, &mut |_| {})
 }
 
@@ -49,20 +47,31 @@ pub(crate) fn lock_live(path: &Path) -> Result<File, StoreError> {
 pub(crate) fn lock_live_checked(
     path: &Path,
     after_lock: &mut dyn FnMut(usize),
-) -> Result<File, StoreError> {
+) -> Result<File, RiftError> {
     for attempt in 0..LIVE_LOCK_ATTEMPTS_MAX {
-        let file = open_lock(path).map_err(folder_error(path, "open live lock"))?;
-        file.lock_shared()
-            .map_err(folder_error(path, "lock live store"))?;
+        let file = open_lock(path).map_err(|source| {
+            errors::history_store::folder()
+                .operation("open live lock")
+                .path(path)
+                .detail(source)
+                .error()
+        })?;
+        file.lock_shared().map_err(|source| {
+            errors::history_store::folder()
+                .operation("lock live store")
+                .path(path)
+                .detail(source)
+                .error()
+        })?;
         after_lock(attempt);
         if names_file(path, &file) {
             return Ok(file);
         }
     }
-    Err(Error::new(StoreFault::LockUnstable {
-        path: path.to_owned(),
-        attempts: LIVE_LOCK_ATTEMPTS_MAX,
-    }))
+    errors::history_store::lock_unstable()
+        .path(path)
+        .attempts(LIVE_LOCK_ATTEMPTS_MAX)
+        .fail()
 }
 
 /// Whether `path` still names `file`: the same file by the identity the

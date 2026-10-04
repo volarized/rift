@@ -11,7 +11,7 @@ use rift_protocol::read::TextRange;
 
 use super::{
     DocumentIdentity, FusedCandidate, ParsedQuery, Path, PathMatcher, ProjectPath, RankingInput,
-    ReadError, ReadFault, ReadWarning, Resolution, ResolvedCandidate, SearchHit, SearchHitTarget,
+    ReadWarning, Resolution, ResolvedCandidate, RiftError, SearchHit, SearchHitTarget,
     SearchParamsTarget, SearchScope, WorkspaceIndex, includes, matched_fields, query_line,
     resolve_candidate, text_range,
 };
@@ -83,25 +83,23 @@ impl<'a> SearchDocumentation<'a> {
         inputs: &[RankingInput],
         target: SearchParamsTarget,
         query: &ParsedQuery,
-    ) -> Result<Vec<RankingInput>, ReadError> {
+    ) -> Result<Vec<RankingInput>, RiftError> {
         let target = match target {
             SearchParamsTarget::Documentation => DocumentationProjectionTarget::Documentation,
             SearchParamsTarget::All => DocumentationProjectionTarget::All,
             _ => return Ok(inputs.to_vec()),
         };
-        self.projection
-            .project(inputs, target, |identity, source| {
-                let range = self.document_range(identity)?;
-                let content = captured_content(self.index, self.resolution, source)?;
-                let start = usize::try_from(range.start).ok()?;
-                let end = usize::try_from(range.end).ok()?;
-                let (_, found, _) = query_line(content.get(start..end)?, query)?;
-                Some(TextRange {
-                    start: range.start.checked_add(found.start)?,
-                    end: range.start.checked_add(found.end)?,
-                })
+        self.projection.project(inputs, target, |identity, source| {
+            let range = self.document_range(identity)?;
+            let content = captured_content(self.index, self.resolution, source)?;
+            let start = usize::try_from(range.start).ok()?;
+            let end = usize::try_from(range.end).ok()?;
+            let (_, found, _) = query_line(content.get(start..end)?, query)?;
+            Some(TextRange {
+                start: range.start.checked_add(found.start)?,
+                end: range.start.checked_add(found.end)?,
             })
-            .map_err(ReadFault::documentation)
+        })
     }
 
     fn document_range(&self, identity: &DocumentIdentity) -> Option<TextRange> {

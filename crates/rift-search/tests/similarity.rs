@@ -1,7 +1,8 @@
 //! Cosine ranking over a corpus built in the test, so no suite loads a model.
 
+use rift_error::errors;
 use rift_index::StoredVector;
-use rift_search::{SearchViolation, VectorMatch, nearest};
+use rift_search::{VectorMatch, nearest};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -40,12 +41,14 @@ fn corpus() -> Vec<StoredVector> {
 #[test]
 fn a_query_with_no_values_is_refused_before_any_vector_is_scanned() {
     let error = nearest(&[], &corpus(), 4).expect_err("a query of no values ranks nothing");
-    assert_eq!(
-        error.fault().violation(),
-        SearchViolation::VectorWidthMismatch
-    );
+    assert_eq!(error.slug(), errors::search::vector_width_mismatch::SLUG);
     assert!(
-        error.to_string().contains("query width 0, stored width 3"),
+        error
+            .context()
+            .any(|(key, value)| key == "query_width" && value == "0")
+            && error
+                .context()
+                .any(|(key, value)| key == "stored_width" && value == "3"),
         "the refusal names both widths: {error}"
     );
 }
@@ -55,14 +58,10 @@ fn a_corpus_row_of_another_width_is_refused_and_the_message_names_both() {
     let mut rows = corpus();
     rows.push(StoredVector::new("narrow".to_owned(), vec![1.0, 0.0]));
     let error = nearest(&QUERY, &rows, 4).expect_err("a row of another width is not an answer");
-    assert_eq!(
-        error.fault().violation(),
-        SearchViolation::VectorWidthMismatch
-    );
+    assert_eq!(error.slug(), errors::search::vector_width_mismatch::SLUG);
     let rendered = error.to_string();
-    assert!(rendered.contains("vector_width_mismatch"), "{rendered}");
     assert!(
-        rendered.contains("query width 3, stored width 2"),
+        rendered.contains("query width 3 does not match stored vector width 2"),
         "{rendered}"
     );
 }

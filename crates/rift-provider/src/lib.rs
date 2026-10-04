@@ -15,10 +15,9 @@ mod normalization;
 mod publication;
 
 pub use composition::{
-    CacheError, CacheFault, CacheUpdate, CacheViolation, Component, CompositionBuilder,
-    CompositionEditor, CompositionError, CompositionFault, CompositionScope, Flow, FlowCardinality,
-    JoinCoverage, JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide, PerKeyCache,
-    ProviderComposition, StageDescriptor, StagePath, join_keyed,
+    CacheUpdate, Component, CompositionBuilder, CompositionEditor, CompositionScope, Flow,
+    FlowCardinality, JoinCoverage, JoinItem, JoinSides, KeyJoinPolicy, KeyedFlow, MissingSide,
+    PerKeyCache, ProviderComposition, StageDescriptor, StagePath, join_keyed,
 };
 pub use normalization::{
     AssociationCandidate, AssociationState, NormalizedGraph, NormalizedReference,
@@ -26,8 +25,7 @@ pub use normalization::{
 };
 pub use publication::{
     CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, CONTRIBUTIONS_TOTAL_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT,
-    ProviderPublication, PublicationError, PublicationFault, PublicationLimits, PublicationSet,
-    PublicationStore, PublicationViolation,
+    ProviderPublication, PublicationLimits, PublicationSet, PublicationStore,
 };
 
 /// Compile-time marker for provider-layer ownership.

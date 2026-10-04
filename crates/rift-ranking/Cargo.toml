@@ -11,6 +11,7 @@ description = "Storage-independent retrieval documents, query construction, and 
 workspace = true
 
 [dependencies]
+rift-error.workspace = true
 data-encoding.workspace = true
 regex-automata.workspace = true
 regex-syntax.workspace = true

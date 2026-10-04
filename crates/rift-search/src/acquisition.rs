@@ -17,7 +17,7 @@ use rift_core::constants::{HTTPS_SCHEME, REDIRECT_HOPS_MAX};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::encoder::{CONFIGURATION_FILE, ModelFiles, TOKENIZER_FILE, WEIGHTS_FILE};
-use crate::error::{SearchError, SearchFault, SearchViolation};
+use rift_error::{RiftError, errors};
 
 /// The variable naming the hub root directly.
 const HUB_CACHE_VARIABLE: &str = "HF_HUB_CACHE";
@@ -137,9 +137,12 @@ impl ModelSource {
     /// Returns `model_source_invalid` naming `model` and the form that was
     /// expected, so an operator learns what to write rather than that the value
     /// was rejected.
-    pub fn repository(model: &str) -> Result<Self, SearchError> {
+    pub fn repository(model: &str) -> Result<Self, RiftError> {
         match repository_violation(model) {
-            Some(expected) => Err(model_source_invalid(model, expected)),
+            Some(expected) => errors::search::model_source_invalid()
+                .model(model)
+                .expected(expected)
+                .fail(),
             None => Ok(Self::at_revision(model)),
         }
     }
@@ -161,9 +164,12 @@ impl ModelSource {
     /// Returns `model_source_invalid` naming `model` and the form that was
     /// expected, so an operator learns what to write rather than that the value
     /// was rejected.
-    pub fn directory(model: &str, root: &Path) -> Result<Self, SearchError> {
+    pub fn directory(model: &str, root: &Path) -> Result<Self, RiftError> {
         match relative_path_violation(model) {
-            Some(expected) => Err(model_source_invalid(model, expected)),
+            Some(expected) => errors::search::model_source_invalid()
+                .model(model)
+                .expected(expected)
+                .fail(),
             None => Ok(Self::Directory(root.join(model))),
         }
     }
@@ -366,7 +372,7 @@ trait FileTransport {
         url: &str,
         destination: &Path,
         bytes_max: u64,
-    ) -> Result<FetchedFile, SearchError>;
+    ) -> Result<FetchedFile, RiftError>;
 }
 
 /// The client one acquisition fetches through.
@@ -376,7 +382,7 @@ struct HubTransport {
 
 impl HubTransport {
     /// Builds a client that follows only https redirects, within a hop bound.
-    fn new(timeout: Duration) -> Result<Self, SearchError> {
+    fn new(timeout: Duration) -> Result<Self, RiftError> {
         let redirects = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= REDIRECT_HOPS_MAX
                 || attempt.url().scheme() != HTTPS_SCHEME
@@ -392,7 +398,12 @@ impl HubTransport {
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .user_agent(ACQUISITION_USER_AGENT)
             .build()
-            .map_err(download_failure)?;
+            .map_err(|source| {
+                errors::search::model_download_failed()
+                    .subject("model file download")
+                    .source(source)
+                    .error()
+            })?;
         Ok(Self { client })
     }
 }
@@ -403,29 +414,50 @@ impl FileTransport for HubTransport {
         url: &str,
         destination: &Path,
         bytes_max: u64,
-    ) -> Result<FetchedFile, SearchError> {
+    ) -> Result<FetchedFile, RiftError> {
         let mut response = self
             .client
             .get(url)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(download_failure)?;
+            .map_err(|source| {
+                errors::search::model_download_failed()
+                    .subject("model file download")
+                    .source(source)
+                    .error()
+            })?;
         if response
             .content_length()
             .is_some_and(|length| length > bytes_max)
         {
-            return Err(download_too_large(url, bytes_max));
+            return errors::search::model_download_too_large()
+                .url(url)
+                .bytes_max(bytes_max)
+                .fail();
         }
         let declared = FetchedFile::from_headers(response.headers());
         let mut output = tokio::fs::File::create(destination)
             .await
-            .map_err(download_failure)?;
+            .map_err(|source| {
+                errors::search::model_download_failed()
+                    .subject("model file download")
+                    .source(source)
+                    .error()
+            })?;
         let received = write_bounded_body(&mut response, &mut output, bytes_max).await?;
         if received == 0 || received > bytes_max {
-            return Err(download_too_large(url, bytes_max));
+            return errors::search::model_download_too_large()
+                .url(url)
+                .bytes_max(bytes_max)
+                .fail();
         }
-        output.sync_all().await.map_err(download_failure)?;
+        output.sync_all().await.map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?;
         Ok(declared)
     }
 }
@@ -440,18 +472,26 @@ async fn write_bounded_body(
     response: &mut reqwest::Response,
     output: &mut tokio::fs::File,
     bytes_max: u64,
-) -> Result<u64, SearchError> {
+) -> Result<u64, RiftError> {
     let ceiling = bytes_max.saturating_add(1);
     let mut received = 0_u64;
     while received < ceiling {
-        let Some(chunk) = response.chunk().await.map_err(download_failure)? else {
+        let Some(chunk) = response.chunk().await.map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?
+        else {
             break;
         };
         let kept = bytes_within_budget(chunk.len(), ceiling - received);
-        output
-            .write_all(&chunk[..kept])
-            .await
-            .map_err(download_failure)?;
+        output.write_all(&chunk[..kept]).await.map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?;
         received = received.saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
     }
     Ok(received)
@@ -506,7 +546,7 @@ impl HubEnvironment {
     ///
     /// Returns `model_cache_unavailable` when no variable and no home directory
     /// names a root.
-    fn cache_root(&self) -> Result<PathBuf, SearchError> {
+    fn cache_root(&self) -> Result<PathBuf, RiftError> {
         self.hub_cache
             .clone()
             .or_else(|| self.hub_home.as_ref().map(|home| home.join(HUB_DIRECTORY)))
@@ -522,7 +562,7 @@ impl HubEnvironment {
                         .join(HUB_DIRECTORY)
                 })
             })
-            .ok_or_else(cache_unavailable)
+            .ok_or_else(|| errors::search::model_cache_unavailable().error())
     }
 
     /// The origin one file is read from.
@@ -638,11 +678,14 @@ impl RepositoryCache {
         file: ModelFile,
         limits: AcquisitionLimits,
         transport: &T,
-    ) -> Result<FetchedBlob, SearchError> {
+    ) -> Result<FetchedBlob, RiftError> {
         let blobs = self.blobs();
-        tokio::fs::create_dir_all(&blobs)
-            .await
-            .map_err(download_failure)?;
+        tokio::fs::create_dir_all(&blobs).await.map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?;
         let staged = blobs.join(staged_name(file.name));
         let url = origin.file_url(file.name);
         let accepted = fetch_with_retry(transport, &url, &staged, file.bytes_max, limits)
@@ -667,11 +710,13 @@ fn accepted_blob(
     revision: &str,
     url: &str,
     blobs: &Path,
-) -> Result<FetchedBlob, SearchError> {
+) -> Result<FetchedBlob, RiftError> {
     let commit = accepted_segment(fetched.commit().unwrap_or(revision))?;
-    let etag = fetched
-        .etag()
-        .ok_or_else(|| download_refused(format!("`{url}`: expected an `etag` header")))?;
+    let etag = fetched.etag().ok_or_else(|| {
+        errors::search::model_download_failed()
+            .subject(format!("`{url}`: expected an `etag` header"))
+            .error()
+    })?;
     Ok(FetchedBlob {
         commit,
         blob: blobs.join(accepted_segment(etag)?),
@@ -696,9 +741,11 @@ fn segment_violation(value: &str) -> Option<&'static str> {
 /// become path segments. A value carrying a separator or a dot segment would
 /// address a path outside the repository, and is refused before any path is
 /// built from it.
-fn accepted_segment(value: &str) -> Result<String, SearchError> {
+fn accepted_segment(value: &str) -> Result<String, RiftError> {
     match segment_violation(value) {
-        Some(expected) => Err(download_refused(format!("`{value}`: expected {expected}"))),
+        Some(expected) => errors::search::model_download_failed()
+            .subject(format!("`{value}`: expected {expected}"))
+            .fail(),
         None => Ok(value.to_owned()),
     }
 }
@@ -715,7 +762,7 @@ async fn fetch_with_retry<T: FileTransport>(
     destination: &Path,
     bytes_max: u64,
     limits: AcquisitionLimits,
-) -> Result<FetchedFile, SearchError> {
+) -> Result<FetchedFile, RiftError> {
     let mut attempt = 1_u32;
     loop {
         let failure = match transport.fetch(url, destination, bytes_max).await {
@@ -754,7 +801,7 @@ fn staged_name(name: &str) -> String {
 ///
 /// The removal is best effort: the staged name is one this process made, and a
 /// name no later run reads either way.
-async fn discard(staged: &Path, failure: SearchError) -> SearchError {
+async fn discard(staged: &Path, failure: RiftError) -> RiftError {
     let _ = tokio::fs::remove_file(staged).await;
     failure
 }
@@ -763,7 +810,7 @@ async fn discard(staged: &Path, failure: SearchError) -> SearchError {
 ///
 /// The cache belongs to every Hugging Face client on the machine, so a blob
 /// another client wrote is never rewritten.
-async fn place_blob(staged: &Path, blob: &Path) -> Result<(), SearchError> {
+async fn place_blob(staged: &Path, blob: &Path) -> Result<(), RiftError> {
     if blob.exists() {
         let _ = tokio::fs::remove_file(staged).await;
         return Ok(());
@@ -777,14 +824,19 @@ async fn place_blob(staged: &Path, blob: &Path) -> Result<(), SearchError> {
 /// follows when linking fails, which is what `huggingface_hub` does on a
 /// filesystem that has no links. A symlink is never used, because creating one
 /// needs privileges on Windows.
-async fn place_in_snapshot(blob: &Path, snapshot: &Path, name: &str) -> Result<(), SearchError> {
+async fn place_in_snapshot(blob: &Path, snapshot: &Path, name: &str) -> Result<(), RiftError> {
     let destination = snapshot.join(name);
     if destination.exists() {
         return Ok(());
     }
     tokio::fs::create_dir_all(snapshot)
         .await
-        .map_err(download_failure)?;
+        .map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?;
     if tokio::fs::hard_link(blob, &destination).await.is_ok() {
         return Ok(());
     }
@@ -792,33 +844,47 @@ async fn place_in_snapshot(blob: &Path, snapshot: &Path, name: &str) -> Result<(
 }
 
 /// Copies `blob` to `name` in `directory` through a staged name there.
-async fn copy_atomically(blob: &Path, directory: &Path, name: &str) -> Result<(), SearchError> {
+async fn copy_atomically(blob: &Path, directory: &Path, name: &str) -> Result<(), RiftError> {
     let staged = directory.join(staged_name(name));
-    tokio::fs::copy(blob, &staged)
-        .await
-        .map_err(download_failure)?;
+    tokio::fs::copy(blob, &staged).await.map_err(|source| {
+        errors::search::model_download_failed()
+            .subject("model file download")
+            .source(source)
+            .error()
+    })?;
     rename_or_discard(&staged, &directory.join(name)).await
 }
 
 /// Writes `bytes` to `name` in `directory` through a staged name there.
-async fn write_atomically(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), SearchError> {
+async fn write_atomically(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), RiftError> {
     tokio::fs::create_dir_all(directory)
         .await
-        .map_err(download_failure)?;
+        .map_err(|source| {
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(source)
+                .error()
+        })?;
     let staged = directory.join(staged_name(name));
-    tokio::fs::write(&staged, bytes)
-        .await
-        .map_err(download_failure)?;
+    tokio::fs::write(&staged, bytes).await.map_err(|source| {
+        errors::search::model_download_failed()
+            .subject("model file download")
+            .source(source)
+            .error()
+    })?;
     rename_or_discard(&staged, &directory.join(name)).await
 }
 
 /// Renames a staged file into place, removing it when the rename fails.
-async fn rename_or_discard(staged: &Path, destination: &Path) -> Result<(), SearchError> {
+async fn rename_or_discard(staged: &Path, destination: &Path) -> Result<(), RiftError> {
     match tokio::fs::rename(staged, destination).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = tokio::fs::remove_file(staged).await;
-            Err(download_failure(error))
+            errors::search::model_download_failed()
+                .subject("model file download")
+                .source(error)
+                .fail()
         }
     }
 }
@@ -845,7 +911,7 @@ async fn rename_or_discard(staged: &Path, destination: &Path) -> Result<(), Sear
 pub async fn acquire(
     source: &ModelSource,
     limits: AcquisitionLimits,
-) -> Result<ModelFiles, SearchError> {
+) -> Result<ModelFiles, RiftError> {
     acquire_from(source, limits, &HubEnvironment::from_process()).await
 }
 
@@ -854,7 +920,7 @@ async fn acquire_from(
     source: &ModelSource,
     limits: AcquisitionLimits,
     environment: &HubEnvironment,
-) -> Result<ModelFiles, SearchError> {
+) -> Result<ModelFiles, RiftError> {
     match source {
         ModelSource::Directory(directory) => ModelFiles::in_directory(directory),
         ModelSource::Repository {
@@ -882,7 +948,7 @@ async fn acquire_repository<T: FileTransport>(
     limits: AcquisitionLimits,
     transport: &T,
     root: &Path,
-) -> Result<ModelFiles, SearchError> {
+) -> Result<ModelFiles, RiftError> {
     let cache = RepositoryCache::new(root, &origin.repository);
     if let Some((snapshot, commit)) = cache.cached_snapshot(origin.revision()) {
         return ModelFiles::in_snapshot(&snapshot, &commit);
@@ -899,45 +965,6 @@ async fn acquire_repository<T: FileTransport>(
     }
     write_atomically(&cache.refs(), origin.revision(), fetched.commit.as_bytes()).await?;
     ModelFiles::in_snapshot(&snapshot, &fetched.commit)
-}
-
-/// One model identifier refusal, naming the value and the form expected.
-fn model_source_invalid(model: &str, expected: &str) -> SearchError {
-    SearchError::new(
-        SearchFault::new(SearchViolation::ModelSourceInvalid)
-            .about(format!("`{model}`: expected {expected}")),
-    )
-}
-
-/// The refusal a machine with no resolvable cache root earns.
-fn cache_unavailable() -> SearchError {
-    SearchError::new(SearchFault::new(SearchViolation::ModelCacheUnavailable).about(format!(
-        "no Hugging Face cache directory resolved: set `{HUB_CACHE_VARIABLE}`, `{HUB_HOME_VARIABLE}`, `{CACHE_HOME_VARIABLE}`, or `{USER_HOME_VARIABLE}`"
-    )))
-}
-
-/// One download failure, naming what the transport or the filesystem reported.
-fn download_failure(source: impl std::error::Error + Send + Sync + 'static) -> SearchError {
-    let subject = source.to_string();
-    SearchError::new(
-        SearchFault::new(SearchViolation::ModelDownloadFailed)
-            .about(subject)
-            .caused_by(source),
-    )
-}
-
-/// One download refusal with no failure of its own to carry.
-fn download_refused(subject: impl Into<String>) -> SearchError {
-    SearchError::new(SearchFault::new(SearchViolation::ModelDownloadFailed).about(subject))
-}
-
-/// The refusal a body that was empty or ran past its ceiling earns.
-fn download_too_large(url: &str, bytes_max: u64) -> SearchError {
-    SearchError::new(
-        SearchFault::new(SearchViolation::ModelDownloadTooLarge).about(format!(
-            "`{url}` was empty or exceeded {bytes_max} bytes: expected a body within the ceiling this file is fetched under"
-        )),
-    )
 }
 
 #[cfg(test)]
@@ -959,7 +986,7 @@ mod tests {
         write_atomically,
     };
     use crate::encoder::ModelFiles;
-    use crate::error::{SearchError, SearchViolation};
+    use rift_error::{RiftError, errors};
 
     type Fallible<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
     type TestResult = Fallible<()>;
@@ -1029,14 +1056,21 @@ mod tests {
             url: &str,
             destination: &Path,
             _bytes_max: u64,
-        ) -> Result<FetchedFile, SearchError> {
+        ) -> Result<FetchedFile, RiftError> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             if call <= self.failures {
-                return Err(download_refused(format!("`{url}`: fixture failure {call}")));
+                return errors::search::model_download_failed()
+                    .subject(format!("`{url}`: fixture failure {call}"))
+                    .fail();
             }
             tokio::fs::write(destination, &self.content)
                 .await
-                .map_err(download_failure)?;
+                .map_err(|source| {
+                    errors::search::model_download_failed()
+                        .subject("model file download")
+                        .source(source)
+                        .error()
+                })?;
             Ok(FetchedFile::new(self.commit.clone(), self.etag.clone()))
         }
     }
@@ -1051,10 +1085,12 @@ mod tests {
             url: &str,
             _destination: &Path,
             _bytes_max: u64,
-        ) -> impl std::future::Future<Output = Result<FetchedFile, SearchError>> {
-            std::future::ready(Err(download_refused(format!(
-                "`{url}`: the cache was expected to answer"
-            ))))
+        ) -> impl std::future::Future<Output = Result<FetchedFile, RiftError>> {
+            std::future::ready(
+                errors::search::model_download_failed()
+                    .subject(format!("`{url}`: the cache was expected to answer"))
+                    .fail(),
+            )
         }
     }
 
@@ -1068,11 +1104,18 @@ mod tests {
             url: &str,
             destination: &Path,
             _bytes_max: u64,
-        ) -> Result<FetchedFile, SearchError> {
+        ) -> Result<FetchedFile, RiftError> {
             tokio::fs::write(destination, b"partial")
                 .await
-                .map_err(download_failure)?;
-            Err(download_refused(format!("`{url}`: the connection ended")))
+                .map_err(|source| {
+                    errors::search::model_download_failed()
+                        .subject("model file download")
+                        .source(source)
+                        .error()
+                })?;
+            errors::search::model_download_failed()
+                .subject(format!("`{url}`: the connection ended"))
+                .fail()
         }
     }
 
@@ -1097,11 +1140,15 @@ mod tests {
             url: &str,
             _destination: &Path,
             _bytes_max: u64,
-        ) -> impl std::future::Future<Output = Result<FetchedFile, SearchError>> {
+        ) -> impl std::future::Future<Output = Result<FetchedFile, RiftError>> {
             if let Ok(mut urls) = self.urls.lock() {
                 urls.push(url.to_owned());
             }
-            std::future::ready(Err(download_refused(format!("`{url}`: recorded"))))
+            std::future::ready(
+                errors::search::model_download_failed()
+                    .subject(format!("`{url}`: recorded"))
+                    .fail(),
+            )
         }
     }
 
@@ -1197,10 +1244,7 @@ mod tests {
         let error = environment(&[])
             .cache_root()
             .expect_err("no variable names a root");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelCacheUnavailable
-        );
+        assert_eq!(error.slug(), errors::search::model_cache_unavailable::SLUG);
         let rendered = error.to_string();
         assert!(rendered.contains("model_cache_unavailable"), "{rendered}");
         assert!(rendered.contains(HUB_CACHE_VARIABLE), "{rendered}");
@@ -1417,10 +1461,7 @@ mod tests {
             )
             .await
             .expect_err("an origin cannot name a path outside its repository");
-            assert_eq!(
-                error.fault().violation(),
-                SearchViolation::ModelDownloadFailed
-            );
+            assert_eq!(error.slug(), errors::search::model_download_failed::SLUG);
             let entries: Vec<_> = std::fs::read_dir(root.path())?.collect();
             assert_eq!(entries.len(), 1, "only the repository directory was made");
             assert!(root.path().join(REPOSITORY_DIRECTORY).is_dir());
@@ -1441,10 +1482,7 @@ mod tests {
         )
         .await
         .expect_err("a blob has no name without an etag");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelDownloadFailed
-        );
+        assert_eq!(error.slug(), errors::search::model_download_failed::SLUG);
         assert!(error.to_string().contains("etag"), "{error}");
         Ok(())
     }
@@ -1460,10 +1498,7 @@ mod tests {
         )
         .await
         .expect_err("a cut connection must refuse");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelDownloadFailed
-        );
+        assert_eq!(error.slug(), errors::search::model_download_failed::SLUG);
         let cache = RepositoryCache::new(root.path(), REPOSITORY);
         assert!(!cache.refs().join(DEFAULT_REVISION).exists());
         assert_eq!(
@@ -1558,8 +1593,8 @@ mod tests {
             .await
             .expect_err("no variable names a cache root");
         assert_eq!(
-            nowhere.fault().violation(),
-            SearchViolation::ModelCacheUnavailable
+            nowhere.slug(),
+            errors::search::model_cache_unavailable::SLUG
         );
         Ok(())
     }
@@ -1593,10 +1628,7 @@ mod tests {
         let error = place_in_snapshot(&absent, &snapshot, "tokenizer.json")
             .await
             .expect_err("a blob that is not there can neither be linked nor copied");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelDownloadFailed
-        );
+        assert_eq!(error.slug(), errors::search::model_download_failed::SLUG);
         place_in_snapshot(&blob, &snapshot, CONFIGURATION_FILE).await?;
         assert_eq!(
             std::fs::read_to_string(snapshot.join(CONFIGURATION_FILE))?,
@@ -1614,10 +1646,7 @@ mod tests {
         let error = write_atomically(&directory, DEFAULT_REVISION, COMMIT.as_bytes())
             .await
             .expect_err("a non-empty directory cannot be replaced by a rename");
-        assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelDownloadFailed
-        );
+        assert_eq!(error.slug(), errors::search::model_download_failed::SLUG);
         assert_eq!(
             std::fs::read_dir(&directory)?.count(),
             1,
@@ -1650,12 +1679,12 @@ mod tests {
         url: &str,
         destination: &Path,
         bytes_max: u64,
-        expected: SearchViolation,
+        expected: rift_error::ErrorSlug,
     ) {
         let error = FileTransport::fetch(transport, url, destination, bytes_max)
             .await
             .expect_err("the fetch must be refused");
-        assert_eq!(error.fault().violation(), expected, "{url}: {error}");
+        assert_eq!(error.slug(), expected, "{url}: {error}");
     }
 
     #[tokio::test]
@@ -1679,8 +1708,8 @@ mod tests {
         assert_eq!(fetched.etag(), Some(ETAG));
         assert_eq!(std::fs::read(&destination)?, b"payload");
 
-        let too_large = SearchViolation::ModelDownloadTooLarge;
-        let failed = SearchViolation::ModelDownloadFailed;
+        let too_large = errors::search::model_download_too_large::SLUG;
+        let failed = errors::search::model_download_failed::SLUG;
         assert_refused(
             &transport,
             &format!("{endpoint}/declared"),
@@ -1740,8 +1769,8 @@ mod tests {
             .await
             .expect_err("the hop is followed to a port that refuses it");
         assert_eq!(
-            error.fault().violation(),
-            SearchViolation::ModelDownloadFailed,
+            error.slug(),
+            errors::search::model_download_failed::SLUG,
             "an https hop is followed rather than stopped: {error}"
         );
         server.join().map_err(|_| "the canned origin must finish")?;

@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::document::composition_revision;
 use crate::encoder::Encoder;
-use crate::error::{SearchError, SearchFault, SearchViolation};
+use rift_error::{RiftError, errors};
 
 /// Inputs one local embedding call may carry, at most.
 ///
@@ -293,7 +293,7 @@ impl EmbeddingModels {
         &self,
         texts: Vec<String>,
         schedule: BatchSchedule,
-    ) -> Result<Vec<Vec<f32>>, SearchError> {
+    ) -> Result<Vec<Vec<f32>>, RiftError> {
         match self {
             Self::Local(pair) => embed_all(&pair.documents, texts, schedule, pair.space()).await,
             Self::OpenAi(pair) => embed_all(&pair.documents, texts, schedule, pair.space()).await,
@@ -305,7 +305,7 @@ impl EmbeddingModels {
     /// # Errors
     ///
     /// Returns the same refusals [`Self::embed_documents`] does.
-    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, SearchError> {
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, RiftError> {
         let schedule = BatchSchedule::new(1, 1);
         let embedded = match self {
             Self::Local(pair) => {
@@ -315,10 +315,11 @@ impl EmbeddingModels {
                 embed_all(&pair.query, vec![text.to_owned()], schedule, pair.space()).await
             }
         }?;
-        embedded
-            .into_iter()
-            .next()
-            .ok_or_else(|| SearchError::new(SearchFault::new(SearchViolation::EncodeFailed)))
+        embedded.into_iter().next().ok_or_else(|| {
+            errors::search::encode_failed()
+                .stage("one query produced no vector")
+                .error()
+        })
     }
 }
 
@@ -339,7 +340,7 @@ async fn embed_all<Model>(
     texts: Vec<String>,
     schedule: BatchSchedule,
     space: &EmbeddingSpace,
-) -> Result<Vec<Vec<f32>>, SearchError>
+) -> Result<Vec<Vec<f32>>, RiftError>
 where
     Model: EmbeddingModel + Clone + Send + Sync + 'static,
 {
@@ -366,18 +367,20 @@ where
     }
     let mut answered = Vec::with_capacity(texts.len());
     for held in placed {
-        answered.extend(
-            held.ok_or_else(|| SearchError::new(SearchFault::new(SearchViolation::EncodeFailed)))?,
-        );
+        answered.extend(held.ok_or_else(|| {
+            errors::search::encode_failed()
+                .stage("scheduled batch returned no vectors")
+                .error()
+        })?);
     }
     if answered.len() != texts.len() {
-        return Err(SearchError::new(
-            SearchFault::new(SearchViolation::EncodeFailed).about(format!(
+        return errors::search::encode_failed()
+            .stage(format!(
                 "{} vectors for {} inputs",
                 answered.len(),
                 texts.len()
-            )),
-        ));
+            ))
+            .fail();
     }
     Ok(answered)
 }
@@ -385,19 +388,21 @@ where
 /// The batch type one scheduled embedding task answers with.
 type BatchAnswer = (
     usize,
-    Result<Result<Vec<Vec<f32>>, SearchError>, EmbeddingError>,
+    Result<Result<Vec<Vec<f32>>, RiftError>, EmbeddingError>,
 );
 
 /// Waits for one batch and files it under the position its inputs came from.
 async fn collect_batch(
     running: &mut tokio::task::JoinSet<BatchAnswer>,
     placed: &mut [Option<Vec<Vec<f32>>>],
-) -> Result<(), SearchError> {
+) -> Result<(), RiftError> {
     let Some(joined) = running.join_next().await else {
         return Ok(());
     };
-    let (position, answered) = joined.map_err(task_failed)?;
-    let embedded = answered.map_err(embedding_failed)??;
+    let (position, answered) =
+        joined.map_err(|source| errors::search::task_failed().source(source).error())?;
+    let embedded =
+        answered.map_err(|source| errors::search::encode_failed().source(source).error())??;
     placed[position] = Some(embedded);
     Ok(())
 }
@@ -408,20 +413,23 @@ async fn collect_batch(
 /// Rig returns `f64`. Rift stores finite `f32`, which is what the local index
 /// already holds and what a later global store would carry, so the conversion
 /// happens once here rather than at every read.
-fn narrowed(embedded: Vec<Embedding>, width: usize) -> Result<Vec<Vec<f32>>, SearchError> {
+fn narrowed(embedded: Vec<Embedding>, width: usize) -> Result<Vec<Vec<f32>>, RiftError> {
     embedded
         .into_iter()
         .map(|one| {
             if one.vec.len() != width {
-                return Err(SearchError::new(SearchFault::new(
-                    SearchViolation::VectorWidthMismatch,
-                )));
+                return errors::search::vector_width_mismatch()
+                    .query_width(one.vec.len())
+                    .stored_width(width)
+                    .fail();
             }
             one.vec
                 .into_iter()
                 .map(|value| {
                     stored_coordinate(value).ok_or_else(|| {
-                        SearchError::new(SearchFault::new(SearchViolation::VectorWidthMismatch))
+                        errors::search::vector_coordinate_invalid()
+                            .coordinate(value.to_string())
+                            .error()
                     })
                 })
                 .collect()
@@ -443,16 +451,6 @@ fn narrowed(embedded: Vec<Embedding>, width: usize) -> Result<Vec<Vec<f32>>, Sea
 fn stored_coordinate(value: f64) -> Option<f32> {
     let narrowed = value as f32;
     narrowed.is_finite().then_some(narrowed)
-}
-
-/// One blocking or scheduled task that did not return.
-fn task_failed(source: tokio::task::JoinError) -> SearchError {
-    SearchError::new(SearchFault::new(SearchViolation::TaskFailed).caused_by(source))
-}
-
-/// One model refusal, carried as this crate's own encode failure.
-fn embedding_failed(source: EmbeddingError) -> SearchError {
-    SearchError::new(SearchFault::new(SearchViolation::EncodeFailed).caused_by(source))
 }
 
 /// The already loaded encoder a local model handle is cloned from.
@@ -586,7 +584,7 @@ fn joined(source: tokio::task::JoinError) -> EmbeddingError {
 }
 
 /// One encoder refusal, as Rig's own failure.
-fn encoded(source: SearchError) -> EmbeddingError {
+fn encoded(source: RiftError) -> EmbeddingError {
     EmbeddingError::DocumentError(Box::new(source))
 }
 
@@ -670,14 +668,16 @@ impl RiftOpenAiEmbeddingModel {
     /// and Rig 0.42.0 never constructs `ClientBuilderError::InvalidProperty`, so
     /// its builder carries no validation of its own. Acceptance refuses a
     /// malformed endpoint before it reaches here.
-    pub fn new(settings: &RemoteEmbeddingSettings) -> Result<Self, SearchError> {
+    pub fn new(settings: &RemoteEmbeddingSettings) -> Result<Self, RiftError> {
         let http = reqwest::Client::builder()
             .timeout(settings.request_timeout)
             .build()
             .map_err(|source| {
-                SearchError::new(
-                    SearchFault::new(SearchViolation::ModelSourceInvalid).caused_by(source),
-                )
+                errors::search::model_source_invalid()
+                    .model("OpenAI-compatible endpoint")
+                    .expected("a valid base URL")
+                    .source(source)
+                    .error()
             })?;
         let client = openai::Client::builder()
             .api_key(settings.api_key.clone())
@@ -685,9 +685,11 @@ impl RiftOpenAiEmbeddingModel {
             .http_client(http)
             .build()
             .map_err(|source| {
-                SearchError::new(
-                    SearchFault::new(SearchViolation::ModelSourceInvalid).caused_by(source),
-                )
+                errors::search::model_source_invalid()
+                    .model("OpenAI-compatible endpoint")
+                    .expected("a valid base URL")
+                    .source(source)
+                    .error()
             })?;
         Ok(Self {
             client,
@@ -923,8 +925,7 @@ mod tests {
     use super::{
         AttemptOutcome, BatchSchedule, EmbeddingDatum, EmbeddingSpace, HttpClientError,
         LOCAL_INPUTS_MAX, QueryTransformation, RemoteEmbeddingSettings, RiftOpenAiEmbeddingModel,
-        SearchViolation, embed_all, narrowed, outcome_of, outcome_of_status, placed_by_index,
-        stored_coordinate,
+        embed_all, narrowed, outcome_of, outcome_of_status, placed_by_index, stored_coordinate,
     };
     use rig_core::embeddings::{Embedding, EmbeddingModel};
     use std::time::Duration;
@@ -983,7 +984,35 @@ mod tests {
             vec: vec![1.0, 2.0],
         }];
         assert!(narrowed(embedded.clone(), 2).is_ok());
-        assert!(narrowed(embedded, 3).is_err());
+        let refused = narrowed(embedded, 3).expect_err("wrong vector width must refuse");
+        assert_eq!(refused.slug(), errors::search::vector_width_mismatch::SLUG);
+        assert!(
+            refused
+                .context()
+                .any(|(key, value)| key == "query_width" && value == "2")
+        );
+        assert!(
+            refused
+                .context()
+                .any(|(key, value)| key == "stored_width" && value == "3")
+        );
+    }
+
+    #[test]
+    fn test_a_coordinate_outside_the_stored_range_has_its_own_identity() {
+        let refused = narrowed(
+            vec![Embedding {
+                document: "one".to_owned(),
+                vec: vec![f64::MAX],
+            }],
+            1,
+        )
+        .expect_err("a coordinate outside f32 range must refuse");
+        assert_eq!(
+            refused.slug(),
+            errors::search::vector_coordinate_invalid::SLUG
+        );
+        assert!(refused.to_string().contains("179769"), "{refused}");
     }
 
     #[test]
@@ -1131,7 +1160,7 @@ mod tests {
         )
         .await
         .expect_err("a short answer must be refused");
-        assert_eq!(refused.fault().violation(), SearchViolation::EncodeFailed);
+        assert_eq!(refused.slug(), errors::search::encode_failed::SLUG);
         assert!(
             format!("{refused}").contains("1 vectors for 2 inputs"),
             "the refusal names both counts: {refused}"

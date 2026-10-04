@@ -36,9 +36,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lsp_types::FileChangeType;
-use rift_core::{Error, ErrorCode, ErrorName, ProjectPath};
+use rift_core::ProjectPath;
+use rift_error::{RiftError, errors};
 use rift_index::{PathChange, PathChanges};
-use rift_lsp::session::{EngineError, EngineFault, EngineLaunch, EngineSession};
+use rift_lsp::session::{EngineLaunch, EngineSession};
 use rift_protocol::configuration::{CommandInput, EmbeddedEngine, LspConfiguration};
 use rift_protocol::read::Language;
 use rift_protocol::retry::{RETRY_ATTEMPTS_MAX, RestartPolicy, RetryPolicy};
@@ -57,7 +58,7 @@ pub(crate) type SessionFuture<'session, T> =
 /// replaces the session instead: a replacement reads every file from disk at its start.
 const OWED_CHANGES_MAX: usize = 16_384;
 
-fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
+fn begin_immediately(_session: &mut EngineSession) -> SessionFuture<'_, Result<(), RiftError>> {
     Box::pin(async { Ok(()) })
 }
 
@@ -332,8 +333,8 @@ impl OwedChanges {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the connection broke.
-    async fn send(self, session: &mut EngineSession) -> Result<(), EngineError> {
+    /// Returns [`RiftError`] when the session ended or the connection broke.
+    async fn send(self, session: &mut EngineSession) -> Result<(), RiftError> {
         if self.paths.is_empty() {
             return Ok(());
         }
@@ -363,7 +364,7 @@ struct SlotState {
     /// waits for the start leaves it here, and the next request waits for the same
     /// start instead of claiming another: the start ends when the engine answers
     /// `initialize` or `startup_timeout` passes, whatever happens to the requests.
-    starting: Option<tokio::task::JoinHandle<Result<EngineSession, EngineError>>>,
+    starting: Option<tokio::task::JoinHandle<Result<EngineSession, RiftError>>>,
     restarts: RestartBudget,
 }
 
@@ -600,7 +601,7 @@ enum Transient<T> {
     Analyzing,
     /// The engine refused the request. A refusal can precede its settled
     /// verdict, so every refusal receives the same bounded retry schedule.
-    Refused(EngineError),
+    Refused(RiftError),
     /// The engine answered nothing where something was expected, so its
     /// silence proves nothing about semantic settlement.
     ///
@@ -620,7 +621,7 @@ impl<T> Transient<T> {
     fn is_loading(&self) -> bool {
         match self {
             Self::Analyzing | Self::Unready => true,
-            Self::Refused(refusal) => refusal.fault().is_retryable_refusal(),
+            Self::Refused(refusal) => refusal.slug() == errors::lsp::engine_refused_retryable::SLUG,
             Self::AnsweredNothing(_) => false,
         }
     }
@@ -650,16 +651,16 @@ impl<T> Transient<T> {
 }
 
 /// What one spawned start ended with: the session or the start's failure, a panic
-/// resumed on the waiting request, or [`EngineFault::Ended`] for a start the slot
+/// resumed on the waiting request, or an ended error for a start the slot
 /// aborted while shutting down.
 fn joined_start(
-    joined: Result<Result<EngineSession, EngineError>, tokio::task::JoinError>,
-) -> Result<EngineSession, EngineError> {
+    joined: Result<Result<EngineSession, RiftError>, tokio::task::JoinError>,
+) -> Result<EngineSession, RiftError> {
     match joined {
         Ok(started) => started,
         Err(failure) => match failure.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
-            Err(_aborted) => Err(Error::new(EngineFault::Ended)),
+            Err(_aborted) => errors::lsp::engine_ended().fail(),
         },
     }
 }
@@ -670,7 +671,7 @@ fn joined_start(
 /// was left by an exchange dropped midway. A failed close ends the session inside the
 /// notification, and the failure comes back as the one the slot reports if no
 /// replacement can start.
-async fn close_left_open(state: &mut SlotState) -> Option<EngineError> {
+async fn close_left_open(state: &mut SlotState) -> Option<RiftError> {
     let running = state
         .session
         .as_mut()
@@ -681,7 +682,7 @@ async fn close_left_open(state: &mut SlotState) -> Option<EngineError> {
 /// How one attempt of an exchange ended.
 enum AttemptEnd<T> {
     /// The operation returned: the engine answered or refused, or the exchange broke.
-    Completed(Result<T, EngineError>),
+    Completed(Result<T, RiftError>),
     /// The walk's wait was spent with this retry in flight; carries the condition the
     /// retry was sent for.
     Spent(Transient<T>),
@@ -703,7 +704,7 @@ enum AttemptEnd<T> {
 /// the same deadline.
 async fn attempt_within<T>(
     retrying: &mut Option<(Instant, Transient<T>)>,
-    operation: impl Future<Output = Result<T, EngineError>>,
+    operation: impl Future<Output = Result<T, RiftError>>,
 ) -> AttemptEnd<T> {
     let Some((deadline, retried)) = retrying.take() else {
         return AttemptEnd::Completed(operation.await);
@@ -727,21 +728,33 @@ enum Answer<T> {
 
 /// Whether restarting the engine could change this failure's answer.
 ///
-/// A configuration fault - an empty program, an absolute one - answers the
+/// A configuration error - an empty program, an absolute one - answers the
 /// same way every time, so it surfaces at once instead of spending the
 /// restart budget on a start that cannot succeed.
 /// The causes under one start failure, joined for a record.
 ///
-/// An engine failure renders its registry text, which names the fault and the
+/// An engine failure renders its registry text, which names the error and the
 /// caller's next step. The operating error behind it - the missing program, the
 /// refused permission - lives in the source chain alone, and that is what an
 /// operator reading `rift://logs` needs.
-fn start_cause(failure: &EngineError) -> String {
-    rift_core::causes(failure).join(": ")
+fn start_cause(failure: &RiftError) -> String {
+    rift_error::causes(failure).join(": ")
 }
 
-fn restart_may_help(error: &EngineError) -> bool {
-    error.name() != ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+fn restart_may_help(error: &RiftError) -> bool {
+    error.slug() != errors::lsp::engine_program_empty::SLUG
+        && error.slug() != errors::lsp::engine_program_absolute::SLUG
+}
+
+fn analyzing_attempts(error: &RiftError) -> Option<u64> {
+    (error.slug() == errors::lsp::engine_analyzing::SLUG)
+        .then(|| {
+            error
+                .context()
+                .find(|(key, _)| *key == "attempts")
+                .and_then(|(_, value)| value.parse().ok())
+        })
+        .flatten()
 }
 
 impl EngineSlot {
@@ -849,9 +862,9 @@ impl EngineSlot {
         operation: impl for<'session> FnMut(
             &'session mut EngineSession,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, EngineError>> + Send + 'session>,
+            Box<dyn Future<Output = Result<T, RiftError>> + Send + 'session>,
         >,
-    ) -> Result<T, EngineError> {
+    ) -> Result<T, RiftError> {
         self.request_deciding(
             begin_immediately,
             operation,
@@ -893,12 +906,12 @@ impl EngineSlot {
         &self,
         begin: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        ) -> SessionFuture<'session, Result<(), RiftError>>,
         operation: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        ) -> SessionFuture<'session, Result<T, RiftError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
-    ) -> Result<T, EngineError> {
+    ) -> Result<T, RiftError> {
         self.request_deciding(
             begin,
             operation,
@@ -929,7 +942,7 @@ impl EngineSlot {
     /// The exchange is an incoming walk's, and waits as an outgoing one does
     /// ([`EngineSlot::request_outgoing`]): past the retry table's attempt
     /// bound, up to `deadline`, so a spent wait ends inside the loop with
-    /// [`EngineFault::Analyzing`] and the session kept. A retry still in
+    /// an analyzing error and the session kept. A retry still in
     /// flight at `deadline` is abandoned there and counts among the attempts
     /// the walk reports. A wait that follows an attempt the engine answered
     /// while analyzing ends once the session no longer reads analyzing, and
@@ -959,14 +972,14 @@ impl EngineSlot {
         &self,
         begin: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        ) -> SessionFuture<'session, Result<(), RiftError>>,
         operation: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<T, EngineError>>,
+        ) -> SessionFuture<'session, Result<T, RiftError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         mut report_state: impl FnMut(&T) -> (bool, bool),
         deadline: Instant,
-    ) -> Result<(T, bool), EngineError> {
+    ) -> Result<(T, bool), RiftError> {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut previous = None;
         let mut settled = Settlement::Retry;
@@ -1045,14 +1058,14 @@ impl EngineSlot {
         &self,
         begin: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        ) -> SessionFuture<'session, Result<(), RiftError>>,
         operation: impl for<'session> FnMut(
             &'session mut EngineSession,
         )
-            -> SessionFuture<'session, Result<Option<T>, EngineError>>,
+            -> SessionFuture<'session, Result<Option<T>, RiftError>>,
         finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         deadline: Instant,
-    ) -> Result<OutgoingAnswer<T>, EngineError> {
+    ) -> Result<OutgoingAnswer<T>, RiftError> {
         let mut settled = OutgoingSettlement::Retry;
         let answer = self
             .request_deciding(
@@ -1079,12 +1092,15 @@ impl EngineSlot {
                 Ok(OutgoingAnswer::Unconfirmed(callees))
             }
             Ok(Some(callees)) => Ok(OutgoingAnswer::Ready(callees)),
-            Err(error) => match error.fault() {
-                EngineFault::Analyzing { attempts } => Ok(OutgoingAnswer::Unsettled {
-                    attempts: *attempts,
-                }),
-                _ => Err(error),
-            },
+            Err(error) if error.slug() == errors::lsp::engine_analyzing::SLUG => {
+                let attempts = error
+                    .context()
+                    .find(|(key, _)| *key == "attempts")
+                    .and_then(|(_, value)| value.parse().ok())
+                    .unwrap_or_default();
+                Ok(OutgoingAnswer::Unsettled { attempts })
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1105,16 +1121,16 @@ impl EngineSlot {
         &self,
         mut begin: impl for<'session> FnMut(
             &'session mut EngineSession,
-        ) -> SessionFuture<'session, Result<(), EngineError>>,
+        ) -> SessionFuture<'session, Result<(), RiftError>>,
         mut operation: impl for<'session> FnMut(
             &'session mut EngineSession,
         )
-            -> SessionFuture<'session, Result<T, EngineError>>,
+            -> SessionFuture<'session, Result<T, RiftError>>,
         mut finish: impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()>,
         deadline: Option<Instant>,
         wake: impl Fn(&EngineSession) -> bool,
         mut decide: impl FnMut(&mut EngineSession, u64, T, bool) -> Answer<T>,
-    ) -> Result<T, EngineError> {
+    ) -> Result<T, RiftError> {
         let retry = self.configuration.retry;
         let mut held = self.state.lock().await;
         let mut guarded = RequestSessionGuard {
@@ -1191,7 +1207,10 @@ impl EngineSlot {
                     reported = Some(error);
                     continue;
                 }
-                AttemptEnd::Completed(Err(error)) if error.fault().is_refusal() => {
+                AttemptEnd::Completed(Err(error))
+                    if error.slug() == errors::lsp::engine_refused_retryable::SLUG
+                        || error.slug() == errors::lsp::engine_refused_terminal::SLUG =>
+                {
                     Transient::Refused(error)
                 }
                 AttemptEnd::Completed(Err(error)) => {
@@ -1223,7 +1242,7 @@ impl EngineSlot {
     /// What one absorbed condition surfaces once attempt bound is spent.
     ///
     /// A walk's wait spent on a retryable refusal surfaces as
-    /// [`EngineFault::Analyzing`], as a wait spent on analyzing answers does:
+    /// an analyzing error, as a wait spent on analyzing answers does:
     /// rust-analyzer answers `-32801` content modified while it loads, and an
     /// empty prepare at the same moment means the same load.
     fn exhausted<T>(
@@ -1231,10 +1250,12 @@ impl EngineSlot {
         absorbed: Transient<T>,
         attempts: u64,
         walk: bool,
-    ) -> Result<T, EngineError> {
+    ) -> Result<T, RiftError> {
         let engine = self.name();
         match absorbed {
-            Transient::Refused(refusal) if walk && refusal.fault().is_retryable_refusal() => {
+            Transient::Refused(refusal)
+                if walk && refusal.slug() == errors::lsp::engine_refused_retryable::SLUG =>
+            {
                 tracing::warn!(
                     component = "engine",
                     engine,
@@ -1242,7 +1263,7 @@ impl EngineSlot {
                     refusal = %refusal,
                     "language engine refused with a retryable code when the walk's wait was spent"
                 );
-                Err(Error::new(EngineFault::Analyzing { attempts }))
+                errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Analyzing | Transient::Unready => {
                 tracing::warn!(
@@ -1251,7 +1272,7 @@ impl EngineSlot {
                     attempts,
                     "language engine was not ready on every attempt"
                 );
-                Err(Error::new(EngineFault::Analyzing { attempts }))
+                errors::lsp::engine_analyzing().attempts(attempts).fail()
             }
             Transient::Refused(refusal) => {
                 tracing::warn!(
@@ -1283,7 +1304,7 @@ impl EngineSlot {
     /// another. After the start it may find in flight, the loop claims at most
     /// `restart.attempts` + 1 starts, and a refused claim ends it. A refused claim
     /// surfaces `reported` - the failure that sent the caller back here -
-    /// or [`EngineFault::Ended`] when this call has no failure of its own
+    /// or an ended error when this call has no failure of its own
     /// to report, which is the honest answer for a budget an earlier
     /// request already spent.
     ///
@@ -1293,8 +1314,8 @@ impl EngineSlot {
     async fn start_within_budget(
         &self,
         state: &mut SlotState,
-        mut reported: Option<EngineError>,
-    ) -> Result<EngineSession, EngineError> {
+        mut reported: Option<RiftError>,
+    ) -> Result<EngineSession, RiftError> {
         loop {
             if let Some(start) = state.starting.as_mut() {
                 let started = joined_start(start.await);
@@ -1323,7 +1344,10 @@ impl EngineSlot {
                     cause,
                     "language engine restart budget is spent for this window"
                 );
-                return Err(reported.unwrap_or_else(|| Error::new(EngineFault::Ended)));
+                if let Some(reported) = reported {
+                    return Err(reported);
+                }
+                return errors::lsp::engine_ended().fail();
             }
             self.report_state(LspState::Starting);
             state.starting = Some(self.spawn_start());
@@ -1334,8 +1358,8 @@ impl EngineSlot {
     /// ends the start loop; a failure a restart may fix is recorded and continues it.
     fn settled_start(
         &self,
-        started: Result<EngineSession, EngineError>,
-    ) -> ControlFlow<Result<EngineSession, EngineError>, EngineError> {
+        started: Result<EngineSession, RiftError>,
+    ) -> ControlFlow<Result<EngineSession, RiftError>, RiftError> {
         match started {
             Ok(session) => {
                 self.report_readiness(session.readiness());
@@ -1357,7 +1381,7 @@ impl EngineSlot {
     ///
     /// The task ends when the engine answers `initialize` or `startup_timeout` passes;
     /// a request that waits for it can be dropped without ending it.
-    fn spawn_start(&self) -> tokio::task::JoinHandle<Result<EngineSession, EngineError>> {
+    fn spawn_start(&self) -> tokio::task::JoinHandle<Result<EngineSession, RiftError>> {
         let root = self.workspace_root.clone();
         match (
             self.configuration.embedded,
@@ -1398,7 +1422,7 @@ impl EngineSlot {
     /// budget. Without this, a missing program reached the caller as
     /// `launch_failed` and left the workspace log holding nothing that says
     /// which program was missing.
-    fn record_start_failure(&self, failure: &EngineError, retrying: bool) {
+    fn record_start_failure(&self, failure: &RiftError, retrying: bool) {
         tracing::warn!(
             component = "engine",
             engine = self.name(),
@@ -1463,8 +1487,8 @@ impl EngineSlot {
         &self,
         state: &'state mut SlotState,
         replaced: Option<EngineSession>,
-        reported: Option<EngineError>,
-    ) -> Result<&'state mut EngineSession, EngineError> {
+        reported: Option<RiftError>,
+    ) -> Result<&'state mut EngineSession, RiftError> {
         if let Some(replaced) = replaced {
             // Boxed: a reap awaits the session's shutdown request.
             Box::pin(self.reap(replaced)).await;
@@ -1558,7 +1582,7 @@ mod tests {
 
     /// Serves one slot whose configured program is `command`, and returns the refusal
     /// a request earns beside every record the attempt emitted.
-    async fn start_refusal(command: &str, attempts: u64) -> (EngineError, RecordedEvents) {
+    async fn start_refusal(command: &str, attempts: u64) -> (RiftError, RecordedEvents) {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let directory = tempfile::tempdir().expect("workspace");
@@ -1628,7 +1652,7 @@ mod tests {
     async fn a_missing_program_is_recorded_with_its_cause() {
         let (failure, recorded) = start_refusal(MISSING_PROGRAM, 1).await;
         assert!(
-            matches!(failure.fault(), EngineFault::LaunchFailed { .. }),
+            failure.slug() == errors::lsp::engine_launch_failed::SLUG,
             "a missing program answers launch_failed: {failure:?}"
         );
         let record = recorded.naming("language engine did not start");
@@ -1758,9 +1782,7 @@ done
     /// An operation that asks the engine nothing and answers the session's document
     /// version, so a request runs it on a session without waiting on the engine.
     #[cfg(unix)]
-    fn document_version(
-        session: &mut EngineSession,
-    ) -> SessionFuture<'_, Result<i32, EngineError>> {
+    fn document_version(session: &mut EngineSession) -> SessionFuture<'_, Result<i32, RiftError>> {
         Box::pin(async move { Ok(session.document_version()) })
     }
 
@@ -1794,7 +1816,7 @@ done
                     let started = Arc::clone(&operation_started);
                     Box::pin(async move {
                         started.notify_one();
-                        std::future::pending::<Result<(), EngineError>>().await
+                        std::future::pending::<Result<(), RiftError>>().await
                     })
                 },
                 close_lib,
@@ -1841,7 +1863,7 @@ done
     /// poll normally reaches it; the bound turns a wait elsewhere into a failure.
     #[cfg(unix)]
     async fn poll_until<T: std::fmt::Debug>(
-        exchange: &mut std::pin::Pin<&mut impl Future<Output = Result<T, EngineError>>>,
+        exchange: &mut std::pin::Pin<&mut impl Future<Output = Result<T, RiftError>>>,
         reached: impl Fn() -> bool,
     ) {
         const POLLS_MAX: usize = 64;
@@ -2301,17 +2323,21 @@ done
     }
 
     #[test]
-    fn a_configuration_fault_is_the_one_failure_no_restart_helps() {
-        let absolute = Error::new(EngineFault::ProgramAbsolute {
-            program: "/usr/bin/engine".to_owned(),
-        });
+    fn a_configuration_error_is_the_one_failure_no_restart_helps() {
+        let absolute = errors::lsp::engine_program_absolute()
+            .program("/usr/bin/engine")
+            .error();
         assert!(!restart_may_help(&absolute));
-        assert!(!restart_may_help(&Error::new(EngineFault::ProgramEmpty)));
-        assert!(restart_may_help(&Error::new(EngineFault::Ended)));
-        assert!(restart_may_help(&Error::new(EngineFault::TimedOut {
-            method: "textDocument/rename".to_owned(),
-            timeout_ms: 1_000,
-        })));
+        assert!(!restart_may_help(
+            &errors::lsp::engine_program_empty().error()
+        ));
+        assert!(restart_may_help(&errors::lsp::engine_ended().error()));
+        assert!(restart_may_help(
+            &errors::lsp::engine_timed_out()
+                .method("textDocument/rename")
+                .timeout_ms(1_000_u64)
+                .error()
+        ));
     }
 
     #[test]
@@ -2344,7 +2370,7 @@ done
 
         let ended = attempt_within(
             &mut retrying,
-            std::future::pending::<Result<(), EngineError>>(),
+            std::future::pending::<Result<(), RiftError>>(),
         )
         .await;
 
@@ -2487,7 +2513,7 @@ done
         attempts: &Arc<std::sync::atomic::AtomicU64>,
     ) -> impl for<'session> FnMut(
         &'session mut EngineSession,
-    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+    ) -> SessionFuture<'session, Result<Option<usize>, RiftError>> {
         let attempts = Arc::clone(attempts);
         move |session: &mut EngineSession| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2506,7 +2532,7 @@ done
     }
 
     #[cfg(unix)]
-    fn open_lib(session: &mut EngineSession) -> SessionFuture<'_, Result<(), EngineError>> {
+    fn open_lib(session: &mut EngineSession) -> SessionFuture<'_, Result<(), RiftError>> {
         Box::pin(async move {
             session
                 .open(
@@ -2544,7 +2570,7 @@ done
     /// An exchange that is no walk ends at the retry table's 8th attempt,
     /// 9.75 s of waits in, while the engine reads analyzing until its 9th
     /// request: an engine whose load outlasts the retry table answers such a
-    /// request with [`EngineFault::Analyzing`], inside the default 30 s
+    /// request with an analyzing error, inside the default 30 s
     /// `readiness_timeout`.
     #[cfg(unix)]
     #[tokio::test]
@@ -2562,13 +2588,15 @@ done
             .expect_err("the engine never reads ready inside the retry table");
         let elapsed = started.elapsed();
         eprintln!(
-            "exchange: attempts={attempts:?} elapsed={elapsed:?} fault={:?}",
-            failure.fault()
+            "exchange: attempts={attempts:?} elapsed={elapsed:?} error={:?}",
+            failure.slug()
         );
-        assert!(matches!(
-            failure.fault(),
-            EngineFault::Analyzing { attempts: 8 }
-        ));
+        assert_eq!(failure.slug(), errors::lsp::engine_analyzing::SLUG);
+        assert!(
+            failure
+                .context()
+                .any(|(key, value)| key == "attempts" && value == "8")
+        );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 8);
         let readiness_timeout = Duration::from_millis(
             rift_protocol::configuration::ServerConfiguration::default()
@@ -2590,7 +2618,7 @@ done
         stamps: &Arc<std::sync::Mutex<Vec<Instant>>>,
     ) -> impl for<'session> FnMut(
         &'session mut EngineSession,
-    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+    ) -> SessionFuture<'session, Result<Option<usize>, RiftError>> {
         let stamps = Arc::clone(stamps);
         move |session: &mut EngineSession| {
             stamps.lock().expect("attempt stamps").push(Instant::now());
@@ -2615,10 +2643,10 @@ done
         mut operation: impl for<'session> FnMut(
             &'session mut EngineSession,
         )
-            -> SessionFuture<'session, Result<T, EngineError>>,
+            -> SessionFuture<'session, Result<T, RiftError>>,
     ) -> impl for<'session> FnMut(
         &'session mut EngineSession,
-    ) -> SessionFuture<'session, Result<T, EngineError>> {
+    ) -> SessionFuture<'session, Result<T, RiftError>> {
         let times = Arc::clone(times);
         move |session: &mut EngineSession| {
             let start = Instant::now();
@@ -2872,7 +2900,7 @@ done
         attempts: &Arc<std::sync::atomic::AtomicU64>,
     ) -> impl for<'session> FnMut(
         &'session mut EngineSession,
-    ) -> SessionFuture<'session, Result<Option<usize>, EngineError>> {
+    ) -> SessionFuture<'session, Result<Option<usize>, RiftError>> {
         let attempts = Arc::clone(attempts);
         move |session: &mut EngineSession| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2890,7 +2918,7 @@ done
 
     /// A retryable refusal as the last condition when a walk's wait is
     /// spent answers like analyzing: an outgoing walk answers `Unsettled`
-    /// and an incoming one [`EngineFault::Analyzing`], both with the session
+    /// and an incoming one an analyzing error, both with the session
     /// kept. A refusal that is the engine's verdict on the request stays the
     /// walk's error once the walk's wait is spent. The retryable engine starts
     /// before the outgoing walk's deadline is taken ([`start_engine`]).
@@ -2947,9 +2975,9 @@ done
             .await
             .expect_err("the incoming walk reports the spent wait");
         assert!(
-            matches!(incoming.fault(), EngineFault::Analyzing { .. }),
+            incoming.slug() == errors::lsp::engine_analyzing::SLUG,
             "{:?}",
-            incoming.fault()
+            incoming
         );
         assert!(slot.state.lock().await.session.is_some());
         pool.shutdown().await;
@@ -2979,15 +3007,12 @@ done
         );
         assert_waits_under_the_deadline(&retry, deadline, &times, returned);
         assert!(
-            matches!(
-                refused.fault(),
-                EngineFault::Refused {
-                    code: INVALID_REQUEST,
-                    ..
-                }
-            ),
+            refused.slug() == errors::lsp::engine_refused_terminal::SLUG
+                && refused
+                    .context()
+                    .any(|(key, value)| key == "code" && value == INVALID_REQUEST.to_string()),
             "{:?}",
-            refused.fault()
+            refused
         );
         pool.shutdown().await;
     }
@@ -3158,7 +3183,7 @@ done
 
     /// An incoming report that never settles - a ready engine answering no reference
     /// beyond the seed's own - keeps the walk waiting until its deadline, and the spent
-    /// wait answers [`EngineFault::Analyzing`] with the session kept, as a wait spent on
+    /// wait answers an analyzing error with the session kept, as a wait spent on
     /// an engine still analyzing does. The engine starts before the deadline is taken
     /// ([`start_engine`]).
     #[cfg(unix)]
@@ -3186,9 +3211,9 @@ done
         let times = times.lock().expect("attempt times").clone();
         let made = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            matches!(spent.fault(), EngineFault::Analyzing { attempts } if *attempts == made && made >= 2),
+            analyzing_attempts(&spent).is_some_and(|attempts| attempts == made && made >= 2),
             "{made} attempts: {:?}",
-            spent.fault()
+            spent
         );
         assert_waits_under_the_deadline(&table("sh").retry, deadline, &times, returned);
         assert!(
@@ -3246,11 +3271,7 @@ done
         };
         let (spent, ()) = tokio::join!(request, owe);
         let spent = spent.expect_err("a partial report never settles");
-        assert!(
-            matches!(spent.fault(), EngineFault::Analyzing { .. }),
-            "{:?}",
-            spent.fault()
-        );
+        assert!(analyzing_attempts(&spent).is_some(), "{:?}", spent);
         assert!(
             !directory.path().join("notified.log").exists(),
             "past the bound the live session is told nothing"

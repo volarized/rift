@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{any, post};
+use rift_error::RiftError;
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::ServerConfiguration;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -24,9 +25,9 @@ use tower_service::Service as _;
 use crate::RiftMcp;
 use crate::election::{ElectionGuard, claim};
 use crate::http::{
-    HttpServeError, HttpServeFault, HttpServer, IdleTracker, MCP_PATH, RequestGate, STOP_PATH,
-    TokenCheck, WORKSPACE_ROOT_HEADER, authorize_request, bind_loopback_listener,
-    guard_loopback_boundary, mint_token, watch_idle,
+    HttpServer, IdleTracker, MCP_PATH, RequestGate, STOP_PATH, TokenCheck, WORKSPACE_ROOT_HEADER,
+    authorize_request, bind_loopback_listener, guard_loopback_boundary, http_serve_failed,
+    mint_token, watch_idle,
 };
 use crate::identity::BuildCheckout;
 use crate::repository::{ServerConfigurationSelection, select_server_configuration};
@@ -48,18 +49,17 @@ pub(crate) async fn serve_repository_http(
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<HttpServer, HttpServeError> {
+) -> Result<HttpServer, RiftError> {
     let authority_root = tokio::fs::canonicalize(authority_root)
         .await
-        .map_err(|error| HttpServeFault::serve("repository authority root", error))?;
+        .map_err(|error| http_serve_failed("repository authority root", error))?;
     let common_directory = tokio::fs::canonicalize(common_directory)
         .await
-        .map_err(|error| HttpServeFault::serve("repository common directory", error))?;
-    let blocking = BlockingExecutor::for_configuration(&server_configuration)
-        .map_err(HttpServeFault::workspace)?;
+        .map_err(|error| http_serve_failed("repository common directory", error))?;
+    let blocking = BlockingExecutor::for_configuration(&server_configuration)?;
     let identity = crate::identity::product_identity(checkout)
         .await
-        .map_err(|error| HttpServeFault::serve("product identity", error))?;
+        .map_err(|error| http_serve_failed("product identity", error))?;
     let token = mint_token()?;
     let (port, listener) = bind_loopback_listener(server_configuration.serving_ports())?;
     let stop = shutdown.child_token();
@@ -476,7 +476,7 @@ impl RepositoryWorkspaceRegistry {
     /// # Errors
     ///
     /// Returns a workspace shutdown failure.
-    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), HttpServeError> {
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> Result<(), RiftError> {
         let workspaces = std::mem::take(&mut *self.workspaces.lock().await);
         for cell in workspaces.values() {
             if let Some(workspace) = cell.get() {
@@ -547,21 +547,17 @@ impl RepositoryWorkspaceRegistry {
 async fn stop_repository_workspace(
     workspace: &RepositoryWorkspace,
     deadline: Instant,
-) -> Result<(), HttpServeError> {
+) -> Result<(), RiftError> {
     workspace.stop.cancel();
     let engines = tokio::time::timeout_at(deadline, workspace.engines.shutdown())
         .await
-        .map_err(|error| HttpServeFault::serve("workspace engines shutdown", error));
-    let supervisor = workspace
-        .supervisor
-        .shutdown(deadline)
-        .await
-        .map_err(HttpServeFault::workspace);
+        .map_err(|error| http_serve_failed("workspace engines shutdown", error));
+    let supervisor = workspace.supervisor.shutdown(deadline).await;
     let database = if let Some(database) = workspace.database.as_ref() {
         database
             .shutdown(deadline)
             .await
-            .map_err(|error| HttpServeFault::serve("SQLite worker shutdown", error))
+            .map_err(|error| http_serve_failed("SQLite worker shutdown", error))
     } else {
         Ok(())
     };

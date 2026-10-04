@@ -11,9 +11,10 @@ use rift_protocol::documentation::{
 use rift_protocol::index::PACKAGE_SYMBOLS_MAX;
 use rift_protocol::read::{Language, SymbolId, TextRange};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::identity::canonical_digest;
 use super::input::{source_path, validate_identity};
+use rift_error::RiftError;
 
 /// A borrowed declaration's identity and name-resolution facts.
 #[derive(Clone, Debug)]
@@ -39,7 +40,7 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
         qualified_name: &'declaration str,
         source: &DocumentationContentIdentity,
         range: TextRange,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         validate_identity(source)?;
         let accepted_name = |text: &str| {
             !text.is_empty()
@@ -97,9 +98,7 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
     }
 }
 
-pub(super) fn declaration_path(
-    source: &DocumentationContentIdentity,
-) -> Result<String, DocumentationError> {
+pub(super) fn declaration_path(source: &DocumentationContentIdentity) -> Result<String, RiftError> {
     let path = source_path(source)?;
     match &source.source {
         DocumentationSourceIdentity::Project { .. } => Ok(path),
@@ -155,7 +154,7 @@ impl ResolvedDocumentationReferences {
 pub fn resolve_references(
     declarations: &[DocumentationDeclaration<'_>],
     candidates: &[DocumentationReferenceCandidate],
-) -> Result<ResolvedDocumentationReferences, DocumentationError> {
+) -> Result<ResolvedDocumentationReferences, RiftError> {
     if declarations.len() > PACKAGE_SYMBOLS_MAX as usize
         || candidates.len() > DOCUMENTATION_REFERENCES_MAX as usize
     {
@@ -211,7 +210,7 @@ pub fn resolve_references(
 
 pub(super) fn validate_candidate(
     candidate: &DocumentationReferenceCandidate,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let spelling_accepted = !candidate.authored.is_empty()
         && candidate.authored.len() <= DOCUMENTATION_TEXT_BYTES_MAX as usize;
     let range_accepted = candidate.range.end > candidate.range.start;
@@ -523,7 +522,10 @@ mod tests {
         let error =
             DocumentationDeclaration::new(&identity, &language, "open", "open", &source, range)
                 .expect_err("mismatch");
-        assert_eq!(error.fault().violation(), DocumentationViolation::Identity);
+        assert_eq!(
+            crate::documentation::failure::violation(&error),
+            DocumentationViolation::Identity
+        );
     }
 
     #[test]
@@ -531,7 +533,10 @@ mod tests {
         let empty = resolve_references(&[], &[]).expect("empty");
         assert!(empty.references().is_empty());
         let error = resolve_references(&[], &[candidate("", 0)]).expect_err("empty spelling");
-        assert_eq!(error.fault().violation(), DocumentationViolation::Identity);
+        assert_eq!(
+            crate::documentation::failure::violation(&error),
+            DocumentationViolation::Identity
+        );
     }
 
     #[test]
@@ -548,7 +553,10 @@ mod tests {
             TextRange { start: 0, end: 1 },
         )
         .expect_err("control character in declaration name");
-        assert_eq!(control_name.fault().field(), "declaration.name");
+        assert_eq!(
+            crate::documentation::failure::context_value(&control_name, "field").as_deref(),
+            Some("declaration.name")
+        );
 
         let reversed_range = DocumentationDeclaration::new(
             &identity,
@@ -559,11 +567,17 @@ mod tests {
             TextRange { start: 2, end: 1 },
         )
         .expect_err("reversed declaration range");
-        assert_eq!(reversed_range.fault().field(), "declaration.range");
+        assert_eq!(
+            crate::documentation::failure::context_value(&reversed_range, "field").as_deref(),
+            Some("declaration.range")
+        );
 
         let candidates =
             vec![candidate("open", 0); super::DOCUMENTATION_REFERENCES_MAX as usize + 1];
         let error = resolve_references(&[], &candidates).expect_err("candidate bound");
-        assert_eq!(error.fault().field(), "references");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("references")
+        );
     }
 }

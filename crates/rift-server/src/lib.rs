@@ -27,8 +27,9 @@ pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
 };
-pub use read::{ReadError, ReadFault, ReadService, ReadServiceBuild, accepted_limit, wire_digest};
+pub use read::{ReadService, ReadServiceBuild, accepted_limit, wire_digest};
 pub use rift_core::CapturedStream;
+pub use rift_error::RiftError;
 pub use rift_lsp::capabilities::PositionEncoding;
 pub use search::{PatternBounds, StoreAnswer, accepted_pattern, search_page_limit};
 

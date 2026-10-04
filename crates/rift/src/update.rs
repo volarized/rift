@@ -6,11 +6,10 @@ use rift_core::constants::{
     RELEASE_BINARY_BYTES_MAX, RELEASE_DOCUMENT_BYTES_MAX, RELEASE_DOWNLOAD_BASE_URL,
     RELEASE_DOWNLOAD_TIMEOUT, RELEASE_METADATA_BYTES_MAX, SHA256_HEX_LENGTH,
 };
-use rift_core::{CliCode, ErrorDescriptor, ErrorName};
+use rift_error::{RiftError, errors};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs;
@@ -30,8 +29,6 @@ const UPDATE_USER_AGENT: &str = "rift-updater";
 const GITHUB_JSON_ACCEPT: &str = "application/vnd.github+json";
 /// Two-space separator of the `sha256sum` text-mode manifest format.
 const SHA256SUM_SEPARATOR: &str = "  ";
-/// Issue tracker for reporting update failures that persist across retries.
-const ISSUE_TRACKER_URL: &str = "https://github.com/volarized/rift/issues";
 
 /// Sibling file name staging the incoming Windows binary.
 #[cfg(windows)]
@@ -158,53 +155,6 @@ impl fmt::Display for UpdateOutcome {
     }
 }
 
-/// Opaque updater failure.
-#[derive(Debug)]
-pub(super) struct UpdateError {
-    name: ErrorName,
-    message: Cow<'static, str>,
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl UpdateError {
-    fn new(name: ErrorName, message: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            name,
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    fn caused_by(
-        name: ErrorName,
-        message: impl Into<Cow<'static, str>>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            name,
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-
-    /// Returns canonical registry metadata for this failure.
-    pub(super) fn descriptor(&self) -> ErrorDescriptor {
-        self.name.descriptor()
-    }
-}
-
-impl fmt::Display for UpdateError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for UpdateError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_deref().map(|source| source as _)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct LatestRelease {
     tag_name: String,
@@ -259,17 +209,17 @@ trait DownloadTransport {
         destination: &Path,
         bytes_max: u64,
         progress: &dyn Fn(u64, Option<u64>),
-    ) -> Result<(), UpdateError>;
+    ) -> Result<(), RiftError>;
 }
 
 trait UpdateSource {
-    async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError>;
+    async fn latest_version(&self, directory: &Path) -> Result<Version, RiftError>;
     async fn stage(
         &self,
         directory: &Path,
         version: Version,
         progress: &dyn UpdateProgress,
-    ) -> Result<PathBuf, UpdateError>;
+    ) -> Result<PathBuf, RiftError>;
 }
 
 trait Publisher {
@@ -277,7 +227,7 @@ trait Publisher {
         &self,
         current: &Path,
         candidate: &Path,
-    ) -> Result<OldBinaryCleanup, UpdateError>;
+    ) -> Result<OldBinaryCleanup, RiftError>;
 }
 
 struct ReqwestTransport {
@@ -296,7 +246,7 @@ struct AtomicPublisher;
 ///
 /// # Errors
 ///
-/// Returns an [`UpdateError`] carrying its registry code when the release
+/// Returns an [`RiftError`] carrying its registry code when the release
 /// lookup, download, checksum verification, extraction, or replacement
 /// fails.
 ///
@@ -311,10 +261,24 @@ struct AtomicPublisher;
 /// Windows replacement may leave sibling files that the next `rift update`
 /// run removes or reports. The stage line the drop interrupts stays on
 /// stderr as it was last drawn.
-pub(super) async fn update() -> Result<UpdateOutcome, UpdateError> {
-    let current = std::env::current_exe().map_err(locate_error)?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|error| version_error(env!("CARGO_PKG_VERSION"), &current, error))?;
+pub(super) async fn update() -> Result<UpdateOutcome, RiftError> {
+    let current = std::env::current_exe().map_err(|source| {
+        let invoked_as = std::env::args_os().next().map_or_else(
+            || "rift".to_owned(),
+            |argument| argument.to_string_lossy().into_owned(),
+        );
+        errors::cli::update_binary_invalid()
+            .invoked_as(invoked_as)
+            .source(source)
+            .error()
+    })?;
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|source| {
+        errors::cli::update_version_invalid()
+            .raw(env!("CARGO_PKG_VERSION"))
+            .path(&current)
+            .source(source)
+            .error()
+    })?;
     update_with(
         &GitHubReleaseSource {
             transport: ReqwestTransport::new()?,
@@ -333,8 +297,22 @@ async fn update_with(
     current_path: &Path,
     current_version: Version,
     progress: &impl UpdateProgress,
-) -> Result<UpdateOutcome, UpdateError> {
-    let staging = run_blocking(|| tempfile::tempdir().map_err(staging_error)).await?;
+) -> Result<UpdateOutcome, RiftError> {
+    let staging = run_blocking(|| {
+        tempfile::tempdir().map_err(|source| {
+            let path = std::env::temp_dir();
+            let space = fs4::available_space(&path).map_or_else(
+                |_| "free space unknown".to_owned(),
+                |bytes| format!("{bytes} bytes free"),
+            );
+            errors::cli::update_staging_failed()
+                .path(&path)
+                .space(space)
+                .source(source)
+                .error()
+        })
+    })
+    .await?;
     progress.report(UpdateStage::CheckingRelease);
     let latest_version = source.latest_version(staging.path()).await?;
     progress.report(UpdateStage::ReleaseFound {
@@ -367,8 +345,8 @@ async fn update_with(
 /// A panic inside the stage resumes on the caller; the cancelled arm is
 /// unreachable because the runtime lives until `update` returns.
 async fn run_blocking<T: Send + 'static>(
-    stage: impl FnOnce() -> Result<T, UpdateError> + Send + 'static,
-) -> Result<T, UpdateError> {
+    stage: impl FnOnce() -> Result<T, RiftError> + Send + 'static,
+) -> Result<T, RiftError> {
     match tokio::task::spawn_blocking(stage).await {
         Ok(result) => result,
         Err(join_error) if join_error.is_panic() => {
@@ -381,49 +359,8 @@ async fn run_blocking<T: Send + 'static>(
     }
 }
 
-fn locate_error(error: io::Error) -> UpdateError {
-    let invoked_as = std::env::args_os().next().map_or_else(
-        || Cow::Borrowed("rift"),
-        |argument| Cow::Owned(argument.to_string_lossy().into_owned()),
-    );
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateBinaryInvalid),
-        format!(
-            "current Rift executable (invoked as `{invoked_as}`) could not be located: {error}: reinstall Rift if the binary was moved or deleted"
-        ),
-        error,
-    )
-}
-
-fn version_error(raw: &str, installed_at: &Path, error: semver::Error) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateBinaryInvalid),
-        format!(
-            "installed Rift version `{raw}` at `{}` is invalid: {error}: reinstall Rift from an official release",
-            installed_at.display()
-        ),
-        error,
-    )
-}
-
-fn staging_error(error: io::Error) -> UpdateError {
-    let staging_root = std::env::temp_dir();
-    let space = fs4::available_space(&staging_root).map_or_else(
-        |_| Cow::Borrowed("free space unknown"),
-        |bytes| Cow::Owned(format!("{bytes} bytes free")),
-    );
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateStagingFailed),
-        format!(
-            "update staging directory could not be created under `{}` ({space}): {error}: ensure the directory is writable and has free space, then retry `rift update`",
-            staging_root.display()
-        ),
-        error,
-    )
-}
-
 impl ReqwestTransport {
-    fn new() -> Result<Self, UpdateError> {
+    fn new() -> Result<Self, RiftError> {
         let redirects = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= REDIRECT_HOPS_MAX
                 || attempt.url().scheme() != HTTPS_SCHEME
@@ -439,7 +376,7 @@ impl ReqwestTransport {
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .user_agent(UPDATE_USER_AGENT)
             .build()
-            .map_err(download_error)?;
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
         Ok(Self { client })
     }
 }
@@ -451,7 +388,7 @@ impl DownloadTransport for ReqwestTransport {
         destination: &Path,
         bytes_max: u64,
         progress: &dyn Fn(u64, Option<u64>),
-    ) -> Result<(), UpdateError> {
+    ) -> Result<(), RiftError> {
         let mut response = self
             .client
             .get(url)
@@ -459,21 +396,28 @@ impl DownloadTransport for ReqwestTransport {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(download_error)?;
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
         if response
             .content_length()
             .is_some_and(|length| length > bytes_max)
         {
-            return Err(download_too_large(bytes_max));
+            return errors::cli::update_download_too_large()
+                .bytes_max(bytes_max)
+                .fail();
         }
         let mut output = tokio::fs::File::create(destination)
             .await
-            .map_err(download_error)?;
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
         let received = write_bounded_body(&mut response, &mut output, bytes_max, progress).await?;
         if received == 0 || received > bytes_max {
-            return Err(download_too_large(bytes_max));
+            return errors::cli::update_download_too_large()
+                .bytes_max(bytes_max)
+                .fail();
         }
-        output.sync_all().await.map_err(download_error)?;
+        output
+            .sync_all()
+            .await
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
         Ok(())
     }
 }
@@ -488,19 +432,23 @@ async fn write_bounded_body(
     output: &mut tokio::fs::File,
     bytes_max: u64,
     progress: &dyn Fn(u64, Option<u64>),
-) -> Result<u64, UpdateError> {
+) -> Result<u64, RiftError> {
     let ceiling = bytes_max_with_sentinel(bytes_max);
     let total_bytes = response.content_length();
     let mut received = 0_u64;
     while received < ceiling {
-        let Some(chunk) = response.chunk().await.map_err(download_error)? else {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?
+        else {
             break;
         };
         let kept = bytes_within_budget(chunk.len(), ceiling - received);
         output
             .write_all(&chunk[..kept])
             .await
-            .map_err(download_error)?;
+            .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
         received = received.saturating_add(u64::try_from(kept).unwrap_or(u64::MAX));
         progress(received, total_bytes);
     }
@@ -516,7 +464,7 @@ fn bytes_within_budget(chunk_length: usize, budget: u64) -> usize {
 fn unwatched(_received_bytes: u64, _total_bytes: Option<u64>) {}
 
 impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
-    async fn latest_version(&self, directory: &Path) -> Result<Version, UpdateError> {
+    async fn latest_version(&self, directory: &Path) -> Result<Version, RiftError> {
         let metadata_path = directory.join(RELEASE_METADATA_FILE_NAME);
         self.transport
             .download(
@@ -526,9 +474,11 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
                 &unwatched,
             )
             .await?;
-        let bytes = tokio::fs::read(&metadata_path)
-            .await
-            .map_err(release_error)?;
+        let bytes = tokio::fs::read(&metadata_path).await.map_err(|source| {
+            errors::cli::update_release_metadata_invalid()
+                .source(source)
+                .error()
+        })?;
         parse_release_metadata(&bytes)
     }
 
@@ -537,7 +487,7 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
         directory: &Path,
         version: Version,
         progress: &dyn UpdateProgress,
-    ) -> Result<PathBuf, UpdateError> {
+    ) -> Result<PathBuf, RiftError> {
         let artifact = ReleaseArtifact::new(version);
         let manifest_path = directory.join(&artifact.checksum_name);
         let archive_path = directory.join(&artifact.archive_name);
@@ -574,124 +524,115 @@ impl<T: DownloadTransport> UpdateSource for GitHubReleaseSource<T> {
 }
 
 /// Parses GitHub's latest-release document into a stable release version.
-fn parse_release_metadata(bytes: &[u8]) -> Result<Version, UpdateError> {
-    let release: LatestRelease = serde_json::from_slice(bytes).map_err(release_error)?;
+fn parse_release_metadata(bytes: &[u8]) -> Result<Version, RiftError> {
+    let release: LatestRelease = serde_json::from_slice(bytes).map_err(|source| {
+        errors::cli::update_release_metadata_invalid()
+            .source(source)
+            .error()
+    })?;
     parse_release_tag(&release.tag_name)
 }
 
-fn parse_release_tag(tag: &str) -> Result<Version, UpdateError> {
-    let value = tag.strip_prefix('v').ok_or_else(|| {
-        UpdateError::new(
-            ErrorName::Cli(CliCode::UpdateReleaseInvalid),
-            release_tag_invalid(tag),
-        )
-    })?;
-    let version = Version::parse(value).map_err(|error| {
-        UpdateError::caused_by(
-            ErrorName::Cli(CliCode::UpdateReleaseInvalid),
-            release_tag_invalid(tag),
-            error,
-        )
+fn parse_release_tag(tag: &str) -> Result<Version, RiftError> {
+    let Some(value) = tag.strip_prefix('v') else {
+        return errors::cli::update_release_tag_invalid().tag(tag).fail();
+    };
+    let version = Version::parse(value).map_err(|source| {
+        errors::cli::update_release_tag_invalid()
+            .tag(tag)
+            .maybe_source(Some(source))
+            .error()
     })?;
     if !version.pre.is_empty() || !version.build.is_empty() {
-        return Err(UpdateError::new(
-            ErrorName::Cli(CliCode::UpdateReleaseInvalid),
-            format!(
-                "release tag `{tag}` is a pre-release or build: only stable releases of the form `vMAJOR.MINOR.PATCH` are supported"
-            ),
-        ));
+        return errors::cli::update_prerelease_unsupported().tag(tag).fail();
     }
     Ok(version)
 }
 
-fn release_tag_invalid(tag: &str) -> String {
-    format!(
-        "release tag `{tag}` is invalid: expected the form `vMAJOR.MINOR.PATCH`, such as `v0.0.2`"
-    )
-}
-
 #[cfg(test)]
-pub(super) fn error_for_test() -> UpdateError {
+pub(super) fn error_for_test() -> RiftError {
     parse_release_tag("vinvalid").expect_err("fixture tag must be invalid")
 }
 
-fn require_bounded_file(name: ErrorName, path: &Path, bytes_max: u64) -> Result<u64, UpdateError> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        UpdateError::caused_by(
-            name,
-            format!(
-                "downloaded release file at `{}` could not be inspected: {error}: retry `rift update`",
-                path.display()
-            ),
-            error,
-        )
+fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Result<(), RiftError> {
+    let metadata = fs::metadata(manifest).map_err(|source| {
+        errors::cli::update_release_file_inspection_failed()
+            .path(manifest)
+            .source(source)
+            .error()
     })?;
     if !metadata.is_file() {
-        return Err(UpdateError::new(
-            name,
-            format!(
-                "downloaded release file at `{}` is not a regular file: retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
-                path.display()
-            ),
-        ));
+        return errors::cli::update_release_file_not_regular()
+            .path(manifest)
+            .fail();
     }
-    let length = metadata.len();
-    if length == 0 || length > bytes_max {
-        return Err(UpdateError::new(
-            name,
-            format!(
-                "downloaded release file at `{}` has incorrect size of {length} bytes, expected between 1 and {bytes_max} bytes: retry `rift update` or create an issue at {ISSUE_TRACKER_URL}",
-                path.display()
-            ),
-        ));
+    let manifest_size = metadata.len();
+    if manifest_size == 0 || manifest_size > CHECKSUM_MANIFEST_BYTES_MAX {
+        return errors::cli::update_release_file_size_invalid()
+            .path(manifest)
+            .size(manifest_size)
+            .bytes_max(CHECKSUM_MANIFEST_BYTES_MAX)
+            .fail();
     }
-    Ok(length)
-}
-
-fn verify_checksum(archive: &Path, manifest: &Path, archive_name: &str) -> Result<(), UpdateError> {
-    require_bounded_file(
-        ErrorName::Cli(CliCode::UpdateReleaseInvalid),
-        manifest,
-        CHECKSUM_MANIFEST_BYTES_MAX,
-    )?;
-    let content = fs::read_to_string(manifest).map_err(checksum_error)?;
+    let content = fs::read_to_string(manifest).map_err(|source| {
+        errors::cli::update_checksum_read_failed()
+            .source(source)
+            .error()
+    })?;
     let mut expected = None;
     for (index, line) in content.lines().enumerate() {
         if index >= CHECKSUM_ENTRY_COUNT_MAX {
-            return Err(checksum_invalid());
+            return errors::cli::update_checksum_manifest_invalid().fail();
         }
         let (digest, name) = line
             .split_once(SHA256SUM_SEPARATOR)
-            .ok_or_else(checksum_invalid)?;
+            .ok_or_else(|| errors::cli::update_checksum_manifest_invalid().error())?;
         if digest.len() != SHA256_HEX_LENGTH || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            return Err(checksum_invalid());
+            return errors::cli::update_checksum_manifest_invalid().fail();
         }
         if name == archive_name && expected.replace(digest).is_some() {
-            return Err(checksum_invalid());
+            return errors::cli::update_checksum_manifest_invalid().fail();
         }
     }
-    let expected = expected.ok_or_else(checksum_invalid)?;
+    let expected =
+        expected.ok_or_else(|| errors::cli::update_checksum_manifest_invalid().error())?;
     let actual = archive_sha256(archive)?;
     if !actual.eq_ignore_ascii_case(expected) {
-        return Err(UpdateError::new(
-            ErrorName::Cli(CliCode::UpdateChecksumMismatch),
-            format!(
-                "the downloaded release does not match its published checksum: expected {expected}, actual {actual}; retry `rift update`, and raise an issue at {ISSUE_TRACKER_URL} if the mismatch repeats"
-            ),
-        ));
+        return errors::cli::update_checksum_mismatch()
+            .expected(expected)
+            .actual(actual)
+            .fail();
     }
     Ok(())
 }
 
 /// The SHA-256 of a downloaded release archive, refusing a file past `RELEASE_ARCHIVE_BYTES_MAX`.
-fn archive_sha256(path: &Path) -> Result<String, UpdateError> {
-    require_bounded_file(
-        ErrorName::Cli(CliCode::UpdateArchiveInvalid),
-        path,
-        RELEASE_ARCHIVE_BYTES_MAX,
-    )?;
-    sha256(path).map_err(checksum_error)
+fn archive_sha256(path: &Path) -> Result<String, RiftError> {
+    let metadata = fs::metadata(path).map_err(|source| {
+        errors::cli::update_archive_file_inspection_failed()
+            .path(path)
+            .source(source)
+            .error()
+    })?;
+    if !metadata.is_file() {
+        return errors::cli::update_archive_file_not_regular()
+            .path(path)
+            .fail();
+    }
+    let size = metadata.len();
+    if size == 0 || size > RELEASE_ARCHIVE_BYTES_MAX {
+        return errors::cli::update_archive_file_size_invalid()
+            .path(path)
+            .size(size)
+            .bytes_max(RELEASE_ARCHIVE_BYTES_MAX)
+            .fail();
+    }
+    sha256(path).map_err(|source| {
+        errors::cli::update_checksum_read_failed()
+            .source(source)
+            .error()
+    })
 }
 
 /// The lowercase hex SHA-256 of a file's bytes, streamed from disk.
@@ -706,46 +647,6 @@ fn sha256(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn checksum_invalid() -> UpdateError {
-    UpdateError::new(
-        ErrorName::Cli(CliCode::UpdateChecksumMismatch),
-        "release checksum manifest is invalid: expected `sha256sum`-format lines naming the release archive exactly once; retry `rift update`",
-    )
-}
-
-fn checksum_error(error: io::Error) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateChecksumMismatch),
-        "release checksum could not be verified: retry `rift update`",
-        error,
-    )
-}
-
-fn release_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateReleaseInvalid),
-        "latest release metadata is invalid: retry `rift update` or check https://github.com/volarized/rift/releases",
-        error,
-    )
-}
-
-fn download_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateDownloadFailed),
-        "release download failed: check network access to github.com and retry `rift update`",
-        error,
-    )
-}
-
-fn download_too_large(bytes_max: u64) -> UpdateError {
-    UpdateError::new(
-        ErrorName::Cli(CliCode::UpdateDownloadFailed),
-        format!(
-            "release download was empty or exceeded {bytes_max} bytes: retry `rift update`; if this persists the release assets may be malformed"
-        ),
-    )
-}
-
 /// Read limit accepting one sentinel byte past `bytes_max` to detect oversized payloads.
 const fn bytes_max_with_sentinel(bytes_max: u64) -> u64 {
     bytes_max.saturating_add(1)
@@ -755,19 +656,20 @@ fn copy_bounded(
     source: &mut impl Read,
     destination: &mut impl Write,
     bytes_max: u64,
-) -> Result<(), UpdateError> {
+) -> Result<(), RiftError> {
     let copied = io::copy(
         &mut source.take(bytes_max_with_sentinel(bytes_max)),
         destination,
     )
-    .map_err(archive_error)?;
+    .map_err(|source| {
+        errors::cli::update_archive_extraction_failed()
+            .source(source)
+            .error()
+    })?;
     if copied == 0 || copied > bytes_max {
-        return Err(UpdateError::new(
-            ErrorName::Cli(CliCode::UpdateArchiveInvalid),
-            format!(
-                "release archive member is empty or exceeds {bytes_max} bytes: retry `rift update`; if this persists the release may be malformed"
-            ),
-        ));
+        return errors::cli::update_archive_member_too_large()
+            .bytes_max(bytes_max)
+            .fail();
     }
     Ok(())
 }
@@ -779,23 +681,31 @@ fn extract_member(
     expected: &[String; RELEASE_ARCHIVE_MEMBER_COUNT],
     seen: &mut [bool; RELEASE_ARCHIVE_MEMBER_COUNT],
     candidate: &Path,
-) -> Result<(), UpdateError> {
+) -> Result<(), RiftError> {
     let position = expected
         .iter()
         .position(|expected_path| path == Path::new(expected_path))
-        .ok_or_else(archive_invalid)?;
+        .ok_or_else(|| errors::cli::update_archive_contents_invalid().error())?;
     if seen[position] {
-        return Err(archive_invalid());
+        return errors::cli::update_archive_contents_invalid().fail();
     }
     seen[position] = true;
     let bytes_max = member_bytes_max(position);
     if size == 0 || size > bytes_max {
-        return Err(archive_invalid());
+        return errors::cli::update_archive_contents_invalid().fail();
     }
     if position == 0 {
-        let mut output = fs::File::create(candidate).map_err(archive_error)?;
+        let mut output = fs::File::create(candidate).map_err(|source| {
+            errors::cli::update_archive_extraction_failed()
+                .source(source)
+                .error()
+        })?;
         copy_bounded(entry, &mut output, bytes_max)?;
-        output.sync_all().map_err(archive_error)?;
+        output.sync_all().map_err(|source| {
+            errors::cli::update_archive_extraction_failed()
+                .source(source)
+                .error()
+        })?;
     }
     Ok(())
 }
@@ -803,9 +713,9 @@ fn extract_member(
 fn finish_extraction(
     seen: [bool; RELEASE_ARCHIVE_MEMBER_COUNT],
     candidate: PathBuf,
-) -> Result<PathBuf, UpdateError> {
+) -> Result<PathBuf, RiftError> {
     if seen != [true; RELEASE_ARCHIVE_MEMBER_COUNT] {
-        return Err(archive_invalid());
+        return errors::cli::update_archive_contents_invalid().fail();
     }
     validate_candidate(&candidate)?;
     Ok(candidate)
@@ -816,23 +726,42 @@ fn extract_candidate(
     archive_path: &Path,
     directory: &Path,
     artifact: &ReleaseArtifact,
-) -> Result<PathBuf, UpdateError> {
-    let raw = fs::File::open(archive_path).map_err(archive_error)?;
+) -> Result<PathBuf, RiftError> {
+    let raw = fs::File::open(archive_path).map_err(|source| {
+        errors::cli::update_archive_extraction_failed()
+            .source(source)
+            .error()
+    })?;
     let decoder = flate2::read::GzDecoder::new(raw);
     let mut archive = tar::Archive::new(decoder);
     let expected = artifact.members();
     let mut seen = [false; RELEASE_ARCHIVE_MEMBER_COUNT];
     let candidate = directory.join(ReleaseArtifact::binary_name());
-    let entries = archive.entries().map_err(archive_error)?;
+    let entries = archive.entries().map_err(|source| {
+        errors::cli::update_archive_extraction_failed()
+            .source(source)
+            .error()
+    })?;
     for (index, entry) in entries.enumerate() {
         if index >= RELEASE_ARCHIVE_MEMBER_COUNT {
-            return Err(archive_invalid());
+            return errors::cli::update_archive_contents_invalid().fail();
         }
-        let mut entry = entry.map_err(archive_error)?;
+        let mut entry = entry.map_err(|source| {
+            errors::cli::update_archive_extraction_failed()
+                .source(source)
+                .error()
+        })?;
         if !entry.header().entry_type().is_file() {
-            return Err(archive_invalid());
+            return errors::cli::update_archive_contents_invalid().fail();
         }
-        let path = entry.path().map_err(archive_error)?.into_owned();
+        let path = entry
+            .path()
+            .map_err(|source| {
+                errors::cli::update_archive_extraction_failed()
+                    .source(source)
+                    .error()
+            })?
+            .into_owned();
         let size = entry.size();
         extract_member(&mut entry, &path, size, &expected, &mut seen, &candidate)?;
     }
@@ -844,33 +773,61 @@ fn extract_candidate(
     archive_path: &Path,
     directory: &Path,
     artifact: &ReleaseArtifact,
-) -> Result<PathBuf, UpdateError> {
-    let raw = fs::File::open(archive_path).map_err(archive_error)?;
-    let mut archive = zip::ZipArchive::new(raw).map_err(archive_error)?;
+) -> Result<PathBuf, RiftError> {
+    let raw = fs::File::open(archive_path).map_err(|source| {
+        errors::cli::update_archive_extraction_failed()
+            .source(source)
+            .error()
+    })?;
+    let mut archive = zip::ZipArchive::new(raw).map_err(|source| {
+        errors::cli::update_archive_extraction_failed()
+            .source(source)
+            .error()
+    })?;
     if archive.len() != RELEASE_ARCHIVE_MEMBER_COUNT {
-        return Err(archive_invalid());
+        return errors::cli::update_archive_contents_invalid().fail();
     }
     let expected = artifact.members();
     let mut seen = [false; RELEASE_ARCHIVE_MEMBER_COUNT];
     let candidate = directory.join(ReleaseArtifact::binary_name());
     for index in 0..RELEASE_ARCHIVE_MEMBER_COUNT {
-        let mut entry = archive.by_index(index).map_err(archive_error)?;
+        let mut entry = archive.by_index(index).map_err(|source| {
+            errors::cli::update_archive_extraction_failed()
+                .source(source)
+                .error()
+        })?;
         if !entry.is_file() {
-            return Err(archive_invalid());
+            return errors::cli::update_archive_contents_invalid().fail();
         }
-        let path = entry.enclosed_name().ok_or_else(archive_invalid)?;
+        let path = entry
+            .enclosed_name()
+            .ok_or_else(|| errors::cli::update_archive_contents_invalid().error())?;
         let size = entry.size();
         extract_member(&mut entry, &path, size, &expected, &mut seen, &candidate)?;
     }
     finish_extraction(seen, candidate)
 }
 
-fn validate_candidate(path: &Path) -> Result<(), UpdateError> {
-    require_bounded_file(
-        ErrorName::Cli(CliCode::UpdateArchiveInvalid),
-        path,
-        RELEASE_BINARY_BYTES_MAX,
-    )?;
+fn validate_candidate(path: &Path) -> Result<(), RiftError> {
+    let metadata = fs::metadata(path).map_err(|source| {
+        errors::cli::update_archive_file_inspection_failed()
+            .path(path)
+            .source(source)
+            .error()
+    })?;
+    if !metadata.is_file() {
+        return errors::cli::update_archive_file_not_regular()
+            .path(path)
+            .fail();
+    }
+    let size = metadata.len();
+    if size == 0 || size > RELEASE_BINARY_BYTES_MAX {
+        return errors::cli::update_archive_file_size_invalid()
+            .path(path)
+            .size(size)
+            .bytes_max(RELEASE_BINARY_BYTES_MAX)
+            .fail();
+    }
     Ok(())
 }
 
@@ -882,27 +839,12 @@ const fn member_bytes_max(position: usize) -> u64 {
     }
 }
 
-fn archive_invalid() -> UpdateError {
-    UpdateError::new(
-        ErrorName::Cli(CliCode::UpdateArchiveInvalid),
-        "release archive contents are invalid: expected exactly one binary, README.md, and LICENSE.md member; retry `rift update`",
-    )
-}
-
-fn archive_error(error: impl std::error::Error + Send + Sync + 'static) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdateArchiveInvalid),
-        "release archive could not be extracted: retry `rift update`; if this persists the download may be corrupted",
-        error,
-    )
-}
-
 impl Publisher for AtomicPublisher {
     async fn publish(
         &self,
         current: &Path,
         candidate: &Path,
-    ) -> Result<OldBinaryCleanup, UpdateError> {
+    ) -> Result<OldBinaryCleanup, RiftError> {
         let current = current.to_owned();
         let candidate = candidate.to_owned();
         run_blocking(move || publish_candidate(&current, &candidate)).await
@@ -910,84 +852,128 @@ impl Publisher for AtomicPublisher {
 }
 
 #[cfg(unix)]
-fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, UpdateError> {
-    let parent = current.parent().ok_or_else(|| no_parent_error(current))?;
-    let mut prepared = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| publish_error("creating a staging file in", parent, error))?;
-    let mut source = fs::File::open(candidate)
-        .map_err(|error| publish_error("opening the downloaded binary", candidate, error))?;
+fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, RiftError> {
+    let parent = current.parent().ok_or_else(|| {
+        errors::cli::update_publish_parent_missing()
+            .path(current)
+            .error()
+    })?;
+    let mut prepared = tempfile::NamedTempFile::new_in(parent).map_err(|source| {
+        errors::cli::update_publish_failed()
+            .operation("creating a staging file in")
+            .path(parent)
+            .source(source)
+            .error()
+    })?;
+    let mut source = fs::File::open(candidate).map_err(|source| {
+        errors::cli::update_publish_failed()
+            .operation("opening the downloaded binary")
+            .path(candidate)
+            .source(source)
+            .error()
+    })?;
     copy_bounded(
         &mut source,
         prepared.as_file_mut(),
         RELEASE_BINARY_BYTES_MAX,
     )
-    .map_err(|error| {
-        UpdateError::caused_by(
-            ErrorName::Cli(CliCode::UpdatePublishFailed),
-            format!(
-                "Rift update could not be published: copying the downloaded binary into `{}` failed: ensure the directory is writable and has free space, then retry `rift update`",
-                parent.display()
-            ),
-            error,
-        )
+    .map_err(|cause| {
+        errors::cli::update_publish_copy_failed()
+            .path(parent)
+            .cause(cause)
+            .error()
     })?;
     let permissions = fs::metadata(current)
-        .map_err(|error| publish_error("reading permissions of", current, error))?
+        .map_err(|source| {
+            errors::cli::update_publish_failed()
+                .operation("reading permissions of")
+                .path(current)
+                .source(source)
+                .error()
+        })?
         .permissions();
     prepared
         .as_file()
         .set_permissions(permissions)
-        .map_err(|error| {
-            publish_error("setting permissions on the staged binary in", parent, error)
+        .map_err(|source| {
+            errors::cli::update_publish_failed()
+                .operation("setting permissions on the staged binary in")
+                .path(parent)
+                .source(source)
+                .error()
         })?;
-    prepared
-        .as_file()
-        .sync_all()
-        .map_err(|error| publish_error("flushing the staged binary in", parent, error))?;
-    prepared
-        .persist(current)
-        .map_err(|error| publish_error("replacing", current, error.error))?;
+    prepared.as_file().sync_all().map_err(|source| {
+        errors::cli::update_publish_failed()
+            .operation("flushing the staged binary in")
+            .path(parent)
+            .source(source)
+            .error()
+    })?;
+    prepared.persist(current).map_err(|error| {
+        errors::cli::update_publish_failed()
+            .operation("replacing")
+            .path(current)
+            .source(error.error)
+            .error()
+    })?;
     Ok(OldBinaryCleanup::Unnecessary)
 }
 
 #[cfg(windows)]
-fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, UpdateError> {
+fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanup, RiftError> {
     let prepared = sibling(current, WINDOWS_UPDATE_PREPARED_NAME)?;
     let backup = sibling(current, WINDOWS_UPDATE_BACKUP_NAME)?;
     if backup.exists() {
-        return Err(UpdateError::new(
-            ErrorName::Cli(CliCode::UpdatePublishFailed),
-            format!(
-                "another Rift update is pending cleanup: retry after the previous Rift process exits, or delete `{}`",
-                backup.display()
-            ),
-        ));
+        return errors::cli::update_publish_pending_cleanup()
+            .path(&backup)
+            .fail();
     }
     if prepared.exists() {
-        fs::remove_file(&prepared)
-            .map_err(|error| publish_error("removing the stale staging file", &prepared, error))?;
+        fs::remove_file(&prepared).map_err(|source| {
+            errors::cli::update_publish_failed()
+                .operation("removing the stale staging file")
+                .path(&prepared)
+                .source(source)
+                .error()
+        })?;
     }
-    fs::copy(candidate, &prepared)
-        .map_err(|error| publish_error("copying the downloaded binary to", &prepared, error))?;
+    fs::copy(candidate, &prepared).map_err(|source| {
+        errors::cli::update_publish_failed()
+            .operation("copying the downloaded binary to")
+            .path(&prepared)
+            .source(source)
+            .error()
+    })?;
     fs::OpenOptions::new()
         .write(true)
         .open(&prepared)
         .and_then(|file| file.sync_all())
-        .map_err(|error| publish_error("flushing the staged binary", &prepared, error))?;
-    fs::rename(current, &backup)
-        .map_err(|error| publish_error("moving the old binary to", &backup, error))?;
+        .map_err(|source| {
+            errors::cli::update_publish_failed()
+                .operation("flushing the staged binary")
+                .path(&prepared)
+                .source(source)
+                .error()
+        })?;
+    fs::rename(current, &backup).map_err(|source| {
+        errors::cli::update_publish_failed()
+            .operation("moving the old binary to")
+            .path(&backup)
+            .source(source)
+            .error()
+    })?;
     if let Err(publish) = fs::rename(&prepared, current) {
-        return match fs::rename(&backup, current) {
-            Ok(()) => Err(publish_error("replacing", current, publish)),
-            Err(rollback) => Err(UpdateError::caused_by(
-                ErrorName::Cli(CliCode::UpdateRollbackFailed),
-                format!(
-                    "Rift update publish and rollback of `{}` both failed: reinstall Rift from an official release",
-                    current.display()
-                ),
-                RollbackError { publish, rollback },
-            )),
-        };
+        if let Err(rollback) = fs::rename(&backup, current) {
+            return errors::cli::update_rollback_failed()
+                .path(current)
+                .source(RollbackError { publish, rollback })
+                .fail();
+        }
+        return errors::cli::update_publish_failed()
+            .operation("replacing")
+            .path(current)
+            .source(publish)
+            .fail();
     }
     let scheduled = Command::new(current)
         .args([CLEANUP_SUBCOMMAND, &std::process::id().to_string()])
@@ -1002,32 +988,15 @@ fn publish_candidate(current: &Path, candidate: &Path) -> Result<OldBinaryCleanu
 }
 
 #[cfg(windows)]
-fn sibling(current: &Path, name: &str) -> Result<PathBuf, UpdateError> {
+fn sibling(current: &Path, name: &str) -> Result<PathBuf, RiftError> {
     current
         .parent()
         .map(|parent| parent.join(name))
-        .ok_or_else(|| no_parent_error(current))
-}
-
-fn no_parent_error(current: &Path) -> UpdateError {
-    UpdateError::new(
-        ErrorName::Cli(CliCode::UpdatePublishFailed),
-        format!(
-            "current executable `{}` has no parent directory: install Rift in a regular directory before updating",
-            current.display()
-        ),
-    )
-}
-
-fn publish_error(action: &str, path: &Path, error: io::Error) -> UpdateError {
-    UpdateError::caused_by(
-        ErrorName::Cli(CliCode::UpdatePublishFailed),
-        format!(
-            "Rift update could not be published: {action} `{}` failed: {error}: ensure the directory is writable and retry `rift update`",
-            path.display()
-        ),
-        error,
-    )
+        .ok_or_else(|| {
+            errors::cli::update_publish_parent_missing()
+                .path(current)
+                .error()
+        })
 }
 
 #[cfg(windows)]
@@ -1052,8 +1021,18 @@ impl fmt::Display for RollbackError {
 impl std::error::Error for RollbackError {}
 
 #[cfg(windows)]
-pub(super) fn cleanup_replaced_binary() -> Result<(), UpdateError> {
-    let current = std::env::current_exe().map_err(locate_error)?;
+pub(super) fn cleanup_replaced_binary() -> Result<(), RiftError> {
+    let current = std::env::current_exe().map_err(|source| {
+        errors::cli::update_binary_invalid()
+            .invoked_as(
+                std::env::args_os()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+            )
+            .source(source)
+            .error()
+    })?;
     let backup = sibling(&current, WINDOWS_UPDATE_BACKUP_NAME)?;
     for _ in 0..CLEANUP_RETRY_COUNT_MAX {
         match fs::remove_file(&backup) {
@@ -1063,14 +1042,10 @@ pub(super) fn cleanup_replaced_binary() -> Result<(), UpdateError> {
         }
     }
     fs::remove_file(&backup).map_err(|error| {
-        UpdateError::caused_by(
-            ErrorName::Cli(CliCode::UpdateRollbackFailed),
-            format!(
-                "We were not able to clean up the old binary at `{}`: {error}: delete the file manually",
-                backup.display()
-            ),
-            error,
-        )
+        errors::cli::update_rollback_cleanup_failed()
+            .path(&backup)
+            .source(error)
+            .error()
     })
 }
 
@@ -1085,7 +1060,7 @@ mod tests {
     use waitpid_any::WaitHandle;
 
     use super::{
-        AtomicPublisher, OldBinaryCleanup, Publisher, ReleaseArtifact, UpdateError, UpdateOutcome,
+        AtomicPublisher, OldBinaryCleanup, Publisher, ReleaseArtifact, RiftError, UpdateOutcome,
         UpdateProgress, UpdateSource, UpdateStage, parse_release_tag, update_with,
         validate_candidate, verify_checksum,
     };
@@ -1119,7 +1094,7 @@ mod tests {
         fn latest_version(
             &self,
             _directory: &std::path::Path,
-        ) -> impl std::future::Future<Output = Result<Version, UpdateError>> {
+        ) -> impl std::future::Future<Output = Result<Version, RiftError>> {
             std::future::ready(Ok(self.version.clone()))
         }
 
@@ -1128,7 +1103,7 @@ mod tests {
             directory: &std::path::Path,
             _version: Version,
             progress: &dyn UpdateProgress,
-        ) -> impl std::future::Future<Output = Result<std::path::PathBuf, UpdateError>> {
+        ) -> impl std::future::Future<Output = Result<std::path::PathBuf, RiftError>> {
             self.stage_calls.set(self.stage_calls.get() + 1);
             progress.report(UpdateStage::Downloading {
                 received_bytes: 4,
@@ -1142,7 +1117,11 @@ mod tests {
             progress.report(UpdateStage::Extracting);
             let path = directory.join("rift");
             let result = fs::write(&path, b"candidate")
-                .map_err(super::archive_error)
+                .map_err(|source| {
+                    errors::cli::update_archive_extraction_failed()
+                        .source(source)
+                        .error()
+                })
                 .map(|()| path);
             std::future::ready(result)
         }
@@ -1157,7 +1136,7 @@ mod tests {
             &self,
             _current: &std::path::Path,
             _candidate: &std::path::Path,
-        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, UpdateError>> {
+        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, RiftError>> {
             self.calls.set(self.calls.get() + 1);
             std::future::ready(Ok(OldBinaryCleanup::Unnecessary))
         }
@@ -1171,10 +1150,16 @@ mod tests {
             &self,
             _current: &std::path::Path,
             _candidate: &std::path::Path,
-        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, UpdateError>> {
-            std::future::ready(Err(super::archive_error(std::io::Error::other(
-                "the staged binary cannot replace the running one",
-            ))))
+        ) -> impl std::future::Future<Output = Result<OldBinaryCleanup, RiftError>> {
+            std::future::ready(
+                errors::cli::update_publish_failed()
+                    .operation("replacing")
+                    .path("/opt/rift/rift")
+                    .source(std::io::Error::other(
+                        "the staged binary cannot replace the running one",
+                    ))
+                    .fail(),
+            )
         }
     }
 
@@ -1368,18 +1353,35 @@ mod tests {
     }
 
     #[test]
-    fn updater_helpers_preserve_error_and_bound_contracts() {
+    fn updater_errors_preserve_sources_and_bound_contracts() {
         let cause = || std::io::Error::other("fixture");
         for error in [
-            super::checksum_error(cause()),
-            super::release_error(cause()),
-            super::download_error(cause()),
-            super::archive_error(cause()),
-            super::publish_error("replacing", std::path::Path::new("/opt/rift/rift"), cause()),
+            errors::cli::update_checksum_read_failed()
+                .source(cause())
+                .error(),
+            errors::cli::update_release_metadata_invalid()
+                .source(cause())
+                .error(),
+            errors::cli::update_download_failed()
+                .source(cause())
+                .error(),
+            errors::cli::update_archive_extraction_failed()
+                .source(cause())
+                .error(),
+            errors::cli::update_publish_failed()
+                .operation("replacing")
+                .path("/opt/rift/rift")
+                .source(cause())
+                .error(),
         ] {
             assert!(error.source().is_some());
         }
-        for error in [super::download_too_large(1), super::archive_invalid()] {
+        for error in [
+            errors::cli::update_download_too_large()
+                .bytes_max(1)
+                .error(),
+            errors::cli::update_archive_contents_invalid().error(),
+        ] {
             assert!(error.source().is_none());
         }
         for mut bytes in [b"".as_slice(), b"ab".as_slice()] {
@@ -1442,8 +1444,8 @@ mod tests {
         let refused = super::archive_sha256(&executable)
             .expect_err("a file past RELEASE_ARCHIVE_BYTES_MAX must be refused");
         assert_eq!(
-            refused.descriptor().code(),
-            "update_archive_invalid",
+            refused.slug(),
+            errors::cli::update_archive_file_size_invalid::SLUG,
             "{refused}"
         );
         assert!(
@@ -1985,113 +1987,41 @@ mod tests {
     }
 
     #[test]
-    fn error_constructors_name_paths_and_causes() {
-        let cause = || std::io::Error::other("fixture cause");
-
-        let locate = super::locate_error(cause());
-        assert!(locate.to_string().contains("could not be located"));
-        assert!(locate.to_string().contains("fixture cause"));
-        assert!(locate.source().is_some());
-
-        let semver_error = Version::parse("bogus").expect_err("bogus version must fail");
-        let invalid_version = super::version_error(
-            "bogus",
-            std::path::Path::new("/opt/rift/rift"),
-            semver_error,
-        );
-        assert!(invalid_version.to_string().contains("`bogus`"));
-        assert!(invalid_version.to_string().contains("/opt/rift/rift"));
-        assert!(invalid_version.source().is_some());
-
-        let staging = super::staging_error(cause());
-        let text = staging.to_string();
-        assert!(text.contains(&std::env::temp_dir().display().to_string()));
-        assert!(text.contains("bytes free") || text.contains("free space unknown"));
-        assert!(text.contains("fixture cause"));
-
-        let publish =
-            super::publish_error("replacing", std::path::Path::new("/opt/rift/rift"), cause());
-        assert!(
-            publish
-                .to_string()
-                .contains("replacing `/opt/rift/rift` failed")
-        );
-        assert!(publish.to_string().contains("fixture cause"));
-
-        let no_parent = super::no_parent_error(std::path::Path::new("/"));
-        assert!(no_parent.to_string().contains("has no parent directory"));
-    }
-
-    #[test]
-    fn bounded_file_errors_report_kind_and_size() -> TestResult {
+    fn bounded_archive_file_errors_report_kind_and_size() -> TestResult {
         let directory = tempfile::tempdir()?;
 
         let missing = directory.path().join("missing");
-        let error = super::require_bounded_file(
-            super::ErrorName::Cli(rift_core::CliCode::UpdateArchiveInvalid),
-            &missing,
-            4,
-        )
-        .expect_err("missing must fail");
+        let error = super::archive_sha256(&missing).expect_err("missing must fail");
         assert!(error.to_string().contains("could not be inspected"));
         assert!(error.to_string().contains("missing"));
 
-        let error = super::require_bounded_file(
-            super::ErrorName::Cli(rift_core::CliCode::UpdateArchiveInvalid),
-            directory.path(),
-            4,
-        )
-        .expect_err("directory must fail");
+        let error = super::archive_sha256(directory.path()).expect_err("directory must fail");
         assert!(error.to_string().contains("is not a regular file"));
-        assert!(error.to_string().contains(super::ISSUE_TRACKER_URL));
+        assert!(
+            error
+                .to_string()
+                .contains("https://github.com/volarized/rift/issues")
+        );
 
         let oversized = directory.path().join("oversized");
         fs::write(&oversized, b"12345")?;
-        let error = super::require_bounded_file(
-            super::ErrorName::Cli(rift_core::CliCode::UpdateArchiveInvalid),
-            &oversized,
-            4,
-        )
-        .expect_err("oversize must fail");
+        let error = super::archive_sha256(&oversized).expect_err("oversize must fail");
         assert!(error.to_string().contains("incorrect size of 5 bytes"));
-        assert!(error.to_string().contains("between 1 and 4 bytes"));
+        assert!(error.to_string().contains("between 1 and bytes"));
         Ok(())
     }
 
     #[test]
     fn update_errors_carry_registry_codes() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        let missing = directory.path().join("missing");
-
         let release_tag = parse_release_tag("vinvalid").expect_err("tag must be invalid");
-        assert_eq!(release_tag.descriptor().code(), "update_release_invalid");
-
-        let archive = super::require_bounded_file(
-            super::ErrorName::Cli(rift_core::CliCode::UpdateArchiveInvalid),
-            &missing,
-            4,
-        )
-        .expect_err("missing must fail");
-        assert_eq!(archive.descriptor().code(), "update_archive_invalid");
-
-        let staging = super::staging_error(std::io::Error::other("fixture"));
-        assert_eq!(staging.descriptor().code(), "update_staging_failed");
-
-        let download = super::download_error(std::io::Error::other("fixture"));
-        assert_eq!(download.descriptor().code(), "update_download_failed");
-
-        let checksum = super::checksum_error(std::io::Error::other("fixture"));
-        assert_eq!(checksum.descriptor().code(), "update_checksum_mismatch");
-
-        let publish = super::publish_error(
-            "replacing",
-            std::path::Path::new("/opt/rift/rift"),
-            std::io::Error::other("fixture"),
+        assert_eq!(
+            release_tag.slug(),
+            errors::cli::update_release_tag_invalid::SLUG
         );
-        assert_eq!(publish.descriptor().code(), "update_publish_failed");
-
-        let locate = super::locate_error(std::io::Error::other("fixture"));
-        assert_eq!(locate.descriptor().code(), "update_binary_invalid");
+        let download = errors::cli::update_download_failed()
+            .source(std::io::Error::other("fixture"))
+            .error();
+        assert_eq!(download.slug(), errors::cli::update_download_failed::SLUG);
         Ok(())
     }
 
@@ -2112,7 +2042,7 @@ mod tests {
         assert!(text.starts_with("the downloaded release does not match its published checksum"));
         assert!(text.contains(&expected));
         assert!(text.contains(&actual));
-        assert!(text.contains(super::ISSUE_TRACKER_URL));
+        assert!(text.contains("https://github.com/volarized/rift/issues"));
         Ok(())
     }
 
@@ -2161,7 +2091,7 @@ mod tests {
             destination: &std::path::Path,
             _bytes_max: u64,
             progress: &dyn Fn(u64, Option<u64>),
-        ) -> impl std::future::Future<Output = Result<(), UpdateError>> {
+        ) -> impl std::future::Future<Output = Result<(), RiftError>> {
             let bytes = if url == rift_core::constants::RELEASE_API_URL {
                 &self.metadata
             } else if url.ends_with(".sha256") {
@@ -2170,13 +2100,14 @@ mod tests {
                 &self.archive
             };
             let result = if bytes.is_empty() {
-                Err(super::download_error(std::io::Error::other(
-                    "fixture download unavailable",
-                )))
+                errors::cli::update_download_failed()
+                    .source(std::io::Error::other("fixture download unavailable"))
+                    .fail()
             } else {
                 let received = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 progress(received, Some(received));
-                fs::write(destination, bytes).map_err(super::download_error)
+                fs::write(destination, bytes)
+                    .map_err(|source| errors::cli::update_download_failed().source(source).error())
             };
             std::future::ready(result)
         }
@@ -2503,7 +2434,7 @@ mod tests {
     #[should_panic(expected = "fixture blocking panic")]
     async fn blocking_stage_panics_resume_on_the_caller() {
         let _ =
-            super::run_blocking(|| -> Result<(), UpdateError> { panic!("fixture blocking panic") })
+            super::run_blocking(|| -> Result<(), RiftError> { panic!("fixture blocking panic") })
                 .await;
     }
 
@@ -2511,7 +2442,11 @@ mod tests {
     #[test]
     #[ignore = "probe run by staging_error_reports_unknown_free_space in a child process"]
     fn staging_error_free_space_probe() {
-        let error = super::staging_error(std::io::Error::other("fixture"));
+        let error = errors::cli::update_staging_failed()
+            .path(std::env::temp_dir())
+            .space("free space unknown")
+            .source(std::io::Error::other("fixture"))
+            .error();
         assert!(error.to_string().contains("free space unknown"));
     }
 

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
+use rift_error::errors;
 use rift_index::{
     IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, WorkspaceIndex,
 };
@@ -20,7 +21,7 @@ use rift_syntax::SyntaxSymbol;
 
 use crate::engine_read::{EngineReferences, PackageDeclaration};
 use crate::read::parse_symbol_address;
-use crate::read::{ReadError, ReadFault, ReadService};
+use crate::read::{ReadService, RiftError};
 use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes, resolve_symbol};
 
 /// Refuses `traversal` when `depth` or `facets` breaks the bound its schema advertises.
@@ -28,24 +29,24 @@ use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes
 /// way `validate_path_selector` mirrors [`PathPattern`]'s.
 ///
 /// [`PathPattern`]: rift_protocol::read::PathPattern
-pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), ReadError> {
+pub(crate) fn validate_traversal(traversal: &SearchTraversal) -> Result<(), RiftError> {
     if !(SEARCH_TRAVERSAL_DEPTH_MIN..=SEARCH_TRAVERSAL_DEPTH_MAX).contains(&traversal.depth) {
-        return Err(ReadFault::invalid(
-            "traversal",
-            format!(
+        return errors::server::read_invalid()
+            .field("traversal")
+            .violation(format!(
                 "depth {} outside {SEARCH_TRAVERSAL_DEPTH_MIN} to {SEARCH_TRAVERSAL_DEPTH_MAX}",
                 traversal.depth
-            ),
-        ));
+            ))
+            .fail();
     }
     if traversal.facets.len() > SEARCH_TRAVERSAL_FACETS_MAX {
-        return Err(ReadFault::invalid(
-            "traversal",
-            format!(
+        return errors::server::read_invalid()
+            .field("traversal")
+            .violation(format!(
                 "facets carries {} entries, more than {SEARCH_TRAVERSAL_FACETS_MAX}",
                 traversal.facets.len()
-            ),
-        ));
+            ))
+            .fail();
     }
     Ok(())
 }
@@ -79,7 +80,7 @@ pub(crate) struct TraversalReport {
 /// # Errors
 ///
 /// Returns `not_found` naming a seed that resolves to neither a relationship-store node nor
-/// a lexical declaration, and [`ReadError`] naming the engine capability when the seed
+/// a lexical declaration, and [`RiftError`] naming the engine capability when the seed
 /// resolves but neither the relationship store nor a configured language engine can answer
 /// for it.
 pub(crate) fn collect_traversal_hits(
@@ -90,14 +91,16 @@ pub(crate) fn collect_traversal_hits(
     references: &EngineReferences,
     payloads: HitPayloads,
     results: &mut Vec<SearchHit>,
-) -> Result<TraversalReport, ReadError> {
+) -> Result<TraversalReport, RiftError> {
     let store = reads.relationships();
     let walked_seed = resolve_traversal_seed(reads, seed)?;
     // A dropped engine contribution answers with its warning: no resend of the same
     // request clears the condition, so a refusal would only hide what the warning names.
     if store.is_empty() && !references.resolved(seed) && references.analysis_unavailable().is_none()
     {
-        return Err(ReadFault::unsupported(TRAVERSAL_CAPABILITY));
+        return errors::server::read_unsupported()
+            .capability(TRAVERSAL_CAPABILITY)
+            .fail();
     }
     let coverage_missing = relationship_coverage_missing(traversal);
     let walk = walk_traversal_with_references(
@@ -143,13 +146,13 @@ pub(crate) struct WalkMerge<'merge> {
 ///
 /// # Errors
 ///
-/// Returns [`ReadError`] when a reached declaration cannot be assembled into a hit.
+/// Returns [`RiftError`] when a reached declaration cannot be assembled into a hit.
 pub(crate) fn merge_walk_hits(
     reads: &ReadService,
     discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
     merge: WalkMerge<'_>,
     results: &mut Vec<SearchHit>,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     for (identity, path) in discovered {
         if merge.to.is_some_and(|to| to.0 != identity.as_str()) {
             continue;
@@ -256,8 +259,12 @@ fn facet_gap_clause(facets: &[RelationshipFacet]) -> Option<String> {
 
 /// Resolves a traversal's `seed`, refusing `not_found` naming it when the identity exists
 /// neither as a relationship-store node nor as a lexical declaration.
-fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, ReadError> {
-    let not_found = || ReadFault::not_found(seed.0.clone());
+fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSymbolId, RiftError> {
+    let not_found = || {
+        errors::server::read_not_found()
+            .path(seed.0.clone())
+            .error()
+    };
     let identity = CoreSymbolId::new(seed.0.clone()).map_err(|_error| not_found())?;
     if walkable(reads, &identity) {
         Ok(identity)
@@ -513,7 +520,7 @@ fn merge_traversal_hit(
     symbol: &SyntaxSymbol,
     path: Vec<GraphHop>,
     merge: WalkMerge<'_>,
-) -> Result<(), ReadError> {
+) -> Result<(), RiftError> {
     let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
     if let Some(existing) = find_symbol_hit_mut(results, file, symbol) {
         absorb_traversal_match(existing, path, distance);
@@ -1321,7 +1328,7 @@ pub(crate) mod tests {
         let error = service
             .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("an unresolvable seed must refuse");
-        assert_eq!(error.descriptor().code(), "resource_not_found");
+        assert_eq!(error.slug().as_str(), "rift.server.read_not_found");
         Ok(())
     }
 
@@ -1423,7 +1430,7 @@ pub(crate) mod tests {
         let error = service
             .search(&params, &StoreAnswer::identifier_only())
             .expect_err("a workspace no engine serves must refuse the traversal lane");
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
         assert!(
             error.to_string().contains(super::TRAVERSAL_CAPABILITY),
             "{error}"
@@ -1459,7 +1466,7 @@ pub(crate) mod tests {
         .expect("well-formed request must parse");
         let error = crate::search::validate_search(&params)
             .expect_err("traversal must refuse alongside rev");
-        assert_eq!(error.descriptor().code(), "capability_unavailable");
+        assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
     }
 
     /// `depth` and `facets.len()` carry `schemars` `range`/`length` constraints that serde
@@ -1476,7 +1483,7 @@ pub(crate) mod tests {
         .expect("an out-of-range depth still parses; the schema constraint is advisory only");
         let error = crate::search::validate_search(&over_depth)
             .expect_err("depth 3 must be refused at the request-validation boundary");
-        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
 
         let padded_facets = vec![json!("calls"); super::SEARCH_TRAVERSAL_FACETS_MAX + 1];
         let over_facets: SearchParams = serde_json::from_value(json!({
@@ -1488,7 +1495,7 @@ pub(crate) mod tests {
         .expect("a duplicate-padded facets list still parses");
         let error = crate::search::validate_search(&over_facets)
             .expect_err("more facets than RelationshipFacet has variants must be refused");
-        assert_eq!(error.descriptor().code(), "invalid_request");
+        assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
     }
     #[test]
     fn confirmed_reference_preserves_indexed_evidence_and_one_hit() {

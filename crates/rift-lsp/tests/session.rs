@@ -14,7 +14,7 @@
 //! Byte-level framing misbehavior (garbage bytes, an oversized
 //! announcement) is proven directly against `framing::Framing` in that
 //! module's own unit tests; the two tests here prove only that the session
-//! turns such a framing refusal into the right `EngineFault`, writing the
+//! turns such a framing refusal into the right registered error, writing the
 //! misbehaving bytes straight onto the duplex with no scripted engine
 //! behind them.
 
@@ -30,12 +30,10 @@ use std::time::{Duration, Instant};
 
 use exchange::{ScriptedEngine, full_capabilities, zero_range};
 use lsp_types::{FileChangeType, Position};
-use rift_core::{ErrorCode, ErrorName, ProjectPath};
+use rift_core::ProjectPath;
+use rift_error::{RiftError, errors};
 use rift_lsp::capabilities::PositionEncoding;
-use rift_lsp::framing::FramingFault;
-use rift_lsp::session::{
-    EngineError, EngineFault, EngineLaunch, EngineReadiness, EngineSession, OPEN_DOCUMENTS_MAX,
-};
+use rift_lsp::session::{EngineLaunch, EngineReadiness, EngineSession, OPEN_DOCUMENTS_MAX};
 use rift_lsp::uri::TreeRoot;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -83,7 +81,7 @@ async fn begin<F, Fut>(
     script: F,
 ) -> (
     tempfile::TempDir,
-    Result<EngineSession, EngineError>,
+    Result<EngineSession, RiftError>,
     tokio::task::JoinHandle<()>,
 )
 where
@@ -333,13 +331,11 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
         )
         .await
         .expect_err("request was never advertised");
-    assert!(matches!(
-        refusal.fault(),
-        EngineFault::CapabilityAbsent { capability } if capability == "textDocument/references"
-    ));
-    assert_eq!(
-        refusal.name(),
-        ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+    assert_eq!(refusal.slug(), errors::lsp::engine_capability_absent::SLUG);
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| key == "capability" && value == "textDocument/references")
     );
     let item: lsp_types::CallHierarchyItem = serde_json::from_value(json!({
         "name": "beacon",
@@ -363,10 +359,7 @@ async fn engine_without_capabilities_gets_typed_refusals_before_any_request() {
         session.outgoing_calls(item).await.err(),
     ] {
         let error = absent.expect("the capability gate refuses");
-        assert!(matches!(
-            error.fault(),
-            EngineFault::CapabilityAbsent { .. }
-        ));
+        assert_eq!(error.slug(), errors::lsp::engine_capability_absent::SLUG);
     }
     session.shutdown().await;
     join(engine_task).await;
@@ -382,16 +375,15 @@ async fn unoffered_position_encoding_fails_the_start() {
     })
     .await;
     let error = result.expect_err("utf-32 was never offered");
-    assert!(matches!(error.fault(), EngineFault::Negotiation { .. }));
     assert_eq!(
-        error.name(),
-        ErrorName::Wire(ErrorCode::CapabilityUnavailable)
+        error.slug(),
+        errors::lsp::capabilities_position_encoding_unsupported::SLUG
     );
     join(engine_task).await;
 }
 
 #[tokio::test]
-async fn garbage_bytes_fail_the_start_with_a_framing_fault() {
+async fn garbage_bytes_fail_the_start_with_a_framing_error() {
     let (client, mut engine_side) = tokio::io::duplex(64 * 1024);
     let engine_task = tokio::spawn(async move {
         engine_side
@@ -408,7 +400,7 @@ async fn garbage_bytes_fail_the_start_with_a_framing_fault() {
     )
     .await
     .expect_err("garbage is refused");
-    assert!(matches!(error.fault(), EngineFault::Framing { .. }));
+    assert_eq!(error.slug(), errors::lsp::framing_header_malformed::SLUG);
     join(engine_task).await;
 }
 
@@ -431,16 +423,11 @@ async fn oversized_announcement_fails_the_start_as_limit_exceeded() {
     )
     .await
     .expect_err("the announcement crosses the bound");
-    match error.fault() {
-        EngineFault::Framing { source } => {
-            assert!(matches!(
-                source.fault(),
-                FramingFault::MessageTooLong { .. }
-            ));
-        }
-        other => panic!("expected a framing fault, got {other:?}"),
-    }
-    assert_eq!(error.name(), ErrorName::Wire(ErrorCode::LimitExceeded));
+    assert_eq!(error.slug(), errors::lsp::framing_message_too_long::SLUG);
+    assert!(
+        error.context().any(|(key, value)| key == "limit"
+            && value == rift_lsp::framing::MESSAGE_BYTES_MAX.to_string())
+    );
     join(engine_task).await;
 }
 
@@ -473,7 +460,7 @@ async fn result_outside_the_method_shape_is_typed_and_non_fatal() {
         )
         .await
         .expect_err("a number is not a location list");
-    assert!(matches!(error.fault(), EngineFault::ResultInvalid { .. }));
+    assert_eq!(error.slug(), errors::lsp::engine_result_invalid::SLUG);
     session
         .references(
             &document,
@@ -519,11 +506,17 @@ async fn refused_references_request_is_typed_and_leaves_the_session_serving() {
         )
         .await
         .expect_err("the engine refuses the position");
-    assert!(matches!(
-        refusal.fault(),
-        EngineFault::Refused { code: -32602, message, .. } if message == "position is outside the document"
-    ));
-    assert_eq!(refusal.name(), ErrorName::Wire(ErrorCode::InvalidRequest));
+    assert_eq!(refusal.slug(), errors::lsp::engine_refused_terminal::SLUG);
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| key == "code" && value == "-32602")
+    );
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| key == "message" && value == "position is outside the document")
+    );
     session
         .references(
             &document,
@@ -539,7 +532,7 @@ async fn refused_references_request_is_typed_and_leaves_the_session_serving() {
 }
 
 /// A server cancellation is a refusal the caller may resend: the typed
-/// fault carries the code, classifies as temporarily unavailable, and
+/// error carries the code, classifies as temporarily unavailable, and
 /// leaves the engine serving the next request.
 #[tokio::test]
 async fn cancelled_references_request_is_a_retryable_refusal() {
@@ -572,15 +565,16 @@ async fn cancelled_references_request_is_a_retryable_refusal() {
         )
         .await
         .expect_err("the engine cancels the request");
-    assert!(matches!(
-        refusal.fault(),
-        EngineFault::Refused { code: -32802, message, .. }
-            if message == "server cancelled the request"
-    ));
-    assert!(refusal.fault().is_retryable_refusal());
-    assert_eq!(
-        refusal.name(),
-        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    assert_eq!(refusal.slug(), errors::lsp::engine_refused_retryable::SLUG);
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| key == "code" && value == "-32802")
+    );
+    assert!(
+        refusal
+            .context()
+            .any(|(key, value)| key == "message" && value == "server cancelled the request")
     );
     session
         .references(
@@ -614,7 +608,7 @@ async fn payload_without_an_envelope_ends_the_session() {
         )
         .await
         .expect_err("the payload fits no envelope");
-    assert!(matches!(error.fault(), EngineFault::MessageUnreadable));
+    assert_eq!(error.slug(), errors::lsp::engine_message_unreadable::SLUG);
     session.shutdown().await;
     join(engine_task).await;
 }
@@ -632,7 +626,7 @@ async fn payload_without_an_envelope_during_a_wait_ends_the_session() {
     let error = Box::pin(session.read_output(until, |_session| false))
         .await
         .expect_err("the payload fits no envelope");
-    assert!(matches!(error.fault(), EngineFault::MessageUnreadable));
+    assert_eq!(error.slug(), errors::lsp::engine_message_unreadable::SLUG);
     assert!(session.is_ended(), "an unreadable message ends the session");
     session.shutdown().await;
     join(engine_task).await;
@@ -652,7 +646,7 @@ async fn engine_closing_its_side_during_a_wait_ends_the_session() {
         .await
         .expect_err("the engine closed its side");
     assert!(
-        matches!(error.fault(), EngineFault::ConnectionClosed { .. }),
+        error.slug() == errors::lsp::engine_connection_closed::SLUG,
         "{error}"
     );
     assert!(session.is_ended(), "a closed connection ends the session");
@@ -1432,7 +1426,7 @@ async fn a_provisional_answer_is_retried_until_the_engine_settles() {
 /// An engine whose progress never ends stays analyzing forever. A caller
 /// that gives up after its own attempt bound reports the budget it spent -
 /// the shape `EngineSlot::request` reports through
-/// `EngineFault::Analyzing` once its own retry table is exhausted.
+/// a registered analyzing error once its own retry table is exhausted.
 #[tokio::test]
 async fn an_engine_that_never_settles_lets_a_caller_report_its_spent_budget() {
     const ATTEMPTS_MAX: u64 = 3;
@@ -1463,17 +1457,18 @@ async fn an_engine_that_never_settles_lets_a_caller_report_its_spent_budget() {
             "the engine never ends the progress it began"
         );
     }
-    let exhausted = EngineError::new(EngineFault::Analyzing {
-        attempts: ATTEMPTS_MAX,
-    });
-    assert_eq!(
-        exhausted.name(),
-        ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
+    let exhausted = errors::lsp::engine_analyzing()
+        .attempts(ATTEMPTS_MAX)
+        .error();
+    assert!(
+        exhausted
+            .context()
+            .any(|(key, value)| key == "attempts" && value == ATTEMPTS_MAX.to_string())
     );
     assert!(
         exhausted
             .to_string()
-            .contains(&format!("attempts {ATTEMPTS_MAX}")),
+            .contains(&format!("after {ATTEMPTS_MAX} attempts")),
         "{exhausted}"
     );
     session.shutdown().await;
@@ -1995,7 +1990,7 @@ async fn silent_engine_is_killed_at_the_startup_timeout() {
     let error = EngineSession::start(silent, workspace.path())
         .await
         .expect_err("the engine never answers");
-    assert!(matches!(error.fault(), EngineFault::TimedOut { .. }));
+    assert_eq!(error.slug(), errors::lsp::engine_timed_out::SLUG);
     let elapsed = started_at.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
@@ -2043,10 +2038,10 @@ async fn engine_that_answers_shutdown_but_never_exits_is_killed_after_the_wait()
 }
 
 /// A spawned session's `Debug` rendering names its child's pid, and
-/// `ended` flips from `false` to `true` once a fault ends the session in
+/// `ended` flips from `false` to `true` once a error ends the session in
 /// place.
 #[tokio::test]
-async fn debug_of_a_spawned_session_names_its_pid_and_flips_ended_after_a_fault() {
+async fn debug_of_a_spawned_session_names_its_pid_and_flips_ended_after_an_error() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let mut hanging = process_lifecycle::answers_then_hangs();
     hanging.request_timeout = Duration::from_millis(300);
@@ -2073,7 +2068,7 @@ async fn debug_of_a_spawned_session_names_its_pid_and_flips_ended_after_a_fault(
         )
         .await
         .expect_err("the hanging engine never answers the request");
-    assert!(matches!(error.fault(), EngineFault::TimedOut { .. }));
+    assert_eq!(error.slug(), errors::lsp::engine_timed_out::SLUG);
     let after = format!("{session:?}");
     assert!(
         after.contains("ended: true"),
@@ -2100,10 +2095,7 @@ async fn engine_exit_mid_request_ends_the_session() {
         )
         .await
         .expect_err("the engine exits instead of answering");
-    assert!(matches!(
-        error.fault(),
-        EngineFault::ConnectionClosed { .. }
-    ));
+    assert_eq!(error.slug(), errors::lsp::engine_connection_closed::SLUG);
     let ended = session
         .references(
             &document,
@@ -2114,7 +2106,7 @@ async fn engine_exit_mid_request_ends_the_session() {
         )
         .await
         .expect_err("the session refuses after its engine ended");
-    assert!(matches!(ended.fault(), EngineFault::Ended));
+    assert_eq!(ended.slug(), errors::lsp::engine_ended::SLUG);
     session.shutdown().await;
 }
 
@@ -2137,10 +2129,7 @@ async fn engine_death_between_operations_closes_the_connection() {
         }
     }
     let error = refusal.expect("the dead engine's pipe refuses within the bound");
-    assert!(matches!(
-        error.fault(),
-        EngineFault::ConnectionClosed { .. }
-    ));
+    assert_eq!(error.slug(), errors::lsp::engine_connection_closed::SLUG);
     session.shutdown().await;
 }
 
@@ -2153,7 +2142,7 @@ async fn missing_program_fails_the_launch_with_a_typed_error() {
     )
     .await
     .expect_err("the program cannot be found");
-    assert!(matches!(error.fault(), EngineFault::LaunchFailed { .. }));
+    assert_eq!(error.slug(), errors::lsp::engine_launch_failed::SLUG);
 }
 
 #[tokio::test]
@@ -2162,17 +2151,15 @@ async fn empty_and_absolute_programs_are_refused_before_spawning() {
     let refused = EngineSession::start(launch_naming(""), workspace.path())
         .await
         .expect_err("an empty program is refused");
-    assert!(matches!(refused.fault(), EngineFault::ProgramEmpty));
+    assert_eq!(refused.slug(), errors::lsp::engine_program_empty::SLUG);
     let refused = EngineSession::start(launch_naming("/usr/bin/rift-engine"), workspace.path())
         .await
         .expect_err("an absolute executable path is refused");
-    assert!(matches!(
-        refused.fault(),
-        EngineFault::ProgramAbsolute { program } if program == "/usr/bin/rift-engine"
-    ));
-    assert_eq!(
-        refused.name(),
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+    assert_eq!(refused.slug(), errors::lsp::engine_program_absolute::SLUG);
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| key == "program" && value == "/usr/bin/rift-engine")
     );
 }
 
@@ -2188,7 +2175,7 @@ async fn notification_write_to_a_non_reading_engine_times_out() {
         .open(&path("src/lib.rs"), "rust", "x".repeat(1 << 20))
         .await
         .expect_err("the full pipe must not stall the session");
-    assert!(matches!(error.fault(), EngineFault::TimedOut { .. }));
+    assert_eq!(error.slug(), errors::lsp::engine_timed_out::SLUG);
     session.shutdown().await;
 }
 

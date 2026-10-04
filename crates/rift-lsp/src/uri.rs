@@ -16,11 +16,8 @@ use std::sync::Arc;
 
 use lsp_types::Uri;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use rift_core::{
-    Error, ErrorCode, ErrorContext, ErrorName, Fault, PackageIdentity, PathError, ProjectPath,
-    SourceUnitId, SourceUnitIdError, fault_label,
-};
-use serde::Serialize;
+use rift_core::{PackageIdentity, ProjectPath, SourceUnitId};
+use rift_error::{RiftError, errors};
 
 /// The sole URI scheme a document may carry.
 const FILE_URI_SCHEME: &str = "file";
@@ -42,90 +39,6 @@ const FILE_URI_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'/')
     .remove(b':');
 
-/// A URI or root that cannot address a workspace document.
-#[derive(Debug, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UriFault {
-    /// The workspace root is not an absolute path.
-    RootNotAbsolute {
-        /// The root as given.
-        root: String,
-    },
-    /// The workspace root is not valid Unicode.
-    RootNotUnicode,
-    /// The URI does not parse under RFC 3986.
-    UriMalformed {
-        /// The URI as received.
-        uri: String,
-    },
-    /// The URI carries a scheme other than `file`.
-    SchemeRefused {
-        /// The scheme as received.
-        scheme: String,
-    },
-    /// The URI carries a host; documents are always local.
-    HostRefused {
-        /// The authority as received.
-        host: String,
-    },
-    /// The URI path does not percent-decode to Unicode.
-    PathNotDecodable,
-    /// The decoded path is not under the workspace root.
-    OutsideRoot,
-    /// The decoded relative path broke a project path rule.
-    PathRefused {
-        /// The path rule's own refusal.
-        #[serde(skip)]
-        source: PathError,
-    },
-    /// The relative path under a package root mints no source unit. The refusal is
-    /// boxed so every other document fault stays small.
-    UnitRefused {
-        /// The unit identity's own refusal.
-        #[serde(skip)]
-        source: Box<SourceUnitIdError>,
-    },
-}
-
-impl Fault for UriFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::OutsideRoot => ErrorName::Wire(ErrorCode::PermissionDenied),
-            Self::PathRefused { source } => source.name(),
-            _ => ErrorName::Wire(ErrorCode::UnsupportedPath),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        let mut context = vec![ErrorContext::new("fault", fault_label(self))];
-        match self {
-            Self::RootNotAbsolute { root } => {
-                context.push(ErrorContext::new("root", root.clone()));
-            }
-            Self::UriMalformed { uri } => context.push(ErrorContext::new("uri", uri.clone())),
-            Self::SchemeRefused { scheme } => {
-                context.push(ErrorContext::new("scheme", scheme.clone()));
-            }
-            Self::HostRefused { host } => context.push(ErrorContext::new("host", host.clone())),
-            Self::PathRefused { source } => context.extend(source.context()),
-            Self::UnitRefused { source } => context.extend(source.context()),
-            _ => {}
-        }
-        context
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::PathRefused { source } => Some(source),
-            Self::UnitRefused { source } => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-/// A URI or root that cannot address a workspace document.
-pub type UriError = Error<UriFault>;
-
 /// One workspace root in forward-slash form, anchoring URI conversion.
 ///
 /// The form is `/abs/dir` on Unix and `C:/abs/dir` on Windows, with the
@@ -140,11 +53,11 @@ impl TreeRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] for a relative or non-Unicode root.
-    pub fn new(root: &Path) -> Result<Self, UriError> {
+    /// Returns [`RiftError`] for a relative or non-Unicode root.
+    pub fn new(root: &Path) -> Result<Self, RiftError> {
         let text = root
             .to_str()
-            .ok_or_else(|| Error::new(UriFault::RootNotUnicode))?;
+            .ok_or_else(|| errors::lsp::uri_root_not_unicode().error())?;
         Self::from_slash_form(text.replace('\\', "/"))
     }
 
@@ -152,8 +65,8 @@ impl TreeRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] when the form is not absolute.
-    pub fn from_slash_form(value: impl Into<String>) -> Result<Self, UriError> {
+    /// Returns [`RiftError`] when the form is not absolute.
+    pub fn from_slash_form(value: impl Into<String>) -> Result<Self, RiftError> {
         let mut slash_form: String = value.into();
         while slash_form.len() > 1 && slash_form.ends_with('/') {
             slash_form.pop();
@@ -164,7 +77,9 @@ impl TreeRoot {
                 slash_form.replace_range(..1, &slash_form[..1].to_ascii_uppercase());
             }
             _ => {
-                return Err(Error::new(UriFault::RootNotAbsolute { root: slash_form }));
+                return errors::lsp::uri_root_not_absolute()
+                    .root(&slash_form)
+                    .fail();
             }
         }
         Ok(Self { slash_form })
@@ -174,9 +89,9 @@ impl TreeRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] only when the composed text does not parse,
+    /// Returns [`RiftError`] only when the composed text does not parse,
     /// which encoding rules out; the arm exists so no failure is unwrapped.
-    pub fn root_uri(&self) -> Result<Uri, UriError> {
+    pub fn root_uri(&self) -> Result<Uri, RiftError> {
         self.compose_uri("")
     }
 
@@ -184,14 +99,14 @@ impl TreeRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] only when the composed text does not parse,
+    /// Returns [`RiftError`] only when the composed text does not parse,
     /// which encoding rules out; the arm exists so no failure is unwrapped.
-    pub fn document_uri(&self, path: &ProjectPath) -> Result<Uri, UriError> {
+    pub fn document_uri(&self, path: &ProjectPath) -> Result<Uri, RiftError> {
         self.compose_uri(path.as_str())
     }
 
     /// Composes and parses the URI text for one relative path.
-    fn compose_uri(&self, relative: &str) -> Result<Uri, UriError> {
+    fn compose_uri(&self, relative: &str) -> Result<Uri, RiftError> {
         let mut text = String::from(FILE_URI_PREFIX);
         if !self.slash_form.starts_with('/') {
             text.push('/');
@@ -201,7 +116,7 @@ impl TreeRoot {
             text.push('/');
             text.push_str(&utf8_percent_encode(relative, FILE_URI_ESCAPE_SET).to_string());
         }
-        Uri::from_str(&text).map_err(|_| Error::new(UriFault::UriMalformed { uri: text }))
+        Uri::from_str(&text).map_err(|_| errors::lsp::uri_uri_malformed().uri(&text).error())
     }
 
     /// The project path one document URI addresses below this root.
@@ -210,24 +125,24 @@ impl TreeRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] for a non-`file` scheme, a host-carrying URI,
+    /// Returns [`RiftError`] for a non-`file` scheme, a host-carrying URI,
     /// an undecodable path, a path outside this root, or a decoded
     /// relative path the project path rules refuse.
-    pub fn project_path(&self, uri: &Uri) -> Result<ProjectPath, UriError> {
+    pub fn project_path(&self, uri: &Uri) -> Result<ProjectPath, RiftError> {
         refuse_scheme_and_host(uri)?;
         let decoded = percent_decode_str(uri.path().as_str())
             .decode_utf8()
-            .map_err(|_| Error::new(UriFault::PathNotDecodable))?;
+            .map_err(|_| errors::lsp::uri_path_not_decodable().error())?;
         let absolute = normalize_drive(&decoded);
         let Some(remainder) = absolute.strip_prefix(self.slash_form.as_str()) else {
-            return Err(Error::new(UriFault::OutsideRoot));
+            return errors::lsp::uri_outside_root().fail();
         };
         let relative = match remainder.as_bytes() {
             [] => "",
             [b'/', ..] => &remainder[1..],
-            _ => return Err(Error::new(UriFault::OutsideRoot)),
+            _ => return errors::lsp::uri_outside_root().fail(),
         };
-        ProjectPath::new(relative).map_err(|source| Error::new(UriFault::PathRefused { source }))
+        ProjectPath::new(relative)
     }
 
     /// The root one project path below this one names. A project path holds no dot
@@ -246,30 +161,26 @@ impl TreeRoot {
 ///
 /// # Errors
 ///
-/// Returns [`UriError`] when the text does not parse under RFC 3986.
-pub fn parse_uri(text: &str) -> Result<Uri, UriError> {
-    Uri::from_str(text).map_err(|_| {
-        Error::new(UriFault::UriMalformed {
-            uri: text.to_owned(),
-        })
-    })
+/// Returns [`RiftError`] when the text does not parse under RFC 3986.
+pub fn parse_uri(text: &str) -> Result<Uri, RiftError> {
+    Uri::from_str(text).map_err(|_| errors::lsp::uri_uri_malformed().uri(text).error())
 }
 
 /// Refuses any scheme but `file` and any non-empty authority.
-fn refuse_scheme_and_host(uri: &Uri) -> Result<(), UriError> {
+fn refuse_scheme_and_host(uri: &Uri) -> Result<(), RiftError> {
     let scheme = uri
         .scheme()
         .map(|scheme| scheme.as_str().to_owned())
         .unwrap_or_default();
     if !scheme.eq_ignore_ascii_case(FILE_URI_SCHEME) {
-        return Err(Error::new(UriFault::SchemeRefused { scheme }));
+        return errors::lsp::uri_scheme_refused().scheme(&scheme).fail();
     }
     let host = uri
         .authority()
         .map(|authority| authority.as_str().to_owned())
         .unwrap_or_default();
     if !host.is_empty() {
-        return Err(Error::new(UriFault::HostRefused { host }));
+        return errors::lsp::uri_host_refused().host(&host).fail();
     }
     Ok(())
 }
@@ -335,7 +246,7 @@ impl PackageRoot {
     }
 
     /// The package path of the file `relative` names below this root.
-    fn package_path(&self, relative: ProjectPath) -> Result<ProjectPath, UriError> {
+    fn package_path(&self, relative: ProjectPath) -> Result<ProjectPath, RiftError> {
         let Some(within) = &self.within else {
             return Ok(relative);
         };
@@ -343,7 +254,6 @@ impl PackageRoot {
             return Ok(within.clone());
         }
         ProjectPath::new(format!("{}/{}", within.as_str(), relative.as_str()))
-            .map_err(|source| Error::new(UriFault::PathRefused { source }))
     }
 }
 
@@ -391,7 +301,7 @@ impl EngineRoots {
     /// tie. A package root nested in the tree - an install under `node_modules` or
     /// `.venv` - therefore addresses its own files as that package, while a URI under the
     /// tree and under no deeper package root answers [`EngineAddress::Project`]. Only
-    /// [`UriFault::OutsideRoot`] from the tree lets a package root answer; every other
+    /// An outside-root error from the tree lets a package root answer; every other
     /// tree fault - scheme, host, decoding, path rules - is returned as is. Each root is
     /// tried through its own [`TreeRoot::project_path`], which decodes the URI first, so a
     /// pnpm folder the engine spells `nanoid%405.1.6` matches the resolved `nanoid@5.1.6`
@@ -401,10 +311,9 @@ impl EngineRoots {
     ///
     /// # Errors
     ///
-    /// Returns [`UriError`] with [`UriFault::OutsideRoot`] for a URI under no
-    /// root, [`UriFault::UnitRefused`] when the matched path mints no unit,
-    /// and the tree's own fault for every other refusal.
-    pub fn address(&self, uri: &Uri) -> Result<EngineAddress, UriError> {
+    /// Returns [`RiftError`] for a URI under no root, a source-unit error when the
+    /// matched path mints no unit, and the tree's own error for every other refusal.
+    pub fn address(&self, uri: &Uri) -> Result<EngineAddress, RiftError> {
         let tree = match self.tree.project_path(uri) {
             Ok(path) => Some(path),
             Err(error) if is_outside_root(&error) => None,
@@ -416,12 +325,7 @@ impl EngineRoots {
         match (deeper, tree) {
             (Some((package, relative)), _) => {
                 let path = package.package_path(relative?)?;
-                let unit =
-                    SourceUnitId::for_package(&package.package, &path).map_err(|source| {
-                        Error::new(UriFault::UnitRefused {
-                            source: Box::new(source),
-                        })
-                    })?;
+                let unit = SourceUnitId::for_package(&package.package, &path)?;
                 Ok(EngineAddress::Package(PackageFile {
                     package: package.package.clone(),
                     path,
@@ -429,12 +333,12 @@ impl EngineRoots {
                 }))
             }
             (None, Some(path)) => Ok(EngineAddress::Project(path)),
-            (None, None) => Err(Error::new(UriFault::OutsideRoot)),
+            (None, None) => Err(uri_outside_root()),
         }
     }
 
     /// The longest package root holding `uri`, with the path below it.
-    fn claimed_package(&self, uri: &Uri) -> Option<(&PackageRoot, Result<ProjectPath, UriError>)> {
+    fn claimed_package(&self, uri: &Uri) -> Option<(&PackageRoot, Result<ProjectPath, RiftError>)> {
         self.packages
             .iter()
             .filter_map(|package| match package.root.project_path(uri) {
@@ -483,8 +387,8 @@ impl PackageFile {
 }
 
 /// Whether a refusal is the decoded path falling outside the tried root.
-fn is_outside_root(error: &UriError) -> bool {
-    matches!(error.fault(), UriFault::OutsideRoot)
+fn is_outside_root(error: &RiftError) -> bool {
+    error.slug() == errors::lsp::uri_outside_root::SLUG
 }
 
 #[cfg(test)]
@@ -531,7 +435,7 @@ mod tests {
     }
 
     /// The unit a package file's address names, or the project path a tree address names.
-    fn addressed(roots: &EngineRoots, text: &str) -> Result<String, UriError> {
+    fn addressed(roots: &EngineRoots, text: &str) -> Result<String, RiftError> {
         roots.address(&uri(text)).map(|address| match address {
             EngineAddress::Project(path) => format!("project {path}"),
             EngineAddress::Package(file) => file.unit().to_string(),
@@ -543,10 +447,13 @@ mod tests {
         let tree = root("/work space/ws/");
         let uri = tree.document_uri(&path("src/caf\u{e9}.rs")).expect("uri");
         assert_eq!(uri.as_str(), "file:///work%20space/ws/src/caf%C3%A9.rs");
-        assert_eq!(tree.project_path(&uri), Ok(path("src/caf\u{e9}.rs")));
+        assert_eq!(
+            tree.project_path(&uri).expect("project path"),
+            path("src/caf\u{e9}.rs")
+        );
         let tree_uri = tree.document_uri(&path("")).expect("root uri");
         assert_eq!(tree_uri.as_str(), "file:///work%20space/ws");
-        assert_eq!(tree.project_path(&tree_uri), Ok(path("")));
+        assert_eq!(tree.project_path(&tree_uri).expect("tree path"), path(""));
     }
 
     #[test]
@@ -561,8 +468,8 @@ mod tests {
         ] {
             let parsed = parse_uri(spelling).expect("uri parses");
             assert_eq!(
-                tree.project_path(&parsed),
-                Ok(path("src/lib.rs")),
+                tree.project_path(&parsed).expect("project path"),
+                path("src/lib.rs"),
                 "{spelling}"
             );
         }
@@ -571,8 +478,7 @@ mod tests {
     #[test]
     fn relative_roots_are_refused_and_backslash_roots_normalize() {
         let error = TreeRoot::from_slash_form("work/ws").expect_err("relative root");
-        assert!(matches!(error.fault(), UriFault::RootNotAbsolute { .. }));
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::UnsupportedPath));
+        assert_eq!(error.slug(), errors::lsp::uri_root_not_absolute::SLUG);
         let tree = TreeRoot::new(Path::new("/work/ws")).expect("absolute root");
         assert_eq!(tree, root("/work/ws"));
     }
@@ -582,16 +488,19 @@ mod tests {
         let tree = root("/work/ws");
         let untitled = parse_uri("untitled:src/lib.rs").expect("uri parses");
         let scheme = tree.project_path(&untitled).expect_err("scheme refused");
-        assert!(matches!(
-            scheme.fault(),
-            UriFault::SchemeRefused { scheme } if scheme == "untitled"
-        ));
+        assert_eq!(scheme.slug(), errors::lsp::uri_scheme_refused::SLUG);
+        assert!(
+            scheme
+                .context()
+                .any(|(key, value)| key == "scheme" && value == "untitled")
+        );
         let hosted = parse_uri("file://build-host/work/ws/src/lib.rs").expect("uri parses");
         let host = tree.project_path(&hosted).expect_err("host refused");
-        assert!(matches!(
-            host.fault(),
-            UriFault::HostRefused { host } if host == "build-host"
-        ));
+        assert_eq!(host.slug(), errors::lsp::uri_host_refused::SLUG);
+        assert!(
+            host.context()
+                .any(|(key, value)| key == "host" && value == "build-host")
+        );
     }
 
     #[test]
@@ -604,8 +513,11 @@ mod tests {
         ] {
             let uri = parse_uri(outside).expect("uri parses");
             let error = tree.project_path(&uri).expect_err("outside the root");
-            assert!(matches!(error.fault(), UriFault::OutsideRoot), "{outside}");
-            assert_eq!(error.name(), ErrorName::Wire(ErrorCode::PermissionDenied));
+            assert_eq!(
+                error.slug(),
+                errors::lsp::uri_outside_root::SLUG,
+                "{outside}"
+            );
         }
     }
 
@@ -616,9 +528,13 @@ mod tests {
         let error = tree
             .project_path(&traversal)
             .expect_err("traversal refused");
-        assert!(matches!(error.fault(), UriFault::PathRefused { .. }));
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::UnsupportedPath));
-        assert!(error.to_string().contains("dot_segment"));
+        assert_eq!(error.slug(), errors::core::path_dot_segment::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "path_kind" && value == "project")
+        );
+        assert!(error.to_string().contains("violation dot_segment"));
     }
 
     #[test]
@@ -626,21 +542,32 @@ mod tests {
         let tree = root("/work/ws");
         let invalid = parse_uri("file:///work/ws/%FF.rs").expect("uri parses");
         let error = tree.project_path(&invalid).expect_err("not unicode");
-        assert!(matches!(error.fault(), UriFault::PathNotDecodable));
+        assert_eq!(error.slug(), errors::lsp::uri_path_not_decodable::SLUG);
     }
 
     #[test]
     fn malformed_uri_text_is_refused_by_parse() {
         let error = parse_uri("file://work ws/lib.rs").expect_err("space is not a URI byte");
-        assert!(matches!(error.fault(), UriFault::UriMalformed { .. }));
+        assert_eq!(error.slug(), errors::lsp::uri_uri_malformed::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "uri" && value == "file://work ws/lib.rs")
+        );
+        assert!(error.to_string().contains("URI file://work ws/lib.rs"));
     }
 
     #[test]
-    fn fault_rendering_names_the_evidence_and_exposes_the_path_source() {
+    fn uri_errors_keep_their_slug_and_evidence() {
         let relative = TreeRoot::from_slash_form("work/ws").expect_err("relative root");
         assert!(relative.to_string().contains("root work/ws"));
         let malformed = parse_uri("file://work ws/lib.rs").expect_err("malformed");
-        assert!(malformed.to_string().contains("uri file://work ws/lib.rs"));
+        assert!(
+            malformed
+                .context()
+                .any(|(key, value)| key == "uri" && value == "file://work ws/lib.rs")
+        );
+        assert!(malformed.to_string().contains("URI file://work ws/lib.rs"));
         let tree = root("/work/ws");
         let scheme = tree
             .project_path(&parse_uri("untitled:src/lib.rs").expect("uri parses"))
@@ -653,11 +580,11 @@ mod tests {
         let refused = tree
             .project_path(&parse_uri("file:///work/ws/%2E%2E/out.rs").expect("uri parses"))
             .expect_err("traversal refused");
-        assert!(std::error::Error::source(&refused).is_some());
+        assert_eq!(refused.slug(), errors::core::path_dot_segment::SLUG);
         let outside = tree
             .project_path(&parse_uri("file:///work/other/a.rs").expect("uri parses"))
             .expect_err("outside the root");
-        assert!(std::error::Error::source(&outside).is_none());
+        assert_eq!(outside.slug(), errors::lsp::uri_outside_root::SLUG);
     }
 
     #[test]
@@ -689,8 +616,8 @@ mod tests {
         ];
         for (text, expected) in answers {
             assert_eq!(
-                addressed(&roots, text),
-                Ok(expected.to_owned()),
+                addressed(&roots, text).expect("address"),
+                expected.to_owned(),
                 "a root equal to the tree, or holding it, loses to the tree; an install no \
                  package root names stays a tree path: {text}"
             );
@@ -715,15 +642,16 @@ mod tests {
             addressed(
                 &roots,
                 "file:///work/ws/node_modules/.pnpm/nanoid%405.1.6/node_modules/nanoid/index.d.ts"
-            ),
-            Ok("rift://source/npm/nanoid@5.1.6/index.d.ts".to_owned())
+            )
+            .expect("package address"),
+            "rift://source/npm/nanoid@5.1.6/index.d.ts".to_owned()
         );
         assert_eq!(
             addressed(
                 &roots,
                 "file:///work/ws/node_modules/.pnpm/%40types%2Bnode%4026.6.2/node_modules/%40types/node/fs.d.ts"
-            ),
-            Ok("rift://source/npm/@types/node@26.6.2/fs.d.ts".to_owned())
+            ).expect("package address"),
+            "rift://source/npm/@types/node@26.6.2/fs.d.ts".to_owned()
         );
     }
 
@@ -769,8 +697,8 @@ mod tests {
         ];
         for (below, expected) in answers {
             assert_eq!(
-                addressed(&roots, &format!("{site}/{below}")),
-                Ok(expected.to_owned()),
+                addressed(&roots, &format!("{site}/{below}")).expect("address"),
+                expected.to_owned(),
                 "{below}"
             );
         }
@@ -815,12 +743,13 @@ mod tests {
         ] {
             let roots = EngineRoots::new(root("/work/ws")).with_packages(packages);
             assert_eq!(
-                addressed(&roots, "file:///cache/outer/vendor/inner/src/lib.rs"),
-                Ok("rift://source/cargo/inner@2.0.0/src/lib.rs".to_owned())
+                addressed(&roots, "file:///cache/outer/vendor/inner/src/lib.rs")
+                    .expect("inner address"),
+                "rift://source/cargo/inner@2.0.0/src/lib.rs".to_owned()
             );
             assert_eq!(
-                addressed(&roots, "file:///cache/outer/vendor/other.rs"),
-                Ok("rift://source/cargo/outer@1.0.0/vendor/other.rs".to_owned())
+                addressed(&roots, "file:///cache/outer/vendor/other.rs").expect("outer address"),
+                "rift://source/cargo/outer@1.0.0/vendor/other.rs".to_owned()
             );
         }
     }
@@ -838,8 +767,11 @@ mod tests {
             "file:///cache",
         ] {
             let error = roots.address(&uri(outside)).expect_err("under no root");
-            assert!(matches!(error.fault(), UriFault::OutsideRoot), "{outside}");
-            assert_eq!(error.name(), ErrorName::Wire(ErrorCode::PermissionDenied));
+            assert_eq!(
+                error.slug(),
+                errors::lsp::uri_outside_root::SLUG,
+                "{outside}"
+            );
         }
     }
 
@@ -853,25 +785,22 @@ mod tests {
         let scheme = roots
             .address(&uri("untitled:src/lib.rs"))
             .expect_err("scheme refused");
-        assert!(matches!(
-            scheme.fault(),
-            UriFault::SchemeRefused { scheme } if scheme == "untitled"
-        ));
+        assert_eq!(scheme.slug(), errors::lsp::uri_scheme_refused::SLUG);
         let host = roots
             .address(&uri("file://build-host/cache/helper/src/lib.rs"))
             .expect_err("host refused");
-        assert!(matches!(
-            host.fault(),
-            UriFault::HostRefused { host } if host == "build-host"
-        ));
+        assert_eq!(host.slug(), errors::lsp::uri_host_refused::SLUG);
         let undecodable = roots
             .address(&uri("file:///cache/helper/%FF.rs"))
             .expect_err("not unicode");
-        assert!(matches!(undecodable.fault(), UriFault::PathNotDecodable));
+        assert_eq!(
+            undecodable.slug(),
+            errors::lsp::uri_path_not_decodable::SLUG
+        );
         let traversal = roots
             .address(&uri("file:///cache/helper/%2E%2E/out.rs"))
             .expect_err("traversal under a package root is refused by the path rules");
-        assert!(matches!(traversal.fault(), UriFault::PathRefused { .. }));
+        assert_eq!(traversal.slug(), errors::core::path_dot_segment::SLUG);
     }
 
     #[test]
@@ -889,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_refused_names_the_evidence_and_exposes_the_unit_source() {
+    fn unit_refused_keeps_the_unit_slug_and_evidence() {
         let package = package_root("/cache/helper", "helper", "0.1.0\\beta");
         assert_eq!(package.root(), &root("/cache/helper"));
         assert_eq!(package.package().version, "0.1.0\\beta");
@@ -897,12 +826,22 @@ mod tests {
         let error = roots
             .address(&uri("file:///cache/helper/src/lib.rs"))
             .expect_err("the version spells no source path");
-        assert!(matches!(error.fault(), UriFault::UnitRefused { .. }));
-        assert_eq!(error.name(), ErrorName::Wire(ErrorCode::UnsupportedPath));
-        let rendered = error.to_string();
-        assert!(rendered.contains("fault unit_refused"), "{rendered}");
-        assert!(rendered.contains("identity source_unit"), "{rendered}");
-        assert!(rendered.contains("violation backslash"), "{rendered}");
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.slug(), errors::core::source_unit_id_invalid_key::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "identity" && value == "source_unit")
+        );
+        let source = std::error::Error::source(&error).expect("underlying path error");
+        let cause = source
+            .downcast_ref::<RiftError>()
+            .expect("registered path error");
+        assert!(
+            cause
+                .context()
+                .any(|(key, value)| key == "violation" && value == "backslash")
+        );
+        assert!(error.to_string().contains("identity source_unit"));
+        assert!(error.to_string().contains("violation backslash"));
     }
 }

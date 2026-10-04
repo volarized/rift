@@ -1,78 +1,18 @@
-use std::error::Error as StdError;
-use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use rift_error::RiftError;
 use rift_core::{
-    Contribution, ContributionError, ContributionKey, ContributionOrigin, ContributionReference,
-    ExactKind, IdError, PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision,
-    ProviderSymbolId, SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision,
-    SourceUnitId, SourceUnitIdError, SymbolId, TreeRevision, encode_path, symbol_identity,
+    Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
+    PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
+    SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
+    SymbolId, TreeRevision, encode_path, symbol_identity,
 };
-use rift_provider::{ProviderPublication, PublicationError, PublicationLimits};
+use rift_provider::{ProviderPublication, PublicationLimits};
 
 use crate::{SyntaxDocument, SyntaxFacts};
 
 /// Stable identity of built-in syntax Contribution provider.
 pub const SYNTAX_PROVIDER_ID: &str = "syntax";
-
-/// Failure while syntax facts become one provider publication.
-#[derive(Debug)]
-pub enum SyntaxPublicationError {
-    /// Provider or symbol identity is invalid.
-    Identity(IdError),
-    /// Source-unit identity is invalid.
-    SourceUnit(SourceUnitIdError),
-    /// One syntax Contribution is invalid.
-    Contribution(ContributionError),
-    /// Completed provider publication is invalid.
-    Publication(PublicationError),
-}
-
-impl Display for SyntaxPublicationError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Identity(error) => Display::fmt(error, formatter),
-            Self::SourceUnit(error) => Display::fmt(error, formatter),
-            Self::Contribution(error) => Display::fmt(error, formatter),
-            Self::Publication(error) => Display::fmt(error, formatter),
-        }
-    }
-}
-
-impl StdError for SyntaxPublicationError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Identity(error) => Some(error),
-            Self::SourceUnit(error) => Some(error),
-            Self::Contribution(error) => Some(error),
-            Self::Publication(error) => Some(error),
-        }
-    }
-}
-
-impl From<IdError> for SyntaxPublicationError {
-    fn from(error: IdError) -> Self {
-        Self::Identity(error)
-    }
-}
-
-impl From<SourceUnitIdError> for SyntaxPublicationError {
-    fn from(error: SourceUnitIdError) -> Self {
-        Self::SourceUnit(error)
-    }
-}
-
-impl From<ContributionError> for SyntaxPublicationError {
-    fn from(error: ContributionError) -> Self {
-        Self::Contribution(error)
-    }
-}
-
-impl From<PublicationError> for SyntaxPublicationError {
-    fn from(error: PublicationError) -> Self {
-        Self::Publication(error)
-    }
-}
 
 /// Where one document's declarations are filed: origin, source unit, and identity path.
 ///
@@ -108,9 +48,9 @@ impl DocumentPlacement {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when the document's path breaks
+    /// Returns [`RiftError`] when the document's path breaks
     /// source-unit rules.
-    pub fn project(document: &SyntaxDocument) -> Result<Self, SyntaxPublicationError> {
+    pub fn project(document: &SyntaxDocument) -> Result<Self, RiftError> {
         Self::project_path(document.path())
     }
 
@@ -118,8 +58,8 @@ impl DocumentPlacement {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when the path breaks source-unit rules.
-    pub fn project_path(path: &ProjectPath) -> Result<Self, SyntaxPublicationError> {
+    /// Returns [`RiftError`] when the path breaks source-unit rules.
+    pub fn project_path(path: &ProjectPath) -> Result<Self, RiftError> {
         let location = SourceLocation::Project { package: None };
         let origin = ContributionOrigin::new(Some(location), SourceKind::Authored)?;
         Ok(Self::new(
@@ -164,14 +104,14 @@ impl SyntaxPublicationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when built-in provider identity is
+    /// Returns [`RiftError`] when built-in provider identity is
     /// invalid.
     pub fn new(
         publication: ProviderRevision,
         source_revision: SourceRevision,
         tree_revision: TreeRevision,
         limits: PublicationLimits,
-    ) -> Result<Self, SyntaxPublicationError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self {
             provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
             publication,
@@ -201,12 +141,12 @@ impl SyntaxPublicationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when source identity or one
+    /// Returns [`RiftError`] when source identity or one
     /// Contribution is invalid.
     pub fn add_document(
         &mut self,
         document: &SyntaxDocument,
-    ) -> Result<(), SyntaxPublicationError> {
+    ) -> Result<(), RiftError> {
         let placement = DocumentPlacement::project(document)?;
         self.add_document_placed(document, &placement)
     }
@@ -219,13 +159,13 @@ impl SyntaxPublicationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when one symbol identity or one
+    /// Returns [`RiftError`] when one symbol identity or one
     /// Contribution is invalid.
     pub fn add_document_placed(
         &mut self,
         document: &SyntaxDocument,
         placement: &DocumentPlacement,
-    ) -> Result<(), SyntaxPublicationError> {
+    ) -> Result<(), RiftError> {
         self.add_facts_placed(document.facts(), placement)
     }
 
@@ -233,12 +173,12 @@ impl SyntaxPublicationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when one symbol identity or Contribution is invalid.
+    /// Returns [`RiftError`] when one symbol identity or Contribution is invalid.
     pub fn add_facts_placed(
         &mut self,
         syntax: &SyntaxFacts,
         placement: &DocumentPlacement,
-    ) -> Result<(), SyntaxPublicationError> {
+    ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         for symbol in syntax.symbols() {
@@ -296,9 +236,9 @@ impl SyntaxPublicationBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxPublicationError`] when publication bounds or keys are
+    /// Returns [`RiftError`] when publication bounds or keys are
     /// invalid.
-    pub fn build(self) -> Result<ProviderPublication, SyntaxPublicationError> {
+    pub fn build(self) -> Result<ProviderPublication, RiftError> {
         Ok(ProviderPublication::new(
             self.provider,
             self.publication,
@@ -317,7 +257,7 @@ impl SyntaxPublicationBuilder {
 /// # Errors
 ///
 /// Returns [`SourceUnitIdError`] when the document's path breaks source-unit rules.
-pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnitIdError> {
+pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, RiftError> {
     source_unit_for_path(document.path())
 }
 
@@ -326,7 +266,7 @@ pub fn source_unit(document: &SyntaxDocument) -> Result<SourceUnitId, SourceUnit
 /// # Errors
 ///
 /// Returns [`SourceUnitIdError`] when the path breaks source-unit rules.
-pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, SourceUnitIdError> {
+pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, RiftError> {
     SourceUnitId::parse(&format!(
         "rift://source/project/{}",
         encode_path(path.as_str())

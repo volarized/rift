@@ -6,8 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rift_core::{ErrorCode, ErrorDescriptor, ErrorName};
 use rift_mcp::skill::{self, SkillForm};
+use rift_protocol::error::ErrorCode;
 
 const OUTPUT_DIR_DEFAULT: &str = "docs";
 const MCP_SCHEMA_PATH: &str = "public/mcp.json";
@@ -120,23 +120,17 @@ impl Error for ExportError {
 }
 
 impl ExportError {
-    /// Returns canonical registry metadata.
+    /// Returns protocol error class for command-boundary reporting.
     #[must_use]
-    pub fn descriptor(&self) -> ErrorDescriptor {
+    pub const fn code(&self) -> ErrorCode {
         match self {
-            Self::UnknownFlag { .. } | Self::ExtraArgument { .. } => {
-                ErrorName::Wire(ErrorCode::InvalidRequest).descriptor()
-            }
-            Self::TemplateToolMissing { .. } => {
-                ErrorName::Cli(rift_core::CliCode::InstallTemplateMissingTool).descriptor()
-            }
+            Self::UnknownFlag { .. } | Self::ExtraArgument { .. } => ErrorCode::InvalidRequest,
+            Self::TemplateToolMissing { .. } => ErrorCode::CapabilityUnavailable,
             Self::CheckUnreadable { .. }
             | Self::WriteFailed { .. }
-            | Self::AnalyzerManifest { .. } => {
-                ErrorName::Wire(ErrorCode::StorageFailure).descriptor()
-            }
+            | Self::AnalyzerManifest { .. } => ErrorCode::StorageFailure,
             Self::CheckMismatch { .. } | Self::GlobalContract { .. } => {
-                ErrorName::Cli(rift_core::CliCode::ArtifactStale).descriptor()
+                ErrorCode::ConfigurationInvalid
             }
         }
     }

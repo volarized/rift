@@ -151,12 +151,11 @@ fn skip_leaves_files_past_the_chunk_bound_out_of_text_search() -> TestResult {
         index.file(&wide).is_some(),
         "a declaration of a skipped file still answers"
     );
-    assert_eq!(
-        index.warnings(),
-        [WorkspaceIndexWarning::FileTooLarge(
-            rift_core::ProjectPath::new("big.rs")?
-        )],
-        "a file past max_file leaves the index under skip"
+    assert!(
+        matches!(index.warnings(), [WorkspaceIndexWarning::FileTooLarge { path, error }]
+        if path.as_str() == "big.rs"
+            && error.slug() == rift_error::errors::index::workspace_file_too_large::SLUG),
+        "a file past max_file leaves index with warning and registered error"
     );
     assert!(
         index.chunked_text_files().is_empty(),

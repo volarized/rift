@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use rift_core::{CliCode, Error, ErrorContext, ErrorName, Fault};
+use rift_error::{RiftError, errors};
 use rift_mcp::skill::{GeneratedSkill, SKILL_NAME, SkillForm, TOOLS_REFERENCE_FILE};
 use serde_json::{Map, Value, json};
 
@@ -148,69 +148,11 @@ impl fmt::Display for InstallOutcome {
     }
 }
 
-/// Failure while running one `rift install` command.
-pub(super) type InstallError = Error<InstallFault>;
-
-/// One install-command failure.
-#[derive(Debug)]
-pub(super) enum InstallFault {
-    /// `--user` was given and neither `HOME` nor `USERPROFILE` names a directory.
-    HomeDirectoryUnresolved,
-    /// The hand-authored decision table names a tool the served MCP surface lacks.
-    TemplateToolMissing { name: &'static str },
-    /// The generated skill could not be written.
-    Write { path: PathBuf, source: io::Error },
-    /// The generated skill directory could not be removed.
-    Remove { path: PathBuf, source: io::Error },
-    /// `.claude/settings.json` could not be read, or does not parse as a JSON
-    /// document the steering hook merge can act on.
-    SettingsUnparsable {
-        path: PathBuf,
-        source: Box<dyn StdError + Send + Sync>,
-    },
-}
-
-impl Fault for InstallFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::HomeDirectoryUnresolved => ErrorName::Cli(CliCode::InstallHomeUnresolved),
-            Self::TemplateToolMissing { .. } => ErrorName::Cli(CliCode::InstallTemplateMissingTool),
-            Self::Write { .. } => ErrorName::Cli(CliCode::InstallWriteFailed),
-            Self::Remove { .. } => ErrorName::Cli(CliCode::InstallRemoveFailed),
-            Self::SettingsUnparsable { .. } => ErrorName::Cli(CliCode::InstallSettingsUnparsable),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::HomeDirectoryUnresolved => {
-                vec![ErrorContext::new("checked", "HOME, USERPROFILE")]
-            }
-            Self::TemplateToolMissing { name } => {
-                vec![ErrorContext::new("tool", (*name).to_owned())]
-            }
-            Self::Write { path, .. }
-            | Self::Remove { path, .. }
-            | Self::SettingsUnparsable { path, .. } => {
-                vec![ErrorContext::new("path", path.display().to_string())]
-            }
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::HomeDirectoryUnresolved | Self::TemplateToolMissing { .. } => None,
-            Self::Write { source, .. } | Self::Remove { source, .. } => Some(source),
-            Self::SettingsUnparsable { source, .. } => Some(source.as_ref()),
-        }
-    }
-}
-
 /// Runs one `rift install` command against the current directory's workspace.
 ///
 /// # Errors
 ///
-/// Returns [`InstallError`] when `--user` cannot resolve a home directory,
+/// Returns [`RiftError`] when `--user` cannot resolve a home directory,
 /// the served tool surface no longer carries a tool the decision table
 /// names, `.claude/settings.json` cannot be read as a JSON document the hook
 /// merge can act on, or the generated skill or settings file could not be
@@ -219,7 +161,7 @@ pub(super) fn run(
     target: InstallTarget,
     user: bool,
     remove: bool,
-) -> Result<InstallOutcome, InstallError> {
+) -> Result<InstallOutcome, RiftError> {
     let InstallTarget::Claude = target;
     let scope = if user {
         InstallScope::User
@@ -236,7 +178,9 @@ pub(super) fn run(
         let tools = rift_mcp::schema::tool_listing();
         let generated =
             rift_mcp::skill::generate(&tools, SkillForm::Installed).map_err(|missing| {
-                Error::new(InstallFault::TemplateToolMissing { name: missing.name })
+                errors::cli::install_template_missing_tool()
+                    .tool(missing.name)
+                    .error()
             })?;
         write_skill(scope, skill_root, &generated)?
     };
@@ -248,11 +192,15 @@ pub(super) fn run(
 /// The project scope resolves to `.` the same way `rift server` and
 /// `rift mcp` resolve the workspace root: unvalidated, since the write
 /// below creates whatever is missing.
-fn resolve_scope_root(scope: InstallScope) -> Result<PathBuf, InstallError> {
+fn resolve_scope_root(scope: InstallScope) -> Result<PathBuf, RiftError> {
     match scope {
         InstallScope::Project => Ok(Path::new(".").to_path_buf()),
-        InstallScope::User => home_directory(&|name| std::env::var_os(name))
-            .ok_or_else(|| Error::new(InstallFault::HomeDirectoryUnresolved)),
+        InstallScope::User => match home_directory(&|name| std::env::var_os(name)) {
+            Some(path) => Ok(path),
+            None => errors::cli::install_home_unresolved()
+                .checked("HOME, USERPROFILE")
+                .fail(),
+        },
     }
 }
 
@@ -275,9 +223,14 @@ fn write_skill(
     scope: InstallScope,
     skill_root: PathBuf,
     generated: &GeneratedSkill,
-) -> Result<SkillOutcome, InstallError> {
+) -> Result<SkillOutcome, RiftError> {
     let references = skill_root.join("references");
-    fs::create_dir_all(&references).map_err(|source| write_error(&references, source))?;
+    fs::create_dir_all(&references).map_err(|source| {
+        errors::cli::install_write_failed()
+            .path(references.clone())
+            .source(source)
+            .error()
+    })?;
     write_atomic(&skill_root.join("SKILL.md"), &generated.skill_md)?;
     write_atomic(&references.join(TOOLS_REFERENCE_FILE), &generated.tools_md)?;
     Ok(SkillOutcome::Written {
@@ -289,49 +242,52 @@ fn write_skill(
 /// Writes `content` to `path` through a sibling temp file, so a concurrent
 /// reader sees either the previous content or the complete new content,
 /// never a partial write.
-fn write_atomic(path: &Path, content: &str) -> Result<(), InstallError> {
+fn write_atomic(path: &Path, content: &str) -> Result<(), RiftError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut staged =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| write_error(path, source))?;
-    staged
-        .write_all(content.as_bytes())
-        .map_err(|source| write_error(path, source))?;
-    staged
-        .as_file()
-        .sync_all()
-        .map_err(|source| write_error(path, source))?;
-    staged
-        .persist(path)
-        .map_err(|error| write_error(path, error.error))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|source| {
+        errors::cli::install_write_failed()
+            .path(path.to_owned())
+            .source(source)
+            .error()
+    })?;
+    staged.write_all(content.as_bytes()).map_err(|source| {
+        errors::cli::install_write_failed()
+            .path(path.to_owned())
+            .source(source)
+            .error()
+    })?;
+    staged.as_file().sync_all().map_err(|source| {
+        errors::cli::install_write_failed()
+            .path(path.to_owned())
+            .source(source)
+            .error()
+    })?;
+    staged.persist(path).map_err(|error| {
+        errors::cli::install_write_failed()
+            .path(path.to_owned())
+            .source(error.error)
+            .error()
+    })?;
     Ok(())
 }
 
 /// Removes the generated skill directory, tolerating one that was never
 /// written. Removes only `skill_root` - the `rift` leaf below
 /// `.claude/skills` - never the `.claude/skills` directory or symlink above it.
-fn remove_skill(scope: InstallScope, skill_root: PathBuf) -> Result<SkillOutcome, InstallError> {
+fn remove_skill(scope: InstallScope, skill_root: PathBuf) -> Result<SkillOutcome, RiftError> {
     match fs::remove_dir_all(&skill_root) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(remove_error(&skill_root, source)),
+        Err(source) => {
+            return errors::cli::install_remove_failed()
+                .path(skill_root)
+                .source(source)
+                .fail();
+        }
     }
     Ok(SkillOutcome::Removed {
         scope,
         root: skill_root,
-    })
-}
-
-fn write_error(path: &Path, source: io::Error) -> InstallError {
-    Error::new(InstallFault::Write {
-        path: path.to_owned(),
-        source,
-    })
-}
-
-fn remove_error(path: &Path, source: io::Error) -> InstallError {
-    Error::new(InstallFault::Remove {
-        path: path.to_owned(),
-        source,
     })
 }
 
@@ -506,12 +462,19 @@ fn hook_runs_steer(hook: &Value) -> bool {
 
 /// Reads `.claude/settings.json`, treating an absent file as an empty
 /// document to merge into.
-fn read_settings(path: &Path) -> Result<Value, InstallError> {
+fn read_settings(path: &Path) -> Result<Value, RiftError> {
     match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<Value>(&text)
-            .map_err(|source| settings_unparsable_error(path, source)),
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|source| {
+            errors::cli::install_settings_unparsable()
+                .path(path.to_owned())
+                .source(source)
+                .error()
+        }),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(json!({})),
-        Err(source) => Err(settings_unparsable_error(path, source)),
+        Err(source) => errors::cli::install_settings_unparsable()
+            .path(path.to_owned())
+            .source(source)
+            .fail(),
     }
 }
 
@@ -519,13 +482,22 @@ fn read_settings(path: &Path) -> Result<Value, InstallError> {
 /// only when the merge actually changed something - so a rerun that changes
 /// nothing leaves the file byte-identical, and `--remove` on a document that
 /// never carried the hook creates no file.
-fn write_hook(settings_path: PathBuf, remove: bool) -> Result<HookOutcome, InstallError> {
+fn write_hook(settings_path: PathBuf, remove: bool) -> Result<HookOutcome, RiftError> {
     let existing = read_settings(&settings_path)?;
-    let (merged, changed) = merge_steer_hook(existing, remove)
-        .map_err(|shape| settings_unparsable_error(&settings_path, shape))?;
+    let (merged, changed) = merge_steer_hook(existing, remove).map_err(|source| {
+        errors::cli::install_settings_unparsable()
+            .path(settings_path.clone())
+            .source(source)
+            .error()
+    })?;
     if changed {
         let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
+        fs::create_dir_all(parent).map_err(|source| {
+            errors::cli::install_write_failed()
+                .path(parent.to_owned())
+                .source(source)
+                .error()
+        })?;
         let mut rendered = format!("{merged:#}");
         rendered.push('\n');
         write_atomic(&settings_path, &rendered)?;
@@ -543,16 +515,6 @@ fn write_hook(settings_path: PathBuf, remove: bool) -> Result<HookOutcome, Insta
     })
 }
 
-fn settings_unparsable_error(
-    path: &Path,
-    source: impl StdError + Send + Sync + 'static,
-) -> InstallError {
-    Error::new(InstallFault::SettingsUnparsable {
-        path: path.to_owned(),
-        source: Box::new(source),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -564,7 +526,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        HOOK_COMMAND, HOOK_MATCHER, InstallFault, InstallScope, SettingsShape, SkillOutcome,
+        HOOK_COMMAND, HOOK_MATCHER, InstallScope, SettingsShape, SkillOutcome, errors,
         home_directory, merge_steer_hook, remove_skill, write_skill,
     };
 
@@ -676,34 +638,47 @@ mod tests {
         use std::path::Path;
 
         let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "denied");
-        let write = super::write_error(Path::new("skill/SKILL.md"), denied());
-        assert_eq!(write.descriptor().code(), "install_write_failed");
+        let write = errors::cli::install_write_failed()
+            .path(Path::new("skill/SKILL.md").to_owned())
+            .source(denied())
+            .error();
+        assert_eq!(write.slug(), errors::cli::install_write_failed::SLUG);
         assert!(write.to_string().contains("skill/SKILL.md"), "{write}");
         assert!(write.source().is_some(), "{write}");
 
-        let remove = super::remove_error(Path::new("skill"), denied());
-        assert_eq!(remove.descriptor().code(), "install_remove_failed");
+        let remove = errors::cli::install_remove_failed()
+            .path(Path::new("skill").to_owned())
+            .source(denied())
+            .error();
+        assert_eq!(remove.slug(), errors::cli::install_remove_failed::SLUG);
         assert!(remove.to_string().contains("skill"), "{remove}");
         assert!(remove.source().is_some(), "{remove}");
 
-        let home = super::Error::new(InstallFault::HomeDirectoryUnresolved);
-        assert_eq!(home.descriptor().code(), "install_home_unresolved");
+        let home = errors::cli::install_home_unresolved()
+            .checked("HOME, USERPROFILE")
+            .error();
+        assert_eq!(home.slug(), errors::cli::install_home_unresolved::SLUG);
         assert!(home.to_string().contains("USERPROFILE"), "{home}");
-        assert!(home.source().is_none(), "{home}");
+        assert!(std::error::Error::source(&home).is_none(), "{home}");
 
-        let template = super::Error::new(InstallFault::TemplateToolMissing { name: "search" });
+        let template = errors::cli::install_template_missing_tool()
+            .tool("search")
+            .error();
         assert_eq!(
-            template.descriptor().code(),
-            "install_template_missing_tool"
+            template.slug(),
+            errors::cli::install_template_missing_tool::SLUG
         );
         assert!(template.to_string().contains("search"), "{template}");
-        assert!(template.source().is_none(), "{template}");
+        assert!(std::error::Error::source(&template).is_none(), "{template}");
 
-        let settings = super::Error::new(InstallFault::SettingsUnparsable {
-            path: Path::new("x/.claude/settings.json").to_owned(),
-            source: Box::new(io::Error::new(io::ErrorKind::InvalidData, "bad json")),
-        });
-        assert_eq!(settings.descriptor().code(), "install_settings_unparsable");
+        let settings = errors::cli::install_settings_unparsable()
+            .path(Path::new("x/.claude/settings.json").to_owned())
+            .source(io::Error::new(io::ErrorKind::InvalidData, "bad json"))
+            .error();
+        assert_eq!(
+            settings.slug(),
+            errors::cli::install_settings_unparsable::SLUG
+        );
         assert!(settings.to_string().contains("settings.json"), "{settings}");
         assert!(settings.source().is_some(), "{settings}");
     }
@@ -990,7 +965,7 @@ mod tests {
 
         let error = super::read_settings(&settings_path)
             .expect_err("reading a directory as settings.json must refuse");
-        assert_eq!(error.descriptor().code(), "install_settings_unparsable");
+        assert_eq!(error.slug(), errors::cli::install_settings_unparsable::SLUG);
         assert!(error.source().is_some(), "{error}");
         Ok(())
     }

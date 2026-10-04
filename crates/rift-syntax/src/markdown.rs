@@ -46,7 +46,7 @@ use tree_sitter::Node;
 use crate::document::{ByteRange, SyntaxDocument};
 mod facts;
 use crate::extract::{self, Declaration, GrammarRules, Visited};
-use crate::failure::SyntaxError;
+use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 pub use facts::{
     MARKDOWN_INLINE_RANGES_MAX, MARKDOWN_PROGRESS_CALLBACKS_MAX, MarkdownBlockFact,
@@ -167,7 +167,7 @@ impl MarkdownRules {
 fn section_body_range(
     section: Node<'_>,
     heading: Node<'_>,
-) -> Result<Option<ByteRange>, SyntaxError> {
+) -> Result<Option<ByteRange>, RiftError> {
     let section_range = extract::byte_range(section)?;
     let heading_range = extract::byte_range(heading)?;
     Ok(
@@ -199,7 +199,7 @@ impl MarkdownRules {
         &self,
         section: Node<'_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let Some(heading) = self.declaring_heading(section) else {
             return Ok(None);
         };
@@ -245,7 +245,7 @@ impl GrammarRules for MarkdownRules {
         &self,
         visited: Visited<'_, '_>,
         text: &str,
-    ) -> Result<Option<Declaration>, SyntaxError> {
+    ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
         if node.kind_id() == self.kinds.section {
             return self.section_declaration(node, text);
@@ -300,7 +300,7 @@ impl SyntaxProvider for MarkdownSyntaxProvider {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError> {
+    ) -> Result<SyntaxDocument, RiftError> {
         limits.admit_source(source)?;
         let trees =
             facts::parse_markdown_trees(source, limits, facts::MarkdownParseBounds::default())?;
@@ -364,7 +364,6 @@ mod tests {
     use rift_core::ProjectPath;
 
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     fn text_at(text: &str, range: ByteRange) -> &str {
         let start = usize::try_from(range.start).expect("range starts within source");
@@ -840,8 +839,8 @@ mod tests {
         )
         .expect_err("source bound");
         assert_eq!(
-            source_error.fault().violation(),
-            SyntaxViolation::SourceTooLarge
+            source_error.slug(),
+            rift_error::errors::syntax::source_too_large::SLUG
         );
 
         let node_error = bounded(
@@ -850,8 +849,8 @@ mod tests {
         )
         .expect_err("node bound");
         assert_eq!(
-            node_error.fault().violation(),
-            SyntaxViolation::TooManyNodes
+            node_error.slug(),
+            rift_error::errors::syntax::too_many_nodes::SLUG
         );
 
         let depth_error = bounded(
@@ -859,7 +858,10 @@ mod tests {
             "# Over\n",
         )
         .expect_err("depth bound");
-        assert_eq!(depth_error.fault().violation(), SyntaxViolation::TooDeep);
+        assert_eq!(
+            depth_error.slug(),
+            rift_error::errors::syntax::too_deep::SLUG
+        );
     }
 
     /// Deeply nested headings stay well inside the default depth budget.

@@ -15,13 +15,14 @@ use rift_protocol::documentation::{
 };
 use rift_protocol::read::{Language, SourceKind, SourceLocationKind};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::identity::{canonical_digest, content_digest, is_digest};
+use rift_error::RiftError;
 
 pub(super) fn slice<'a>(
     text: &'a str,
     range: &rift_protocol::read::TextRange,
-) -> Result<&'a str, DocumentationError> {
+) -> Result<&'a str, RiftError> {
     let start = usize::try_from(range.start)
         .map_err(|_| refused(DocumentationViolation::Range, "range"))?;
     let end =
@@ -49,10 +50,7 @@ impl<'source> DocumentationInput<'source> {
     /// # Errors
     ///
     /// Returns a typed refusal for invalid identities, origins, formats, digests, or bounds.
-    pub fn new(
-        source: DocumentationSource,
-        text: &'source str,
-    ) -> Result<Self, DocumentationError> {
+    pub fn new(source: DocumentationSource, text: &'source str) -> Result<Self, RiftError> {
         validate_source(&source, text)?;
         Ok(Self {
             source,
@@ -81,10 +79,7 @@ impl<'source> DocumentationInput<'source> {
     /// # Errors
     ///
     /// Returns a refusal if source path, language, or bytes do not match syntax facts.
-    pub fn with_syntax(
-        self,
-        syntax: &rift_syntax::SyntaxDocument,
-    ) -> Result<Self, DocumentationError> {
+    pub fn with_syntax(self, syntax: &rift_syntax::SyntaxDocument) -> Result<Self, RiftError> {
         self.with_syntax_facts(syntax.path(), syntax.shared_facts())
     }
 
@@ -98,7 +93,7 @@ impl<'source> DocumentationInput<'source> {
         self,
         path: &ProjectPath,
         syntax: &Arc<rift_syntax::SyntaxFacts>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         self.with_syntax_facts(path, Arc::clone(syntax))
     }
 
@@ -107,7 +102,7 @@ impl<'source> DocumentationInput<'source> {
         mut self,
         path: &ProjectPath,
         syntax: Arc<rift_syntax::SyntaxFacts>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if !syntax_matches_source(&self.source, self.text, path, &syntax) {
             return Err(refused(DocumentationViolation::Format, "syntax_source"));
         }
@@ -123,7 +118,7 @@ impl<'source> DocumentationInput<'source> {
     pub fn with_chunks(
         mut self,
         chunks: Vec<rift_protocol::documentation::DocumentationChunk>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if chunks.len() > rift_protocol::documentation::DOCUMENTATION_BLOCKS_MAX as usize {
             return Err(refused(DocumentationViolation::LimitExceeded, "chunks"));
         }
@@ -199,8 +194,8 @@ pub struct DocumentationSourceSet<'source> {
 ///
 /// # Errors
 ///
-/// Returns [`DocumentationError`] when the count exceeds [`DOCUMENTATION_SOURCES_MAX`].
-pub fn check_documentation_source_count(count: usize) -> Result<(), DocumentationError> {
+/// Returns [`RiftError`] when the count exceeds [`DOCUMENTATION_SOURCES_MAX`].
+pub fn check_documentation_source_count(count: usize) -> Result<(), RiftError> {
     if count > DOCUMENTATION_SOURCES_MAX as usize {
         Err(refused(DocumentationViolation::LimitExceeded, "sources"))
     } else {
@@ -217,7 +212,7 @@ impl<'source> DocumentationSourceSet<'source> {
     /// # Errors
     ///
     /// Returns a typed refusal for duplicate identities or aggregate bounds.
-    pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, DocumentationError> {
+    pub fn new(mut sources: Vec<DocumentationInput<'source>>) -> Result<Self, RiftError> {
         check_documentation_source_count(sources.len())?;
         sources.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
         let mut bytes = 0_u64;
@@ -252,7 +247,7 @@ impl<'source> DocumentationSourceSet<'source> {
     }
 }
 
-fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), DocumentationError> {
+fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), RiftError> {
     validate_source_metadata(source)?;
     let size_accepted = text.len() <= DOCUMENTATION_SOURCE_BYTES_MAX as usize;
     let length_matches = source.byte_length == text.len() as u64;
@@ -268,9 +263,7 @@ fn validate_source(source: &DocumentationSource, text: &str) -> Result<(), Docum
     }
 }
 
-pub(super) fn validate_source_metadata(
-    source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+pub(super) fn validate_source_metadata(source: &DocumentationSource) -> Result<(), RiftError> {
     validate_identity(&source.identity)?;
     validate_origin(source)?;
     validate_format(source)?;
@@ -296,7 +289,7 @@ pub(super) fn validate_source_metadata(
 
 pub(super) fn source_selection_digest<'source>(
     sources: impl IntoIterator<Item = &'source DocumentationSource>,
-) -> Result<DocumentationDigest, DocumentationError> {
+) -> Result<DocumentationDigest, RiftError> {
     let selected: Vec<_> = sources
         .into_iter()
         .map(|source| {
@@ -311,9 +304,7 @@ pub(super) fn source_selection_digest<'source>(
     canonical_digest(&selected)
 }
 
-pub(super) fn validate_identity(
-    identity: &DocumentationContentIdentity,
-) -> Result<(), DocumentationError> {
+pub(super) fn validate_identity(identity: &DocumentationContentIdentity) -> Result<(), RiftError> {
     let accepted = match &identity.source {
         DocumentationSourceIdentity::Project { path } => {
             !path.0.is_empty() && ProjectPath::new(&path.0).is_ok()
@@ -338,7 +329,7 @@ pub(super) fn validate_identity(
     Ok(())
 }
 
-fn validate_origin(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_origin(source: &DocumentationSource) -> Result<(), RiftError> {
     let origin = &source.origin;
     let authored_location =
         origin.source_kind != SourceKind::Synthetic && origin.location.is_some();
@@ -371,7 +362,7 @@ fn validate_origin(source: &DocumentationSource) -> Result<(), DocumentationErro
     }
 }
 
-fn validate_selection(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_selection(source: &DocumentationSource) -> Result<(), RiftError> {
     use DocumentationSelectionReason as Selection;
     let valid = match source.selection {
         Selection::Workspace => {
@@ -398,7 +389,7 @@ fn validate_selection(source: &DocumentationSource) -> Result<(), DocumentationE
 fn validate_package_origin(
     unit: &rift_protocol::read::SourceUnitId,
     source: &DocumentationSource,
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     let parsed = SourceUnitId::parse(&unit.0)
         .map_err(|_| refused(DocumentationViolation::Identity, "source.unit"))?;
     let Some(package) = &source.origin.package else {
@@ -422,7 +413,7 @@ fn validate_package_origin(
     Ok(())
 }
 
-fn validate_format(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_format(source: &DocumentationSource) -> Result<(), RiftError> {
     let path = source_path(&source.identity)?;
     let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     let accepted = match source.format {
@@ -452,9 +443,7 @@ fn validate_format(source: &DocumentationSource) -> Result<(), DocumentationErro
     Ok(())
 }
 
-pub(super) fn source_path(
-    identity: &DocumentationContentIdentity,
-) -> Result<String, DocumentationError> {
+pub(super) fn source_path(identity: &DocumentationContentIdentity) -> Result<String, RiftError> {
     match &identity.source {
         DocumentationSourceIdentity::Project { path } => Ok(path.0.clone()),
         DocumentationSourceIdentity::Package { unit } => SourceUnitId::parse(&unit.0)
@@ -463,9 +452,7 @@ pub(super) fn source_path(
     }
 }
 
-pub(super) fn source_file_path(
-    source: &DocumentationSource,
-) -> Result<ProjectPath, DocumentationError> {
+pub(super) fn source_file_path(source: &DocumentationSource) -> Result<ProjectPath, RiftError> {
     let full_path = source_path(&source.identity)?;
     let path = match &source.identity.source {
         DocumentationSourceIdentity::Project { .. } => full_path.as_str(),
@@ -483,7 +470,7 @@ pub(super) fn source_file_path(
     ProjectPath::new(path).map_err(|_| refused(DocumentationViolation::Identity, "source"))
 }
 
-fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), RiftError> {
     if source.physical_ranges.len() > NOTEBOOK_SOURCE_RANGES_MAX as usize {
         return Err(refused(
             DocumentationViolation::LimitExceeded,
@@ -506,7 +493,7 @@ fn validate_physical_ranges(source: &DocumentationSource) -> Result<(), Document
     Ok(())
 }
 
-fn validate_license(source: &DocumentationSource) -> Result<(), DocumentationError> {
+fn validate_license(source: &DocumentationSource) -> Result<(), RiftError> {
     let Some(license) = &source.license else {
         return Ok(());
     };
@@ -570,10 +557,8 @@ mod tests {
     }
 
     fn violation(source: DocumentationSource, text: &str) -> DocumentationViolation {
-        DocumentationInput::new(source, text)
-            .expect_err("input refused")
-            .fault()
-            .violation()
+        let error = DocumentationInput::new(source, text).expect_err("input refused");
+        crate::documentation::failure::violation(&error)
     }
 
     #[test]
@@ -613,7 +598,7 @@ mod tests {
         let input = DocumentationInput::new(source("a.md", "a"), "a").expect("input");
         let error = DocumentationSourceSet::new(vec![input.clone(), input]).expect_err("duplicate");
         assert_eq!(
-            error.fault().violation(),
+            crate::documentation::failure::violation(&error),
             DocumentationViolation::DuplicateSource
         );
     }
@@ -882,7 +867,10 @@ mod tests {
             .expect("source")
             .with_chunks(chunks)
             .expect_err("chunk count bound");
-        assert_eq!(error.fault().field(), "chunks");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("chunks")
+        );
     }
 
     #[test]
@@ -904,7 +892,10 @@ mod tests {
             })
             .collect();
         let error = DocumentationSourceSet::new(sources).expect_err("total byte bound");
-        assert_eq!(error.fault().field(), "source_bytes");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("source_bytes")
+        );
 
         let mut notebook = source("guide.ipynb", "a");
         notebook.format = DocumentationSourceFormat::Notebook;

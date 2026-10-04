@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use super::{PatternBounds, StoreAnswer, accepted_pattern};
-use crate::read::{ReadFault, ReadService};
+use crate::read::ReadService;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -376,10 +376,13 @@ fn refusal(service: &ReadService, request: Value) -> TestResult<String> {
     let error = service
         .search(&params(request)?, &StoreAnswer::identifier_only())
         .expect_err("the request is refused");
-    let ReadFault::Invalid { field, .. } = error.fault() else {
-        return Err(format!("expected invalid_request, found {error}").into());
-    };
-    assert_eq!(*field, "pattern", "{error}");
+    assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "field" && value == "pattern"),
+        "{error}"
+    );
     Ok(error.to_string())
 }
 
@@ -419,10 +422,7 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
             &StoreAnswer::identifier_only(),
         )
         .expect_err("documentation blocks answer no pattern");
-    assert!(matches!(
-        documentation.fault(),
-        ReadFault::Unsupported { .. }
-    ));
+    assert!((documentation.slug() == rift_error::errors::server::read_unsupported::SLUG));
     Ok(())
 }
 
@@ -487,10 +487,13 @@ fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> T
         let error = service
             .search(&params(request.clone())?, &StoreAnswer::identifier_only())
             .expect_err("the argument has nothing to change");
-        let ReadFault::Invalid { field, .. } = error.fault() else {
-            return Err(format!("expected invalid_request, found {error}").into());
-        };
-        assert_eq!(*field, "packages", "{request}: {error}");
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "packages"),
+            "{request}: {error}"
+        );
         let message = error.to_string();
         assert!(message.contains(expected), "{request}: {message}");
     }

@@ -22,6 +22,7 @@ lsp-types.workspace = true
 percent-encoding.workspace = true
 globset.workspace = true
 rift-core.workspace = true
+rift-error.workspace = true
 rift-dependency.workspace = true
 rift-history.workspace = true
 rift-history-store.workspace = true

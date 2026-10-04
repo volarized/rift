@@ -16,7 +16,6 @@ mod acquisition;
 mod document;
 mod embedding;
 mod encoder;
-mod error;
 mod fusion;
 mod index;
 mod similarity;
@@ -32,7 +31,6 @@ pub use embedding::{
     RiftLocalDocumentModel, RiftLocalQueryModel, RiftOpenAiEmbeddingModel,
 };
 pub use encoder::{Encoder, EncoderLimits, ModelFiles};
-pub use error::{SearchError, SearchFault, SearchViolation};
 pub use fusion::{DeclarationMatch, best_per_file, spread_per_file};
 pub use index::{
     DescribedUnit, Embedding, SearchIndex, SearchIndexLimits, SearchIndexLimitsBuilder,

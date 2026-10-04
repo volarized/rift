@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
-use rift_search::{Declaration, Encoder, EncoderLimits, ModelFiles, SearchViolation, document};
+use rift_error::errors;
+use rift_search::{Declaration, Encoder, EncoderLimits, ModelFiles, document};
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::processors::bert::BertProcessing;
 use tokenizers::{Tokenizer, normalizers, pre_tokenizers};
@@ -312,7 +313,7 @@ fn more_texts_than_the_bound_are_refused_before_any_pass_runs() -> TestResult {
     let error = encoder
         .embed_documents(&texts)
         .expect_err("the bound must refuse the call");
-    assert_eq!(error.fault().violation(), SearchViolation::TextLimit);
+    assert_eq!(error.slug(), errors::search::text_limit::SLUG);
     assert!(error.to_string().contains("9 texts, 8 allowed"), "{error}");
     Ok(())
 }
@@ -372,7 +373,7 @@ fn a_batch_the_tokenizer_empties_is_refused_rather_than_embedded() -> TestResult
     let error = encoder
         .embed_documents(&[String::new()])
         .expect_err("no tokens means no vector");
-    assert_eq!(error.fault().violation(), SearchViolation::EncodeFailed);
+    assert_eq!(error.slug(), errors::search::encode_failed::SLUG);
     assert!(
         error
             .to_string()

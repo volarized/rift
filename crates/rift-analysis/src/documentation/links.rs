@@ -11,8 +11,9 @@ use rift_protocol::documentation::{
 use rift_protocol::read::{ProjectPath, SourceUnitId, TextRange};
 use url::Url;
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::input::source_file_path;
+use rift_error::RiftError;
 
 /// One explicit fragment supplied by a format parser, never a generated heading slug.
 #[derive(Clone, Debug)]
@@ -39,7 +40,7 @@ pub fn resolve_links(
     blocks: &[DocumentationBlock],
     links: &mut [DocumentationLink],
     fragments: &[DocumentationFragment],
-) -> Result<(), DocumentationError> {
+) -> Result<(), RiftError> {
     use rift_protocol::documentation::{
         DOCUMENTATION_BLOCKS_MAX, DOCUMENTATION_REFERENCES_MAX, DOCUMENTATION_SOURCES_MAX,
     };
@@ -134,7 +135,7 @@ impl<'declaration> DeclarationLinkNames<'declaration> {
         &self,
         source: &DocumentationSource,
         authored: &str,
-    ) -> Result<DeclarationLinkMatch, DocumentationError> {
+    ) -> Result<DeclarationLinkMatch, RiftError> {
         if let Some(symbol) = self.direct(authored) {
             return Ok(DeclarationLinkMatch::Symbol(symbol.clone()));
         }
@@ -160,7 +161,7 @@ pub(super) fn resolve_declaration_links(
     blocks: &[DocumentationBlock],
     links: &mut [DocumentationLink],
     declarations: &[super::DocumentationDeclaration<'_>],
-) -> Result<Vec<rift_protocol::documentation::DocumentationReference>, DocumentationError> {
+) -> Result<Vec<rift_protocol::documentation::DocumentationReference>, RiftError> {
     use rift_protocol::documentation::{DocumentationReference, DocumentationReferenceEvidence};
     if declarations.len() > rift_protocol::index::PACKAGE_SYMBOLS_MAX as usize {
         return Err(refused(
@@ -223,7 +224,7 @@ pub(super) fn resolve_declaration_links(
 
 pub(super) fn fragment_index(
     fragments: &[DocumentationFragment],
-) -> Result<Fragments<'_>, DocumentationError> {
+) -> Result<Fragments<'_>, RiftError> {
     let mut index = BTreeMap::new();
     for fragment in fragments {
         super::input::validate_identity(&fragment.source)?;
@@ -250,7 +251,7 @@ fn resolve_destination(
     authored: &str,
     sources: &BTreeMap<&DocumentationContentIdentity, &DocumentationSource>,
     fragments: &Fragments<'_>,
-) -> Result<DocumentationLinkResolution, DocumentationError> {
+) -> Result<DocumentationLinkResolution, RiftError> {
     let (identity, fragment) = match local_destination(source, authored)? {
         Destination::Local { identity, fragment } => (identity, fragment),
         Destination::Unresolved(reason) => return Ok(unresolved(reason)),
@@ -284,7 +285,7 @@ pub(super) enum Destination {
 pub(super) fn local_destination(
     source: &DocumentationSource,
     authored: &str,
-) -> Result<Destination, DocumentationError> {
+) -> Result<Destination, RiftError> {
     use DocumentationUnresolvedReason as Reason;
     let authored_valid = !authored.is_empty()
         && authored.len() <= rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize
@@ -354,7 +355,7 @@ fn resolve_fragment(
     }
 }
 
-fn source_base(source: &DocumentationSource) -> Result<Url, DocumentationError> {
+fn source_base(source: &DocumentationSource) -> Result<Url, RiftError> {
     let mut base = Url::parse("https://rift.invalid/root/")
         .map_err(|_| refused(DocumentationViolation::Identity, "source.base"))?;
     let path = source_file_path(source)?;
@@ -368,7 +369,7 @@ fn source_base(source: &DocumentationSource) -> Result<Url, DocumentationError> 
 fn target_identity(
     source: &DocumentationSource,
     path: &rift_core::ProjectPath,
-) -> Result<DocumentationContentIdentity, DocumentationError> {
+) -> Result<DocumentationContentIdentity, RiftError> {
     let target = match &source.identity.source {
         DocumentationSourceIdentity::Project { .. } => DocumentationSourceIdentity::Project {
             path: ProjectPath(path.to_string()),

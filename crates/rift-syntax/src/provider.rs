@@ -1,13 +1,29 @@
 //! The contract every language syntax provider serves.
 
-use rift_core::{Error, ProjectPath};
+use rift_core::ProjectPath;
+use rift_error::RiftError;
+use rift_error::errors;
 use rift_protocol::configuration::{
     SYNTAX_DEPTH_DEFAULT, SYNTAX_FILE_BYTES_DEFAULT, SYNTAX_NODES_DEFAULT, SyntaxConfiguration,
 };
 use rift_protocol::read::{Language, NodeFacet};
+use serde::Serialize;
 
 use crate::document::SyntaxDocument;
-use crate::failure::{SyntaxBound, SyntaxError, SyntaxFault};
+
+/// Syntax bound named in configuration or evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxBound {
+    /// Accepted source bytes.
+    SourceBytesMax,
+    /// Accepted syntax nodes.
+    SyntaxNodesMax,
+    /// Accepted syntax depth.
+    SyntaxDepthMax,
+    /// Accepted query captures.
+    CapturesMax,
+}
 
 /// Bytes accepted from one source under the default `[providers.syntax]` table.
 pub(crate) const SOURCE_BYTES_MAX_DEFAULT: usize = bound(SYNTAX_FILE_BYTES_DEFAULT);
@@ -55,12 +71,12 @@ impl SyntaxLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] naming the first zero bound.
+    /// Returns [`RiftError`] naming the first zero bound.
     pub fn new(
         source_bytes_max: usize,
         syntax_nodes_max: usize,
         syntax_depth_max: usize,
-    ) -> Result<Self, SyntaxError> {
+    ) -> Result<Self, RiftError> {
         let bounds = [
             (source_bytes_max, SyntaxBound::SourceBytesMax),
             (syntax_nodes_max, SyntaxBound::SyntaxNodesMax),
@@ -68,7 +84,13 @@ impl SyntaxLimits {
         ];
         for (value, bound) in bounds {
             if value == 0 {
-                return Err(Error::new(SyntaxFault::ZeroLimit { bound }));
+                let bound = match bound {
+                    SyntaxBound::SourceBytesMax => "source_bytes_max",
+                    SyntaxBound::SyntaxNodesMax => "syntax_nodes_max",
+                    SyntaxBound::SyntaxDepthMax => "syntax_depth_max",
+                    SyntaxBound::CapturesMax => "captures_max",
+                };
+                return errors::syntax::zero_limit().bound(bound).fail();
             }
         }
         Ok(Self {
@@ -89,9 +111,9 @@ impl SyntaxLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] naming the first zero bound; configuration
+    /// Returns [`RiftError`] naming the first zero bound; configuration
     /// acceptance refuses such a table before it reaches this call.
-    pub fn from_configuration(configuration: &SyntaxConfiguration) -> Result<Self, SyntaxError> {
+    pub fn from_configuration(configuration: &SyntaxConfiguration) -> Result<Self, RiftError> {
         Self::new(
             bound(configuration.max_file.bytes()),
             bound(configuration.max_nodes),
@@ -151,14 +173,14 @@ impl SyntaxLimits {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] naming the source's size and the bound when it is larger.
-    pub(crate) fn admit_source(self, source: SyntaxSource<'_>) -> Result<(), SyntaxError> {
+    /// Returns [`RiftError`] naming the source's size and the bound when it is larger.
+    pub(crate) fn admit_source(self, source: SyntaxSource<'_>) -> Result<(), RiftError> {
         if source.text.len() > self.source_bytes_max {
-            return Err(Error::new(SyntaxFault::SourceTooLarge {
-                path: Some(source.path.clone()),
-                source_bytes: source.text.len(),
-                source_bytes_max: self.source_bytes_max,
-            }));
+            return errors::syntax::source_too_large()
+                .path(source.path)
+                .source_bytes(source.text.len())
+                .source_bytes_max(self.source_bytes_max)
+                .fail();
         }
         Ok(())
     }
@@ -182,13 +204,13 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SyntaxError`] for incompatible grammar, cancellation, or an
+    /// Returns [`RiftError`] for incompatible grammar, cancellation, or an
     /// exceeded bound.
     fn analyze(
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-    ) -> Result<SyntaxDocument, SyntaxError>;
+    ) -> Result<SyntaxDocument, RiftError>;
 
     /// Portable structural facets for one grammar node kind.
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet>;
@@ -196,10 +218,7 @@ pub trait SyntaxProvider: std::fmt::Debug + Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{ErrorCode, ErrorContext, ErrorName};
-
     use super::*;
-    use crate::failure::SyntaxViolation;
 
     #[test]
     fn test_limits_reject_each_zero_bound_with_its_configuration_name() {
@@ -210,14 +229,10 @@ mod tests {
         ];
         for (result, bound_name) in cases {
             let error = result.expect_err("zero bound");
-            assert_eq!(error.fault().violation(), SyntaxViolation::ZeroLimit);
+            assert_eq!(error.slug(), rift_error::errors::syntax::zero_limit::SLUG);
             assert_eq!(
-                error.descriptor().name(),
-                ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-            );
-            assert_eq!(
-                error.context(),
-                vec![ErrorContext::new("bound", bound_name)]
+                error.context().collect::<Vec<_>>(),
+                vec![("bound", bound_name.to_owned())]
             );
         }
     }
@@ -236,8 +251,9 @@ mod tests {
         use rift_protocol::configuration::ByteSize;
 
         assert_eq!(
-            SyntaxLimits::from_configuration(&SyntaxConfiguration::default()),
-            Ok(SyntaxLimits::DEFAULT)
+            SyntaxLimits::from_configuration(&SyntaxConfiguration::default())
+                .expect("default configuration is valid"),
+            SyntaxLimits::DEFAULT
         );
         let configured = SyntaxLimits::from_configuration(&SyntaxConfiguration {
             max_file: ByteSize::from_bytes(16 << 20),

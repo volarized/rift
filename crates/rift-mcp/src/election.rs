@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
-use rift_core::{CliCode, Error, ErrorCode, ErrorContext, ErrorName, Fault, causes};
+use rift_error::{ErrorContext, RiftError, causes, errors};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::lock::{SERVER_LOCK_FILE_NAME, ServerLock, ServerLockViolation};
@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::http::serve_http;
 use crate::http::{
-    DeferredDatabaseShutdown, HttpServeError, HttpServer, TokenCheck, serve_http_with_storage,
+    DeferredDatabaseShutdown, HttpServer, TokenCheck, serve_http_with_storage,
     serve_repository_http,
 };
 use crate::identity::BuildCheckout;
@@ -48,80 +48,12 @@ const UNPUBLISHED_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// once; the bound only keeps a probe from hanging on a filtered socket.
 const PRESENCE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Failure while claiming, publishing, or serving a workspace's election.
-pub type ElectionError = Error<ElectionFault>;
-
-/// One election failure: what stopped this process from serving the
-/// workspace.
-#[derive(Debug)]
-pub enum ElectionFault {
-    /// Another process holds this workspace's election lock.
-    AlreadyServing,
-    /// A lock-file read or write failed.
-    Storage {
-        /// The filesystem operation that failed.
-        operation: &'static str,
-        /// The path the operation addressed.
-        path: PathBuf,
-        /// The underlying failure.
-        source: io::Error,
-    },
-    /// The document this server built breaks the published lock contract.
-    DocumentInvalid(ServerLockViolation),
-    /// The HTTP transport failed while starting or serving under the
-    /// election. Boxed to keep this fault small beside it.
-    Serve(Box<HttpServeError>),
-}
-
-impl Fault for ElectionFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::AlreadyServing => ErrorName::Cli(CliCode::ServerAlreadyServing),
-            Self::Storage { .. } => ErrorName::Wire(ErrorCode::StorageFailure),
-            Self::DocumentInvalid(_) => ErrorName::Wire(ErrorCode::InternalError),
-            Self::Serve(source) => source.name(),
-        }
+fn election_document_invalid(violation: ServerLockViolation) -> RiftError {
+    let mut builder = errors::mcp::election_document_invalid();
+    for (key, value) in violation.evidence() {
+        builder = builder.with(ErrorContext::new(key, value));
     }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::AlreadyServing => Vec::new(),
-            Self::Storage {
-                operation, path, ..
-            } => vec![
-                ErrorContext::new("operation", *operation),
-                ErrorContext::new("path", path.display().to_string()),
-            ],
-            Self::DocumentInvalid(violation) => violation
-                .evidence()
-                .into_iter()
-                .map(|(key, value)| ErrorContext::new(key, value))
-                .collect(),
-            Self::Serve(source) => source.context(),
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::AlreadyServing | Self::DocumentInvalid(_) => None,
-            Self::Storage { source, .. } => Some(source),
-            Self::Serve(source) => Some(source.as_ref()),
-        }
-    }
-}
-
-impl ElectionFault {
-    fn storage(operation: &'static str, path: &Path, source: io::Error) -> ElectionError {
-        Error::new(Self::Storage {
-            operation,
-            path: path.to_owned(),
-            source,
-        })
-    }
-
-    fn serve(source: HttpServeError) -> ElectionError {
-        Error::new(Self::Serve(Box::new(source)))
-    }
+    builder.error()
 }
 
 /// Claims the workspace's election for this process.
@@ -133,20 +65,21 @@ impl ElectionFault {
 ///
 /// # Errors
 ///
-/// Returns [`ElectionFault::AlreadyServing`] when another process holds the
-/// election, and [`ElectionFault::Storage`] when the state directory or the
-/// election file cannot be prepared.
-pub fn claim(root: &Path) -> Result<ElectionGuard, ElectionError> {
+/// Returns a registered error when another process holds the election or
+/// the state directory or election file cannot be prepared.
+pub fn claim(root: &Path) -> Result<ElectionGuard, RiftError> {
     claim_state_directory(&root.join(RIFT_STATE_DIRECTORY))
 }
 
 /// Claims an election whose files live in `state_directory`.
-pub(crate) fn claim_state_directory(
-    state_directory: &Path,
-) -> Result<ElectionGuard, ElectionError> {
+pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGuard, RiftError> {
     let state_directory = state_directory.to_path_buf();
-    std::fs::create_dir_all(&state_directory).map_err(|error| {
-        ElectionFault::storage("create state directory", &state_directory, error)
+    std::fs::create_dir_all(&state_directory).map_err(|source| {
+        errors::mcp::election_storage_failed()
+            .operation("create state directory")
+            .path(&state_directory)
+            .source(source)
+            .error()
     })?;
     let election_path = state_directory.join(SERVER_ELECTION_FILE_NAME);
     let election_file = OpenOptions::new()
@@ -155,7 +88,13 @@ pub(crate) fn claim_state_directory(
         .read(true)
         .write(true)
         .open(&election_path)
-        .map_err(|error| ElectionFault::storage("open election file", &election_path, error))?;
+        .map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("open election file")
+                .path(&election_path)
+                .source(source)
+                .error()
+        })?;
     match election_file.try_lock() {
         Ok(()) => {
             let guard = ElectionGuard {
@@ -169,12 +108,12 @@ pub(crate) fn claim_state_directory(
             guard.retire();
             Ok(guard)
         }
-        Err(TryLockError::WouldBlock) => Err(Error::new(ElectionFault::AlreadyServing)),
-        Err(TryLockError::Error(error)) => Err(ElectionFault::storage(
-            "lock election file",
-            &election_path,
-            error,
-        )),
+        Err(TryLockError::WouldBlock) => errors::mcp::election_already_serving().fail(),
+        Err(TryLockError::Error(source)) => errors::mcp::election_storage_failed()
+            .operation("lock election file")
+            .path(&election_path)
+            .source(source)
+            .fail(),
     }
 }
 
@@ -194,22 +133,31 @@ pub struct ElectionGuard {
 
 impl ElectionGuard {
     /// Checks that this guard holds the requested workspace's election.
-    pub(crate) fn validate_workspace(&self, root: &Path) -> Result<(), ElectionError> {
+    pub(crate) fn validate_workspace(&self, root: &Path) -> Result<(), RiftError> {
         let state = root.join(RIFT_STATE_DIRECTORY);
-        let requested = std::fs::canonicalize(&state)
-            .map_err(|error| ElectionFault::storage("read election directory", &state, error))?;
-        let held = std::fs::canonicalize(&self.state_directory).map_err(|error| {
-            ElectionFault::storage("read election directory", &self.state_directory, error)
+        let requested = std::fs::canonicalize(&state).map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("read election directory")
+                .path(&state)
+                .source(source)
+                .error()
+        })?;
+        let held = std::fs::canonicalize(&self.state_directory).map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("read election directory")
+                .path(&self.state_directory)
+                .source(source)
+                .error()
         })?;
         if requested != held {
-            return Err(ElectionFault::storage(
-                "validate workspace election",
-                root,
-                io::Error::new(
+            return errors::mcp::election_storage_failed()
+                .operation("validate workspace election")
+                .path(root)
+                .source(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "election belongs to another workspace",
-                ),
-            ));
+                ))
+                .fail();
         }
         Ok(())
     }
@@ -224,18 +172,16 @@ impl ElectionGuard {
     ///
     /// # Errors
     ///
-    /// Returns [`ElectionFault::DocumentInvalid`] when the document breaks
-    /// the [`ServerLock`] contract, and [`ElectionFault::Storage`] when
-    /// staging or renaming fails.
-    pub fn publish(&self, lock: &ServerLock) -> Result<(), ElectionError> {
-        lock.validate()
-            .map_err(|violation| Error::new(ElectionFault::DocumentInvalid(violation)))?;
+    /// Returns a registered error when the document breaks the [`ServerLock`]
+    /// contract or staging or renaming fails.
+    pub fn publish(&self, lock: &ServerLock) -> Result<(), RiftError> {
+        lock.validate().map_err(election_document_invalid)?;
         let bytes = serde_json::to_vec(lock).map_err(|error| {
-            ElectionFault::storage(
-                "serialize lock document",
-                &self.document_path,
-                io::Error::other(error),
-            )
+            errors::mcp::election_storage_failed()
+                .operation("serialize lock document")
+                .path(&self.document_path)
+                .source(io::Error::other(error))
+                .error()
         })?;
         self.stage_and_rename(&bytes)
     }
@@ -249,22 +195,49 @@ impl ElectionGuard {
     /// open, while `std::fs::rename` retries that refusal as a POSIX-semantics
     /// rename, which replaces it. A staged file the rename leaves behind is
     /// removed best effort.
-    fn stage_and_rename(&self, bytes: &[u8]) -> Result<(), ElectionError> {
-        let stage_failed = |error: io::Error| {
-            ElectionFault::storage("stage lock document", &self.state_directory, error)
-        };
-        let staged =
-            tempfile::NamedTempFile::new_in(&self.state_directory).map_err(stage_failed)?;
-        restrict_to_owner(staged.as_file()).map_err(stage_failed)?;
-        staged.as_file().write_all(bytes).map_err(stage_failed)?;
-        staged.as_file().sync_all().map_err(stage_failed)?;
-        let staged = staged
-            .into_temp_path()
-            .keep()
-            .map_err(|error| stage_failed(error.error))?;
+    fn stage_and_rename(&self, bytes: &[u8]) -> Result<(), RiftError> {
+        let staged = tempfile::NamedTempFile::new_in(&self.state_directory).map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("stage lock document")
+                .path(&self.state_directory)
+                .source(source)
+                .error()
+        })?;
+        restrict_to_owner(staged.as_file()).map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("stage lock document")
+                .path(&self.state_directory)
+                .source(source)
+                .error()
+        })?;
+        staged.as_file().write_all(bytes).map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("stage lock document")
+                .path(&self.state_directory)
+                .source(source)
+                .error()
+        })?;
+        staged.as_file().sync_all().map_err(|source| {
+            errors::mcp::election_storage_failed()
+                .operation("stage lock document")
+                .path(&self.state_directory)
+                .source(source)
+                .error()
+        })?;
+        let staged = staged.into_temp_path().keep().map_err(|error| {
+            errors::mcp::election_storage_failed()
+                .operation("stage lock document")
+                .path(&self.state_directory)
+                .source(error.error)
+                .error()
+        })?;
         std::fs::rename(&staged, &self.document_path).map_err(|error| {
             let _ = std::fs::remove_file(&staged);
-            ElectionFault::storage("publish lock document", &self.document_path, error)
+            errors::mcp::election_storage_failed()
+                .operation("publish lock document")
+                .path(&self.document_path)
+                .source(error)
+                .error()
         })?;
         Ok(())
     }
@@ -540,8 +513,8 @@ fn served_document(
 ///
 /// # Errors
 ///
-/// Returns [`ElectionFault::AlreadyServing`] when another process holds the
-/// election, and otherwise the claim, transport, or publish failure.
+/// Returns a registered error when another process holds the election or
+/// the claim, transport, or publish operation fails.
 ///
 /// # Cancel safety
 ///
@@ -551,7 +524,7 @@ fn served_document(
 pub async fn serve_elected(
     root: &Path,
     shutdown: CancellationToken,
-) -> Result<ElectedServer, ElectionError> {
+) -> Result<ElectedServer, RiftError> {
     let guard = Arc::new(claim(root)?);
     let storage = WorkspaceStorage::open_elected(root, Arc::clone(&guard)).await?;
     serve_elected_with_storage(
@@ -585,7 +558,7 @@ pub async fn serve_elected_with_storage(
     storage: WorkspaceStorage,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<ElectedServer, ElectionError> {
+) -> Result<ElectedServer, RiftError> {
     serve_elected_at(
         root,
         guard,
@@ -608,19 +581,23 @@ pub async fn serve_repository_elected(
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<ElectedServer, ElectionError> {
+) -> Result<ElectedServer, RiftError> {
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|source| {
-            ElectionFault::storage("read product identity", common_directory, source)
+            errors::mcp::election_storage_failed()
+                .operation("read product identity")
+                .path(common_directory)
+                .source(source)
+                .error()
         })?;
     let state_directory =
         repository_election_directory(common_directory, &identity).map_err(|error| {
-            ElectionFault::storage(
-                "select repository election",
-                common_directory,
-                io::Error::other(error),
-            )
+            errors::mcp::election_storage_failed()
+                .operation("select repository election")
+                .path(common_directory)
+                .source(io::Error::other(error))
+                .error()
         })?;
     let guard = Arc::new(claim_state_directory(&state_directory)?);
     let serving_stop = shutdown.child_token();
@@ -633,8 +610,7 @@ pub async fn serve_repository_elected(
         check,
         checkout,
     )
-    .await
-    .map_err(ElectionFault::serve)?;
+    .await?;
     let document = served_document(
         server.port(),
         server.token(),
@@ -669,7 +645,7 @@ pub(crate) async fn serve_elected_at(
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<ElectedServer, ElectionError> {
+) -> Result<ElectedServer, RiftError> {
     let elected = elect_and_serve(root, guard, shutdown, storage, limits, check, checkout).await;
     if let Err(error) = &elected {
         record_start_failure(error);
@@ -678,8 +654,8 @@ pub(crate) async fn serve_elected_at(
 }
 
 /// Records why this process will not serve, before the caller exits on it.
-fn record_start_failure(error: &ElectionError) {
-    if matches!(error.fault(), ElectionFault::AlreadyServing) {
+fn record_start_failure(error: &RiftError) {
+    if error.slug() == errors::mcp::election_already_serving::SLUG {
         tracing::info!(
             component = "mcp",
             operation = "server.start",
@@ -706,23 +682,23 @@ async fn elect_and_serve(
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
     checkout: BuildCheckout,
-) -> Result<ElectedServer, ElectionError> {
+) -> Result<ElectedServer, RiftError> {
     guard.validate_workspace(root)?;
     if !storage.holds_election(&guard) {
-        return Err(ElectionFault::storage(
-            "validate workspace storage",
-            root,
-            io::Error::new(
+        return errors::mcp::election_storage_failed()
+            .operation("validate workspace storage")
+            .path(root)
+            .source(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "storage opened without this workspace election",
-            ),
-        ));
+            ))
+            .fail();
     }
     let serving_stop = shutdown.child_token();
     let server =
         serve_http_with_storage(root, serving_stop.clone(), storage, limits, check, checkout)
             .await
-            .map_err(ElectionFault::serve)?;
+            .await?;
     let document = served_document(
         server.port(),
         server.token(),
@@ -743,8 +719,8 @@ async fn elect_and_serve(
 async fn shut_down_unpublished(
     server: HttpServer,
     serving_stop: &CancellationToken,
-    publish_failure: ElectionError,
-) -> ElectionError {
+    publish_failure: RiftError,
+) -> RiftError {
     serving_stop.cancel();
     let (_deadline, outcome) = server.stopped(UNPUBLISHED_SHUTDOWN_DEADLINE).await;
     if let Err(error) = outcome {
@@ -793,12 +769,9 @@ impl ElectedServer {
     pub async fn stopped(
         self,
         budget: Duration,
-    ) -> (Arc<ElectionGuard>, Instant, Result<(), ElectionError>) {
+    ) -> (Arc<ElectionGuard>, Instant, Result<(), RiftError>) {
         let (guard, deadline, stopped, database) = self.stopped_before_database(budget).await;
-        let database = database
-            .shutdown(deadline)
-            .await
-            .map_err(ElectionFault::serve);
+        let database = database.shutdown(deadline).await;
         (guard, deadline, stopped.and(database))
     }
 
@@ -810,16 +783,11 @@ impl ElectedServer {
     ) -> (
         Arc<ElectionGuard>,
         Instant,
-        Result<(), ElectionError>,
+        Result<(), RiftError>,
         DeferredDatabaseShutdown,
     ) {
         let (deadline, outcome, database) = self.server.stopped_before_database(budget).await;
-        (
-            self.guard,
-            deadline,
-            outcome.map_err(ElectionFault::serve),
-            database,
-        )
+        (self.guard, deadline, outcome, database)
     }
 }
 
@@ -829,18 +797,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use rift_core::{Error, Fault};
+    use rift_error::errors;
     use rift_protocol::lock::{
         SERVER_LOCK_FILE_NAME, SERVER_PORT_MIN, SERVER_TOKEN_LENGTH, ServerLock,
     };
     use tokio_util::sync::CancellationToken;
 
-    use crate::http::{HttpServeFault, TokenCheck};
+    use crate::http::TokenCheck;
 
     use super::{
-        ElectionFault, SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe,
-        read_serving, serve_elected, serve_elected_at, serve_http, served_document,
-        shut_down_unpublished,
+        SERVER_ELECTION_FILE_NAME, ServerPresence, StaleReason, claim, probe, read_serving,
+        serve_elected, serve_elected_at, serve_http, served_document, shut_down_unpublished,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -907,11 +874,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let first = claim(directory.path())?;
         let refused = claim(directory.path()).expect_err("held election must refuse");
-        assert!(
-            matches!(refused.fault(), ElectionFault::AlreadyServing),
-            "refusal must be the typed AlreadyServing outcome: {refused:?}"
-        );
-        assert_eq!(refused.descriptor().code(), "server_already_serving");
+        assert_eq!(refused.slug(), errors::mcp::election_already_serving::SLUG);
         drop(first);
         let _reclaimed = claim(directory.path())?;
         Ok(())
@@ -995,8 +958,8 @@ mod tests {
         let error = guard
             .publish(&document)
             .expect_err("invalid document must refuse");
-        assert!(matches!(error.fault(), ElectionFault::DocumentInvalid(_)));
-        assert_eq!(error.descriptor().code(), "internal_error");
+        assert_eq!(error.slug(), errors::mcp::election_document_invalid::SLUG);
+        assert!(error.context().any(|(key, _)| key == "pid"));
         assert!(
             !document_path(directory.path()).exists(),
             "a refused publish must write nothing"
@@ -1245,7 +1208,7 @@ mod tests {
         let (sink, mut drain) = crate::logs::log_capture();
         let subscriber = tracing_subscriber::registry().with(sink);
         tracing::subscriber::with_default(subscriber, || {
-            super::record_start_failure(&Error::new(ElectionFault::AlreadyServing));
+            super::record_start_failure(&errors::mcp::election_already_serving().error());
         });
         let recorded = drain
             .try_recv_record()
@@ -1271,60 +1234,45 @@ mod tests {
     }
 
     #[test]
-    fn election_faults_carry_registry_codes_and_evidence() {
-        let storage = ElectionFault::storage(
-            "open election file",
-            std::path::Path::new("/workspace/.rift/server.lock"),
-            std::io::Error::other("disk gone"),
-        );
-        assert_eq!(storage.descriptor().code(), "storage_failure");
+    fn election_errors_carry_registered_slug_evidence_and_source() {
+        let storage = errors::mcp::election_storage_failed()
+            .operation("open election file")
+            .path(std::path::Path::new("/workspace/.rift/server.lock"))
+            .source(std::io::Error::other("disk gone"))
+            .error();
+        assert_eq!(storage.slug(), errors::mcp::election_storage_failed::SLUG);
+        assert!(storage.context().any(|(key, _)| key == "operation"));
+        assert!(storage.context().any(|(key, _)| key == "path"));
         let rendered = storage.to_string();
         assert!(rendered.contains("open election file"), "{rendered}");
         assert!(rendered.contains("server.lock"), "{rendered}");
         assert!(
             std::error::Error::source(&storage).is_some(),
-            "storage faults keep their io source"
+            "storage errors keep their io source"
         );
     }
 
     #[test]
-    fn already_serving_fault_carries_no_evidence_and_no_source() {
-        let fault = ElectionFault::AlreadyServing;
-        assert!(fault.context().is_empty());
-        assert!(Fault::source(&fault).is_none());
+    fn already_serving_error_carries_no_evidence_and_no_source() {
+        let error = errors::mcp::election_already_serving().error();
+        assert!(error.context().next().is_none());
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
-    fn document_invalid_fault_carries_the_violation_evidence() {
+    fn document_invalid_error_carries_the_violation_evidence() {
         let mut document = valid_document();
         document.pid = 0;
         let violation = document
             .validate()
             .expect_err("a zero pid must break the contract");
-        let fault = ElectionFault::DocumentInvalid(violation);
-        let context = fault.context();
+        let error = super::election_document_invalid(violation);
+        let context = error.context().collect::<Vec<_>>();
         assert!(
-            context.iter().any(|entry| entry.key() == "pid"),
+            context.iter().any(|(key, _)| *key == "pid"),
             "the violation's evidence must surface: {context:?}"
         );
-        assert!(Fault::source(&fault).is_none());
-    }
-
-    #[test]
-    fn serve_fault_forwards_name_evidence_and_source() {
-        let transport = Error::new(HttpServeFault::Serve {
-            operation: "http serve loop",
-            source: Box::new(std::io::Error::other("socket gone")),
-        });
-        let expected_code = transport.descriptor().code();
-        let expected_context = transport.context();
-        let error = ElectionFault::serve(transport);
-        assert_eq!(error.descriptor().code(), expected_code);
-        assert_eq!(error.context(), expected_context);
-        assert!(
-            std::error::Error::source(&error).is_some(),
-            "the wrapped transport failure must stay on the source chain"
-        );
+        assert_eq!(error.slug(), errors::mcp::election_document_invalid::SLUG);
     }
 
     #[test]
@@ -1333,14 +1281,9 @@ mod tests {
         fs::write(directory.path().join(".rift"), b"a file in the way")?;
         let error = claim(directory.path()).expect_err("a file at .rift must refuse the claim");
         assert!(
-            matches!(
-                error.fault(),
-                ElectionFault::Storage {
-                    operation: "create state directory",
-                    ..
-                }
-            ),
-            "the refusal must name the directory creation: {error:?}"
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "create state directory")
         );
         Ok(())
     }
@@ -1359,14 +1302,9 @@ mod tests {
         fs::set_permissions(&state_directory, saved)?;
         let error = outcome.expect_err("a read-only state directory must fail the staging");
         assert!(
-            matches!(
-                error.fault(),
-                ElectionFault::Storage {
-                    operation: "stage lock document",
-                    ..
-                }
-            ),
-            "the refusal must name the staging: {error:?}"
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "stage lock document")
         );
         Ok(())
     }
@@ -1380,14 +1318,9 @@ mod tests {
             .publish(&valid_document())
             .expect_err("a directory at the document path must fail the rename");
         assert!(
-            matches!(
-                error.fault(),
-                ElectionFault::Storage {
-                    operation: "publish lock document",
-                    ..
-                }
-            ),
-            "the refusal must name the publish rename: {error:?}"
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "publish lock document")
         );
         Ok(())
     }
@@ -1462,12 +1395,9 @@ mod tests {
         let serving_stop = shutdown.child_token();
         let server =
             serve_http(directory.path(), serving_stop.clone(), TokenCheck::Required).await?;
-        let failure = Error::new(ElectionFault::AlreadyServing);
+        let failure = errors::mcp::election_already_serving().error();
         let returned = shut_down_unpublished(server, &serving_stop, failure).await;
-        assert!(
-            matches!(returned.fault(), ElectionFault::AlreadyServing),
-            "the fabricated failure must come back unchanged: {returned:?}"
-        );
+        assert_eq!(returned.slug(), errors::mcp::election_already_serving::SLUG);
         assert!(
             serving_stop.is_cancelled(),
             "the unpublished server's token must be cancelled"
@@ -1492,13 +1422,11 @@ mod tests {
         )
         .await
         .expect_err("another workspace's storage cannot serve");
-        assert!(matches!(
-            error.fault(),
-            ElectionFault::Storage {
-                operation: "validate workspace storage",
-                ..
-            }
-        ));
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "validate workspace storage")
+        );
         assert!(!document_path(requested.path()).exists());
         assert!(!requested.path().join(".rift/db").exists());
         Ok(())
@@ -1511,7 +1439,7 @@ mod tests {
         let error = serve_elected(directory.path(), CancellationToken::new())
             .await
             .expect_err("a competing owner refuses the start");
-        assert!(matches!(error.fault(), ElectionFault::AlreadyServing));
+        assert_eq!(error.slug(), errors::mcp::election_already_serving::SLUG);
         assert!(!directory.path().join(".rift/db").exists());
         Ok(())
     }
@@ -1526,14 +1454,9 @@ mod tests {
             .await
             .expect_err("publishing over a directory must fail the election");
         assert!(
-            matches!(
-                error.fault(),
-                ElectionFault::Storage {
-                    operation: "publish lock document",
-                    ..
-                }
-            ),
-            "the publish failure must surface: {error:?}"
+            error
+                .context()
+                .any(|(key, value)| key == "operation" && value == "publish lock document")
         );
         Ok(())
     }

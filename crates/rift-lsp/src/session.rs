@@ -39,20 +39,17 @@ use lsp_types::{
     TextDocumentPositionParams, WatchKind, WorkDoneProgress, WorkDoneProgressCreateParams,
     WorkDoneProgressParams, WorkspaceFolder,
 };
-use rift_core::{
-    CapturedStream, Error, ErrorCode, ErrorContext, ErrorName, Fault, ProjectPath,
-    STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX, fault_label,
-};
-use serde::Serialize;
+use rift_core::{CapturedStream, ProjectPath, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_error::{RiftError, errors};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
-use crate::capabilities::{Capabilities, CapabilitiesError, glob_matches, offered};
-use crate::correlation::{self, Correlation, CorrelationError, METHOD_NOT_FOUND_CODE, RequestId};
-use crate::framing::{Framing, FramingError};
-use crate::uri::{TreeRoot, UriError};
+use crate::capabilities::{Capabilities, glob_matches, offered};
+use crate::correlation::{self, Correlation, METHOD_NOT_FOUND_CODE, RequestId};
+use crate::framing::Framing;
+use crate::uri::TreeRoot;
 
 /// Wall-clock bound on the shutdown request and on the exit wait.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -132,216 +129,20 @@ pub struct EngineLaunch {
     pub stderr_capture_bytes: usize,
 }
 
-/// How one engine session failed.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineFault {
-    /// The configured program is empty.
-    ProgramEmpty,
-    /// The configured program is an absolute executable path.
-    ProgramAbsolute {
-        /// The program as configured.
-        program: String,
-    },
-    /// The program could not be started.
-    LaunchFailed {
-        /// The launch failure.
-        #[serde(skip)]
-        source: std::io::Error,
-    },
-    /// The engine ended its side of the connection mid-request.
-    ConnectionClosed {
-        /// The request in flight.
-        method: String,
-    },
-    /// The engine overstayed its timeout and was killed.
-    TimedOut {
-        /// The request in flight.
-        method: String,
-        /// The bound that was overstayed, in milliseconds.
-        timeout_ms: u64,
-    },
-    /// The engine sent a payload that is not a JSON-RPC envelope.
-    MessageUnreadable,
-    /// The engine broke the base protocol's framing.
-    Framing {
-        /// The framing refusal.
-        #[serde(skip)]
-        source: FramingError,
-    },
-    /// The engine broke request correlation.
-    Correlation {
-        /// The correlation refusal.
-        #[serde(skip)]
-        source: CorrelationError,
-    },
-    /// The engine's initialize answer was refused.
-    Negotiation {
-        /// The capability refusal.
-        #[serde(skip)]
-        source: CapabilitiesError,
-    },
-    /// A document address could not be converted.
-    Document {
-        /// The URI refusal.
-        #[serde(skip)]
-        source: UriError,
-    },
-    /// The engine answered the request with a JSON-RPC error.
-    ///
-    /// The code decides whether the same request is worth sending again;
-    /// [`EngineFault::is_retryable_refusal`] reads that verdict.
-    Refused {
-        /// The refused request.
-        method: String,
-        /// The engine's error code.
-        code: i64,
-        /// The engine's error message.
-        message: String,
-    },
-    /// The engine's answer does not deserialize as the method's result.
-    ResultInvalid {
-        /// The answered request.
-        method: String,
-        /// The deserialization failure.
-        #[serde(skip)]
-        source: serde_json::Error,
-    },
-    /// The engine never advertised the operation.
-    CapabilityAbsent {
-        /// The unserved method.
-        capability: String,
-    },
-    /// The engine answered every attempt while it was still analyzing.
-    ///
-    /// The answers were provisional: the engine had work-done progress
-    /// outstanding each time, so the same request may answer differently
-    /// once that work ends. The holder spent its whole attempt bound
-    /// waiting, and reports the wait rather than the provisional answer.
-    Analyzing {
-        /// Attempts the operation was given.
-        attempts: u64,
-    },
-    /// The session already killed its engine; nothing further is served.
-    Ended,
+/// Whether an error means session cannot serve another exchange.
+fn ends_session(error: &RiftError) -> bool {
+    let slug = error.slug();
+    slug == errors::lsp::engine_connection_closed::SLUG
+        || slug == errors::lsp::engine_timed_out::SLUG
+        || slug == errors::lsp::engine_message_unreadable::SLUG
+        || slug == errors::lsp::framing_header_too_long::SLUG
+        || slug == errors::lsp::framing_message_too_long::SLUG
+        || slug == errors::lsp::framing_header_malformed::SLUG
+        || slug == errors::lsp::framing_content_length_missing::SLUG
+        || slug == errors::lsp::framing_content_length_invalid::SLUG
+        || slug == errors::lsp::correlation_pending_requests_exceeded::SLUG
+        || slug == errors::lsp::correlation_response_unknown::SLUG
 }
-
-impl EngineFault {
-    /// Whether the fault leaves the engine unusable, so it must be ended.
-    fn ends_session(&self) -> bool {
-        matches!(
-            self,
-            Self::ConnectionClosed { .. }
-                | Self::TimedOut { .. }
-                | Self::MessageUnreadable
-                | Self::Framing { .. }
-                | Self::Correlation { .. }
-        )
-    }
-
-    /// Whether the fault is the engine's own reply to the request.
-    ///
-    /// Only [`EngineFault::Refused`] is: the engine read the request and
-    /// answered it with an error code. Every other fault names something
-    /// around the request - an absent capability, a broken exchange, a
-    /// killed child - and no amount of further analysis changes it.
-    #[must_use]
-    pub fn is_refusal(&self) -> bool {
-        matches!(self, Self::Refused { .. })
-    }
-
-    /// Whether the engine refused with a code that invites the same
-    /// request again.
-    ///
-    /// Only [`EngineFault::Refused`] can answer yes, and only for the
-    /// codes in `RETRYABLE_REFUSAL_CODES`: the engine cancelled the
-    /// request, or the document moved under it. Every other refusal is
-    /// the engine's verdict on the request, and resending it changes
-    /// nothing.
-    #[must_use]
-    pub fn is_retryable_refusal(&self) -> bool {
-        matches!(self, Self::Refused { code, .. } if RETRYABLE_REFUSAL_CODES.contains(code))
-    }
-}
-
-impl Fault for EngineFault {
-    fn name(&self) -> ErrorName {
-        match self {
-            Self::ProgramEmpty | Self::ProgramAbsolute { .. } => {
-                ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-            }
-            Self::ConnectionClosed { .. }
-            | Self::TimedOut { .. }
-            | Self::Analyzing { .. }
-            | Self::Ended => ErrorName::Wire(ErrorCode::TemporarilyUnavailable),
-            Self::Refused { .. } if self.is_retryable_refusal() => {
-                ErrorName::Wire(ErrorCode::TemporarilyUnavailable)
-            }
-            Self::Refused { .. } => ErrorName::Wire(ErrorCode::InvalidRequest),
-            Self::Framing { source } => source.name(),
-            Self::Correlation { source } => source.name(),
-            Self::Negotiation { source } => source.name(),
-            Self::Document { source } => source.name(),
-            _ => ErrorName::Wire(ErrorCode::CapabilityUnavailable),
-        }
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        match self {
-            Self::Framing { source } => source.context(),
-            Self::Correlation { source } => source.context(),
-            Self::Negotiation { source } => source.context(),
-            Self::Document { source } => source.context(),
-            _ => {
-                let mut context = vec![ErrorContext::new("fault", fault_label(self))];
-                match self {
-                    Self::ProgramAbsolute { program } => {
-                        context.push(ErrorContext::new("program", program.clone()));
-                    }
-                    Self::ConnectionClosed { method } | Self::ResultInvalid { method, .. } => {
-                        context.push(ErrorContext::new("method", method.clone()));
-                    }
-                    Self::TimedOut { method, timeout_ms } => {
-                        context.push(ErrorContext::new("method", method.clone()));
-                        context.push(ErrorContext::new("timeout_ms", timeout_ms.to_string()));
-                    }
-                    Self::Refused {
-                        method,
-                        code,
-                        message,
-                    } => {
-                        context.push(ErrorContext::new("method", method.clone()));
-                        context.push(ErrorContext::new("code", code.to_string()));
-                        context.push(ErrorContext::new("message", message.clone()));
-                    }
-                    Self::CapabilityAbsent { capability } => {
-                        context.push(ErrorContext::new("capability", capability.clone()));
-                    }
-                    Self::Analyzing { attempts } => {
-                        context.push(ErrorContext::new("attempts", attempts.to_string()));
-                    }
-                    _ => {}
-                }
-                context
-            }
-        }
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::LaunchFailed { source } => Some(source),
-            Self::ResultInvalid { source, .. } => Some(source),
-            Self::Framing { source } => Some(source),
-            Self::Correlation { source } => Some(source),
-            Self::Negotiation { source } => Some(source),
-            Self::Document { source } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// A failed engine session or operation.
-pub type EngineError = Error<EngineFault>;
 
 /// What the engine has said about its own work over `$/progress`.
 ///
@@ -694,14 +495,14 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] for a refused program, a failed spawn, or a
+    /// Returns [`RiftError`] for a refused program, a failed spawn, or a
     /// failed handshake; the child never outlives the failure.
     ///
     /// # Cancel safety
     ///
     /// Dropping the future mid-handshake drops the child with kill-on-drop
     /// armed: the runtime kills and reaps it in the background.
-    pub async fn start(launch: EngineLaunch, workspace_root: &Path) -> Result<Self, EngineError> {
+    pub async fn start(launch: EngineLaunch, workspace_root: &Path) -> Result<Self, RiftError> {
         refuse_program(&launch.program)?;
         let mut command = Command::new(&launch.program);
         command
@@ -712,16 +513,14 @@ impl EngineSession {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|source| Error::new(EngineFault::LaunchFailed { source }))?;
+        let mut child = command.spawn().map_err(engine_launch_failed)?;
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
             let _ = child.kill().await;
-            return Err(Error::new(EngineFault::LaunchFailed {
-                source: std::io::Error::other("child pipes were not handed over"),
-            }));
+            return errors::lsp::engine_launch_failed()
+                .source(std::io::Error::other("child pipes were not handed over"))
+                .fail();
         };
         let stderr_drain = tokio::spawn(drain(stderr, launch.stderr_capture_bytes));
         Self::assembled(
@@ -748,14 +547,14 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] under the same conditions as
+    /// Returns [`RiftError`] under the same conditions as
     /// [`EngineSession::start`], minus a failed spawn.
     pub async fn start_over_transport(
         launch: EngineLaunch,
         workspace_root: &Path,
         transport: impl AsyncRead + AsyncWrite + Send + 'static,
         stderr: impl AsyncRead + Send + Unpin + 'static,
-    ) -> Result<Self, EngineError> {
+    ) -> Result<Self, RiftError> {
         let (read_half, write_half) = tokio::io::split(transport);
         let stderr_drain = tokio::spawn(drain(stderr, launch.stderr_capture_bytes));
         Self::assembled(
@@ -780,9 +579,8 @@ impl EngineSession {
         stderr_drain: tokio::task::JoinHandle<CapturedStream>,
         workspace_root: &Path,
         launch: EngineLaunch,
-    ) -> Result<Self, EngineError> {
-        let root = TreeRoot::new(workspace_root)
-            .map_err(|source| Error::new(EngineFault::Document { source }))?;
+    ) -> Result<Self, RiftError> {
+        let root = TreeRoot::new(workspace_root)?;
         let mut session = Self {
             child,
             stdin,
@@ -955,7 +753,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the engine's side
+    /// Returns [`RiftError`] when the session ended or the engine's side
     /// of the connection broke.
     ///
     /// # Cancel safety
@@ -969,7 +767,7 @@ impl EngineSession {
         path: &ProjectPath,
         language_id: &str,
         text: String,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), RiftError> {
         let uri = self.document_uri(path)?;
         self.document_version += 1;
         let params = DidOpenTextDocumentParams {
@@ -999,7 +797,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the engine's side
+    /// Returns [`RiftError`] when the session ended or the engine's side
     /// of the connection broke.
     ///
     /// # Cancel safety
@@ -1008,7 +806,7 @@ impl EngineSession {
     /// frame is being written leaves the session not intact
     /// ([`EngineSession::is_intact`]); the document stays recorded open until the
     /// frame is written, so [`EngineSession::close_open_documents`] closes it again.
-    pub async fn close(&mut self, path: &ProjectPath) -> Result<(), EngineError> {
+    pub async fn close(&mut self, path: &ProjectPath) -> Result<(), RiftError> {
         let params = DidCloseTextDocumentParams {
             text_document: TextDocumentIdentifier {
                 uri: self.document_uri(path)?,
@@ -1029,7 +827,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the engine's side of the
+    /// Returns [`RiftError`] when the session ended or the engine's side of the
     /// connection broke.
     ///
     /// # Cancel safety
@@ -1037,7 +835,7 @@ impl EngineSession {
     /// Dropping the future leaves every document not yet closed on record, so a
     /// later call closes it; one dropped while a frame is being written leaves the
     /// session not intact ([`EngineSession::is_intact`]).
-    pub async fn close_open_documents(&mut self) -> Result<(), EngineError> {
+    pub async fn close_open_documents(&mut self) -> Result<(), RiftError> {
         let open: Vec<ProjectPath> = self.open_documents.iter().cloned().collect();
         for path in &open {
             self.close(path).await?;
@@ -1056,7 +854,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when references are not advertised or the exchange breaks.
+    /// Returns [`RiftError`] when references are not advertised or the exchange breaks.
     ///
     /// # Cancel safety
     ///
@@ -1067,7 +865,7 @@ impl EngineSession {
         &mut self,
         path: &ProjectPath,
         position: Position,
-    ) -> Result<Vec<Location>, EngineError> {
+    ) -> Result<Vec<Location>, RiftError> {
         require(self.capabilities.references, References::METHOD)?;
         let params = ReferenceParams {
             text_document_position: self.position_params(path, position)?,
@@ -1089,7 +887,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when call hierarchy is not advertised or the
+    /// Returns [`RiftError`] when call hierarchy is not advertised or the
     /// exchange breaks.
     ///
     /// # Cancel safety
@@ -1101,7 +899,7 @@ impl EngineSession {
         &mut self,
         path: &ProjectPath,
         position: Position,
-    ) -> Result<Vec<CallHierarchyItem>, EngineError> {
+    ) -> Result<Vec<CallHierarchyItem>, RiftError> {
         require(
             self.capabilities.call_hierarchy,
             CallHierarchyPrepare::METHOD,
@@ -1119,7 +917,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when call hierarchy is not advertised or the
+    /// Returns [`RiftError`] when call hierarchy is not advertised or the
     /// exchange breaks.
     ///
     /// # Cancel safety
@@ -1130,7 +928,7 @@ impl EngineSession {
     pub async fn outgoing_calls(
         &mut self,
         item: CallHierarchyItem,
-    ) -> Result<Vec<CallHierarchyOutgoingCall>, EngineError> {
+    ) -> Result<Vec<CallHierarchyOutgoingCall>, RiftError> {
         require(
             self.capabilities.call_hierarchy,
             CallHierarchyOutgoingCalls::METHOD,
@@ -1164,7 +962,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended or the engine's side of
+    /// Returns [`RiftError`] when the session ended or the engine's side of
     /// the connection broke; a broken connection ends the session.
     ///
     /// # Cancel safety
@@ -1177,7 +975,7 @@ impl EngineSession {
         &mut self,
         until: Instant,
         settled: impl Fn(&Self) -> bool,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), RiftError> {
         self.refuse_ended()?;
         loop {
             let now = Instant::now();
@@ -1205,7 +1003,7 @@ impl EngineSession {
                     return Ok(());
                 }
                 Err(error) => {
-                    if error.fault().ends_session() {
+                    if ends_session(&error) {
                         self.end().await;
                     }
                     return Err(error);
@@ -1217,9 +1015,9 @@ impl EngineSession {
     /// Routes one message [`EngineSession::read_output`] read: an engine
     /// notification or request is handled here, and a response comes back
     /// unread, since it belongs to the next exchange.
-    async fn route_waited(&mut self, payload: Vec<u8>) -> Result<Option<Vec<u8>>, EngineError> {
+    async fn route_waited(&mut self, payload: Vec<u8>) -> Result<Option<Vec<u8>>, RiftError> {
         let Some(incoming) = correlation::classify(&payload) else {
-            return Err(Error::new(EngineFault::MessageUnreadable));
+            return errors::lsp::engine_message_unreadable().fail();
         };
         let Some(method) = incoming.method else {
             return Ok(Some(payload));
@@ -1239,7 +1037,7 @@ impl EngineSession {
         id: Option<Value>,
         params: Option<Value>,
         during: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), RiftError> {
         let Some(request_id) = id else {
             self.record_notification(method, params);
             return Ok(());
@@ -1257,7 +1055,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when diagnostic pulls are not advertised or
+    /// Returns [`RiftError`] when diagnostic pulls are not advertised or
     /// the exchange breaks.
     ///
     /// # Cancel safety
@@ -1269,7 +1067,7 @@ impl EngineSession {
     pub async fn pull_diagnostics(
         &mut self,
         path: &ProjectPath,
-    ) -> Result<PulledDiagnostics, EngineError> {
+    ) -> Result<PulledDiagnostics, RiftError> {
         require(
             self.capabilities.pull_diagnostics,
             DocumentDiagnosticRequest::METHOD,
@@ -1345,7 +1143,7 @@ impl EngineSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] when the session ended, a path cannot form
+    /// Returns [`RiftError`] when the session ended, a path cannot form
     /// a document URI, or the engine's connection broke.
     ///
     /// # Cancel safety
@@ -1357,7 +1155,7 @@ impl EngineSession {
     pub async fn notify_changed_paths(
         &mut self,
         paths: &[(ProjectPath, FileChangeType)],
-    ) -> Result<Vec<ProjectPath>, EngineError> {
+    ) -> Result<Vec<ProjectPath>, RiftError> {
         let matched: Vec<(ProjectPath, FileChangeType)> = paths
             .iter()
             .filter(|(path, change)| self.matches_watched_file(path, *change))
@@ -1429,11 +1227,8 @@ impl EngineSession {
         workspace_root: &Path,
         startup_timeout: Duration,
         initialization_options: Option<Value>,
-    ) -> Result<(), EngineError> {
-        let root_uri = self
-            .root
-            .root_uri()
-            .map_err(|source| Error::new(EngineFault::Document { source }))?;
+    ) -> Result<(), RiftError> {
+        let root_uri = self.root.root_uri()?;
         let folder_name = workspace_root.file_name().map_or_else(
             || "workspace".to_owned(),
             |name| name.to_string_lossy().into_owned(),
@@ -1452,13 +1247,12 @@ impl EngineSession {
         let answer = self
             .request_within::<Initialize>(params, startup_timeout)
             .await?;
-        self.capabilities = Capabilities::negotiated(&answer)
-            .map_err(|source| Error::new(EngineFault::Negotiation { source }))?;
+        self.capabilities = Capabilities::negotiated(&answer)?;
         self.notify::<Initialized>(&InitializedParams {}).await
     }
 
     /// Sends one request and reads until its response, under the timeout.
-    async fn request<R: Request>(&mut self, params: R::Params) -> Result<R::Result, EngineError> {
+    async fn request<R: Request>(&mut self, params: R::Params) -> Result<R::Result, RiftError> {
         self.request_within::<R>(params, self.request_timeout).await
     }
 
@@ -1471,34 +1265,31 @@ impl EngineSession {
         &mut self,
         params: R::Params,
         timeout: Duration,
-    ) -> Result<R::Result, EngineError> {
+    ) -> Result<R::Result, RiftError> {
         self.refuse_ended()?;
         self.empty_answers.forget();
-        let id = self
-            .correlation
-            .begin(R::METHOD)
-            .map_err(|source| Error::new(EngineFault::Correlation { source }))?;
+        let id = self.correlation.begin(R::METHOD)?;
         let value = serde_json::to_value(params).map_err(|source| {
-            Error::new(EngineFault::ResultInvalid {
-                method: R::METHOD.to_owned(),
-                source,
-            })
+            errors::lsp::engine_result_invalid()
+                .method(R::METHOD)
+                .source(source)
+                .error()
         })?;
         let payload = correlation::request(id, R::METHOD, &value);
         match tokio::time::timeout(timeout, self.exchange::<R>(id, payload)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => {
-                if error.fault().ends_session() {
+                if ends_session(&error) {
                     self.end().await;
                 }
                 Err(error)
             }
             Err(_elapsed) => {
                 self.end().await;
-                Err(Error::new(EngineFault::TimedOut {
-                    method: R::METHOD.to_owned(),
-                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                }))
+                errors::lsp::engine_timed_out()
+                    .method(R::METHOD)
+                    .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
+                    .fail()
             }
         }
     }
@@ -1514,12 +1305,12 @@ impl EngineSession {
         &mut self,
         id: RequestId,
         payload: Vec<u8>,
-    ) -> Result<R::Result, EngineError> {
+    ) -> Result<R::Result, RiftError> {
         self.write_payload(payload, R::METHOD).await?;
         loop {
             let payload = self.next_payload(R::METHOD).await?;
             let Some(incoming) = correlation::classify(&payload) else {
-                return Err(Error::new(EngineFault::MessageUnreadable));
+                return errors::lsp::engine_message_unreadable().fail();
             };
             if let Some(method) = incoming.method {
                 self.route_unrequested(&method, incoming.id, incoming.params, R::METHOD)
@@ -1527,27 +1318,35 @@ impl EngineSession {
                 continue;
             }
             let response_id = incoming.id.unwrap_or(Value::Null);
-            let method = self
-                .correlation
-                .conclude(&response_id)
-                .map_err(|source| Error::new(EngineFault::Correlation { source }))?;
+            let method = self.correlation.conclude(&response_id)?;
             if response_id.as_u64() != Some(id.value()) {
                 // The settled response answers a cancelled call; discard it.
                 continue;
             }
             if let Some(refusal) = incoming.error {
-                return Err(Error::new(EngineFault::Refused {
-                    method: method.to_owned(),
-                    code: refusal.code,
-                    message: refusal.message,
-                }));
+                let code = refusal.code;
+                let method = method.to_owned();
+                let message = refusal.message;
+                if RETRYABLE_REFUSAL_CODES.contains(&code) {
+                    return errors::lsp::engine_refused_retryable()
+                        .method(method)
+                        .code(code)
+                        .message(message)
+                        .fail();
+                } else {
+                    return errors::lsp::engine_refused_terminal()
+                        .method(method)
+                        .code(code)
+                        .message(message)
+                        .fail();
+                }
             }
             let result = incoming.result.unwrap_or(Value::Null);
             return serde_json::from_value(result).map_err(|source| {
-                Error::new(EngineFault::ResultInvalid {
-                    method: method.to_owned(),
-                    source,
-                })
+                errors::lsp::engine_result_invalid()
+                    .method(method)
+                    .source(source)
+                    .error()
             });
         }
     }
@@ -1556,24 +1355,24 @@ impl EngineSession {
     ///
     /// The request timeout bounds the write, so a non-reading engine
     /// cannot stall the session.
-    async fn notify<N: Notification>(&mut self, params: &N::Params) -> Result<(), EngineError> {
+    async fn notify<N: Notification>(&mut self, params: &N::Params) -> Result<(), RiftError> {
         self.refuse_ended()?;
         self.empty_answers.forget();
         let value = serde_json::to_value(params).map_err(|source| {
-            Error::new(EngineFault::ResultInvalid {
-                method: N::METHOD.to_owned(),
-                source,
-            })
+            errors::lsp::engine_result_invalid()
+                .method(N::METHOD)
+                .source(source)
+                .error()
         })?;
         let payload = correlation::notification(N::METHOD, &value);
         let timeout = self.request_timeout;
         let sent = match tokio::time::timeout(timeout, self.write_payload(payload, N::METHOD)).await
         {
             Ok(written) => written,
-            Err(_elapsed) => Err(Error::new(EngineFault::TimedOut {
-                method: N::METHOD.to_owned(),
-                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-            })),
+            Err(_elapsed) => errors::lsp::engine_timed_out()
+                .method(N::METHOD)
+                .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
+                .fail(),
         };
         if sent.is_err() {
             self.end().await;
@@ -1586,27 +1385,24 @@ impl EngineSession {
     /// Each iteration either returns a queued message or reads at least one
     /// byte; the framing bounds refuse unbounded buffering and the caller's
     /// timeout bounds the wall clock.
-    async fn next_payload(&mut self, method: &str) -> Result<Vec<u8>, EngineError> {
+    async fn next_payload(&mut self, method: &str) -> Result<Vec<u8>, RiftError> {
         loop {
             if let Some(payload) = self.queue.pop_front() {
                 return Ok(payload);
             }
             let mut chunk = [0_u8; STREAM_READ_BYTES];
             let read = self.stdout.read(&mut chunk).await.map_err(|_| {
-                Error::new(EngineFault::ConnectionClosed {
-                    method: method.to_owned(),
-                })
+                errors::lsp::engine_connection_closed()
+                    .method(method)
+                    .error()
             })?;
             if read == 0 {
-                return Err(Error::new(EngineFault::ConnectionClosed {
-                    method: method.to_owned(),
-                }));
+                return errors::lsp::engine_connection_closed()
+                    .method(method)
+                    .fail();
             }
             self.progress.read(Instant::now());
-            let messages = self
-                .framing
-                .feed(&chunk[..read])
-                .map_err(|source| Error::new(EngineFault::Framing { source }))?;
+            let messages = self.framing.feed(&chunk[..read])?;
             self.queue.extend(messages);
         }
     }
@@ -1618,11 +1414,11 @@ impl EngineSession {
     /// intact ([`EngineSession::is_intact`]): the engine may hold part of the frame,
     /// and its framing would read the next frame's bytes as the rest of this one. A
     /// failed write leaves the frame in flight too, and the caller ends the session.
-    async fn write_payload(&mut self, payload: Vec<u8>, method: &str) -> Result<(), EngineError> {
+    async fn write_payload(&mut self, payload: Vec<u8>, method: &str) -> Result<(), RiftError> {
         let closed = || {
-            Error::new(EngineFault::ConnectionClosed {
-                method: method.to_owned(),
-            })
+            errors::lsp::engine_connection_closed()
+                .method(method)
+                .error()
         };
         let framed = Framing::frame(&payload);
         self.frame_in_flight = true;
@@ -1743,11 +1539,9 @@ impl EngineSession {
         }
     }
 
-    /// The file URI for one project path, as an engine fault on refusal.
-    fn document_uri(&self, path: &ProjectPath) -> Result<lsp_types::Uri, EngineError> {
-        self.root
-            .document_uri(path)
-            .map_err(|source| Error::new(EngineFault::Document { source }))
+    /// The file URI for one project path, as an engine error on refusal.
+    fn document_uri(&self, path: &ProjectPath) -> Result<lsp_types::Uri, RiftError> {
+        self.root.document_uri(path)
     }
 
     /// The document-and-position parameters for one addressed position.
@@ -1755,7 +1549,7 @@ impl EngineSession {
         &self,
         path: &ProjectPath,
         position: Position,
-    ) -> Result<TextDocumentPositionParams, EngineError> {
+    ) -> Result<TextDocumentPositionParams, RiftError> {
         Ok(TextDocumentPositionParams {
             text_document: TextDocumentIdentifier {
                 uri: self.document_uri(path)?,
@@ -1765,9 +1559,9 @@ impl EngineSession {
     }
 
     /// Refuses every operation after the engine was killed.
-    fn refuse_ended(&self) -> Result<(), EngineError> {
+    fn refuse_ended(&self) -> Result<(), RiftError> {
         if self.ended {
-            Err(Error::new(EngineFault::Ended))
+            errors::lsp::engine_ended().fail()
         } else {
             Ok(())
         }
@@ -1784,7 +1578,7 @@ impl EngineSession {
         self.ended = true;
         if let Some(child) = self.child.as_mut() {
             // A kill on an already-exited child only re-observes it; the
-            // result carries nothing actionable beyond the fault in flight.
+            // result carries nothing actionable beyond the error in flight.
             let _ = child.kill().await;
         }
     }
@@ -1832,13 +1626,13 @@ fn glob_pattern_matches(pattern: &GlobPattern, path: &str) -> bool {
 }
 
 /// Refuses the operation when the engine was advertised without it.
-fn require(served: bool, capability: &str) -> Result<(), EngineError> {
+fn require(served: bool, capability: &str) -> Result<(), RiftError> {
     if served {
         Ok(())
     } else {
-        Err(Error::new(EngineFault::CapabilityAbsent {
-            capability: capability.to_owned(),
-        }))
+        errors::lsp::engine_capability_absent()
+            .capability(capability)
+            .fail()
     }
 }
 
@@ -1846,14 +1640,14 @@ fn require(served: bool, capability: &str) -> Result<(), EngineError> {
 ///
 /// "Absolute" is what configuration acceptance refuses, on every platform: a
 /// `/` root, a backslash, or a drive prefix.
-fn refuse_program(program: &str) -> Result<(), EngineError> {
+fn refuse_program(program: &str) -> Result<(), RiftError> {
     if program.is_empty() {
-        return Err(Error::new(EngineFault::ProgramEmpty));
+        return errors::lsp::engine_program_empty().fail();
     }
     if rift_core::is_absolute_program(program) {
-        return Err(Error::new(EngineFault::ProgramAbsolute {
-            program: program.to_owned(),
-        }));
+        return errors::lsp::engine_program_absolute()
+            .program(program)
+            .fail();
     }
     Ok(())
 }
@@ -1933,16 +1727,14 @@ mod tests {
     #[test]
     fn program_refusals_name_invalid_executables() {
         let empty = refuse_program("").expect_err("empty program");
-        assert!(matches!(empty.fault(), EngineFault::ProgramEmpty));
-        assert_eq!(
-            empty.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-        );
+        assert_eq!(empty.slug(), errors::lsp::engine_program_empty::SLUG);
         let absolute = refuse_program("/usr/bin/engine").expect_err("absolute program");
-        assert!(matches!(
-            absolute.fault(),
-            EngineFault::ProgramAbsolute { program } if program == "/usr/bin/engine"
-        ));
+        assert_eq!(absolute.slug(), errors::lsp::engine_program_absolute::SLUG);
+        assert!(
+            absolute
+                .context()
+                .any(|(key, value)| key == "program" && value == "/usr/bin/engine")
+        );
         refuse_program("engine").expect("bare names are accepted");
     }
 
@@ -1967,233 +1759,60 @@ mod tests {
         );
     }
 
-    use crate::capabilities::CapabilitiesFault;
-    use crate::correlation::CorrelationFault;
-    use crate::framing::FramingFault;
-    use crate::uri::UriFault;
+    #[test]
+    fn engine_errors_keep_registered_identity_and_sources() {
+        let launch = errors::lsp::engine_launch_failed()
+            .source(std::io::Error::other("spawn torn down"))
+            .error();
+        assert_eq!(launch.slug(), errors::lsp::engine_launch_failed::SLUG);
+        assert!(std::error::Error::source(&launch).is_some());
 
-    /// One row per fault variant: the fault, its classification, whether it
-    /// ends the session, and evidence its render must name.
-    #[expect(clippy::too_many_lines, reason = "one data row per fault variant")]
-    fn engine_fault_rows() -> Vec<(EngineFault, ErrorCode, bool, &'static str)> {
-        vec![
-            (
-                EngineFault::ProgramEmpty,
-                ErrorCode::ConfigurationInvalid,
-                false,
-                "program_empty",
-            ),
-            (
-                EngineFault::ProgramAbsolute {
-                    program: "/usr/bin/engine".to_owned(),
-                },
-                ErrorCode::ConfigurationInvalid,
-                false,
-                "/usr/bin/engine",
-            ),
-            (
-                EngineFault::LaunchFailed {
-                    source: std::io::Error::other("spawn torn down"),
-                },
-                ErrorCode::CapabilityUnavailable,
-                false,
-                "launch_failed",
-            ),
-            (
-                EngineFault::ConnectionClosed {
-                    method: "textDocument/references".to_owned(),
-                },
-                ErrorCode::TemporarilyUnavailable,
-                true,
-                "textDocument/references",
-            ),
-            (
-                EngineFault::TimedOut {
-                    method: "initialize".to_owned(),
-                    timeout_ms: 300,
-                },
-                ErrorCode::TemporarilyUnavailable,
-                true,
-                "timeout_ms 300",
-            ),
-            (
-                EngineFault::MessageUnreadable,
-                ErrorCode::CapabilityUnavailable,
-                true,
-                "fault",
-            ),
-            (
-                EngineFault::Framing {
-                    source: Error::new(FramingFault::HeaderMalformed),
-                },
-                ErrorCode::CapabilityUnavailable,
-                true,
-                "header_malformed",
-            ),
-            (
-                EngineFault::Correlation {
-                    source: Error::new(CorrelationFault::ResponseUnknown { id: "7".to_owned() }),
-                },
-                ErrorCode::CapabilityUnavailable,
-                true,
-                "response_unknown",
-            ),
-            (
-                EngineFault::Negotiation {
-                    source: Error::new(CapabilitiesFault::PositionEncodingUnsupported {
-                        encoding: "utf-32".to_owned(),
-                    }),
-                },
-                ErrorCode::CapabilityUnavailable,
-                false,
-                "utf-32",
-            ),
-            (
-                EngineFault::Document {
-                    source: Error::new(UriFault::OutsideRoot),
-                },
-                ErrorCode::PermissionDenied,
-                false,
-                "outside_root",
-            ),
-            (
-                EngineFault::Refused {
-                    method: "textDocument/references".to_owned(),
-                    code: -32602,
-                    message: "not an identifier".to_owned(),
-                },
-                ErrorCode::InvalidRequest,
-                false,
-                "not an identifier",
-            ),
-            (
-                EngineFault::Refused {
-                    method: "textDocument/diagnostic".to_owned(),
-                    code: SERVER_CANCELLED,
-                    message: "server cancelled the request".to_owned(),
-                },
-                ErrorCode::TemporarilyUnavailable,
-                false,
-                "server cancelled the request",
-            ),
-            (
-                EngineFault::ResultInvalid {
-                    method: "shutdown".to_owned(),
-                    source: serde_json::from_value::<u64>(Value::Null).expect_err("typed"),
-                },
-                ErrorCode::CapabilityUnavailable,
-                false,
-                "shutdown",
-            ),
-            (
-                EngineFault::CapabilityAbsent {
-                    capability: "textDocument/diagnostic".to_owned(),
-                },
-                ErrorCode::CapabilityUnavailable,
-                false,
-                "textDocument/diagnostic",
-            ),
-            (
-                EngineFault::Analyzing { attempts: 8 },
-                ErrorCode::TemporarilyUnavailable,
-                false,
-                "attempts 8",
-            ),
-            (
-                EngineFault::Ended,
-                ErrorCode::TemporarilyUnavailable,
-                false,
-                "ended",
-            ),
-        ]
+        let child = errors::lsp::framing_header_malformed().error();
+        assert_eq!(child.slug(), errors::lsp::framing_header_malformed::SLUG);
+
+        let timeout = errors::lsp::engine_timed_out()
+            .method("initialize")
+            .timeout_ms(300_u64)
+            .error();
+        assert!(ends_session(&timeout));
+        assert_ne!(timeout.slug(), errors::lsp::engine_refused_retryable::SLUG);
+        assert_ne!(timeout.slug(), errors::lsp::engine_refused_terminal::SLUG);
     }
 
     #[test]
-    fn engine_faults_classify_and_render_their_evidence() {
-        for (fault, code, ends, evidence) in engine_fault_rows() {
-            assert_eq!(fault.ends_session(), ends, "{fault:?}");
-            let error = Error::new(fault);
-            assert_eq!(error.name(), ErrorName::Wire(code), "{error:?}");
-            let rendered = error.to_string();
-            assert!(rendered.contains(evidence), "{rendered}");
-        }
-    }
-
-    #[test]
-    fn engine_faults_expose_their_sources() {
-        let sourced = [
-            Error::new(EngineFault::LaunchFailed {
-                source: std::io::Error::other("spawn torn down"),
-            }),
-            Error::new(EngineFault::Framing {
-                source: Error::new(FramingFault::HeaderMalformed),
-            }),
-            Error::new(EngineFault::Correlation {
-                source: Error::new(CorrelationFault::PendingRequestsExceeded),
-            }),
-            Error::new(EngineFault::Negotiation {
-                source: Error::new(CapabilitiesFault::PositionEncodingUnsupported {
-                    encoding: "utf-32".to_owned(),
-                }),
-            }),
-            Error::new(EngineFault::Document {
-                source: Error::new(UriFault::OutsideRoot),
-            }),
-            Error::new(EngineFault::ResultInvalid {
-                method: "shutdown".to_owned(),
-                source: serde_json::from_value::<u64>(Value::Null).expect_err("typed"),
-            }),
-        ];
-        for error in &sourced {
-            assert!(std::error::Error::source(error).is_some(), "{error:?}");
-        }
-        assert!(std::error::Error::source(&Error::new(EngineFault::Ended)).is_none());
-    }
-
-    #[test]
-    fn refusal_codes_decide_the_retry_verdict_and_the_wire_code() {
-        let rows = [
+    fn refusal_code_selects_registered_retry_behavior() {
+        for (code, retryable) in [
             (SERVER_CANCELLED, true),
             (CONTENT_MODIFIED, true),
             (lsp_types::error_codes::REQUEST_CANCELLED, false),
             (METHOD_NOT_FOUND_CODE, false),
             (1, false),
-        ];
-        for (code, retryable) in rows {
-            let fault = EngineFault::Refused {
-                method: "textDocument/diagnostic".to_owned(),
-                code,
-                message: "engine words".to_owned(),
-            };
-            assert_eq!(fault.is_retryable_refusal(), retryable, "code {code}");
-            let expected = if retryable {
-                ErrorCode::TemporarilyUnavailable
+        ] {
+            let error = if retryable {
+                errors::lsp::engine_refused_retryable()
+                    .method("textDocument/diagnostic")
+                    .code(code)
+                    .message("engine words")
+                    .error()
             } else {
-                ErrorCode::InvalidRequest
+                errors::lsp::engine_refused_terminal()
+                    .method("textDocument/diagnostic")
+                    .code(code)
+                    .message("engine words")
+                    .error()
             };
+            assert!(
+                error.slug() == errors::lsp::engine_refused_retryable::SLUG
+                    || error.slug() == errors::lsp::engine_refused_terminal::SLUG
+            );
             assert_eq!(
-                Error::new(fault).name(),
-                ErrorName::Wire(expected),
-                "code {code}"
+                error.slug() == errors::lsp::engine_refused_retryable::SLUG,
+                retryable
             );
         }
-        assert!(
-            !EngineFault::Ended.is_retryable_refusal(),
-            "a fault that is not a refusal is never a retryable refusal"
-        );
-        assert!(
-            !EngineFault::Ended.is_refusal(),
-            "a fault the engine never answered is not its reply"
-        );
-        assert!(
-            EngineFault::Refused {
-                method: "textDocument/references".to_owned(),
-                code: -32602,
-                message: "No references found at position".to_owned(),
-            }
-            .is_refusal(),
-            "a verdict the engine answered is still its reply"
-        );
+        let ended = errors::lsp::engine_ended().error();
+        assert_ne!(ended.slug(), errors::lsp::engine_refused_retryable::SLUG);
+        assert_ne!(ended.slug(), errors::lsp::engine_refused_terminal::SLUG);
     }
 
     #[test]

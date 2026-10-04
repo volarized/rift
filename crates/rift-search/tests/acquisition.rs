@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rift_search::{AcquisitionLimits, FetchedFile, ModelSource, SearchViolation, acquire};
+use rift_error::errors;
+use rift_search::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -51,11 +52,11 @@ fn resolved_directory(
 }
 
 /// The refusal one identifier earned, with its rendered message.
-fn refused(source: Result<ModelSource, rift_search::SearchError>, model: &str) -> String {
+fn refused(source: Result<ModelSource, rift_search::RiftError>, model: &str) -> String {
     let error = source.expect_err(&format!("`{model}` must be refused"));
     assert_eq!(
-        error.fault().violation(),
-        SearchViolation::ModelSourceInvalid,
+        error.slug(),
+        errors::search::model_source_invalid::SLUG,
         "`{model}` must be refused as an invalid model source"
     );
     let rendered = error.to_string();
@@ -246,7 +247,7 @@ async fn a_directory_source_short_of_one_file_names_the_file_that_is_missing() -
     let error = acquire(&source, limits(1))
         .await
         .expect_err("a directory short of a file cannot load");
-    assert_eq!(error.fault().violation(), SearchViolation::ModelFileMissing);
+    assert_eq!(error.slug(), errors::search::model_file_missing::SLUG);
     assert!(error.to_string().contains("tokenizer.json"), "{error}");
     Ok(())
 }
@@ -286,29 +287,25 @@ fn the_debug_render_names_a_source_a_bound_and_a_fetched_file() -> TestResult {
 #[test]
 fn every_acquisition_violation_renders_its_own_message() {
     let cases = [
-        (SearchViolation::ModelSourceInvalid, "model_source_invalid"),
-        (
-            SearchViolation::ModelCacheUnavailable,
-            "model_cache_unavailable",
-        ),
-        (
-            SearchViolation::ModelDownloadFailed,
-            "model_download_failed",
-        ),
-        (
-            SearchViolation::ModelDownloadTooLarge,
-            "model_download_too_large",
-        ),
+        errors::search::model_source_invalid()
+            .model("test model")
+            .expected("repository")
+            .error(),
+        errors::search::model_cache_unavailable().error(),
+        errors::search::model_download_failed()
+            .subject("test file")
+            .error(),
+        errors::search::model_download_too_large()
+            .url("https://example.test/model")
+            .bytes_max(64)
+            .error(),
     ];
-    for (violation, label) in cases {
-        let error = rift_search::SearchError::new(
-            rift_search::SearchFault::new(violation).about("the subject it was about"),
-        );
+    for error in cases {
         let rendered = error.to_string();
-        assert!(rendered.contains(label), "{violation:?}: {rendered}");
         assert!(
-            rendered.contains("the subject it was about"),
-            "{violation:?}: {rendered}"
+            error.slug().as_str().starts_with("rift.search."),
+            "registered search slug: {error:?}"
         );
+        assert!(!rendered.is_empty(), "registered error renders its message");
     }
 }

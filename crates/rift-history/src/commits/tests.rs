@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::Path;
 
+use crate::Repository;
 use crate::fixture::{commit_all, git, init};
-use crate::{HistoryFault, Repository};
+use rift_error::errors;
 
 fn write(root: &Path, path: &str, text: &str) {
     let path = root.join(path);
@@ -181,12 +182,14 @@ fn tagged_commits_peel_annotated_tags_and_refuse_past_the_bound() {
     let refused = repository
         .tagged_commits(1)
         .expect_err("two tags exceed a bound of one");
-    assert!(matches!(
-        refused.fault(),
-        HistoryFault::TooManyTags { tags_max: 1 }
-    ));
+    assert_eq!(refused.slug(), errors::history::too_many_tags::SLUG);
+    assert!(
+        refused
+            .context()
+            .any(|(key, value)| key == "tags_max" && value == "1")
+    );
     let rendered = refused.to_string();
-    assert!(rendered.contains("tags_max 1"), "{rendered}");
+    assert!(rendered.contains("accepted limit 1"), "{rendered}");
 }
 
 #[test]

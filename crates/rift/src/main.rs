@@ -268,20 +268,20 @@ fn reevaluated<S>(filter: impl Filter<S>) -> impl Filter<S> {
 
 #[derive(Debug)]
 enum CliError {
-    Mcp(rift_mcp::ProxyServeError),
-    Server(server::ServerCommandError),
-    Update(update::UpdateError),
-    Install(install::InstallError),
+    Mcp(rift_mcp::McpFailure),
+    Server(rift_error::RiftError),
+    Update(rift_error::RiftError),
+    Install(rift_error::RiftError),
 }
 
 impl CliError {
-    /// Returns canonical registry metadata from the wrapped failure.
-    fn descriptor(&self) -> rift_core::ErrorDescriptor {
+    /// Returns stable command code for operator output.
+    fn code(&self) -> String {
         match self {
-            Self::Mcp(error) => error.descriptor(),
-            Self::Server(error) => error.descriptor(),
-            Self::Update(error) => error.descriptor(),
-            Self::Install(error) => error.descriptor(),
+            Self::Mcp(error) => rift_mcp::wire_code_for_slug(error.slug().as_str())
+                .unwrap_or_else(|| error.slug().as_str().to_owned()),
+            Self::Update(error) => cli_code(error),
+            Self::Server(error) | Self::Install(error) => cli_code(error),
         }
     }
 
@@ -290,19 +290,67 @@ impl CliError {
     ///
     /// The outer line names what was refused; the causes name why, down to
     /// the store's or the provider's own words. The walk is bounded by
-    /// [`rift_core::CAUSE_DEPTH_MAX`].
+    /// [`rift_error::CAUSE_DEPTH_MAX`].
     fn rendered(&self) -> String {
         use std::fmt::Write as _;
 
-        let mut rendered = format!(
-            "rift: error[{code}]: {self}\n",
-            code = self.descriptor().code()
-        );
-        for cause in rift_core::causes(self) {
+        let mut rendered = format!("rift: error[{code}]: {self}\n", code = self.code());
+        for cause in rift_error::causes(self) {
             let _ = writeln!(rendered, "  caused by: {cause}");
         }
         rendered
     }
+}
+
+fn cli_code(error: &rift_error::RiftError) -> String {
+    match error.slug().as_str() {
+        "rift.cli.server_already_serving" => "server_already_serving",
+        "rift.cli.server_spawn_failed" | "rift.cli.server_start_exited" => "server_start_failed",
+        "rift.cli.server_start_timed_out" => "server_start_timed_out",
+        "rift.cli.server_election_unreleased"
+        | "rift.cli.server_stop_request_failed"
+        | "rift.cli.server_stop_refused"
+        | "rift.cli.server_stop_timed_out" => "server_stop_failed",
+        "rift.cli.server_logs_unavailable" => "server_logs_unavailable",
+        "rift.cli.install_home_unresolved" => "install_home_unresolved",
+        "rift.cli.install_template_missing_tool" => "install_template_missing_tool",
+        "rift.cli.install_write_failed" => "install_write_failed",
+        "rift.cli.install_remove_failed" => "install_remove_failed",
+        "rift.cli.install_settings_unparsable" => "install_settings_unparsable",
+        "rift.cli.update_binary_invalid" => "update_binary_invalid",
+        "rift.cli.update_version_invalid" => "update_release_invalid",
+        "rift.cli.update_staging_failed" => "update_staging_failed",
+        "rift.cli.update_release_tag_invalid"
+        | "rift.cli.update_prerelease_unsupported"
+        | "rift.cli.update_release_file_inspection_failed"
+        | "rift.cli.update_release_file_not_regular"
+        | "rift.cli.update_release_file_size_invalid"
+        | "rift.cli.update_release_metadata_invalid" => "update_release_invalid",
+        "rift.cli.update_checksum_mismatch"
+        | "rift.cli.update_checksum_manifest_invalid"
+        | "rift.cli.update_checksum_read_failed" => "update_checksum_mismatch",
+        "rift.cli.update_download_failed" | "rift.cli.update_download_too_large" => {
+            "update_download_failed"
+        }
+        "rift.cli.update_archive_file_inspection_failed"
+        | "rift.cli.update_archive_file_not_regular"
+        | "rift.cli.update_archive_file_size_invalid"
+        | "rift.cli.update_archive_member_too_large"
+        | "rift.cli.update_archive_contents_invalid"
+        | "rift.cli.update_archive_extraction_failed" => "update_archive_invalid",
+        "rift.cli.update_publish_copy_failed"
+        | "rift.cli.update_publish_pending_cleanup"
+        | "rift.cli.update_publish_parent_missing"
+        | "rift.cli.update_publish_failed" => "update_publish_failed",
+        "rift.cli.update_rollback_failed" | "rift.cli.update_rollback_cleanup_failed" => {
+            "update_rollback_failed"
+        }
+        _ => {
+            return rift_mcp::wire_code_for_slug(error.slug().as_str())
+                .unwrap_or_else(|| error.slug().as_str().to_owned());
+        }
+    }
+    .to_owned()
 }
 
 impl fmt::Display for CliError {
@@ -422,7 +470,9 @@ mod tests {
 
     #[test]
     fn mcp_cli_error_preserves_message_and_source() {
-        let error = CliError::Mcp(rift_core::Error::new(rift_mcp::ProxyFault::UnexpectedQuit));
+        let error = CliError::Mcp(rift_mcp::McpFailure::new(
+            rift_error::errors::mcp::proxy_unexpected_quit().error(),
+        ));
         assert!(
             error.to_string().contains("MCP service ended unexpectedly"),
             "{error}"
@@ -441,27 +491,30 @@ mod tests {
     }
 
     #[test]
-    fn install_cli_error_preserves_message_source_and_descriptor() {
-        let install = rift_core::Error::new(super::install::InstallFault::HomeDirectoryUnresolved);
-        let code = install.descriptor().code();
-        assert_eq!(code, "install_home_unresolved");
+    fn install_cli_error_preserves_message_source_and_code() {
+        let install = rift_error::errors::cli::install_home_unresolved()
+            .checked("HOME, USERPROFILE")
+            .error();
+        let code = install.slug();
+        assert_eq!(code, rift_error::errors::cli::install_home_unresolved::SLUG);
         let error = CliError::Install(install);
-        assert_eq!(error.descriptor().code(), code);
+        assert_eq!(error.code(), "install_home_unresolved");
         assert!(error.to_string().contains("USERPROFILE"), "{error}");
         assert!(error.source().is_some());
     }
 
     #[test]
-    fn cli_error_descriptor_matches_wrapped_error() {
+    fn cli_error_code_matches_wrapped_legacy_errors() {
         let update = super::update::error_for_test();
-        let update_code = update.descriptor().code();
+        let update_code = cli_code(&update);
         assert!(!update_code.is_empty());
-        assert_eq!(CliError::Update(update).descriptor().code(), update_code);
+        assert_eq!(CliError::Update(update).code(), update_code);
 
-        let mcp = rift_core::Error::new(rift_mcp::ProxyFault::UnexpectedQuit);
-        let mcp_code = mcp.descriptor().code();
+        let mcp =
+            rift_mcp::McpFailure::new(rift_error::errors::mcp::proxy_unexpected_quit().error());
+        let mcp_code = rift_mcp::wire_code_for_slug(mcp.slug().as_str()).unwrap();
         assert!(!mcp_code.is_empty());
-        assert_eq!(CliError::Mcp(mcp).descriptor().code(), mcp_code);
+        assert_eq!(CliError::Mcp(mcp).code(), mcp_code);
     }
 
     #[test]
@@ -720,8 +773,12 @@ mod tests {
 
     #[test]
     fn server_cli_error_preserves_registry_identity() {
-        let error = CliError::Server(super::server::error_for_test());
-        assert_eq!(error.descriptor().code(), "server_start_timed_out");
+        let error = CliError::Server(
+            rift_error::errors::cli::server_start_timed_out()
+                .waited(rift_mcp::START_WAIT_MAX)
+                .error(),
+        );
+        assert_eq!(error.code(), "server_start_timed_out");
         assert!(error.to_string().contains("--foreground"));
         assert!(error.source().is_some());
     }
@@ -730,13 +787,12 @@ mod tests {
     /// the chain below the registry line starts at the first cause that says more.
     #[test]
     fn a_rendered_error_prints_each_cause_on_its_own_line() {
-        let inner = std::io::Error::other("the disk is full");
-        let election = rift_core::Error::new(rift_mcp::ElectionFault::Storage {
-            operation: "publish lock document",
-            path: std::path::PathBuf::from("/workspace/.rift/server.json"),
-            source: inner,
-        });
-        let error = CliError::Server(super::server::election_error_for_test(election));
+        let election = rift_error::errors::mcp::election_storage_failed()
+            .operation("publish lock document")
+            .path("/workspace/.rift/server.json")
+            .source(std::io::Error::other("the disk is full"))
+            .error();
+        let error = CliError::Server(election);
 
         let rendered = error.rendered();
 

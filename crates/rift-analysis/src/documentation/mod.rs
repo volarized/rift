@@ -7,7 +7,7 @@ mod collect_tests;
 mod context;
 #[cfg(all(test, feature = "collector"))]
 mod coverage_tests;
-mod failure;
+pub(crate) mod failure;
 mod identity;
 mod input;
 mod links;
@@ -21,7 +21,7 @@ mod resolution;
 #[cfg(feature = "collector")]
 mod rst;
 
-pub use failure::{DocumentationError, DocumentationFault, DocumentationViolation};
+pub use failure::DocumentationViolation;
 pub use input::{DocumentationInput, DocumentationSourceSet, check_documentation_source_count};
 pub use links::{DocumentationFragment, linked_blocks, resolve_links};
 pub use projection::{

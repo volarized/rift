@@ -17,12 +17,10 @@ use rift_core::constants::RIFT_STATE_DIRECTORY;
 use tempfile::NamedTempFile;
 
 use crate::change_set::FileDigest;
-use crate::workspace::{
-    WorkspaceIndexError, WorkspaceIndexLimits, WorkspaceIndexViolation, index_error_caused_by,
-    metadata_is_executable, read_file_bytes,
-};
+use crate::workspace::{WorkspaceIndexLimits, metadata_is_executable, read_file_bytes};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::sys::statfs::statfs;
+use rift_error::{RiftError, errors};
 #[cfg(not(unix))]
 use same_file::Handle;
 
@@ -274,7 +272,7 @@ pub(crate) fn capture_path(
     last: &LastCapture,
     boundary: Option<CaptureBoundary>,
     root_identity: Option<(u64, u64)>,
-) -> Result<(CapturedPath, bool), WorkspaceIndexError> {
+) -> Result<(CapturedPath, bool), RiftError> {
     capture_path_with(path, limits, last, boundary, root_identity, || {})
 }
 
@@ -285,18 +283,8 @@ fn capture_path_with(
     boundary: Option<CaptureBoundary>,
     root_identity: Option<(u64, u64)>,
     before_open: impl FnOnce(),
-) -> Result<(CapturedPath, bool), WorkspaceIndexError> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            index_error_caused_by(
-                WorkspaceIndexViolation::ChangedDuringCapture,
-                Some(path),
-                error,
-            )
-        } else {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-        }
-    })?;
+) -> Result<(CapturedPath, bool), RiftError> {
+    let metadata = fs::metadata(path).map_err(|error| capture_io_error(path, error))?;
     let stat = FileStat::of(&metadata);
     if let Some(captured) = last.reusable(path, stat, limits, boundary, root_identity) {
         return Ok((captured, false));
@@ -389,7 +377,7 @@ impl CapturedFile {
         path: &Path,
         limits: WorkspaceIndexLimits,
         boundary: Option<CaptureBoundary>,
-    ) -> Result<CapturedPath, WorkspaceIndexError> {
+    ) -> Result<CapturedPath, RiftError> {
         Self::read_with(path, limits, boundary, || {})
     }
 
@@ -399,61 +387,45 @@ impl CapturedFile {
         limits: WorkspaceIndexLimits,
         boundary: Option<CaptureBoundary>,
         after_read: impl FnOnce(),
-    ) -> Result<CapturedPath, WorkspaceIndexError> {
-        let handle = fs::File::open(path).map_err(|error| {
-            let violation = if error.kind() == std::io::ErrorKind::NotFound {
-                WorkspaceIndexViolation::ChangedDuringCapture
-            } else {
-                WorkspaceIndexViolation::Filesystem
-            };
-            index_error_caused_by(violation, Some(path), error)
-        })?;
+    ) -> Result<CapturedPath, RiftError> {
+        let handle = fs::File::open(path).map_err(|error| capture_io_error(path, error))?;
         let metadata = handle.metadata().map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+            errors::index::workspace_filesystem()
+                .path(path)
+                .source(error)
+                .error()
         })?;
         let stat = FileStat::of(&metadata);
         #[cfg(not(unix))]
         let held_identity = Handle::from_file(handle.try_clone().map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+            errors::index::workspace_filesystem()
+                .path(path)
+                .source(error)
+                .error()
         })?)
         .map_err(|error| {
-            index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
+            errors::index::workspace_filesystem()
+                .path(path)
+                .source(error)
+                .error()
         })?;
         let bytes = read_file_bytes(handle, path, limits)?;
         after_read();
         #[cfg(not(unix))]
         {
-            let named_identity = Handle::from_path(path).map_err(|error| {
-                let violation = if error.kind() == std::io::ErrorKind::NotFound {
-                    WorkspaceIndexViolation::ChangedDuringCapture
-                } else {
-                    WorkspaceIndexViolation::Filesystem
-                };
-                index_error_caused_by(violation, Some(path), error)
-            })?;
+            let named_identity =
+                Handle::from_path(path).map_err(|error| capture_io_error(path, error))?;
             if held_identity != named_identity {
-                return Err(crate::workspace::index_error_at(
-                    WorkspaceIndexViolation::ChangedDuringCapture,
-                    path,
-                ));
+                return errors::index::workspace_changed_during_capture()
+                    .path(path)
+                    .fail();
             }
         }
-        let after_path = fs::metadata(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                index_error_caused_by(
-                    WorkspaceIndexViolation::ChangedDuringCapture,
-                    Some(path),
-                    error,
-                )
-            } else {
-                index_error_caused_by(WorkspaceIndexViolation::Filesystem, Some(path), error)
-            }
-        })?;
+        let after_path = fs::metadata(path).map_err(|error| capture_io_error(path, error))?;
         if FileStat::of(&after_path) != stat {
-            return Err(crate::workspace::index_error_at(
-                WorkspaceIndexViolation::ChangedDuringCapture,
-                path,
-            ));
+            return errors::index::workspace_changed_during_capture()
+                .path(path)
+                .fail();
         }
         if bytes.len() > limits.file_bytes_max() {
             return Ok(CapturedPath {
@@ -486,12 +458,27 @@ impl CapturedFile {
     }
 }
 
+fn capture_io_error(path: &Path, source: std::io::Error) -> RiftError {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        errors::index::workspace_changed_during_capture()
+            .path(path)
+            .source(source)
+            .error()
+    } else {
+        errors::index::workspace_filesystem()
+            .path(path)
+            .source(source)
+            .error()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::{LastCapture, capture_path_with};
-    use crate::workspace::{WorkspaceIndexLimits, WorkspaceIndexViolation};
+    use crate::workspace::WorkspaceIndexLimits;
+    use rift_error::errors;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -557,8 +544,8 @@ mod tests {
         };
 
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::ChangedDuringCapture
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
         );
     }
 
@@ -579,11 +566,11 @@ mod tests {
             panic!("removed path fails the capture");
         };
         assert_eq!(
-            error.fault().violation(),
-            WorkspaceIndexViolation::ChangedDuringCapture
+            error.slug(),
+            errors::index::workspace_changed_during_capture::SLUG
         );
         assert!(
-            !rift_core::causes(&error).is_empty(),
+            std::error::Error::source(&error).is_some(),
             "missing path keeps original operating-system cause"
         );
     }

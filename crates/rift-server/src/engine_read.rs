@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lsp_types::{CallHierarchyItem, Location, Position, Range, Uri};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
+use rift_error::errors;
 use rift_index::{IndexedFile, RelationshipStore};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
-use rift_lsp::session::{EngineError, EngineFault, EngineSession};
-use rift_lsp::uri::{TreeRoot, UriFault};
+use rift_lsp::session::EngineSession;
+use rift_lsp::uri::TreeRoot;
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
@@ -22,7 +23,7 @@ use crate::callee::{
     CalleeDeclaration, CalleeFile, CalleeRoots, NamedCallee, PackageCallee, callee_file,
 };
 use crate::engine::{EnginePool, EngineSlot, OutgoingAnswer, SessionFuture};
-use crate::read::{ReadError, ReadFault, ReadService, symbol_id};
+use crate::read::{ReadService, RiftError, symbol_id};
 use crate::traversal::{
     TRAVERSAL_NODES_MAX, engine_facet, resolve_graph_symbol, validate_traversal,
     walk_traversal_with_references,
@@ -176,16 +177,16 @@ impl EngineReferences {
         self.package_declarations.get(symbol)
     }
 
-    pub(crate) fn validate_revision(&self, reads: &ReadService) -> Result<(), ReadError> {
+    pub(crate) fn validate_revision(&self, reads: &ReadService) -> Result<(), RiftError> {
         if self
             .revision
             .as_deref()
             .is_some_and(|revision| revision != reads.tree_revision())
         {
-            return Err(ReadFault::unavailable(
-                "engine references",
-                "source revision changed before search",
-            ));
+            return errors::server::read_unavailable()
+                .operation("engine references")
+                .detail("source revision changed before search")
+                .fail();
         }
         Ok(())
     }
@@ -211,14 +212,18 @@ pub fn uses_engine_references(
     reads: &ReadService,
     engines: &EnginePool,
     params: &SearchParams,
-) -> Result<bool, ReadError> {
+) -> Result<bool, RiftError> {
     reads.validate_engine_search(params)?;
     let Some((traversal, seed)) = reference_traversal(params) else {
         return Ok(false);
     };
     validate_traversal(traversal)?;
-    let seed = CoreSymbolId::new(seed.0.clone())
-        .map_err(|_| ReadFault::invalid("traversal.seed", "not a symbol identity"))?;
+    let seed = CoreSymbolId::new(seed.0.clone()).map_err(|_| {
+        errors::server::read_invalid()
+            .field("traversal.seed")
+            .violation("not a symbol identity")
+            .error()
+    })?;
     Ok(reachable_reference_source(
         reads.relationships(),
         &seed,
@@ -326,7 +331,7 @@ pub async fn resolve_engine_references(
     engines: &EnginePool,
     params: &SearchParams,
     (deadline, roots): (Instant, &CalleeRoots),
-) -> Result<EngineReferences, ReadError> {
+) -> Result<EngineReferences, RiftError> {
     if !uses_engine_references(reads, engines, params)? {
         return Ok(EngineReferences::default());
     }
@@ -334,8 +339,12 @@ pub async fn resolve_engine_references(
         return Ok(EngineReferences::default());
     };
     validate_traversal(traversal)?;
-    let seed = CoreSymbolId::new(seed.0.clone())
-        .map_err(|_| ReadFault::invalid("traversal.seed", "not a symbol identity"))?;
+    let seed = CoreSymbolId::new(seed.0.clone()).map_err(|_| {
+        errors::server::read_invalid()
+            .field("traversal.seed")
+            .violation("not a symbol identity")
+            .error()
+    })?;
     let mut references = EngineReferences {
         revision: Some(reads.tree_revision().to_owned()),
         ..EngineReferences::default()
@@ -403,7 +412,7 @@ async fn extend_references(
     pending: Vec<CoreSymbolId>,
     requested: &mut BTreeSet<CoreSymbolId>,
     deadline: Instant,
-) -> Result<Option<ReadWarning>, ReadError> {
+) -> Result<Option<ReadWarning>, RiftError> {
     let stored: usize = references.incoming.values().map(Vec::len).sum();
     let mut remaining = TRAVERSAL_NODES_MAX - stored;
     for identity in pending {
@@ -591,7 +600,7 @@ async fn extend_callees(
     pending: Vec<CoreSymbolId>,
     requested: &mut BTreeSet<CoreSymbolId>,
     walk: OutgoingWalk<'_>,
-) -> Result<Option<ReadWarning>, ReadError> {
+) -> Result<Option<ReadWarning>, RiftError> {
     let stored: usize = references.outgoing.values().map(Vec::len).sum::<usize>()
         + references.package_callees.len();
     let mut remaining = TRAVERSAL_NODES_MAX - stored;
@@ -615,10 +624,12 @@ async fn extend_callees(
             }
             SymbolCallees::NotServed => continue,
             SymbolCallees::Unprepared { kind } if identity == *walk.seed => {
-                return Err(ReadFault::unsupported(format!(
-                    "outgoing traversal from a declaration of kind `{kind}` (the language \
+                return errors::server::read_unsupported()
+                    .capability(format!(
+                        "outgoing traversal from a declaration of kind `{kind}` (the language \
                      engine prepares no call hierarchy item at the seed)"
-                )));
+                    ))
+                    .fail();
             }
             SymbolCallees::Unprepared { .. } => {
                 references.outgoing.insert(identity, Vec::new());
@@ -700,7 +711,7 @@ async fn resolve_symbol_callees(
     engines: &EnginePool,
     identity: &CoreSymbolId,
     walk: OutgoingWalk<'_>,
-) -> Result<SymbolCallees, ReadError> {
+) -> Result<SymbolCallees, RiftError> {
     let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
         return Ok(SymbolCallees::NotServed);
     };
@@ -716,10 +727,10 @@ async fn resolve_symbol_callees(
         Ok(OutgoingAnswer::Unsettled { attempts }) => {
             return Ok(SymbolCallees::Unsettled { language, attempts });
         }
-        Err(error) if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) => {
+        Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
             return Ok(SymbolCallees::NotServed);
         }
-        Err(error) => return Err(ReadFault::engine(error)),
+        Err(error) => return Err(error),
     };
     let trees = [slot.workspace_root(), reads.index().root()];
     match map_callees(reads, report, identity, (walk.roots, &trees)) {
@@ -734,7 +745,7 @@ async fn resolve_symbol_callees(
             language,
             unconfirmed,
         }),
-        Err(error) if matches!(error.fault(), ReadFault::EngineAnswer { .. }) => {
+        Err(error) if error.slug() == errors::server::read_engine_answer::SLUG => {
             Ok(SymbolCallees::Unmapped {
                 language,
                 detail: error.detail(),
@@ -755,7 +766,7 @@ async fn callees_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
     deadline: Instant,
-) -> Result<OutgoingAnswer<CalleeReport>, EngineError> {
+) -> Result<OutgoingAnswer<CalleeReport>, RiftError> {
     let request_path = target.path.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
@@ -815,15 +826,13 @@ fn map_callees(
     report: CalleeReport,
     caller: &CoreSymbolId,
     (roots, trees): (&CalleeRoots, &[&std::path::Path]),
-) -> Result<MappedCallees, ReadError> {
-    let calls = report.calls.map_err(|observed| {
-        ReadFault::engine_answer(
-            "engine calls",
-            format!(
+) -> Result<MappedCallees, RiftError> {
+    let calls =
+        report.calls.map_err(|observed| {
+            errors::server::read_engine_answer().operation("engine calls").detail(format!(
                 "outgoing calls {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound"
-            ),
-        )
-    })?;
+            )).error()
+        })?;
     let mut mapped = MappedCallees {
         callees: Vec::new(),
         held: Vec::new(),
@@ -836,8 +845,12 @@ fn map_callees(
             position: item.selection_range.start,
             encoding: report.encoding,
         };
-        let file = callee_file(roots, trees, caller, call)
-            .map_err(|error| ReadFault::task("callee URI conversion", error.detail()))?;
+        let file = callee_file(roots, trees, caller, call).map_err(|error| {
+            errors::server::read_task()
+                .operation("callee URI conversion")
+                .detail(error.detail())
+                .error()
+        })?;
         let declaration = match file {
             CalleeFile::Project(path) => project_declaration(
                 reads,
@@ -864,7 +877,7 @@ async fn resolve_symbol_references(
     engines: &EnginePool,
     identity: &CoreSymbolId,
     deadline: Instant,
-) -> Result<SymbolReferences, ReadError> {
+) -> Result<SymbolReferences, RiftError> {
     let Some((slot, file, symbol)) = reference_source(reads, engines, identity) else {
         return Ok(SymbolReferences::NotServed);
     };
@@ -873,18 +886,18 @@ async fn resolve_symbol_references(
     let answered = Box::pin(references_on_engine(slot, &target, deadline)).await;
     let (report, unconfirmed) = match answered {
         Ok((report, unconfirmed)) => (report, unconfirmed.then(|| slot.name().to_owned())),
-        Err(error) if matches!(error.fault(), EngineFault::CapabilityAbsent { .. }) => {
+        Err(error) if error.slug() == errors::lsp::engine_capability_absent::SLUG => {
             return Ok(SymbolReferences::NotServed);
         }
-        Err(error) => match error.fault() {
-            EngineFault::Analyzing { attempts } => {
-                return Ok(SymbolReferences::Unsettled {
-                    language,
-                    attempts: *attempts,
-                });
-            }
-            _ => return Err(ReadFault::engine(error)),
-        },
+        Err(error) if error.slug() == errors::lsp::engine_analyzing::SLUG => {
+            let attempts = error
+                .context()
+                .find(|(key, _)| *key == "attempts")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            return Ok(SymbolReferences::Unsettled { language, attempts });
+        }
+        Err(error) => return Err(error),
     };
     symbol_references(
         map_references(reads, identity, report, slot.workspace_root()),
@@ -901,17 +914,17 @@ async fn resolve_symbol_references(
 /// root the server cannot address says nothing about the engine's revision, and
 /// degrading it would hide a defect behind a warning.
 fn symbol_references(
-    mapped: Result<Vec<GraphHop>, ReadError>,
+    mapped: Result<Vec<GraphHop>, RiftError>,
     language: Language,
     unconfirmed: Option<String>,
-) -> Result<SymbolReferences, ReadError> {
+) -> Result<SymbolReferences, RiftError> {
     match mapped {
         Ok(edges) => Ok(SymbolReferences::Resolved {
             edges,
             language,
             unconfirmed,
         }),
-        Err(error) if matches!(error.fault(), ReadFault::EngineAnswer { .. }) => {
+        Err(error) if error.slug() == errors::server::read_engine_answer::SLUG => {
             Ok(SymbolReferences::Unmapped {
                 language,
                 detail: error.detail(),
@@ -938,7 +951,7 @@ impl ReferenceTarget {
         &self,
     ) -> impl for<'session> FnMut(
         &'session mut EngineSession,
-    ) -> SessionFuture<'session, Result<(), EngineError>>
+    ) -> SessionFuture<'session, Result<(), RiftError>>
     + use<> {
         let path = self.path.clone();
         let language = self.language.clone();
@@ -980,24 +993,37 @@ impl ReferenceTarget {
         canonical_root: &std::path::Path,
         file: &IndexedFile,
         symbol: &SyntaxSymbol,
-    ) -> Result<Self, ReadError> {
+    ) -> Result<Self, RiftError> {
         let source = file.source();
         let offset = declaration_name_offset(file, symbol)?;
         let index = LineIndex::new(source);
         let position = |encoding| {
-            index
-                .position(encoding, offset)
-                .map_err(|error| ReadFault::task("reference position conversion", error.detail()))
+            index.position(encoding, offset).map_err(|error| {
+                errors::server::read_task()
+                    .operation("reference position conversion")
+                    .detail(error.detail())
+                    .error()
+            })
         };
         Ok(Self {
             path: file.path().clone(),
             language: file.syntax().language().name.clone(),
             uri: TreeRoot::new(workspace_root)
                 .and_then(|root| root.document_uri(file.path()))
-                .map_err(|error| ReadFault::task("reference URI conversion", error.detail()))?,
+                .map_err(|error| {
+                    errors::server::read_task()
+                        .operation("reference URI conversion")
+                        .detail(error.detail())
+                        .error()
+                })?,
             canonical_uri: TreeRoot::new(canonical_root)
                 .and_then(|root| root.document_uri(file.path()))
-                .map_err(|error| ReadFault::task("reference URI conversion", error.detail()))?,
+                .map_err(|error| {
+                    errors::server::read_task()
+                        .operation("reference URI conversion")
+                        .detail(error.detail())
+                        .error()
+                })?,
             source: source.to_owned(),
             utf8: position(PositionEncoding::Utf8)?,
             utf16: position(PositionEncoding::Utf16)?,
@@ -1016,7 +1042,7 @@ async fn references_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
     deadline: Instant,
-) -> Result<(ReferenceReport, bool), EngineError> {
+) -> Result<(ReferenceReport, bool), RiftError> {
     let request_path = target.path.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
@@ -1091,11 +1117,14 @@ fn map_references(
     target: &CoreSymbolId,
     report: ReferenceReport,
     workspace_root: &std::path::Path,
-) -> Result<Vec<GraphHop>, ReadError> {
-    let locations = report.locations.map_err(|observed| ReadFault::engine_answer(
-        "engine references", format!("reference locations {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound")))?;
-    let root = TreeRoot::new(workspace_root)
-        .map_err(|error| ReadFault::task("reference root conversion", error.detail()))?;
+) -> Result<Vec<GraphHop>, RiftError> {
+    let locations = report.locations.map_err(|observed| errors::server::read_engine_answer().operation("engine references").detail(format!("reference locations {observed} exceed the {TRAVERSAL_NODES_MAX}-node traversal bound")).error())?;
+    let root = TreeRoot::new(workspace_root).map_err(|error| {
+        errors::server::read_task()
+            .operation("reference root conversion")
+            .detail(error.detail())
+            .error()
+    })?;
     let mut callers = BTreeSet::new();
     for location in locations {
         let at = EngineLocation {
@@ -1142,9 +1171,9 @@ fn reference_caller(
     reads: &ReadService,
     root: &TreeRoot,
     at: EngineLocation<'_>,
-) -> Result<Option<SymbolId>, ReadError> {
+) -> Result<Option<SymbolId>, RiftError> {
     let relative = root.project_path(at.uri).or_else(|error| {
-        if matches!(error.fault(), UriFault::OutsideRoot) {
+        if error.slug() == errors::lsp::uri_outside_root::SLUG {
             TreeRoot::new(reads.index().root())?.project_path(at.uri)
         } else {
             Err(error)
@@ -1152,8 +1181,8 @@ fn reference_caller(
     });
     let path = match relative {
         Ok(path) => path,
-        Err(error) if matches!(error.fault(), UriFault::OutsideRoot) => return Ok(None),
-        Err(error) => return Err(ReadFault::task("reference URI conversion", error.detail())),
+        Err(error) if error.slug() == errors::lsp::uri_outside_root::SLUG => return Ok(None),
+        Err(error) => return Err(error),
     };
     project_declaration(reads, &path, (at.range, at.encoding), "engine references")
 }
@@ -1167,23 +1196,26 @@ fn project_declaration(
     path: &ProjectPath,
     (range, encoding): (Range, PositionEncoding),
     operation: &'static str,
-) -> Result<Option<SymbolId>, ReadError> {
+) -> Result<Option<SymbolId>, RiftError> {
     let Some(file) = reads.index().file(path) else {
         return Ok(None);
     };
     let index = LineIndex::new(file.source());
     let convert = |position| {
-        index
-            .byte_offset(encoding, position)
-            .map_err(|error| ReadFault::engine_answer(operation, error.detail()))
+        index.byte_offset(encoding, position).map_err(|error| {
+            errors::server::read_engine_answer()
+                .operation(operation)
+                .detail(error.detail())
+                .error()
+        })
     };
     let start = convert(range.start)? as u64;
     let end = convert(range.end)? as u64;
     if start > end {
-        return Err(ReadFault::engine_answer(
-            operation,
-            "an engine range ends before it starts",
-        ));
+        return errors::server::read_engine_answer()
+            .operation(operation)
+            .detail("an engine range ends before it starts")
+            .fail();
     }
     Ok(file
         .enclosing_symbol(start, end)
@@ -1191,15 +1223,17 @@ fn project_declaration(
 }
 
 /// Reads the exact name range retained by the syntax provider.
-fn declaration_name_offset(file: &IndexedFile, symbol: &SyntaxSymbol) -> Result<usize, ReadError> {
-    let range = symbol
-        .name_range
-        .ok_or_else(|| ReadFault::unsupported("declaration name range"))?;
+fn declaration_name_offset(file: &IndexedFile, symbol: &SyntaxSymbol) -> Result<usize, RiftError> {
+    let range = symbol.name_range.ok_or_else(|| {
+        errors::server::read_unsupported()
+            .capability("declaration name range")
+            .error()
+    })?;
     let invalid = || {
-        ReadFault::task(
-            "reference position conversion",
-            "declaration name range exceeds indexed source",
-        )
+        errors::server::read_task()
+            .operation("reference position conversion")
+            .detail("declaration name range exceeds indexed source")
+            .error()
     };
     let start = usize::try_from(range.start).map_err(|_| invalid())?;
     let end = usize::try_from(range.end).map_err(|_| invalid())?;
@@ -1430,7 +1464,7 @@ mod tests {
                 panic!("an unmappable answer is refused");
             };
             assert!(
-                matches!(error.fault(), super::ReadFault::EngineAnswer { .. }),
+                error.slug() == errors::server::read_engine_answer::SLUG,
                 "{error}"
             );
         }
@@ -1593,7 +1627,7 @@ mod tests {
         }
     }
 
-    fn reads(root: &std::path::Path) -> Result<ReadService, crate::ReadError> {
+    fn reads(root: &std::path::Path) -> Result<ReadService, crate::RiftError> {
         ReadService::build(
             root,
             WorkspaceIndexLimits::default(),
@@ -1767,10 +1801,10 @@ mod tests {
             Ok(super::SymbolReferences::Resolved { edges, .. }) if edges.is_empty()
         ));
         let unmapped = super::symbol_references(
-            Err(super::ReadFault::engine_answer(
-                "engine references",
-                "character out of range",
-            )),
+            errors::server::read_engine_answer()
+                .operation("engine references")
+                .detail("character out of range")
+                .fail(),
             language.clone(),
             None,
         );
@@ -1780,10 +1814,10 @@ mod tests {
                 if detail.contains("character out of range")
         ));
         let refused = super::symbol_references(
-            Err(super::ReadFault::task(
-                "reference URI conversion",
-                "scheme refused",
-            )),
+            errors::server::read_task()
+                .operation("reference URI conversion")
+                .detail("scheme refused")
+                .fail(),
             language,
             None,
         );
@@ -2058,7 +2092,7 @@ mod tests {
         .await;
         engines.shutdown().await;
         let error = result.expect_err("absolute program is refused");
-        assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
+        assert!(error.slug() == errors::lsp::engine_launch_failed::SLUG);
         assert!(error.detail().contains("absolute"), "{}", error.detail());
         Ok(())
     }
@@ -2153,7 +2187,7 @@ mod tests {
         .await;
         engines.shutdown().await;
         let error = result.expect_err("engine refused references");
-        assert!(matches!(error.fault(), crate::ReadFault::Engine(_)));
+        assert!(error.slug() == errors::lsp::engine_launch_failed::SLUG);
         assert!(
             error.detail().contains("references refused"),
             "{}",
@@ -2478,7 +2512,7 @@ done
         engines.shutdown().await;
         let error = result.expect_err("an answer outside the shape refuses the walk");
         assert!(
-            matches!(error.fault(), crate::ReadFault::Engine(_)),
+            error.slug() == errors::lsp::engine_launch_failed::SLUG,
             "{error}"
         );
         let rendered = error.to_string();
@@ -2510,10 +2544,7 @@ done
         let result = Box::pin(resolve_engine_references(&reads, &engines, &params, walk())).await;
         engines.shutdown().await;
         let error = result.expect_err("a refused callee URI refuses the walk");
-        assert!(
-            matches!(error.fault(), crate::ReadFault::Task { .. }),
-            "{error}"
-        );
+        assert!(error.slug() == errors::server::read_task::SLUG, "{error}");
         Ok(())
     }
 

@@ -12,8 +12,8 @@
 //! the precise phase first, so one index's broad hit cannot displace another
 //! index's precise hit.
 
-use crate::error::{RankingError, RankingViolation, refuse, refuse_over_limit};
 use crate::identifier::{IdentifierCandidate, identifier_candidates};
+use rift_error::{RiftError, errors};
 
 /// Bytes a query must carry, at least.
 pub const QUERY_BYTES_MIN: usize = 1;
@@ -100,23 +100,22 @@ impl ParsedQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] naming `query` when the text is empty, when it
+    /// Returns [`RiftError`] naming `query` when the text is empty, when it
     /// runs past [`QUERY_BYTES_MAX`], when a quote opens and never closes, when one
     /// member runs past [`QUERY_TERM_BYTES_MAX`], or when the text carries
     /// more quoted phrases than [`PARSED_QUERY_MEMBERS_MAX`]: phrases cannot
     /// be dropped without changing what the caller asked for.
-    pub fn parse(query: &str) -> Result<Self, RankingError> {
+    pub fn parse(query: &str) -> Result<Self, RiftError> {
         if query.len() < QUERY_BYTES_MIN {
-            return Err(refuse(RankingViolation::QueryEmpty, "query"));
+            return errors::ranking::query_empty().subject("query").fail();
         }
         if query.len() > QUERY_BYTES_MAX {
-            return Err(refuse_over_limit(
-                RankingViolation::QueryLength,
-                "query",
-                "query",
-                QUERY_BYTES_MAX,
-                query.len(),
-            ));
+            return errors::ranking::query_length()
+                .subject("query")
+                .field("query")
+                .limit(QUERY_BYTES_MAX)
+                .required(query.len())
+                .fail();
         }
         let scanned = deduplicate(scan(query)?);
         if let Some(refusal) = phrase_limit(&scanned) {
@@ -267,14 +266,16 @@ fn quote(value: &str) -> String {
 
 /// Splits caller text into quoted phrases and unquoted terms, refusing an
 /// unterminated quote and an overlong member as it goes.
-fn scan(query: &str) -> Result<Vec<QueryMember>, RankingError> {
+fn scan(query: &str) -> Result<Vec<QueryMember>, RiftError> {
     let mut members = Vec::new();
     let mut rest = query;
     while let Some(opening) = rest.find(QUOTE) {
         push_terms(&mut members, &rest[..opening])?;
         let after = &rest[opening + QUOTE.len_utf8()..];
         let Some(closing) = after.find(QUOTE) else {
-            return Err(refuse(RankingViolation::QueryQuoteUnterminated, "query"));
+            return errors::ranking::query_quote_unterminated()
+                .subject("query")
+                .fail();
         };
         let phrase = after[..closing].trim();
         if !phrase.is_empty() {
@@ -294,7 +295,7 @@ fn scan(query: &str) -> Result<Vec<QueryMember>, RankingError> {
 /// else, which is what `char::is_alphanumeric` answers.
 ///
 /// [`CORPUS_TOKENIZER`]: crate::document::CORPUS_TOKENIZER
-fn push_terms(members: &mut Vec<QueryMember>, span: &str) -> Result<(), RankingError> {
+fn push_terms(members: &mut Vec<QueryMember>, span: &str) -> Result<(), RiftError> {
     for term in span.split(|character: char| !character.is_alphanumeric()) {
         if term.is_empty() {
             continue;
@@ -306,15 +307,14 @@ fn push_terms(members: &mut Vec<QueryMember>, span: &str) -> Result<(), RankingE
 
 /// Refuses one member past the byte bound, naming `query` as the parameter at
 /// fault.
-fn bounded(value: &str) -> Result<&str, RankingError> {
+fn bounded(value: &str) -> Result<&str, RiftError> {
     if value.len() > QUERY_TERM_BYTES_MAX {
-        return Err(refuse_over_limit(
-            RankingViolation::QueryTermLength,
-            "query",
-            "query.term",
-            QUERY_TERM_BYTES_MAX,
-            value.len(),
-        ));
+        return errors::ranking::query_term_length()
+            .subject("query")
+            .field("query.term")
+            .limit(QUERY_TERM_BYTES_MAX)
+            .required(value.len())
+            .fail();
     }
     Ok(value)
 }
@@ -388,16 +388,15 @@ fn narrow(members: Vec<QueryMember>) -> Narrowed {
 /// Unquoted terms narrow, so a long question is answered rather than refused.
 /// A phrase cannot narrow the same way: dropping one changes what the caller
 /// asked for, and keeping a partial set would answer a question nobody asked.
-fn phrase_limit(members: &[QueryMember]) -> Option<RankingError> {
+fn phrase_limit(members: &[QueryMember]) -> Option<RiftError> {
     let phrases = members.iter().filter(|member| member.is_phrase()).count();
     (phrases > PARSED_QUERY_MEMBERS_MAX).then(|| {
-        refuse_over_limit(
-            RankingViolation::QueryPhraseLimit,
-            "query",
-            "query.phrases",
-            PARSED_QUERY_MEMBERS_MAX,
-            phrases,
-        )
+        errors::ranking::query_phrase_limit()
+            .subject("query")
+            .field("query.phrases")
+            .limit(PARSED_QUERY_MEMBERS_MAX)
+            .required(phrases)
+            .error()
     })
 }
 
@@ -407,17 +406,16 @@ mod tests {
         PARSED_QUERY_MEMBERS_MAX, ParsedQuery, QUERY_BYTES_MAX, QUERY_TERM_BYTES_MAX, QueryMember,
         QueryPhase, quote, takes_prefix,
     };
-    use crate::error::RankingViolation;
+    use rift_error::ErrorSlug;
 
     fn parsed(query: &str) -> ParsedQuery {
         ParsedQuery::parse(query).expect("query must parse")
     }
 
-    fn violation(query: &str) -> RankingViolation {
+    fn violation(query: &str) -> ErrorSlug {
         ParsedQuery::parse(query)
             .expect_err("query must be refused")
-            .fault()
-            .violation()
+            .slug()
     }
 
     fn texts(query: &ParsedQuery) -> Vec<&str> {
@@ -426,13 +424,16 @@ mod tests {
 
     #[test]
     fn test_an_empty_query_is_refused_for_its_length() {
-        assert_eq!(violation(""), RankingViolation::QueryEmpty);
+        assert_eq!(violation(""), ErrorSlug::new("rift.ranking.query_empty"));
     }
 
     #[test]
     fn test_a_query_past_the_byte_bound_is_refused() {
         let query = "a".repeat(QUERY_BYTES_MAX + 1);
-        assert_eq!(violation(&query), RankingViolation::QueryLength);
+        assert_eq!(
+            violation(&query),
+            ErrorSlug::new("rift.ranking.query_length")
+        );
     }
 
     #[test]
@@ -446,14 +447,17 @@ mod tests {
     fn test_an_unterminated_quote_is_refused() {
         assert_eq!(
             violation("\"impact radius"),
-            RankingViolation::QueryQuoteUnterminated
+            ErrorSlug::new("rift.ranking.query_quote_unterminated")
         );
     }
 
     #[test]
     fn test_a_term_past_the_term_bound_is_refused() {
         let query = "b".repeat(QUERY_TERM_BYTES_MAX + 1);
-        assert_eq!(violation(&query), RankingViolation::QueryTermLength);
+        assert_eq!(
+            violation(&query),
+            ErrorSlug::new("rift.ranking.query_term_length")
+        );
     }
 
     #[test]
@@ -461,7 +465,7 @@ mod tests {
         let phrase = "b".repeat(QUERY_TERM_BYTES_MAX + 1);
         assert_eq!(
             violation(&format!("\"{phrase}\"")),
-            RankingViolation::QueryTermLength
+            ErrorSlug::new("rift.ranking.query_term_length")
         );
     }
 
@@ -471,7 +475,10 @@ mod tests {
             .map(|index| format!("\"phrase {index}\""))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(violation(&query), RankingViolation::QueryPhraseLimit);
+        assert_eq!(
+            violation(&query),
+            ErrorSlug::new("rift.ranking.query_phrase_limit")
+        );
     }
 
     #[test]

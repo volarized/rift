@@ -22,13 +22,11 @@
 //! from.
 
 mod database;
-mod error;
 mod lock;
 mod record;
 mod store;
 
 pub use database::{HeldCommit, StoreFiller, StoreReader, StoreReads, StoredCommit};
-pub use error::{StoreError, StoreFault};
 pub use record::{ChangedPath, CommitRecord, DeclarationChange, MovedDeclaration, RenamedPath};
 pub use store::{HistoryStore, STORE_FOLDER_NAME, StoreLocation, SweptRevisions, WorktreeFallback};
 

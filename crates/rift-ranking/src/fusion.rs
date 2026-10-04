@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::document::{DocumentIdentity, FieldSet, SearchableField};
-use crate::error::{RankingError, RankingFault, RankingViolation};
 use crate::query::QueryPhase;
+use rift_error::{RiftError, errors};
 
 /// `fusion_k` accepted, at least.
 pub const FUSION_K_MIN: u64 = 1;
@@ -240,7 +240,7 @@ impl RankingWeights {
     ///
     /// # Errors
     ///
-    /// Returns [`RankingError`] when a share is negative or is not a finite
+    /// Returns [`RiftError`] when a share is negative or is not a finite
     /// number, when every share is zero, or when `fusion_k` falls outside
     /// [`FUSION_K_MIN`] to [`FUSION_K_MAX`].
     pub fn new(
@@ -248,22 +248,23 @@ impl RankingWeights {
         lexical: f64,
         vector: f64,
         fusion_k: u64,
-    ) -> Result<Self, RankingError> {
-        let Some(violation) = weights_violation(identifier, lexical, vector, fusion_k) else {
-            return Ok(Self {
-                identifier,
-                lexical,
-                vector,
-                fusion_k,
-            });
-        };
-        let subject = match violation {
-            RankingViolation::FusionConstantInvalid => "search.ranking.fusion_k",
-            _ => "search.ranking",
-        };
-        Err(RankingError::new(
-            RankingFault::new(violation).about(subject),
-        ))
+    ) -> Result<Self, RiftError> {
+        if !shares_valid(identifier, lexical, vector) {
+            return errors::ranking::ranking_weights_invalid()
+                .subject("search.ranking")
+                .fail();
+        }
+        if !constant_valid(fusion_k) {
+            return errors::ranking::fusion_constant_invalid()
+                .subject("search.ranking.fusion_k")
+                .fail();
+        }
+        Ok(Self {
+            identifier,
+            lexical,
+            vector,
+            fusion_k,
+        })
     }
 
     /// Names shares and a rank constant a caller writes in its own source.
@@ -278,7 +279,7 @@ impl RankingWeights {
     #[must_use]
     pub const fn fixed(identifier: f64, lexical: f64, vector: f64, fusion_k: u64) -> Self {
         assert!(
-            weights_violation(identifier, lexical, vector, fusion_k).is_none(),
+            shares_valid(identifier, lexical, vector) && constant_valid(fusion_k),
             "fixed ranking weights need shares from 0 to 1 with a positive sum and a rank \
              constant from FUSION_K_MIN to FUSION_K_MAX"
         );
@@ -311,21 +312,16 @@ impl RankingWeights {
 /// number from 0 to 1, their sum positive, and the rank constant from [`FUSION_K_MIN`] to
 /// [`FUSION_K_MAX`]. [`RankingWeights::new`] refuses what this names, and
 /// [`RankingWeights::fixed`] refuses it at compile time.
-const fn weights_violation(
-    identifier: f64,
-    lexical: f64,
-    vector: f64,
-    fusion_k: u64,
-) -> Option<RankingViolation> {
-    let shares_bounded =
-        share_bounded(identifier) && share_bounded(lexical) && share_bounded(vector);
-    let shares_positive = identifier + lexical + vector > 0.0;
-    let constant_bounded = FUSION_K_MIN <= fusion_k && fusion_k <= FUSION_K_MAX;
-    match (shares_bounded && shares_positive, constant_bounded) {
-        (false, _) => Some(RankingViolation::RankingWeightsInvalid),
-        (true, false) => Some(RankingViolation::FusionConstantInvalid),
-        (true, true) => None,
-    }
+const fn shares_valid(identifier: f64, lexical: f64, vector: f64) -> bool {
+    share_bounded(identifier)
+        && share_bounded(lexical)
+        && share_bounded(vector)
+        && identifier + lexical + vector > 0.0
+}
+
+/// Whether rank constant falls within accepted bounds.
+const fn constant_valid(fusion_k: u64) -> bool {
+    FUSION_K_MIN <= fusion_k && fusion_k <= FUSION_K_MAX
 }
 
 /// Whether one share is a finite number from 0 to 1.
@@ -701,8 +697,8 @@ mod tests {
         RankingInput, RankingInputKind, RankingInputSet, RankingWeights, fuse,
     };
     use crate::document::{DocumentIdentity, FieldSet, SearchableField};
-    use crate::error::RankingViolation;
     use crate::query::QueryPhase;
+    use rift_error::ErrorSlug;
 
     fn identity(value: &str) -> DocumentIdentity {
         DocumentIdentity::new(value).expect("identity must be accepted")
@@ -836,9 +832,8 @@ mod tests {
         assert_eq!(
             RankingWeights::new(-0.1, 0.5, 0.5, 60)
                 .expect_err("a negative share must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::RankingWeightsInvalid
+                .slug(),
+            ErrorSlug::new("rift.ranking.ranking_weights_invalid")
         );
     }
 
@@ -862,9 +857,8 @@ mod tests {
         assert_eq!(
             RankingWeights::new(0.5, 0.5, 0.0, 0)
                 .expect_err("a zero rank constant must be refused")
-                .fault()
-                .violation(),
-            RankingViolation::FusionConstantInvalid
+                .slug(),
+            ErrorSlug::new("rift.ranking.fusion_constant_invalid")
         );
         assert!(RankingWeights::new(0.5, 0.5, 0.0, FUSION_K_MAX + 1).is_err());
     }

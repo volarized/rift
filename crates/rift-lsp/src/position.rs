@@ -11,69 +11,9 @@ use std::iter;
 
 use lsp_types::Position;
 use rift_core::line::{LineEnding, lines_inclusive, without_ending};
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault, fault_label};
-use serde::Serialize;
+use rift_error::{RiftError, errors};
 
 use crate::capabilities::PositionEncoding;
-
-/// A position or offset outside the document it addresses.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PositionFault {
-    /// The line number is at or past the document's line count.
-    LineOutOfRange {
-        /// The line as addressed.
-        line: u32,
-        /// Lines the document has.
-        line_count: u32,
-    },
-    /// The character is past the addressed line's end.
-    CharacterOutOfRange {
-        /// The line as addressed.
-        line: u32,
-        /// The character as addressed.
-        character: u32,
-        /// Code units the line holds before its ending.
-        line_units: u32,
-    },
-    /// The character lands inside one character's code units.
-    CharacterMisaligned {
-        /// The line as addressed.
-        line: u32,
-        /// The character as addressed.
-        character: u32,
-    },
-    /// The byte offset is past the document's end.
-    OffsetOutOfRange {
-        /// The offset as addressed.
-        byte_offset: usize,
-        /// Bytes the document holds.
-        document_bytes: usize,
-    },
-    /// The byte offset lands inside one character's UTF-8 bytes.
-    OffsetMisaligned {
-        /// The offset as addressed.
-        byte_offset: usize,
-    },
-    /// The byte offset lands inside one line's ending bytes.
-    OffsetInsideLineEnding {
-        /// The offset as addressed.
-        byte_offset: usize,
-    },
-}
-
-impl Fault for PositionFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::InternalError)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        vec![ErrorContext::new("fault", fault_label(self))]
-    }
-}
-
-/// A position outside the document it addresses.
-pub type PositionError = Error<PositionFault>;
 
 /// Line starts of one document, for position conversion.
 ///
@@ -113,13 +53,13 @@ impl<'text> LineIndex<'text> {
     ///
     /// # Errors
     ///
-    /// Returns [`PositionError`] when the line or character is past the
+    /// Returns [`RiftError`] when the line or character is past the
     /// document, or the character splits one character's code units.
     pub fn byte_offset(
         &self,
         encoding: PositionEncoding,
         position: Position,
-    ) -> Result<usize, PositionError> {
+    ) -> Result<usize, RiftError> {
         let line_start = self.line_start(position.line)?;
         let content = without_ending(self.line_text(position.line as usize, line_start));
         // The line's end joins the character boundaries, so a character inside the last
@@ -133,40 +73,42 @@ impl<'text> LineIndex<'text> {
             match units.cmp(&position.character) {
                 Ordering::Equal => return Ok(line_start + offset),
                 Ordering::Greater => {
-                    return Err(Error::new(PositionFault::CharacterMisaligned {
-                        line: position.line,
-                        character: position.character,
-                    }));
+                    return errors::lsp::position_character_misaligned()
+                        .line(position.line)
+                        .character(position.character)
+                        .fail();
                 }
                 Ordering::Less => units += width,
             }
         }
-        Err(Error::new(PositionFault::CharacterOutOfRange {
-            line: position.line,
-            character: position.character,
-            line_units: units,
-        }))
+        errors::lsp::position_character_out_of_range()
+            .line(position.line)
+            .character(position.character)
+            .line_units(units)
+            .fail()
     }
 
     /// The position one byte offset addresses.
     ///
     /// # Errors
     ///
-    /// Returns [`PositionError`] when the offset is past the document or
+    /// Returns [`RiftError`] when the offset is past the document or
     /// splits one character's UTF-8 bytes.
     pub fn position(
         &self,
         encoding: PositionEncoding,
         byte_offset: usize,
-    ) -> Result<Position, PositionError> {
+    ) -> Result<Position, RiftError> {
         if byte_offset > self.text.len() {
-            return Err(Error::new(PositionFault::OffsetOutOfRange {
-                byte_offset,
-                document_bytes: self.text.len(),
-            }));
+            return errors::lsp::position_offset_out_of_range()
+                .byte_offset(byte_offset)
+                .document_bytes(self.text.len())
+                .fail();
         }
         if !self.text.is_char_boundary(byte_offset) {
-            return Err(Error::new(PositionFault::OffsetMisaligned { byte_offset }));
+            return errors::lsp::position_offset_misaligned()
+                .byte_offset(byte_offset)
+                .fail();
         }
         let line_index = self
             .line_starts
@@ -175,9 +117,9 @@ impl<'text> LineIndex<'text> {
         let line_start = self.line_starts[line_index];
         let content = without_ending(self.line_text(line_index, line_start));
         if byte_offset > line_start + content.len() {
-            return Err(Error::new(PositionFault::OffsetInsideLineEnding {
-                byte_offset,
-            }));
+            return errors::lsp::position_offset_inside_line_ending()
+                .byte_offset(byte_offset)
+                .fail();
         }
         let units: u32 = self.text[line_start..byte_offset]
             .chars()
@@ -190,12 +132,12 @@ impl<'text> LineIndex<'text> {
     }
 
     /// The byte offset where one addressed line starts.
-    fn line_start(&self, line: u32) -> Result<usize, PositionError> {
+    fn line_start(&self, line: u32) -> Result<usize, RiftError> {
         self.line_starts.get(line as usize).copied().ok_or_else(|| {
-            Error::new(PositionFault::LineOutOfRange {
-                line,
-                line_count: self.line_count(),
-            })
+            errors::lsp::position_line_out_of_range()
+                .line(line)
+                .line_count(self.line_count())
+                .error()
         })
     }
 
@@ -222,6 +164,17 @@ fn unit_width(encoding: PositionEncoding, character: char) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_error::ErrorSlug;
+
+    fn assert_failure(error: &RiftError, slug: ErrorSlug, expected: &[(&str, &str)]) {
+        assert_eq!(error.slug(), slug);
+        let context = error
+            .context()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (key, value) in expected {
+            assert_eq!(context.get(key).map(String::as_str), Some(*value), "{key}");
+        }
+    }
 
     fn at(line: u32, character: u32) -> Position {
         Position { line, character }
@@ -254,23 +207,27 @@ mod tests {
                         let refused = index
                             .position(encoding, offset)
                             .expect_err("an offset inside CRLF is not addressable");
-                        assert_eq!(
-                            *refused.fault(),
-                            PositionFault::OffsetInsideLineEnding {
-                                byte_offset: offset
-                            }
+                        assert_failure(
+                            &refused,
+                            errors::lsp::position_offset_inside_line_ending::SLUG,
+                            &[("byte_offset", &offset.to_string())],
                         );
                         continue;
                     }
                     let position = index.position(encoding, offset).expect("in range");
                     assert_eq!(
-                        index.byte_offset(encoding, position),
-                        Ok(offset),
+                        index
+                            .byte_offset(encoding, position)
+                            .expect("valid position"),
+                        offset,
                         "{text:?}"
                     );
                 }
                 let end = index.position(encoding, text.len()).expect("document end");
-                assert_eq!(index.byte_offset(encoding, end), Ok(text.len()));
+                assert_eq!(
+                    index.byte_offset(encoding, end).expect("document end"),
+                    text.len()
+                );
             }
         }
     }
@@ -297,13 +254,10 @@ mod tests {
         let error = index
             .byte_offset(PositionEncoding::Utf16, at(0, 10))
             .expect_err("line 0 holds 9 units");
-        assert_eq!(
-            *error.fault(),
-            PositionFault::CharacterOutOfRange {
-                line: 0,
-                character: 10,
-                line_units: 9
-            }
+        assert_failure(
+            &error,
+            errors::lsp::position_character_out_of_range::SLUG,
+            &[("line", "0"), ("character", "10"), ("line_units", "9")],
         );
         assert!(index.byte_offset(PositionEncoding::Utf16, at(0, 9)).is_ok());
     }
@@ -314,17 +268,17 @@ mod tests {
         let error = index
             .byte_offset(PositionEncoding::Utf16, at(2, 0))
             .expect_err("two lines exist");
-        assert_eq!(
-            *error.fault(),
-            PositionFault::LineOutOfRange {
-                line: 2,
-                line_count: 2
-            }
+        assert_failure(
+            &error,
+            errors::lsp::position_line_out_of_range::SLUG,
+            &[("line", "2"), ("line_count", "2")],
         );
         let trailing = LineIndex::new("one\n");
         assert_eq!(
-            trailing.byte_offset(PositionEncoding::Utf16, at(1, 0)),
-            Ok(4)
+            trailing
+                .byte_offset(PositionEncoding::Utf16, at(1, 0))
+                .expect("trailing empty line"),
+            4
         );
     }
 
@@ -334,20 +288,18 @@ mod tests {
         let inside_pair = index
             .byte_offset(PositionEncoding::Utf16, at(1, 11))
             .expect_err("unit 11 splits the astral pair");
-        assert_eq!(
-            *inside_pair.fault(),
-            PositionFault::CharacterMisaligned {
-                line: 1,
-                character: 11
-            }
+        assert_failure(
+            &inside_pair,
+            errors::lsp::position_character_misaligned::SLUG,
+            &[("line", "1"), ("character", "11")],
         );
         let inside_euro = index
             .byte_offset(PositionEncoding::Utf8, at(1, 11))
             .expect_err("byte 11 splits the euro sign");
-        assert!(matches!(
-            inside_euro.fault(),
-            PositionFault::CharacterMisaligned { .. }
-        ));
+        assert_eq!(
+            inside_euro.slug(),
+            errors::lsp::position_character_misaligned::SLUG
+        );
     }
 
     /// A character inside the line's last character splits it, whatever the
@@ -365,26 +317,24 @@ mod tests {
                         .byte_offset(encoding, at(0, character))
                         .expect_err("the character splits the astral one");
                     assert_eq!(
-                        *error.fault(),
-                        PositionFault::CharacterMisaligned { line: 0, character },
+                        error.slug(),
+                        errors::lsp::position_character_misaligned::SLUG,
                         "{text:?} {encoding:?}"
                     );
                 }
                 assert_eq!(
-                    index.byte_offset(encoding, at(0, line_units)),
-                    Ok("x𝄞".len()),
+                    index
+                        .byte_offset(encoding, at(0, line_units))
+                        .expect("line end"),
+                    "x𝄞".len(),
                     "{text:?} {encoding:?}"
                 );
                 let past = index
                     .byte_offset(encoding, at(0, line_units + 1))
                     .expect_err("past the line's end");
                 assert_eq!(
-                    *past.fault(),
-                    PositionFault::CharacterOutOfRange {
-                        line: 0,
-                        character: line_units + 1,
-                        line_units
-                    },
+                    past.slug(),
+                    errors::lsp::position_character_out_of_range::SLUG,
                     "{text:?} {encoding:?}"
                 );
             }
@@ -397,24 +347,20 @@ mod tests {
         let past = index
             .position(PositionEncoding::Utf16, LF.len() + 1)
             .expect_err("past the document");
-        assert_eq!(
-            *past.fault(),
-            PositionFault::OffsetOutOfRange {
-                byte_offset: LF.len() + 1,
-                document_bytes: LF.len()
-            }
-        );
+        assert_eq!(past.slug(), errors::lsp::position_offset_out_of_range::SLUG);
         let inside = LF.find('é').expect("é exists") + 1;
         let misaligned = index
             .position(PositionEncoding::Utf16, inside)
             .expect_err("inside the two-byte character");
-        assert_eq!(
-            *misaligned.fault(),
-            PositionFault::OffsetMisaligned {
-                byte_offset: inside
-            }
+        assert_failure(
+            &misaligned,
+            errors::lsp::position_offset_misaligned::SLUG,
+            &[("byte_offset", &inside.to_string())],
         );
-        assert_eq!(misaligned.name(), ErrorName::Wire(ErrorCode::InternalError));
-        assert!(misaligned.to_string().contains("offset_misaligned"));
+        assert!(
+            misaligned
+                .to_string()
+                .contains(&format!("byte offset {inside}"))
+        );
     }
 }

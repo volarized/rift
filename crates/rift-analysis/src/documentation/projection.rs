@@ -16,8 +16,9 @@ use rift_protocol::documentation::{
 use rift_protocol::read::TextRange;
 use rift_ranking::{DocumentIdentity, RankedIdentity, RankingInput};
 
-use super::failure::{DocumentationError, DocumentationViolation, refused};
+use super::failure::{DocumentationViolation, refused};
 use super::publication::DocumentationCollection;
+use rift_error::RiftError;
 
 /// Blocks one layer holds across its collections.
 ///
@@ -120,7 +121,7 @@ impl DocumentationLayer<'static> {
     /// block, or mapping counts over their layer bounds.
     pub fn shared(
         collections: impl IntoIterator<Item = Arc<DocumentationCollection>>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         Self::build(
             collections
                 .into_iter()
@@ -139,7 +140,7 @@ impl<'collection> DocumentationLayer<'collection> {
     /// Refuses the same conditions as [`DocumentationLayer::shared`].
     pub fn borrowed(
         collections: &[&'collection DocumentationCollection],
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         Self::build(
             collections
                 .iter()
@@ -153,7 +154,7 @@ impl<'collection> DocumentationLayer<'collection> {
     fn build(
         collections: Vec<HeldCollection<'collection>>,
         bounds: LayerBounds,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         if u32::try_from(collections.len()).is_err() {
             return Err(refused(
                 DocumentationViolation::LimitExceeded,
@@ -182,7 +183,7 @@ impl<'collection> DocumentationLayer<'collection> {
         &mut self,
         identity: DocumentIdentity,
         block_identity: &DocumentationDigest,
-    ) -> Result<(), DocumentationError> {
+    ) -> Result<(), RiftError> {
         let address = self
             .block_address(block_identity)
             .ok_or_else(|| refused(DocumentationViolation::MissingTarget, "block.identity"))?;
@@ -315,7 +316,7 @@ impl<'layer> DocumentationProjection<'layer> {
     /// # Errors
     ///
     /// Refuses the conditions [`DocumentationLayer::borrowed`] refuses.
-    pub fn new(collection: &'layer DocumentationCollection) -> Result<Self, DocumentationError> {
+    pub fn new(collection: &'layer DocumentationCollection) -> Result<Self, RiftError> {
         Self::from_collections(&[collection])
     }
 
@@ -326,7 +327,7 @@ impl<'layer> DocumentationProjection<'layer> {
     /// Refuses the conditions [`DocumentationLayer::borrowed`] refuses.
     pub fn from_collections(
         collections: &[&'layer DocumentationCollection],
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self::default().with_owned_layer(DocumentationLayer::borrowed(collections)?))
     }
 
@@ -407,7 +408,7 @@ impl<'layer> DocumentationProjection<'layer> {
         inputs: &[RankingInput],
         target: DocumentationProjectionTarget,
         mut locate: F,
-    ) -> Result<Vec<RankingInput>, DocumentationError>
+    ) -> Result<Vec<RankingInput>, RiftError>
     where
         F: FnMut(&DocumentIdentity, &DocumentationContentIdentity) -> Option<TextRange>,
     {
@@ -479,7 +480,7 @@ impl Projected {
         chosen: Option<ResolvedMapping<'_>>,
         target: DocumentationProjectionTarget,
         owner_answers: &BTreeSet<&DocumentationDigest>,
-    ) -> Result<Self, DocumentationError> {
+    ) -> Result<Self, RiftError> {
         let Some(mapping) = chosen else {
             return Ok(Self::Original);
         };
@@ -527,7 +528,7 @@ impl ProjectedOrder {
 fn layer_sources(
     collections: &[HeldCollection<'_>],
     bound: usize,
-) -> Result<Vec<(DocumentationContentIdentity, u32)>, DocumentationError> {
+) -> Result<Vec<(DocumentationContentIdentity, u32)>, RiftError> {
     let count = collections.iter().try_fold(0_usize, |count, held| {
         count.checked_add(held.collection().index().sources.len())
     });
@@ -561,7 +562,7 @@ fn layer_sources(
 fn layer_blocks(
     collections: &[HeldCollection<'_>],
     bound: usize,
-) -> Result<Vec<(DocumentationDigest, BlockAddress)>, DocumentationError> {
+) -> Result<Vec<(DocumentationDigest, BlockAddress)>, RiftError> {
     let count = collections.iter().try_fold(0_usize, |count, held| {
         count.checked_add(held.collection().index().blocks.len())
     });
@@ -598,7 +599,7 @@ fn layer_blocks(
 fn layer_mappings(
     collections: &[HeldCollection<'_>],
     bound: usize,
-) -> Result<Vec<(DocumentIdentity, Mapping)>, DocumentationError> {
+) -> Result<Vec<(DocumentIdentity, Mapping)>, RiftError> {
     let derived = derive_mappings(collections)?;
     let count = derived.iter().try_fold(0_usize, |count, additions| {
         count.checked_add(additions.len())
@@ -617,7 +618,7 @@ fn layer_mappings(
 #[cfg(feature = "parallel")]
 fn derive_mappings(
     collections: &[HeldCollection<'_>],
-) -> Result<Vec<Vec<(DocumentIdentity, Mapping)>>, DocumentationError> {
+) -> Result<Vec<Vec<(DocumentIdentity, Mapping)>>, RiftError> {
     use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     collections
@@ -632,7 +633,7 @@ fn derive_mappings(
 #[cfg(not(feature = "parallel"))]
 fn derive_mappings(
     collections: &[HeldCollection<'_>],
-) -> Result<Vec<Vec<(DocumentIdentity, Mapping)>>, DocumentationError> {
+) -> Result<Vec<Vec<(DocumentIdentity, Mapping)>>, RiftError> {
     collections
         .iter()
         .enumerate()
@@ -686,7 +687,7 @@ fn without_repeated_blocks(
 fn collection_mappings(
     collection: &DocumentationCollection,
     position: u32,
-) -> Result<Vec<(DocumentIdentity, Mapping)>, DocumentationError> {
+) -> Result<Vec<(DocumentIdentity, Mapping)>, RiftError> {
     let mut additions = Vec::new();
     for (block_position, block) in (0_u32..).zip(&collection.index().blocks) {
         let address = BlockAddress {
@@ -734,7 +735,7 @@ fn collection_mappings(
 fn heading_identities(
     collection: &DocumentationCollection,
     block: &DocumentationBlock,
-) -> Result<Vec<DocumentIdentity>, DocumentationError> {
+) -> Result<Vec<DocumentIdentity>, RiftError> {
     let markdown = collection.source(&block.source).is_some_and(|source| {
         matches!(
             source.format,
@@ -753,9 +754,7 @@ fn heading_identities(
 
 /// The identities of the declaration an attached comment belongs to: its symbol, and for
 /// a package block also the unit-scoped identity package declarations rank under.
-fn owner_identities(
-    block: &DocumentationBlock,
-) -> Result<Vec<DocumentIdentity>, DocumentationError> {
+fn owner_identities(block: &DocumentationBlock) -> Result<Vec<DocumentIdentity>, RiftError> {
     let Some(symbol) = &block.symbol else {
         return Ok(Vec::new());
     };
@@ -780,7 +779,7 @@ fn owner_identities(
 fn heading_identity(
     source: &DocumentationContentIdentity,
     name: &str,
-) -> Result<DocumentIdentity, DocumentationError> {
+) -> Result<DocumentIdentity, RiftError> {
     match &source.source {
         DocumentationSourceIdentity::Project { path } => DocumentIdentity::new(
             rift_core::symbol_identity("markdown", &path.0, name),
@@ -801,10 +800,8 @@ fn caused_by(
     violation: DocumentationViolation,
     field: &'static str,
     source: impl std::error::Error + Send + Sync + 'static,
-) -> DocumentationError {
-    super::failure::DocumentationFault::new(violation, field)
-        .caused_by(source)
-        .into()
+) -> RiftError {
+    super::failure::refused_by(violation, field, source)
 }
 
 /// Picks the narrowest block containing the located match, ties broken by source, start,
@@ -911,6 +908,7 @@ fn push_or_union(
 
 #[cfg(test)]
 mod tests {
+    use rift_error::RiftError;
     use rift_protocol::documentation::{
         DocumentationBlockKind, DocumentationContentIdentity, DocumentationCoverage,
         DocumentationIndex, DocumentationSelectionReason, DocumentationSource,
@@ -1079,7 +1077,7 @@ mod tests {
     fn bounded(
         collections: &[&DocumentationCollection],
         bounds: LayerBounds,
-    ) -> Result<DocumentationLayer<'static>, crate::documentation::DocumentationError> {
+    ) -> Result<DocumentationLayer<'static>, RiftError> {
         let shared = collections
             .iter()
             .map(|collection| {
@@ -1109,7 +1107,10 @@ mod tests {
         let duplicate_source = collection(vec![source.clone()], Vec::new());
         let error = DocumentationLayer::borrowed(&[&first, &duplicate_source])
             .expect_err("duplicate source refused");
-        assert_eq!(error.fault().field(), "projection.source");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("projection.source")
+        );
 
         let other = source_named("other.md");
         let same_block = collection(
@@ -1125,7 +1126,10 @@ mod tests {
         );
         let error = DocumentationLayer::borrowed(&[&first, &same_block])
             .expect_err("duplicate block refused");
-        assert_eq!(error.fault().field(), "projection.block");
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("projection.block")
+        );
 
         let layer = DocumentationLayer::borrowed(&[&first]).expect("single collection layer");
         let projected = DocumentationProjection::default()
@@ -1191,7 +1195,10 @@ mod tests {
             ),
         ] {
             let error = bounded(&[&one, &two], bounds).expect_err("one past the bound");
-            assert_eq!(error.fault().field(), field);
+            assert_eq!(
+                crate::documentation::failure::context_value(&error, "field").as_deref(),
+                Some(field)
+            );
         }
     }
 
@@ -1688,7 +1695,10 @@ mod tests {
                 &content_digest(b"unknown"),
             )
             .expect_err("unknown block");
-        assert_eq!(unknown.fault().field(), "block.identity");
+        assert_eq!(
+            crate::documentation::failure::context_value(&unknown, "field").as_deref(),
+            Some("block.identity")
+        );
 
         let owner = layer
             .associate_document(
@@ -1696,7 +1706,10 @@ mod tests {
                 &block_identity,
             )
             .expect_err("block has no symbol owner");
-        assert_eq!(owner.fault().field(), "block.symbol");
+        assert_eq!(
+            crate::documentation::failure::context_value(&owner, "field").as_deref(),
+            Some("block.symbol")
+        );
     }
 
     /// Regression for #362: a candidate set past the collection block bound projects,

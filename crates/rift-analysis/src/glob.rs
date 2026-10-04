@@ -7,43 +7,7 @@ use std::path::{Path, PathBuf};
 
 use ignore::Match;
 use ignore::overrides::{Override, OverrideBuilder};
-use rift_core::{Error, ErrorCode, ErrorContext, ErrorName, Fault};
-
-/// One glob list that does not compile: the pattern that broke it, when one pattern alone
-/// did, and the glob compiler's own refusal.
-#[derive(Debug)]
-pub struct SourcePatternFault {
-    pattern: Option<String>,
-    source: ignore::Error,
-}
-
-impl SourcePatternFault {
-    /// The pattern the glob compiler refused, when one pattern alone caused the failure.
-    #[must_use]
-    pub fn pattern(&self) -> Option<&str> {
-        self.pattern.as_deref()
-    }
-}
-
-impl Fault for SourcePatternFault {
-    fn name(&self) -> ErrorName {
-        ErrorName::Wire(ErrorCode::ConfigurationInvalid)
-    }
-
-    fn context(&self) -> Vec<ErrorContext> {
-        self.pattern
-            .iter()
-            .map(|pattern| ErrorContext::new("pattern", pattern.clone()))
-            .collect()
-    }
-
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// A glob list that does not compile.
-pub type SourcePatternError = Error<SourcePatternFault>;
+use rift_error::{RiftError, errors};
 
 /// What the `[source]` globs say about one path, in the table's own precedence order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,12 +69,8 @@ impl PathMatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`SourcePatternError`] when a pattern is not a valid glob.
-    pub fn build(
-        root: &Path,
-        include: &[String],
-        exclude: &[String],
-    ) -> Result<Self, SourcePatternError> {
+    /// Returns [`RiftError`] when a pattern is not a valid glob.
+    pub fn build(root: &Path, include: &[String], exclude: &[String]) -> Result<Self, RiftError> {
         Self::build_with_force_include(root, include, exclude, &[])
     }
 
@@ -120,13 +80,13 @@ impl PathMatcher {
     ///
     /// # Errors
     ///
-    /// Returns [`SourcePatternError`] when a pattern is not a valid glob.
+    /// Returns [`RiftError`] when a pattern is not a valid glob.
     pub fn build_with_force_include(
         root: &Path,
         include: &[String],
         exclude: &[String],
         force_include: &[String],
-    ) -> Result<Self, SourcePatternError> {
+    ) -> Result<Self, RiftError> {
         Ok(Self {
             root: root.to_path_buf(),
             include: compiled_override(root, include)?,
@@ -245,27 +205,24 @@ fn plain_root_relative_pattern(pattern: &str) -> Option<&str> {
     (!pattern.contains('\\') && !pattern.starts_with(['!', '#'])).then_some(pattern)
 }
 
-fn compiled_override(
-    root: &Path,
-    patterns: &[String],
-) -> Result<Option<Override>, SourcePatternError> {
+fn compiled_override(root: &Path, patterns: &[String]) -> Result<Option<Override>, RiftError> {
     if patterns.is_empty() {
         return Ok(None);
     }
     let mut builder = OverrideBuilder::new(root);
     for pattern in patterns {
         builder.add(pattern).map_err(|source| {
-            Error::new(SourcePatternFault {
-                pattern: Some(pattern.clone()),
-                source,
-            })
+            errors::analysis::source_pattern_invalid()
+                .pattern(pattern.clone())
+                .source(source)
+                .error()
         })?;
     }
     builder.build().map(Some).map_err(|source| {
-        Error::new(SourcePatternFault {
-            pattern: None,
-            source,
-        })
+        errors::analysis::source_pattern_invalid()
+            .maybe_pattern(None::<&str>)
+            .source(source)
+            .error()
     })
 }
 
@@ -448,10 +405,14 @@ mod tests {
         let root = Path::new("/workspace");
         let error = PathMatcher::build_with_force_include(root, &[], &[], &["[".to_owned()])
             .expect_err("an unclosed character class must be refused");
-        assert_eq!(error.fault().pattern(), Some("["));
         assert_eq!(
-            error.name(),
-            ErrorName::Wire(ErrorCode::ConfigurationInvalid)
+            error.slug().as_str(),
+            "rift.analysis.source_pattern_invalid"
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
         );
     }
 
@@ -462,8 +423,15 @@ mod tests {
         let root = Path::new("/workspace");
         let error = PathMatcher::build(root, &["src/**".to_owned(), "[".to_owned()], &[])
             .expect_err("an unclosed character class must be refused");
-        assert_eq!(error.fault().pattern(), Some("["));
-        assert_eq!(error.context(), [ErrorContext::new("pattern", "[")]);
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.source_pattern_invalid"
+        );
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "pattern" && value == "[")
+        );
         assert!(
             error.source().is_some(),
             "the glob compiler's refusal is the cause"
@@ -485,8 +453,11 @@ mod tests {
         let oversized = "?".repeat(OVERSIZED_GLOB_WILDCARDS);
         let error = PathMatcher::build(root, &[oversized], &[])
             .expect_err("a matcher past the compiled size limit must be refused");
-        assert_eq!(error.fault().pattern(), None);
-        assert!(error.context().is_empty());
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.source_pattern_invalid"
+        );
+        assert!(!error.context().any(|(key, _)| key == "pattern"));
         assert!(
             error.source().is_some(),
             "the glob compiler's refusal is the cause"
