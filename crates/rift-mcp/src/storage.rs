@@ -286,6 +286,72 @@ mod tests {
         assert_eq!(read.len(), 1);
     }
 
+    /// An elected start beside the single database of an earlier release creates the
+    /// metrics and index databases, opens no vectors database, and leaves the four old
+    /// files byte-identical: nothing reads, migrates, or removes them.
+    #[tokio::test]
+    async fn an_elected_start_leaves_an_earlier_database_untouched() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let state = directory.path().join(RIFT_STATE_DIRECTORY);
+        std::fs::create_dir_all(&state).expect("the state directory");
+        let earlier = [
+            ("db", b"earlier pages".as_slice()),
+            ("db-wal", b"earlier log".as_slice()),
+            ("db-shm", b"earlier index".as_slice()),
+            ("db.lock", b"".as_slice()),
+        ];
+        for (name, bytes) in earlier {
+            std::fs::write(state.join(name), bytes).expect("an earlier file");
+        }
+        let guard = Arc::new(crate::claim(directory.path()).expect("the election"));
+
+        let storage = WorkspaceStorage::open_elected(directory.path(), Arc::clone(&guard))
+            .await
+            .expect("elected storage opens");
+
+        assert!(storage.database.is_some(), "the index database opens");
+        assert!(storage.logs().is_some(), "the metrics database opens");
+        assert!(state.join(INDEX_DATABASE_FILE_NAME).is_file());
+        assert!(state.join("metrics").is_file());
+        assert!(
+            !state.join("vectors").exists(),
+            "the vectors database waits for its first vector operation"
+        );
+        for (name, bytes) in earlier {
+            assert_eq!(
+                std::fs::read(state.join(name)).expect("the earlier file stays"),
+                bytes,
+                "{name} is byte-identical"
+            );
+        }
+        let vectors = storage.vectors().expect("the vectors handle");
+        vectors
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .expect("an unopened handle closes");
+    }
+
+    /// A refused vectors database leaves the index and metrics databases serving: each
+    /// database opens on its own.
+    #[tokio::test]
+    async fn a_refused_vectors_database_leaves_the_others_open() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let state = directory.path().join(RIFT_STATE_DIRECTORY);
+        std::fs::create_dir_all(state.join("vectors")).expect("a directory occupies vectors");
+
+        let storage = WorkspaceStorage::open(directory.path()).await;
+
+        let index = storage.database().expect("the index database opens");
+        assert!(storage.logs().is_some(), "the metrics database opens");
+        let vectors = storage.vectors().expect("the vectors handle");
+        let refused = vectors
+            .resolve(index.pool())
+            .await
+            .expect_err("a directory at the vectors path refuses the open");
+        assert_eq!(refused.slug(), errors::index::database_failed::SLUG);
+        assert!(state.join("vectors").is_dir(), "the failed path stays");
+    }
+
     #[test]
     fn a_workspace_without_a_metrics_database_has_no_log_reader() {
         let directory = tempfile::tempdir().expect("a temporary directory");

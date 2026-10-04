@@ -824,6 +824,93 @@ async fn a_disabled_tier_holds_no_model_it_is_handed() -> TestResult {
     Ok(())
 }
 
+/// With the vector ranking off, nothing opens the vectors database: a handed model, an
+/// acquisition, a whole pass, and a search leave no file and no migration lock behind.
+#[tokio::test]
+async fn a_disabled_tier_creates_no_vectors_database() -> TestResult {
+    let root = workspace()?;
+    let index = opened(root.path(), lexical_only_limits()).await?;
+    let (models, space) = local_models(root.path(), "model")?;
+    index.hold_models(models, space).await?;
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    let fixture = two()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    let _ranking = ranked(&index, "load config", 10).await?;
+    index
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await?;
+
+    assert!(database(root.path(), DatabaseName::Index).exists());
+    assert!(!database(root.path(), DatabaseName::Vectors).exists());
+    assert!(
+        !DatabaseName::Vectors
+            .migration_lock_path(root.path())
+            .exists()
+    );
+    Ok(())
+}
+
+/// With the vector ranking on, opening the index and writing the lexical set create no
+/// vectors database; the first vector operation creates it, and a search answers from
+/// the full-text tier before it.
+#[tokio::test]
+async fn the_first_vector_operation_creates_the_vectors_database() -> TestResult {
+    let root = workspace()?;
+    let vectors = database(root.path(), DatabaseName::Vectors);
+    let index = opened(root.path(), limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+    let before = ranked(&index, "load config", 10).await?;
+    assert!(input(&before, RankingInputKind::Lexical).is_ok());
+    assert!(!vectors.exists(), "no vector operation ran yet");
+
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    assert!(
+        vectors.exists(),
+        "holding a model opened the vectors database"
+    );
+    index
+        .embed_described(&fixture.described(), Embedding::Every, REVISION)
+        .await?;
+    assert_eq!(stored(root.path(), "model").await?.len(), 2);
+    index
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await?;
+    Ok(())
+}
+
+/// A vectors database that refuses to open leaves the next vector operation to open it,
+/// and the full-text tier answers meanwhile.
+#[tokio::test]
+async fn a_refused_vectors_database_opens_at_the_next_vector_operation() -> TestResult {
+    let root = workspace()?;
+    let vectors = database(root.path(), DatabaseName::Vectors);
+    std::fs::create_dir(&vectors)?;
+    let index = opened(root.path(), limits()).await?;
+    let fixture = two()?;
+    index.replace_lexical(fixture.documents(), REVISION).await?;
+
+    let refused = index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await
+        .expect_err("a directory at the vectors path refuses the open");
+    assert_eq!(refused.slug(), errors::index::database_failed::SLUG);
+    let answered = ranked(&index, "load config", 10).await?;
+    assert!(input(&answered, RankingInputKind::Lexical).is_ok());
+
+    std::fs::remove_dir(&vectors)?;
+    index
+        .prepare(&model_source(root.path(), "model")?, acquisition_limits())
+        .await?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    assert_eq!(stored(root.path(), "model").await?.len(), 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_build_gives_every_declaration_a_vector_and_stamps_the_tree_revision() -> TestResult {
     let root = workspace()?;
