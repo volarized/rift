@@ -350,36 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn path_violation_labels_are_non_empty_lowercase() {
-        let violations = [
-            PathViolation::Empty,
-            PathViolation::TooLong,
-            PathViolation::Absolute,
-            PathViolation::DotSegment,
-            PathViolation::EmptySegment,
-            PathViolation::Backslash,
-            PathViolation::ControlCharacter,
-            PathViolation::NonCanonicalUnicode,
-            PathViolation::RiftState,
-        ];
-        for violation in violations {
-            let label = crate::fault_label(&violation);
-            assert!(!label.is_empty(), "violation={violation:?}");
-            assert!(
-                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "label must be the serde snake_case name so the rendered line \
-                 and the wire spelling cannot drift: violation={violation:?}, label={label}"
-            );
-        }
-    }
-
-    #[test]
-    fn path_kind_labels_name_each_vocabulary() {
-        assert_eq!(crate::fault_label(&PathKind::Project), "project");
-        assert_eq!(crate::fault_label(&PathKind::Source), "source");
-    }
-
-    #[test]
     fn path_error_display_covers_project_and_source_kinds() {
         let project_error = ProjectPath::new("../outside").expect_err("dot segment is invalid");
         assert_eq!(

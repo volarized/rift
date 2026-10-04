@@ -4,7 +4,6 @@ pub mod acceptance;
 mod capture;
 mod configuration;
 mod digest;
-mod error;
 mod identity;
 mod limits;
 mod measurement;
@@ -28,10 +27,6 @@ pub use configuration::{
     is_absolute_program,
 };
 pub use digest::FileDigest;
-pub use error::{
-    CAUSE_DEPTH_MAX, CliCode, Error, ErrorCode, ErrorContext, ErrorDescriptor, ErrorName, Fault,
-    LimitEvidence, RetryDirective, RiftError, causes, fault_label, render_failure,
-};
 pub use identity::{
     CompositionId, CompositionRevision, IndexRevision, ModelId, ModelRevision,
     ParsedSymbolIdentity, ProviderId, ProviderRevision, ProviderSymbolId,
