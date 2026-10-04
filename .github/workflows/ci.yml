@@ -135,9 +135,8 @@ jobs:
         timeout-minutes: 1
       - run: just testing-check
         timeout-minutes: 1
-      # The pre-commit quick gate runs generated checks and the all-features
-      # workspace compile. Their cold builds belong within the build budget.
-      - run: just clippy
+      # The pre-commit quick gate runs generated checks, the all-features
+      # workspace compile, and strict Clippy. Their cold builds belong within the build budget.
       - run: just docs
       - run: just doctest
       - name: Test release tooling
