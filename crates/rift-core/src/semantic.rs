@@ -1019,9 +1019,9 @@ mod tests {
     use super::{
         CONTRIBUTION_EVIDENCE_MAX, CONTRIBUTION_FACTS_MAX, CONTRIBUTION_NAMESPACE_BYTES_MAX,
         CONTRIBUTION_NAMESPACES_MAX, Contribution, ContributionKey, ContributionOrigin,
-        ContributionReference, ContributionRelationship, ContributionViolation,
-        EquivalenceEvidence, PortableSymbolFacts, ReferenceRole, RelationshipKind,
-        SemanticReference, SourceApplicability, SourceRange, SymbolRecord, SymbolResolution,
+        ContributionReference, ContributionRelationship, EquivalenceEvidence, PortableSymbolFacts,
+        ReferenceRole, RelationshipKind, SemanticReference, SourceApplicability, SourceRange,
+        SymbolRecord, SymbolResolution,
     };
     use crate::{
         IndexRevision, ProviderId, ProviderRevision, ProviderSymbolId, SourcePath,
@@ -1156,31 +1156,6 @@ mod tests {
         assert!(exact.applies_to(source_revision(2), tree_revision(3)));
         assert!(!exact.applies_to(source_revision(2), tree_revision(4)));
         assert!(SourceApplicability::Independent.applies_to(source_revision(9), tree_revision(9)));
-    }
-
-    fn contribution_slug(violation: ContributionViolation) -> &'static str {
-        match violation {
-            ContributionViolation::InvalidName => "rift.core.contribution_invalid_name",
-            ContributionViolation::InvalidLanguage => "rift.core.contribution_invalid_language",
-            ContributionViolation::InvalidKind => "rift.core.contribution_invalid_kind",
-            ContributionViolation::InvalidSourceRange => {
-                "rift.core.contribution_invalid_source_range"
-            }
-            ContributionViolation::InvalidOrigin => "rift.core.contribution_invalid_origin",
-            ContributionViolation::UnboundIdentity => "rift.core.contribution_unbound_identity",
-            ContributionViolation::TooManyFacts => "rift.core.contribution_too_many_facts",
-            ContributionViolation::TooMuchEvidence => "rift.core.contribution_too_much_evidence",
-            ContributionViolation::TooManyNamespacedFacts => {
-                "rift.core.contribution_too_many_namespaced_facts"
-            }
-            ContributionViolation::InvalidNamespace => "rift.core.contribution_invalid_namespace",
-            ContributionViolation::InvalidNamespaceVersion => {
-                "rift.core.contribution_invalid_namespace_version"
-            }
-            ContributionViolation::InvalidReference => "rift.core.contribution_invalid_reference",
-            ContributionViolation::DuplicateFact => "rift.core.contribution_duplicate_fact",
-            ContributionViolation::InvalidRecord => "rift.core.contribution_invalid_record",
-        }
     }
 
     #[test]
@@ -1343,7 +1318,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidName,
+                "rift.core.contribution_invalid_name",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1355,7 +1330,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidLanguage,
+                "rift.core.contribution_invalid_language",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1367,7 +1342,7 @@ mod tests {
                     "Beacon",
                     ExactKind("struct".to_owned()),
                 ),
-                ContributionViolation::InvalidLanguage,
+                "rift.core.contribution_invalid_language",
             ),
             (
                 PortableSymbolFacts::new(
@@ -1379,10 +1354,10 @@ mod tests {
                     "Beacon",
                     ExactKind("9struct".to_owned()),
                 ),
-                ContributionViolation::InvalidKind,
+                "rift.core.contribution_invalid_kind",
             ),
         ];
-        for (facts, violation) in cases {
+        for (facts, expected_slug) in cases {
             let error = Contribution::builder(
                 ContributionKey::new(provider("docs"), publication(1), provider_symbol("Beacon")),
                 SourceApplicability::Independent,
@@ -1391,7 +1366,7 @@ mod tests {
             )
             .build()
             .expect_err("invalid portable facts");
-            assert_eq!(error.slug().as_str(), contribution_slug(violation));
+            assert_eq!(error.slug().as_str(), expected_slug);
         }
 
         let error = Contribution::builder(
@@ -1541,6 +1516,56 @@ mod tests {
             value.relationships()[0].kind(),
             RelationshipKind::Implementation
         );
+    }
+
+    #[test]
+    fn reference_and_relationship_counts_accept_the_bound_and_refuse_one_more() {
+        // Issue #535: both collections must retain the count-bound refusal evidence.
+        let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
+        let binding = super::DeclarationBinding::new(
+            source_unit(),
+            SourceRange::new(20, 26).expect("range"),
+            None,
+        );
+        let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
+            .expect("reference");
+        let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);
+        let build = |references, relationships| {
+            Contribution::fact_builder(
+                ContributionKey::new(
+                    provider("native"),
+                    publication(1),
+                    provider_symbol("Caller"),
+                ),
+                SourceApplicability::Independent,
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin"),
+            )
+            .references(references)
+            .relationships(relationships)
+            .build()
+        };
+        let accepted = build(
+            vec![reference.clone(); CONTRIBUTION_FACTS_MAX],
+            vec![relationship.clone(); CONTRIBUTION_FACTS_MAX],
+        )
+        .expect("counts at the bound are accepted");
+        assert_eq!(accepted.references().len(), CONTRIBUTION_FACTS_MAX);
+        assert_eq!(accepted.relationships().len(), CONTRIBUTION_FACTS_MAX);
+        for (references, relationships) in [
+            (vec![reference; CONTRIBUTION_FACTS_MAX + 1], Vec::new()),
+            (Vec::new(), vec![relationship; CONTRIBUTION_FACTS_MAX + 1]),
+        ] {
+            let error = build(references, relationships).expect_err("count exceeds the bound");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.core.contribution_too_many_facts"
+            );
+            assert_eq!(
+                error.context().collect::<Vec<_>>(),
+                [("field", "references".to_owned())]
+            );
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]

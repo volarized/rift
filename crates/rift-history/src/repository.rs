@@ -1767,6 +1767,179 @@ mod tests {
             .join(&commit_id[2..])
     }
 
+    fn assert_missing_object(error: &RiftError, operation: &str, object_id: &str) {
+        let detail = format!("An object with id {object_id} could not be found");
+        assert_eq!(error.slug().as_str(), "rift.history.storage");
+        assert_eq!(
+            error
+                .context()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            std::collections::BTreeMap::from([
+                ("operation", operation.to_owned()),
+                ("detail", detail.clone()),
+            ])
+        );
+        assert_eq!(error.context().count(), 2);
+        assert_eq!(
+            error.message(),
+            format!("repository storage failed during {operation}: {detail}")
+        );
+        assert_eq!(error.action(), "check repository storage and retry");
+        assert!(std::error::Error::source(error).is_none());
+    }
+
+    #[test]
+    fn test_missing_commit_refuses_list_comparison_and_history_without_partial_results() {
+        // Issue #535: all commit readers retain the missing object's identity.
+        let directory = repository_fixture();
+        let root = directory.path();
+        let repository = Repository::open(root).expect("repository");
+        let head = repository.resolve("HEAD").expect("head");
+        let object_id = head.commit_id();
+        drop(repository);
+        let path = loose_object(root, &object_id);
+        let bytes = fs::read(&path).expect("loose commit");
+        fs::remove_file(&path).expect("remove commit");
+        let repository = Repository::open(root).expect("repository");
+
+        let error = repository
+            .tree_files(&head, &include_all, 16)
+            .expect_err("missing commit");
+        assert_missing_object(&error, "read commit", &object_id);
+        let error = repository
+            .changed_files(&head, &head, &include_all, 16)
+            .expect_err("missing commit");
+        assert_missing_object(&error, "read commit", &object_id);
+        let error = repository
+            .path_revisions(&head, "lib.rs", 16)
+            .expect_err("missing commit");
+        assert_missing_object(&error, "read commit", &object_id);
+        drop(repository);
+
+        fs::write(&path, bytes).expect("restore commit");
+        let restored = Repository::open(root).expect("repository");
+        assert_eq!(
+            restored
+                .tree_files(&head, &include_all, 16)
+                .expect("files")
+                .len(),
+            1
+        );
+        assert!(
+            restored
+                .changed_files(&head, &head, &include_all, 16)
+                .expect("comparison")
+                .paths()
+                .is_empty()
+        );
+        assert!(
+            restored
+                .path_revisions(&head, "lib.rs", 16)
+                .expect("history")
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn test_missing_root_tree_refuses_list_comparison_and_history() {
+        // Issue #535: a readable commit must not hide an absent root tree.
+        let directory = repository_fixture();
+        let root = directory.path();
+        let repository = Repository::open(root).expect("repository");
+        let head = repository.resolve("HEAD").expect("head");
+        let object_id = repository.commit_tree(&head).expect("tree").id.to_string();
+        drop(repository);
+        let path = loose_object(root, &object_id);
+        let bytes = fs::read(&path).expect("loose tree");
+        fs::remove_file(&path).expect("remove tree");
+        let repository = Repository::open(root).expect("repository");
+
+        let error = repository
+            .tree_files(&head, &include_all, 16)
+            .expect_err("missing tree");
+        assert_missing_object(&error, "read commit tree", &object_id);
+        let error = repository
+            .changed_files(&head, &head, &include_all, 16)
+            .expect_err("missing tree");
+        assert_missing_object(&error, "read commit tree", &object_id);
+        let error = repository
+            .path_revisions(&head, "lib.rs", 16)
+            .expect_err("missing tree");
+        assert_missing_object(&error, "read commit tree", &object_id);
+        drop(repository);
+
+        fs::write(&path, bytes).expect("restore tree");
+        let restored = Repository::open(root).expect("repository");
+        assert_eq!(
+            restored
+                .tree_files(&head, &include_all, 16)
+                .expect("files")
+                .len(),
+            1
+        );
+        assert!(
+            restored
+                .path_revisions(&head, "lib.rs", 16)
+                .expect("history")
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn test_missing_blob_refuses_content_and_recovers_after_object_restoration() {
+        // Issue #535: the tree can list a file whose content object is absent.
+        let directory = repository_fixture();
+        let root = directory.path();
+        let repository = Repository::open(root).expect("repository");
+        let head = repository.resolve("HEAD").expect("head");
+        let files = repository
+            .tree_files(&head, &include_all, 16)
+            .expect("files");
+        let object_id = files[0].blob_id();
+        drop(repository);
+        let path = loose_object(root, &object_id);
+        let bytes = fs::read(&path).expect("loose blob");
+        fs::remove_file(&path).expect("remove blob");
+        let repository = Repository::open(root).expect("repository");
+        assert_eq!(
+            repository
+                .tree_files(&head, &include_all, 16)
+                .expect("files"),
+            files
+        );
+        let error = repository
+            .blob_bytes(&files[0], 1024)
+            .expect_err("missing blob");
+        assert_missing_object(&error, "read blob header", &object_id);
+        drop(repository);
+
+        fs::write(&path, bytes).expect("restore blob");
+        let restored = Repository::open(root).expect("repository");
+        assert_eq!(
+            restored.blob_bytes(&files[0], 1024).expect("content"),
+            b"pub fn beacon() {}\n"
+        );
+    }
+
+    #[test]
+    fn test_missing_subtree_refuses_listing_and_path_history() {
+        // Issue #535: a missing nested tree refuses both traversal and path lookup.
+        let directory = repository_fixture();
+        let root = directory.path();
+        crate::fixture::commit_missing_subtree(root, "refs/heads/broken");
+        let repository = Repository::open(root).expect("repository");
+        let broken = repository.resolve("broken").expect("broken branch");
+        let object_id = "0123456789abcdef0123456789abcdef01234567";
+        let error = repository
+            .tree_files(&broken, &include_all, 16)
+            .expect_err("missing subtree");
+        assert_missing_object(&error, "walk commit tree", object_id);
+        let error = repository
+            .path_revisions(&broken, "absent/lib.rs", 16)
+            .expect_err("missing subtree");
+        assert_missing_object(&error, "read tree entry", object_id);
+    }
+
     #[test]
     fn test_path_revisions_ends_incomplete_at_the_shallow_boundary() {
         let (directory, _first) = shallow_fixture();

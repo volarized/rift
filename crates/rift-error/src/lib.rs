@@ -267,6 +267,7 @@ mod generated_api_tests {
         let mcp: TestRepresentation = errors::ranking::query_empty().mcp();
         let cli: CliRepresentation = errors::ranking::query_empty().cli();
         assert_eq!(mcp.to_string(), "test representation");
+        assert_eq!(cli.to_string(), "cli representation");
         let mcp_result: Result<(), TestRepresentation> = mcp.fail();
         let cli_result: Result<(), CliRepresentation> = cli.fail();
         assert!(mcp_result.is_err());

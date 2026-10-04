@@ -643,6 +643,84 @@ mod tests {
         assert!(decode_notebook(invalid_source, &notebook_identity()).is_err());
     }
 
+    fn assert_notebook_refusal(source: &str, field: &str) {
+        let error = decode_notebook(source, &notebook_identity())
+            .expect_err("invalid notebook returns no partial cells");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.documentation_notebook_invalid"
+        );
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some(field),
+            "{source}"
+        );
+        assert_eq!(
+            error.message(),
+            format!("documentation field {field} has an invalid notebook shape")
+        );
+        assert_eq!(
+            error.action(),
+            format!("correct notebook field {field} and retry")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn notebook_requires_top_level_object_and_cells_array() {
+        for source in ["null", "[]", "42", "\"notebook\""] {
+            assert_notebook_refusal(source, "notebook.object");
+        }
+        for source in [
+            "{}",
+            r#"{"cells":null}"#,
+            r#"{"cells":{}}"#,
+            r#"{"cells":"text"}"#,
+        ] {
+            assert_notebook_refusal(source, "notebook.cells");
+        }
+        let empty = decode_notebook(r#"{"cells":[]}"#, &notebook_identity())
+            .expect("empty cell array is valid");
+        assert!(empty.cells().is_empty());
+    }
+
+    #[test]
+    fn selected_cell_without_source_refuses_prior_valid_cells() {
+        for source in [
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"markdown"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code"}]}"#,
+        ] {
+            assert_notebook_refusal(source, "notebook.cell.source");
+        }
+        let unselected = decode_notebook(
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"raw"}]}"#,
+            &notebook_identity(),
+        )
+        .expect("unselected raw cell does not require source");
+        assert_eq!(unselected.cells().len(), 1);
+        assert_eq!(unselected.cells()[0].text(), "kept");
+    }
+
+    #[test]
+    fn unpaired_unicode_escapes_refuse_notebook_without_partial_cells() {
+        for source in [
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"\uD800"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"\uDC00"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"},{"cell_type":"code","source":"text","id":"\uD800"}]}"#,
+            r#"{"cells":[{"cell_type":"markdown","source":"kept"}],"metadata":{"language_info":{"name":"\uD800"}}}"#,
+        ] {
+            super::parse_tree(source).expect("lexical JSON parser accepts the escape");
+            assert_notebook_refusal(source, "notebook.string");
+        }
+        let paired = decode_notebook(
+            r#"{"cells":[{"cell_type":"markdown","source":"\uD83D\uDE80"}]}"#,
+            &notebook_identity(),
+        )
+        .expect("paired UTF-16 escapes decode to one Unicode character");
+        assert_eq!(paired.cells().len(), 1);
+        assert_eq!(paired.cells()[0].text(), "\u{1f680}");
+    }
+
     #[test]
     fn a_cell_source_line_or_member_of_another_kind_refuses_the_notebook() {
         // tree-sitter-json reads a comment as a named node beside the values, and nbformat

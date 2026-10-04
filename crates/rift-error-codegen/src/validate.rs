@@ -274,6 +274,139 @@ action = "provide query text"
     }
 
     #[test]
+    fn rejects_unsupported_schema_invalid_namespaces_and_empty_registries() {
+        let unsupported = GOOD.replace("schema = 1", "schema = 2");
+        assert_eq!(
+            parse(&unsupported)
+                .expect_err("schema version must be supported")
+                .to_string(),
+            "invalid registry: unsupported schema version 2"
+        );
+        for namespace in ["", "_rift", "rift_", "rift__cloud", "Rift", "rift..cloud"] {
+            let input = GOOD.replace(
+                "namespace = \"rift\"",
+                &format!("namespace = {namespace:?}"),
+            );
+            assert_eq!(
+                parse(&input)
+                    .expect_err("namespace parts must be Rust names")
+                    .to_string(),
+                format!("invalid registry: invalid registry namespace {namespace:?}")
+            );
+        }
+        let empty = "[registry]\nnamespace = \"rift\"\nschema = 1\n[error]\n";
+        assert_eq!(
+            parse(empty)
+                .expect_err("a registry must define errors")
+                .to_string(),
+            "invalid registry: registry defines no errors"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_messages_actions_and_non_table_error_paths() {
+        for (before, member) in [
+            ("query is empty", "message"),
+            ("provide query text", "action"),
+        ] {
+            let input = GOOD.replace(before, "   ");
+            assert_eq!(
+                parse(&input)
+                    .expect_err("messages and actions cannot be blank")
+                    .to_string(),
+                format!("invalid registry: error rift.ranking.query_empty has empty {member}")
+            );
+        }
+        let input = "[registry]\nnamespace = \"rift\"\nschema = 1\n[error]\nranking = 7\n";
+        assert_eq!(
+            parse(input)
+                .expect_err("error paths must contain tables")
+                .to_string(),
+            "invalid registry: error path ranking must be a table"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_field_names_and_reserved_builder_methods() {
+        let input =
+            format!("{GOOD}\n[error.ranking.query_empty.fields.bad-name]\ntype = \"string\"\n");
+        assert_eq!(
+            parse(&input)
+                .expect_err("field names must be Rust names")
+                .to_string(),
+            "invalid registry: error rift.ranking.query_empty has invalid field name \"bad-name\""
+        );
+        for method in ["error", "fail", "evidence", "with", "mcp"] {
+            let input =
+                format!("{GOOD}\n[error.ranking.query_empty.fields.{method}]\ntype = \"string\"\n");
+            assert_eq!(
+                parse(&input)
+                    .expect_err("fields cannot replace builder methods")
+                    .to_string(),
+                format!(
+                    "invalid registry: error rift.ranking.query_empty field generates reserved method {method}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_duration_format_and_format_on_plain_fields() {
+        for (definition, detail) in [
+            (
+                "type = \"duration\"",
+                "duration field value requires format = human",
+            ),
+            (
+                "type = \"string\"\nformat = \"display\"",
+                "field value does not support format",
+            ),
+        ] {
+            let input = format!("{GOOD}\n[error.ranking.query_empty.fields.value]\n{definition}\n");
+            assert_eq!(
+                parse(&input)
+                    .expect_err("formats must match their field type")
+                    .to_string(),
+                format!("invalid registry: error rift.ranking.query_empty {detail}")
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_escaped_braces_but_rejects_malformed_and_hidden_placeholders() {
+        let escaped = GOOD.replace("query is empty", "query {{text}} is empty");
+        assert_eq!(
+            parse(&escaped).expect("escaped braces are literal").errors[0].message,
+            "query {{text}} is empty"
+        );
+        for (message, detail) in [
+            (
+                "query {bad-name} is empty",
+                "malformed message placeholder {bad-name}",
+            ),
+            ("query } is empty", "malformed message placeholder"),
+        ] {
+            let input = GOOD.replace("query is empty", message);
+            assert_eq!(
+                parse(&input)
+                    .expect_err("placeholder syntax must be valid")
+                    .to_string(),
+                format!("invalid registry: error rift.ranking.query_empty has {detail}")
+            );
+        }
+        let hidden = format!(
+            "{}\n[error.ranking.query_empty.fields.internal]\ntype = \"string\"\ndisplay = false\n",
+            GOOD.replace("provide query text", "retry {internal}")
+        );
+        assert_eq!(
+            parse(&hidden)
+                .expect_err("actions cannot expose hidden fields")
+                .to_string(),
+            "invalid registry: error rift.ranking.query_empty action references hidden field internal"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_placeholder() {
         let input = GOOD.replace("query is empty", "query {field} is empty");
         assert!(

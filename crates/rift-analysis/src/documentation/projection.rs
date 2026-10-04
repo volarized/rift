@@ -1726,6 +1726,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn association_at_mapping_bound_keeps_existing_owner_and_refuses_new_owner() {
+        let source = source(
+            "src/lib.rs",
+            "guide",
+            DocumentationSourceFormat::AttachedComment,
+        );
+        let symbol = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Guide"));
+        let block = block(
+            &source,
+            "guide",
+            TextRange { start: 0, end: 5 },
+            Vec::new(),
+            &[],
+            Some(symbol.clone()),
+        );
+        let identity = block.identity.clone();
+        let collection = collection(vec![source], vec![block]);
+        let mut layer = bounded(
+            &[&collection],
+            LayerBounds {
+                sources: 1,
+                blocks: 1,
+                mappings: 2,
+            },
+        )
+        .expect("one owning symbol");
+        let owner = DocumentIdentity::new("package-owner").expect("owner identity");
+        layer
+            .associate_document(owner.clone(), &identity)
+            .expect("exact mapping bound");
+        layer
+            .associate_document(owner, &identity)
+            .expect("existing association at bound");
+        assert_eq!(layer.mapping_count(), 2);
+        let error = layer
+            .associate_document(
+                DocumentIdentity::new("another-owner").expect("identity"),
+                &identity,
+            )
+            .expect_err("new association exceeds bound");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.documentation_limit_exceeded"
+        );
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("projection.mappings")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(layer.mapping_count(), 2);
+        layer
+            .associate_document(
+                DocumentIdentity::new(symbol.0).expect("symbol identity"),
+                &identity,
+            )
+            .expect("original owner remains associated");
+    }
+
+    #[test]
+    fn encoded_heading_identity_refusal_retains_ranking_source() {
+        let source = source_named("guide.md");
+        let heading =
+            "#".repeat(rift_protocol::documentation::DOCUMENTATION_TEXT_BYTES_MAX as usize);
+        let block = block(
+            &source,
+            "guide",
+            TextRange { start: 0, end: 5 },
+            Vec::new(),
+            &[&heading],
+            None,
+        );
+        let collection = collection(vec![source], vec![block]);
+        let error = DocumentationLayer::borrowed(&[&collection])
+            .expect_err("percent-encoded heading exceeds document identity bound");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.documentation_identity_invalid"
+        );
+        assert_eq!(
+            crate::documentation::failure::context_value(&error, "field").as_deref(),
+            Some("heading.identity")
+        );
+        assert_eq!(
+            error.action(),
+            "correct documentation field heading.identity and retry"
+        );
+        let source = std::error::Error::source(&error).expect("ranking refusal preserved");
+        let source = source
+            .downcast_ref::<RiftError>()
+            .expect("registered ranking refusal");
+        assert_eq!(source.slug().as_str(), "rift.ranking.document_field_length");
+        assert_eq!(
+            crate::documentation::failure::context_value(source, "field").as_deref(),
+            Some("document.identity")
+        );
+        assert_eq!(
+            crate::documentation::failure::context_value(source, "limit").as_deref(),
+            Some("8192")
+        );
+        let required = rift_core::symbol_identity("markdown", "guide.md", &heading).len();
+        assert_eq!(
+            crate::documentation::failure::context_value(source, "required"),
+            Some(required.to_string())
+        );
+    }
+
     /// Regression for #362: a candidate set past the collection block bound projects,
     /// where the projection used to refuse the whole search.
     #[test]

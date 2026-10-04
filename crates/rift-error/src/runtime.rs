@@ -925,6 +925,10 @@ mod tests {
         let first = (&stored).into_rift_error();
         let second = (&stored).into_rift_error();
         assert_eq!(first.slug(), stored.slug());
+        assert_eq!(
+            first.detail(),
+            "source failed: operation read, source identity source"
+        );
         assert!(
             second
                 .context()
@@ -1009,5 +1013,108 @@ mod tests {
         assert_eq!(ErrorValue::pid(pid_ref).rendered(), "42");
         let port_ref = &port;
         assert_eq!(ErrorValue::port(port_ref).rendered(), "8080");
+    }
+
+    #[test]
+    fn source_value_debug_hides_text_and_redacted_views_stop_the_chain() {
+        let value = ErrorValue::source(std::io::Error::other("private source text"));
+        assert_eq!(format!("{value:?}"), "Source([hidden])");
+        let ErrorValue::Source(view) = &value else {
+            panic!("source conversion must retain a source view");
+        };
+        assert_eq!(format!("{view:?}"), "SourceView([hidden])");
+        assert_eq!(view.to_string(), "private source text");
+        let original = Error::source(view.as_ref())
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the public view exposes the concrete source");
+        assert_eq!(original.to_string(), "private source text");
+
+        let sensitive = ErrorContext::with_flags("source", value.clone(), true, true);
+        let ErrorValue::Source(redacted) = sensitive.value() else {
+            panic!("redaction must retain a source view");
+        };
+        assert_eq!(redacted.to_string(), "[redacted]");
+        assert!(Error::source(redacted.as_ref()).is_none());
+        assert_eq!(
+            view.to_string(),
+            "private source text",
+            "redaction must not change another retained view"
+        );
+
+        let cause = ErrorValue::cause(crate::errors::ranking::query_empty().error());
+        assert_eq!(format!("{cause:?}"), "Cause([registered error])");
+        assert_eq!(
+            format!("{:?}", ErrorValue::display("query")),
+            "Display(\"query\")"
+        );
+    }
+
+    #[test]
+    fn representation_failure_preserves_registered_evidence_and_source_identity() {
+        let error = crate::errors::cli::server_spawn_failed()
+            .operation("spawn")
+            .source(std::io::Error::other("permission refused"))
+            .error();
+        let failed = IntoRiftError::fail::<u32>(&error)
+            .expect_err("the representation returns its registered error");
+        assert_eq!(failed.slug().to_string(), "rift.cli.server_spawn_failed");
+        assert_eq!(
+            failed.message(),
+            "the rift server process could not be started: permission refused"
+        );
+        assert_eq!(failed.to_string(), error.to_string());
+        assert_eq!(failed.fields().len(), 2);
+        let operation = failed
+            .fields()
+            .iter()
+            .find(|field| field.key() == "operation")
+            .expect("operation evidence remains attached");
+        assert!(operation.is_displayed());
+        assert!(!operation.is_sensitive());
+        assert_eq!(operation.value().rendered(), "spawn");
+        let original = Error::source(&error).expect("the registered source is present");
+        let converted = Error::source(&failed).expect("failure retains the source");
+        assert!(std::ptr::eq(original, converted));
+        assert_eq!(
+            converted
+                .downcast_ref::<std::io::Error>()
+                .expect("concrete source type is retained")
+                .to_string(),
+            "permission refused"
+        );
+    }
+
+    #[test]
+    fn evidence_accessors_retain_hidden_and_sensitive_flags() {
+        let error = crate::errors::ranking::query_empty()
+            .error()
+            .with(ErrorContext::with_flags("internal", "trace", false, false))
+            .with(ErrorContext::with_flags("token", "secret", true, true));
+        assert_eq!(error.fields().len(), 2);
+        let hidden = &error.fields()[0];
+        assert_eq!(hidden.key(), "internal");
+        assert!(!hidden.is_displayed());
+        assert!(!hidden.is_sensitive());
+        let sensitive = &error.fields()[1];
+        assert_eq!(sensitive.key(), "token");
+        assert!(sensitive.is_displayed());
+        assert!(sensitive.is_sensitive());
+        assert_eq!(
+            error.context().collect::<Vec<_>>(),
+            [("token", "[redacted]".to_owned())]
+        );
+        assert!(!format!("{sensitive:?}").contains("secret"));
+    }
+
+    #[test]
+    fn incomplete_runtime_template_remains_visible() {
+        let error = RiftError::new(
+            crate::errors::ranking::query_empty::SLUG,
+            "query {subject",
+            "provide query text",
+            vec![],
+        );
+        assert_eq!(error.message(), "query {subject");
+        assert_eq!(error.to_string(), "query {subject; provide query text");
     }
 }

@@ -995,6 +995,217 @@ mod tests {
     use super::DocumentationCollection;
     use crate::documentation::DocumentationViolation;
 
+    fn reference_collection(text: &str) -> (DocumentationCollection, SymbolId) {
+        let mut candidate = index(vec![source("README.md", text)]);
+        candidate.blocks[0].range.end = text.len() as u64;
+        let symbol = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Thing"));
+        for start in [0, 6] {
+            candidate.references.push(DocumentationReference {
+                identity: content_digest(&[u8::try_from(start).expect("fixture reference offset")]),
+                block: candidate.blocks[0].identity.clone(),
+                target: symbol.clone(),
+                range: TextRange {
+                    start,
+                    end: start + 5,
+                },
+                authored: "Thing".to_owned(),
+                evidence: DocumentationReferenceEvidence::UniqueName,
+            });
+        }
+        (
+            DocumentationCollection::new(candidate).expect("valid references"),
+            symbol,
+        )
+    }
+
+    fn assert_refusal(
+        error: &rift_error::RiftError,
+        violation: DocumentationViolation,
+        field: &str,
+    ) {
+        assert_eq!(crate::documentation::failure::violation(error), violation);
+        assert_eq!(
+            crate::documentation::failure::context_value(error, "field").as_deref(),
+            Some(field)
+        );
+        assert!(std::error::Error::source(error).is_none());
+    }
+
+    #[test]
+    fn context_refuses_mismatched_reference_facts_and_source_metadata() {
+        let text = "Thing Thing";
+        let (collection, symbol) = reference_collection(text);
+        let context =
+            crate::documentation::documentation_context(&collection, &symbol, |_| Some(text));
+        super::validate_documentation_context(&context, &symbol).expect("valid context");
+
+        let mut wrong_target = context.clone();
+        wrong_target.references[0].reference.target =
+            SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "Other"));
+        let mut wrong_block = context.clone();
+        wrong_block.references[0].reference.block = content_digest(b"other block");
+        let mut wrong_revision = context.clone();
+        wrong_revision.references[0]
+            .documentation
+            .documentation_revision = Digest("0".repeat(rift_core::constants::DIGEST_WIRE_CHARS));
+        let mut repeated_identity = context.clone();
+        repeated_identity.references[1].reference.identity =
+            repeated_identity.references[0].reference.identity.clone();
+        let mut outside_block = context.clone();
+        outside_block.references[0].reference.range.end = text.len() as u64 + 1;
+        for refused in [
+            wrong_target,
+            wrong_block,
+            wrong_revision,
+            repeated_identity,
+            outside_block,
+        ] {
+            let error = super::validate_documentation_context(&refused, &symbol)
+                .expect_err("mismatched reference");
+            assert_refusal(&error, DocumentationViolation::Identity, "reference");
+        }
+
+        let mut inconsistent_source = context.clone();
+        inconsistent_source.references[1]
+            .documentation
+            .source
+            .revision = content_digest(b"another tree");
+        let error = super::validate_documentation_context(&inconsistent_source, &symbol)
+            .expect_err("different metadata for one source");
+        assert_refusal(&error, DocumentationViolation::Identity, "source");
+
+        let mut reversed = context;
+        reversed.references.reverse();
+        let error = super::validate_documentation_context(&reversed, &symbol)
+            .expect_err("references out of order");
+        assert_refusal(&error, DocumentationViolation::Order, "references");
+    }
+
+    #[test]
+    fn context_refuses_invalid_revision_symbol_and_reference_count() {
+        let (collection, symbol) = reference_collection("Thing Thing");
+        let context = crate::documentation::documentation_context(&collection, &symbol, |_| None);
+        let mut bad_revision = context.clone();
+        bad_revision.documentation_revision = Digest("invalid".to_owned());
+        let mut too_many = context.clone();
+        too_many.references =
+            vec![
+                context.references[0].clone();
+                rift_protocol::documentation::DOCUMENTATION_SYMBOL_REFERENCES_MAX as usize + 1
+            ];
+        for (refused, target) in [
+            (&bad_revision, &symbol),
+            (&too_many, &symbol),
+            (&context, &SymbolId("invalid".to_owned())),
+        ] {
+            let error = super::validate_documentation_context(refused, target)
+                .expect_err("invalid context bounds");
+            assert_refusal(
+                &error,
+                DocumentationViolation::LimitExceeded,
+                "documentation",
+            );
+        }
+    }
+
+    #[test]
+    fn context_accepts_exact_excerpt_budget_and_refuses_one_more_byte() {
+        let text =
+            "x".repeat(rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize);
+        let (collection, symbol) = reference_collection(&text);
+        let mut context =
+            crate::documentation::documentation_context(&collection, &symbol, |_| Some(&text));
+        assert_eq!(
+            context.references[0].excerpt.as_deref(),
+            Some(text.as_str())
+        );
+        assert!(context.references[1].excerpt.is_none());
+        super::validate_documentation_context(&context, &symbol).expect("exact excerpt budget");
+        context.references[1].excerpt = Some("x".to_owned());
+        let error = super::validate_documentation_context(&context, &symbol)
+            .expect_err("total excerpt budget exceeded");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "excerpt");
+    }
+
+    #[cfg(feature = "collector")]
+    #[test]
+    fn source_omissions_accept_exact_count_and_refuse_additional_sources() {
+        use rift_protocol::documentation::{DOCUMENTATION_SOURCES_MAX, DocumentationWarningKind};
+
+        let omitted = source("missing.md", "").identity;
+        let mut candidate = index(Vec::new());
+        candidate.coverage.selected = DOCUMENTATION_SOURCES_MAX - 1;
+        candidate.coverage.omitted = DOCUMENTATION_SOURCES_MAX - 1;
+        let collection = DocumentationCollection::new(candidate)
+            .expect("bounded omitted sources")
+            .with_source_omissions(vec![(
+                omitted.clone(),
+                DocumentationWarningKind::SourceUnavailable,
+            )])
+            .expect("exact source bound");
+        assert_eq!(
+            collection.index().coverage.selected,
+            DOCUMENTATION_SOURCES_MAX
+        );
+        assert_eq!(
+            collection.index().coverage.omitted,
+            DOCUMENTATION_SOURCES_MAX
+        );
+        assert_eq!(collection.index().warnings[0].source, omitted);
+        let error = collection
+            .with_source_omissions(vec![(
+                omitted.clone(),
+                DocumentationWarningKind::SourceUnavailable,
+            )])
+            .expect_err("one source above the bound");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "sources");
+
+        let error = DocumentationCollection::new(index(Vec::new()))
+            .expect("empty collection")
+            .with_source_omissions(vec![
+                (omitted, DocumentationWarningKind::SourceUnavailable);
+                DOCUMENTATION_SOURCES_MAX as usize + 1
+            ])
+            .expect_err("omission list above the bound");
+        assert_refusal(&error, DocumentationViolation::LimitExceeded, "sources");
+    }
+
+    #[test]
+    fn publication_refuses_missing_reference_targets_and_reversed_references() {
+        let (collection, _) = reference_collection("Thing Thing");
+        let base = collection.index().clone();
+        let mut missing = base.clone();
+        missing.references[0].block = content_digest(b"missing block");
+        let error = DocumentationCollection::new(missing).expect_err("missing reference target");
+        assert_refusal(
+            &error,
+            DocumentationViolation::MissingTarget,
+            "reference.block",
+        );
+
+        let mut unresolved = base.clone();
+        unresolved
+            .unresolved_references
+            .push(DocumentationReferenceCandidate {
+                block: content_digest(b"missing block"),
+                range: TextRange { start: 0, end: 5 },
+                authored: "Thing".to_owned(),
+                language: None,
+                reason: DocumentationUnresolvedReason::Missing,
+            });
+        let error = DocumentationCollection::new(unresolved).expect_err("missing candidate block");
+        assert_refusal(
+            &error,
+            DocumentationViolation::MissingTarget,
+            "reference.block",
+        );
+
+        let mut reversed = base;
+        reversed.references.reverse();
+        let error = DocumentationCollection::new(reversed).expect_err("references out of order");
+        assert_refusal(&error, DocumentationViolation::Order, "references");
+    }
+
     fn source(path: &str, text: &str) -> DocumentationSource {
         DocumentationSource {
             identity: DocumentationContentIdentity {

@@ -200,37 +200,7 @@ fn is_dot_segment(segment: &str) -> bool {
 mod tests {
     use std::hash::{Hash as _, Hasher as _};
 
-    use super::{PathKind, PathViolation, ProjectPath, SourcePath};
-
-    fn path_slug(kind: PathKind, violation: PathViolation) -> &'static str {
-        let kind = match kind {
-            PathKind::Project => "project",
-            PathKind::Source => "source",
-        };
-        let violation = match violation {
-            PathViolation::Empty => "empty",
-            PathViolation::TooLong => "too_long",
-            PathViolation::Absolute => "absolute",
-            PathViolation::DotSegment => "dot_segment",
-            PathViolation::EmptySegment => "empty_segment",
-            PathViolation::Backslash => "backslash",
-            PathViolation::ControlCharacter => "control_character",
-            PathViolation::NonCanonicalUnicode => "non_canonical_unicode",
-            PathViolation::RiftState => "rift_state",
-        };
-        match violation {
-            "empty" => "rift.core.path_empty",
-            "too_long" => "rift.core.path_too_long",
-            "absolute" => "rift.core.path_absolute",
-            "dot_segment" => "rift.core.path_dot_segment",
-            "empty_segment" => "rift.core.path_empty_segment",
-            "backslash" => "rift.core.path_backslash",
-            "control_character" => "rift.core.path_control_character",
-            "non_canonical_unicode" => "rift.core.path_non_canonical_unicode",
-            "rift_state" => "rift.core.path_rift_state",
-            _ => unreachable!("path kind {kind} and violation {violation}"),
-        }
-    }
+    use super::{ProjectPath, SourcePath};
 
     #[test]
     fn cloned_paths_share_text_and_keep_value_semantics() {
@@ -279,23 +249,20 @@ mod tests {
     #[test]
     fn project_path_rejects_every_filesystem_boundary() {
         let cases = [
-            ("/src/lib.rs", PathViolation::Absolute),
-            ("C:/src/lib.rs", PathViolation::Absolute),
-            ("C:src/lib.rs", PathViolation::Absolute),
-            ("src/../lib.rs", PathViolation::DotSegment),
-            ("src//lib.rs", PathViolation::EmptySegment),
-            ("src\\lib.rs", PathViolation::Backslash),
-            ("src/line\n.rs", PathViolation::ControlCharacter),
-            ("src/cafe\u{301}.rs", PathViolation::NonCanonicalUnicode),
-            (".rift/index.db", PathViolation::RiftState),
+            ("/src/lib.rs", "rift.core.path_absolute"),
+            ("C:/src/lib.rs", "rift.core.path_absolute"),
+            ("C:src/lib.rs", "rift.core.path_absolute"),
+            ("src/../lib.rs", "rift.core.path_dot_segment"),
+            ("src//lib.rs", "rift.core.path_empty_segment"),
+            ("src\\lib.rs", "rift.core.path_backslash"),
+            ("src/line\n.rs", "rift.core.path_control_character"),
+            ("src/cafe\u{301}.rs", "rift.core.path_non_canonical_unicode"),
+            (".rift/index.db", "rift.core.path_rift_state"),
         ];
 
-        for (value, violation) in cases {
+        for (value, expected_slug) in cases {
             let error = ProjectPath::new(value).expect_err("fixture must be rejected");
-            assert_eq!(
-                error.slug().as_str(),
-                path_slug(PathKind::Project, violation)
-            );
+            assert_eq!(error.slug().as_str(), expected_slug);
         }
     }
 
