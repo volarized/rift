@@ -430,6 +430,49 @@ pub(crate) async fn await_workspace_ready(
     }
 }
 
+/// Calls `search` until the lexical population pass has landed.
+///
+/// Workspace map readiness covers local file preparation. The lexical lane commits its
+/// initial write behind that publication, so a search can still return identifier matches
+/// with `lexical_ranking_unavailable` or `stale_index` while the store catches up.
+///
+/// # Errors
+///
+/// Returns an error if the store does not rank the answer after 60 polls at 50 ms.
+/// Each request uses the existing proxied call bound.
+pub(crate) async fn search_after_population(
+    client: &RunningService<RoleClient, ()>,
+    arguments: &serde_json::Value,
+) -> TestResult<serde_json::Value> {
+    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
+    const SEARCH_TIER_POLL: Duration = Duration::from_millis(50);
+
+    let query = arguments["query"].as_str().unwrap_or("<missing query>");
+    let mut answer = proxied_call(client, "search", arguments).await?;
+    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
+        let population_pending =
+            answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    matches!(
+                        warning["code"].as_str(),
+                        Some("lexical_ranking_unavailable" | "stale_index")
+                    )
+                });
+        if !population_pending {
+            return Ok(answer);
+        }
+        tokio::time::sleep(SEARCH_TIER_POLL).await;
+        answer = proxied_call(client, "search", arguments).await?;
+    }
+    Err(format!(
+        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    )
+    .into())
+}
+
 /// One proxied live-engine call under [`PROXIED_ENGINE_CALL_MAX`].
 pub(crate) async fn proxied_engine_call(
     client: &RunningService<RoleClient, ()>,

@@ -16,7 +16,7 @@ mod rust_engine;
 
 use harness::{
     StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
-    proxied_call, proxy_client, require_success, run_rift, within,
+    proxy_client, require_success, run_rift, search_after_population, within,
 };
 use serde_json::json;
 
@@ -53,12 +53,11 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let client = proxy_client(root).await?;
-    // Issue #511: file hits require completed local preparation after transport startup.
+    // Issue #511: full-text hits require local file preparation and lexical population.
     within("workspace preparation", await_workspace_ready(&client)).await??;
 
-    let mdx = proxied_call(
+    let mdx = search_after_population(
         &client,
-        "search",
         &json!({ "query": "agentic development toolkit", "target": "file", "limit": 50 }),
     )
     .await?;
@@ -81,9 +80,8 @@ async fn search_reaches_the_mdx_file_and_the_extensionless_justfile() -> TestRes
         "a text-lane hit claims the content lane: {mdx:#}"
     );
 
-    let just = proxied_call(
+    let just = search_after_population(
         &client,
-        "search",
         &json!({ "query": "cargo fmt --all --check", "limit": 50 }),
     )
     .await?;
